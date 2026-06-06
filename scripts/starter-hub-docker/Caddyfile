@@ -1,0 +1,29 @@
+{
+	email {$CADDY_EMAIL}
+
+	# Browsers and curl don't send SNI when the host is an IP literal
+	# (RFC 6066). Without SNI, Caddy can't pick a site and aborts the
+	# handshake. Falling back to HUB_DOMAIN lets IP-based clients still
+	# reach the proxy — they'll see the cert for HUB_DOMAIN and (for
+	# IP/.localhost addresses) need to accept Caddy's internal CA.
+	default_sni {$HUB_DOMAIN}
+}
+
+# Primary site. On a real domain Caddy auto-provisions Let's Encrypt.
+# When HUB_DOMAIN is *.localhost or an IP, Caddy falls back to its
+# internal CA — first-party clients will see an "untrusted cert"
+# warning until you trust the Caddy root CA on each client.
+{$HUB_DOMAIN}{$LAN_HOSTS} {
+	encode zstd gzip
+
+	# WebSocket-aware reverse proxy. Broker control channels and SSE
+	# both use long-lived connections; bump read/write timeouts so they
+	# survive idle periods. Host, X-Real-IP, X-Forwarded-{For,Proto}
+	# are passed upstream by Caddy's default reverse_proxy behavior.
+	reverse_proxy hub:8080 {
+		transport http {
+			read_timeout 24h
+			write_timeout 24h
+		}
+	}
+}
