@@ -152,6 +152,7 @@ export default defineConfig({
 							items: [
 								{ label: 'Single-node Overview', slug: 'hosted/single-node/overview' },
 								{ label: 'Hub Setup', slug: 'hosted/single-node/hub-server' },
+								{ label: 'Hub Setup (Docker Compose)', slug: 'hosted/single-node/hub-setup-docker-compose' },
 								{ label: 'Deploy on a VM (GCE)', slug: 'hosted/single-node/hub-setup-gce' },
 								{ label: 'Auth & Tenancy', slug: 'hosted/single-node/auth' },
 								{ label: 'Managed Agents', slug: 'hosted/single-node/managed-agents' },
