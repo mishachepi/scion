@@ -1,0 +1,11 @@
+# LAN-access override for local smoke testing from other machines on
+# the same network. Exposes Hub directly on host port 8080 with plain
+# HTTP, bypassing Caddy. Do NOT use in production.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.lan.yml up -d
+#
+# Then from a neighbour: http://<this-host-LAN-IP>:8080
+services:
+  hub:
+    ports:
+      - "8080:8080"
