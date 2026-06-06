@@ -1,0 +1,57 @@
+services:
+  hub:
+    image: scion-hub:latest
+    container_name: scion-hub
+    restart: unless-stopped
+    expose:
+      - "8080"
+    environment:
+      SCION_HUB_ENDPOINT: "https://${HUB_DOMAIN}"
+      SCION_SERVER_SESSION_SECRET: "${SCION_SESSION_SECRET}"
+    volumes:
+      # The hub image runs as root, so $HOME=/root and state lives at
+      # /root/.scion. If you ever rebuild the image to drop root, update
+      # this target accordingly.
+      - hub-data:/root/.scion
+      # Pre-built web assets. The hub image is built with -tags
+      # no_embed_web, so the binary has no embedded UI. Run `make web`
+      # in the repo first.
+      - ../../web/dist/client:/srv/web:ro
+    command:
+      - scion
+      - server
+      - start
+      - --foreground
+      - --hosted
+      - --enable-hub
+      - --enable-web
+      - --dev-auth
+      - --host=0.0.0.0
+      - --web-port=8080
+      - --web-assets-dir=/srv/web
+
+  caddy:
+    image: caddy:2
+    container_name: scion-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      HUB_DOMAIN: "${HUB_DOMAIN}"
+      CADDY_EMAIL: "${CADDY_EMAIL}"
+      # Optional extra hostnames/IPs to serve TLS on (comma-prefixed,
+      # e.g. ", 192.168.1.20, hub.lan"). Useful for LAN testing.
+      LAN_HOSTS: "${LAN_HOSTS:-}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - hub
+
+volumes:
+  hub-data:
+  caddy-data:
+  caddy-config:
