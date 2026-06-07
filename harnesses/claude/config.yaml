@@ -57,7 +57,7 @@ env:
   # (and what it spawns) rather than every process in the container.
   ANTHROPIC_DEFAULT_HAIKU_MODEL: "claude-haiku-4-5"
 command:
-  base: ["claude", "--no-chrome", "--dangerously-skip-permissions"]
+  base: ["claude", "--no-chrome", "--permission-mode", "bypassPermissions"]
   resume_flag: "--continue"
   task_position: after_base_args
   system_prompt_flag: "--system-prompt"
@@ -104,6 +104,11 @@ auth:
           type: file
           target_suffix: "/.claude/.credentials.json"
           field: ClaudeAuthFile
+    # manual is a no-op auth method: scion injects no env vars or credential
+    # files, leaving the agent to resolve auth out-of-band (Keychain on macOS,
+    # host-mounted credentials, etc.). Only used when explicitly selected;
+    # never auto-detected.
+    manual: {}
     vertex-ai:
       required_env:
         - any_of: ["GOOGLE_CLOUD_PROJECT"]
