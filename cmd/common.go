@@ -676,7 +676,12 @@ func RunAgent(cmd *cobra.Command, args []string, resume bool) error {
 		})
 	}
 
-	statusf("Agent '%s' %s successfully (ID: %s)\n", agentName, displayStatus, info.ID)
+	// Hub UUID is empty in local runs; fall back to the runtime ID.
+	displayID := info.ID
+	if displayID == "" {
+		displayID = info.ContainerID
+	}
+	statusf("Agent '%s' %s successfully (ID: %s)\n", agentName, displayStatus, displayID)
 
 	return nil
 }
