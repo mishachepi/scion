@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/agent"
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
@@ -87,7 +88,16 @@ If the agent was started with tmux support, this will attach to the tmux session
 			return fmt.Errorf("agent '%s' not found in project '%s'", agentName, projectName)
 		}
 
-		rt := runtime.GetRuntime(targetProjectPath, profile)
+		// Fall back to the agent's recorded profile so attach uses the
+		// runtime the agent was started with. Mirrors hub-side dispatch
+		// (pkg/runtimebroker/handlers.go).
+		effectiveProfile := profile
+		if effectiveProfile == "" {
+			if saved := agent.GetSavedProfile(agentName, targetProjectPath); saved != "" {
+				effectiveProfile = saved
+			}
+		}
+		rt := runtime.GetRuntime(targetProjectPath, effectiveProfile)
 
 		// Use project-scoped lookup to find the exact container,
 		// preventing cross-project collision when agents share a name.
