@@ -1308,7 +1308,14 @@ class ClaudePluginInstaller(scion_harness.PluginInstaller):
 
 
 def provision(ctx: scion_harness.ProvisionContext) -> None:
-    auth = ctx.select_auth(AUTH)
+    # `manual` is a no-op auth method: scion injects no env vars or credential
+    # files, leaving the agent to resolve auth out-of-band (Keychain on macOS,
+    # host-mounted credentials, etc.). Only honored when explicitly selected;
+    # never auto-detected, so it does not participate in AUTH's method list.
+    if ctx.explicit_type == "manual":
+        auth = scion_harness.ResolvedAuth(method="manual")
+    else:
+        auth = ctx.select_auth(AUTH)
 
     try:
         claude_version = _update_project_paths(ctx)

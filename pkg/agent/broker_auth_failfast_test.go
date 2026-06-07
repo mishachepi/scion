@@ -187,7 +187,7 @@ func TestStart_BrokerFailsFastWhenEnvOnlyAuthTypeUnsatisfied(t *testing.T) {
 			opts.HarnessAuth = "api-key"
 			opts.Env = map[string]string{"GOOGLE_CLOUD_LOCATION": "us-east5"} // ambient only
 			_, err := failfastManager(&runs, rt).Start(context.Background(), opts)
-			assertNoAuthSatisfied(t, err, runs, "claude", `"api-key"`, "ANTHROPIC_API_KEY", "api-key, auth-file, oauth-token, vertex-ai")
+			assertNoAuthSatisfied(t, err, runs, "claude", `"api-key"`, "ANTHROPIC_API_KEY", "api-key, auth-file, manual, oauth-token, vertex-ai")
 		})
 	}
 }
