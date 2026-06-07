@@ -1632,6 +1632,11 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 
 	chain := rt.Chain
 	finalScionCfg := rt.Config
+
+	// Must run before harness-config merge — otherwise harness-config fields
+	// (image, auth_selectedType) get misattributed to the template.
+	config.PrintDeprecationWarnings(config.WarnDeprecatedTemplateFields(finalScionCfg))
+
 	harnessConfigName := rt.HarnessConfigName
 	templatePaths := rt.TemplatePaths
 	hcDir := rt.HarnessConfigDir
@@ -1692,9 +1697,6 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 	// Ensure harness and harness_config fields are not overridden by the merge
 	finalScionCfg.Harness = hcDir.Config.Harness
 	finalScionCfg.HarnessConfig = harnessConfigName
-
-	// Warn about deprecated harness-specific fields in template config
-	config.PrintDeprecationWarnings(config.WarnDeprecatedTemplateFields(finalScionCfg))
 
 	// Resolve model size aliases (small/medium/large → concrete model name)
 	if finalScionCfg.Model != "" && hcDir.Config.ModelAliases != nil {
