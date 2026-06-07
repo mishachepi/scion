@@ -1,0 +1,43 @@
+{{- /*
+  Helm-managed smoke test. Run with `helm test <release>`.
+  Curls /healthz from inside the cluster. Should return 200 + JSON.
+*/ -}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "scion-hub.fullname" . }}-test-healthz
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "scion-hub.labels" . | nindent 4 }}
+    app.kubernetes.io/component: test
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    runAsGroup: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: curl
+      image: curlimages/curl:8.10.1
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/sh", "-ec"]
+      args:
+        - |
+          set -eu
+          url="http://{{ include "scion-hub.fullname" . }}.{{ .Release.Namespace }}.svc:{{ int .Values.service.port }}/healthz"
+          echo "GET $url"
+          body=$(curl -fsS --max-time 10 "$url")
+          echo "$body"
+          echo "$body" | grep -q '"status":"healthy"'
+      resources:
+        requests: { cpu: 10m, memory: 32Mi }
+        limits:   { cpu: 100m, memory: 64Mi }
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: { drop: ["ALL"] }

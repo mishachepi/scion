@@ -1,0 +1,89 @@
+{{- $fullname := include "scion-hub.fullname" . -}}
+{{ $fullname }} has been deployed to namespace `{{ .Release.Namespace }}`.
+
+==============================================================================
+ 1. Wait for the rollout to settle
+==============================================================================
+
+    kubectl rollout status -n {{ .Release.Namespace }} deployment/{{ $fullname }}
+    kubectl logs -n {{ .Release.Namespace }} -l app.kubernetes.io/instance={{ .Release.Name }} -f
+
+==============================================================================
+ 2. Reach the Hub
+==============================================================================
+
+{{- if .Values.gateway.enabled }}
+
+    HTTPRoute attached to Gateway(s):
+    {{- range .Values.gateway.parentRefs }}
+        - {{ .name }}{{ with .namespace }} (ns: {{ . }}){{ end }}{{ with .sectionName }} listener: {{ . }}{{ end }}
+    {{- end }}
+
+    External URL(s):
+    {{- range .Values.gateway.hostnames }}
+        - https://{{ . }}/
+    {{- end }}
+
+    Verify TLS + reachability:
+        curl https://{{ index .Values.gateway.hostnames 0 }}/healthz
+{{- else }}
+
+    Gateway integration is disabled. Port-forward to test locally:
+
+        kubectl port-forward -n {{ .Release.Namespace }} svc/{{ $fullname }} 9080:{{ int .Values.service.port }}
+        curl http://localhost:9080/healthz
+{{- end }}
+
+==============================================================================
+ 3. Authenticate the CLI
+==============================================================================
+
+{{- if eq .Values.auth.mode "dev" }}
+{{- if .Values.auth.dev.token }}
+
+    Dev token was set explicitly via values:
+
+        export SCION_DEV_TOKEN={{ .Values.auth.dev.token }}
+{{- else }}
+
+    Dev token is auto-generated inside the pod. Retrieve it with:
+
+        kubectl exec -n {{ .Release.Namespace }} deployment/{{ $fullname }} -- cat /home/scion/.scion/dev-token
+        # then on the client:
+        export SCION_DEV_TOKEN=<that-token>
+
+    For a stable workflow, set `auth.dev.token` in values.yaml or your
+    external secret.
+{{- end }}
+{{- else }}
+
+    OAuth mode is active. Sign in via the Web UI in a browser:
+    {{- range .Values.gateway.hostnames }}
+        https://{{ . }}/auth/login
+    {{- end }}
+{{- end }}
+
+==============================================================================
+ 4. Register a Runtime Broker
+==============================================================================
+
+The Hub does not run agents itself. Connect a broker from outside the cluster
+(your laptop, a Steam Deck, another K8s cluster) to provide execution capacity:
+
+    # On the broker machine:
+    export SCION_HUB_ENDPOINT={{ if .Values.gateway.hostnames }}https://{{ index .Values.gateway.hostnames 0 }}{{ else }}<set-this>{{ end }}
+    scion broker register
+    scion broker provide
+
+See docs/hub-user/runtime-broker/ for the full flow.
+
+==============================================================================
+ 5. Important things to know
+==============================================================================
+
+  * Persistence: {{- if .Values.persistence.enabled }} ON ({{ .Values.persistence.size }}, {{ .Values.persistence.accessMode }}){{ if not .Values.persistence.annotations }} — consider setting `persistence.annotations.helm.sh/resource-policy: keep` for production{{ end }}{{- else }} OFF — Hub state will be lost on every pod restart!{{- end }}
+  * Database: sqlite — single-writer, single-replica. Postgres support not yet upstreamed.
+  * Image: {{ include "scion-hub.image" . }}
+  * Agent image registry (broker pulls from): {{ .Values.imageRegistry | default "(not set — agents will fail to start until brokers configure their own image_registry)" }}
+
+For troubleshooting, see the Hub Setup (Helm) page in the Scion docs.

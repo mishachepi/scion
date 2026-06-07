@@ -1,0 +1,67 @@
+{{- /*
+  ConfigMap holding settings.yaml. Mounted at /home/scion/.scion/settings.yaml
+  as a single-file subPath mount so the rest of /home/scion/.scion can stay
+  writable on the PVC.
+*/ -}}
+{{- include "scion-hub.validate" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "scion-hub.configMapName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "scion-hub.labels" . | nindent 4 }}
+  {{- with (include "scion-hub.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+data:
+  settings.yaml: |
+    schema_version: "1"
+    {{- with .Values.imageRegistry }}
+    image_registry: {{ . | quote }}
+    {{- end }}
+
+    cli:
+      autohelp: true
+
+    server:
+      log_level: {{ .Values.hub.logLevel | quote }}
+      log_format: {{ .Values.hub.logFormat | quote }}
+
+      hub:
+        host: "0.0.0.0"
+        port: {{ int .Values.hub.port }}
+        {{- with .Values.hub.publicUrl }}
+        public_url: {{ . | quote }}
+        {{- end }}
+        {{- with .Values.hub.adminEmails }}
+        admin_emails:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+
+      # The Broker is NOT enabled in the chart-managed Hub container. Brokers
+      # connect from outside the cluster (laptops, deck, other k8s nodes via
+      # the broker DaemonSet pattern). See docs/hub-user/runtime-broker/.
+      broker:
+        enabled: false
+
+      database:
+        driver: sqlite
+        # The hub.db lives on the PVC, mounted at /home/scion/.scion.
+        url: "/home/scion/.scion/hub.db"
+
+      auth:
+        {{- if eq .Values.auth.mode "dev" }}
+        dev_mode: true
+        {{- else }}
+        dev_mode: false
+        {{- end }}
+        {{- with .Values.hub.authorizedDomains }}
+        authorized_domains:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+
+      storage:
+        provider: local
+        local_path: "/home/scion/.scion/storage"

@@ -1,0 +1,201 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "scion-hub Helm values",
+  "description": "Schema for scion-hub chart values. Catches obvious mis-configs at install time.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "nameOverride":     { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "commonLabels":      { "type": "object", "additionalProperties": { "type": "string" } },
+    "commonAnnotations": { "type": "object", "additionalProperties": { "type": "string" } },
+
+    "image": {
+      "type": "object",
+      "required": ["repository", "pullPolicy"],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "description": "Container image repository. Required; chart will refuse to render when empty."
+        },
+        "tag":        { "type": "string" },
+        "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] },
+        "pullSecrets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "properties": { "name": { "type": "string" } }
+          }
+        }
+      }
+    },
+
+    "replicaCount": { "type": "integer", "minimum": 1, "maximum": 1, "description": "Hard-capped at 1 while the database is sqlite." },
+
+    "strategy": {
+      "type": "object",
+      "properties": {
+        "type": { "type": "string", "enum": ["Recreate", "RollingUpdate"] }
+      }
+    },
+
+    "hub": {
+      "type": "object",
+      "properties": {
+        "publicUrl": { "type": "string" },
+        "port":      { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "logLevel":  { "type": "string", "enum": ["debug", "info", "warn", "error"] },
+        "logFormat": { "type": "string", "enum": ["text", "json"] },
+        "adminEmails":       { "type": "array", "items": { "type": "string", "format": "email" } },
+        "authorizedDomains": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+
+    "auth": {
+      "type": "object",
+      "required": ["mode"],
+      "properties": {
+        "mode":            { "type": "string", "enum": ["dev", "oauth"] },
+        "sessionSecret":   { "type": "string" },
+        "existingSecret":  { "type": "string" },
+        "dev": {
+          "type": "object",
+          "properties": { "token": { "type": "string" } }
+        },
+        "oauth": {
+          "type": "object",
+          "properties": {
+            "google": { "$ref": "#/$defs/oauthProvider" },
+            "github": { "$ref": "#/$defs/oauthProvider" }
+          }
+        }
+      }
+    },
+
+    "persistence": {
+      "type": "object",
+      "properties": {
+        "enabled":       { "type": "boolean" },
+        "storageClass":  { "type": "string" },
+        "accessMode":    { "type": "string", "enum": ["ReadWriteOnce", "ReadWriteOncePod"] },
+        "size":          { "type": "string", "pattern": "^[0-9]+(Ki|Mi|Gi|Ti|Pi|Ei|K|M|G|T|P|E)?$" },
+        "annotations":   { "type": "object", "additionalProperties": { "type": "string" } },
+        "existingClaim": { "type": "string" }
+      }
+    },
+
+    "gateway": {
+      "type": "object",
+      "properties": {
+        "enabled":   { "type": "boolean" },
+        "hostnames": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+        "parentRefs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+              "name":        { "type": "string" },
+              "namespace":   { "type": "string" },
+              "sectionName": { "type": "string" },
+              "port":        { "type": "integer" },
+              "kind":        { "type": "string" },
+              "group":       { "type": "string" }
+            }
+          }
+        },
+        "rules":           { "type": "array" },
+        "referenceGrant": {
+          "type": "object",
+          "properties": {
+            "enabled":       { "type": "boolean" },
+            "fromNamespace": { "type": "string" }
+          }
+        }
+      }
+    },
+
+    "service": {
+      "type": "object",
+      "properties": {
+        "type":        { "type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+        "port":        { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "annotations": { "type": "object", "additionalProperties": { "type": "string" } }
+      }
+    },
+
+    "imageRegistry": { "type": "string" },
+
+    "discord": {
+      "type": "object",
+      "properties": { "webhookUrl": { "type": "string" } }
+    },
+
+    "probes":   { "type": "object" },
+    "resources":{ "type": "object" },
+
+    "nodeSelector":              { "type": "object" },
+    "tolerations":               { "type": "array" },
+    "affinity":                  { "type": "object" },
+    "topologySpreadConstraints": { "type": "array" },
+    "terminationGracePeriodSeconds": { "type": "integer", "minimum": 0 },
+
+    "extraEnv":         { "type": "array" },
+    "extraEnvFrom":     { "type": "array" },
+    "extraVolumes":     { "type": "array" },
+    "extraVolumeMounts":{ "type": "array" },
+
+    "podSecurityContext": { "type": "object" },
+    "securityContext":    { "type": "object" },
+
+    "networkPolicy": {
+      "type": "object",
+      "properties": {
+        "enabled":     { "type": "boolean" },
+        "ingressFrom": { "type": "array" }
+      }
+    },
+
+    "serviceAccount": {
+      "type": "object",
+      "properties": {
+        "create":      { "type": "boolean" },
+        "name":        { "type": "string" },
+        "annotations": { "type": "object", "additionalProperties": { "type": "string" } },
+        "automountServiceAccountToken": { "type": "boolean" }
+      }
+    },
+
+    "podDisruptionBudget": {
+      "type": "object",
+      "properties": {
+        "enabled":        { "type": "boolean" },
+        "minAvailable":   { "oneOf": [{ "type": "integer" }, { "type": "string" }] },
+        "maxUnavailable": { "oneOf": [{ "type": "integer" }, { "type": "string" }] }
+      }
+    }
+  },
+
+  "$defs": {
+    "oauthProvider": {
+      "type": "object",
+      "properties": {
+        "web": {
+          "type": "object",
+          "properties": {
+            "clientId":     { "type": "string" },
+            "clientSecret": { "type": "string" }
+          }
+        },
+        "cli": {
+          "type": "object",
+          "properties": {
+            "clientId":     { "type": "string" },
+            "clientSecret": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,210 @@
+{{- include "scion-hub.validate" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "scion-hub.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "scion-hub.labels" . | nindent 4 }}
+  {{- with (include "scion-hub.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: {{ int .Values.replicaCount }}
+  strategy:
+    {{- toYaml .Values.strategy | nindent 4 }}
+  selector:
+    matchLabels:
+      {{- include "scion-hub.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "scion-hub.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Roll the pod when config or auth secret content changes.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if not .Values.auth.existingSecret }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.commonAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "scion-hub.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: hub
+          image: {{ include "scion-hub.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Bypass the scion-base ENTRYPOINT (`sciontool init`), which is built
+          # for agent containers that need to remap UID/GID at boot. Hub runs
+          # as a fixed non-root user from a read-only rootfs, so we invoke the
+          # binary directly.
+          command:
+            - scion
+          args:
+            # --hosted is required: without it the server applies workstation
+            # defaults, which force-enable the co-located runtime broker and
+            # dev-auth at the flag level, overriding settings.yaml. In hosted
+            # mode only the explicitly enabled components (--enable-hub,
+            # --enable-web) run; external brokers register via the Hub API
+            # (HMAC handshake) instead of a co-located broker process that
+            # would compete for the same broker_id.
+            - "--global"
+            - server
+            - start
+            - --hosted
+            - --foreground
+            - --enable-hub
+            - --enable-web
+            - --host
+            - "0.0.0.0"
+            - --web-port
+            - "{{ int .Values.hub.port }}"
+          ports:
+            - name: http
+              containerPort: {{ int .Values.hub.port }}
+              protocol: TCP
+          env:
+            - name: HOME
+              value: /home/scion
+            - name: SCION_SERVER_SESSION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "scion-hub.authSecretName" . }}
+                  key: session-secret
+            {{- if and (eq .Values.auth.mode "dev") (or .Values.auth.dev.token .Values.auth.existingSecret) }}
+            - name: SCION_DEV_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "scion-hub.authSecretName" . }}
+                  key: dev-token
+                  optional: true
+            {{- end }}
+            {{- with .Values.hub.publicUrl }}
+            - name: SCION_SERVER_BASE_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if eq .Values.auth.mode "oauth" }}
+            {{- range $provider := list "google" "github" }}
+            {{- range $client := list "web" "cli" }}
+            - name: SCION_SERVER_OAUTH_{{ $client | upper }}_{{ $provider | upper }}_CLIENTID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "scion-hub.authSecretName" $ }}
+                  key: oauth-{{ $provider }}-{{ $client }}-client-id
+                  optional: true
+            - name: SCION_SERVER_OAUTH_{{ $client | upper }}_{{ $provider | upper }}_CLIENTSECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "scion-hub.authSecretName" $ }}
+                  key: oauth-{{ $provider }}-{{ $client }}-client-secret
+                  optional: true
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.discord.webhookUrl }}
+            - name: SCION_DISCORD_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "scion-hub.authSecretName" . }}
+                  key: discord-webhook-url
+                  optional: true
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if .Values.probes.startup.enabled }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.probes.startup.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.startup.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+          {{- end }}
+          {{- if .Values.probes.liveness.enabled }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          {{- end }}
+          {{- if .Values.probes.readiness.enabled }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /home/scion/.scion
+            - name: config
+              mountPath: /home/scion/.scion/settings.yaml
+              subPath: settings.yaml
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ default (printf "%s-data" (include "scion-hub.fullname" .)) .Values.persistence.existingClaim }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: config
+          configMap:
+            name: {{ include "scion-hub.configMapName" . }}
+            items:
+              - key: settings.yaml
+                path: settings.yaml
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}

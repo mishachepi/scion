@@ -1,0 +1,40 @@
+apiVersion: v2
+name: scion-hub
+description: |
+  Scion Hub — central control plane for orchestrating multi-agent LLM workloads.
+  This chart deploys the Hub API + Web Dashboard. Runtime Brokers (which actually
+  execute agents) connect from outside the cluster and are NOT in scope of this
+  chart.
+type: application
+
+# Chart SemVer — independent of the Scion application version.
+version: 0.1.0
+
+# Pinned to a Scion release. Override `image.tag` when deploying a different one.
+appVersion: "0.1.0"
+
+kubeVersion: ">=1.29.0-0"
+
+home: https://scion-ai.dev/
+sources:
+  - https://github.com/GoogleCloudPlatform/scion
+
+keywords:
+  - scion
+  - llm
+  - agents
+  - ai
+  - orchestration
+
+maintainers:
+  - name: Scion contributors
+    url: https://github.com/GoogleCloudPlatform/scion/blob/main/MAINTAINERS
+
+annotations:
+  # artifacthub.io annotations for downstream discovery.
+  artifacthub.io/category: "ai-machine-learning"
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/prerelease: "true"
+  artifacthub.io/changes: |
+    - kind: added
+      description: Initial chart — Hub API, Web Dashboard, Gateway API HTTPRoute, sqlite persistence.

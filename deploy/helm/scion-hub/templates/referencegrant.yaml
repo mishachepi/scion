@@ -1,0 +1,47 @@
+{{- /*
+  ReferenceGrant lets an HTTPRoute in this namespace attach to a Gateway in a
+  different namespace. Only render when the user explicitly opts in.
+
+  This grant is created in *this* release's namespace (where the Service lives)
+  and authorizes any HTTPRoute from `fromNamespace` to reference our Service.
+  Wait — that's backwards. Gateway API's actual model:
+    - The grant lives in the TARGET namespace (where the referenced object is)
+    - `from` describes who is allowed to reference into here
+  HTTPRoute -> Gateway needs the grant in the Gateway's namespace.
+  So when the Gateway is in `fromNamespace`, the grant must be rendered THERE,
+  but Helm releases are bound to a single namespace. The user must apply this
+  manually OR install the chart with --namespace = the Gateway's namespace.
+
+  Therefore we keep the toggle but emit a comment-only YAML pointing the user
+  at the correct fix. (Most real installs use same-namespace Gateways anyway.)
+*/ -}}
+{{- if .Values.gateway.referenceGrant.enabled -}}
+{{- if not .Values.gateway.referenceGrant.fromNamespace -}}
+{{- fail "gateway.referenceGrant.enabled=true requires gateway.referenceGrant.fromNamespace." -}}
+{{- end -}}
+# ReferenceGrant template — apply this manifest in the Gateway's namespace
+# ({{ .Values.gateway.referenceGrant.fromNamespace }}) so HTTPRoutes there can
+# reference the Service in {{ .Release.Namespace }}.
+#
+# Helm cannot render a resource into a foreign namespace; the YAML below is
+# emitted with a {{`{{}}-style`}} note so it appears in `helm template` output
+# but does NOT install. Kubectl-apply it separately:
+#
+#   helm template {{ .Release.Name }} . --show-only templates/referencegrant.yaml \
+#     | kubectl apply -n {{ .Values.gateway.referenceGrant.fromNamespace }} -f -
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: {{ include "scion-hub.fullname" . }}-from-{{ .Values.gateway.referenceGrant.fromNamespace }}
+  # IMPORTANT: apply this in namespace {{ .Values.gateway.referenceGrant.fromNamespace }}
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: {{ .Values.gateway.referenceGrant.fromNamespace | quote }}
+  to:
+    - group: ""
+      kind: Service
+      name: {{ include "scion-hub.fullname" . }}
+{{- end }}

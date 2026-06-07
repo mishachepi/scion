@@ -1,0 +1,334 @@
+# Default values for scion-hub.
+# This file is a public contract — changes are user-visible.
+# Documented per-field; defaults are designed for a single-tenant Hub on a
+# small cluster. Larger or multi-user deployments will need explicit overrides.
+
+# -- Override the chart name (used in resource names). Defaults to Chart.Name.
+nameOverride: ""
+# -- Override the full release+chart name (used in resource names).
+fullnameOverride: ""
+
+# -- Common labels added to every resource the chart renders.
+commonLabels: {}
+# -- Common annotations added to every resource the chart renders.
+commonAnnotations: {}
+
+# ----------------------------------------------------------------------------
+# Image
+# ----------------------------------------------------------------------------
+image:
+  # -- Image repository. **Required** — no upstream public registry is
+  # canonicalized yet. Set to e.g. `ghcr.io/your-org/scion-hub`.
+  repository: ""
+  # -- Image tag. Defaults to .Chart.AppVersion when empty.
+  tag: ""
+  # -- Pull policy. `IfNotPresent` for tagged releases, `Always` for `latest`.
+  pullPolicy: IfNotPresent
+  # -- imagePullSecrets references (name-only objects) for private registries.
+  pullSecrets: []
+  # - name: ghcr-pull-secret
+
+# ----------------------------------------------------------------------------
+# Replica & strategy
+# ----------------------------------------------------------------------------
+# -- Hub is currently a single-writer (sqlite) workload. Keep replicaCount: 1
+# until a shared backend (e.g. Postgres) is wired in upstream.
+replicaCount: 1
+
+# -- Deployment update strategy. `Recreate` is required while the database is
+# a sqlite file on a ReadWriteOnce PVC — RollingUpdate would briefly start a
+# second pod that fails to lock the DB.
+strategy:
+  type: Recreate
+
+# ----------------------------------------------------------------------------
+# Hub configuration
+# ----------------------------------------------------------------------------
+hub:
+  # -- Public URL clients use to reach the Hub. Becomes `server.hub.public_url`
+  # and `SCION_SERVER_BASE_URL`. Used for OAuth callbacks, agent-facing URLs,
+  # and links in the Web UI. **Set this.**
+  publicUrl: ""
+
+  # -- Optional list of admin emails to auto-promote when they first log in.
+  adminEmails: []
+  # - admin@example.com
+
+  # -- Optional list of email-domain allowlist. Empty = all domains allowed.
+  # Applies to OAuth logins. Case-insensitive, exact match (no wildcards).
+  authorizedDomains: []
+  # - example.com
+
+  # -- The container exposes the Hub API + Web on a single port (combo mode).
+  port: 9080
+
+  logLevel: info  # debug | info | warn | error
+  logFormat: text  # text | json
+
+# ----------------------------------------------------------------------------
+# Authentication
+# ----------------------------------------------------------------------------
+auth:
+  # -- `dev` for development (auto-generated dev token, no OAuth) or `oauth`
+  # for production. `oauth` requires at least one provider configured below.
+  mode: dev
+
+  # When mode=dev:
+  dev:
+    # -- Explicit dev token. If empty, the Hub auto-generates one at first
+    # start and writes it to /home/scion/.scion/dev-token inside the pod.
+    # Setting this explicitly is recommended — otherwise you must `kubectl
+    # exec` into the pod to retrieve it.
+    token: ""
+
+  # When mode=oauth:
+  oauth:
+    google:
+      web:
+        clientId: ""
+        clientSecret: ""
+      cli:
+        clientId: ""
+        clientSecret: ""
+    github:
+      web:
+        clientId: ""
+        clientSecret: ""
+      cli:
+        clientId: ""
+        clientSecret: ""
+
+  # -- HMAC session signing secret. If empty, the chart generates a random
+  # value at install time and stores it in the chart-managed Secret. Provide
+  # explicitly when you need to share session state across pod restarts in
+  # ways that survive an uninstall, or when using an external secret manager.
+  sessionSecret: ""
+
+  # -- When set, reference an externally-managed Secret containing the auth
+  # values (sessionSecret, devToken, OAuth client ids/secrets). Disables the
+  # chart-managed Secret. Use with external-secrets-operator, sealed-secrets,
+  # or any other GitOps-friendly secret distribution mechanism.
+  existingSecret: ""
+  # The external Secret must use these keys (only the ones you need):
+  #   session-secret
+  #   dev-token
+  #   oauth-google-web-client-id
+  #   oauth-google-web-client-secret
+  #   oauth-google-cli-client-id
+  #   oauth-google-cli-client-secret
+  #   oauth-github-web-client-id
+  #   oauth-github-web-client-secret
+  #   oauth-github-cli-client-id
+  #   oauth-github-cli-client-secret
+
+# ----------------------------------------------------------------------------
+# Persistence (sqlite + storage + cache)
+# ----------------------------------------------------------------------------
+persistence:
+  # -- Whether to provision a PVC. Set to false only for ephemeral testing —
+  # the Hub loses its database on every pod restart when disabled.
+  enabled: true
+  # -- Storage class. Leave empty to use the cluster default.
+  storageClass: ""
+  # -- Access mode. Must be ReadWriteOnce because sqlite tolerates one writer.
+  accessMode: ReadWriteOnce
+  size: 10Gi
+  # -- Annotations on the PVC (e.g. `helm.sh/resource-policy: keep` to retain
+  # data on `helm uninstall`). Strongly recommended for production.
+  annotations: {}
+  #   helm.sh/resource-policy: keep
+  # -- Use an existing PVC instead of provisioning one.
+  existingClaim: ""
+
+# ----------------------------------------------------------------------------
+# Networking: Gateway API HTTPRoute (NOT Ingress)
+# ----------------------------------------------------------------------------
+# This chart targets Gateway API v1 (GA in Kubernetes 1.30+). It does NOT
+# create a Gateway — Gateways are cluster-scoped infrastructure with their
+# own TLS configuration and lifecycle.  Configure a Gateway separately, then
+# reference it here via `gateway.parentRefs`.
+gateway:
+  # -- Whether to render an HTTPRoute attaching the Hub Service to a Gateway.
+  enabled: true
+
+  # -- Hostnames the HTTPRoute matches. Should align with the Listener on the
+  # parent Gateway. Wildcards allowed per Gateway API rules.
+  hostnames:
+    - hub.example.com
+
+  # -- Parent Gateway references. **Set at least one.**
+  # See https://gateway-api.sigs.k8s.io/api-types/httproute/
+  parentRefs:
+    - name: ""              # required: the Gateway's metadata.name
+      namespace: ""         # optional; defaults to this release's namespace
+      sectionName: ""       # optional; for matching a specific Gateway Listener
+      # kind: Gateway       # default; omit unless using a custom kind
+      # group: gateway.networking.k8s.io  # default
+
+  # -- HTTPRoute additional rules. Defaults to a single PathPrefix=/ rule
+  # that proxies all paths to the Hub Service. Override to split paths, add
+  # filters, etc.
+  rules: []
+  # - matches:
+  #     - path:
+  #         type: PathPrefix
+  #         value: /
+  #   filters: []
+
+  # -- When the parent Gateway is in another namespace, set this to render a
+  # ReferenceGrant allowing the HTTPRoute to attach.
+  referenceGrant:
+    enabled: false
+    # -- Namespace where the Gateway lives. Required when enabled.
+    fromNamespace: ""
+
+# ----------------------------------------------------------------------------
+# Service (cluster-internal — Gateway terminates external traffic)
+# ----------------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 9080
+  # -- Service annotations (e.g. for service-mesh sidecar opt-in).
+  annotations: {}
+
+# ----------------------------------------------------------------------------
+# Image registry for downstream agent containers
+# ----------------------------------------------------------------------------
+# When the Hub dispatches an agent, the broker pulls `scion-<harness>` images
+# from this registry. This is the user-facing default; brokers may override
+# it via their own settings.yaml.
+imageRegistry: ""
+# Example: ghcr.io/your-org
+
+# ----------------------------------------------------------------------------
+# Discord notification webhook (optional)
+# ----------------------------------------------------------------------------
+discord:
+  # -- Webhook URL for outbound-only notifications. If set, becomes
+  # `SCION_DISCORD_WEBHOOK_URL`.
+  webhookUrl: ""
+
+# ----------------------------------------------------------------------------
+# Probes
+# ----------------------------------------------------------------------------
+probes:
+  liveness:
+    enabled: true
+    path: /healthz
+    initialDelaySeconds: 10
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readiness:
+    enabled: true
+    # The container serves the web mux, which exposes /healthz (/readyz only
+    # exists on the standalone hub API mux and would fall through to the SPA).
+    path: /healthz
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  startup:
+    enabled: true
+    path: /healthz
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 5
+    failureThreshold: 30  # 30 * 5s = 2.5min grace for first-time DB init
+
+# ----------------------------------------------------------------------------
+# Pod resources & scheduling
+# ----------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    # -- CPU limits can cause throttling; consider unsetting in production.
+    cpu: 2000m
+    memory: 1Gi
+
+# -- Node selector for pod assignment.
+nodeSelector: {}
+
+# -- Tolerations for the Hub pod.
+tolerations: []
+
+# -- Affinity rules. Defaults to none — single replica, no spreading needed.
+affinity: {}
+
+# -- Topology spread constraints (no-op while replicaCount: 1).
+topologySpreadConstraints: []
+
+# -- Termination grace in seconds. Hub gracefully shuts down within ~10s.
+terminationGracePeriodSeconds: 30
+
+# -- Extra env vars to inject into the container.
+extraEnv: []
+# - name: SCION_DEBUG
+#   value: "1"
+
+# -- Extra envFrom sources (configMapRef / secretRef).
+extraEnvFrom: []
+
+# -- Extra volumes attached to the pod.
+extraVolumes: []
+# -- Extra volume mounts on the Hub container.
+extraVolumeMounts: []
+
+# ----------------------------------------------------------------------------
+# Security
+# ----------------------------------------------------------------------------
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  capabilities:
+    drop: ["ALL"]
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- NetworkPolicy controlling pod ingress/egress. Off by default — enable
+# in production environments with a NetworkPolicy-enforcing CNI (Cilium,
+# Calico, etc.). The HTTPRoute and Gateway live outside this policy.
+networkPolicy:
+  enabled: false
+  # -- Pod selector for ingress sources. Empty = allow from any pod in the
+  # same namespace; restrict in production.
+  ingressFrom: []
+  # - namespaceSelector:
+  #     matchLabels:
+  #       kubernetes.io/metadata.name: my-gateway-namespace
+  # - podSelector:
+  #     matchLabels:
+  #       app.kubernetes.io/name: my-gateway
+
+# ----------------------------------------------------------------------------
+# ServiceAccount, RBAC
+# ----------------------------------------------------------------------------
+serviceAccount:
+  create: true
+  # -- Override the SA name (default: chart fullname).
+  name: ""
+  annotations: {}
+  # -- Hub does not call the k8s API at runtime; keep this false.
+  automountServiceAccountToken: false
+
+# -- PodDisruptionBudget. Single-replica deployment can still benefit when
+# voluntary disruptions (node drains) shouldn't take the only pod down without
+# a manual override.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+  # maxUnavailable: 0
