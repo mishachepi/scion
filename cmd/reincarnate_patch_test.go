@@ -61,6 +61,7 @@ func TestValidateReincarnatePatchFlags(t *testing.T) {
 	}{
 		{name: "unset", tl: -1},
 		{name: "valid", role: "readonly", tl: 50, auth: "vertex-ai"},
+		{name: "manual auth", tl: -1, auth: "manual"},
 		{name: "bad role", role: "admin", tl: -1, wantErr: "invalid role"},
 		{name: "thinking too high", tl: 101, wantErr: "--thinking-level"},
 		{name: "thinking negative", tl: -2, wantErr: "--thinking-level"},

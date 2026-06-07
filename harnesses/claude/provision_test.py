@@ -507,6 +507,29 @@ def _select_with_candidates(home: str, candidates: dict[str, Any]):
     return ctx, ctx.select_auth(provision.AUTH)
 
 
+class ManualAuthTest(unittest.TestCase):
+    # `manual` is not in AUTH: provision() resolves it before select_auth,
+    # and TestAuthSpecMatchesHarnessConfig relies on that.
+    def test_explicit_manual_skips_selection_and_injects_no_credential(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp):
+            bundle = os.path.join(tmp, ".scion", "harness")
+            os.makedirs(os.path.join(bundle, "inputs"))
+            with open(os.path.join(bundle, "inputs", "auth-candidates.json"), "w", encoding="utf-8") as f:
+                json.dump({"explicit_type": "manual"}, f)
+            ctx = make_ctx(tmp)
+
+            def no_selection(_spec: Any) -> scion_harness.ResolvedAuth:
+                raise AssertionError("select_auth must not run for manual")
+
+            ctx.select_auth = no_selection  # type: ignore[method-assign]
+            with env_vars(ANTHROPIC_API_KEY=None, CLAUDE_CODE_OAUTH_TOKEN=None):
+                provision.provision(ctx)
+            with open(os.path.join(bundle, "outputs", "env.json"), encoding="utf-8") as f:
+                env = json.load(f)
+        for key in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_VERTEX"):
+            self.assertNotIn(key, env)
+
+
 class VertexAuthSelectionTest(unittest.TestCase):
     # config.yaml's vertex-ai region group accepts CLOUD_ML_REGION; the
     # provisioner must accept it too (ptone/scion#4623).

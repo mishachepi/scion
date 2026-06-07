@@ -146,7 +146,7 @@ If no usable credentials are found, provisioning **falls back to no-auth** rathe
 
 ### The Explicit Path
 
-You can override the automatic detection by explicitly forcing a specific authentication method in your agent's profile or template configuration (using the `auth_selectedType` field). You can also override this on the fly when starting an agent by using the `--harness-auth` flag (e.g., `scion start my-agent --harness-auth vertex-ai`).
+You can override the automatic detection by explicitly forcing a specific authentication method in your agent's template (`auth_selectedType` in `scion-agent.yaml`) or profile (`profiles.<name>.harness_overrides.<harness-config>.auth_selected_type` in `settings.yaml`). You can also override this on the fly when starting an agent by using the `--harness-auth` flag (e.g., `scion start my-agent --harness-auth vertex-ai`).
 
 When you configure the explicit path, the automatic fallback is disabled. The credentials required for your chosen method **must** be present (either gathered from the local environment or provided via Hub secrets), otherwise the agent will immediately fail to start.
 
@@ -156,12 +156,13 @@ The available explicit authentication types are:
 - **OAuth Token** (`oauth-token`): A raw OAuth token injected via an environment variable (e.g. Claude's `CLAUDE_CODE_OAUTH_TOKEN`).
 - **Vertex Model Garden** (`vertex-ai`): Google Cloud Vertex AI using Application Default Credentials (ADC).
 - **Harness specific credential file** (`auth-file`): A credential file native to the harness, such as an OAuth credentials file.
+- **Manual** (`manual`, Claude): Scion injects no credentials; the agent resolves auth out-of-band, for example through the macOS Keychain on the tmux runtime (see [The tmux Runtime](/scion/local/tmux-runtime/#auth)).
 
 Not every harness supports every type — see the
 [auth capability matrix](/scion/supported-harnesses/#feature-capability-matrix).
 
 :::note
-Scion translates these universal explicit auth types to harness-native values internally. You should always use the universal values (`api-key`, `oauth-token`, `vertex-ai`, `auth-file`) in your Scion configuration.
+Scion translates these universal explicit auth types to harness-native values internally. You should always use the universal values (`api-key`, `oauth-token`, `vertex-ai`, `auth-file`, `manual`) in your Scion configuration.
 :::
 
 ---

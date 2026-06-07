@@ -839,7 +839,7 @@ func init() {
 	reincarnateCmd.Flags().StringVar(&reincarnateModel, "model", "", "Model for the new generation (aliases accepted)")
 	reincarnateCmd.Flags().StringVar(&reincarnateThinkingLevel, "thinking-level", "", "Thinking level for the new generation: an integer 0-100, or low (25), medium (50), high (75), max (100)")
 	reincarnateThinkingLevelChanged = func() bool { return reincarnateCmd.Flags().Changed("thinking-level") }
-	reincarnateCmd.Flags().StringVar(&reincarnateHarnessAuth, "harness-auth", "", "Auth method for the new generation (api-key, oauth-token, auth-file, vertex-ai)")
+	reincarnateCmd.Flags().StringVar(&reincarnateHarnessAuth, "harness-auth", "", "Auth method for the new generation (api-key, oauth-token, auth-file, vertex-ai, manual)")
 	reincarnateCmd.Flags().StringVarP(&reincarnateImage, "image", "i", "", "Container image for the new generation")
 	rootCmd.AddCommand(reincarnateCmd)
 }

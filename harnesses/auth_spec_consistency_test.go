@@ -34,7 +34,10 @@ import (
 // two cannot share code, so TestAuthSpecMatchesHarnessConfig locks them
 // together, in both directions, for every shipped harness:
 //
-//	a. the same auth type names;
+//	a. the same auth type names, except that a type declaring neither
+//	   required_env nor required_files (claude's manual) is a no-op type
+//	   that provision() resolves before select_auth, so it has no AuthSpec
+//	   method; ManualAuthTest in claude/provision_test.py pins that;
 //	b. an env method's key groups (each all_of key is its own group, any_of
 //	   is one group) equal the type's required_env groups. A type with no
 //	   required_env may instead be backed by one required file whose name or
@@ -176,6 +179,12 @@ func fileBacksEnvMethod(rf api.HarnessAuthFileRequirement, groups [][]string) bo
 	return true
 }
 
+// isNoOpAuthType reports whether a config.yaml auth type declares no
+// credential at all: scion injects nothing for it.
+func isNoOpAuthType(typ api.HarnessAuthTypeMetadata) bool {
+	return len(typ.RequiredEnv) == 0 && len(typ.RequiredFiles) == 0
+}
+
 // checkAuthSpecConsistency returns one message per disagreement between a
 // harness's config.yaml auth types and its provisioner AuthSpec.
 func checkAuthSpecConsistency(auth *config.HarnessAuthMetadata, rep specReport) []string {
@@ -190,8 +199,8 @@ func checkAuthSpecConsistency(auth *config.HarnessAuthMetadata, rep specReport) 
 	for _, m := range rep.Methods {
 		pyNames[m.Name] = true
 	}
-	for name := range types {
-		if !pyNames[name] {
+	for name, typ := range types {
+		if !pyNames[name] && !isNoOpAuthType(typ) {
 			problems = append(problems, "config.yaml auth type "+name+" has no provisioner auth method")
 		}
 	}
@@ -328,6 +337,15 @@ func TestCheckAuthSpecConsistencyRules(t *testing.T) {
 	}
 	if got := checkAuthSpecConsistency(auth, good()); len(got) != 0 {
 		t.Fatalf("consistent input reported problems: %v", got)
+	}
+
+	// (a): a no-op type needs no AuthSpec method; a type with requirements does.
+	withNoOp := &config.HarnessAuthMetadata{Types: map[string]api.HarnessAuthTypeMetadata{"manual": {}}}
+	for k, v := range auth.Types {
+		withNoOp.Types[k] = v
+	}
+	if got := checkAuthSpecConsistency(withNoOp, good()); len(got) != 0 {
+		t.Errorf("no-op type reported problems: %v", got)
 	}
 
 	cases := []struct {

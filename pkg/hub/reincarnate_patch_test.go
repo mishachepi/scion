@@ -80,6 +80,14 @@ func TestReincarnatePatch_EachFlagAppliesAndPersists(t *testing.T) {
 			},
 		},
 		{
+			name: "manual harness auth",
+			body: func(string) ReincarnateAgentRequest { return ReincarnateAgentRequest{HarnessAuth: "manual"} },
+			check: func(t *testing.T, cfg *store.AgentAppliedConfig, _ string) {
+				assert.Equal(t, "manual", cfg.HarnessAuth)
+				assert.Equal(t, "manual", cfg.CreateInputs.HarnessAuth)
+			},
+		},
+		{
 			name: "role",
 			body: func(string) ReincarnateAgentRequest { return ReincarnateAgentRequest{Role: "readonly"} },
 			check: func(t *testing.T, cfg *store.AgentAppliedConfig, _ string) {

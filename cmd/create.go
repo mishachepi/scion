@@ -351,7 +351,7 @@ func init() {
 	createCmd.Flags().StringVar(&modelFlag, "model", "", "Model to use: alias (small, medium, large, extra-large/xl) or explicit model ID")
 	createCmd.Flags().StringVar(&thinkingLevelFlag, "thinking-level", "", thinkingLevelFlagUsage)
 
-	createCmd.Flags().StringVar(&harnessAuthFlag, "harness-auth", "", "Override auth method for the harness (api-key, oauth-token, auth-file, vertex-ai)")
+	createCmd.Flags().StringVar(&harnessAuthFlag, "harness-auth", "", "Override auth method for the harness (api-key, oauth-token, auth-file, vertex-ai, manual)")
 
 	// Template resolution flags (Section 9.4)
 	createCmd.Flags().BoolVar(&uploadTemplate, "upload-template", false, "Automatically upload local template to Hub if not found")

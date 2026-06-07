@@ -92,9 +92,9 @@ func validateReincarnatePatchRequest(w http.ResponseWriter, req ReincarnateAgent
 	}
 	if req.HarnessAuth != "" {
 		switch req.HarnessAuth {
-		case "api-key", "oauth-token", "auth-file", "vertex-ai":
+		case "api-key", "oauth-token", "auth-file", "vertex-ai", "manual":
 		default:
-			ValidationError(w, fmt.Sprintf("invalid harnessAuth %q: must be one of api-key, oauth-token, auth-file, vertex-ai", req.HarnessAuth), nil)
+			ValidationError(w, fmt.Sprintf("invalid harnessAuth %q: must be one of api-key, oauth-token, auth-file, vertex-ai, manual", req.HarnessAuth), nil)
 			return false
 		}
 	}

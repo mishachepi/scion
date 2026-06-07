@@ -171,10 +171,10 @@ func validateAgentRole(role string) error {
 // (no override).
 func validateHarnessAuthFlag(v string) error {
 	switch v {
-	case "", "api-key", "oauth-token", "auth-file", "vertex-ai":
+	case "", "api-key", "oauth-token", "auth-file", "vertex-ai", "manual":
 		return nil
 	default:
-		return fmt.Errorf("invalid --harness-auth value %q: must be one of api-key, oauth-token, auth-file, vertex-ai", v)
+		return fmt.Errorf("invalid --harness-auth value %q: must be one of api-key, oauth-token, auth-file, vertex-ai, manual", v)
 	}
 }
 
