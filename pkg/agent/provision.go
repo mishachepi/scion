@@ -1441,7 +1441,12 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 	}
 
 	// Workspace Resolution Logic
-	if emptyPerAgent {
+	// Template-declared /workspace mount overrides the worktree-creation
+	// branches below. The mount survives the later chain merge verbatim.
+	if peekTemplateWorkspaceMount(templateName, projectPath, inlineConfig) {
+		agentWorkspace = ""
+		shouldCreateWorktree = false
+	} else if emptyPerAgent {
 		// Empty-per-agent (design #2703): a private, initially empty, non-git
 		// directory at <projectDir>/agents/<slug>/workspace. Checked first so
 		// that neither settings.WorkspacePath, the global-project directory,
@@ -2953,6 +2958,39 @@ func UpdateAgentDeletedAt(agentName string, projectPath string, deletedAt time.T
 	})
 }
 
+// peekTemplateWorkspaceMount reports whether any template-chain layer or
+// inline config declares a /workspace mount, before the full provisioning
+// merge runs.
+func peekTemplateWorkspaceMount(templateName, projectPath string, inlineConfig []*api.ScionConfig) bool {
+	if chain, err := config.GetTemplateChainInProject(templateName, projectPath); err == nil {
+		for _, tpl := range chain {
+			if cfg, err := tpl.LoadConfig(); err == nil && hasWorkspaceMount(cfg) {
+				return true
+			}
+		}
+	}
+	for _, ic := range inlineConfig {
+		if hasWorkspaceMount(ic) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasWorkspaceMount reports whether cfg declares a /workspace volume mount
+// with a non-empty source.
+func hasWorkspaceMount(cfg *api.ScionConfig) bool {
+	if cfg == nil {
+		return false
+	}
+	for _, v := range cfg.Volumes {
+		if v.Target == "/workspace" && v.Source != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func GetAgent(ctx context.Context, agentName string, templateName string, agentImage string, harnessConfig string, projectPath string, profileName string, optionalStatus string, branch string, workspace string, inlineConfig ...*api.ScionConfig) (string, string, string, *api.ScionConfig, error) {
 	projectDir, err := config.GetResolvedProjectDir(projectPath)
 	if err != nil {
@@ -3016,6 +3054,10 @@ func GetAgent(ctx context.Context, agentName string, templateName string, agentI
 	// An empty-per-agent agent's persisted mode (design #2703) is ORed into
 	// ctx, so a resume whose request lost the mode still recreates its
 	// private directory below instead of a worktree or nothing.
+	// The persisted-volume fallback covers agents whose /workspace mount was
+	// declared by the template chain rather than the --workspace flag (no
+	// ExplicitWorkspace marker): recreating a worktree for those would
+	// silently shadow the external mount with an empty checkout.
 	if config.ScionAgentConfigExists(agentDir) {
 		if persisted, cfgErr := (&config.Template{Path: agentDir}).LoadConfig(); cfgErr != nil {
 			util.Debugf("GetAgent: could not load persisted config to check workspace mode: %v", cfgErr)
@@ -3025,6 +3067,9 @@ func GetAgent(ctx context.Context, agentName string, templateName string, agentI
 			}
 			if agentWorkspace != "" && persisted.ExplicitWorkspace {
 				util.Debugf("GetAgent: explicit-workspace agent %q — skipping managed-worktree recovery", agentName)
+				agentWorkspace = ""
+			} else if agentWorkspace != "" && hasWorkspaceMount(persisted) {
+				util.Debugf("GetAgent: external /workspace mount for agent %q — skipping managed-worktree recovery", agentName)
 				agentWorkspace = ""
 			}
 		}
