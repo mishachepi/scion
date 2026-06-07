@@ -1,0 +1,126 @@
+#!/bin/sh
+# Example pre_start_script for the scion tmux runtime.
+#
+# Invoked before `tmux new-window` with: $1=<agentHome>, $2=<operator-$HOME>.
+# Lays down symlinks so the agent (HOME=<agentHome>) inherits operator's
+# credential state without copying live files.
+#
+# To use: copy to ~/.scion/scripts/pre_start_tmux.sh, chmod +x, and point
+# at it from ~/.scion/settings.yaml:
+#
+#   runtimes:
+#     tmux:
+#       type: tmux
+#       pre_start_script: ~/.scion/scripts/pre_start_tmux.sh
+
+set -eu
+
+AGENT_HOME=$1
+OP_HOME=$2
+
+# macOS: Keychain access is $HOME/Library/Keychains-bound.
+if [ "$(uname)" = "Darwin" ]; then
+    mkdir -p "$AGENT_HOME/Library"
+    ln -snf "$OP_HOME/Library/Keychains" "$AGENT_HOME/Library/Keychains"
+    ln -snf "$OP_HOME/Library/Application Support" "$AGENT_HOME/Library/Application Support" 2>/dev/null || true
+    ln -snf "$OP_HOME/Library/Preferences" "$AGENT_HOME/Library/Preferences" 2>/dev/null || true
+fi
+
+# Claude
+[ -f "$OP_HOME/.claude.json" ] && ln -snf "$OP_HOME/.claude.json" "$AGENT_HOME/.claude.json"
+
+mkdir -p "$AGENT_HOME/.claude"
+if [ -d "$OP_HOME/.claude" ]; then
+    for entry in "$OP_HOME/.claude/"* "$OP_HOME/.claude/".[!.]*; do
+        name=$(basename "$entry")
+        case "$name" in
+            "*"|".[!.]*"|"."|"..") continue ;;
+            CLAUDE.md|skills|system-prompt.md) continue ;;  # scion-provisioned
+        esac
+        [ -e "$entry" ] || continue
+        [ -e "$AGENT_HOME/.claude/$name" ] && continue
+        ln -snf "$entry" "$AGENT_HOME/.claude/$name"
+    done
+fi
+
+if [ -d "$OP_HOME/.claude/skills" ] && [ -d "$AGENT_HOME/.claude/skills" ]; then
+    for skill in "$OP_HOME/.claude/skills/"*; do
+        [ -e "$skill" ] || continue
+        name=$(basename "$skill")
+        [ -e "$AGENT_HOME/.claude/skills/$name" ] && continue
+        ln -snf "$skill" "$AGENT_HOME/.claude/skills/$name"
+    done
+fi
+
+# Gemini
+if [ -d "$OP_HOME/.gemini" ]; then
+    mkdir -p "$AGENT_HOME/.gemini"
+    for entry in "$OP_HOME/.gemini/"* "$OP_HOME/.gemini/".[!.]*; do
+        name=$(basename "$entry")
+        case "$name" in "*"|".[!.]*"|"."|"..") continue ;; esac
+        [ -e "$entry" ] || continue
+        [ -e "$AGENT_HOME/.gemini/$name" ] && continue
+        ln -snf "$entry" "$AGENT_HOME/.gemini/$name"
+    done
+fi
+
+# Codex
+if [ -d "$OP_HOME/.codex" ]; then
+    mkdir -p "$AGENT_HOME/.codex"
+    for entry in "$OP_HOME/.codex/"* "$OP_HOME/.codex/".[!.]*; do
+        name=$(basename "$entry")
+        case "$name" in "*"|".[!.]*"|"."|"..") continue ;; esac
+        [ -e "$entry" ] || continue
+        [ -e "$AGENT_HOME/.codex/$name" ] && continue
+        ln -snf "$entry" "$AGENT_HOME/.codex/$name"
+    done
+fi
+
+# OpenCode
+if [ -f "$OP_HOME/.local/share/opencode/auth.json" ]; then
+    mkdir -p "$AGENT_HOME/.local/share/opencode"
+    ln -snf "$OP_HOME/.local/share/opencode/auth.json" "$AGENT_HOME/.local/share/opencode/auth.json"
+fi
+
+# git config
+[ -f "$OP_HOME/.gitconfig" ] && ln -snf "$OP_HOME/.gitconfig" "$AGENT_HOME/.gitconfig"
+
+# Operator's scion config — lets `scion` CLI inside the agent resolve
+# harness-configs, templates, and settings.yaml. The whole .scion/ dir
+# already exists in agentHome (sciontool state), so symlink subdirs
+# individually rather than replacing the directory.
+mkdir -p "$AGENT_HOME/.scion"
+for entry in harness-configs templates settings.yaml project-configs scripts; do
+    src="$OP_HOME/.scion/$entry"
+    [ -e "$src" ] || continue
+    [ -e "$AGENT_HOME/.scion/$entry" ] && continue
+    ln -snf "$src" "$AGENT_HOME/.scion/$entry"
+done
+
+# Operator-bridge shims for tools that talk to operator-side daemons.
+# Obsidian's `obsidian eval` (used by `oq`) opens an IPC socket whose path
+# resolution is HOME-dependent and ignores --user-data-dir; the only working
+# fix is to invoke with operator's HOME.
+#
+# Functions are written directly into .bashrc / .zshrc inside a managed
+# block (markers below). Re-running this script replaces the block in place.
+BRIDGE_BEGIN='# >>> scion operator-bridge (pre_start_tmux.sh) >>>'
+BRIDGE_END='# <<< scion operator-bridge <<<'
+BRIDGE_BODY=$(cat <<BODY
+$BRIDGE_BEGIN
+oq()       { HOME="$OP_HOME" command oq "\$@"; }
+obsidian() { HOME="$OP_HOME" command obsidian "\$@"; }
+$BRIDGE_END
+BODY
+)
+
+for rc in "$AGENT_HOME/.bashrc" "$AGENT_HOME/.zshrc"; do
+    touch "$rc"
+    # Strip any existing managed block, then append a fresh one.
+    awk -v b="$BRIDGE_BEGIN" -v e="$BRIDGE_END" '
+        $0 == b { skip=1; next }
+        $0 == e { skip=0; next }
+        !skip   { print }
+    ' "$rc" > "$rc.tmp" && mv "$rc.tmp" "$rc"
+    printf '%s\n' "$BRIDGE_BODY" >> "$rc"
+done

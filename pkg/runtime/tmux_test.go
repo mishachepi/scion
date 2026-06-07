@@ -767,6 +767,60 @@ esac
 	}
 }
 
+func TestTmuxRuntime_RunPreStartScript_HappyPath(t *testing.T) {
+	tmp := t.TempDir()
+	scriptPath := filepath.Join(tmp, "pre.sh")
+	outPath := filepath.Join(tmp, "out.txt")
+	body := "#!/bin/sh\nprintf '%s\\n' \"$1\" \"$2\" > " + outPath + "\n"
+	if err := os.WriteFile(scriptPath, []byte(body), 0o755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+	r := &TmuxRuntime{PreStartScript: scriptPath}
+	if err := r.runPreStartScript(context.Background(), "/tmp/agent-home"); err != nil {
+		t.Fatalf("runPreStartScript: %v", err)
+	}
+	got, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("read script output: %v", err)
+	}
+	want := "/tmp/agent-home\n" + os.Getenv("HOME") + "\n"
+	if string(got) != want {
+		t.Errorf("script output = %q, want %q", string(got), want)
+	}
+}
+
+func TestTmuxRuntime_RunPreStartScript_RejectsBadPaths(t *testing.T) {
+	cases := []struct {
+		name     string
+		setup    func(t *testing.T) string
+		wantSubs string
+	}{
+		{"missing file",
+			func(t *testing.T) string { return filepath.Join(t.TempDir(), "missing.sh") },
+			"no such file"},
+		{"directory not file",
+			func(t *testing.T) string { return t.TempDir() },
+			"is a directory"},
+		{"not executable",
+			func(t *testing.T) string {
+				p := filepath.Join(t.TempDir(), "noexec.sh")
+				if err := os.WriteFile(p, []byte("#!/bin/sh\nexit 0\n"), 0o644); err != nil {
+					t.Fatalf("write: %v", err)
+				}
+				return p
+			},
+			"not executable"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &TmuxRuntime{PreStartScript: tc.setup(t)}
+			err := r.runPreStartScript(context.Background(), "/tmp/agent-home")
+			if err == nil || !strings.Contains(err.Error(), tc.wantSubs) {
+				t.Errorf("error = %v, want substring %q", err, tc.wantSubs)
+			}
+		})
+	}
+}
 
 func TestWarnIgnoredFeatures(t *testing.T) {
 	cases := []struct {
@@ -895,6 +949,19 @@ func captureStderr(t *testing.T, fn func()) string {
 	return string(b)
 }
 
+func TestTmuxRuntime_RunPreStartScript_PropagatesScriptFailure(t *testing.T) {
+	tmp := t.TempDir()
+	scriptPath := filepath.Join(tmp, "fail.sh")
+	body := "#!/bin/sh\necho 'something went wrong' >&2\nexit 7\n"
+	if err := os.WriteFile(scriptPath, []byte(body), 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	r := &TmuxRuntime{PreStartScript: scriptPath}
+	err := r.runPreStartScript(context.Background(), "/tmp/agent-home")
+	if err == nil || !strings.Contains(err.Error(), "something went wrong") {
+		t.Errorf("error = %v, want script stderr surfaced", err)
+	}
+}
 
 // home_mode == "" (unset) must behave identically to home_mode == "agent" so
 // existing deployments upgrade silently.
@@ -1024,3 +1091,24 @@ func TestResolveSciontool(t *testing.T) {
 	}
 }
 
+func TestTmuxRuntime_RunPreStartScript_SkippedInSystemMode(t *testing.T) {
+	tmp := t.TempDir()
+	scriptPath := filepath.Join(tmp, "should-not-run.sh")
+	canary := filepath.Join(tmp, "canary.txt")
+	body := "#!/bin/sh\ntouch " + canary + "\nexit 0\n"
+	if err := os.WriteFile(scriptPath, []byte(body), 0o755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+	r := &TmuxRuntime{PreStartScript: scriptPath, HomeMode: HomeModeSystem}
+	stderr := captureStderr(t, func() {
+		if err := r.runPreStartScript(context.Background(), "/tmp/agent-home"); err != nil {
+			t.Fatalf("runPreStartScript: %v", err)
+		}
+	})
+	if _, err := os.Stat(canary); err == nil {
+		t.Errorf("script must not run in system mode (canary created)")
+	}
+	if !strings.Contains(stderr, "skipped in home_mode=system") {
+		t.Errorf("stderr should warn about skipped script; got %q", stderr)
+	}
+}

@@ -903,6 +903,10 @@ type V1RuntimeConfig struct {
 	// kubernetes.namespace (see note 11 in scion-mch/).
 	DefaultTmuxSession string `json:"default_tmux_session,omitempty" yaml:"default_tmux_session,omitempty" koanf:"default_tmux_session"`
 
+	// PreStartScript is invoked before each `tmux new-window` with
+	// arguments <agentHome> <operator-$HOME>. Tmux only.
+	PreStartScript string `json:"pre_start_script,omitempty" yaml:"pre_start_script,omitempty" koanf:"pre_start_script"`
+
 	// HomeMode controls HOME handling for tmux-runtime agents.
 	// "agent" (default; HOME=<agentHome>) for full isolation.
 	// "system" preserves operator HOME and only exports SCION_AGENT_HOME.

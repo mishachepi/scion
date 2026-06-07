@@ -287,6 +287,10 @@
           "type": "string",
           "description": "tmux runtime: default name of the tmux session hosting scion-managed windows for this runtime (default \"scion\"). Per-agent override available via kubernetes.namespace. Must not contain ':' or '.'."
         },
+        "pre_start_script": {
+          "type": "string",
+          "description": "tmux runtime: path (absolute or ~-prefixed) to a shell script invoked before tmux new-window with arguments <agentHome> <operator-$HOME>. Skipped when home_mode is 'system'."
+        },
         "home_mode": {
           "type": "string",
           "enum": ["agent", "system"],
