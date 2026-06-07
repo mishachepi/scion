@@ -558,7 +558,12 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 	}
 
 	// Workspace Resolution Logic
-	if gitClone != nil {
+	// Template-declared /workspace mount overrides the worktree-creation
+	// branches below. The mount survives the later chain merge verbatim.
+	if peekTemplateWorkspaceMount(templateName, projectPath, inlineConfig) {
+		agentWorkspace = ""
+		shouldCreateWorktree = false
+	} else if gitClone != nil {
 		// Git clone mode: ensure the workspace directory exists and is ready
 		// for sciontool to clone into at container startup.
 		//
@@ -1725,6 +1730,39 @@ func UpdateAgentDeletedAt(agentName string, projectPath string, deletedAt time.T
 	return os.WriteFile(agentInfoPath, newData, 0644)
 }
 
+// peekTemplateWorkspaceMount reports whether any template-chain layer or
+// inline config declares a /workspace mount, before the full provisioning
+// merge runs.
+func peekTemplateWorkspaceMount(templateName, projectPath string, inlineConfig []*api.ScionConfig) bool {
+	if chain, err := config.GetTemplateChainInProject(templateName, projectPath); err == nil {
+		for _, tpl := range chain {
+			if cfg, err := tpl.LoadConfig(); err == nil && hasWorkspaceMount(cfg) {
+				return true
+			}
+		}
+	}
+	for _, ic := range inlineConfig {
+		if hasWorkspaceMount(ic) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasWorkspaceMount reports whether cfg declares a /workspace volume mount
+// with a non-empty source.
+func hasWorkspaceMount(cfg *api.ScionConfig) bool {
+	if cfg == nil {
+		return false
+	}
+	for _, v := range cfg.Volumes {
+		if v.Target == "/workspace" && v.Source != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func GetAgent(ctx context.Context, agentName string, templateName string, agentImage string, harnessConfig string, projectPath string, profileName string, optionalStatus string, branch string, workspace string, inlineConfig ...*api.ScionConfig) (string, string, string, *api.ScionConfig, error) {
 	projectDir, err := config.GetResolvedProjectDir(projectPath)
 	if err != nil {
@@ -1773,11 +1811,19 @@ func GetAgent(ctx context.Context, agentName string, templateName string, agentI
 	// that recovery would CreateWorktree a throwaway managed worktree and the
 	// agent would silently edit that phantom branch instead of the operator's
 	// explicit tree — breaking "edit the real tree in place" on resume.
+	//
+	// The persisted-volume fallback covers agents whose /workspace mount was
+	// declared by the template chain rather than the --workspace flag (no
+	// ExplicitWorkspace marker): recreating a worktree for those would
+	// silently shadow the external mount with an empty checkout.
 	if agentWorkspace != "" && config.ScionAgentConfigExists(agentDir) {
 		if persisted, cfgErr := (&config.Template{Path: agentDir}).LoadConfig(); cfgErr != nil {
 			util.Debugf("GetAgent: could not load persisted config to check explicit workspace: %v", cfgErr)
 		} else if persisted.ExplicitWorkspace {
 			util.Debugf("GetAgent: explicit-workspace agent %q — skipping managed-worktree recovery", agentName)
+			agentWorkspace = ""
+		} else if hasWorkspaceMount(persisted) {
+			util.Debugf("GetAgent: external /workspace mount for agent %q — skipping managed-worktree recovery", agentName)
 			agentWorkspace = ""
 		}
 	}
