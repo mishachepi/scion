@@ -950,6 +950,73 @@ func TestProvisionAgentGitClone_ClearsStaleWorktreeWorkspace(t *testing.T) {
 // TestProvisionAgentGitClone_PreservesExistingClone verifies that when git
 // clone mode is active and the workspace already has a real git clone (.git
 // directory), the content is preserved for the stop/restart case.
+func TestProvisionAgent_TemplateWorkspaceMount_SkipsWorktreeOnGit(t *testing.T) {
+	t.Setenv("SCION_HOST_UID", "")
+	mockRuntimeForTest(t)
+	tmpDir := t.TempDir()
+
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	t.Setenv("HOME", tmpDir)
+
+	projectDir := filepath.Join(tmpDir, "project")
+	os.MkdirAll(projectDir, 0755)
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "Test"},
+		{"commit", "--allow-empty", "-m", "initial"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = projectDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	projectScionDir := filepath.Join(projectDir, ".scion")
+	os.MkdirAll(projectScionDir, 0755)
+	os.WriteFile(filepath.Join(projectDir, ".gitignore"), []byte(".scion/agents/\n"), 0644)
+
+	globalScionDir := filepath.Join(tmpDir, ".scion")
+	os.MkdirAll(filepath.Join(globalScionDir, "templates"), 0755)
+	seedTestHarnessConfig(t, globalScionDir, "generic", "generic")
+	tplDir := filepath.Join(globalScionDir, "templates", "shared-ws")
+	os.MkdirAll(tplDir, 0755)
+	tplCfg, err := json.Marshal(api.ScionConfig{
+		DefaultHarnessConfig: "generic",
+		Volumes:              []api.VolumeMount{{Source: projectDir, Target: "/workspace"}},
+	})
+	if err != nil {
+		t.Fatalf("marshal tpl cfg: %v", err)
+	}
+	os.WriteFile(filepath.Join(tplDir, "scion-agent.json"), tplCfg, 0644)
+
+	_, _, cfg, err := ProvisionAgent(context.Background(), "shared-agent", "shared-ws", "", "", projectScionDir, "", "", "", "")
+	if err != nil {
+		t.Fatalf("ProvisionAgent: %v", err)
+	}
+
+	worktreeDir := filepath.Join(projectScionDir, "agents", "shared-agent", "workspace")
+	if _, err := os.Stat(filepath.Join(worktreeDir, ".git")); err == nil {
+		t.Errorf("per-agent worktree created at %s despite template /workspace mount", worktreeDir)
+	}
+
+	var count int
+	for _, v := range cfg.Volumes {
+		if v.Target == "/workspace" {
+			count++
+			if v.Source != projectDir {
+				t.Errorf("volume source = %q, want %q", v.Source, projectDir)
+			}
+		}
+	}
+	if count != 1 {
+		t.Errorf("got %d /workspace mounts, want 1; volumes=%+v", count, cfg.Volumes)
+	}
+}
+
 func TestProvisionAgentGitClone_PreservesExistingClone(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -1489,6 +1556,84 @@ func TestGetAgent_ExplicitWorkspaceSkipsWorktreeRecovery(t *testing.T) {
 	}
 	if _, statErr := os.Stat(agentWorkspace); !os.IsNotExist(statErr) {
 		t.Fatalf("explicit-workspace agent: expected NO phantom worktree at %s, but one was created", agentWorkspace)
+	}
+}
+
+// TestGetAgent_ExternalWorkspaceMount_SkipsWorktreeRecreate covers the
+// persisted-volume fallback: an agent whose /workspace mount came from the
+// template chain (no explicit_workspace flag) must also skip managed-worktree
+// recreation on resume.
+func TestGetAgent_ExternalWorkspaceMount_SkipsWorktreeRecreate(t *testing.T) {
+	t.Setenv("SCION_HOST_UID", "")
+	tmpDir := t.TempDir()
+
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	t.Setenv("HOME", tmpDir)
+
+	projectDir := filepath.Join(tmpDir, "project")
+	os.MkdirAll(projectDir, 0755)
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "Test"},
+		{"commit", "--allow-empty", "-m", "initial"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = projectDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+
+	externalWS := filepath.Join(tmpDir, "external-ws")
+	os.MkdirAll(externalWS, 0755)
+
+	scionDir := filepath.Join(projectDir, ".scion")
+	os.MkdirAll(filepath.Join(scionDir, "templates"), 0755)
+
+	globalScionDir := filepath.Join(tmpDir, ".scion")
+	os.MkdirAll(filepath.Join(globalScionDir, "templates"), 0755)
+	seedTestHarnessConfig(t, globalScionDir, "generic", "generic")
+	tplDir := filepath.Join(globalScionDir, "templates", "default")
+	os.MkdirAll(tplDir, 0755)
+	os.WriteFile(filepath.Join(tplDir, "scion-agent.json"), []byte(`{"default_harness_config":"generic"}`), 0644)
+
+	agentDir := filepath.Join(scionDir, "agents", "ext-agent")
+	agentHome := config.GetAgentHomePath(scionDir, "ext-agent")
+	os.MkdirAll(agentDir, 0755)
+	os.MkdirAll(agentHome, 0755)
+
+	cfg, err := json.Marshal(api.ScionConfig{
+		DefaultHarnessConfig: "generic",
+		Volumes:              []api.VolumeMount{{Source: externalWS, Target: "/workspace"}},
+	})
+	if err != nil {
+		t.Fatalf("marshal cfg: %v", err)
+	}
+	os.WriteFile(filepath.Join(agentDir, "scion-agent.json"), cfg, 0644)
+	os.WriteFile(filepath.Join(agentHome, "agent-info.json"), []byte(`{"name":"ext-agent","template":"default"}`), 0644)
+
+	_, _, wsPath, gotCfg, err := GetAgent(context.Background(), "ext-agent", "", "", "", scionDir, "", "", "", "")
+	if err != nil {
+		t.Fatalf("GetAgent: %v", err)
+	}
+	if wsPath != "" {
+		t.Errorf("wsPath = %q, want empty (run.go falls back to volume mount)", wsPath)
+	}
+	if _, err := os.Stat(filepath.Join(agentDir, "workspace")); !os.IsNotExist(err) {
+		t.Errorf("per-agent worktree should not be created, but %s exists", filepath.Join(agentDir, "workspace"))
+	}
+	var found bool
+	for _, v := range gotCfg.Volumes {
+		if v.Target == "/workspace" && v.Source == externalWS {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("/workspace mount %q missing after GetAgent; volumes=%+v", externalWS, gotCfg.Volumes)
 	}
 }
 
