@@ -96,7 +96,7 @@
     },
     "auth_selectedType": {
       "type": "string",
-      "enum": ["api-key", "oauth-token", "auth-file", "vertex-ai"],
+      "enum": ["api-key", "oauth-token", "auth-file", "vertex-ai", "manual"],
       "description": "Deprecated: authentication mechanism override. Move to harness-config config.yaml instead. Retained for backward compatibility as an override.",
       "x-deprecated-by": "1"
     },
