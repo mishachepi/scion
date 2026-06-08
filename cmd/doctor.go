@@ -240,7 +240,8 @@ func checkTmux() {
 	_, err := exec.LookPath("tmux")
 	if err != nil {
 		if goruntime.GOOS == "darwin" || goruntime.GOOS == "linux" {
-			printCheck("tmux", "warn", "tmux not found locally (required inside agent containers)", "")
+			printCheck("tmux", "warn",
+				"tmux not found locally (required as shell wrapper in container runtimes, and as the host runtime for `runtime: tmux`)", "")
 		} else {
 			printCheck("tmux", "skip", "tmux check skipped on this platform", "")
 		}

@@ -263,7 +263,7 @@
       "properties": {
         "type": {
           "type": "string",
-          "enum": ["docker", "podman", "container", "kubernetes", "cloudrun", "cloudrun-instances", "cloudrun-sandbox"],
+          "enum": ["docker", "podman", "container", "kubernetes", "cloudrun", "cloudrun-instances", "cloudrun-sandbox", "tmux"],
           "description": "Runtime type. Defaults to the runtime entry name if omitted."
         },
         "host": { "type": "string" },
@@ -278,6 +278,23 @@
           "type": "boolean",
           "default": false,
           "description": "Enable GKE-specific features (e.g., Workload Identity)."
+        },
+        "list_all_namespaces": {
+          "type": "boolean",
+          "description": "Kubernetes runtime: list agents across all namespaces."
+        },
+        "default_tmux_session": {
+          "type": "string",
+          "description": "tmux runtime: default name of the tmux session hosting scion-managed windows for this runtime (default \"scion\"). Per-agent override available via kubernetes.namespace. Must not contain ':' or '.'."
+        },
+        "home_mode": {
+          "type": "string",
+          "enum": ["agent"],
+          "description": "tmux runtime: HOME handling. Currently only 'agent' (default) is supported — overrides HOME=<agentHome>."
+        },
+        "sciontool": {
+          "type": "string",
+          "description": "tmux runtime: wrap each harness in 'sciontool init --tmuxruntime --'. '' (default) disables wrapping; 'auto' looks up sciontool on PATH with graceful fallback; any other value is an explicit absolute path."
         }
       },
       "additionalProperties": false
@@ -327,8 +344,8 @@
         },
         "auth_selected_type": {
           "type": "string",
-          "enum": ["api-key", "oauth-token", "auth-file", "vertex-ai", "none"],
-          "description": "Authentication mechanism to use (e.g., api-key, oauth-token, vertex-ai, auth-file, none)."
+          "enum": ["api-key", "oauth-token", "auth-file", "vertex-ai", "none", "manual"],
+          "description": "Authentication mechanism to use (e.g., api-key, oauth-token, vertex-ai, auth-file, none, manual)."
         },
         "secrets": {
           "type": "array",
@@ -594,7 +611,7 @@
       "properties": {
         "default_type": {
           "type": "string",
-          "enum": ["api-key", "oauth-token", "auth-file", "vertex-ai"]
+          "enum": ["api-key", "oauth-token", "auth-file", "vertex-ai", "manual"]
         },
         "types": {
           "type": "object",
@@ -653,14 +670,14 @@
           "type": "object",
           "additionalProperties": {
             "type": "string",
-            "enum": ["api-key", "oauth-token", "auth-file", "vertex-ai"]
+            "enum": ["api-key", "oauth-token", "auth-file", "vertex-ai", "manual"]
           }
         },
         "files": {
           "type": "object",
           "additionalProperties": {
             "type": "string",
-            "enum": ["api-key", "oauth-token", "auth-file", "vertex-ai"]
+            "enum": ["api-key", "oauth-token", "auth-file", "vertex-ai", "manual"]
           }
         }
       },
@@ -724,7 +741,7 @@
         "resources": { "$ref": "#/$defs/resourceSpec" },
         "auth_selected_type": {
           "type": "string",
-          "enum": ["api-key", "oauth-token", "auth-file", "vertex-ai"]
+          "enum": ["api-key", "oauth-token", "auth-file", "vertex-ai", "manual"]
         }
       },
       "additionalProperties": false

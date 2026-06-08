@@ -197,6 +197,13 @@ func (vs *VersionedSettings) ResolveImageRegistry(profileName string) string {
 	return vs.ImageRegistry
 }
 
+// IsHostExecutionRuntime reports whether the runtime type executes agents
+// as host processes (no container image required). These runtimes do not
+// need image_registry to be configured.
+func IsHostExecutionRuntime(runtimeType string) bool {
+	return runtimeType == "tmux"
+}
+
 // RequireImageRegistry checks that image_registry is configured and returns an
 // actionable error if not. This is called early in command execution to fail fast.
 func RequireImageRegistry(projectPath, profileName string) error {
@@ -206,6 +213,12 @@ func RequireImageRegistry(projectPath, profileName string) error {
 		return nil
 	}
 	if vs == nil {
+		return nil
+	}
+	if IsHostExecutionRuntime(profileName) {
+		return nil
+	}
+	if _, runtimeType, resolveErr := vs.ResolveRuntime(profileName); resolveErr == nil && IsHostExecutionRuntime(runtimeType) {
 		return nil
 	}
 	if vs.IsImageRegistryConfigured(profileName) {
@@ -897,6 +910,20 @@ type V1RuntimeConfig struct {
 	CloudRunInstances *V1CloudRunInstancesConfig `json:"cloudrun_instances,omitempty" yaml:"cloudrun_instances,omitempty" koanf:"cloudrun_instances"`
 	// CloudRunSandbox holds Cloud Run Sandbox-specific settings when Type is "cloudrun-sandbox".
 	CloudRunSandbox *V1CloudRunSandboxConfig `json:"cloudrun_sandbox,omitempty" yaml:"cloudrun_sandbox,omitempty" koanf:"cloudrun_sandbox"`
+
+	// DefaultTmuxSession is the tmux session name when Type is "tmux".
+	// Defaults to "scion" when empty. Can be overridden per-agent via
+	// kubernetes.namespace (see note 11 in design-notes/).
+	DefaultTmuxSession string `json:"default_tmux_session,omitempty" yaml:"default_tmux_session,omitempty" koanf:"default_tmux_session"`
+
+	// HomeMode controls HOME handling for tmux-runtime agents. Currently
+	// only "agent" is supported (default; HOME=<agentHome>).
+	HomeMode string `json:"home_mode,omitempty" yaml:"home_mode,omitempty" koanf:"home_mode"`
+
+	// Sciontool is the absolute path to the sciontool binary used to wrap
+	// each harness in `sciontool init --tmuxruntime`. Empty disables
+	// wrapping; "auto" resolves the binary on PATH.
+	Sciontool string `json:"sciontool,omitempty" yaml:"sciontool,omitempty" koanf:"sciontool"`
 }
 
 // V1RuntimeDefaultsConfig holds runtime-wide behaviour that is not specific to
