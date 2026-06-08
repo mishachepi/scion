@@ -137,7 +137,7 @@ type Harness interface {
 The harness factory (`harness.New(name)`) returns the appropriate implementation. Each harness handles:
 - **Auth discovery**: Locating credentials on the host.
 - **Environment injection**: Mapping credentials to container environment variables.
-- **Command construction**: Building the correct CLI invocation (e.g., `claude --no-chrome --dangerously-skip-permissions <task>`).
+- **Command construction**: Building the correct CLI invocation (e.g., `claude --no-chrome --permission-mode bypassPermissions <task>`).
 - **Provisioning hooks**: Harness-specific setup during agent creation (e.g., writing config files).
 - **Template seeding**: Populating default template directories from embedded files (`pkg/config/embeds/`).
 
