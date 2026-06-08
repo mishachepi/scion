@@ -1121,3 +1121,49 @@ func TestVersionedSettings_IsHubExplicitlyDisabled(t *testing.T) {
 	vs.Hub.Enabled = boolPtr(false)
 	assert.True(t, vs.IsHubExplicitlyDisabled())
 }
+
+// Schema must accept every field the tmux runtime reads from V1RuntimeConfig.
+// Drift between this list and the schema's runtimeConfig.properties is what
+// would silently break `scion config validate` and legacy→v1 migration for
+// tmux operators.
+func TestValidateSettings_TmuxRuntimeAllFields(t *testing.T) {
+	data := []byte(`
+schema_version: "1"
+runtimes:
+  tmux:
+    type: tmux
+    default_tmux_session: scion
+    home_mode: agent
+    sciontool: auto
+profiles:
+  tmux-local:
+    runtime: tmux
+`)
+	errors, err := ValidateSettings(data, "1")
+	require.NoError(t, err)
+	assert.Empty(t, errors, "all documented tmux runtime fields must pass schema validation")
+}
+
+func TestValidateSettings_TmuxHomeModeEnum(t *testing.T) {
+	cases := []struct {
+		mode    string
+		wantErr bool
+	}{
+		{"agent", false},
+		{"system", true},
+		{"nonsense", true},
+		{"AGENT", true}, // case-sensitive enum
+	}
+	for _, tc := range cases {
+		t.Run(tc.mode, func(t *testing.T) {
+			data := []byte("schema_version: \"1\"\nruntimes:\n  tmux:\n    type: tmux\n    home_mode: " + tc.mode + "\n")
+			errors, err := ValidateSettings(data, "1")
+			require.NoError(t, err)
+			if tc.wantErr {
+				assert.NotEmpty(t, errors, "home_mode=%q must fail schema validation", tc.mode)
+			} else {
+				assert.Empty(t, errors, "home_mode=%q must pass schema validation: %v", tc.mode, errors)
+			}
+		})
+	}
+}

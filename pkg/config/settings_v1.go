@@ -3072,6 +3072,20 @@ type V1RuntimeConfig struct {
 	// ServiceAccount. A profile's own value wins over this one; see
 	// VersionedSettings.ResolveKubernetesBlockServiceAccountForSelection.
 	KubernetesBlockServiceAccount string `json:"kubernetes_block_service_account,omitempty" yaml:"kubernetes_block_service_account,omitempty" koanf:"kubernetes_block_service_account"`
+
+	// DefaultTmuxSession is the tmux session name when Type is "tmux".
+	// Defaults to "scion" when empty. Can be overridden per-agent via
+	// kubernetes.namespace (see note 11 in design-notes/).
+	DefaultTmuxSession string `json:"default_tmux_session,omitempty" yaml:"default_tmux_session,omitempty" koanf:"default_tmux_session"`
+
+	// HomeMode controls HOME handling for tmux-runtime agents. Currently
+	// only "agent" is supported (default; HOME=<agentHome>).
+	HomeMode string `json:"home_mode,omitempty" yaml:"home_mode,omitempty" koanf:"home_mode"`
+
+	// Sciontool is the absolute path to the sciontool binary used to wrap
+	// each harness in `sciontool init --tmuxruntime`. Empty disables
+	// wrapping; "auto" resolves the binary on PATH.
+	Sciontool string `json:"sciontool,omitempty" yaml:"sciontool,omitempty" koanf:"sciontool"`
 }
 
 // V1RuntimeDefaultsConfig holds runtime-wide behaviour that is not specific to
