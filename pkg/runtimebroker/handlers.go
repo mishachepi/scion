@@ -2605,31 +2605,38 @@ func (s *Server) resolveManagerForOpts(opts api.StartOptions) agent.Manager {
 	}
 
 	// ResolveRuntime("") uses vs.ActiveProfile as the fallback.
-	_, runtimeType, err := vs.ResolveRuntime(opts.Profile)
+	rtConfig, runtimeType, err := vs.ResolveRuntime(opts.Profile)
 	if err != nil {
 		// Profile or its runtime not found in settings; use default
 		return s.manager
 	}
 
-	if runtimeType == s.runtime.Name() {
+	// Config-aware cache key so projects resolving to the same runtime type
+	// but distinct configs (e.g. different tmux Session) get separate managers.
+	cacheKey := runtimeInstanceCacheKey(runtimeType, rtConfig)
+	defaultKey := runtimeInstanceCacheKeyForInstance(s.runtime)
+	if cacheKey == defaultKey {
 		return s.manager
 	}
+
+	s.auxiliaryRuntimesMu.RLock()
+	if aux, ok := s.auxiliaryRuntimes[cacheKey]; ok {
+		s.auxiliaryRuntimesMu.RUnlock()
+		return aux.Manager
+	}
+	s.auxiliaryRuntimesMu.RUnlock()
 
 	// Settings specify a different runtime - resolve and create a manager.
 	// Cache it as an auxiliary manager so LookupContainerID can find agents
 	// created on non-default runtimes (e.g. K8s pods when default is docker).
-	//
-	// Use opts.Profile for ResolveRuntime so it picks up the same profile
-	// that was just checked. When empty, GetRuntime falls back to settings
-	// the same way ResolveRuntime does.
 	resolved := agent.ResolveRuntime(opts.ProjectPath, opts.Name, opts.Profile)
 
 	if s.config.Debug {
-		s.agentLifecycleLog.Debug("Settings resolved to different runtime",
+		s.agentLifecycleLog.Debug("Settings resolved to different runtime instance",
 			"agent", opts.Name, "profile", opts.Profile,
 			"activeProfile", vs.ActiveProfile,
-			"defaultRuntime", s.runtime.Name(),
-			"resolvedRuntime", resolved.Name(),
+			"defaultCacheKey", defaultKey,
+			"resolvedCacheKey", cacheKey,
 		)
 	}
 
@@ -2637,11 +2644,31 @@ func (s *Server) resolveManagerForOpts(opts api.StartOptions) agent.Manager {
 
 	if resolved.Name() != "error" {
 		s.auxiliaryRuntimesMu.Lock()
-		s.auxiliaryRuntimes[resolved.Name()] = auxiliaryRuntime{Runtime: resolved, Manager: mgr}
+		s.auxiliaryRuntimes[cacheKey] = auxiliaryRuntime{Runtime: resolved, Manager: mgr}
 		s.auxiliaryRuntimesMu.Unlock()
 	}
 
 	return mgr
+}
+
+// runtimeInstanceCacheKey distinguishes runtime instances that share a type
+// but configure differently (currently only tmux's DefaultTmuxSession).
+func runtimeInstanceCacheKey(runtimeType string, rtConfig config.V1RuntimeConfig) string {
+	if runtimeType == "tmux" {
+		session := rtConfig.DefaultTmuxSession
+		if session == "" {
+			session = scionrt.DefaultTmuxSession
+		}
+		return "tmux:" + session
+	}
+	return runtimeType
+}
+
+func runtimeInstanceCacheKeyForInstance(rt scionrt.Runtime) string {
+	if tr, ok := rt.(*scionrt.TmuxRuntime); ok {
+		return "tmux:" + tr.Session
+	}
+	return rt.Name()
 }
 
 // Helper functions
