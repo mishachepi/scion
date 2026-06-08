@@ -32,10 +32,10 @@ var sectionSchemaDiffAllowList = map[string]string{
 	// Pre-existing: the hand-written map-of-objects section schemas are
 	// looser than the root defs. Tightening them changes which PUT
 	// server-config bodies are accepted; tracked in ptone/scion#3053.
-	"harness_configs.*.auth_selected_type: enum [], root [api-key auth-file manual none oauth-token vertex-ai]":                  "section looser than root; ptone/scion#3053",
-	"harness_configs.*.name: pattern <nil>, root ^[a-zA-Z0-9][a-zA-Z0-9_-]*$":                                                    "section looser than root; ptone/scion#3053",
-	"profiles.*.harness_overrides.*.auth_selected_type: enum [], root [api-key auth-file manual oauth-token vertex-ai]":          "section looser than root; ptone/scion#3053",
-	"runtimes.*.type: enum [], root [cloudrun cloudrun-instances cloudrun-sandbox container docker kubernetes podman substrate]": "section looser than root; ptone/scion#3053",
+	"harness_configs.*.auth_selected_type: enum [], root [api-key auth-file manual none oauth-token vertex-ai]":                       "section looser than root; ptone/scion#3053",
+	"harness_configs.*.name: pattern <nil>, root ^[a-zA-Z0-9][a-zA-Z0-9_-]*$":                                                         "section looser than root; ptone/scion#3053",
+	"profiles.*.harness_overrides.*.auth_selected_type: enum [], root [api-key auth-file manual oauth-token vertex-ai]":               "section looser than root; ptone/scion#3053",
+	"runtimes.*.type: enum [], root [cloudrun cloudrun-instances cloudrun-sandbox container docker kubernetes podman substrate tmux]": "section looser than root; ptone/scion#3053",
 
 	// Pre-existing: the profiles section schema accepts profiles.*.env, but
 	// V1ProfileConfig has no env field, so a PUT carrying it gets a 200 and
