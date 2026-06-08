@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -198,6 +199,162 @@ active_profile: apple
 		r := GetRuntime(projectScionDir, "")
 		if _, ok := r.(*AppleContainerRuntime); !ok {
 			t.Errorf("expected *AppleContainerRuntime from project active_profile override, got %T", r)
+		}
+	})
+
+	t.Run("Tmux_SessionName_Override", func(t *testing.T) {
+		tmpHome := t.TempDir()
+		t.Setenv("HOME", tmpHome)
+
+		globalDir := filepath.Join(tmpHome, ".scion")
+		if err := os.MkdirAll(globalDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(globalDir, "settings.json"),
+			[]byte(`{"schema_version": "1", "active_profile": "tmux", "runtimes": {"tmux": {"type": "tmux", "default_tmux_session": "lsa-vault"}}, "profiles": {"tmux": {"runtime": "tmux"}}}`),
+			0644); err != nil {
+			t.Fatal(err)
+		}
+
+		r := GetRuntime("", "")
+		tr, ok := r.(*TmuxRuntime)
+		if !ok {
+			t.Fatalf("expected *TmuxRuntime, got %T", r)
+		}
+		if tr.Session != "lsa-vault" {
+			t.Errorf("Session = %q, want %q (from settings)", tr.Session, "lsa-vault")
+		}
+	})
+
+	t.Run("Tmux_SessionName_DefaultsToScion", func(t *testing.T) {
+		tmpHome := t.TempDir()
+		t.Setenv("HOME", tmpHome)
+
+		globalDir := filepath.Join(tmpHome, ".scion")
+		if err := os.MkdirAll(globalDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(globalDir, "settings.json"),
+			[]byte(`{"schema_version": "1", "active_profile": "tmux", "runtimes": {"tmux": {"type": "tmux"}}, "profiles": {"tmux": {"runtime": "tmux"}}}`),
+			0644); err != nil {
+			t.Fatal(err)
+		}
+
+		r := GetRuntime("", "")
+		tr, ok := r.(*TmuxRuntime)
+		if !ok {
+			t.Fatalf("expected *TmuxRuntime, got %T", r)
+		}
+		if tr.Session != DefaultTmuxSession {
+			t.Errorf("Session = %q, want default %q", tr.Session, DefaultTmuxSession)
+		}
+	})
+
+	t.Run("Tmux_HomeMode_InvalidRejected", func(t *testing.T) {
+		tmpHome := t.TempDir()
+		t.Setenv("HOME", tmpHome)
+		globalDir := filepath.Join(tmpHome, ".scion")
+		if err := os.MkdirAll(globalDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		settings := `
+schema_version: "1"
+active_profile: tmux
+runtimes:
+  tmux:
+    type: tmux
+    home_mode: garbage
+profiles:
+  tmux:
+    runtime: tmux
+`
+		if err := os.WriteFile(filepath.Join(globalDir, "settings.yaml"), []byte(settings), 0644); err != nil {
+			t.Fatal(err)
+		}
+		r := GetRuntime("", "")
+		er, ok := r.(*ErrorRuntime)
+		if !ok {
+			t.Fatalf("expected *ErrorRuntime for invalid home_mode, got %T", r)
+		}
+		if er.Err == nil || !strings.Contains(er.Err.Error(), "home_mode") {
+			t.Errorf("ErrorRuntime.Err = %v, want validation error mentioning home_mode", er.Err)
+		}
+	})
+
+	t.Run("Tmux_Sciontool_DefaultOff", func(t *testing.T) {
+		tmpHome := t.TempDir()
+		t.Setenv("HOME", tmpHome)
+		globalDir := filepath.Join(tmpHome, ".scion")
+		if err := os.MkdirAll(globalDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(globalDir, "settings.json"),
+			[]byte(`{"schema_version": "1", "active_profile": "tmux", "runtimes": {"tmux": {"type": "tmux"}}, "profiles": {"tmux": {"runtime": "tmux"}}}`),
+			0644); err != nil {
+			t.Fatal(err)
+		}
+		r := GetRuntime("", "")
+		tr, ok := r.(*TmuxRuntime)
+		if !ok {
+			t.Fatalf("expected *TmuxRuntime, got %T", r)
+		}
+		if tr.Sciontool != "" {
+			t.Errorf("Sciontool = %q, want empty (default = no wrap)", tr.Sciontool)
+		}
+	})
+
+	t.Run("Tmux_Sciontool_ExplicitPathPassThrough", func(t *testing.T) {
+		tmpHome := t.TempDir()
+		t.Setenv("HOME", tmpHome)
+		globalDir := filepath.Join(tmpHome, ".scion")
+		if err := os.MkdirAll(globalDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		settings := `
+schema_version: "1"
+active_profile: tmux
+runtimes:
+  tmux:
+    type: tmux
+    sciontool: /opt/scion/bin/sciontool
+profiles:
+  tmux:
+    runtime: tmux
+`
+		if err := os.WriteFile(filepath.Join(globalDir, "settings.yaml"), []byte(settings), 0644); err != nil {
+			t.Fatal(err)
+		}
+		r := GetRuntime("", "")
+		tr, ok := r.(*TmuxRuntime)
+		if !ok {
+			t.Fatalf("expected *TmuxRuntime, got %T", r)
+		}
+		if tr.Sciontool != "/opt/scion/bin/sciontool" {
+			t.Errorf("Sciontool = %q, want %q", tr.Sciontool, "/opt/scion/bin/sciontool")
+		}
+	})
+
+	t.Run("Tmux_SessionName_InvalidRejected", func(t *testing.T) {
+		tmpHome := t.TempDir()
+		t.Setenv("HOME", tmpHome)
+
+		globalDir := filepath.Join(tmpHome, ".scion")
+		if err := os.MkdirAll(globalDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(globalDir, "settings.json"),
+			[]byte(`{"schema_version": "1", "active_profile": "tmux", "runtimes": {"tmux": {"type": "tmux", "default_tmux_session": "bad:name"}}, "profiles": {"tmux": {"runtime": "tmux"}}}`),
+			0644); err != nil {
+			t.Fatal(err)
+		}
+
+		r := GetRuntime("", "")
+		er, ok := r.(*ErrorRuntime)
+		if !ok {
+			t.Fatalf("expected *ErrorRuntime for invalid session name, got %T", r)
+		}
+		if er.Err == nil || !strings.Contains(er.Err.Error(), "':' or '.'") {
+			t.Errorf("ErrorRuntime.Err = %v, want validation error mentioning separators", er.Err)
 		}
 	})
 

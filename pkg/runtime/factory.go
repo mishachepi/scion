@@ -16,6 +16,7 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
@@ -124,6 +125,23 @@ func GetRuntime(projectPath string, profileName string) Runtime {
 	util.Debugf("GetRuntime: final runtime type: %s", runtimeType)
 
 	switch runtimeType {
+	case "tmux":
+		tr := NewTmuxRuntime()
+		if rtConfig.DefaultTmuxSession != "" {
+			if err := ValidateTmuxSessionName(rtConfig.DefaultTmuxSession); err != nil {
+				return &ErrorRuntime{Err: err}
+			}
+			tr.Session = rtConfig.DefaultTmuxSession
+		}
+		switch rtConfig.HomeMode {
+		case "", HomeModeAgent:
+			tr.HomeMode = HomeModeAgent
+		default:
+			return &ErrorRuntime{Err: fmt.Errorf("tmux runtime: invalid home_mode %q (only %q is supported)",
+				rtConfig.HomeMode, HomeModeAgent)}
+		}
+		tr.Sciontool = resolveSciontool(rtConfig.Sciontool)
+		return tr
 	case "container":
 		return NewAppleContainerRuntime()
 	case "docker":
@@ -260,6 +278,25 @@ func findPodmanNonStandardPath() string {
 		}
 	}
 	return ""
+}
+
+// resolveSciontool maps a settings.yaml `sciontool` value to an absolute path.
+// "auto" triggers a PATH lookup; lookup failures degrade to empty with a stderr
+// warning so the runtime falls back to direct exec without the init wrapper.
+func resolveSciontool(value string) string {
+	if value == "" {
+		return ""
+	}
+	if value == "auto" {
+		path, err := exec.LookPath("sciontool")
+		if err != nil {
+			fmt.Fprintln(os.Stderr,
+				"Warning: tmux runtime: sciontool: auto requested but 'sciontool' was not found on PATH — running harness directly without the init wrapper")
+			return ""
+		}
+		return path
+	}
+	return value
 }
 
 type ErrorRuntime struct {
