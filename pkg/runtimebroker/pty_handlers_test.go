@@ -22,6 +22,33 @@ import (
 	"k8s.io/client-go/tools/remotecommand"
 )
 
+func TestIsTmuxRuntimeTarget(t *testing.T) {
+	cases := []struct {
+		name        string
+		containerID string
+		want        bool
+	}{
+		{"tmux window in default session", "scion:@7", true},
+		{"tmux window in custom session", "obsi:@19", true},
+		{"tmux window with multi-digit id", "lsa-vault:@1234", true},
+		{"docker container id", "abc123def456", false},
+		{"k8s pod name", "agent-foo-pod", false},
+		{"docker name with colon in image-style label", "scion-claude:latest", false},
+		{"empty string", "", false},
+		{"trailing colon (no window)", "scion:", false},
+		{"leading colon", ":@7", false},
+		{"colon but no @ after", "session:scion", false},
+		{"@ before colon", "@7:session", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isTmuxRuntimeTarget(c.containerID); got != c.want {
+				t.Errorf("isTmuxRuntimeTarget(%q) = %v, want %v", c.containerID, got, c.want)
+			}
+		})
+	}
+}
+
 func TestWaitForTmuxSession_ContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Cancel immediately

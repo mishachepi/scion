@@ -45,7 +45,8 @@ import (
 )
 
 var (
-	gracePeriod time.Duration
+	gracePeriod     time.Duration
+	tmuxRuntimeMode bool
 )
 
 // initCmd represents the init command
@@ -63,10 +64,16 @@ It provides:
 The command after -- is executed as the child process. If no command is
 specified, sciontool will exit with an error.
 
+Pass --tmuxruntime (or set SCION_TMUX_RUNTIME=true) when invoked from
+scion's tmux runtime to suppress container-only steps while keeping
+lifecycle hooks, telemetry, hub heartbeat, and the supervisor active.
+See .design/tmux-runtime.md for details.
+
 Examples:
   sciontool init -- gemini
   sciontool init -- tmux new-session -A -s main
-  sciontool init --grace-period=30s -- claude`,
+  sciontool init --grace-period=30s -- claude
+  sciontool init --tmuxruntime -- claude --permission-mode bypassPermissions`,
 	DisableFlagParsing: false,
 	Run: func(cmd *cobra.Command, args []string) {
 		exitCode := runInit(args)
@@ -79,12 +86,17 @@ func init() {
 
 	initCmd.Flags().DurationVar(&gracePeriod, "grace-period", 10*time.Second,
 		"Time to wait after SIGTERM before sending SIGKILL")
+	initCmd.Flags().BoolVar(&tmuxRuntimeMode, "tmuxruntime", false,
+		"Host-execution mode (scion tmux runtime): skip container-only steps")
 
 	// Override the default SCION_GRACE_PERIOD env var if set
 	if envGrace := os.Getenv("SCION_GRACE_PERIOD"); envGrace != "" {
 		if d, err := time.ParseDuration(envGrace); err == nil {
 			gracePeriod = d
 		}
+	}
+	if os.Getenv("SCION_TMUX_RUNTIME") == "true" {
+		tmuxRuntimeMode = true
 	}
 }
 
@@ -105,6 +117,9 @@ func runInit(args []string) int {
 	log.Info("sciontool init starting as PID %d (uid=%d, gid=%d, euid=%d, egid=%d)", os.Getpid(), os.Getuid(), os.Getgid(), os.Geteuid(), os.Getegid())
 	log.Info("Child command: %v", childArgs)
 	log.Info("Grace period: %s", gracePeriod)
+	if tmuxRuntimeMode {
+		log.Info("tmux runtime mode: container-only steps suppressed")
+	}
 
 	// Log operating mode for diagnostics
 	mode := hub.OperatingMode()
@@ -117,9 +132,16 @@ func runInit(args []string) int {
 		log.Info("Operating mode: hosted (endpoint: %s)", os.Getenv(hub.EnvHubEndpoint))
 	}
 
-	// Set up scion user UID/GID to match host user
-	targetUID, targetGID, rootless := setupHostUser()
-	log.Info("setupHostUser result: targetUID=%d, targetGID=%d, rootless=%v (now euid=%d, egid=%d)", targetUID, targetGID, rootless, os.Geteuid(), os.Getegid())
+	// Set up scion user UID/GID to match host user.
+	var targetUID, targetGID int
+	var rootless bool
+	if tmuxRuntimeMode {
+		// Already running as operator; setuid/chown not possible on host.
+		targetUID, targetGID, rootless = os.Getuid(), os.Getgid(), true
+	} else {
+		targetUID, targetGID, rootless = setupHostUser()
+		log.Info("setupHostUser result: targetUID=%d, targetGID=%d, rootless=%v (now euid=%d, egid=%d)", targetUID, targetGID, rootless, os.Geteuid(), os.Getegid())
+	}
 
 	// Chown the log file so the scion user can write to it even if it was created by root
 	if targetUID != 0 {
@@ -130,12 +152,15 @@ func runInit(args []string) int {
 
 	// Resolve the scion user's home directory early. Init runs as root
 	// (HOME=/root), but agent-info.json and other agent state files live
-	// in the scion user's home directory. This must happen before the
-	// StatusHandler is created so it writes to the correct path.
-	// In rootless mode, targetUID is 0 but we still need the scion user's
-	// home directory since the child process environment will use it.
+	// in the scion user's home directory.
+	// In tmux runtime mode, SCION_AGENT_HOME is the authoritative source
+	// for the per-agent state directory.
 	agentHome := os.Getenv("HOME")
-	if targetUID != 0 {
+	if tmuxRuntimeMode {
+		if v := os.Getenv("SCION_AGENT_HOME"); v != "" {
+			agentHome = v
+		}
+	} else if targetUID != 0 {
 		if scionUser, err := user.LookupId(strconv.Itoa(targetUID)); err == nil {
 			agentHome = scionUser.HomeDir
 		} else {
@@ -283,7 +308,14 @@ func runInit(args []string) int {
 	// first also prevents provisioner-created files (e.g. .agents/) from
 	// causing isWorkspaceEmpty to return false and skipping the clone.
 	// See: https://github.com/ptone/scion/issues/739
-	if err := gitCloneWorkspace(targetUID, targetGID, agentHome); err != nil {
+	// The tmux runtime clones before invoking sciontool
+	// (cloneWorkspaceIfRequested), so skip here.
+	var cloneErr error
+	if !tmuxRuntimeMode {
+		cloneErr = gitCloneWorkspace(targetUID, targetGID, agentHome)
+	}
+	if cloneErr != nil {
+		err := cloneErr
 		log.Error("Git clone failed: %v", err)
 
 		// Update local agent-info.json to error state so local status readers
@@ -381,14 +413,14 @@ func runInit(args []string) int {
 
 	// Configure git credentials for shared-workspace projects (git-workspace hybrid).
 	// The workspace is pre-cloned on the host; agents need credentials to push/pull.
-	if resolveIsSharedGitWorkspace() {
+	if !tmuxRuntimeMode && resolveIsSharedGitWorkspace() {
 		configureSharedWorkspaceGit(agentHome)
 	}
 
-	// Write critical environment variables to a shell-sourceable file so that
-	// processes launched by harnesses (which may re-exec with a filtered env)
-	// can recover the full SCION environment. The file is sourced by .bashrc/.zshrc.
-	writeEnvFile(agentHome, targetUID, targetGID)
+	// scion-env is sourced by container-side .bashrc/.zshrc; not applicable on tmux.
+	if !tmuxRuntimeMode {
+		writeEnvFile(agentHome, targetUID, targetGID)
+	}
 
 	// Read and start sidecar services
 	var svcManager *services.Manager
@@ -397,7 +429,8 @@ func runInit(args []string) int {
 	// Pre-create the directory as read-only (0555) so no symlinks can be
 	// created inside it. We use chmod rather than chown because chown is
 	// silently a no-op on VirtioFS mounts used by the Apple VZ runtime.
-	if isClaude(childArgs) {
+	// Apple-container-specific; tmux would touch operator's ~/.claude.
+	if !tmuxRuntimeMode && isClaude(childArgs) {
 		debugDir := filepath.Join(agentHome, ".claude", "debug")
 		if err := os.MkdirAll(debugDir, 0755); err != nil {
 			log.Error("Failed to create debug directory %s: %v", debugDir, err)
@@ -408,19 +441,22 @@ func runInit(args []string) int {
 		}
 	}
 
-	servicesPath := filepath.Join(agentHome, ".scion", "scion-services.yaml")
-	log.Debug("Looking for services config at: %s", servicesPath)
-	if data, err := os.ReadFile(servicesPath); err == nil {
-		var specs []api.ServiceSpec
-		if err := yaml.Unmarshal(data, &specs); err != nil {
-			log.Error("Failed to parse scion-services.yaml: %v", err)
-		} else if len(specs) > 0 {
-			log.Info("Starting %d sidecar service(s)...", len(specs))
-			svcManager = services.New(gracePeriod)
-			svcCtx := context.Background()
-			if err := svcManager.Start(svcCtx, specs, targetUID, targetGID, "scion"); err != nil {
-				log.Error("Failed to start services: %v", err)
-				// Continue — service failure shouldn't block harness
+	// Sidecar services bind host ports; skip on tmux to avoid collisions.
+	if !tmuxRuntimeMode {
+		servicesPath := filepath.Join(agentHome, ".scion", "scion-services.yaml")
+		log.Debug("Looking for services config at: %s", servicesPath)
+		if data, err := os.ReadFile(servicesPath); err == nil {
+			var specs []api.ServiceSpec
+			if err := yaml.Unmarshal(data, &specs); err != nil {
+				log.Error("Failed to parse scion-services.yaml: %v", err)
+			} else if len(specs) > 0 {
+				log.Info("Starting %d sidecar service(s)...", len(specs))
+				svcManager = services.New(gracePeriod)
+				svcCtx := context.Background()
+				if err := svcManager.Start(svcCtx, specs, targetUID, targetGID, "scion"); err != nil {
+					log.Error("Failed to start services: %v", err)
+					// Continue — service failure shouldn't block harness
+				}
 			}
 		}
 	}
@@ -445,56 +481,55 @@ func runInit(args []string) int {
 		}
 	}
 
-	// Start GCP metadata server if configured
+	// GCP metadata server binds 169.254.169.254; not feasible on host (tmux runtime).
 	var metadataServer *metadata.Server
-	if metaCfg := metadata.ConfigFromEnv(); metaCfg != nil {
-		// Remove pre-existing gcloud configuration state so that gcloud
-		// re-initializes and discovers the emulated metadata server via
-		// GCE_METADATA_ROOT. gcloud only checks for the metadata server
-		// during its first-run configuration detection.
-		// We preserve application_default_credentials.json which may be
-		// bind-mounted as a secret (gcloud-adc).
-		cleanGcloudConfigForMetadata(filepath.Join(agentHome, ".config", "gcloud"))
-		// Wire up dynamic token retrieval so the metadata server always
-		// uses the latest agent token after refresh, not the startup value.
-		metaCfg.TokenFunc = func() string {
-			return hub.ReadTokenFile()
-		}
-		// Delegate GCP token fetching to the hub client so the metadata
-		// server uses the correct auth headers (X-Scion-Agent-Token) and
-		// OIDC transport layer. The hub client is created after the metadata
-		// server starts, so the closures capture the hubClient variable
-		// which is set later. Token requests only arrive after the child
-		// process has started, so the hub client is always available by then.
-		metaCfg.FetchGCPToken = func(ctx context.Context, scopes []string) (*metadata.GCPAccessTokenResponse, error) {
-			hc := hubClient
-			if hc == nil || !hc.IsConfigured() {
-				return nil, fmt.Errorf("hub client not initialized")
+	if !tmuxRuntimeMode {
+		if metaCfg := metadata.ConfigFromEnv(); metaCfg != nil {
+			// Remove pre-existing gcloud configuration state so that gcloud
+			// re-initializes and discovers the emulated metadata server via
+			// GCE_METADATA_ROOT. gcloud only checks for the metadata server
+			// during its first-run configuration detection.
+			// We preserve application_default_credentials.json which may be
+			// bind-mounted as a secret (gcloud-adc).
+			cleanGcloudConfigForMetadata(filepath.Join(agentHome, ".config", "gcloud"))
+			// Wire up dynamic token retrieval so the metadata server always
+			// uses the latest agent token after refresh, not the startup value.
+			metaCfg.TokenFunc = func() string {
+				return hub.ReadTokenFile()
 			}
-			hubResp, err := hc.FetchGCPToken(ctx, scopes)
-			if err != nil {
-				return nil, err
+			// Delegate GCP token fetching to the hub client so the metadata
+			// server uses the correct auth headers (X-Scion-Agent-Token) and
+			// OIDC transport layer.
+			metaCfg.FetchGCPToken = func(ctx context.Context, scopes []string) (*metadata.GCPAccessTokenResponse, error) {
+				hc := hubClient
+				if hc == nil || !hc.IsConfigured() {
+					return nil, fmt.Errorf("hub client not initialized")
+				}
+				hubResp, err := hc.FetchGCPToken(ctx, scopes)
+				if err != nil {
+					return nil, err
+				}
+				return &metadata.GCPAccessTokenResponse{
+					AccessToken: hubResp.AccessToken,
+					ExpiresIn:   hubResp.ExpiresIn,
+					TokenType:   hubResp.TokenType,
+				}, nil
 			}
-			return &metadata.GCPAccessTokenResponse{
-				AccessToken: hubResp.AccessToken,
-				ExpiresIn:   hubResp.ExpiresIn,
-				TokenType:   hubResp.TokenType,
-			}, nil
-		}
-		metaCfg.FetchGCPIdentityToken = func(ctx context.Context, audience string) (string, error) {
-			hc := hubClient
-			if hc == nil || !hc.IsConfigured() {
-				return "", fmt.Errorf("hub client not initialized")
+			metaCfg.FetchGCPIdentityToken = func(ctx context.Context, audience string) (string, error) {
+				hc := hubClient
+				if hc == nil || !hc.IsConfigured() {
+					return "", fmt.Errorf("hub client not initialized")
+				}
+				return hc.FetchGCPIdentityToken(ctx, audience)
 			}
-			return hc.FetchGCPIdentityToken(ctx, audience)
-		}
-		metadataServer = metadata.New(*metaCfg)
-		metaCtx := context.Background()
-		if err := metadataServer.Start(metaCtx); err != nil {
-			log.Error("Failed to start metadata server: %v", err)
-			// Continue — metadata failure shouldn't block harness
-		} else {
-			log.Info("GCP metadata server started (mode=%s, port=%d)", metaCfg.Mode, metaCfg.Port)
+			metadataServer = metadata.New(*metaCfg)
+			metaCtx := context.Background()
+			if err := metadataServer.Start(metaCtx); err != nil {
+				log.Error("Failed to start metadata server: %v", err)
+				// Continue — metadata failure shouldn't block harness
+			} else {
+				log.Info("GCP metadata server started (mode=%s, port=%d)", metaCfg.Mode, metaCfg.Port)
+			}
 		}
 	}
 
@@ -514,7 +549,8 @@ func runInit(args []string) int {
 		}
 	}
 
-	// Create supervisor with configuration
+	// Create supervisor. In tmux mode, inherit the operator's environment
+	// unchanged (no credential drop, no HOME/USER/LOGNAME rewrite).
 	config := supervisor.Config{
 		GracePeriod: gracePeriod,
 		UID:         targetUID,
@@ -522,6 +558,12 @@ func runInit(args []string) int {
 		Username:    "scion",
 		Rootless:    rootless,
 		EnvOverlay:  harnessEnvOverlay,
+	}
+	if tmuxRuntimeMode {
+		config.UID = 0
+		config.GID = 0
+		config.Username = ""
+		config.Rootless = false
 	}
 	sup := supervisor.New(config)
 
@@ -1952,7 +1994,7 @@ func buildAuthenticatedURL(cloneURL, token string) string {
 // It scans all arguments because the harness binary may not be the first
 // argument (e.g. "tmux new-session -s scion claude --no-chrome ...").
 // It also handles the case where the harness command is joined into a single
-// string passed to tmux (e.g. "claude --no-chrome --dangerously-skip-permissions").
+// string passed to tmux (e.g. "claude --no-chrome --permission-mode bypassPermissions").
 func isClaude(childArgs []string) bool {
 	for _, arg := range childArgs {
 		// Split on whitespace to handle joined command strings
