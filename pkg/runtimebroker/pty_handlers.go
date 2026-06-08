@@ -40,6 +40,23 @@ import (
 	"k8s.io/client-go/tools/remotecommand"
 )
 
+// isTmuxRuntimeTarget reports whether containerID looks like a tmux runtime
+// window target (e.g. "obsi:@19") rather than a docker/podman container ID
+// or a kubernetes pod name. Tmux runtime sets ContainerID to the host-tmux
+// `<session>:@<window-id>` form when registering an agent; container
+// runtimes use opaque IDs. This is a defensive check used in addition to
+// runtimeCmd == "tmux" so PTY routing still works if the runtime label is
+// missing — for example when an agent is matched via the backward-compat
+// lookup path in Server.LookupAgent which never overrides the default
+// runtimeName.
+func isTmuxRuntimeTarget(containerID string) bool {
+	colon := strings.IndexByte(containerID, ':')
+	if colon <= 0 || colon == len(containerID)-1 {
+		return false
+	}
+	return containerID[colon+1] == '@'
+}
+
 const (
 	tmuxSessionWaitTimeout  = 30 * time.Second
 	tmuxSessionPollInterval = 500 * time.Millisecond
@@ -413,6 +430,7 @@ func newLocalPTYSession(ctx context.Context, agentID, containerID, runtimeCmd, e
 func (s *LocalPTYSession) Run() error {
 	isK8s := (s.runtimeCmd == "kubernetes" || s.runtimeCmd == "k8s") && s.k8sConfig != nil && s.k8sClientset != nil
 	isCloudRunSandbox := s.runtimeCmd == "cloudrun-sandbox"
+	isTmux := s.runtimeCmd == "tmux" || isTmuxRuntimeTarget(s.containerID)
 
 	if isCloudRunSandbox {
 		if err := s.startCloudRunSandboxExec(); err != nil {
@@ -426,6 +444,11 @@ func (s *LocalPTYSession) Run() error {
 		// Fall through to the same read/write/resize loop as Docker.
 	} else if isK8s {
 		return s.runK8sExec()
+	} else if isTmux {
+		// tmux runtime has no container — attach directly to the host tmux window.
+		if err := s.startTmuxAttach(); err != nil {
+			return fmt.Errorf("failed to start tmux attach: %w", err)
+		}
 	} else {
 		// Start docker/container exec with PTY
 		if err := s.startDockerExec(); err != nil {
@@ -638,6 +661,52 @@ func (s *LocalPTYSession) startCloudRunSandboxExec() error {
 	return nil
 }
 
+// startTmuxAttach attaches the PTY to a host tmux window. containerID is a
+// tmux target like "scion:@344".
+func (s *LocalPTYSession) startTmuxAttach() error {
+	if err := waitForHostTmuxWindow(s.ctx, s.containerID); err != nil {
+		return err
+	}
+
+	args := []string{"attach-session", "-t", s.containerID}
+	s.cmd = exec.CommandContext(s.ctx, "tmux", args...)
+	s.cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+
+	ptmx, err := pty.StartWithSize(s.cmd, &pty.Winsize{
+		Cols: uint16(s.cols),
+		Rows: uint16(s.rows),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to start tmux attach with PTY: %w", err)
+	}
+
+	s.ptyMaster = ptmx
+	s.ptySlave = ptmx
+	return nil
+}
+
+// waitForHostTmuxWindow polls the host until `tmux has-session -t <target>`
+// returns ok. Mirrors waitForTmuxSession, but without the container exec hop.
+func waitForHostTmuxWindow(ctx context.Context, target string) error {
+	ctx, cancel := context.WithTimeout(ctx, tmuxSessionWaitTimeout)
+	defer cancel()
+
+	ticker := time.NewTicker(tmuxSessionPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timed out waiting for host tmux window '%s' to become ready", target)
+		case <-ticker.C:
+			if err := exec.CommandContext(ctx, "tmux", "has-session", "-t", target).Run(); err == nil {
+				return nil
+			}
+			slog.Debug("Waiting for host tmux window", "target", target)
+		}
+	}
+}
+
 // startDockerExec starts a docker exec session with tmux attach using a real PTY.
 func (s *LocalPTYSession) startDockerExec() error {
 	if err := waitForTmuxSession(s.ctx, s.runtimeCmd, s.containerID, s.namespace, s.execUser, nil, nil); err != nil {
@@ -789,6 +858,7 @@ func (h *StreamPTYHandler) Run() error {
 	}
 	isK8s := (runtimeCmd == "kubernetes" || runtimeCmd == "k8s") && h.k8sConfig != nil && h.k8sClientset != nil
 	isCloudRunSandbox := runtimeCmd == "cloudrun-sandbox"
+	isTmux := runtimeCmd == "tmux" || isTmuxRuntimeTarget(h.containerID)
 
 	if isCloudRunSandbox {
 		if err := h.startCloudRunSandboxExec(); err != nil {
@@ -801,6 +871,10 @@ func (h *StreamPTYHandler) Run() error {
 		// Fall through to the same read/write/resize loop as Docker.
 	} else if isK8s {
 		return h.runK8sExec()
+	} else if isTmux {
+		if err := h.startTmuxAttach(); err != nil {
+			return err
+		}
 	} else {
 		// Start docker/container exec with tmux attach
 		if err := h.startDockerExec(); err != nil {
@@ -1031,6 +1105,29 @@ func (h *StreamPTYHandler) startCloudRunSandboxExec() error {
 	})
 	if err != nil {
 		return fmt.Errorf("failed to start sandbox exec with PTY: %w", err)
+	}
+
+	h.ptyMaster = ptmx
+	h.ptySlave = ptmx
+	return nil
+}
+
+// startTmuxAttach mirrors LocalPTYSession.startTmuxAttach for the streaming path.
+func (h *StreamPTYHandler) startTmuxAttach() error {
+	if err := waitForHostTmuxWindow(h.ctx, h.containerID); err != nil {
+		return err
+	}
+
+	args := []string{"attach-session", "-t", h.containerID}
+	h.cmd = exec.CommandContext(h.ctx, "tmux", args...)
+	h.cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+
+	ptmx, err := pty.StartWithSize(h.cmd, &pty.Winsize{
+		Cols: uint16(h.cols),
+		Rows: uint16(h.rows),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to start tmux attach with PTY: %w", err)
 	}
 
 	h.ptyMaster = ptmx
