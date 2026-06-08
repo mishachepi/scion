@@ -3,7 +3,13 @@ title: Interactive Sessions with Tmux
 description: Learn how to use and customize the built-in tmux session management in Scion.
 ---
 
-Scion uses [tmux](https://github.com/tmux/tmux), a terminal multiplexer, as the default and mandatory shell wrapper for all agent sessions. This ensures that every interactive session is persistent, collaborative, and consistent across all runtimes (Docker, Apple Virtualization, Kubernetes, etc.).
+Scion uses [tmux](https://github.com/tmux/tmux), a terminal multiplexer, as the default and mandatory shell wrapper for all container-based agent sessions. This ensures that every interactive session is persistent, collaborative, and consistent across the container runtimes (Docker, Apple Virtualization, Kubernetes, etc.).
+
+:::note[Two distinct uses of tmux in Scion]
+The tmux described on this page is the **in-container shell wrapper** — every agent running under Docker / Podman / Kubernetes / Apple Container has a tmux session inside its container so attach/detach works reliably.
+
+There is a separate **tmux runtime** that uses tmux *as the runtime itself*: agents are plain host processes, not container processes, and the host's tmux server manages them directly. See [The tmux Runtime](/scion/local/tmux-runtime/).
+:::
 
 ## Why Tmux?
 

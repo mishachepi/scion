@@ -46,11 +46,12 @@ Auth type can be explicitly set via `auth_selectedType` in your Scion settings p
 A harness for Anthropic's "Claude Code" agent.
 
 ### Authentication
-Claude supports four authentication methods (auto-detected in this precedence order):
+Claude supports the following authentication methods (auto-detected in this precedence order, or explicitly selected):
 - **API Key** (`api-key`): Set `ANTHROPIC_API_KEY` in your host environment. Scion propagates this to the agent and pre-approves it in `.claude.json` so Claude Code does not prompt for confirmation.
 - **OAuth Token** (`oauth-token`): Set `CLAUDE_CODE_OAUTH_TOKEN` (generate with `claude setup-token`). This is also the token captured automatically after an in-agent `claude setup-token` login.
 - **Auth File** (`auth-file`): Uses `~/.claude/.credentials.json` (file-secret key `CLAUDE_AUTH`) if available.
 - **Vertex AI** (`vertex-ai`): Uses Google Cloud's Vertex AI endpoint with ADC, `GOOGLE_CLOUD_PROJECT`, and `GOOGLE_CLOUD_REGION`. Scion automatically translates `GOOGLE_CLOUD_PROJECT` to `ANTHROPIC_VERTEX_PROJECT_ID` during container provisioning to ensure compatibility with Claude Code's native Vertex AI client.
+- **Manual** (`manual`): Scion injects nothing; the agent resolves credentials out-of-band. Must be selected explicitly — never auto-detected.
 
 If no credentials are found, the agent drops to a shell — run `claude setup-token` interactively, then capture the credential with `capture_auth.py` (see [Harness Authentication](/scion/local/agent-credentials/#capturing-credentials-from-a-running-agent)).
 
