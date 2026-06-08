@@ -3521,6 +3521,91 @@ telemetry:
 	assert.NotEmpty(t, errors, "unknown field in telemetry should produce validation error")
 }
 
+// Schema must accept every field the tmux runtime reads from V1RuntimeConfig.
+// Drift between this list and the schema's runtimeConfig.properties is what
+// would silently break `scion config validate` and legacy→v1 migration for
+// tmux operators.
+func TestValidateSettings_TmuxRuntimeAllFields(t *testing.T) {
+	data := []byte(`
+schema_version: "1"
+runtimes:
+  tmux:
+    type: tmux
+    default_tmux_session: scion
+    home_mode: agent
+    sciontool: auto
+profiles:
+  tmux-local:
+    runtime: tmux
+`)
+	errors, err := ValidateSettings(data, "1")
+	require.NoError(t, err)
+	assert.Empty(t, errors, "all documented tmux runtime fields must pass schema validation")
+}
+
+func TestValidateSettings_TmuxHomeModeEnum(t *testing.T) {
+	cases := []struct {
+		mode    string
+		wantErr bool
+	}{
+		{"agent", false},
+		{"system", true},
+		{"nonsense", true},
+		{"AGENT", true}, // case-sensitive enum
+	}
+	for _, tc := range cases {
+		t.Run(tc.mode, func(t *testing.T) {
+			data := []byte("schema_version: \"1\"\nruntimes:\n  tmux:\n    type: tmux\n    home_mode: " + tc.mode + "\n")
+			errors, err := ValidateSettings(data, "1")
+			require.NoError(t, err)
+			if tc.wantErr {
+				assert.NotEmpty(t, errors, "home_mode=%q must fail schema validation", tc.mode)
+			} else {
+				assert.Empty(t, errors, "home_mode=%q must pass schema validation: %v", tc.mode, errors)
+			}
+		})
+	}
+}
+
+func TestIsHostExecutionRuntime(t *testing.T) {
+	cases := map[string]bool{
+		"tmux":       true,
+		"docker":     false,
+		"podman":     false,
+		"kubernetes": false,
+		"k8s":        false,
+		"container":  false,
+		"":           false,
+	}
+	for runtimeType, want := range cases {
+		if got := IsHostExecutionRuntime(runtimeType); got != want {
+			t.Errorf("IsHostExecutionRuntime(%q) = %v, want %v", runtimeType, got, want)
+		}
+	}
+}
+
+func TestRequireImageRegistry_TmuxRuntimeResolved(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir := t.TempDir()
+
+	vs := &VersionedSettings{
+		SchemaVersion: "1",
+		ActiveProfile: "host",
+		Profiles: map[string]V1ProfileConfig{
+			"host": {Runtime: "tmux"},
+		},
+		HarnessConfigs: map[string]HarnessConfigEntry{},
+		Runtimes: map[string]V1RuntimeConfig{
+			"tmux": {Type: "tmux"},
+		},
+	}
+	require.NoError(t, SaveVersionedSettings(dir, vs))
+
+	if err := RequireImageRegistry(dir, ""); err != nil {
+		t.Errorf("RequireImageRegistry on tmux-profile project = %v, want nil", err)
+	}
+}
+
 func TestLoadVersionedSettings_TelemetryHierarchyMerge(t *testing.T) {
 	// Unset all SCION_ environment variables to avoid pollution
 	for _, e := range os.Environ() {
