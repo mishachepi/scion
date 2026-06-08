@@ -58,7 +58,8 @@ import (
 )
 
 var (
-	gracePeriod time.Duration
+	gracePeriod     time.Duration
+	tmuxRuntimeMode bool
 )
 
 // telemetryStopBudget permits one safe 15-second metric write interval plus
@@ -87,10 +88,15 @@ It provides:
 The command after -- is executed as the child process. If no command is
 specified, sciontool will exit with an error.
 
+Pass --tmuxruntime (or set SCION_TMUX_RUNTIME=true) when invoked from
+scion's tmux runtime to suppress container-only steps while keeping
+lifecycle hooks, telemetry, hub heartbeat, and the supervisor active.
+
 Examples:
   sciontool init -- gemini
   sciontool init -- tmux new-session -A -s main
-  sciontool init --grace-period=30s -- claude`,
+  sciontool init --grace-period=30s -- claude
+  sciontool init --tmuxruntime -- claude --permission-mode bypassPermissions`,
 	DisableFlagParsing: false,
 	Run: func(cmd *cobra.Command, args []string) {
 		exitCode := RunInit(args, InitRunOptions{})
@@ -249,6 +255,12 @@ func init() {
 
 	initCmd.Flags().DurationVar(&gracePeriod, "grace-period", 10*time.Second,
 		"Time to wait after SIGTERM before sending SIGKILL")
+
+	initCmd.Flags().BoolVar(&tmuxRuntimeMode, "tmuxruntime", false,
+		"Host-execution mode (scion tmux runtime): skip container-only steps")
+	if os.Getenv("SCION_TMUX_RUNTIME") == "true" {
+		tmuxRuntimeMode = true
+	}
 
 	// Override the default SCION_GRACE_PERIOD env var if set
 	if envGrace := os.Getenv("SCION_GRACE_PERIOD"); envGrace != "" {
@@ -453,6 +465,9 @@ func RunInit(args []string, opts InitRunOptions) int {
 	log.Info("sciontool init starting as PID %d (uid=%d, gid=%d, euid=%d, egid=%d)", os.Getpid(), os.Getuid(), os.Getgid(), os.Geteuid(), os.Getegid())
 	log.Info("Child command: %v", childArgs)
 	log.Info("Grace period: %s", gracePeriod)
+	if tmuxRuntimeMode {
+		log.Info("tmux runtime mode: container-only steps suppressed")
+	}
 
 	// Log operating mode for diagnostics
 	mode := hub.OperatingMode()
@@ -479,7 +494,15 @@ func RunInit(args []string, opts InitRunOptions) int {
 	}
 
 	// Set up scion user UID/GID to match host user
-	targetUID, targetGID, rootless := runSetupHostUser(opts.RequirePrivilegeDrop)
+	var targetUID, targetGID int
+	var rootless bool
+	if tmuxRuntimeMode {
+		// Already running as the operator on the host; setuid/chown are neither
+		// possible nor wanted.
+		targetUID, targetGID, rootless = os.Getuid(), os.Getgid(), true
+	} else {
+		targetUID, targetGID, rootless = runSetupHostUser(opts.RequirePrivilegeDrop)
+	}
 	log.Info("setupHostUser result: targetUID=%d, targetGID=%d, rootless=%v (now euid=%d, egid=%d)", targetUID, targetGID, rootless, os.Geteuid(), os.Getegid())
 	if msg := hostUIDMismatchWarning(os.Getenv("SCION_HOST_UID"), os.Getenv("SCION_HOST_GID"), targetUID, targetGID, rootless, os.Geteuid(), os.Getegid()); msg != "" {
 		log.Warn("%s", msg)
@@ -512,6 +535,12 @@ func RunInit(args []string, opts InitRunOptions) int {
 	// in the scion user's home directory. This must happen before the
 	// StatusHandler is created so it writes to the correct path.
 	agentHome := resolveAgentHome(targetUID, rootless)
+	if tmuxRuntimeMode {
+		// The tmux runtime names the per-agent state directory explicitly.
+		if v := os.Getenv("SCION_AGENT_HOME"); v != "" {
+			agentHome = v
+		}
+	}
 
 	// Move the bootstrap transport credential out of the environment and
 	// into the transport token file before anything else can inherit it.
@@ -728,7 +757,12 @@ func RunInit(args []string, opts InitRunOptions) int {
 	// causing isWorkspaceEmpty to return false and skipping the clone.
 	// See: https://github.com/ptone/scion/issues/739
 	cloneStepStart := time.Now()
-	cloneErr := runGitCloneWorkspace(targetUID, targetGID, agentHome, opts.RequirePrivilegeDrop)
+	// The tmux runtime clones before invoking sciontool
+	// (cloneWorkspaceIfRequested), so the in-container clone is skipped.
+	var cloneErr error
+	if !tmuxRuntimeMode {
+		cloneErr = runGitCloneWorkspace(targetUID, targetGID, agentHome, opts.RequirePrivilegeDrop)
+	}
 	slog.Info("sciontool init: clone step complete", "elapsed_ms", time.Since(cloneStepStart).Milliseconds(), "ok", cloneErr == nil)
 	if err := cloneErr; err != nil {
 		log.Error("Git clone failed: %v", err)
@@ -842,7 +876,7 @@ func RunInit(args []string, opts InitRunOptions) int {
 
 	// Configure git credentials for shared-workspace projects (git-workspace hybrid).
 	// The workspace is pre-cloned on the host; agents need credentials to push/pull.
-	if resolveIsSharedGitWorkspace() {
+	if !tmuxRuntimeMode && resolveIsSharedGitWorkspace() {
 		if err := configureSharedWorkspaceGit(agentHome, targetUID, targetGID, opts.RequirePrivilegeDrop); err != nil {
 			log.Error("Refusing shared workspace git configuration: %v", err)
 		}
@@ -850,8 +884,11 @@ func RunInit(args []string, opts InitRunOptions) int {
 
 	// Write critical environment variables to a shell-sourceable file so that
 	// processes launched by harnesses (which may re-exec with a filtered env)
-	// can recover the full SCION environment. The file is sourced by .bashrc/.zshrc.
-	writeEnvFile(agentHome, targetUID, targetGID)
+	// can recover the full SCION environment. The file is sourced by
+	// container-side .bashrc/.zshrc, so it is not written under tmux.
+	if !tmuxRuntimeMode {
+		writeEnvFile(agentHome, targetUID, targetGID)
+	}
 
 	// Read and start sidecar services
 	var svcManager *services.Manager
@@ -860,14 +897,16 @@ func RunInit(args []string, opts InitRunOptions) int {
 	// Pre-create the directory as read-only (0555) so no symlinks can be
 	// created inside it. We use chmod rather than chown because chown is
 	// silently a no-op on VirtioFS mounts used by the Apple VZ runtime.
-	if isClaude(childArgs) {
+	// Apple-container-specific; under tmux it would touch the operator's ~/.claude.
+	if !tmuxRuntimeMode && isClaude(childArgs) {
 		debugDir := filepath.Join(agentHome, ".claude", "debug")
 		runBlockClaudeDebugSymlink(debugDir, opts.RequirePrivilegeDrop)
 	}
 
 	servicesPath := filepath.Join(agentHome, ".scion", "scion-services.yaml")
 	log.Debug("Looking for services config at: %s", servicesPath)
-	if data, err := runReadServicesYAML(servicesPath, opts.RequirePrivilegeDrop); err == nil {
+	// Sidecar services bind host ports; skipped under tmux to avoid collisions.
+	if data, err := runReadServicesYAML(servicesPath, opts.RequirePrivilegeDrop); err == nil && !tmuxRuntimeMode {
 		var specs []api.ServiceSpec
 		if err := yaml.Unmarshal(data, &specs); err != nil {
 			log.Error("Failed to parse scion-services.yaml: %v", err)
@@ -917,7 +956,8 @@ func RunInit(args []string, opts InitRunOptions) int {
 
 	// Start GCP metadata server if configured
 	var metadataServer *metadata.Server
-	if metaCfg := metadata.ConfigFromEnv(); metaCfg != nil {
+	// The GCP metadata server binds 169.254.169.254; not feasible on the host (tmux runtime).
+	if metaCfg := metadata.ConfigFromEnv(); metaCfg != nil && !tmuxRuntimeMode {
 		// Remove pre-existing gcloud configuration state so that gcloud
 		// re-initializes and discovers the emulated metadata server via
 		// GCE_METADATA_ROOT. gcloud only checks for the metadata server
@@ -1011,6 +1051,14 @@ func RunInit(args []string, opts InitRunOptions) int {
 
 	// Create supervisor with configuration
 	config := harnessSupervisorConfig(opts, gracePeriod, targetUID, targetGID, rootless, harnessEnvOverlay, nativeTelemetryPolicy, secretOverrides)
+	if tmuxRuntimeMode {
+		// Inherit the operator's environment unchanged: no credential drop,
+		// no HOME/USER/LOGNAME rewrite.
+		config.UID = 0
+		config.GID = 0
+		config.Username = ""
+		config.Rootless = false
+	}
 	sup := supervisor.New(config)
 
 	// Create a cancellable context for graceful shutdown
@@ -1051,11 +1099,18 @@ func RunInit(args []string, opts InitRunOptions) int {
 	// passed in. The agent runtime waits on these before pasting a buffered
 	// message. Failure only means the runtime falls back to its session-age
 	// check, so it is not fatal.
+	// In tmux runtime mode the harness shares the host's /tmp with every
+	// other agent and the runtime does not probe readiness, so no files are
+	// written.
 	readySpec := hooks.LoadReadySpec(os.Getenv)
-	readyNonce, err := writeInitRunFile(readySpec)
-	if err != nil {
-		log.Warn("Harness readiness: writing init-run file: %v", err)
-		readyNonce = ""
+	readyNonce := ""
+	if !tmuxRuntimeMode {
+		var err error
+		readyNonce, err = writeInitRunFile(readySpec)
+		if err != nil {
+			log.Warn("Harness readiness: writing init-run file: %v", err)
+			readyNonce = ""
+		}
 	}
 	readyMode := state.ReadyModeForStrategy(readySpec.Strategy)
 	harnessLaunchedAt := time.Now()
@@ -3521,7 +3576,7 @@ func buildAuthenticatedURL(cloneURL, token string) string {
 // It scans all arguments because the harness binary may not be the first
 // argument (e.g. "tmux new-session -s scion claude --no-chrome ...").
 // It also handles the case where the harness command is joined into a single
-// string passed to tmux (e.g. "claude --no-chrome --dangerously-skip-permissions").
+// string passed to tmux (e.g. "claude --no-chrome --permission-mode bypassPermissions").
 func isClaude(childArgs []string) bool {
 	for _, arg := range childArgs {
 		// Split on whitespace to handle joined command strings

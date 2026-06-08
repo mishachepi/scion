@@ -83,6 +83,7 @@ func (s execSite) String() string {
 // Reasons shared by several execSiteAllowlist entries.
 const (
 	reasonCloneCredential  = "runs as the workload uid via Credential whenever uid>0"
+	reasonTmuxHostOnly     = "tmux runtime only: runs as the operator on the broker host, never in a root container context"
 	reasonDropOrFailClosed = "runs as the workload uid via Credential whenever UID/GID>0, or fails closed under RequirePrivilegeDrop"
 )
 
@@ -100,6 +101,13 @@ const (
 // Changing a listed call's text, moving it into a different function, or
 // adding a second identical call all produce an unlisted site.
 var execSiteAllowlist = map[execSite]string{
+	// tmux runtime status hooks (pkg/sciontool/hooks/handlers): reachable
+	// only when $TMUX_PANE is set, i.e. under the tmux runtime, where
+	// sciontool runs as the operator on the broker host rather than as root
+	// in a container. tmux is operator-installed there (e.g. Homebrew, not
+	// root-owned), so rootexec.Resolve would refuse it; $SCION_TMUX_BIN or
+	// "tmux" from the operator's PATH is the intended binary.
+	{File: "pkg/sciontool/hooks/handlers/tmux_status.go", Func: "defaultRunTmux", Call: "exec.Command(bin, args...)"}: reasonTmuxHostOnly,
 	// gitCloneWorkspace's clone-path git calls (including detectDefaultBranch,
 	// which it calls into): configureGitCommand sets a Credential to (uid,
 	// gid) whenever uid > 0, so the process runs as the workload's own
