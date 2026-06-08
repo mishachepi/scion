@@ -42,12 +42,13 @@ A **Template** is a blueprint for creating an agent. It defines the base configu
 
 
 ### Runtime
-The **Runtime** is the infrastructure layer responsible for executing the agent containers.
-- Scion abstracts the container execution, allowing it to support different backends.
+The **Runtime** is the infrastructure layer responsible for executing the agent containers — or, in one case, the agent host processes.
+- Scion abstracts the execution layer, allowing it to support different backends.
 - **Docker**: The standard runtime for Linux and macOS.
 - **Podman**: A daemonless, rootless alternative to Docker for Linux and macOS.
 - **Apple Container**: Uses the native Virtualization Framework on macOS for improved performance.
 - **Kubernetes**: Allows running agents as Pods in a Kubernetes cluster, enabling remote execution and scaling at production scale.
+- **tmux** (host execution): Runs each agent as a plain host process inside a tmux window. No container, no image, no isolation boundary — for trusted local development where the container overhead isn't justified. See [The tmux Runtime](/scion/local/tmux-runtime/).
 
 ### Runtime Broker
 A **Runtime Broker** is a *service* that manages the lifecycle of containerized agents on behalf of the **Hub** — it is not itself a compute node. It provisions workspaces, hydrates templates, streams logs, and delegates container operations to a pluggable **Runtime**.
