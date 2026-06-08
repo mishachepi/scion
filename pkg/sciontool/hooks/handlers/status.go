@@ -42,6 +42,10 @@ type StatusHandler struct {
 
 	// lockOpts tunes the agent-info lock. Tests shorten the wait.
 	lockOpts agentinfolock.Options
+	// tmuxSink, when non-nil, mirrors activity to tmux user-options
+	// after each successful JSON write. Tests construct StatusHandler
+	// directly without a sink — production builds via NewStatusHandler.
+	tmuxSink *TmuxStatusSink
 
 	mu sync.Mutex
 }
@@ -81,6 +85,7 @@ func NewStatusHandler() *StatusHandler {
 	}
 	return &StatusHandler{
 		StatusPath: filepath.Join(home, "agent-info.json"),
+		tmuxSink:   NewTmuxStatusSink(),
 	}
 }
 
@@ -874,6 +879,10 @@ func (h *StatusHandler) writeAgentInfoLocked(info map[string]interface{}) error 
 	// can read and converge the file after the container exits.
 	if err := dirfd.WriteFileNoFollow(h.StatusPath, data, 0644, 0, 0, dirfd.ReplaceLeaf); err != nil {
 		return fmt.Errorf("writing %s: %w", h.StatusPath, err)
+	}
+	if h.tmuxSink != nil {
+		activity, _ := info["activity"].(string)
+		h.tmuxSink.Apply(state.Activity(activity))
 	}
 	return nil
 }
