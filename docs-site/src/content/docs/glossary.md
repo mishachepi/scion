@@ -60,7 +60,7 @@ The helper utility injected into every agent container for status reporting, met
 A feature that allows exposing local HTTP ports running inside an agent container through the Hub as authenticated, reverse-proxied URLs. Built on an outbound WebSocket reverse tunnel.
 
 ### Runtime
-The container technology that executes an agent's container: Docker, Podman, Apple Container, or Kubernetes.
+The technology that executes an agent. Container backends: Docker, Podman, Apple Container, or Kubernetes; the **tmux** backend runs agents as host processes inside tmux windows with no container — see [The tmux Runtime](/scion/local/tmux-runtime/).
 
 ### Workspace
 The working directory mounted into a single agent's container at `/workspace`. How it is provisioned across a project's agents is set by the project's **workspace sharing mode**.
