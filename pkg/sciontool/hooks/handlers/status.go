@@ -24,6 +24,11 @@ type StatusHandler struct {
 	// StatusPath is the path to the agent-info.json file.
 	StatusPath string
 
+	// tmuxSink, when non-nil, mirrors activity to tmux user-options
+	// after each successful JSON write. Tests construct StatusHandler
+	// directly without a sink — production builds via NewStatusHandler.
+	tmuxSink *TmuxStatusSink
+
 	mu sync.Mutex
 }
 
@@ -35,6 +40,7 @@ func NewStatusHandler() *StatusHandler {
 	}
 	return &StatusHandler{
 		StatusPath: filepath.Join(home, "agent-info.json"),
+		tmuxSink:   NewTmuxStatusSink(),
 	}
 }
 
@@ -257,6 +263,10 @@ func (h *StatusHandler) writeAgentInfoLocked(info map[string]interface{}) error 
 		return fmt.Errorf("atomic rename: %w", err)
 	}
 
+	if h.tmuxSink != nil {
+		activity, _ := info["activity"].(string)
+		h.tmuxSink.Apply(state.Activity(activity))
+	}
 	return nil
 }
 
