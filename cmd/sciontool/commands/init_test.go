@@ -163,6 +163,53 @@ func TestInitCommand_GracePeriodFlag(t *testing.T) {
 	}
 }
 
+func TestInitCommand_TmuxRuntimeFlag(t *testing.T) {
+	flag := initCmd.Flags().Lookup("tmuxruntime")
+	if flag == nil {
+		t.Fatal("tmuxruntime flag not registered")
+	}
+	if flag.DefValue != "false" {
+		t.Errorf("tmuxruntime default = %q, want %q (must be opt-in)", flag.DefValue, "false")
+	}
+}
+
+// TestInitCommand_TmuxRuntimeIntegration verifies that sciontool init
+// --tmuxruntime runs the child command without attempting the container-only
+// privilege drop or other host-hostile operations.
+func TestInitCommand_TmuxRuntimeIntegration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	scrubHubEnv(t)
+
+	binPath := filepath.Join(t.TempDir(), "sciontool-test")
+	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", binPath, "../")
+	if err := cmd.Run(); err != nil {
+		t.Skipf("failed to build sciontool for integration test: %v", err)
+	}
+
+	// SCION_AGENT_HOME points at a tmp dir so that any (unexpected) writes
+	// inside sciontool's tmux branch land here, not in the operator's HOME.
+	agentHome := t.TempDir()
+	testCmd := exec.Command(binPath, "init", "--tmuxruntime", "--", "echo", "tmux-ok")
+	testCmd.Env = append(filterHubEnv(os.Environ()), "SCION_AGENT_HOME="+agentHome)
+	output, err := testCmd.CombinedOutput()
+	if err != nil {
+		t.Errorf("--tmuxruntime init failed: %v\noutput: %s", err, output)
+	}
+	if !strings.Contains(string(output), "tmux-ok") {
+		t.Errorf("child stdout missing 'tmux-ok'; output: %s", output)
+	}
+	if !strings.Contains(string(output), "tmux runtime mode") {
+		t.Errorf("expected log line confirming tmux runtime mode; output: %s", output)
+	}
+	// Container-only artifacts must NOT appear under SCION_AGENT_HOME in
+	// tmux mode (writeEnvFile and the Claude debug munging are both skipped).
+	if _, err := os.Stat(filepath.Join(agentHome, ".scion", "scion-env")); err == nil {
+		t.Errorf("scion-env was written under SCION_AGENT_HOME in tmux runtime mode (writeEnvFile not skipped)")
+	}
+}
+
 // TestInitCommand_Integration performs an integration test with a real subprocess.
 // This is skipped in short mode as it involves actual process execution.
 func TestInitCommand_Integration(t *testing.T) {
@@ -702,7 +749,7 @@ func TestIsClaude(t *testing.T) {
 		{name: "claude-code variant", args: []string{"claude-code"}, expected: true},
 		{name: "tmux wrapping claude", args: []string{"tmux", "new-session", "-s", "scion", "claude", "--no-chrome"}, expected: true},
 		{name: "tmux wrapping claude full path", args: []string{"tmux", "new-session", "-s", "scion", "/usr/local/bin/claude"}, expected: true},
-		{name: "tmux with joined cmdline", args: []string{"tmux", "new-session", "-s", "scion", "claude --no-chrome --dangerously-skip-permissions"}, expected: true},
+		{name: "tmux with joined cmdline", args: []string{"tmux", "new-session", "-s", "scion", "claude --no-chrome --permission-mode bypassPermissions"}, expected: true},
 		{name: "tmux with joined cmdline full path", args: []string{"tmux", "new-session", "-s", "scion", "/usr/local/bin/claude --no-chrome"}, expected: true},
 		{name: "gemini binary", args: []string{"gemini"}, expected: false},
 		{name: "bash command", args: []string{"bash", "-c", "echo hello"}, expected: false},
