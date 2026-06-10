@@ -248,9 +248,11 @@ func (s runtimeSelection) build() Runtime {
 		switch rtConfig.HomeMode {
 		case "", HomeModeAgent:
 			tr.HomeMode = HomeModeAgent
+		case HomeModeSystem:
+			tr.HomeMode = HomeModeSystem
 		default:
-			return &ErrorRuntime{Err: fmt.Errorf("tmux runtime: invalid home_mode %q (only %q is supported)",
-				rtConfig.HomeMode, HomeModeAgent)}
+			return &ErrorRuntime{Err: fmt.Errorf("tmux runtime: invalid home_mode %q (want %q or %q)",
+				rtConfig.HomeMode, HomeModeAgent, HomeModeSystem)}
 		}
 		tr.Sciontool = resolveSciontool(rtConfig.Sciontool)
 		return tr
