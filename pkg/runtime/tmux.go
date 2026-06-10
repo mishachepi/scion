@@ -43,6 +43,12 @@ const (
 	tmuxLabelPrefix      = "@scion-label-"
 	tmuxAnnotationPrefix = "@scion-annotation-"
 	tmuxWorkspaceOption  = "@scion-workspace"
+	// tmuxPaneOption persists the agent's pane_id on the window so
+	// send-keys/paste-buffer target the agent's pane explicitly, even
+	// after a user-driven split shifts "the active pane" or a tmux
+	// server restart re-issues pane_ids. Refreshed by sciontool's
+	// SessionStart hook (see pkg/sciontool/hooks/handlers/tmux_pane.go).
+	tmuxPaneOption = "@scion-pane"
 )
 
 // ValidateTmuxSessionName rejects names tmux would misparse as target
@@ -281,7 +287,56 @@ func (r *TmuxRuntime) applyMetadata(ctx context.Context, target string, config R
 			return err
 		}
 	}
+	r.persistPaneID(ctx, target)
 	return nil
+}
+
+// persistPaneID reads the window's current pane_id and writes it to the
+// @scion-pane user-option. Best-effort — failure is logged-then-ignored
+// since the value is a routing optimization, not a correctness invariant.
+func (r *TmuxRuntime) persistPaneID(ctx context.Context, target string) {
+	out, err := exec.CommandContext(ctx, r.Command,
+		"display-message", "-p", "-t", target, "#{pane_id}").Output()
+	if err != nil {
+		return
+	}
+	pane := strings.TrimSpace(string(out))
+	if pane == "" {
+		return
+	}
+	_ = r.setUserOption(ctx, target, tmuxPaneOption, pane)
+}
+
+// resolvePaneTarget returns the agent's pane_id from the window's
+// @scion-pane user-option, falling back to the window target when the
+// option is missing or malformed — keeps legacy windows working without
+// backfill. tmux pane_ids always start with '%', so anything else is
+// rejected (covers empty values and noisy fake-tmux test doubles).
+func (r *TmuxRuntime) resolvePaneTarget(ctx context.Context, target string) string {
+	out, err := exec.CommandContext(ctx, r.Command,
+		"show-option", "-w", "-v", "-t", target, tmuxPaneOption).Output()
+	if err != nil {
+		return target
+	}
+	pane := strings.TrimSpace(string(out))
+	if !strings.HasPrefix(pane, "%") {
+		return target
+	}
+	return pane
+}
+
+// needsPaneTarget reports whether a tmux subcommand operates on a pane
+// (vs. a window/session). For pane-level subcommands we route through
+// resolvePaneTarget so user-driven splits don't misdirect input.
+func needsPaneTarget(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "send-keys", "paste-buffer", "display-message", "capture-pane":
+		return true
+	}
+	return false
 }
 
 // setUserOption persists a tmux user-option at window scope. The -w flag is
@@ -305,7 +360,8 @@ func (r *TmuxRuntime) Stop(ctx context.Context, id string) error {
 	if !r.windowExists(ctx, id) {
 		return nil
 	}
-	_, _ = exec.CommandContext(ctx, r.Command, "send-keys", "-t", id, "C-c").CombinedOutput()
+	sendTarget := r.resolvePaneTarget(ctx, id)
+	_, _ = exec.CommandContext(ctx, r.Command, "send-keys", "-t", sendTarget, "C-c").CombinedOutput()
 	return r.killWindow(ctx, id)
 }
 
@@ -564,7 +620,11 @@ func (r *TmuxRuntime) Exec(ctx context.Context, id string, cmd []string) (string
 			}
 			return "", fmt.Errorf("tmux runtime: agent window %s not found", id)
 		}
-		rewritten := rewriteTmuxTarget(cmd[1:], id)
+		effectiveTarget := id
+		if needsPaneTarget(cmd[1:]) {
+			effectiveTarget = r.resolvePaneTarget(ctx, id)
+		}
+		rewritten := rewriteTmuxTarget(cmd[1:], effectiveTarget)
 		out, err := exec.CommandContext(ctx, r.Command, rewritten...).CombinedOutput()
 		if err != nil {
 			return string(out), fmt.Errorf("tmux %s on %s: %w (output: %s)",
