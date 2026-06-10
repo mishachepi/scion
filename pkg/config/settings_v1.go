@@ -903,8 +903,9 @@ type V1RuntimeConfig struct {
 	// kubernetes.namespace (see note 11 in scion-mch/).
 	DefaultTmuxSession string `json:"default_tmux_session,omitempty" yaml:"default_tmux_session,omitempty" koanf:"default_tmux_session"`
 
-	// HomeMode controls HOME handling for tmux-runtime agents. Currently
-	// only "agent" is supported (default; HOME=<agentHome>).
+	// HomeMode controls HOME handling for tmux-runtime agents.
+	// "agent" (default; HOME=<agentHome>) for full isolation.
+	// "system" preserves operator HOME and only exports SCION_AGENT_HOME.
 	HomeMode string `json:"home_mode,omitempty" yaml:"home_mode,omitempty" koanf:"home_mode"`
 
 	// Sciontool is the absolute path to the sciontool binary used to wrap
