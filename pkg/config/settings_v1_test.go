@@ -3549,7 +3549,8 @@ func TestValidateSettings_TmuxHomeModeEnum(t *testing.T) {
 		wantErr bool
 	}{
 		{"agent", false},
-		{"system", true},
+		{"system", false},
+		{"mixed", true},
 		{"nonsense", true},
 		{"AGENT", true}, // case-sensitive enum
 	}

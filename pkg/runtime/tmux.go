@@ -31,11 +31,10 @@ import (
 // is unset.
 const DefaultTmuxSession = "scion"
 
-// HomeMode values for TmuxRuntime.HomeMode. Only "agent" is supported today;
-// the field reserves space for additional modes (e.g. preserving the operator's
-// $HOME) that will land in follow-up changes.
+// HomeMode values for TmuxRuntime.HomeMode. Empty defaults to HomeModeAgent.
 const (
-	HomeModeAgent = "agent"
+	HomeModeAgent  = "agent"
+	HomeModeSystem = "system"
 )
 
 // User-option key namespaces. tmux requires user-option names to start with "@".
@@ -181,15 +180,17 @@ func (r *TmuxRuntime) buildNewWindowArgs(config RunConfig) ([]string, error) {
 	args = append(args, r.buildEnvFlags(config)...)
 	// Harnesses emit container-side paths (e.g. /home/scion/.gemini/...);
 	// rewrite to host-side agentHome so they resolve under tmux.
-	containerHome := util.GetHomeDir(config.UnixUsername)
-	for k, v := range harnessEnv {
-		if k == "" || v == "" {
-			continue
+	if r.HomeMode != HomeModeSystem {
+		containerHome := util.GetHomeDir(config.UnixUsername)
+		for k, v := range harnessEnv {
+			if k == "" || v == "" {
+				continue
+			}
+			if containerHome != "" && strings.HasPrefix(v, containerHome+"/") {
+				v = config.HomeDir + v[len(containerHome):]
+			}
+			args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
 		}
-		if containerHome != "" && strings.HasPrefix(v, containerHome+"/") {
-			v = config.HomeDir + v[len(containerHome):]
-		}
-		args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
 	}
 	// -P -F prints the new window_id on stdout.
 	args = append(args, "-P", "-F", "#{window_id}")
@@ -226,10 +227,14 @@ func (r *TmuxRuntime) ensureSession(ctx context.Context) error {
 	return nil
 }
 
-// buildEnvFlags produces tmux -e KEY=VAL flags. HOME is overridden to
-// config.HomeDir so the agent sees a private state directory; SCION_AGENT and
-// SCION_AGENT_HOME identify the agent to in-window tooling.
+// buildEnvFlags produces tmux -e KEY=VAL flags. SCION_AGENT_HOME is always
+// emitted; everything else depends on r.HomeMode. HomeModeSystem returns
+// exactly `-e SCION_AGENT_HOME=<agentHome>` and nothing more.
 func (r *TmuxRuntime) buildEnvFlags(config RunConfig) []string {
+	if r.HomeMode == HomeModeSystem {
+		return []string{"-e", fmt.Sprintf("SCION_AGENT_HOME=%s", config.HomeDir)}
+	}
+
 	entries := []string{
 		fmt.Sprintf("HOME=%s", config.HomeDir),
 		fmt.Sprintf("SCION_AGENT=%s", config.Name),

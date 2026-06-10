@@ -916,7 +916,7 @@ func TestTmuxRuntime_BuildEnvFlags_AgentModeDefaultBackCompat(t *testing.T) {
 }
 
 func TestTmuxRuntime_BuildEnvFlags_ScionAgentHomeAlwaysSet(t *testing.T) {
-	for _, mode := range []string{"", HomeModeAgent} {
+	for _, mode := range []string{"", HomeModeAgent, HomeModeSystem} {
 		t.Run("mode="+mode, func(t *testing.T) {
 			r := &TmuxRuntime{HomeMode: mode}
 			flags := r.buildEnvFlags(RunConfig{HomeDir: "/agent-home", Name: "a"})
@@ -924,6 +924,50 @@ func TestTmuxRuntime_BuildEnvFlags_ScionAgentHomeAlwaysSet(t *testing.T) {
 				t.Errorf("SCION_AGENT_HOME missing in HomeMode=%q: %v", mode, flags)
 			}
 		})
+	}
+}
+
+// SystemMode = absolute minimum. Exactly one -e flag, exactly SCION_AGENT_HOME.
+// No HOME, no SCION_AGENT, no SCION_PROJECT, no Env passthrough, no resolved
+// secrets, no *_CONFIG_DIR, nothing else. Load-bearing contract for the mode.
+func TestTmuxRuntime_BuildEnvFlags_SystemModeOnlyScionAgentHome(t *testing.T) {
+	r := &TmuxRuntime{HomeMode: HomeModeSystem}
+	flags := r.buildEnvFlags(RunConfig{
+		HomeDir:   "/agent-home",
+		Name:      "agent-1",
+		Project:   "myproj",
+		ProjectID: "id-7",
+		Env:       []string{"FOO=bar"},
+		ResolvedSecrets: []api.ResolvedSecret{
+			{Type: "environment", Target: "ANTHROPIC_API_KEY", Value: "sk-test"},
+		},
+		Harness: &stubHarness{name: "claude"},
+	})
+	want := []string{"-e", "SCION_AGENT_HOME=/agent-home"}
+	if !slices.Equal(flags, want) {
+		t.Errorf("system mode buildEnvFlags = %v, want %v (exactly one entry)", flags, want)
+	}
+}
+
+// SystemMode also suppresses harness env passthrough done in buildNewWindowArgs.
+func TestTmuxRuntime_BuildNewWindowArgs_SystemModeSkipsHarnessEnv(t *testing.T) {
+	r := &TmuxRuntime{Command: "tmux", Session: "scion", HomeMode: HomeModeSystem}
+	args, err := r.buildNewWindowArgs(RunConfig{
+		Name:    "agent-1",
+		HomeDir: "/agent-home",
+		Harness: &MockHarness{},
+	})
+	if err != nil {
+		t.Fatalf("buildNewWindowArgs: %v", err)
+	}
+	eCount := 0
+	for _, a := range args {
+		if a == "-e" {
+			eCount++
+		}
+	}
+	if eCount != 1 {
+		t.Errorf("system mode emitted %d -e flags, want exactly 1 (SCION_AGENT_HOME): args=%v", eCount, args)
 	}
 }
 
