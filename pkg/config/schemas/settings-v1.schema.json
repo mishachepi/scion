@@ -289,8 +289,8 @@
         },
         "home_mode": {
           "type": "string",
-          "enum": ["agent"],
-          "description": "tmux runtime: HOME handling. Currently only 'agent' (default) is supported — overrides HOME=<agentHome>."
+          "enum": ["agent", "system"],
+          "description": "tmux runtime: HOME handling. 'agent' (default) overrides HOME=<agentHome>. 'system' preserves operator HOME and only exports SCION_AGENT_HOME."
         },
         "sciontool": {
           "type": "string",
