@@ -108,6 +108,7 @@ var execSiteAllowlist = map[execSite]string{
 	// root-owned), so rootexec.Resolve would refuse it; $SCION_TMUX_BIN or
 	// "tmux" from the operator's PATH is the intended binary.
 	{File: "pkg/sciontool/hooks/handlers/tmux_status.go", Func: "defaultRunTmux", Call: "exec.Command(bin, args...)"}: reasonTmuxHostOnly,
+	{File: "pkg/sciontool/hooks/handlers/tmux_pane.go", Func: "NewTmuxPaneSink", Call: "exec.Command(bin, args...)"}:  reasonTmuxHostOnly,
 	// gitCloneWorkspace's clone-path git calls (including detectDefaultBranch,
 	// which it calls into): configureGitCommand sets a Credential to (uid,
 	// gid) whenever uid > 0, so the process runs as the workload's own
