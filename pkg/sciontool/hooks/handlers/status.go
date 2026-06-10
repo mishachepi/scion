@@ -47,6 +47,11 @@ type StatusHandler struct {
 	// directly without a sink — production builds via NewStatusHandler.
 	tmuxSink *TmuxStatusSink
 
+	// tmuxPaneSink, when non-nil, refreshes @scion-pane on SessionStart
+	// so `scion message` keeps targeting the agent's pane after tmux
+	// server restart or user-driven pane shuffles.
+	tmuxPaneSink *TmuxPaneSink
+
 	mu sync.Mutex
 }
 
@@ -84,8 +89,9 @@ func NewStatusHandler() *StatusHandler {
 		home = "/home/scion"
 	}
 	return &StatusHandler{
-		StatusPath: filepath.Join(home, "agent-info.json"),
-		tmuxSink:   NewTmuxStatusSink(),
+		StatusPath:   filepath.Join(home, "agent-info.json"),
+		tmuxSink:     NewTmuxStatusSink(),
+		tmuxPaneSink: NewTmuxPaneSink(),
 	}
 }
 
@@ -212,6 +218,14 @@ func (h *StatusHandler) Handle(event *hooks.Event) error {
 	// with no parent tool-end left to clear the wait.
 	if event.Name == hooks.EventSubagentEnd && isSubagentEvent(event) {
 		return h.releaseNotificationWaitOwner(subagentID(event))
+	}
+
+	// Refresh the pane-id mapping on session-level start events. Covers
+	// tmux server restart (new pane_ids) and any case where the agent's
+	// pane moved since launch. Cheap enough to run on every SessionStart
+	// — one tmux set-option per Claude/Codex/Gemini session boundary.
+	if h.tmuxPaneSink != nil && event.Name == hooks.EventSessionStart {
+		h.tmuxPaneSink.Apply()
 	}
 
 	result := eventToPhaseActivity(event)
