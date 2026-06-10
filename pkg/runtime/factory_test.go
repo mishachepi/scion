@@ -250,6 +250,37 @@ active_profile: apple
 		}
 	})
 
+	t.Run("Tmux_HomeMode_System", func(t *testing.T) {
+		tmpHome := t.TempDir()
+		t.Setenv("HOME", tmpHome)
+		globalDir := filepath.Join(tmpHome, ".scion")
+		if err := os.MkdirAll(globalDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		settings := `
+schema_version: "1"
+active_profile: tmux
+runtimes:
+  tmux:
+    type: tmux
+    home_mode: system
+profiles:
+  tmux:
+    runtime: tmux
+`
+		if err := os.WriteFile(filepath.Join(globalDir, "settings.yaml"), []byte(settings), 0644); err != nil {
+			t.Fatal(err)
+		}
+		r := GetRuntime("", "")
+		tr, ok := r.(*TmuxRuntime)
+		if !ok {
+			t.Fatalf("expected *TmuxRuntime, got %T", r)
+		}
+		if tr.HomeMode != HomeModeSystem {
+			t.Errorf("HomeMode = %q, want %q", tr.HomeMode, HomeModeSystem)
+		}
+	})
+
 	t.Run("Tmux_HomeMode_InvalidRejected", func(t *testing.T) {
 		tmpHome := t.TempDir()
 		t.Setenv("HOME", tmpHome)
