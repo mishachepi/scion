@@ -468,10 +468,17 @@ func TestHubMethods(t *testing.T) {
 			wantExplicitlyDisabled: false,
 		},
 		{
-			name:                   "hub with endpoint, token, and enabled=false overrides to enabled",
+			name:                   "explicit enabled=false wins over implicit credentials",
 			hub:                    &HubClientConfig{Endpoint: "https://hub.example.com", Token: "scion_pat_xxx", Enabled: &falseBool},
 			wantConfigured:         true,
-			wantEnabled:            true,
+			wantEnabled:            false,
+			wantExplicitlyDisabled: true,
+		},
+		{
+			name:                   "explicit enabled=false wins over implicit apiKey credentials",
+			hub:                    &HubClientConfig{Endpoint: "https://hub.example.com", APIKey: "key123", Enabled: &falseBool},
+			wantConfigured:         true,
+			wantEnabled:            false,
 			wantExplicitlyDisabled: true,
 		},
 	}
