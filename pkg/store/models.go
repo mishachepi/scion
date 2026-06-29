@@ -229,14 +229,15 @@ const (
 	LabelTemplate = "scion.io/template"
 )
 
-// Workspace mode constants for git projects.
-// When a git project has the workspace mode label set to "shared", it uses a
-// single shared clone mounted by all agents instead of per-agent clones.
+// Workspace mode constants control how agents share or isolate the project
+// workspace. Set via the scion.dev/workspace-mode label on a project; "shared"
+// and "worktree-per-agent" apply to git projects, "in-place" applies to both.
 const (
 	LabelWorkspaceMode            = "scion.dev/workspace-mode"
 	WorkspaceModeShared           = "shared"
 	WorkspaceModePerAgent         = "per-agent"
 	WorkspaceModeWorktreePerAgent = "worktree-per-agent"
+	WorkspaceModeInPlace          = "in-place"
 )
 
 // WorkspaceSharingMode is the canonical set of workspace sharing modes from the
@@ -384,6 +385,13 @@ func (p *Project) IsWorktreePerAgent() bool {
 // IsTemplate returns true if this project is marked as a project template.
 func (p *Project) IsTemplate() bool {
 	return p.Labels[LabelTemplate] == "true"
+}
+
+// IsInPlace returns true if this project is configured to run every agent
+// directly in the project root, with no per-agent worktree or shared clone.
+// Unlike IsSharedWorkspace, this mode does not require a git remote.
+func (p *Project) IsInPlace() bool {
+	return p.Labels[LabelWorkspaceMode] == WorkspaceModeInPlace
 }
 
 // RuntimeBroker represents a compute node in the Hub database.

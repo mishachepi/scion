@@ -471,8 +471,16 @@ func (d *HTTPAgentDispatcher) buildCreateRequest(ctx context.Context, agent *sto
 		// provisioning (HTTPS + GitHub token) rather than worktree-based,
 		// ensuring a consistent workspace strategy regardless of whether
 		// the broker happens to have the repo locally.
+		//
+		// Exception: in-place projects. Hub passes the explicit execution
+		// workspace (project root) and clears GitClone so the broker takes
+		// the explicit-Workspace branch in provision.go instead of cloning
+		// into a per-agent worktree.
 		if projectInfo.projectPath != "" {
-			if workspace == "" || filepath.IsAbs(workspace) {
+			if projectInfo.workspace != "" {
+				workspace = projectInfo.workspace
+				gitClone = nil
+			} else if workspace == "" || filepath.IsAbs(workspace) {
 				workspace = ""
 			}
 			// else: relative workspace -- keep it; broker joins with its own project root
@@ -882,6 +890,7 @@ type projectDispatchInfo struct {
 	sharedDirs      []api.SharedDir
 	sharedWorkspace bool   // true for git-workspace hybrid projects
 	workspaceMode   string // resolved workspace mode label (e.g. "shared", "worktree-per-agent")
+	workspace       string // explicit execution workspace (Case 1 in provision.go); set for in-place projects
 }
 
 //nolint:unused // Kept for dispatcher compatibility while dispatch paths are split.
@@ -922,6 +931,24 @@ func (d *HTTPAgentDispatcher) resolveDispatchProjectInfo(ctx context.Context, ag
 			info.projectPath = provider.LocalPath
 			if d.debug {
 				d.log.Debug("Found project path for broker", "brokerID", agent.RuntimeBrokerID, "path", info.projectPath)
+			}
+			// For in-place projects, derive the execution workspace so every
+			// agent lands in the project root rather than a per-agent
+			// worktree. Two LocalPath conventions coexist today:
+			//   - CLI (scion hub link): LocalPath includes the .scion suffix
+			//     (e.g. "/Volumes/data/.scion") — take the parent.
+			//   - Web UI (/api/v1/system/fs/validate-path): LocalPath is the
+			//     project root itself (e.g. "/Volumes/data") — use as-is.
+			if project.IsInPlace() {
+				ws := provider.LocalPath
+				if filepath.Base(ws) == config.DotScion {
+					ws = filepath.Dir(ws)
+				}
+				info.workspace = ws
+				if d.debug {
+					d.log.Debug("In-place project: derived workspace from provider path",
+						"brokerID", agent.RuntimeBrokerID, "workspace", info.workspace)
+				}
 			}
 		}
 	}
