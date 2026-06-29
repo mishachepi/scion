@@ -75,6 +75,70 @@ func TestWorkspaceSharingMode_Constants(t *testing.T) {
 	}
 }
 
+func TestProject_IsInPlace(t *testing.T) {
+	tests := []struct {
+		name    string
+		project Project
+		want    bool
+	}{
+		{
+			name: "non-git project with in-place label",
+			project: Project{
+				Labels: map[string]string{LabelWorkspaceMode: WorkspaceModeInPlace},
+			},
+			want: true,
+		},
+		{
+			name: "git project with in-place label",
+			project: Project{
+				GitRemote: "github.com/test/repo",
+				Labels:    map[string]string{LabelWorkspaceMode: WorkspaceModeInPlace},
+			},
+			want: true,
+		},
+		{
+			name: "shared label",
+			project: Project{
+				Labels: map[string]string{LabelWorkspaceMode: WorkspaceModeShared},
+			},
+			want: false,
+		},
+		{
+			name: "per-agent label",
+			project: Project{
+				Labels: map[string]string{LabelWorkspaceMode: WorkspaceModePerAgent},
+			},
+			want: false,
+		},
+		{
+			name: "worktree-per-agent label",
+			project: Project{
+				Labels: map[string]string{LabelWorkspaceMode: WorkspaceModeWorktreePerAgent},
+			},
+			want: false,
+		},
+		{
+			name:    "no labels",
+			project: Project{GitRemote: "github.com/test/repo"},
+			want:    false,
+		},
+		{
+			name:    "empty project",
+			project: Project{},
+			want:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.project.IsInPlace()
+			if got != tt.want {
+				t.Errorf("IsInPlace() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestProject_IsWorktreePerAgent(t *testing.T) {
 	tests := []struct {
 		name    string
