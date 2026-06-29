@@ -219,6 +219,14 @@ func EnsureHubReady(projectPath string, opts EnsureHubReadyOptions) (*HubContext
 	// a hub-connected container (env vars like SCION_HUB_ENDPOINT are set).
 	// Inside containers, hub.enabled is not written to settings files, but
 	// the hub env vars signal that the Hub API should be used.
+	//
+	// An explicit hub.enabled=false in settings always wins — even over
+	// the hub-context env vars. Otherwise a user who set SCION_HUB_ENDPOINT
+	// for an ad-hoc local Hub would silently re-enable Hub mode for every
+	// project, including ones they have intentionally taken offline.
+	if settings.IsHubExplicitlyDisabled() {
+		return nil, nil
+	}
 	hubContext := config.IsHubContext()
 	if !settings.IsHubEnabled() && !hubContext {
 		return nil, nil
