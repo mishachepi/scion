@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -3114,6 +3115,145 @@ func TestHTTPAgentDispatcher_DispatchAgentCreate_PropagatesSharedWorkspace(t *te
 	}
 	if mockClient.lastCreateReq.Config.GitClone != nil {
 		t.Error("expected GitClone to be nil for shared-workspace project")
+	}
+}
+
+// TestHTTPAgentDispatcher_DispatchAgentCreate_InPlaceWorkspace verifies that
+// for projects labeled with workspace-mode=in-place, the Hub computes an
+// explicit execution workspace and propagates it via req.Config.Workspace so
+// the broker takes the explicit-Workspace branch in provision.go — landing
+// every agent in the project root rather than a per-agent worktree subdir.
+//
+// Two LocalPath conventions coexist and must both resolve to the same
+// project root: CLI (`scion hub link`) registers providers with the .scion
+// directory as LocalPath; the Web UI's /api/v1/system/fs/validate-path
+// returns the project root itself.
+func TestHTTPAgentDispatcher_DispatchAgentCreate_InPlaceWorkspace(t *testing.T) {
+	cases := []struct {
+		name          string
+		localPath     string // value stored on the provider
+		wantWorkspace string // expected Config.Workspace after dispatch
+		gitRemote     string // optional — set to exercise the git-clone bypass
+		gitClone      *api.GitCloneConfig
+	}{
+		{
+			name:          "CLI convention: LocalPath ends in /.scion",
+			localPath:     "/Volumes/data/.scion",
+			wantWorkspace: "/Volumes/data",
+		},
+		{
+			name:          "Web UI convention: LocalPath is project root",
+			localPath:     "/Volumes/data",
+			wantWorkspace: "/Volumes/data",
+		},
+		{
+			name:          "git project: GitClone is cleared",
+			localPath:     "/home/op/m-claude/.scion",
+			wantWorkspace: "/home/op/m-claude",
+			gitRemote:     "github.com/example/m-claude",
+			gitClone:      &api.GitCloneConfig{URL: "https://github.com/example/m-claude.git", Branch: "main"},
+		},
+	}
+
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			memStore := createTestStore(t)
+
+			projectID := tid(fmt.Sprintf("project-vault-%d", i))
+			brokerID := tid(fmt.Sprintf("broker-vault-%d", i))
+
+			project := &store.Project{
+				ID:        projectID,
+				Name:      "Obsidian Vault",
+				Slug:      fmt.Sprintf("obsidian-vault-%d", i),
+				GitRemote: tc.gitRemote,
+				Labels: map[string]string{
+					store.LabelWorkspaceMode: store.WorkspaceModeInPlace,
+				},
+			}
+			if err := memStore.CreateProject(ctx, project); err != nil {
+				t.Fatalf("failed to create project: %v", err)
+			}
+
+			broker := &store.RuntimeBroker{
+				ID:       brokerID,
+				Name:     "vault-host",
+				Slug:     fmt.Sprintf("vault-host-%d", i),
+				Endpoint: "http://localhost:9801",
+				Status:   store.BrokerStatusOnline,
+			}
+			if err := memStore.CreateRuntimeBroker(ctx, broker); err != nil {
+				t.Fatalf("failed to create runtime broker: %v", err)
+			}
+
+			provider := &store.ProjectProvider{
+				ProjectID:  projectID,
+				BrokerID:   brokerID,
+				BrokerName: "vault-host",
+				LocalPath:  tc.localPath,
+				Status:     store.BrokerStatusOnline,
+			}
+			if err := memStore.AddProjectProvider(ctx, provider); err != nil {
+				t.Fatalf("failed to add project provider: %v", err)
+			}
+
+			mockClient := &mockRuntimeBrokerClient{}
+			dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+
+			agent := &store.Agent{
+				ID:              fmt.Sprintf("agent-vault-%d", i),
+				Name:            "vault-agent",
+				Slug:            "vault-agent",
+				ProjectID:       projectID,
+				RuntimeBrokerID: brokerID,
+				AppliedConfig: &store.AgentAppliedConfig{
+					HarnessConfig: "claude",
+					// Any incoming workspace should be overridden by the in-place
+					// derivation; assert that explicitly below.
+					Workspace: "/should/be/replaced",
+					GitClone:  tc.gitClone,
+				},
+			}
+
+			if err := dispatcher.DispatchAgentCreate(ctx, agent); err != nil {
+				t.Fatalf("DispatchAgentCreate failed: %v", err)
+			}
+
+			if !mockClient.createCalled {
+				t.Fatal("expected CreateAgent to be called")
+			}
+			req := mockClient.lastCreateReq
+			if req.Config == nil {
+				t.Fatal("expected config to be present")
+			}
+
+			// ProjectPath must remain the provider LocalPath verbatim — broker
+			// uses it for the .scion directory lookup.
+			if req.ProjectPath != tc.localPath {
+				t.Errorf("ProjectPath = %q, want %q", req.ProjectPath, tc.localPath)
+			}
+
+			// Workspace must always be the project root regardless of LocalPath
+			// convention, so every in-place agent lands in the same directory.
+			if req.Config.Workspace != tc.wantWorkspace {
+				t.Errorf("Config.Workspace = %q, want %q", req.Config.Workspace, tc.wantWorkspace)
+			}
+
+			// In-place must NOT be confused with shared-workspace mode (which
+			// requires a git remote and triggers different broker behavior).
+			if req.Config.SharedWorkspace {
+				t.Error("expected SharedWorkspace=false for in-place project")
+			}
+
+			// GitClone MUST be cleared for in-place projects, even when the
+			// agent's AppliedConfig had it set. Otherwise provision.go takes
+			// the git-clone branch (cloning into .scion/agents/<n>/workspace/)
+			// before reaching Case 1 (explicit Workspace).
+			if req.Config.GitClone != nil {
+				t.Errorf("expected GitClone=nil for in-place project, got %+v", req.Config.GitClone)
+			}
+		})
 	}
 }
 
