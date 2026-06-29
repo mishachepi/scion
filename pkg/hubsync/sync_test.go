@@ -232,6 +232,48 @@ func TestEnsureHubReady_GlobalFallbackWithHubDisabled(t *testing.T) {
 	}
 }
 
+func TestEnsureHubReady_ExplicitDisableWinsOverHubContext(t *testing.T) {
+	// An explicit hub.enabled=false in settings must short-circuit before
+	// the IsHubContext() env-var check. Otherwise a user who exports
+	// SCION_HUB_ENDPOINT for an ad-hoc local Hub would re-enable Hub mode
+	// for every project, including ones they have intentionally disabled.
+
+	tmpHome := t.TempDir()
+	globalDir := filepath.Join(tmpHome, ".scion")
+	if err := os.MkdirAll(globalDir, 0755); err != nil {
+		t.Fatalf("Failed to create global dir: %v", err)
+	}
+	settingsContent := `hub:
+  enabled: false
+  endpoint: https://configured-but-disabled.example.com
+`
+	if err := os.WriteFile(filepath.Join(globalDir, "settings.yaml"), []byte(settingsContent), 0644); err != nil {
+		t.Fatalf("Failed to write settings: %v", err)
+	}
+
+	t.Setenv("HOME", tmpHome)
+	// Simulate the ad-hoc local-hub helper having exported its endpoint.
+	t.Setenv("SCION_HUB_ENDPOINT", "http://127.0.0.1:9810")
+
+	origDir, _ := os.Getwd()
+	if err := os.Chdir(tmpHome); err != nil {
+		t.Fatalf("Failed to chdir: %v", err)
+	}
+	defer os.Chdir(origDir)
+
+	hubCtx, err := EnsureHubReady("", EnsureHubReadyOptions{
+		SkipSync:    true,
+		AutoConfirm: true,
+	})
+	if err != nil {
+		t.Fatalf("EnsureHubReady returned error: %v", err)
+	}
+	if hubCtx != nil {
+		t.Error("EnsureHubReady should return nil when hub is explicitly disabled, " +
+			"even with SCION_HUB_ENDPOINT set")
+	}
+}
+
 func TestEnsureHubReady_HubContextEnvVars(t *testing.T) {
 	// When hub.enabled is NOT set in settings but SCION_HUB_ENDPOINT env var
 	// is present (inside a hub-connected container), EnsureHubReady should
