@@ -617,6 +617,14 @@ func (d *HTTPAgentDispatcher) buildCreateRequest(ctx context.Context, agent *sto
 		// repo locally.
 		workspace := effectiveDispatchWorkspace(agent.AppliedConfig.Workspace, projectInfo.projectPath)
 		wsSpec := workspaceSpecFor(agent, projectInfo.workspaceMode)
+		// Exception: in-place projects. Hub passes the explicit execution
+		// workspace (project root) and clears GitClone so the broker takes
+		// the explicit-Workspace branch in provision.go instead of cloning
+		// into a per-agent worktree.
+		if projectInfo.workspace != "" {
+			workspace = projectInfo.workspace
+			wsSpec.GitClone = nil
+		}
 		var remoteGCPIdentity *RemoteGCPIdentityConfig
 		if gcpID := agent.AppliedConfig.GCPIdentity; gcpID != nil {
 			remoteGCPIdentity = &RemoteGCPIdentityConfig{
@@ -1039,6 +1047,7 @@ type projectDispatchInfo struct {
 	sharedDirs      []api.SharedDir
 	sharedWorkspace bool   // true for git-workspace hybrid projects
 	workspaceMode   string // resolved workspace mode label (e.g. "shared", "worktree-per-agent")
+	workspace       string // explicit execution workspace (Case 1 in provision.go); set for in-place projects
 }
 
 func (d *HTTPAgentDispatcher) resolveDispatchProjectInfo(ctx context.Context, agent *store.Agent) projectDispatchInfo {
@@ -1073,6 +1082,24 @@ func (d *HTTPAgentDispatcher) resolveDispatchProjectInfo(ctx context.Context, ag
 			info.projectPath = provider.LocalPath
 			if d.debug {
 				d.log.Debug("Found project path for broker", "brokerID", agent.RuntimeBrokerID, "path", info.projectPath)
+			}
+			// For in-place projects, derive the execution workspace so every
+			// agent lands in the project root rather than a per-agent
+			// worktree. Two LocalPath conventions coexist today:
+			//   - CLI (scion hub link): LocalPath includes the .scion suffix
+			//     (e.g. "/Volumes/data/.scion") — take the parent.
+			//   - Web UI (/api/v1/system/fs/validate-path): LocalPath is the
+			//     project root itself (e.g. "/Volumes/data") — use as-is.
+			if project.IsInPlace() {
+				ws := provider.LocalPath
+				if filepath.Base(ws) == config.DotScion {
+					ws = filepath.Dir(ws)
+				}
+				info.workspace = ws
+				if d.debug {
+					d.log.Debug("In-place project: derived workspace from provider path",
+						"brokerID", agent.RuntimeBrokerID, "workspace", info.workspace)
+				}
 			}
 		}
 	}
@@ -2414,6 +2441,12 @@ func (d *HTTPAgentDispatcher) DispatchAgentStart(ctx context.Context, agent *sto
 	// who is dispatching this start (ptone/scion#1994), so the resolved set
 	// for a given agent is the same whether the creator, an admin, or a
 	// project owner starts it.
+	// In-place projects run in the project root and are never cloned: as in
+	// buildCreateRequest, drop GitClone so a start cannot recreate the
+	// workspace as a per-agent clone.
+	if projectInfo.workspace != "" {
+		wsSpec.GitClone = nil
+	}
 	extras := StartExtras{
 		HubEndpoint:          d.effectiveAgentHubEndpoint(),
 		UserID:               agent.OwnerID,
