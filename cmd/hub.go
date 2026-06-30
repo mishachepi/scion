@@ -34,6 +34,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/credentials"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubsync"
+	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/transportauth"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 	"github.com/GoogleCloudPlatform/scion/pkg/version"
@@ -224,15 +225,27 @@ This command associates your local project with the Hub, enabling:
 - Agent state synchronization
 - Remote management via the Hub UI or API
 
-The project will be created on the Hub if it doesn't exist, or linked
-to an existing project with a matching name or git remote.
+Default behavior matches by name or git remote: the project is created
+on the Hub when no match is found, or linked to the existing one.
+
+Use --new to force-create a fresh Hub project for the current directory,
+skipping name matching entirely. Intended for non-git in-place projects
+(Obsidian vaults, local KBs) where matching by name catches the wrong
+project. Combine with --name, --slug, --workspace-mode, and --label.
 
 Examples:
-  # Link the current project
+  # Link the current project (matching / discovery)
   scion hub link
 
   # Link the global project
-  scion hub link --global`,
+  scion hub link --global
+
+  # Force-create + link a fresh project for the current dir
+  scion hub link --new --name "Infra Main" --workspace-mode in-place
+
+  # Custom slug + extra labels
+  scion hub link --new --name infra-main --slug infra-main \
+    --workspace-mode in-place --label owner=mikhail --label team=ops`,
 	RunE: runHubLink,
 }
 
@@ -262,6 +275,17 @@ var (
 	hubProjectCreateName       string
 	hubProjectCreateBranch     string
 	hubProjectCreateVisibility string
+)
+
+// Flags for `scion hub link --new` (force-create + link in one shot,
+// bypassing name matching). Distinct from hubProjectCreate* since
+// `link --new` doesn't take a git URL and supports labels directly.
+var (
+	hubLinkNew              bool
+	hubLinkNewName          string
+	hubLinkNewSlug          string
+	hubLinkNewWorkspaceMode string
+	hubLinkNewLabels        []string
 )
 
 // hubProjectCreateCmd creates a project on the Hub from a git URL
@@ -337,6 +361,14 @@ func init() {
 	hubProjectsInfoCmd.Flags().BoolVar(&hubOutputJSON, "json", false, "Output in JSON format")
 	hubProjectsDeleteCmd.Flags().BoolVarP(&autoConfirm, "yes", "y", false, "Skip confirmation prompt")
 	hubProjectsDeleteCmd.Flags().BoolVar(&nonInteractive, "non-interactive", false, "Non-interactive mode: implies --yes, errors on ambiguous prompts")
+	// hub link --new flags: force-create a new Hub project for the current dir
+	// instead of matching an existing one. See scion-mch/13 for motivation.
+	hubLinkCmd.Flags().BoolVar(&hubLinkNew, "new", false, "Force-create a new Hub project (skip name matching). Combine with --name, --slug, --workspace-mode, --label.")
+	hubLinkCmd.Flags().StringVar(&hubLinkNewName, "name", "", "Display name for the new project (used with --new; defaults to cwd basename)")
+	hubLinkCmd.Flags().StringVar(&hubLinkNewSlug, "slug", "", "Slug for the new project (used with --new; defaults to slugify(--name) or basename(cwd))")
+	hubLinkCmd.Flags().StringVar(&hubLinkNewWorkspaceMode, "workspace-mode", "", "Workspace mode (used with --new): shared | per-agent | worktree-per-agent | in-place")
+	hubLinkCmd.Flags().StringSliceVar(&hubLinkNewLabels, "label", nil, "Project label in key=value form (used with --new; repeat for multiple)")
+
 	// Project create flags
 	hubProjectCreateCmd.Flags().StringVar(&hubProjectCreateSlug, "slug", "", "Override the auto-derived slug")
 	hubProjectCreateCmd.Flags().StringVar(&hubProjectCreateName, "name", "", "Human-friendly display name (defaults to repo name)")
@@ -2220,6 +2252,28 @@ func runHubLink(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("hub endpoint not configured: set SCION_HUB_ENDPOINT, hub.endpoint in settings.yaml, or use --hub flag")
 	}
 
+	// --new short-circuits to a force-create-and-link path that bypasses the
+	// matching/discovery flow below. Use case: non-git in-place projects
+	// (Obsidian vaults, local KBs) where matching by name picks the wrong
+	// existing project. See scion-mch/13 for design.
+	if hubLinkNew {
+		// Anchor the link to the current dir, NOT the global fallback. When
+		// no project flag is given and there's no existing .scion/ in cwd,
+		// ResolveProjectPath walks up and returns the global config dir,
+		// which would clobber global hub.projectId. --new must always create
+		// a fresh `<cwd>/.scion/` link unless --project / --global was
+		// passed explicitly.
+		if projectPath == "" && !globalMode && isGlobal {
+			wd, wdErr := os.Getwd()
+			if wdErr != nil {
+				return fmt.Errorf("failed to resolve current dir for --new: %w", wdErr)
+			}
+			resolvedPath = filepath.Join(wd, config.DotScion)
+			isGlobal = false
+		}
+		return runHubLinkNew(settings, resolvedPath, isGlobal, endpoint)
+	}
+
 	// Get project name for display
 	var projectName string
 	if isGlobal {
@@ -2548,6 +2602,189 @@ func offerTemplateSyncOnLink(projectPath, endpoint, projectID string) {
 		synced++
 	}
 	fmt.Printf("%d template(s) synced to project scope.\n", synced)
+}
+
+// buildLinkNewRequest assembles a CreateProjectRequest from the user's
+// --new flag values, applying name/slug derivation and label validation.
+// Pure (no I/O, no globals): callers pass flag values and the cwd-fallback
+// basename explicitly. Returns a friendly error for invalid inputs.
+func buildLinkNewRequest(name, slug, workspaceMode string, labelFlags []string, fallbackName string) (*hubclient.CreateProjectRequest, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = strings.TrimSpace(fallbackName)
+	}
+	if name == "" || name == "." || name == "/" {
+		return nil, fmt.Errorf("could not derive project name; pass --name explicitly")
+	}
+
+	slug = strings.TrimSpace(slug)
+	if slug == "" {
+		slug = api.Slugify(name)
+	}
+	if slug == "" {
+		return nil, fmt.Errorf("could not derive slug from %q; pass --slug explicitly", name)
+	}
+
+	labels := make(map[string]string)
+	for _, kv := range labelFlags {
+		eq := strings.Index(kv, "=")
+		if eq <= 0 {
+			return nil, fmt.Errorf("--label must be key=value, got %q", kv)
+		}
+		k := strings.TrimSpace(kv[:eq])
+		v := strings.TrimSpace(kv[eq+1:])
+		if k == "" {
+			return nil, fmt.Errorf("--label has empty key in %q", kv)
+		}
+		labels[k] = v
+	}
+	if workspaceMode != "" {
+		switch workspaceMode {
+		case store.WorkspaceModeShared,
+			store.WorkspaceModePerAgent,
+			store.WorkspaceModeWorktreePerAgent,
+			store.WorkspaceModeInPlace:
+			labels[store.LabelWorkspaceMode] = workspaceMode
+		default:
+			return nil, fmt.Errorf("invalid --workspace-mode %q; want one of: %s, %s, %s, %s",
+				workspaceMode,
+				store.WorkspaceModeShared, store.WorkspaceModePerAgent,
+				store.WorkspaceModeWorktreePerAgent, store.WorkspaceModeInPlace)
+		}
+	}
+
+	return &hubclient.CreateProjectRequest{
+		Name:   name,
+		Slug:   slug,
+		Labels: labels,
+	}, nil
+}
+
+// runHubLinkNew implements `scion hub link --new`: force-create a Hub
+// project for the current dir and persist the link locally, bypassing
+// the name-matching/discovery flow. Intended for non-git in-place
+// projects (Obsidian vaults, KBs, local-only repos) where matching by
+// name catches the wrong existing project. See scion-mch/13.
+func runHubLinkNew(settings *config.Settings, resolvedPath string, isGlobal bool, endpoint string) error {
+	createReq, err := buildLinkNewRequest(
+		hubLinkNewName,
+		hubLinkNewSlug,
+		hubLinkNewWorkspaceMode,
+		hubLinkNewLabels,
+		filepath.Base(filepath.Dir(resolvedPath)),
+	)
+	if err != nil {
+		return err
+	}
+	name, slug, labels := createReq.Name, createReq.Slug, createReq.Labels
+
+	// Pre-flight: refuse to overwrite an existing link. Read project-local
+	// settings in isolation so we don't trip on inherited global hub.projectId.
+	localSettings, _ := config.LoadSettingsFromDir(resolvedPath)
+	if localSettings != nil {
+		if existing := localSettings.GetHubProjectID(); existing != "" {
+			return fmt.Errorf("project at %s is already linked to Hub project %s; run 'scion hub unlink' first",
+				filepath.Dir(resolvedPath), existing)
+		}
+	}
+
+	// Confirmation prompt unless --yes / --non-interactive.
+	if !autoConfirm && !nonInteractive && !isJSONOutput() {
+		fmt.Printf("Create new Hub project:\n")
+		fmt.Printf("  Name:     %s\n", name)
+		fmt.Printf("  Slug:     %s\n", slug)
+		fmt.Printf("  Endpoint: %s\n", endpoint)
+		if len(labels) > 0 {
+			fmt.Println("  Labels:")
+			for k, v := range labels {
+				fmt.Printf("    %s = %s\n", k, v)
+			}
+		}
+		if !hubsync.ConfirmAction("Continue?", true, autoConfirm) {
+			return fmt.Errorf("cancelled")
+		}
+	}
+
+	// Auth + client + connectivity.
+	if info := getAuthInfo(settings, endpoint); info.MethodType == "none" {
+		return fmt.Errorf("not authenticated to Hub at %s\n\nPlease log in first:\n  scion hub auth login", endpoint)
+	}
+	client, err := getHubClient(settings)
+	if err != nil {
+		return fmt.Errorf("failed to create Hub client: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := client.Health(ctx); err != nil {
+		return fmt.Errorf("Hub at %s is not responding: %w", endpoint, err)
+	}
+
+	// Reject early if the slug is already taken (server would 409 anyway,
+	// but this gives a friendlier error before the create call).
+	slugCheck, err := client.Projects().List(ctx, &hubclient.ListProjectsOptions{Slug: slug})
+	if err != nil {
+		return fmt.Errorf("failed to validate slug: %w", err)
+	}
+	if len(slugCheck.Projects) > 0 {
+		return fmt.Errorf("slug %q is already taken on the Hub (project %q, ID: %s); choose another with --slug",
+			slug, slugCheck.Projects[0].Name, slugCheck.Projects[0].ID)
+	}
+
+	// Create the project.
+	project, err := client.Projects().Create(ctx, &hubclient.CreateProjectRequest{
+		Name:   name,
+		Slug:   slug,
+		Labels: labels,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create project: %w", err)
+	}
+
+	// Persist the link locally. Same triplet as runHubLink: hub.projectId,
+	// hub.enabled, hub.linked. Endpoint stamp if user passed --hub.
+	if err := config.UpdateSetting(resolvedPath, "hub.projectId", project.ID, isGlobal); err != nil {
+		return fmt.Errorf("failed to save hub project ID: %w", err)
+	}
+	if err := config.UpdateSetting(resolvedPath, "hub.enabled", "true", isGlobal); err != nil {
+		return fmt.Errorf("failed to enable hub: %w", err)
+	}
+	if err := config.UpdateSetting(resolvedPath, "hub.linked", "true", isGlobal); err != nil {
+		return fmt.Errorf("failed to save linked state: %w", err)
+	}
+	if hubEndpoint != "" {
+		if err := config.UpdateSetting(resolvedPath, "hub.endpoint", hubEndpoint, isGlobal); err != nil {
+			return fmt.Errorf("failed to save endpoint: %w", err)
+		}
+	}
+
+	if isJSONOutput() {
+		return outputJSON(ActionResult{
+			Status:  "success",
+			Command: "hub link --new",
+			Message: fmt.Sprintf("Created and linked Hub project '%s' (ID: %s)", project.Name, project.ID),
+			Details: map[string]interface{}{
+				"project":      project.Name,
+				"slug":         project.Slug,
+				"hubProjectId": project.ID,
+				"endpoint":     endpoint,
+				"labels":       labels,
+			},
+		})
+	}
+
+	fmt.Println()
+	fmt.Printf("Created and linked Hub project:\n")
+	fmt.Printf("  ID:    %s\n", project.ID)
+	fmt.Printf("  Name:  %s\n", project.Name)
+	fmt.Printf("  Slug:  %s\n", project.Slug)
+	if len(labels) > 0 {
+		fmt.Println("  Labels:")
+		for k, v := range labels {
+			fmt.Printf("    %s = %s\n", k, v)
+		}
+	}
+
+	return nil
 }
 
 // registerProjectOnHub registers a new project on the Hub.
