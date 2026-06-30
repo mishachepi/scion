@@ -124,12 +124,12 @@ func TestTmuxRuntime_BuildNewWindowArgs_LayoutAndOrder(t *testing.T) {
 		Env:       []string{"FOO=bar"},
 		Harness:   &MockHarness{},
 		Task:      "do thing",
-	})
+	}, r.Session)
 	if err != nil {
 		t.Fatalf("buildNewWindowArgs: %v", err)
 	}
 
-	want := []string{"new-window", "-d", "-t", "scion", "-n", "agent-1", "-c", "/tmp/ws"}
+	want := []string{"new-window", "-d", "-t", "scion:", "-n", "agent-1", "-c", "/tmp/ws"}
 	if !slices.Equal(args[:len(want)], want) {
 		t.Errorf("positional prefix = %v, want %v", args[:len(want)], want)
 	}
@@ -158,7 +158,7 @@ func TestTmuxRuntime_BuildNewWindowArgs_Validation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := r.buildNewWindowArgs(tc.config)
+			_, err := r.buildNewWindowArgs(tc.config, r.Session)
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantErr)
 			}
@@ -250,7 +250,7 @@ func TestTmuxRuntime_Run_HappyPath(t *testing.T) {
 
 	log := readLog(t, logPath)
 	for _, want := range []string{
-		"new-window -d -t scion -n agent-1",
+		"new-window -d -t scion: -n agent-1",
 		"-c /tmp/ws",
 		"-e SCION_AGENT=agent-1",
 		"-P -F #{window_id}",
@@ -307,7 +307,7 @@ func TestTmuxRuntime_Stop_HappyPath_SendsInterruptThenKill(t *testing.T) {
 	log := readLog(t, logPath)
 
 	for _, want := range []string{
-		"list-windows -t scion -F #{window_id}",
+		"list-windows -t scion: -F #{window_id}",
 		"send-keys -t scion:@5 C-c",
 		"kill-window -t scion:@5",
 	} {
@@ -704,12 +704,12 @@ func TestTmuxRuntime_Exec_HasSessionMapsToWindowExists(t *testing.T) {
 	r := &TmuxRuntime{Command: fakeTmux(t, tmpDir, logPath), Session: "scion"}
 
 	if _, err := r.Exec(context.Background(), "scion:@5",
-		[]string{"tmux", "has-session", "-t", "scion"}); err != nil {
+		[]string{"tmux", "has-session", "-t", "scion:"}); err != nil {
 		t.Fatalf("has-session probe should succeed when window exists; err=%v", err)
 	}
 
 	log := readLog(t, logPath)
-	if !strings.Contains(log, "list-windows -t scion -F #{window_id}") {
+	if !strings.Contains(log, "list-windows -t scion: -F #{window_id}") {
 		t.Errorf("expected list-windows probe in log:\n%s", log)
 	}
 	if strings.Contains(log, "has-session") {
@@ -1037,7 +1037,7 @@ func TestTmuxRuntime_BuildNewWindowArgs_NoSciontoolWrap_ByDefault(t *testing.T) 
 		Name:    "agent-1",
 		HomeDir: "/tmp/home",
 		Harness: &MockHarness{},
-	})
+	}, r.Session)
 	if err != nil {
 		t.Fatalf("buildNewWindowArgs: %v", err)
 	}
@@ -1058,7 +1058,7 @@ func TestTmuxRuntime_BuildNewWindowArgs_SciontoolWrap_WhenConfigured(t *testing.
 		Name:    "agent-1",
 		HomeDir: "/tmp/home",
 		Harness: &MockHarness{},
-	})
+	}, r.Session)
 	if err != nil {
 		t.Fatalf("buildNewWindowArgs: %v", err)
 	}
@@ -1070,6 +1070,96 @@ func TestTmuxRuntime_BuildNewWindowArgs_SciontoolWrap_WhenConfigured(t *testing.
 	want := []string{"/usr/local/bin/sciontool", "init", "--tmuxruntime", "--", "/bin/echo"}
 	if got := args[wrapIdx : wrapIdx+len(want)]; !slices.Equal(got, want) {
 		t.Errorf("wrapper sequence = %v, want %v", got, want)
+	}
+}
+
+// resolveTmuxSession picks the per-agent override out of
+// KubernetesConfig.Namespace; falls back to the runtime default.
+func TestResolveTmuxSession(t *testing.T) {
+	cases := []struct {
+		name       string
+		runtimeDef string
+		config     RunConfig
+		want       string
+	}{
+		{
+			name:       "no kubernetes block → runtime default",
+			runtimeDef: "obsi",
+			config:     RunConfig{},
+			want:       "obsi",
+		},
+		{
+			name:       "kubernetes block but empty namespace → runtime default",
+			runtimeDef: "obsi",
+			config:     RunConfig{Kubernetes: &api.KubernetesConfig{}},
+			want:       "obsi",
+		},
+		{
+			name:       "kubernetes.namespace set → override",
+			runtimeDef: "obsi",
+			config:     RunConfig{Kubernetes: &api.KubernetesConfig{Namespace: "obsi-bio"}},
+			want:       "obsi-bio",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveTmuxSession(tc.runtimeDef, tc.config); got != tc.want {
+				t.Errorf("got %q want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// buildNewWindowArgs must emit `-t <effectiveSession>` so tmux places the
+// new window in the per-agent session, not the runtime default.
+func TestTmuxRuntime_BuildNewWindowArgs_SessionOverride(t *testing.T) {
+	r := &TmuxRuntime{Command: "tmux", Session: "obsi"}
+	args, err := r.buildNewWindowArgs(RunConfig{
+		Name:    "area-bio",
+		HomeDir: "/tmp/home",
+		Harness: &MockHarness{},
+	}, "obsi-bio")
+	if err != nil {
+		t.Fatalf("buildNewWindowArgs: %v", err)
+	}
+	wantPrefix := []string{"new-window", "-d", "-t", "obsi-bio:", "-n", "area-bio"}
+	if !slices.Equal(args[:len(wantPrefix)], wantPrefix) {
+		t.Errorf("args prefix = %v, want prefix %v", args[:len(wantPrefix)], wantPrefix)
+	}
+}
+
+func TestFormatWindowTarget(t *testing.T) {
+	got := formatWindowTarget("obsi-bio", "@42")
+	if got != "obsi-bio:@42" {
+		t.Errorf("formatWindowTarget=%q want obsi-bio:@42", got)
+	}
+}
+
+// Regression: tmux's `-t <name>` for new-window uses the *target-window*
+// resolver, which prefix-matches across all windows and may pick a window
+// that shares the session's name. When that happens, tmux tries to insert
+// at the matched window's index and fails with "index N in use". Real
+// incident 2026-06-30: session "scion" plus a stray window named "scion"
+// in another session → orchestrator resume errored with "index 1 in use".
+//
+// Fix: emit the target with a trailing colon so tmux uses the session
+// resolver. This test asserts the colon is present in the args.
+func TestTmuxRuntime_BuildNewWindowArgs_SessionTargetTrailingColon(t *testing.T) {
+	r := &TmuxRuntime{Command: "tmux", Session: "scion"}
+	args, err := r.buildNewWindowArgs(RunConfig{
+		Name:    "orchestrator",
+		HomeDir: "/tmp/home",
+		Harness: &MockHarness{},
+	}, r.Session)
+	if err != nil {
+		t.Fatalf("buildNewWindowArgs: %v", err)
+	}
+	tIdx := indexOf(args, "-t")
+	if tIdx < 0 || tIdx+1 >= len(args) {
+		t.Fatalf("no -t flag in args: %v", args)
+	}
+	if got := args[tIdx+1]; got != "scion:" {
+		t.Errorf("session target = %q, want %q (trailing colon disambiguates session-vs-window resolver)", got, "scion:")
 	}
 }
 
