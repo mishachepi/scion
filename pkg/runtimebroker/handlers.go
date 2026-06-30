@@ -1298,7 +1298,14 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 		attribute.String("scion.project.id", projectID),
 	)
 
-	// Read optional task, projectPath, projectSlug, harnessConfig, and resolvedEnv from request body
+	// Read optional task, projectPath, projectSlug, harnessConfig, and
+	// resolvedEnv from request body. Hub sends new-style keys (see
+	// pkg/hub/broker_http_transport.go and controlchannel_client.go); the
+	// broker previously decoded `grovePath` / `groveSlug` and silently
+	// dropped both fields, breaking resume — with no projectPath the
+	// broker could not locate the pinned harnessSessionId, and the agent
+	// home defaulted to the global config dir, putting the tmux window in
+	// the global runtime's session instead of the project's.
 	var startReq struct {
 		Task            string               `json:"task"`
 		ProjectPath     string               `json:"projectPath"`

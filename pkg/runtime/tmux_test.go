@@ -1016,7 +1016,7 @@ func TestTmuxRuntime_BuildNewWindowArgs_SystemModeSkipsHarnessEnv(t *testing.T) 
 		Name:    "agent-1",
 		HomeDir: "/agent-home",
 		Harness: &MockHarness{},
-	})
+	}, r.Session)
 	if err != nil {
 		t.Fatalf("buildNewWindowArgs: %v", err)
 	}
