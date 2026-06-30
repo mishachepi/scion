@@ -172,7 +172,7 @@ func (r *TmuxRuntime) buildNewWindowArgs(config RunConfig) ([]string, error) {
 		return nil, fmt.Errorf("tmux runtime: Name is required")
 	}
 	harnessEnv := config.Harness.GetEnv(config.Name, config.HomeDir, config.UnixUsername)
-	harnessArgs := config.Harness.GetCommand(config.Task, config.Resume, config.CommandArgs)
+	harnessArgs := config.Harness.GetCommand(config.Task, config.Resume, config.HarnessSessionID, config.CommandArgs)
 	if len(harnessArgs) == 0 {
 		return nil, fmt.Errorf("tmux runtime: harness %s returned empty command", config.Harness.Name())
 	}
@@ -653,6 +653,12 @@ func (r *TmuxRuntime) Attach(ctx context.Context, id string) error {
 
 func (r *TmuxRuntime) ImageExists(_ context.Context, _ string) (bool, error) { return true, nil }
 func (r *TmuxRuntime) PullImage(_ context.Context, _ string) error           { return nil }
+
+// ImageID: agents run as host processes — there are no local images.
+func (r *TmuxRuntime) ImageID(_ context.Context, _ string) (string, error) { return "", nil }
+
+// RemoveImage: agents run as host processes — there are no local images.
+func (r *TmuxRuntime) RemoveImage(_ context.Context, _ string) error { return nil }
 func (r *TmuxRuntime) Sync(_ context.Context, _ string, _ SyncDirection) error {
 	return nil
 }

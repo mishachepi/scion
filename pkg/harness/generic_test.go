@@ -44,17 +44,17 @@ func TestGeneric_GetEnv(t *testing.T) {
 func TestGeneric_GetCommand(t *testing.T) {
 	g := &Generic{}
 
-	cmd := g.GetCommand("test task", false, nil)
+	cmd := g.GetCommand("test task", false, "", nil)
 	if !reflect.DeepEqual(cmd, []string{"test task"}) {
 		t.Errorf("Expected command ['test task'], got %v", cmd)
 	}
 
-	cmdWithArgs := g.GetCommand("test task", false, []string{"--arg1"})
+	cmdWithArgs := g.GetCommand("test task", false, "", []string{"--arg1"})
 	if !reflect.DeepEqual(cmdWithArgs, []string{"--arg1", "test task"}) {
 		t.Errorf("Expected command ['--arg1', 'test task'], got %v", cmdWithArgs)
 	}
 
-	cmdEmpty := g.GetCommand("", false, nil)
+	cmdEmpty := g.GetCommand("", false, "", nil)
 	if len(cmdEmpty) != 0 {
 		t.Errorf("Expected empty command, got %v", cmdEmpty)
 	}

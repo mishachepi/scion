@@ -44,7 +44,7 @@ func TestTmuxRuntime_Defaults(t *testing.T) {
 type stubHarness struct{ name string }
 
 func (h *stubHarness) Name() string { return h.name }
-func (h *stubHarness) GetCommand(string, bool, []string) []string {
+func (h *stubHarness) GetCommand(string, bool, string, []string) []string {
 	return []string{h.name}
 }
 func (h *stubHarness) GetEnv(string, string, string) map[string]string { return nil }
@@ -56,6 +56,7 @@ func (h *stubHarness) Provision(context.Context, string, string, string, string)
 }
 func (h *stubHarness) GetEmbedDir() string                          { return h.name }
 func (h *stubHarness) GetInterruptKey() string                      { return "Escape" }
+func (h *stubHarness) GetInterruptSequence() []string               { return nil }
 func (h *stubHarness) GetHarnessEmbedsFS() (embed.FS, string)       { return embed.FS{}, "" }
 func (h *stubHarness) InjectAgentInstructions(string, []byte) error { return nil }
 func (h *stubHarness) InjectSystemPrompt(string, []byte) error      { return nil }

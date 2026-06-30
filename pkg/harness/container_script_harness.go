@@ -132,8 +132,9 @@ func (c *ContainerScriptHarness) AdvancedCapabilities() api.HarnessAdvancedCapab
 //
 // The resume_flag string is split on whitespace, so a multi-token flag like
 // "resume --last" becomes two argv entries. Single-token flags like "--continue"
-// are unaffected.
-func (c *ContainerScriptHarness) GetCommand(task string, resume bool, baseArgs []string) []string {
+// are unaffected. When sessionID is non-empty and resume_id_flag is set, the
+// id-aware flag wins over resume_flag — see buildResumeTokens.
+func (c *ContainerScriptHarness) GetCommand(task string, resume bool, sessionID string, baseArgs []string) []string {
 	cmd := c.entry.Command
 	if cmd == nil {
 		args := append([]string{}, baseArgs...)
@@ -143,9 +144,9 @@ func (c *ContainerScriptHarness) GetCommand(task string, resume bool, baseArgs [
 		return args
 	}
 
-	resumeTokens := []string{}
-	if resume && cmd.ResumeFlag != "" {
-		resumeTokens = strings.Fields(cmd.ResumeFlag)
+	var resumeTokens []string
+	if resume {
+		resumeTokens = buildResumeTokens(cmd, sessionID)
 	}
 
 	args := append([]string{}, cmd.Base...)

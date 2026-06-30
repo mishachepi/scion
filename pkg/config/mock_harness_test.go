@@ -35,8 +35,10 @@ func (m *MockHarness) AdvancedCapabilities() api.HarnessAdvancedCapabilities {
 func (m *MockHarness) GetEnv(agentName string, agentHome string, unixUsername string) map[string]string {
 	return nil
 }
-func (m *MockHarness) GetCommand(task string, resume bool, baseArgs []string) []string { return nil }
-func (m *MockHarness) DefaultConfigDir() string                                        { return m.ConfigDirVal }
+func (m *MockHarness) GetCommand(task string, resume bool, sessionID string, baseArgs []string) []string {
+	return nil
+}
+func (m *MockHarness) DefaultConfigDir() string { return m.ConfigDirVal }
 func (m *MockHarness) SkillsDir() string {
 	if m.ConfigDirVal == "" {
 		return ""

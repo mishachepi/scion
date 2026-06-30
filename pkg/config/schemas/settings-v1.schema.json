@@ -536,6 +536,7 @@
           "items": { "type": "string" }
         },
         "resume_flag": { "type": "string" },
+        "resume_id_flag": { "type": "string" },
         "task_flag": { "type": ["string", "null"] },
         "task_position": {
           "type": "string",

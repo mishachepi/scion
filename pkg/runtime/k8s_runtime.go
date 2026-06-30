@@ -916,7 +916,7 @@ func (r *KubernetesRuntime) buildPod(namespace string, config RunConfig) (*corev
 	if config.NoAuth {
 		cmdLine = buildNoAuthCmdLine(config.NoAuthMessage, config.NoAuthCommand)
 	} else if config.Harness != nil {
-		harnessArgs := config.Harness.GetCommand(config.Task, config.Resume, config.CommandArgs)
+		harnessArgs := config.Harness.GetCommand(config.Task, config.Resume, config.HarnessSessionID, config.CommandArgs)
 		var quotedArgs []string
 		for _, a := range harnessArgs {
 			quotedArgs = append(quotedArgs, shellQuote(a))

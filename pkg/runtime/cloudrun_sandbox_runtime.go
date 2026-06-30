@@ -648,7 +648,7 @@ func buildEntrypoint(cfg RunConfig) ([]string, error) {
 	if cfg.NoAuth {
 		cmdLine = buildNoAuthCmdLine(cfg.NoAuthMessage, cfg.NoAuthCommand)
 	} else if cfg.Harness != nil {
-		harnessArgs := cfg.Harness.GetCommand(cfg.Task, cfg.Resume, cfg.CommandArgs)
+		harnessArgs := cfg.Harness.GetCommand(cfg.Task, cfg.Resume, cfg.HarnessSessionID, cfg.CommandArgs)
 		var quotedArgs []string
 		for _, a := range harnessArgs {
 			quotedArgs = append(quotedArgs, shellQuote(a))
