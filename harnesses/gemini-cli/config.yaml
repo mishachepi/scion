@@ -40,7 +40,11 @@ env:
   GEMINI_CLI_NO_RELAUNCH: "true"
 command:
   base: ["gemini", "--yolo"]
+  # resume_flag is the cwd-scoped fallback; resume_id_flag pins the exact
+  # session by id (preferred). The id is captured into agent-info.json by
+  # the SessionStart hook and read on resume by `scion resume`.
   resume_flag: "--resume"
+  resume_id_flag: "--resume {session_id}"
   task_flag: "--prompt-interactive"
   task_position: after_base_args
 capabilities:

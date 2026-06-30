@@ -194,7 +194,7 @@ func (h *nfsTestHarness) Name() string { return "test" }
 func (h *nfsTestHarness) AdvancedCapabilities() api.HarnessAdvancedCapabilities {
 	return api.HarnessAdvancedCapabilities{Harness: "test"}
 }
-func (h *nfsTestHarness) GetCommand(task string, resume bool, args []string) []string {
+func (h *nfsTestHarness) GetCommand(task string, resume bool, sessionID string, args []string) []string {
 	return []string{"echo", "test"}
 }
 func (h *nfsTestHarness) GetEnv(name, homeDir, unixUsername string) map[string]string {

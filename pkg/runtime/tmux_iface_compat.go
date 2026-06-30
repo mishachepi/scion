@@ -22,11 +22,6 @@ import (
 	"strings"
 )
 
-// ImageExists-style stubs the Runtime interface grew upstream: agents run as
-// host processes, so there are no local images to identify or remove.
-func (r *TmuxRuntime) ImageID(_ context.Context, _ string) (string, error) { return "", nil }
-func (r *TmuxRuntime) RemoveImage(_ context.Context, _ string) error       { return nil }
-
 // ExecWithStdin runs cmd on the broker host with stdin piped from the given
 // reader, satisfying Runtime.ExecWithStdin (#1355: the broker's reset-auth
 // path must not put the token on argv). Minimal form: no agent identity or
