@@ -1598,7 +1598,12 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 		return
 	}
 
-	// Read optional task, projectPath, projectSlug, harnessConfig, and resolvedEnv from request body
+	// Read optional task, projectPath, projectSlug, harnessConfig, and
+	// resolvedEnv from request body. projectPath is load-bearing for resume:
+	// without it the broker cannot locate the agent's pinned
+	// harnessSessionId (see below), and the agent home falls back to the
+	// global config dir, so a tmux window lands in the global runtime's
+	// session instead of the project's.
 	var startReq struct {
 		Task               string                 `json:"task"`
 		ProjectPath        string                 `json:"projectPath"`
