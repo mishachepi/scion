@@ -22,24 +22,29 @@ import (
 )
 
 type RunConfig struct {
-	Name                 string
-	Template             string
-	UnixUsername         string
-	Image                string
-	HomeDir              string
-	Workspace            string
-	RepoRoot             string
-	ContainerWorkspace   string // The container-side workspace path (e.g., /workspace or /repo-root/.scion/agents/foo/workspace)
-	Env                  []string
-	ResolvedSecrets      []api.ResolvedSecret
-	Volumes              []api.VolumeMount
-	Labels               map[string]string
-	Annotations          map[string]string
-	ResolvedAuth         *api.ResolvedAuth
-	Harness              api.Harness
-	Task                 string
-	CommandArgs          []string
-	Resume               bool
+	Name               string
+	Template           string
+	UnixUsername       string
+	Image              string
+	HomeDir            string
+	Workspace          string
+	RepoRoot           string
+	ContainerWorkspace string // The container-side workspace path (e.g., /workspace or /repo-root/.scion/agents/foo/workspace)
+	Env                []string
+	ResolvedSecrets    []api.ResolvedSecret
+	Volumes            []api.VolumeMount
+	Labels             map[string]string
+	Annotations        map[string]string
+	ResolvedAuth       *api.ResolvedAuth
+	Harness            api.Harness
+	Task               string
+	CommandArgs        []string
+	Resume             bool
+	// HarnessSessionID, when non-empty together with Resume=true, requests
+	// an exact-session resume via the harness's id-aware flag (e.g.
+	// `claude --resume <id>`). Empty falls back to the latest-session flag
+	// (`claude --continue`).
+	HarnessSessionID     string
 	TelemetryEnabled     bool
 	Resources            *api.ResourceSpec
 	Kubernetes           *api.KubernetesConfig

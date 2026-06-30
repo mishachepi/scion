@@ -70,6 +70,16 @@ func (h *StatusHandler) Handle(event *hooks.Event) error {
 		h.tmuxPaneSink.Apply()
 	}
 
+	// Capture harness session id from every SessionStart. Claude generates
+	// a fresh UUID on each --continue/--resume, so pinning to the most
+	// recent observed id keeps `scion resume` aimed at the head of the
+	// chain. See harnessSessionId on api.AgentInfo.
+	if event.Name == hooks.EventSessionStart && event.Data.SessionID != "" {
+		if err := h.UpdateHarnessSessionID(event.Data.SessionID); err != nil {
+			return err
+		}
+	}
+
 	result := eventToPhaseActivity(event)
 	if result == nil {
 		return nil // Event doesn't trigger a state change
@@ -166,6 +176,27 @@ func (h *StatusHandler) UpdatePhase(phase state.Phase, activity state.Activity, 
 	delete(info, "status")
 	delete(info, "sessionStatus")
 
+	return h.writeAgentInfoLocked(info)
+}
+
+// UpdateHarnessSessionID writes the harness's native session id (e.g.
+// Claude Code's UUID for `~/.claude/projects/<hashed-cwd>/<id>.jsonl`)
+// to agent-info.json. Persisted so `scion resume <slug>` can request an
+// exact-session resume (`claude --resume <id>`) instead of relying on
+// `claude --continue`, which silently cross-talks when multiple agents
+// share one cwd (in-place workspace mode). No-op for empty id.
+func (h *StatusHandler) UpdateHarnessSessionID(sessionID string) error {
+	if sessionID == "" {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	info := h.readAgentInfoMap()
+	if existing, _ := info["harnessSessionId"].(string); existing == sessionID {
+		return nil
+	}
+	info["harnessSessionId"] = sessionID
 	return h.writeAgentInfoLocked(info)
 }
 
