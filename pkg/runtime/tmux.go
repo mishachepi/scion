@@ -153,6 +153,31 @@ func (r *TmuxRuntime) Run(ctx context.Context, config RunConfig) (string, error)
 		return "", err
 	}
 
+	// Reap a stale window with the same name in the target session. Tmux
+	// user-options (where scion.name lives) don't survive a tmux server
+	// restart, so the List() check above misses windows whose harness died
+	// with the crash; the leftover zsh shell still occupies the slot. Without
+	// this, new-window would silently create a duplicate window with the
+	// same display name, leaving two `<project>--<agent>` entries in the
+	// session list. Killing the stale one first keeps the post-resume
+	// window in the original slot with the original name.
+	//
+	// Re-ensure the session after reaping: tmux auto-destroys a session
+	// whose last window is killed, so a one-window session (typical for
+	// per-agent obsi-* sessions resolved via Kubernetes.Namespace) vanishes
+	// here and the subsequent new-window would fail with "can't find
+	// session".
+	if id, ok := r.findWindowByName(ctx, session, config.Name); ok {
+		if out, killErr := exec.CommandContext(ctx, r.Command,
+			"kill-window", "-t", id).CombinedOutput(); killErr != nil {
+			return "", fmt.Errorf("tmux runtime: reap stale window %q: %w (output: %s)",
+				config.Name, killErr, strings.TrimSpace(string(out)))
+		}
+		if err := r.ensureSession(ctx, session); err != nil {
+			return "", fmt.Errorf("tmux runtime: re-ensure session %q after reap: %w", session, err)
+		}
+	}
+
 	// Direct exec rather than runSimpleCommand so resolved secret values in
 	// envFlags do not appear in the runtime debug log.
 	out, err := exec.CommandContext(ctx, r.Command, args...).CombinedOutput()
@@ -233,6 +258,33 @@ func (r *TmuxRuntime) buildNewWindowArgs(config RunConfig, session string) ([]st
 	args = append(args, "-P", "-F", "#{window_id}")
 	args = append(args, harnessArgs...)
 	return args, nil
+}
+
+// findWindowByName returns the tmux window id (e.g. "@42") for the first
+// window in `session` whose display name exactly matches `name`. Returns
+// ("", false) when no window matches or the lookup fails. Used to detect
+// orphan windows from a previous tmux server (whose scion.name labels
+// did not survive the restart) so Start can reap them before re-creating
+// the agent window with the same name.
+func (r *TmuxRuntime) findWindowByName(ctx context.Context, session, name string) (string, bool) {
+	if session == "" || name == "" {
+		return "", false
+	}
+	out, err := exec.CommandContext(ctx, r.Command,
+		"list-windows", "-t", session+":", "-F", "#{window_id} #{window_name}").CombinedOutput()
+	if err != nil {
+		return "", false
+	}
+	for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
+		fields := strings.SplitN(line, " ", 2)
+		if len(fields) != 2 {
+			continue
+		}
+		if fields[1] == name {
+			return fields[0], true
+		}
+	}
+	return "", false
 }
 
 // lockWindowName disables tmux auto-rename and resets the window name.
