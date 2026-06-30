@@ -41,11 +41,16 @@ type RunConfig struct {
 	Task               string
 	CommandArgs        []string
 	Resume             bool
-	TelemetryEnabled   bool
-	Resources          *api.ResourceSpec
-	Kubernetes         *api.KubernetesConfig
-	GitClone           *api.GitCloneConfig
-	SharedDirs         []api.SharedDir
+	// HarnessSessionID, when non-empty together with Resume=true, requests
+	// an exact-session resume via the harness's id-aware flag (e.g.
+	// `claude --resume <id>`). Empty falls back to the latest-session flag
+	// (`claude --continue`).
+	HarnessSessionID string
+	TelemetryEnabled bool
+	Resources        *api.ResourceSpec
+	Kubernetes       *api.KubernetesConfig
+	GitClone         *api.GitCloneConfig
+	SharedDirs       []api.SharedDir
 	// SharedDirStorage holds the resolved shared-dir storage plan when
 	// server.shared_dir_storage.backend is "nfs" (design
 	// deploy-config-explore §3.2.3/§3.2.4). It is independent of
