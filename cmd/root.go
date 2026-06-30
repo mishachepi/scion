@@ -147,6 +147,12 @@ return an error instead of blocking.`,
 		}
 
 		requiresProject := commandRequiresProject(cmd)
+		// `hub link --new` creates a fresh Hub project for the current dir; the
+		// local .scion/ comes into existence as part of the link, so requiring
+		// it pre-flight would defeat the purpose.
+		if cmd.Name() == "link" && cmd.Parent() != nil && cmd.Parent().Name() == "hub" && hubLinkNew {
+			requiresProject = false
+		}
 
 		// For commands that require project context, use RequireProjectPath
 		// to error if no project found and --global not specified
