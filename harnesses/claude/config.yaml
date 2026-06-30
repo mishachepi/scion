@@ -58,7 +58,11 @@ env:
   ANTHROPIC_DEFAULT_HAIKU_MODEL: "claude-haiku-4-5"
 command:
   base: ["claude", "--no-chrome", "--permission-mode", "bypassPermissions"]
+  # resume_flag is the cwd-scoped fallback; resume_id_flag pins the exact
+  # session by id (preferred). The id is captured into agent-info.json by
+  # the SessionStart hook and read on resume by `scion resume`.
   resume_flag: "--continue"
+  resume_id_flag: "--resume {session_id}"
   task_position: after_base_args
   system_prompt_flag: "--system-prompt"
 capabilities:

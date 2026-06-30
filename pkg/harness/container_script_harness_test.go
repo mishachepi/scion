@@ -88,12 +88,12 @@ func TestContainerScriptHarness_BasicGetters(t *testing.T) {
 	if h.GetInterruptKey() != "Escape" {
 		t.Errorf("GetInterruptKey=%q", h.GetInterruptKey())
 	}
-	cmd := h.GetCommand("hello", false, []string{"--debug"})
+	cmd := h.GetCommand("hello", false, "", []string{"--debug"})
 	want := []string{"testcli", "--debug", "--prompt", "hello"}
 	if strings.Join(cmd, " ") != strings.Join(want, " ") {
 		t.Errorf("GetCommand=%v want %v", cmd, want)
 	}
-	cmd2 := h.GetCommand("", true, nil)
+	cmd2 := h.GetCommand("", true, "", nil)
 	want2 := []string{"testcli", "--resume", "--prompt", "Continue your previous task. Check for pending work or new messages."}
 	if strings.Join(cmd2, " ") != strings.Join(want2, " ") {
 		t.Errorf("GetCommand resume=%v want %v", cmd2, want2)
@@ -128,21 +128,21 @@ func TestContainerScriptHarness_GetCommand_ResumeWithSyntheticPrompt(t *testing.
 	}
 
 	// Initial start: task is passed through normally.
-	cmd := h.GetCommand("do something", false, nil)
+	cmd := h.GetCommand("do something", false, "", nil)
 	want := []string{"opencode-launch", "--prompt", "do something"}
 	if strings.Join(cmd, " ") != strings.Join(want, " ") {
 		t.Errorf("initial start: GetCommand=%v want %v", cmd, want)
 	}
 
 	// Resume without task: synthetic prompt is injected via task_flag.
-	cmd = h.GetCommand("", true, nil)
+	cmd = h.GetCommand("", true, "", nil)
 	want = []string{"opencode-launch", "--continue", "--prompt", "Continue your previous task. Check for pending work or new messages."}
 	if strings.Join(cmd, " ") != strings.Join(want, " ") {
 		t.Errorf("resume without task: GetCommand=%v want %v", cmd, want)
 	}
 
 	// Resume with explicit task: explicit task is used, not synthetic.
-	cmd = h.GetCommand("new work", true, nil)
+	cmd = h.GetCommand("new work", true, "", nil)
 	want = []string{"opencode-launch", "--continue", "--prompt", "new work"}
 	if strings.Join(cmd, " ") != strings.Join(want, " ") {
 		t.Errorf("resume with task: GetCommand=%v want %v", cmd, want)
@@ -176,7 +176,7 @@ func TestContainerScriptHarness_GetCommand_ResumeNoTaskFlag(t *testing.T) {
 	}
 
 	// Resume without task: no synthetic prompt (no task_flag configured).
-	cmd := h.GetCommand("", true, nil)
+	cmd := h.GetCommand("", true, "", nil)
 	want := []string{"grok", "--yolo", "-c"}
 	if strings.Join(cmd, " ") != strings.Join(want, " ") {
 		t.Errorf("resume no task_flag: GetCommand=%v want %v", cmd, want)
@@ -1266,7 +1266,7 @@ command:
 	if _, ok := resolved.Harness.(*DeclarativeGenericHarness); !ok {
 		t.Errorf("expected DeclarativeGenericHarness, got %T", resolved.Harness)
 	}
-	cmd := resolved.Harness.GetCommand("hello", false, nil)
+	cmd := resolved.Harness.GetCommand("hello", false, "", nil)
 	if strings.Join(cmd, " ") != "customcli run hello" {
 		t.Errorf("GetCommand=%v", cmd)
 	}

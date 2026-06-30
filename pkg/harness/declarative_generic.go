@@ -26,6 +26,28 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 )
 
+// buildResumeTokens picks the right resume-flag tokens from a declarative
+// HarnessCommandConfig. Prefers ResumeIDFlag (e.g. "--resume {session_id}")
+// when a sessionID is available; falls back to ResumeFlag (e.g. "--continue"
+// or bare "--resume") otherwise. The {session_id} placeholder is replaced
+// after splitting on whitespace so multi-token templates work.
+func buildResumeTokens(cmd *config.HarnessCommandConfig, sessionID string) []string {
+	if cmd == nil {
+		return nil
+	}
+	if sessionID != "" && cmd.ResumeIDFlag != "" {
+		parts := strings.Fields(cmd.ResumeIDFlag)
+		for i, p := range parts {
+			parts[i] = strings.ReplaceAll(p, "{session_id}", sessionID)
+		}
+		return parts
+	}
+	if cmd.ResumeFlag != "" {
+		return strings.Fields(cmd.ResumeFlag)
+	}
+	return nil
+}
+
 // DeclarativeGenericHarness implements api.Harness for harness-config
 // directories that have no provision.py and no built-in Go harness — they
 // rely entirely on the metadata declared in config.yaml. It is the
@@ -90,7 +112,7 @@ func (d *DeclarativeGenericHarness) AdvancedCapabilities() api.HarnessAdvancedCa
 	return caps
 }
 
-func (d *DeclarativeGenericHarness) GetCommand(task string, resume bool, baseArgs []string) []string {
+func (d *DeclarativeGenericHarness) GetCommand(task string, resume bool, sessionID string, baseArgs []string) []string {
 	if d.entry.Command == nil {
 		args := append([]string{}, baseArgs...)
 		if task != "" {
@@ -100,8 +122,8 @@ func (d *DeclarativeGenericHarness) GetCommand(task string, resume bool, baseArg
 	}
 	cmd := d.entry.Command
 	args := append([]string{}, cmd.Base...)
-	if resume && cmd.ResumeFlag != "" {
-		args = append(args, cmd.ResumeFlag)
+	if resume {
+		args = append(args, buildResumeTokens(cmd, sessionID)...)
 	}
 	args = append(args, baseArgs...)
 	if task != "" {
