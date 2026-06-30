@@ -88,12 +88,12 @@ func TestContainerScriptHarness_BasicGetters(t *testing.T) {
 	if h.GetInterruptKey() != "Escape" {
 		t.Errorf("GetInterruptKey=%q", h.GetInterruptKey())
 	}
-	cmd := h.GetCommand("hello", false, []string{"--debug"})
+	cmd := h.GetCommand("hello", false, "", []string{"--debug"})
 	want := []string{"testcli", "--debug", "--prompt", "hello"}
 	if strings.Join(cmd, " ") != strings.Join(want, " ") {
 		t.Errorf("GetCommand=%v want %v", cmd, want)
 	}
-	cmd2 := h.GetCommand("", true, nil)
+	cmd2 := h.GetCommand("", true, "", nil)
 	want2 := []string{"testcli", "--resume"}
 	if strings.Join(cmd2, " ") != strings.Join(want2, " ") {
 		t.Errorf("GetCommand resume=%v want %v", cmd2, want2)
@@ -1136,7 +1136,7 @@ command:
 	if _, ok := resolved.Harness.(*DeclarativeGenericHarness); !ok {
 		t.Errorf("expected DeclarativeGenericHarness, got %T", resolved.Harness)
 	}
-	cmd := resolved.Harness.GetCommand("hello", false, nil)
+	cmd := resolved.Harness.GetCommand("hello", false, "", nil)
 	if strings.Join(cmd, " ") != "customcli run hello" {
 		t.Errorf("GetCommand=%v", cmd)
 	}

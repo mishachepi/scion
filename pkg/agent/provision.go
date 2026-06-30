@@ -1590,6 +1590,28 @@ func GetSavedHarnessConfig(agentName string, projectPath string) string {
 	return ""
 }
 
+// GetSavedHarnessSessionID returns the harness session id captured into
+// agent-info.json by the in-container SessionStart hook, or "" if no id
+// has been captured yet (fresh agent, or harness that doesn't emit one).
+// Used by `scion resume` to request an exact-session resume from the
+// harness CLI instead of falling back to "latest in cwd".
+func GetSavedHarnessSessionID(agentName string, projectPath string) string {
+	projectDir, err := config.GetResolvedProjectDir(projectPath)
+	if err != nil {
+		return ""
+	}
+	agentInfoPath := filepath.Join(config.GetAgentHomePath(projectDir, agentName), "agent-info.json")
+	data, err := os.ReadFile(agentInfoPath)
+	if err != nil {
+		return ""
+	}
+	var info api.AgentInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return ""
+	}
+	return info.HarnessSessionID
+}
+
 func GetSavedPhase(agentName string, projectPath string) string {
 	projectDir, err := config.GetResolvedProjectDir(projectPath)
 	if err != nil {

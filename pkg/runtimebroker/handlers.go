@@ -1411,6 +1411,14 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 		}
 	}
 
+	// When resuming, pin to the exact harness session id captured by the
+	// in-container SessionStart hook. agent-info.json lives on the broker
+	// filesystem (the broker is the one running the agent), so the read is
+	// purely local.
+	if opts.Resume && opts.ProjectPath != "" {
+		opts.HarnessSessionID = agent.GetSavedHarnessSessionID(id, opts.ProjectPath)
+	}
+
 	// Re-resolve manager after profile update
 	mgr := s.resolveManagerForOpts(opts)
 	agentInfo, err := mgr.Start(ctx, opts)

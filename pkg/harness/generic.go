@@ -61,7 +61,11 @@ func (g *Generic) GetEnv(agentName string, agentHome string, unixUsername string
 	return env
 }
 
-func (g *Generic) GetCommand(task string, resume bool, baseArgs []string) []string {
+func (g *Generic) GetCommand(task string, resume bool, sessionID string, baseArgs []string) []string {
+	// Generic harness does not implement resume — both resume and sessionID
+	// are ignored. AdvancedCapabilities advertises Resume.Support == "no".
+	_ = resume
+	_ = sessionID
 	args := append([]string{}, baseArgs...)
 	if task != "" {
 		args = append(args, task)

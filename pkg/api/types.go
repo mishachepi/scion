@@ -613,6 +613,15 @@ type AgentInfo struct {
 	WebPTYEnabled     bool   `json:"webPtyEnabled,omitempty"`     // Whether web terminal access is available
 	TaskSummary       string `json:"taskSummary,omitempty"`       // Current task description (for dashboard)
 
+	// HarnessSessionID is the harness-native conversation/session id captured
+	// from the most recent SessionStart hook event (e.g. Claude Code's UUID
+	// written to ~/.claude/projects/<hashed-cwd>/<id>.jsonl). Persisted so
+	// `scion resume` can request the exact session via `--resume <id>` rather
+	// than relying on `--continue`, which picks the most recent session per
+	// cwd and silently cross-talks when multiple agents share a directory
+	// (in-place workspace mode).
+	HarnessSessionID string `json:"harnessSessionId,omitempty"`
+
 	// Optimistic locking
 	StateVersion int64 `json:"stateVersion,omitempty"` // Version for concurrent update detection
 }
@@ -909,6 +918,11 @@ type StartOptions struct {
 	BrokerMode        bool // When true, auth gathering skips local sources (broker env + filesystem)
 	Detached          *bool
 	Resume            bool
+	// HarnessSessionID, when set together with Resume=true, requests an
+	// exact-session resume (e.g. `claude --resume <id>`) instead of the
+	// harness's "latest in cwd" default (`claude --continue`). Empty falls
+	// back to the latest-in-cwd flag.
+	HarnessSessionID  string
 	NoAuth            bool
 	Branch            string
 	Workspace         string

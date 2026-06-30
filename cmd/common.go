@@ -559,21 +559,30 @@ func RunAgent(cmd *cobra.Command, args []string, resume bool) error {
 		statusf("Force-resuming agent '%s' (saved phase: %s)...\n", agentName, savedPhase)
 	}
 
+	// Read the pinned harness session id only when we're actually
+	// resuming — a fresh start should never pick up a stale id and
+	// silently `--resume <id>` it.
+	var harnessSessionID string
+	if effectiveResume {
+		harnessSessionID = agent.GetSavedHarnessSessionID(agentName, projectPath)
+	}
+
 	opts := api.StartOptions{
-		Name:          agentName,
-		Task:          effectiveTask,
-		Template:      templateName,
-		Profile:       profile,
-		HarnessConfig: effectiveHarnessConfig,
-		HarnessAuth:   effectiveHarnessAuth,
-		Image:         resolvedImage,
-		ProjectPath:   projectPath,
-		Resume:        effectiveResume,
-		Detached:      detached,
-		NoAuth:        noAuth,
-		Branch:        effectiveBranch,
-		Workspace:     workspace,
-		InlineConfig:  inlineCfg,
+		Name:             agentName,
+		Task:             effectiveTask,
+		Template:         templateName,
+		Profile:          profile,
+		HarnessConfig:    effectiveHarnessConfig,
+		HarnessAuth:      effectiveHarnessAuth,
+		Image:            resolvedImage,
+		ProjectPath:      projectPath,
+		Resume:           effectiveResume,
+		HarnessSessionID: harnessSessionID,
+		Detached:         detached,
+		NoAuth:           noAuth,
+		Branch:           effectiveBranch,
+		Workspace:        workspace,
+		InlineConfig:     inlineCfg,
 	}
 
 	// Apply telemetry override from CLI flags
