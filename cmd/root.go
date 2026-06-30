@@ -110,6 +110,12 @@ return an error instead of blocking.`,
 		if parentName == "project" || parentName == "grove" {
 			requiresProject = false
 		}
+		// `hub link --new` creates a fresh Hub project for the current dir; the
+		// local .scion/ comes into existence as part of the link, so requiring
+		// it pre-flight would defeat the purpose. See design-notes/13.
+		if cmdName == "link" && parentName == "hub" && hubLinkNew {
+			requiresProject = false
+		}
 
 		// For commands that require project context, use RequireProjectPath
 		// to error if no project found and --global not specified
