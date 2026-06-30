@@ -96,7 +96,18 @@ func (r *TmuxRuntime) Run(ctx context.Context, config RunConfig) (string, error)
 	if r.HomeMode == "" {
 		r.HomeMode = HomeModeAgent
 	}
-	args, err := r.buildNewWindowArgs(config)
+
+	// Per-agent tmux session override. We intentionally piggy-back on
+	// KubernetesConfig.Namespace rather than introducing a TmuxConfig
+	// struct: the field is already wired end-to-end (template →
+	// ScionConfig → runCfg, see pkg/agent/run.go), already per-agent,
+	// and the conceptual mapping "namespace = organizational scope" is
+	// the same. The k8s runtime keeps its own meaning of the field; the
+	// tmux runtime reads it as session name. r.Session remains the
+	// runtime-level default when no per-agent override is set.
+	session := resolveTmuxSession(r.Session, config)
+
+	args, err := r.buildNewWindowArgs(config, session)
 	if err != nil {
 		return "", err
 	}
@@ -121,18 +132,20 @@ func (r *TmuxRuntime) Run(ctx context.Context, config RunConfig) (string, error)
 		return "", err
 	}
 
-	if err := r.ensureSession(ctx); err != nil {
-		return "", fmt.Errorf("tmux runtime: ensure session %q: %w", r.Session, err)
+	if err := r.ensureSession(ctx, session); err != nil {
+		return "", fmt.Errorf("tmux runtime: ensure session %q: %w", session, err)
 	}
 
 	// Refuse explicit collision rather than silently creating a duplicate
-	// window with the same scion.name.
+	// window with the same scion.name. List() walks all sessions via
+	// `list-windows -a` + scion.name label, so a per-agent session
+	// override does not let a slug exist twice across sessions.
 	if scionName := scionNameFromRunConfig(config); scionName != "" {
 		existing, listErr := r.List(ctx, map[string]string{"scion.name": scionName})
 		if listErr == nil && len(existing) > 0 {
 			return "", fmt.Errorf(
-				"tmux runtime: agent %q already exists in session %q at %s — delete it first (scion delete %s) or attach (scion attach %s)",
-				scionName, r.Session, existing[0].ContainerID, scionName, scionName)
+				"tmux runtime: agent %q already exists at %s — delete it first (scion delete %s) or attach (scion attach %s)",
+				scionName, existing[0].ContainerID, scionName, scionName)
 		}
 	}
 
@@ -151,7 +164,7 @@ func (r *TmuxRuntime) Run(ctx context.Context, config RunConfig) (string, error)
 		return "", fmt.Errorf("tmux new-window returned empty window_id")
 	}
 
-	target := r.formatWindowTarget(windowID)
+	target := formatWindowTarget(session, windowID)
 	if err := r.lockWindowName(ctx, target, config.Name); err != nil {
 		return target, err
 	}
@@ -161,7 +174,17 @@ func (r *TmuxRuntime) Run(ctx context.Context, config RunConfig) (string, error)
 	return target, nil
 }
 
-func (r *TmuxRuntime) buildNewWindowArgs(config RunConfig) ([]string, error) {
+// resolveTmuxSession picks the tmux session for an agent. Per-agent
+// override piggy-backs on KubernetesConfig.Namespace (see TmuxRuntime.Run
+// for the rationale); runtimeDefault is r.Session when no override is set.
+func resolveTmuxSession(runtimeDefault string, config RunConfig) string {
+	if config.Kubernetes != nil && config.Kubernetes.Namespace != "" {
+		return config.Kubernetes.Namespace
+	}
+	return runtimeDefault
+}
+
+func (r *TmuxRuntime) buildNewWindowArgs(config RunConfig, session string) ([]string, error) {
 	if config.Harness == nil {
 		return nil, fmt.Errorf("tmux runtime: no harness provided")
 	}
@@ -184,7 +207,13 @@ func (r *TmuxRuntime) buildNewWindowArgs(config RunConfig) ([]string, error) {
 		workspace = config.HomeDir
 	}
 
-	args := []string{"new-window", "-d", "-t", r.Session, "-n", config.Name, "-c", workspace}
+	// Trailing colon disambiguates the target as a *session* — without it
+	// tmux uses its target-window resolver (new-window takes -t target-window),
+	// which prefix-matches across all sessions and may pick a window that
+	// shares the session name. When that happens tmux tries to insert at
+	// that window's index and fails with "index N in use". Real incident:
+	// session "scion" + a window named "scion" elsewhere → "index 1 in use".
+	args := []string{"new-window", "-d", "-t", session + ":", "-n", config.Name, "-c", workspace}
 	args = append(args, r.buildEnvFlags(config)...)
 	// Harnesses emit container-side paths (e.g. /home/scion/.gemini/...);
 	// rewrite to host-side agentHome so they resolve under tmux.
@@ -225,12 +254,14 @@ func (r *TmuxRuntime) lockWindowName(ctx context.Context, target, want string) e
 	return nil
 }
 
-func (r *TmuxRuntime) ensureSession(ctx context.Context) error {
-	if err := exec.CommandContext(ctx, r.Command, "has-session", "-t", r.Session).Run(); err == nil {
+func (r *TmuxRuntime) ensureSession(ctx context.Context, session string) error {
+	// Trailing colon: same defensive disambiguation as buildNewWindowArgs —
+	// keeps tmux's resolver pinned on sessions and consistent with new-window.
+	if err := exec.CommandContext(ctx, r.Command, "has-session", "-t", session+":").Run(); err == nil {
 		return nil
 	}
-	if out, err := exec.CommandContext(ctx, r.Command, "new-session", "-d", "-s", r.Session).CombinedOutput(); err != nil {
-		return fmt.Errorf("create session %q: %w (output: %s)", r.Session, err, strings.TrimSpace(string(out)))
+	if out, err := exec.CommandContext(ctx, r.Command, "new-session", "-d", "-s", session).CombinedOutput(); err != nil {
+		return fmt.Errorf("create session %q: %w (output: %s)", session, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
@@ -413,7 +444,7 @@ func (r *TmuxRuntime) windowExists(ctx context.Context, id string) bool {
 	if !ok {
 		return false
 	}
-	out, err := exec.CommandContext(ctx, r.Command, "list-windows", "-t", session, "-F", "#{window_id}").CombinedOutput()
+	out, err := exec.CommandContext(ctx, r.Command, "list-windows", "-t", session+":", "-F", "#{window_id}").CombinedOutput()
 	if err != nil {
 		return false
 	}
@@ -564,7 +595,7 @@ func mergeLabelMaps(labels, annotations map[string]string) map[string]string {
 }
 
 func (r *TmuxRuntime) sessionExists(ctx context.Context) bool {
-	return exec.CommandContext(ctx, r.Command, "has-session", "-t", r.Session).Run() == nil
+	return exec.CommandContext(ctx, r.Command, "has-session", "-t", r.Session+":").Run() == nil
 }
 
 type windowMetadata struct {
@@ -759,8 +790,12 @@ func (r *TmuxRuntime) GetWorkspacePath(ctx context.Context, id string) (string, 
 	return workspace, nil
 }
 
-func (r *TmuxRuntime) formatWindowTarget(windowID string) string {
-	return fmt.Sprintf("%s:%s", r.Session, windowID)
+// formatWindowTarget joins a tmux session and window id into the
+// "<session>:<window_id>" target string used everywhere downstream.
+// Free function (not a method) because per-agent session can differ
+// from r.Session — callers always pass the resolved session.
+func formatWindowTarget(session, windowID string) string {
+	return fmt.Sprintf("%s:%s", session, windowID)
 }
 
 // warnIgnoredFeatures emits stderr warnings for RunConfig fields the tmux
