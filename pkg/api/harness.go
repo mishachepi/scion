@@ -24,7 +24,16 @@ type Harness interface {
 	Name() string
 	AdvancedCapabilities() HarnessAdvancedCapabilities
 	GetEnv(agentName string, agentHome string, unixUsername string) map[string]string
-	GetCommand(task string, resume bool, baseArgs []string) []string
+	// GetCommand builds the harness CLI invocation argv.
+	//   task        — the prompt to deliver (empty on bare resume).
+	//   resume      — true to add the harness's resume flag.
+	//   sessionID   — exact harness session id to resume; when empty the
+	//                 harness falls back to its latest-session resume flag
+	//                 (e.g. `claude --continue`). See HarnessSessionID on
+	//                 AgentInfo / StartOptions / runtime.RunConfig for how
+	//                 the id is captured and threaded.
+	//   baseArgs    — auxiliary args (limits, model overrides, etc.).
+	GetCommand(task string, resume bool, sessionID string, baseArgs []string) []string
 	DefaultConfigDir() string
 	SkillsDir() string
 	HasSystemPrompt(agentHome string) bool

@@ -38,7 +38,7 @@ func (h *EnvHarness) Name() string { return "test" }
 func (h *EnvHarness) AdvancedCapabilities() api.HarnessAdvancedCapabilities {
 	return api.HarnessAdvancedCapabilities{Harness: "test"}
 }
-func (h *EnvHarness) GetCommand(task string, resume bool, args []string) []string {
+func (h *EnvHarness) GetCommand(task string, resume bool, sessionID string, args []string) []string {
 	return []string{"/bin/echo", "test"}
 }
 func (h *EnvHarness) GetEnv(agentName, homeDir, username string) map[string]string {

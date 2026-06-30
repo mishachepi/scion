@@ -383,7 +383,7 @@ func (r *CloudRunRuntime) buildCloudRunInstance(cfg RunConfig, uid, gid int, nfs
 		)
 		container.Args = []string{"/bin/sh", "-c", tmuxCmd}
 	} else if cfg.Harness != nil {
-		harnessArgs := cfg.Harness.GetCommand(cfg.Task, cfg.Resume, cfg.CommandArgs)
+		harnessArgs := cfg.Harness.GetCommand(cfg.Task, cfg.Resume, cfg.HarnessSessionID, cfg.CommandArgs)
 		var quotedArgs []string
 		for _, a := range harnessArgs {
 			quotedArgs = append(quotedArgs, shellQuote(a))

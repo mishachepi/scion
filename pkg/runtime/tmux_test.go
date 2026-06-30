@@ -44,7 +44,7 @@ func TestTmuxRuntime_Defaults(t *testing.T) {
 type stubHarness struct{ name string }
 
 func (h *stubHarness) Name() string { return h.name }
-func (h *stubHarness) GetCommand(string, bool, []string) []string {
+func (h *stubHarness) GetCommand(string, bool, string, []string) []string {
 	return []string{h.name}
 }
 func (h *stubHarness) GetEnv(string, string, string) map[string]string { return nil }
