@@ -42,6 +42,18 @@ import (
 var ErrTmuxBinaryNotFound = errors.New("tmux binary not found")
 var ErrContainerNameInUse = errors.New("agent name is already in use by a stopped container; please delete the existing agent or choose a different name")
 
+// runtimeEndpointOverrideKeys are env keys whose value is resolved differently
+// depending on where the process using them runs. cmd.common.go sets these
+// from the operator's CLI/settings context (typically a loopback endpoint that
+// only works on the operator's host). For remote runtimes (k8s pod, cloud
+// broker) the profile / harness-config entry must be authoritative so a pod
+// gets a routable-from-container variant instead of laptop loopback. Non-
+// endpoint keys keep the ordinary "first writer wins" precedence.
+var runtimeEndpointOverrideKeys = map[string]struct{}{
+	"SCION_HUB_ENDPOINT": {},
+	"SCION_HUB_URL":      {},
+}
+
 func classifyLaunchRuntimeError(err error, resolvedImage string) error {
 	if err == nil {
 		return nil
@@ -1382,6 +1394,17 @@ func resolveAuthEnvOverlay(opts *api.StartOptions, settings *config.VersionedSet
 				opts.Env = make(map[string]string)
 			}
 			for k, v := range hcEntry.Env {
+				// Endpoint variables are runtime-scoped: a profile/harness-config
+				// entry authoritatively overrides the CLI-resolved default,
+				// because the CLI resolves them relative to the operator's
+				// laptop while a remote runtime (k8s pod, cloud broker) may
+				// need a routable-from-container variant. Non-endpoint keys
+				// keep "first writer wins" so CLI-scope flags like SCION_DEBUG
+				// and hub-supplied values stay authoritative.
+				if _, isEndpoint := runtimeEndpointOverrideKeys[k]; isEndpoint {
+					opts.Env[k] = v
+					continue
+				}
 				if _, exists := opts.Env[k]; !exists { // never clobber hub-supplied values
 					opts.Env[k] = v
 				}

@@ -3365,3 +3365,133 @@ func TestReResolveModelAlias(t *testing.T) {
 		})
 	}
 }
+
+// TestStartSettingsEnvEndpointPrecedence covers the endpoint env override
+// contract (originally feat/runtime-endpoint-env-precedence, re-expressed on
+// top of the G3-full settings model where harness-config env is the only
+// settings-declared env source):
+//   - SCION_HUB_ENDPOINT / SCION_HUB_URL in a settings harness-config entry
+//     authoritatively override the CLI-resolved value already sitting in
+//     opts.Env, because CLI values are laptop-scoped (loopback /
+//     operator-local) and won't route from a remote runtime like a k8s pod.
+//   - Non-endpoint keys keep the ordinary "first writer wins" precedence so
+//     CLI-scope flags (SCION_DEBUG, etc.) remain authoritative.
+func TestStartSettingsEnvEndpointPrecedence(t *testing.T) {
+	setup := func(t *testing.T, hcEnv map[string]string) map[string]string {
+		t.Helper()
+		tmpDir := t.TempDir()
+
+		oldWd, _ := os.Getwd()
+		os.Chdir(tmpDir)
+		t.Cleanup(func() { os.Chdir(oldWd) })
+
+		originalHome := os.Getenv("HOME")
+		t.Cleanup(func() { os.Setenv("HOME", originalHome) })
+		os.Setenv("HOME", tmpDir)
+
+		for _, k := range []string{"SCION_DEV_TOKEN", "SCION_AUTH_TOKEN", "SCION_HUB_ENDPOINT", "SCION_HUB_URL"} {
+			if old, ok := os.LookupEnv(k); ok {
+				k := k
+				t.Cleanup(func() { os.Setenv(k, old) })
+				os.Unsetenv(k)
+			}
+		}
+
+		globalScionDir := filepath.Join(tmpDir, ".scion")
+		hcDir := filepath.Join(globalScionDir, "harness-configs", "cfg")
+		os.MkdirAll(hcDir, 0755)
+		os.WriteFile(filepath.Join(hcDir, "config.yaml"),
+			[]byte("harness: gemini\nuser: scion\nimage: test-image:latest\n"), 0644)
+
+		tplDir := filepath.Join(globalScionDir, "templates", "default")
+		os.MkdirAll(tplDir, 0755)
+		os.WriteFile(filepath.Join(tplDir, "scion-agent.json"),
+			[]byte(`{"default_harness_config": "cfg"}`), 0644)
+
+		var envLines []string
+		for k, v := range hcEnv {
+			envLines = append(envLines, fmt.Sprintf("      %s: %q", k, v))
+		}
+		hcBlock := ""
+		if len(envLines) > 0 {
+			hcBlock = "harness_configs:\n  cfg:\n    env:\n" + strings.Join(envLines, "\n") + "\n"
+		}
+		os.WriteFile(filepath.Join(globalScionDir, "settings.yaml"),
+			[]byte("schema_version: \"1\"\nactive_profile: k8s-remote\n"+hcBlock+
+				"profiles:\n  k8s-remote:\n    runtime: docker\n"+
+				"runtimes:\n  docker:\n    type: docker\n"), 0644)
+
+		projectDir := filepath.Join(tmpDir, "project")
+		projectScionDir := filepath.Join(projectDir, ".scion")
+		os.MkdirAll(projectScionDir, 0755)
+
+		var capturedConfig runtime.RunConfig
+		mockRT := &runtime.MockRuntime{
+			ListFunc: func(ctx context.Context, labelFilter map[string]string) ([]api.AgentInfo, error) {
+				return []api.AgentInfo{}, nil
+			},
+			RunFunc: func(ctx context.Context, cfg runtime.RunConfig) (string, error) {
+				capturedConfig = cfg
+				return "mock-id", nil
+			},
+		}
+
+		mgr := NewManager(mockRT)
+		_, err := mgr.Start(context.Background(), api.StartOptions{
+			Name:        "test-agent",
+			ProjectPath: projectScionDir,
+			NoAuth:      true,
+			// Simulate cmd/common.go priming opts.Env with CLI-resolved endpoint
+			// and a laptop-scope debug flag.
+			Env: map[string]string{
+				"SCION_HUB_ENDPOINT": "http://cli-loopback:9810",
+				"SCION_HUB_URL":      "http://cli-loopback:9810",
+				"SCION_DEBUG":        "1",
+			},
+		})
+		if err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+		envMap := make(map[string]string)
+		for _, e := range capturedConfig.Env {
+			parts := strings.SplitN(e, "=", 2)
+			if len(parts) == 2 {
+				envMap[parts[0]] = parts[1]
+			}
+		}
+		return envMap
+	}
+
+	t.Run("harness-config SCION_HUB_ENDPOINT overrides CLI-injected loopback", func(t *testing.T) {
+		envMap := setup(t, map[string]string{
+			"SCION_HUB_ENDPOINT": "http://hc-remote:9810",
+			"SCION_HUB_URL":      "http://hc-remote:9810",
+		})
+		if got := envMap["SCION_HUB_ENDPOINT"]; got != "http://hc-remote:9810" {
+			t.Errorf("SCION_HUB_ENDPOINT = %q, want harness-config %q", got, "http://hc-remote:9810")
+		}
+		if got := envMap["SCION_HUB_URL"]; got != "http://hc-remote:9810" {
+			t.Errorf("SCION_HUB_URL = %q, want harness-config %q", got, "http://hc-remote:9810")
+		}
+	})
+
+	t.Run("non-endpoint keys keep first-writer-wins", func(t *testing.T) {
+		envMap := setup(t, map[string]string{
+			"SCION_DEBUG": "0", // harness config would clear debug, must NOT win
+			"MY_VAR":      "hc-value",
+		})
+		if got := envMap["SCION_DEBUG"]; got != "1" {
+			t.Errorf("SCION_DEBUG = %q, want CLI-scoped %q (non-endpoint keys must not be overridden)", got, "1")
+		}
+		if got := envMap["MY_VAR"]; got != "hc-value" {
+			t.Errorf("MY_VAR = %q, want %q (no CLI value → harness-config env wins by default)", got, "hc-value")
+		}
+	})
+
+	t.Run("no harness-config env leaves CLI-injected endpoint intact", func(t *testing.T) {
+		envMap := setup(t, nil)
+		if got := envMap["SCION_HUB_ENDPOINT"]; got != "http://cli-loopback:9810" {
+			t.Errorf("SCION_HUB_ENDPOINT = %q, want CLI-injected %q", got, "http://cli-loopback:9810")
+		}
+	})
+}
