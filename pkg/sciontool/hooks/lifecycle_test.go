@@ -53,9 +53,9 @@ func TestRunPreStart_ExecutesScriptsAcrossMultipleDirs(t *testing.T) {
 	// system dir: pre-start.d/10-system writes "system" to a marker file
 	marker := filepath.Join(t.TempDir(), "marker")
 	mustWriteScript(t, filepath.Join(system, "pre-start.d", "10-system"),
-		"#!/bin/sh\necho -n system >> "+marker+"\n")
+		"#!/bin/sh\nprintf '%s' system >> "+marker+"\n")
 	mustWriteScript(t, filepath.Join(agent, "pre-start.d", "20-agent"),
-		"#!/bin/sh\necho -n :agent >> "+marker+"\n")
+		"#!/bin/sh\nprintf '%s' :agent >> "+marker+"\n")
 
 	m := &LifecycleManager{
 		HooksDirs: []string{system, agent},
@@ -77,7 +77,7 @@ func TestRunPreStart_HandlersRunAfterScriptHooks(t *testing.T) {
 	dir := t.TempDir()
 	marker := filepath.Join(t.TempDir(), "marker")
 	mustWriteScript(t, filepath.Join(dir, "pre-start.d", "10"),
-		"#!/bin/sh\necho -n A >> "+marker+"\n")
+		"#!/bin/sh\nprintf '%s' A >> "+marker+"\n")
 
 	var mu sync.Mutex
 	m := &LifecycleManager{HooksDirs: []string{dir}, Handlers: map[string][]Handler{}}
@@ -102,11 +102,11 @@ func TestRunPreStart_ScriptDDirSortedLexically(t *testing.T) {
 	dir := t.TempDir()
 	marker := filepath.Join(t.TempDir(), "marker")
 	mustWriteScript(t, filepath.Join(dir, "pre-start.d", "20"),
-		"#!/bin/sh\necho -n 20 >> "+marker+"\n")
+		"#!/bin/sh\nprintf '%s' 20 >> "+marker+"\n")
 	mustWriteScript(t, filepath.Join(dir, "pre-start.d", "10"),
-		"#!/bin/sh\necho -n 10 >> "+marker+"\n")
+		"#!/bin/sh\nprintf '%s' 10 >> "+marker+"\n")
 	mustWriteScript(t, filepath.Join(dir, "pre-start.d", "30"),
-		"#!/bin/sh\necho -n 30 >> "+marker+"\n")
+		"#!/bin/sh\nprintf '%s' 30 >> "+marker+"\n")
 
 	m := &LifecycleManager{HooksDirs: []string{dir}, Handlers: map[string][]Handler{}}
 	if err := m.RunPreStart(); err != nil {
@@ -145,7 +145,7 @@ func TestRunPreStart_AgentHomeOverridesHOMEInHooks(t *testing.T) {
 
 	// Script writes $HOME to marker file
 	mustWriteScript(t, filepath.Join(dir, "pre-start.d", "10-check-home"),
-		"#!/bin/sh\necho -n \"$HOME\" > "+marker+"\n")
+		"#!/bin/sh\nprintf '%s' \"$HOME\" > "+marker+"\n")
 
 	agentHome := "/home/scion"
 	m := &LifecycleManager{
