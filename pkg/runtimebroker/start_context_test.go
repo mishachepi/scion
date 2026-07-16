@@ -1460,6 +1460,12 @@ func TestWorktreeWorkspace_RepoRootDerivesToBase(t *testing.T) {
 	}
 
 	base := resolved.HostPath // <projectPath>/workspace — the shared base checkout
+	// t.TempDir() may sit behind symlinks (macOS: /var → /private/var); git
+	// reports the resolved path in --git-common-dir, so canonicalize base
+	// before deriving expectations from it.
+	if canon, err := filepath.EvalSymlinks(base); err == nil {
+		base = canon
+	}
 	worktree := provision.WorktreePath(base, "agent-a")
 
 	// Replicate pkg/agent/run.go's repoRoot derivation from the workspace.
