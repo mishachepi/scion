@@ -329,10 +329,11 @@ func TestDeleteAgent_DispatchesToBroker(t *testing.T) {
 	rec := doRequest(t, srv, http.MethodDelete, "/api/v1/agents/"+agent.ID, nil)
 	assert.Equal(t, http.StatusNoContent, rec.Code)
 
-	// Verify dispatch was called with correct defaults
+	// Verify dispatch was called with correct defaults: file/branch cleanup
+	// is opt-in, so absent query params must mean "preserve".
 	assert.Equal(t, 1, disp.deleteCalls, "DispatchAgentDelete should be called once")
-	assert.True(t, disp.lastDeleteFiles, "deleteFiles should default to true")
-	assert.True(t, disp.lastRemoveBranch, "removeBranch should default to true")
+	assert.False(t, disp.lastDeleteFiles, "deleteFiles should default to false (opt-in)")
+	assert.False(t, disp.lastRemoveBranch, "removeBranch should default to false (opt-in)")
 
 	// Verify agent was deleted from hub
 	ctx := context.Background()

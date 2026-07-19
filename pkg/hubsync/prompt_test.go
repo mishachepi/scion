@@ -15,6 +15,7 @@
 package hubsync
 
 import (
+	"os"
 	"testing"
 )
 
@@ -37,22 +38,79 @@ func TestConfirmAction_AutoConfirm(t *testing.T) {
 	}
 }
 
-func TestConfirmAction_NoAutoConfirm_DefaultYes(t *testing.T) {
-	// When not auto-confirming and stdin returns EOF/error, it falls back to defaultYes.
-	// With defaultYes=true, should return true.
-	result := ConfirmAction("Test prompt", true, false)
-	if !result {
-		t.Error("ConfirmAction with defaultYes=true should return true on stdin EOF")
+func TestConfirmAction_NoAutoConfirm_EOFDeclines(t *testing.T) {
+	// When not auto-confirming and stdin yields no input (EOF — running
+	// non-interactively), the prompt must DECLINE regardless of defaultYes.
+	// The interactive default must never confirm an action nobody saw.
+	for _, defaultYes := range []bool{true, false} {
+		if result := ConfirmAction("Test prompt", defaultYes, false); result {
+			t.Errorf("ConfirmAction(defaultYes=%v) should return false on stdin EOF", defaultYes)
+		}
 	}
 }
 
-func TestConfirmAction_NoAutoConfirm_DefaultNo(t *testing.T) {
-	// When not auto-confirming and stdin returns EOF/error, it falls back to defaultYes.
-	// With defaultYes=false, should return false.
-	result := ConfirmAction("Test prompt", false, false)
-	if result {
-		t.Error("ConfirmAction with defaultYes=false should return false on stdin EOF")
+// withStdin replaces os.Stdin with a pipe carrying the given input for the
+// duration of fn.
+func withStdin(t *testing.T, input string, fn func()) {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
 	}
+	orig := os.Stdin
+	os.Stdin = r
+	defer func() {
+		os.Stdin = orig
+		_ = r.Close()
+	}()
+	if _, err := w.WriteString(input); err != nil {
+		t.Fatalf("write stdin: %v", err)
+	}
+	_ = w.Close()
+	fn()
+}
+
+func TestConfirmAction_InteractiveInputs(t *testing.T) {
+	tests := []struct {
+		name       string
+		input      string
+		defaultYes bool
+		want       bool
+	}{
+		{"empty line uses default yes", "\n", true, true},
+		{"empty line uses default no", "\n", false, false},
+		{"explicit yes", "y\n", false, true},
+		{"explicit no", "n\n", true, false},
+		{"partial yes without newline", "y", false, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			withStdin(t, tt.input, func() {
+				if got := ConfirmAction("Test prompt", tt.defaultYes, false); got != tt.want {
+					t.Errorf("ConfirmAction(input=%q, defaultYes=%v) = %v, want %v", tt.input, tt.defaultYes, got, tt.want)
+				}
+			})
+		})
+	}
+}
+
+func TestShowSyncPlan_RemovalsDefaultToNo(t *testing.T) {
+	// A bare Enter must not confirm a sync that would remove hub
+	// registrations; register-only syncs keep the friendly Yes default.
+	removal := &SyncResult{ToRemove: []AgentRef{{Name: "gone-agent", ID: "id-1"}}}
+	withStdin(t, "\n", func() {
+		if ShowSyncPlan(removal, false) {
+			t.Error("ShowSyncPlan with removals should decline on bare Enter")
+		}
+	})
+
+	registerOnly := &SyncResult{ToRegister: []string{"new-agent"}}
+	withStdin(t, "\n", func() {
+		if !ShowSyncPlan(registerOnly, false) {
+			t.Error("ShowSyncPlan with register-only plan should confirm on bare Enter")
+		}
+	})
 }
 
 func TestNextSlugFromMatches(t *testing.T) {
