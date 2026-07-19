@@ -216,7 +216,8 @@ func TestAgentsCreate(t *testing.T) {
 }
 
 func TestAgentsDelete(t *testing.T) {
-	// DeleteFiles=true (server default) should NOT send deleteFiles param
+	// Cleanup flags are always sent explicitly — the server must never fall
+	// back to its own default for these destructive parameters.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodDelete {
 			t.Errorf("expected DELETE, got %s", r.Method)
@@ -225,9 +226,11 @@ func TestAgentsDelete(t *testing.T) {
 			t.Errorf("expected path /api/v1/agents/agent-to-delete, got %s", r.URL.Path)
 		}
 
-		// deleteFiles defaults to true on server, so client should not send it
-		if r.URL.Query().Get("deleteFiles") != "" {
-			t.Errorf("expected no deleteFiles param (server defaults to true), got %q", r.URL.Query().Get("deleteFiles"))
+		if r.URL.Query().Get("deleteFiles") != "true" {
+			t.Errorf("expected explicit deleteFiles=true, got %q", r.URL.Query().Get("deleteFiles"))
+		}
+		if r.URL.Query().Get("removeBranch") != "false" {
+			t.Errorf("expected explicit removeBranch=false, got %q", r.URL.Query().Get("removeBranch"))
 		}
 
 		w.WriteHeader(http.StatusNoContent)
