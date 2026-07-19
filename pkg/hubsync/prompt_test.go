@@ -72,6 +72,22 @@ func TestConfirmAction_Terminal(t *testing.T) {
 	}
 }
 
+func TestShowSyncPlan_RemovalsDefaultToNo(t *testing.T) {
+	// A bare Enter must not confirm a sync that would remove hub
+	// registrations; register-only syncs keep the friendly Yes default.
+	removal := &SyncResult{ToRemove: []AgentRef{{Name: "gone-agent", ID: "id-1"}}}
+	withPromptIO(t, strings.NewReader("\n"), true)
+	if ShowSyncPlan(removal, false) {
+		t.Error("ShowSyncPlan with removals should decline on bare Enter")
+	}
+
+	registerOnly := &SyncResult{ToRegister: []string{"new-agent"}}
+	withPromptIO(t, strings.NewReader("\n"), true)
+	if !ShowSyncPlan(registerOnly, false) {
+		t.Error("ShowSyncPlan with register-only plan should confirm on bare Enter")
+	}
+}
+
 func TestNextSlugFromMatches(t *testing.T) {
 	tests := []struct {
 		name     string

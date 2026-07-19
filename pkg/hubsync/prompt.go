@@ -149,7 +149,9 @@ func ShowSyncPlan(result *SyncResult, autoConfirm bool) bool {
 	}
 
 	_, _ = fmt.Fprintln(promptOut)
-	return ConfirmAction("Proceed with sync?", true, autoConfirm)
+	// A sync that removes hub registrations is destructive: default to No so
+	// a bare Enter never deletes anything. Register-only syncs keep default Yes.
+	return ConfirmAction("Proceed with sync?", len(result.ToRemove) == 0, autoConfirm)
 }
 
 // ShowLinkPrompt displays the project link prompt.
