@@ -329,8 +329,52 @@ func loadLegacySettingsFileOnly(dir string) (*Settings, error) {
 	return settings, nil
 }
 
-// loadSettingsFile loads settings from a directory, preferring YAML over
-// JSON. Before loading a YAML file it migrates any legacy hub.grove_id key
+// legacyHubGroveIDJSON is the JSON/camelCase spelling of the legacy hub
+// project-link key (hub.groveId). Unlike the YAML snake_case spelling
+// (hub.grove_id), migrateProjectSettingsFile/hubGroveIDRename does not
+// rewrite this one in place — it only targets "grove_id" — so
+// ProjectSettingsDefineHubLink must still check for it directly.
+// projectkeys no longer exports a constant for it (upstream #1999, "stop
+// emitting grove keys", dropped the API-response-facing aliases this used
+// to share a home with), so it lives here as a fork-owned literal instead.
+const legacyHubGroveIDJSON = "hub.groveId"
+
+// ProjectSettingsDefineHubLink reports whether the project rooted at dir
+// defines its own hub project link (hub.project_id / hub.projectId, or the
+// legacy hub.groveId alias) in its settings files — the in-repo .scion
+// settings or the external project-config settings for split storage.
+// Embedded defaults, global settings, and environment variables are
+// deliberately excluded: a hub link inherited from the global settings
+// hierarchy does not count as the project's own. The legacy hub.grove_id
+// (snake_case) spelling needs no entry here — loadSettingsFile's migration
+// rewrites it to hub.project_id in place before this function ever reads
+// the file, so the canonical key already covers it.
+func ProjectSettingsDefineHubLink(dir string) bool {
+	dirs := []string{dir}
+	if eff := resolveEffectiveProjectPath(dir); eff != "" && eff != dir {
+		dirs = append(dirs, eff)
+	}
+	keys := []string{
+		projectkeys.ConfigHubProjectIDJSON,
+		projectkeys.ConfigHubProjectIDKey,
+		legacyHubGroveIDJSON,
+	}
+	for _, d := range dirs {
+		k := koanf.New(".")
+		if _, err := loadSettingsFile(k, d); err != nil {
+			continue
+		}
+		for _, key := range keys {
+			if k.String(key) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// loadSettingsFile loads settings from a directory, preferring YAML over JSON.
+// Before loading a YAML file it migrates any legacy hub.grove_id key
 // to hub.project_id in place (see migrateProjectSettingsFile). Whenever that
 // migration found a legacy key with no existing hub.project_id, its value is
 // also loaded into k directly, whether or not the on-disk rewrite itself
