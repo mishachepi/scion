@@ -228,6 +228,37 @@ func LoadSettingsFromDir(dir string) (*Settings, error) {
 	return settings, nil
 }
 
+// ProjectSettingsDefineHubLink reports whether the project rooted at dir
+// defines its own hub project link (hub.projectId or a legacy alias) in its
+// settings files — the in-repo .scion settings or the external project-config
+// settings for split storage. Embedded defaults, global settings, and
+// environment variables are deliberately excluded: a hub link inherited from
+// the global settings hierarchy does not count as the project's own.
+func ProjectSettingsDefineHubLink(dir string) bool {
+	dirs := []string{dir}
+	if eff := resolveEffectiveProjectPath(dir); eff != "" && eff != dir {
+		dirs = append(dirs, eff)
+	}
+	keys := []string{
+		projectcompat.ConfigHubProjectIDJSON,
+		projectcompat.ConfigHubProjectIDKey,
+		projectcompat.ConfigHubGroveIDJSON,
+		projectcompat.ConfigHubGroveIDKey,
+	}
+	for _, d := range dirs {
+		k := koanf.New(".")
+		if err := loadSettingsFile(k, d); err != nil {
+			continue
+		}
+		for _, key := range keys {
+			if k.String(key) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // loadSettingsFile loads settings from a directory, preferring YAML over JSON
 func loadSettingsFile(k *koanf.Koanf, dir string) error {
 	yamlPath := filepath.Join(dir, "settings.yaml")
