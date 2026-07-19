@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
@@ -408,20 +409,20 @@ func (s *projectService) GetAgent(ctx context.Context, projectID, agentID string
 }
 
 // DeleteAgent removes an agent by ID or slug within a project.
+// File and branch cleanup is strictly opt-in: both flags are always sent
+// explicitly so the server never falls back to its own default. A nil opts
+// deletes the hub registration only, leaving all broker-side files intact.
 func (s *projectService) DeleteAgent(ctx context.Context, projectID, agentID string, opts *DeleteAgentOptions) error {
-	path := "/api/v1/projects/" + projectID + "/agents/" + agentID
-	if opts != nil {
-		query := url.Values{}
-		if opts.DeleteFiles {
-			query.Set("deleteFiles", "true")
-		}
-		if opts.RemoveBranch {
-			query.Set("removeBranch", "true")
-		}
-		if len(query) > 0 {
-			path += "?" + query.Encode()
-		}
+	if opts == nil {
+		opts = &DeleteAgentOptions{}
 	}
+	query := url.Values{}
+	query.Set("deleteFiles", strconv.FormatBool(opts.DeleteFiles))
+	query.Set("removeBranch", strconv.FormatBool(opts.RemoveBranch))
+	if opts.Force {
+		query.Set("force", "true")
+	}
+	path := "/api/v1/projects/" + projectID + "/agents/" + agentID + "?" + query.Encode()
 
 	resp, err := s.c.delete(ctx, path, nil)
 	if err != nil {

@@ -2426,3 +2426,175 @@ func TestWrapHubError_SuppressesLocalHintForAgents(t *testing.T) {
 		}
 	})
 }
+
+func TestEnsureHubReady_ProjectDoesNotInheritGlobalHubLink(t *testing.T) {
+	// A project-level .scion WITHOUT its own hub link must not adopt the
+	// hub.grove_id inherited from the global settings file. Doing so made
+	// every unlinked project sync against the operator's global hub project —
+	// comparing unrelated agent sets and offering to delete the difference.
+	for _, e := range []string{"SCION_HUB_ENDPOINT", "SCION_HUB_URL", "SCION_GROVE_ID", "SCION_HUB_GROVE_ID", "SCION_PROJECT_ID"} {
+		if val, ok := os.LookupEnv(e); ok {
+			_ = os.Unsetenv(e)
+			defer func() { _ = os.Setenv(e, val) }()
+		}
+	}
+
+	globalHubProjectID := "global-hub-project-id"
+	localProjectID := "local-project-id"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/healthz":
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		case r.URL.Path == "/api/v1/projects/"+localProjectID:
+			// The project is registered on the hub under its local ID.
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"id":   localProjectID,
+				"name": "my-project",
+			})
+		case strings.Contains(r.URL.Path, "/agents"):
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"agents":     []interface{}{},
+				"serverTime": time.Now().UTC().Format(time.RFC3339Nano),
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	// Global .scion with hub enabled AND a hub project link of its own.
+	tmpHome := t.TempDir()
+	globalDir := filepath.Join(tmpHome, ".scion")
+	if err := os.MkdirAll(globalDir, 0755); err != nil {
+		t.Fatalf("Failed to create global dir: %v", err)
+	}
+	globalSettings := fmt.Sprintf(`hub:
+  enabled: true
+  endpoint: %s
+  grove_id: %s
+`, server.URL, globalHubProjectID)
+	if err := os.WriteFile(filepath.Join(globalDir, "settings.yaml"), []byte(globalSettings), 0644); err != nil {
+		t.Fatalf("Failed to write global settings: %v", err)
+	}
+
+	// Project-level .scion with a local identity but NO hub link of its own.
+	projectDir := filepath.Join(tmpHome, "my-project", ".scion")
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatalf("Failed to create project dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, "project-id"), []byte(localProjectID), 0644); err != nil {
+		t.Fatalf("Failed to write project-id: %v", err)
+	}
+
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("SCION_DEV_TOKEN", "test-dev-token")
+	t.Setenv("SCION_AUTH_TOKEN", "")
+
+	origDir, _ := os.Getwd()
+	if err := os.Chdir(filepath.Dir(projectDir)); err != nil {
+		t.Fatalf("Failed to chdir: %v", err)
+	}
+	defer func() { _ = os.Chdir(origDir) }()
+
+	hubCtx, err := EnsureHubReady(projectDir, EnsureHubReadyOptions{
+		SkipSync:    true,
+		AutoConfirm: true,
+	})
+	if err != nil {
+		t.Fatalf("EnsureHubReady returned error: %v", err)
+	}
+	if hubCtx == nil {
+		t.Fatal("EnsureHubReady returned nil hub context")
+	}
+	if hubCtx.ProjectID == globalHubProjectID {
+		t.Fatalf("ProjectID = %q: project without its own hub link must not inherit the global hub project link", globalHubProjectID)
+	}
+	if hubCtx.ProjectID != localProjectID {
+		t.Errorf("ProjectID = %q, want local project id %q", hubCtx.ProjectID, localProjectID)
+	}
+}
+
+func TestEnsureHubReady_ProjectHonorsOwnHubLink(t *testing.T) {
+	// A project-level .scion WITH its own hub link (even via the legacy
+	// hub.grove_id key) keeps resolving to that hub project.
+	for _, e := range []string{"SCION_HUB_ENDPOINT", "SCION_HUB_URL", "SCION_GROVE_ID", "SCION_HUB_GROVE_ID", "SCION_PROJECT_ID"} {
+		if val, ok := os.LookupEnv(e); ok {
+			_ = os.Unsetenv(e)
+			defer func() { _ = os.Setenv(e, val) }()
+		}
+	}
+
+	ownHubProjectID := "own-hub-project-id"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/healthz":
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		case r.URL.Path == "/api/v1/projects/"+ownHubProjectID:
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"id":   ownHubProjectID,
+				"name": "my-project",
+			})
+		case strings.Contains(r.URL.Path, "/agents"):
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"agents":     []interface{}{},
+				"serverTime": time.Now().UTC().Format(time.RFC3339Nano),
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	tmpHome := t.TempDir()
+	globalDir := filepath.Join(tmpHome, ".scion")
+	if err := os.MkdirAll(globalDir, 0755); err != nil {
+		t.Fatalf("Failed to create global dir: %v", err)
+	}
+	globalSettings := fmt.Sprintf(`hub:
+  enabled: true
+  endpoint: %s
+  grove_id: some-other-global-project
+`, server.URL)
+	if err := os.WriteFile(filepath.Join(globalDir, "settings.yaml"), []byte(globalSettings), 0644); err != nil {
+		t.Fatalf("Failed to write global settings: %v", err)
+	}
+
+	projectDir := filepath.Join(tmpHome, "my-project", ".scion")
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatalf("Failed to create project dir: %v", err)
+	}
+	projectSettings := fmt.Sprintf(`hub:
+  grove_id: %s
+`, ownHubProjectID)
+	if err := os.WriteFile(filepath.Join(projectDir, "settings.yaml"), []byte(projectSettings), 0644); err != nil {
+		t.Fatalf("Failed to write project settings: %v", err)
+	}
+
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("SCION_DEV_TOKEN", "test-dev-token")
+	t.Setenv("SCION_AUTH_TOKEN", "")
+
+	origDir, _ := os.Getwd()
+	if err := os.Chdir(filepath.Dir(projectDir)); err != nil {
+		t.Fatalf("Failed to chdir: %v", err)
+	}
+	defer func() { _ = os.Chdir(origDir) }()
+
+	hubCtx, err := EnsureHubReady(projectDir, EnsureHubReadyOptions{
+		SkipSync:    true,
+		AutoConfirm: true,
+	})
+	if err != nil {
+		t.Fatalf("EnsureHubReady returned error: %v", err)
+	}
+	if hubCtx == nil {
+		t.Fatal("EnsureHubReady returned nil hub context")
+	}
+	if hubCtx.ProjectID != ownHubProjectID {
+		t.Errorf("ProjectID = %q, want the project's own hub link %q", hubCtx.ProjectID, ownHubProjectID)
+	}
+}
