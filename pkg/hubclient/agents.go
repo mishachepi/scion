@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -478,6 +479,9 @@ func (s *agentService) Update(ctx context.Context, agentID string, req *UpdateAg
 }
 
 // Delete removes an agent.
+// File and branch cleanup is strictly opt-in: both flags are always sent
+// explicitly so the server never falls back to its own default. A nil opts
+// deletes the hub registration only, leaving all broker-side files intact.
 func (s *agentService) Delete(ctx context.Context, agentID string, opts *DeleteAgentOptions) error {
 	resp, err := s.c.delete(ctx, s.deletePath(agentID, opts), nil)
 	if err != nil {
@@ -493,28 +497,20 @@ func (s *agentService) deletePath(agentID string, opts *DeleteAgentOptions) stri
 
 // withDeleteAgentQuery appends the DELETE query parameters for opts to path.
 // It is shared by the agent-scoped and project-scoped delete calls so both
-// encode the options identically. A nil opts sends no parameters, leaving the
-// server defaults in place.
+// encode the options identically. File and branch cleanup is strictly opt-in:
+// both flags are always sent explicitly so the server never falls back to its
+// own default, and a nil opts deletes the hub registration only.
 func withDeleteAgentQuery(path string, opts *DeleteAgentOptions) string {
 	if opts == nil {
-		return path
+		opts = &DeleteAgentOptions{}
 	}
 	query := url.Values{}
-	// Server defaults deleteFiles/removeBranch to true, so only send
-	// the parameter when the caller explicitly wants to preserve them.
-	if !opts.DeleteFiles {
-		query.Set("deleteFiles", "false")
-	}
-	if !opts.RemoveBranch {
-		query.Set("removeBranch", "false")
-	}
+	query.Set("deleteFiles", strconv.FormatBool(opts.DeleteFiles))
+	query.Set("removeBranch", strconv.FormatBool(opts.RemoveBranch))
 	if opts.Force {
 		query.Set("force", "true")
 	}
-	if len(query) > 0 {
-		path += "?" + query.Encode()
-	}
-	return path
+	return path + "?" + query.Encode()
 }
 
 // Start starts a stopped agent via the hub's /start lifecycle action. It

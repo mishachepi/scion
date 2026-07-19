@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
@@ -407,6 +408,9 @@ func (s *projectService) GetAgent(ctx context.Context, projectID, agentID string
 }
 
 // DeleteAgent removes an agent by ID or slug within a project.
+// File and branch cleanup is strictly opt-in: both flags are always sent
+// explicitly so the server never falls back to its own default. A nil opts
+// deletes the hub registration only, leaving all broker-side files intact.
 func (s *projectService) DeleteAgent(ctx context.Context, projectID, agentID string, opts *DeleteAgentOptions) error {
 	path := withDeleteAgentQuery("/api/v1/projects/"+projectID+"/agents/"+agentID, opts)
 
