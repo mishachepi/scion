@@ -171,3 +171,55 @@ func TestCreateAgentRequest_GCPIdentity_JSONRoundTrip(t *testing.T) {
 	assert.Equal(t, "assign", decoded.GCPIdentity.MetadataMode)
 	assert.Equal(t, "sa-123", decoded.GCPIdentity.ServiceAccountID)
 }
+
+// TestAgentService_Delete_ExplicitCleanupFlags verifies that Delete always
+// sends deleteFiles/removeBranch explicitly. The server must never fall back
+// to its own default for these destructive flags; nil opts means
+// "registration only — preserve all broker-side files".
+func TestAgentService_Delete_ExplicitCleanupFlags(t *testing.T) {
+	tests := []struct {
+		name             string
+		opts             *DeleteAgentOptions
+		wantDeleteFiles  string
+		wantRemoveBranch string
+	}{
+		{"nil opts preserves files", nil, "false", "false"},
+		{"zero opts preserves files", &DeleteAgentOptions{}, "false", "false"},
+		{"explicit cleanup", &DeleteAgentOptions{DeleteFiles: true, RemoveBranch: true}, "true", "true"},
+		{"files only", &DeleteAgentOptions{DeleteFiles: true}, "true", "false"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var sawQuery bool
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				sawQuery = true
+				query := r.URL.Query()
+				if got := query.Get("deleteFiles"); got != tt.wantDeleteFiles {
+					t.Errorf("deleteFiles = %q, want %q", got, tt.wantDeleteFiles)
+				}
+				if got := query.Get("removeBranch"); got != tt.wantRemoveBranch {
+					t.Errorf("removeBranch = %q, want %q", got, tt.wantRemoveBranch)
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer server.Close()
+
+			client, err := New(server.URL)
+			if err != nil {
+				t.Fatalf("New failed: %v", err)
+			}
+
+			if err := client.Agents().Delete(context.Background(), "agent-1", tt.opts); err != nil {
+				t.Fatalf("Agents().Delete failed: %v", err)
+			}
+			if !sawQuery {
+				t.Fatal("server never saw the delete request")
+			}
+
+			if err := client.Projects().DeleteAgent(context.Background(), "project-1", "agent-1", tt.opts); err != nil {
+				t.Fatalf("Projects().DeleteAgent failed: %v", err)
+			}
+		})
+	}
+}

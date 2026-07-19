@@ -42,14 +42,17 @@ func ConfirmAction(prompt string, defaultYes bool, autoConfirm bool) bool {
 
 	reader := bufio.NewReader(os.Stdin)
 	input, err := reader.ReadString('\n')
-	if err != nil {
-		// On error, return the default
-		return defaultYes
+	input = strings.TrimSpace(strings.ToLower(input))
+	if err != nil && input == "" {
+		// Stdin is closed or empty (EOF without any input) — we are running
+		// non-interactively. A prompt that cannot be answered must never
+		// confirm the action, regardless of its interactive default.
+		fmt.Println()
+		fmt.Println("No input available (non-interactive) — assuming No.")
+		return false
 	}
 
-	input = strings.TrimSpace(strings.ToLower(input))
-
-	// Empty input returns the default
+	// Empty input (bare Enter) returns the interactive default
 	if input == "" {
 		return defaultYes
 	}
@@ -110,7 +113,9 @@ func ShowSyncPlan(result *SyncResult, autoConfirm bool) bool {
 	}
 
 	fmt.Println()
-	return ConfirmAction("Proceed with sync?", true, autoConfirm)
+	// A sync that removes hub registrations is destructive: default to No so
+	// a bare Enter never deletes anything. Register-only syncs keep default Yes.
+	return ConfirmAction("Proceed with sync?", len(result.ToRemove) == 0, autoConfirm)
 }
 
 // ShowLinkPrompt displays the project link prompt.

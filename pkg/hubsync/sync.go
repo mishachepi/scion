@@ -314,9 +314,20 @@ func EnsureHubReady(projectPath string, opts EnsureHubReadyOptions) (*HubContext
 	// Prefer hub.projectId (explicit link to a hub project) over project_id
 	// (deterministic local identity). For hub API calls, we need the ID
 	// the hub knows the project by.
+	//
+	// Only honor a hub link the project actually owns: merged settings
+	// inherit hub.groveId from the GLOBAL settings file, so without this
+	// check every unlinked project-level .scion silently resolves to the
+	// operator's global hub project and syncs against it — comparing this
+	// project's local agents with the global project's hub agents and
+	// offering to delete the difference.
 	effectiveProjectID := projectID
 	if hgid := settings.GetHubProjectID(); hgid != "" {
-		effectiveProjectID = hgid
+		if isGlobal || hubContext || config.ProjectSettingsDefineHubLink(resolvedPath) {
+			effectiveProjectID = hgid
+		} else {
+			debugf("ignoring hub project link %s inherited from global settings: project-level %s defines no hub link of its own", hgid, resolvedPath)
+		}
 	}
 
 	hubCtx := &HubContext{
@@ -932,13 +943,18 @@ func ExecuteSync(ctx context.Context, hubCtx *HubContext, result *SyncResult, au
 		}
 	}
 
-	// Remove Hub agents that are not on this broker
+	// Remove Hub agents that are not on this broker.
+	// Registration-only removal: the agent's files are not on this broker
+	// (that is exactly why it is in ToRemove), so never request file or
+	// branch cleanup — deleting the hub record must not touch disk state
+	// anywhere.
+	delOpts := &hubclient.DeleteAgentOptions{DeleteFiles: false, RemoveBranch: false}
 	for _, ref := range result.ToRemove {
 		fmt.Printf("Removing agent '%s' from Hub...\n", ref.Name)
 		debugf("Deleting agent via project-scoped endpoint: name=%s, id=%s, projectID=%s",
 			ref.Name, ref.ID, hubCtx.ProjectID)
 		// Use project-scoped endpoint which supports both ID and slug lookup
-		if err := hubCtx.Client.Projects().DeleteAgent(ctxTimeout, hubCtx.ProjectID, ref.ID, nil); err != nil {
+		if err := hubCtx.Client.Projects().DeleteAgent(ctxTimeout, hubCtx.ProjectID, ref.ID, delOpts); err != nil {
 			debugf("Failed to remove agent '%s' (id=%s): %v", ref.Name, ref.ID, err)
 			return fmt.Errorf("failed to remove agent '%s': %w", ref.Name, err)
 		}

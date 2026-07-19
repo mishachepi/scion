@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -400,25 +401,20 @@ func (s *agentService) Update(ctx context.Context, agentID string, req *UpdateAg
 }
 
 // Delete removes an agent.
+// File and branch cleanup is strictly opt-in: both flags are always sent
+// explicitly so the server never falls back to its own default. A nil opts
+// deletes the hub registration only, leaving all broker-side files intact.
 func (s *agentService) Delete(ctx context.Context, agentID string, opts *DeleteAgentOptions) error {
-	path := s.agentPath(agentID)
-	if opts != nil {
-		query := url.Values{}
-		// Server defaults deleteFiles/removeBranch to true, so only send
-		// the parameter when the caller explicitly wants to preserve them.
-		if !opts.DeleteFiles {
-			query.Set("deleteFiles", "false")
-		}
-		if !opts.RemoveBranch {
-			query.Set("removeBranch", "false")
-		}
-		if opts.Force {
-			query.Set("force", "true")
-		}
-		if len(query) > 0 {
-			path += "?" + query.Encode()
-		}
+	if opts == nil {
+		opts = &DeleteAgentOptions{}
 	}
+	query := url.Values{}
+	query.Set("deleteFiles", strconv.FormatBool(opts.DeleteFiles))
+	query.Set("removeBranch", strconv.FormatBool(opts.RemoveBranch))
+	if opts.Force {
+		query.Set("force", "true")
+	}
+	path := s.agentPath(agentID) + "?" + query.Encode()
 
 	resp, err := s.c.delete(ctx, path, nil)
 	if err != nil {

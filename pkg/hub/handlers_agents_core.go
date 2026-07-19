@@ -2396,10 +2396,12 @@ func (s *Server) performAgentDelete(w http.ResponseWriter, r *http.Request, agen
 
 	query := r.URL.Query()
 
-	// Default deleteFiles and removeBranch to true for full cleanup.
-	// Callers can explicitly set them to "false" to preserve files/branches.
-	deleteFiles := query.Get("deleteFiles") != "false"
-	removeBranch := query.Get("removeBranch") != "false"
+	// File and branch cleanup is opt-in: an absent parameter means "preserve".
+	// First-party clients (CLI hubclient, web UI) always send both flags
+	// explicitly. Defaulting to destructive cleanup here once turned a
+	// registration-only sync removal into broker-side file deletion.
+	deleteFiles := query.Get("deleteFiles") == "true"
+	removeBranch := query.Get("removeBranch") == "true"
 	force := query.Get("force") == "true"
 
 	// Idempotency: already-deleted agent returns 204

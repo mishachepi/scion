@@ -1004,3 +1004,39 @@ profiles:
 	assert.Equal(t, "docker", profile.Runtime,
 		"external config should override in-repo profiles.local.runtime")
 }
+
+func TestProjectSettingsDefineHubLink(t *testing.T) {
+	writeSettings := func(t *testing.T, content string) string {
+		t.Helper()
+		dir := t.TempDir()
+		if content != "" {
+			if err := os.WriteFile(filepath.Join(dir, "settings.yaml"), []byte(content), 0644); err != nil {
+				t.Fatalf("write settings: %v", err)
+			}
+		}
+		return dir
+	}
+
+	tests := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{"no settings file", "", false},
+		{"settings without hub section", "active_profile: local\n", false},
+		{"hub section without project link", "hub:\n  enabled: true\n  endpoint: http://x\n", false},
+		{"canonical hub.projectId", "hub:\n  projectId: abc\n", true},
+		{"v1 hub.project_id", "hub:\n  project_id: abc\n", true},
+		{"legacy hub.groveId", "hub:\n  groveId: abc\n", true},
+		{"legacy v1 hub.grove_id", "hub:\n  grove_id: abc\n", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := writeSettings(t, tt.content)
+			if got := ProjectSettingsDefineHubLink(dir); got != tt.want {
+				t.Errorf("ProjectSettingsDefineHubLink = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
