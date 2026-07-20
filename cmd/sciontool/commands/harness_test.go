@@ -189,6 +189,34 @@ func TestRunHarnessProvision_RejectsMissingProvisioner(t *testing.T) {
 	}
 }
 
+// Builtin provisioners carry no provision.py command — all provisioning runs
+// inline on the broker. The pre-start hook is still staged (the config has a
+// provisioner block), so runHarnessProvision must treat it as a no-op instead
+// of failing on the absent command. Regression: tmux-runtime harnesses like
+// claude-tmux (provisioner.type=builtin) died on every launch because the hook
+// exited 1 with "manifest provisioner.command is empty".
+func TestRunHarnessProvision_BuiltinIsNoop(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	bundle := filepath.Join(home, ".scion", "harness")
+	if err := os.MkdirAll(bundle, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	manifest := baseManifest(t, home, "")
+	manifest.HarnessConfig.Provisioner = &containerProvisioner{
+		Type:             "builtin",
+		InterfaceVersion: 1,
+		// No Command: builtin provisioners have nothing to run.
+	}
+	manifestPath := writeManifest(t, bundle, manifest)
+
+	if err := runHarnessProvision(context.Background(), manifestPath); err != nil {
+		t.Fatalf("builtin provisioner should be a no-op, got error: %v", err)
+	}
+}
+
 func TestRunHarnessProvision_InvalidEnvJSONFails(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
