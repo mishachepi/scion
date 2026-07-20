@@ -130,6 +130,18 @@ func runHarnessProvision(ctx context.Context, manifestPath string) error {
 	if prov == nil {
 		return fmt.Errorf("manifest does not declare a provisioner block")
 	}
+	// Builtin provisioners have no provision.py to run: all provisioning
+	// (skills, system prompt, agent instructions) is performed inline on the
+	// broker at provision time. The pre-start hook is still staged for these
+	// harness-configs (they carry a provisioner block so Resolve wires up the
+	// container-script staging path), so treat the hook as a no-op here rather
+	// than failing on the absent command. Mirrors the "not required" semantics
+	// in pkg/sciontool/hooks/harness_manifest.go.
+	if prov.Type == "builtin" {
+		log.TaggedInfo("provision", "builtin provisioner (harness=%s agent=%s): nothing to run, provisioning done inline at provision time",
+			manifest.HarnessConfig.Harness, manifest.AgentName)
+		return nil
+	}
 	if len(prov.Command) == 0 {
 		return fmt.Errorf("manifest provisioner.command is empty")
 	}
