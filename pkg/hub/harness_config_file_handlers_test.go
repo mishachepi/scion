@@ -149,3 +149,77 @@ func TestHandleHarnessConfigFileWrite_UpdatesImage(t *testing.T) {
 		t.Errorf("expected Config.Image = %q, got %q", newImage, updated.Config.Image)
 	}
 }
+
+// fileURLMockStorage returns file:// signed URLs like the real local backend,
+// so the download handler's proxy rewrite branch is exercised.
+type fileURLMockStorage struct {
+	contentMockStorage
+}
+
+func (m *fileURLMockStorage) GenerateSignedURL(_ context.Context, objectPath string, opts storage.SignedURLOptions) (*storage.SignedURL, error) {
+	return &storage.SignedURL{
+		URL:     "file:///srv/hub-storage/" + objectPath,
+		Method:  opts.Method,
+		Expires: time.Now().Add(opts.Expires),
+	}, nil
+}
+
+func TestHandleHarnessConfigFileRead_RawProxyFlow(t *testing.T) {
+	srv, s, stor := testHarnessConfigFileServer(t)
+
+	content := "harness: claude\nimage: img:v1\n"
+	hc := createTestHarnessConfigWithFiles(t, s, stor, map[string]string{"config.yaml": content})
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/harness-configs/"+hc.ID+"/files/config.yaml?raw=1", nil)
+	req.Header.Set("Authorization", "Bearer "+testDevToken)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "application/octet-stream" {
+		t.Errorf("expected octet-stream content type, got %q", ct)
+	}
+	if w.Body.String() != content {
+		t.Errorf("raw body mismatch: got %q, want %q", w.Body.String(), content)
+	}
+}
+
+func TestHandleHarnessConfigDownload_RewritesLocalFileURLs(t *testing.T) {
+	srv, s, _ := testHarnessConfigFileServer(t)
+
+	stor := &fileURLMockStorage{contentMockStorage: *newContentMockStorage("test-bucket")}
+	srv.SetStorage(stor)
+
+	hc := createTestHarnessConfigWithFiles(t, s, &stor.contentMockStorage,
+		map[string]string{"config.yaml": "harness: claude\n", "capture_auth.py": "#!/usr/bin/env python3\n"})
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/harness-configs/"+hc.ID+"/download", nil)
+	req.Header.Set("Authorization", "Bearer "+testDevToken)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp DownloadResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if len(resp.Files) != 2 {
+		t.Fatalf("expected 2 files, got %d", len(resp.Files))
+	}
+	for _, f := range resp.Files {
+		if strings.HasPrefix(f.URL, "file://") {
+			t.Errorf("file %q: URL not rewritten, still file://: %s", f.Path, f.URL)
+		}
+		want := "/api/v1/harness-configs/" + hc.ID + "/files/" + f.Path + "?raw=1"
+		if !strings.HasSuffix(f.URL, want) {
+			t.Errorf("file %q: URL %q does not end with %q", f.Path, f.URL, want)
+		}
+	}
+}
