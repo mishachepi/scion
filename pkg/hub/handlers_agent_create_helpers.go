@@ -813,6 +813,8 @@ func (s *Server) handleExistingAgent(
 
 			// A stopped agent restarts with a fresh harness session even when
 			// resume was requested (mirrors the local CLI's effectiveResume).
+			// Session continuity is reserved for suspend: stop is documented
+			// as terminal ("the next start runs a fresh session").
 			// A forced recovery is the opposite: the whole point is to continue
 			// the session the crash interrupted, so the harness resume flag is
 			// passed through.

@@ -764,6 +764,7 @@ type createAgentDispatcher struct {
 	deleteCalled  bool
 	deleteErr     error
 	startCalled   bool
+	startResume   bool
 	execOutput    string
 	execExitCode  int
 }
@@ -784,8 +785,9 @@ func (d *createAgentDispatcher) DispatchAgentProvision(_ context.Context, agent 
 	agent.Phase = string(state.PhaseCreated)
 	return nil
 }
-func (d *createAgentDispatcher) DispatchAgentStart(_ context.Context, _ *store.Agent, _ string, _ bool) error {
+func (d *createAgentDispatcher) DispatchAgentStart(_ context.Context, _ *store.Agent, _ string, resume bool) error {
 	d.startCalled = true
+	d.startResume = resume
 	return nil
 }
 func (d *createAgentDispatcher) DispatchAgentStop(_ context.Context, _ *store.Agent) error {
@@ -1263,6 +1265,10 @@ func TestCreateAgent_ResumeFromStoppedStatus(t *testing.T) {
 	// DispatchAgentStart should have been called (not delete+create)
 	assert.True(t, disp.startCalled, "DispatchAgentStart should be called for resume")
 	assert.False(t, disp.deleteCalled, "DispatchAgentDelete should NOT be called for resume")
+	// Stop is terminal for the harness session: even an explicit resume of
+	// a stopped agent restarts with a fresh session (resume=false). Session
+	// continuity is reserved for suspend.
+	assert.False(t, disp.startResume, "DispatchAgentStart must carry resume=false for a stopped agent: stop is documented as terminal for the session")
 }
 
 // TestCreateAgent_StartFromStoppedStatus_NoResume verifies that without Resume=true,

@@ -980,6 +980,22 @@ waitLoop:
 		log.Error("Session-end hooks failed: %v", err)
 	}
 
+	// Capture the harness session id for later resume. In tmux runtime mode
+	// sciontool records it directly from the harness's on-disk session store
+	// instead of relying on harness-side hooks, which the operator-shared
+	// settings may not configure.
+	if tmuxRuntimeMode && isClaude(childArgs) {
+		if cwd, err := os.Getwd(); err == nil {
+			if id := latestClaudeSessionID(agentHome, cwd); id != "" {
+				if err := statusHandler.UpdateHarnessSessionID(id); err != nil {
+					log.Error("Failed to record harness session id: %v", err)
+				} else {
+					log.Info("Recorded harness session id %s for resume", id)
+				}
+			}
+		}
+	}
+
 	// Determine the final exit code and whether this was a crash.
 	// Also recognize ExitCodeLimitsExceeded from the child process itself
 	// (e.g., the harness detected limits before the supervisor signal).
