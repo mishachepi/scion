@@ -21,10 +21,12 @@ import (
 // resumeCmd represents the resume command
 var resumeCmd = &cobra.Command{
 	Use:   "resume <agent-name>",
-	Short: "Resume a stopped scion agent",
-	Long: `Resume an existing stopped LLM agent.
-The agent will be re-launched with the harness-specific resume flag,
-preserving its previous state.
+	Short: "Resume a suspended scion agent",
+	Long: `Resume an existing suspended LLM agent.
+A suspended agent is re-launched with the harness-specific resume flag,
+preserving its previous session. A stopped agent restarts with a fresh
+session instead — stop is terminal for the harness session; use suspend
+when you want to continue later.
 
 The agent-name is required as the first argument. Subsequent arguments
 are optional and form a task prompt to be added to the resumed session
