@@ -1511,6 +1511,22 @@ waitLoop:
 		log.Error("Session-end hooks failed: %v", err)
 	}
 
+	// Capture the harness session id for later resume. In tmux runtime mode
+	// sciontool records it directly from the harness's on-disk session store
+	// instead of relying on harness-side hooks, which the operator-shared
+	// settings may not configure.
+	if tmuxRuntimeMode && isClaude(childArgs) {
+		if cwd, err := os.Getwd(); err == nil {
+			if id := latestClaudeSessionID(agentHome, cwd); id != "" {
+				if err := statusHandler.UpdateHarnessSessionID(id); err != nil {
+					log.Error("Failed to record harness session id: %v", err)
+				} else {
+					log.Info("Recorded harness session id %s for resume", id)
+				}
+			}
+		}
+	}
+
 	// Update local agent-info.json BEFORE the Hub report so the broker
 	// heartbeat can relay crash/limits state even if the Hub call is slow
 	// or fails entirely.
