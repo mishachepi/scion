@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/harness"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
@@ -148,12 +150,22 @@ func (e *errHarnessNoResume) Error() string {
 // resuming a session. An empty harness name (no applied config) is treated as
 // supported, matching the HTTP suspend handler's prior behavior of only
 // rejecting when a harness was explicitly resolved and declared SupportNo.
-func (s *Server) harnessSupportsResume(agent *store.Agent) (bool, string) {
+//
+// Installed harness-configs (hub store) are consulted before the compiled-in
+// embeds: harness.New only knows embedded harnesses and silently falls back
+// to Generic (resume unsupported) for user-installed configs like claude-tmux.
+func (s *Server) harnessSupportsResume(ctx context.Context, agent *store.Agent) (bool, string) {
 	harnessName := ""
 	if agent.AppliedConfig != nil {
 		harnessName = agent.AppliedConfig.HarnessConfig
 	}
 	if harnessName == "" {
+		return true, ""
+	}
+	if caps, ok := s.installedHarnessCapabilities(ctx, harnessName); ok {
+		if caps.Resume.Support == api.SupportNo {
+			return false, caps.Resume.Reason
+		}
 		return true, ""
 	}
 	caps := harness.New(harnessName).AdvancedCapabilities()
@@ -163,6 +175,41 @@ func (s *Server) harnessSupportsResume(agent *store.Agent) (bool, string) {
 	return true, ""
 }
 
+// installedHarnessCapabilities loads the capability matrix declared in an
+// installed harness-config's config.yaml (hub store + storage). Returns
+// ok=false when the config is not installed or cannot be read, so the caller
+// can fall back to the embedded harness resolution.
+func (s *Server) installedHarnessCapabilities(ctx context.Context, name string) (api.HarnessAdvancedCapabilities, bool) {
+	var zero api.HarnessAdvancedCapabilities
+	hc, err := s.findHarnessConfigByName(ctx, name)
+	if err != nil || hc == nil {
+		return zero, false
+	}
+	stor := s.GetStorage()
+	if stor == nil {
+		return zero, false
+	}
+	reader, _, err := stor.Download(ctx, hc.StoragePath+"/config.yaml")
+	if err != nil {
+		return zero, false
+	}
+	defer func() { _ = reader.Close() }()
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return zero, false
+	}
+	entry, err := config.ParseHarnessConfigYAML(data)
+	if err != nil {
+		return zero, false
+	}
+	if entry.Capabilities == nil {
+		// Installed but no capability matrix declared: undeclared fields are
+		// "unknown", which the resume check treats as supported.
+		return zero, true
+	}
+	return *entry.Capabilities, true
+}
+
 // suspendAgent performs the core SUSPEND action shared by the HTTP lifecycle
 // handler and the auto-suspend scheduler: it validates harness resume support,
 // syncs the workspace on stop, dispatches the container stop to the runtime
@@ -170,7 +217,7 @@ func (s *Server) harnessSupportsResume(agent *store.Agent) (bool, string) {
 // and publishes the resulting status event. It returns *errHarnessNoResume when
 // the harness cannot resume so callers can decline to suspend.
 func (s *Server) suspendAgent(ctx context.Context, agent *store.Agent) error {
-	if ok, reason := s.harnessSupportsResume(agent); !ok {
+	if ok, reason := s.harnessSupportsResume(ctx, agent); !ok {
 		return &errHarnessNoResume{reason: reason}
 	}
 
