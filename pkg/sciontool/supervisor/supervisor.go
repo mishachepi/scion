@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/term"
+
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/log"
 )
 
@@ -54,6 +56,12 @@ type Config struct {
 	// change mergeEnvOverlay's precedence rule — it is correct for its own
 	// case. See the override reasoning in the P2d PR description.
 	SecretOverrides map[string]string
+	// ForegroundTTY makes the child's process group the foreground group of
+	// the controlling terminal (tmux runtime mode). Setpgid alone leaves the
+	// child in a background process group of the pane TTY, so interactive
+	// TUI harnesses (claude, gemini) get SIGTTIN on tty reads and exit
+	// instead of rendering. Ignored when stdin is not a terminal.
+	ForegroundTTY bool
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -104,6 +112,18 @@ func (s *Supervisor) Run(ctx context.Context, args []string) (int, error) {
 	// Start in a new process group so we can signal the whole group
 	s.cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
+	}
+
+	// Hand the terminal foreground to the child's process group so
+	// interactive TUI harnesses can own the tty (see Config.ForegroundTTY).
+	if s.config.ForegroundTTY {
+		if fd := int(os.Stdin.Fd()); term.IsTerminal(fd) {
+			s.cmd.SysProcAttr.Foreground = true
+			s.cmd.SysProcAttr.Ctty = fd
+			log.Debug("Child process group will own the terminal foreground (ctty fd=%d)", fd)
+		} else {
+			log.Debug("ForegroundTTY requested but stdin is not a terminal; skipping foreground transfer")
+		}
 	}
 
 	// Drop privileges if UID/GID specified (skip in rootless mode where
