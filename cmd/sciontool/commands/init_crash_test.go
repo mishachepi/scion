@@ -102,6 +102,37 @@ func TestClassifyExit(t *testing.T) {
 			wantMsg:           "Agent crashed with exit code 1",
 		},
 		{
+			// tmux kill-window HUPs the pane: a harness that catches the
+			// signal and exits itself reports 128+signum, not -1.
+			name:              "128+SIGHUP with requested shutdown is clean stop",
+			supervisedCode:    129,
+			requestedShutdown: true,
+			wantCode:          0,
+			wantCrash:         false,
+		},
+		{
+			name:              "128+SIGTERM with requested shutdown is clean stop",
+			supervisedCode:    143,
+			requestedShutdown: true,
+			wantCode:          0,
+			wantCrash:         false,
+		},
+		{
+			name:              "128+SIGINT harness code with requested shutdown is clean stop",
+			supervisedCode:    0,
+			harnessCode:       intPtr(130),
+			requestedShutdown: true,
+			wantCode:          0,
+			wantCrash:         false,
+		},
+		{
+			name:           "128+SIGHUP without requested shutdown is crash",
+			supervisedCode: 129,
+			wantCode:       129,
+			wantCrash:      true,
+			wantMsg:        "Agent crashed with exit code 129",
+		},
+		{
 			name:              "harness code -1 with requested shutdown is clean stop",
 			supervisedCode:    0,
 			harnessCode:       intPtr(-1),
