@@ -1139,10 +1139,15 @@ func classifyExit(supervisedCode int, supervisorErr error, harnessCode *int, lim
 		return exitOutcome{exitCode: handlers.ExitCodeLimitsExceeded, limitsExceeded: true}
 	}
 
-	// When init was told to shut down (SIGTERM/SIGINT), the child is killed by
-	// signal and Go reports exit code -1. This is expected, not a crash.
-	if requestedShutdown && finalCode == -1 {
-		return exitOutcome{exitCode: 0}
+	// When init was told to shut down (SIGTERM/SIGINT/SIGHUP), the child's
+	// death is expected, not a crash. Go reports -1 for a signal-killed
+	// child; a harness that catches the signal and exits itself uses the
+	// 128+signum convention (129 HUP, 130 INT, 143 TERM).
+	if requestedShutdown {
+		switch finalCode {
+		case -1, 129, 130, 143:
+			return exitOutcome{exitCode: 0}
+		}
 	}
 
 	// A supervisor error with a zero exit code is itself a failure.
