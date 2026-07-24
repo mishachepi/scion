@@ -6,9 +6,12 @@ package supervisor
 
 import (
 	"context"
+	"os"
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/term"
 )
 
 func TestSupervisor_RunSuccessfulCommand(t *testing.T) {
@@ -53,6 +56,32 @@ func TestSupervisor_RunNoCommand(t *testing.T) {
 	}
 	if exitCode != 1 {
 		t.Errorf("expected exit code 1, got %d", exitCode)
+	}
+}
+
+// TestSupervisor_ForegroundTTYWithoutTerminal verifies that ForegroundTTY is
+// a no-op when stdin is not a terminal (e.g. tests, CI, piped stdin): the
+// child must still start and exit normally instead of failing on a bogus
+// tcsetpgrp against a non-tty fd.
+func TestSupervisor_ForegroundTTYWithoutTerminal(t *testing.T) {
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		t.Skip("stdin is a terminal; this test requires non-tty stdin")
+	}
+	config := DefaultConfig()
+	config.ForegroundTTY = true
+	sup := New(config)
+
+	ctx := context.Background()
+	exitCode, err := sup.Run(ctx, []string{"true"})
+
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if exitCode != 0 {
+		t.Errorf("expected exit code 0, got %d", exitCode)
+	}
+	if sup.cmd.SysProcAttr.Foreground {
+		t.Error("Foreground must not be set when stdin is not a terminal")
 	}
 }
 
