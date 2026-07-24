@@ -1058,6 +1058,9 @@ func RunInit(args []string, opts InitRunOptions) int {
 		config.GID = 0
 		config.Username = ""
 		config.Rootless = false
+		// The pane TTY must be foregrounded to the harness, or interactive
+		// TUIs exit immediately (background pgrp cannot read the tty).
+		config.ForegroundTTY = true
 	}
 	sup := supervisor.New(config)
 
