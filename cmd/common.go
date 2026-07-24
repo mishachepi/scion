@@ -558,6 +558,9 @@ func RunAgent(cmd *cobra.Command, args []string, resume bool) error {
 	if forcedRecovery {
 		statusf("Force-resuming agent '%s' (saved phase: %s)...\n", agentName, savedPhase)
 	}
+	if resume && !effectiveResume && savedPhase == string(state.PhaseStopped) {
+		statusf("Agent '%s' was stopped; starting a fresh session (use 'suspend' to preserve the session).\n", agentName)
+	}
 
 	// Read the pinned harness session id only when we're actually
 	// resuming — a fresh start should never pick up a stale id and
