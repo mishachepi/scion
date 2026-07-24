@@ -7,12 +7,16 @@ package commands
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/creack/pty"
 )
 
 // hubEnvVars lists the environment variables used by the Hub client.
@@ -207,6 +211,55 @@ func TestInitCommand_TmuxRuntimeIntegration(t *testing.T) {
 	// tmux mode (writeEnvFile and the Claude debug munging are both skipped).
 	if _, err := os.Stat(filepath.Join(agentHome, ".scion", "scion-env")); err == nil {
 		t.Errorf("scion-env was written under SCION_AGENT_HOME in tmux runtime mode (writeEnvFile not skipped)")
+	}
+}
+
+// TestInitCommand_TmuxRuntimeForegroundTTY verifies that in tmux runtime
+// mode the supervised child's process group owns the terminal foreground.
+// Without the foreground transfer the child lands in a background pgrp of
+// the pane tty (pgid != tpgid) and interactive TUI harnesses exit instead
+// of rendering — the exact failure observed with claude under the tmux
+// runtime. Uses a real pty so sciontool has a controlling terminal, like a
+// tmux pane does.
+func TestInitCommand_TmuxRuntimeForegroundTTY(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	scrubHubEnv(t)
+
+	binPath := filepath.Join(t.TempDir(), "sciontool-test")
+	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", binPath, "../")
+	if err := cmd.Run(); err != nil {
+		t.Skipf("failed to build sciontool for integration test: %v", err)
+	}
+
+	agentHome := t.TempDir()
+	testCmd := exec.Command(binPath, "init", "--tmuxruntime", "--",
+		"/bin/sh", "-c", `echo "FGPROBE pgid=$(ps -o pgid= -p $$) tpgid=$(ps -o tpgid= -p $$)"`)
+	testCmd.Env = append(filterHubEnv(os.Environ()), "SCION_AGENT_HOME="+agentHome)
+
+	// pty.Start gives sciontool the pty slave as its controlling terminal
+	// (Setsid+Setctty), mirroring how a tmux pane runs its command.
+	ptmx, err := pty.Start(testCmd)
+	if err != nil {
+		t.Fatalf("pty.Start failed: %v", err)
+	}
+	defer func() { _ = ptmx.Close() }()
+
+	// Read until the child exits; reading the pty master returns an error
+	// (EIO on Linux, EOF on macOS) once the slave side is closed.
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, ptmx)
+	if err := testCmd.Wait(); err != nil {
+		t.Fatalf("sciontool init exited with error: %v\noutput: %s", err, buf.String())
+	}
+
+	m := regexp.MustCompile(`FGPROBE pgid=\s*(\d+) tpgid=\s*(\d+)`).FindStringSubmatch(buf.String())
+	if m == nil {
+		t.Fatalf("FGPROBE line not found in output: %s", buf.String())
+	}
+	if m[1] != m[2] {
+		t.Errorf("child pgid %s != tty foreground pgid %s: child is a background pgrp, interactive harnesses would exit", m[1], m[2])
 	}
 }
 
