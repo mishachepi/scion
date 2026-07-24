@@ -6,7 +6,7 @@
     "enabled": false
   },
   "permissions": {
-    "allow": [],
+    "defaultMode": "bypassPermissions",
     "deny": [
       "EnterPlanMode",
       "ExitPlanMode",
