@@ -1867,7 +1867,6 @@ func (s *Server) resetAuth(w http.ResponseWriter, r *http.Request, id, projectID
 	}
 
 	// Write the token to the canonical file atomically via temp+rename.
-	// Write the token to the canonical file atomically via temp+rename.
 	// Pass the token as part of the script using a heredoc pattern to avoid
 	// exposing it in argv (visible in /proc).
 	writeCmd := []string{"sh", "-c",
@@ -1884,11 +1883,12 @@ func (s *Server) resetAuth(w http.ResponseWriter, r *http.Request, id, projectID
 	}
 
 	// Signal sciontool init (PID 1) to re-read the token and restart its refresh
-	// loop immediately. The token was already written above, and the agent also
-	// polls the token file as a UID-safe fallback, so it recovers within a few
-	// seconds even if this signal fails. In rootless containers the broker execs
-	// as the scion user and `kill -USR2 1` against the root-owned PID 1 fails
-	// with EPERM — this is expected and not an error since the token is on disk.
+	// loop immediately. The token was already written above, and the refresh
+	// loop re-reads the token file whenever a refresh attempt is auth-rejected,
+	// so the agent recovers on its next retry (≤5min backoff) even if this
+	// signal fails. In rootless containers the broker execs as the scion user
+	// and `kill -USR2 1` against the root-owned PID 1 fails with EPERM — this
+	// is expected and not an error since the token is on disk.
 	signalCmd := []string{"kill", "-USR2", "1"}
 	signaled := true
 	if _, err := rt.Exec(ctx, target, signalCmd); err != nil {

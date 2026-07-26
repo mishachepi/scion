@@ -804,6 +804,56 @@ func TestClient_StartTokenRefresh(t *testing.T) {
 		assert.True(t, sawUnauthorized.Load(), "401 refresh error should wrap ErrTokenRefreshUnauthorized")
 	})
 
+	t.Run("adopts fresh token file when refresh is unauthorized", func(t *testing.T) {
+		tokenHome := t.TempDir()
+		cleanup := SetTokenHome(tokenHome)
+		defer cleanup()
+
+		// The in-memory token is expired and the hub rejects it with 401 —
+		// refresh can never succeed with this token. An out-of-band recovery
+		// (broker reset-auth / operator tooling) has already written a fresh
+		// token to the canonical file; the loop must adopt it.
+		expiredToken := makeJWTWithExpiry(t, time.Now().Add(-time.Minute))
+		freshToken := makeJWTWithExpiry(t, time.Now().Add(10*time.Hour))
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte("invalid agent token: failed to verify token"))
+		}))
+		defer server.Close()
+
+		client := NewClientWithConfig(server.URL, expiredToken, "agent-123")
+		require.NoError(t, WriteTokenFile(freshToken))
+
+		refreshed := make(chan time.Time, 1)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		done := client.StartTokenRefresh(ctx, &TokenRefreshConfig{
+			RefreshAt:      time.Now(),
+			Timeout:        time.Second,
+			RetryBaseDelay: 10 * time.Millisecond,
+			RetryMaxDelay:  10 * time.Millisecond,
+			OnRefreshed: func(newExpiry time.Time) {
+				select {
+				case refreshed <- newExpiry:
+				default:
+				}
+			},
+		})
+
+		select {
+		case <-refreshed:
+		case <-time.After(time.Second):
+			t.Fatal("refresh loop did not adopt the fresh token from the file")
+		}
+
+		assert.Equal(t, freshToken, client.GetToken(), "client should hold the token from the file")
+
+		cancel()
+		<-done
+	})
+
 	t.Run("initial schedule adjusted for transport token TTL", func(t *testing.T) {
 		// Regression test: the initial refreshAt must account for transport
 		// tokens that expire sooner than the app token. Without the fix,

@@ -944,6 +944,27 @@ func (c *Client) StartTokenRefresh(ctx context.Context, config *TokenRefreshConf
 					config.OnError(err)
 				}
 
+				// A rejected token cannot refresh itself, but an out-of-band
+				// recovery (broker reset-auth, operator tooling) may have written
+				// a fresh token to the canonical file. Adopt it when it differs
+				// and is still valid — this file-based fallback makes reset-auth
+				// work even when its SIGUSR2 signal cannot be delivered.
+				if errors.Is(err, ErrTokenRefreshUnauthorized) {
+					if exp, ok := c.adoptTokenFromFile(); ok {
+						tokenExpiry = exp
+						consecutiveFailures = 0
+						authLostNotified = false
+						if config != nil && config.OnRefreshed != nil {
+							config.OnRefreshed(exp)
+						}
+						refreshAt = c.adjustRefreshForTransportTokens(exp.Add(-2 * time.Hour))
+						if refreshAt.Before(time.Now()) {
+							refreshAt = time.Now().Add(1 * time.Minute)
+						}
+						continue
+					}
+				}
+
 				// Once the current token has actually expired and refresh still
 				// fails, auth is lost. Surface it once (for observability and to
 				// trigger out-of-band recovery such as reset-auth) — but keep
@@ -998,6 +1019,23 @@ func (c *Client) StartTokenRefresh(ctx context.Context, config *TokenRefreshConf
 	}()
 
 	return done
+}
+
+// adoptTokenFromFile re-reads the canonical token file and, when it holds a
+// token that differs from the in-memory one and has not yet expired, installs
+// it as the client's current token. Returns the new token's expiry and whether
+// adoption happened.
+func (c *Client) adoptTokenFromFile() (time.Time, bool) {
+	fileToken := ReadTokenFile()
+	if fileToken == "" || fileToken == c.GetToken() {
+		return time.Time{}, false
+	}
+	exp, err := ParseTokenExpiry(fileToken)
+	if err != nil || !time.Now().Before(exp) {
+		return time.Time{}, false
+	}
+	c.SetToken(fileToken)
+	return exp, true
 }
 
 // GetToken returns the client's current auth token.
