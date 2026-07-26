@@ -817,7 +817,8 @@ type createAgentDispatcher struct {
 	// that need the create-time agent.ID (e.g. to check quota reservations,
 	// ptone/scion#1986) can read it back after the HTTP response, which for
 	// a failure path never echoes the ID.
-	capturedAgent *store.Agent
+	capturedAgent   *store.Agent
+	resetAuthCalled bool
 }
 
 func (d *createAgentDispatcher) DispatchAgentCreate(_ context.Context, agent *store.Agent) error {
@@ -853,6 +854,7 @@ func (d *createAgentDispatcher) DispatchAgentRestart(_ context.Context, _ *store
 	return nil
 }
 func (d *createAgentDispatcher) DispatchAgentResetAuth(_ context.Context, _ *store.Agent) error {
+	d.resetAuthCalled = true
 	return nil
 }
 func (d *createAgentDispatcher) DispatchAgentDelete(_ context.Context, _ *store.Agent, _, _, _ bool, _ time.Time) error {
@@ -4922,6 +4924,39 @@ func TestHandleProjectAgentExec_DispatchesToRuntimeBroker(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
 	assert.Equal(t, "terminal output", resp.Output)
 	assert.Equal(t, 0, resp.ExitCode)
+}
+
+// TestHandleProjectAgentResetAuth_RoutesToDispatcher is a regression test for
+// the project-scoped action switch missing the reset-auth case: the CLI client
+// posts to /api/v1/projects/{id}/agents/{slug}/reset-auth, which used to 404
+// while only the agent-scoped route was wired.
+func TestHandleProjectAgentResetAuth_RoutesToDispatcher(t *testing.T) {
+	srv, s := testServer(t)
+	ctx := context.Background()
+
+	project := &store.Project{
+		ID:   tid("project-reset-auth-route"),
+		Name: "Reset Auth Project Route",
+		Slug: "reset-auth-project-route",
+	}
+	require.NoError(t, s.CreateProject(ctx, project))
+
+	agent := &store.Agent{
+		ID:        tid("agent-reset-auth-route"),
+		Slug:      tid("agent-reset-auth-route"),
+		Name:      "Reset Auth Agent Route",
+		ProjectID: project.ID,
+		Phase:     string(state.PhaseRunning),
+	}
+	require.NoError(t, s.CreateAgent(ctx, agent))
+
+	dispatcher := &createAgentDispatcher{}
+	srv.SetDispatcher(dispatcher)
+
+	rec := doRequest(t, srv, http.MethodPost,
+		"/api/v1/projects/"+project.ID+"/agents/"+agent.Slug+"/reset-auth", nil)
+	require.Equal(t, http.StatusOK, rec.Code, "response body: %s", rec.Body.String())
+	assert.True(t, dispatcher.resetAuthCalled, "reset-auth should reach the dispatcher")
 }
 
 func TestAgentStatusUpdate_RejectsPhaseRegression(t *testing.T) {
