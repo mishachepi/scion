@@ -2481,14 +2481,14 @@ func (s *Server) handleProjectAgentAction(w http.ResponseWriter, r *http.Request
 		s.handleAgentLifecycle(w, r, agent.ID, action)
 	case api.AgentActionExec:
 		s.handleAgentExec(w, r, agent.ID)
+	case api.AgentActionResetAuth:
+		s.handleAgentResetAuth(w, r, agent.ID)
 	case api.AgentActionEnv:
 		s.submitAgentEnv(w, r, projectID, agentID)
 	case api.AgentActionRestore:
 		s.restoreAgent(w, r, agent.ID)
 	case api.AgentActionOutboundMessage:
 		s.handleAgentOutboundMessage(w, r, agent.ID)
-	case api.AgentActionResetAuth:
-		s.handleAgentResetAuth(w, r, agent.ID)
 	default:
 		NotFound(w, "Action")
 	}
