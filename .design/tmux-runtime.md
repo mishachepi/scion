@@ -119,6 +119,43 @@ The `home_mode` enum is constrained so typos fail at the schema layer rather tha
 | `GetWorkspacePath()` | `show-option -w -v -t <target> @scion-workspace`. |
 | `ImageExists`/`PullImage` | Return success — no images. |
 
+## Auth recovery (reset-auth / token expiry)
+
+The broker's `resetAuth` handler (`pkg/runtimebroker/handlers.go`) is
+container-centric and **cannot reach tmux agents**:
+
+- The token-write script derives `TOKEN_DIR` via `getent passwd scion`; under
+  tmux, `Exec` runs the command **host-side with the broker's own
+  environment** (see Method notes), where `getent` is absent on macOS and the
+  agent's HOME is unknown → it tries `/.scion` and fails on the read-only
+  root.
+- The follow-up signal `kill -USR2 1` targets PID 1, which on a macOS host is
+  launchd — sciontool init is an ordinary host process, not PID 1.
+
+The working recovery contract for tmux agents (since `abf8d051`):
+
+- sciontool's token-refresh loop **re-reads the canonical token file when a
+  refresh attempt is auth-rejected** and adopts a different still-valid token
+  (`Client.adoptTokenFromFile`). Writing a fresh token to
+  `<agentHome>/.scion/scion-token` is sufficient; the agent recovers within
+  one retry (≤5 min backoff). `SIGUSR2` to the sciontool init process remains
+  an optional accelerator (immediate re-read).
+
+Facts for a future native tmux `reset-auth` implementation (prototyped and
+shelved 2026-07-26 in favor of the file-adoption fallback):
+
+- Agent home resolves host-side as
+  `config.GetAgentHomePath(<scion.project_path window annotation>, <slug>)` —
+  the same pattern `getLogs` uses.
+- The tmux pane's `pane_pid` **is** the sciontool init process (tmux execs
+  the window command argv directly), so it is a reliable signal target;
+  verify the pid still maps to a sciontool process before signaling —
+  SIGUSR2's default disposition terminates an unrelated reused pid.
+
+Related fork fix: upstream PR #322 wired `reset-auth` only on the
+agent-scoped route while the CLI client posts to the project-scoped one, so
+`scion reset-auth` always 404'd; fixed in `3fcbc972` (upstreamable).
+
 ## Decisions summary
 
 | # | Topic | Decision |
