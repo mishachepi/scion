@@ -1102,6 +1102,25 @@ const (
 	existingAgentConflict
 )
 
+// mergeTemplateLabels overlays request labels onto the template's default
+// labels (the labels: map of its scion-agent.yaml, via the derived
+// AgentConfig snapshot): template labels seed the set, request labels win on
+// key conflict. Returns the request labels unchanged when the template
+// declares none.
+func mergeTemplateLabels(reqLabels map[string]string, template *store.Template) map[string]string {
+	if template == nil || template.AgentConfig == nil || len(template.AgentConfig.Labels) == 0 {
+		return reqLabels
+	}
+	merged := make(map[string]string, len(template.AgentConfig.Labels)+len(reqLabels))
+	for k, v := range template.AgentConfig.Labels {
+		merged[k] = v
+	}
+	for k, v := range reqLabels {
+		merged[k] = v
+	}
+	return merged
+}
+
 // createNotifySubscription creates a notification subscription for the given agent
 // if notify is true and a subscriber has been identified.
 func (s *Server) createNotifySubscription(ctx context.Context, agentID, projectID, notifySubscriberType, notifySubscriberID, createdBy string) {
