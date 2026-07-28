@@ -77,6 +77,7 @@ var (
 	disableTelemetry      bool
 	inlineConfigPath      string
 	labelFlags            []string
+	ephemeralFlag         bool
 	modelFlag             string
 	thinkingLevelFlag     string
 	agentRoleFlag         string
@@ -181,6 +182,20 @@ func resolveBranch(flag string, inlineCfg *api.ScionConfig) string {
 		return inlineCfg.Branch
 	}
 	return ""
+}
+
+// applyEphemeralLabel stamps the ephemeral label onto the parsed label set
+// when --ephemeral was passed, so the Hub suppresses STALLED notifications
+// for the agent (see api.LabelEphemeral).
+func applyEphemeralLabel(parsed map[string]string) map[string]string {
+	if !ephemeralFlag {
+		return parsed
+	}
+	if parsed == nil {
+		parsed = make(map[string]string, 1)
+	}
+	parsed[api.LabelEphemeral] = "true"
+	return parsed
 }
 
 // loadInlineConfig loads a ScionConfig from the --config flag path.
@@ -1038,6 +1053,7 @@ func startAgentViaHub(cmd *cobra.Command, hubCtx *HubContext, agentName, task st
 	if err != nil {
 		return asUsageError(err)
 	}
+	parsedLabels = applyEphemeralLabel(parsedLabels)
 
 	// Validate --role flag if provided
 	if err := validateAgentRole(agentRoleFlag); err != nil {

@@ -247,6 +247,7 @@ func createAgentViaHub(hubCtx *HubContext, agentName string, task string, inline
 	if err != nil {
 		return asUsageError(err)
 	}
+	parsedLabels = applyEphemeralLabel(parsedLabels)
 
 	// Validate --role flag if provided
 	if err := validateAgentRole(agentRoleFlag); err != nil {
@@ -354,6 +355,7 @@ func init() {
 
 	// Label flags
 	createCmd.Flags().StringArrayVar(&labelFlags, "label", nil, "Label in key=value format (repeatable)")
+	createCmd.Flags().BoolVar(&ephemeralFlag, "ephemeral", false, "Mark the agent as ephemeral: expected to flap with its broker, STALLED notifications are suppressed")
 
 	// Agent role flag
 	createCmd.Flags().StringVar(&agentRoleFlag, "role", "",
