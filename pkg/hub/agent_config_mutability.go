@@ -192,6 +192,7 @@ var agentEditFields = []agentEditField{
 	{Key: "config.harness", Tier: EditTierImmutable, LockedReason: editReasonImmutable},
 	{Key: "config.harness_config", Tier: EditTierImmutable, LockedReason: editReasonImmutable},
 	{Key: "config.default_harness_config", Tier: EditTierImmutable, LockedReason: editReasonImmutable},
+	{Key: "config.labels", Tier: EditTierImmutable, LockedReason: editReasonImmutable},
 	{Key: "config.config_dir", Tier: EditTierImmutable, LockedReason: editReasonInternal},
 	{Key: "config.detached", Tier: EditTierImmutable, LockedReason: editReasonInternal},
 	{Key: "config.hub", Tier: EditTierImmutable, LockedReason: editReasonInternal},

@@ -162,9 +162,10 @@ var perfBudgets = []perfBudget{
 		// with main fb721f16f merged (its #3536 edit rows) plus the TX
 		// config.agent_plugins editability row (ptone/scion#4933). 14680: CI's
 		// measurement with the claude harness's agent_plugins capability row
-		// added (default-claude, ptone/scion#4933 U4).
+		// added (default-claude, ptone/scion#4933 U4). 14839: plus the
+		// config.labels editability row (+159).
 		// Store calls: the invited-user account-status check reads the user record per decision; this route has no request-local authz memo (ptone/scion#3684).
-		baseline: perfBudgetCounts{authzStoreCalls: 20, decisions: 10, dbReads: 0, bytes: 14680},
+		baseline: perfBudgetCounts{authzStoreCalls: 20, decisions: 10, dbReads: 0, bytes: 14839},
 	},
 	{
 		// Store calls: per-request sender standing (upstream #3101).
@@ -179,9 +180,10 @@ var perfBudgets = []perfBudget{
 		// with main fb721f16f merged (its #3536 edit rows) plus the TX
 		// config.agent_plugins editability row (ptone/scion#4933). 14680: CI's
 		// measurement with the claude harness's agent_plugins capability row
-		// added (default-claude, ptone/scion#4933 U4).
+		// added (default-claude, ptone/scion#4933 U4). 14839: plus the
+		// config.labels editability row (+159).
 		// Store calls: the invited-user account-status check reads the user record per decision; this route has no request-local authz memo (ptone/scion#3684).
-		baseline: perfBudgetCounts{authzStoreCalls: 19, decisions: 10, dbReads: 0, bytes: 14680},
+		baseline: perfBudgetCounts{authzStoreCalls: 19, decisions: 10, dbReads: 0, bytes: 14839},
 	},
 }
 
