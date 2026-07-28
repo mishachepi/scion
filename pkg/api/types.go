@@ -22,6 +22,13 @@ import (
 	"time"
 )
 
+// LabelEphemeral marks an agent as ephemeral: expected to come and go as its
+// broker flaps (e.g. a laptop broker that roams between networks). The Hub
+// suppresses STALLED notifications for agents carrying this label with value
+// "true"; every other lifecycle notification (including ERROR) is delivered
+// normally, and the stalled state itself remains visible in agent listings.
+const LabelEphemeral = "scion.ephemeral"
+
 // ParseDuration parses a duration string, returning 0 for empty or invalid input.
 func ParseDuration(s string) time.Duration {
 	if s == "" {
