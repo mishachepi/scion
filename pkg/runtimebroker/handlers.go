@@ -5616,12 +5616,15 @@ func isExecTargetNotFound(err error) bool {
 	return execContainerNotFoundRe.MatchString(msg)
 }
 
-// scionTokenDirScript sets TOKEN_DIR to the scion user's ~/.scion inside
-// the agent container, falling back to /home/scion when getent is missing
+// scionTokenDirScript sets TOKEN_DIR to the agent's ~/.scion: the
+// SCION_AGENT_HOME a host-execution runtime's Exec exports (tmux: there is
+// no scion user on the broker host), else the scion user's home inside the
+// agent container, falling back to /home/scion when getent is missing
 // or has no entry. (A `getent … | cut … || echo …` pipeline never takes the
 // fallback: its status is cut's, which succeeds on empty input.) It is a
 // brace group, so callers can chain it with && like a single command.
-const scionTokenDirScript = `{ d="$(getent passwd scion 2>/dev/null | cut -d: -f6)"; ` +
+const scionTokenDirScript = `{ d="${SCION_AGENT_HOME:-}"; ` +
+	`[ -n "$d" ] || d="$(getent passwd scion 2>/dev/null | cut -d: -f6)"; ` +
 	`[ -n "$d" ] || d=/home/scion; ` +
 	`TOKEN_DIR="$d/.scion"; }`
 
