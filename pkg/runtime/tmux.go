@@ -48,6 +48,10 @@ const (
 	// server restart re-issues pane_ids. Refreshed by sciontool's
 	// SessionStart hook (see pkg/sciontool/hooks/handlers/tmux_pane.go).
 	tmuxPaneOption = "@scion-pane"
+	// tmuxHomeOption records the agent's home directory so Exec can
+	// impersonate the agent (HOME, cwd, SCION_* env) instead of running
+	// as the broker user — the host-execution analogue of container exec.
+	tmuxHomeOption = "@scion-home"
 )
 
 // ValidateTmuxSessionName rejects names tmux would misparse as target
@@ -383,6 +387,11 @@ func (r *TmuxRuntime) applyMetadata(ctx context.Context, target string, config R
 			return err
 		}
 	}
+	if config.HomeDir != "" {
+		if err := r.setUserOption(ctx, target, tmuxHomeOption, config.HomeDir); err != nil {
+			return err
+		}
+	}
 	r.persistPaneID(ctx, target)
 	return nil
 }
@@ -654,6 +663,7 @@ type windowMetadata struct {
 	labels      map[string]string
 	annotations map[string]string
 	workspace   string
+	home        string
 }
 
 func (r *TmuxRuntime) readMetadata(ctx context.Context, target string) (windowMetadata, error) {
@@ -675,6 +685,8 @@ func (r *TmuxRuntime) readMetadata(ctx context.Context, target string) (windowMe
 			meta.annotations[name[len(tmuxAnnotationPrefix):]] = value
 		case name == tmuxWorkspaceOption:
 			meta.workspace = value
+		case name == tmuxHomeOption:
+			meta.home = value
 		}
 	}
 	return meta, nil
@@ -747,7 +759,13 @@ func (r *TmuxRuntime) Sync(_ context.Context, _ string, _ SyncDirection) error {
 }
 
 // Exec dispatches on cmd[0]: a tmux subcommand is forwarded to host tmux with
-// -t rewritten to id; any other binary runs on the host with cwd=pane_current_path.
+// -t rewritten to id; any other binary runs host-side with the agent's
+// identity (HOME=agent home, cwd=workspace, SCION_* markers) — the
+// host-execution analogue of container exec, so hub actions written with
+// ~-relative paths (reset-auth token writes, scion exec) behave the same in
+// both worlds. Windows without a recorded @scion-home (started by a
+// pre-upgrade binary, or after a tmux server restart dropped user-options)
+// fall back to the legacy semantics: broker user, cwd=pane_current_path.
 func (r *TmuxRuntime) Exec(ctx context.Context, id string, cmd []string) (string, error) {
 	if id == "" {
 		return "", fmt.Errorf("tmux runtime: Exec requires a non-empty id")
@@ -778,6 +796,54 @@ func (r *TmuxRuntime) Exec(ctx context.Context, id string, cmd []string) (string
 	if !r.windowExists(ctx, id) {
 		return "", fmt.Errorf("tmux runtime: agent window %s not found", id)
 	}
+	return r.execAsAgent(ctx, id, cmd)
+}
+
+// execAsAgent runs a host command impersonating the agent: cwd is the
+// agent's workspace, HOME is the agent home recorded at start in the
+// @scion-home window option, and the SCION_* identity variables mirror
+// what Run exports. Resolved secrets are deliberately not replayed —
+// they were materialized on disk under the agent home at start, so
+// commands read them exactly the way the agent does. When no home is
+// recorded the command degrades to execWithPaneCwd rather than failing,
+// keeping exec working against windows started before this option existed.
+func (r *TmuxRuntime) execAsAgent(ctx context.Context, id string, cmd []string) (string, error) {
+	meta, err := r.readMetadata(ctx, id)
+	if err != nil || meta.home == "" {
+		return r.execWithPaneCwd(ctx, id, cmd)
+	}
+	workdir := meta.workspace
+	if workdir == "" {
+		workdir = meta.home
+	}
+	env := append(os.Environ(),
+		"HOME="+meta.home,
+		"SCION_AGENT_HOME="+meta.home,
+	)
+	if name := meta.labels["scion.name"]; name != "" {
+		env = append(env, "SCION_AGENT="+name)
+	}
+	if project := projectcompat.ProjectNameFromLabels(meta.labels); project != "" {
+		env = append(env, "SCION_PROJECT="+project, "SCION_GROVE="+project)
+	}
+	if projectID := projectcompat.ProjectIDFromLabels(meta.labels); projectID != "" {
+		env = append(env, "SCION_PROJECT_ID="+projectID, "SCION_GROVE_ID="+projectID)
+	}
+	c := exec.CommandContext(ctx, cmd[0], cmd[1:]...)
+	c.Dir = workdir
+	c.Env = env
+	out, runErr := c.CombinedOutput()
+	if runErr != nil {
+		return string(out), fmt.Errorf("exec %v on %s (cwd=%s, home=%s): %w (output: %s)",
+			cmd, id, workdir, meta.home, runErr, strings.TrimSpace(string(out)))
+	}
+	return string(out), nil
+}
+
+// execWithPaneCwd is the legacy Exec semantics: run as the broker user with
+// cwd taken from the window's live pane. Kept as the fallback for windows
+// with no recorded @scion-home.
+func (r *TmuxRuntime) execWithPaneCwd(ctx context.Context, id string, cmd []string) (string, error) {
 	workdir, err := r.readPaneCwd(ctx, id)
 	if err != nil {
 		workdir = ""
