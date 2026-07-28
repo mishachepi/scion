@@ -220,6 +220,7 @@ func createAgentViaHub(hubCtx *HubContext, agentName string, task string) error 
 	if err != nil {
 		return err
 	}
+	parsedLabels = applyEphemeralLabel(parsedLabels)
 
 	// Build create request — always provision-only (create does not start the agent)
 	req := &hubclient.CreateAgentRequest{
@@ -342,6 +343,7 @@ func init() {
 
 	// Label flags
 	createCmd.Flags().StringArrayVar(&labelFlags, "label", nil, "Label in key=value format (repeatable)")
+	createCmd.Flags().BoolVar(&ephemeralFlag, "ephemeral", false, "Mark the agent as ephemeral: expected to flap with its broker, STALLED notifications are suppressed")
 
 	// GCP service account assignment flag
 	createCmd.Flags().StringVar(&serviceAccountFlag, "service-account", "", "GCP service account ID to assign to this agent (requires Hub mode)")
