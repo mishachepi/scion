@@ -123,11 +123,12 @@ func (s *Server) bootstrapSingleTemplate(ctx context.Context, name, templatePath
 	return err
 }
 
-// templateConfigInfo holds the harness type and default harness config name
-// extracted from a template's scion-agent.yaml.
+// templateConfigInfo holds the harness type, default harness config name, and
+// default agent labels extracted from a template's scion-agent.yaml.
 type templateConfigInfo struct {
-	Harness              string // inferred harness type (claude, gemini, etc.)
-	DefaultHarnessConfig string // actual harness-config name from config (e.g. "claude-web", "adk")
+	Harness              string            // inferred harness type (claude, gemini, etc.)
+	DefaultHarnessConfig string            // actual harness-config name from config (e.g. "claude-web", "adk")
+	Labels               map[string]string // default labels stamped onto agents created from the template
 }
 
 // detectHarnessFromConfig reads a template's config and returns the harness type
@@ -142,17 +143,20 @@ func detectHarnessFromConfig(templatePath, templateName string) templateConfigIn
 			return templateConfigInfo{
 				Harness:              inferHarnessFromName(cfg.HarnessConfig),
 				DefaultHarnessConfig: cfg.HarnessConfig,
+				Labels:               cfg.Labels,
 			}
 		}
 		if cfg.DefaultHarnessConfig != "" {
 			return templateConfigInfo{
 				Harness:              inferHarnessFromName(cfg.DefaultHarnessConfig),
 				DefaultHarnessConfig: cfg.DefaultHarnessConfig,
+				Labels:               cfg.Labels,
 			}
 		}
 		if cfg.Harness != "" {
-			return templateConfigInfo{Harness: cfg.Harness}
+			return templateConfigInfo{Harness: cfg.Harness, Labels: cfg.Labels}
 		}
+		return templateConfigInfo{Harness: inferHarnessFromName(templateName), Labels: cfg.Labels}
 	}
 
 	return templateConfigInfo{Harness: inferHarnessFromName(templateName)}
