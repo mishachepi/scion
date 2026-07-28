@@ -1220,6 +1220,14 @@ func (s *Server) createAgentInProject(
 		}
 	}
 
+	// Template default labels seed the agent's label set; request labels win.
+	// Re-validate because template labels come from an operator-authored yaml.
+	req.Labels = mergeTemplateLabels(req.Labels, resolvedTemplate)
+	if err := labels.Validate(req.Labels); err != nil {
+		ValidationError(w, "Invalid labels: "+err.Error(), nil)
+		return
+	}
+
 	agent := &store.Agent{
 		ID:              api.NewUUID(),
 		Slug:            slug,
