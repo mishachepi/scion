@@ -28,6 +28,11 @@
       "type": "object",
       "additionalProperties": { "type": "string" }
     },
+    "labels": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Default labels stamped onto agents created from this template. Request-supplied labels win on key conflict."
+    },
     "volumes": {
       "type": "array",
       "items": { "$ref": "#/$defs/volumeMount" }
