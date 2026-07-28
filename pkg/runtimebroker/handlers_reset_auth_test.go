@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -129,5 +130,34 @@ func TestResetAuth_MissingTokenIsValidationError(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest && w.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected a client error for missing token, got %d (%s)", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenDirExpr_ResolvesHomeFirst runs the actual shell expression the
+// reset-auth handler ships to the runtime and verifies both resolution
+// branches: an Exec-provided HOME (host-execution runtimes impersonating the
+// agent) wins; without HOME the container convention applies.
+func TestTokenDirExpr_ResolvesHomeFirst(t *testing.T) {
+	run := func(env []string) string {
+		t.Helper()
+		cmd := exec.Command("sh", "-c", tokenDirExpr+` && printf '%s' "$TOKEN_DIR"`)
+		cmd.Env = env
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("token dir expr: %v", err)
+		}
+		return string(out)
+	}
+
+	if got := run([]string{"HOME=/agents/core/home"}); got != "/agents/core/home/.scion" {
+		t.Errorf("with HOME: TOKEN_DIR = %q, want %q", got, "/agents/core/home/.scion")
+	}
+
+	// Without HOME the expression must not collapse to bare "/.scion" — it
+	// falls back to the scion user's passwd entry or /home/scion. On dev
+	// machines without a scion user getent may yield an empty home; the
+	// HOME-first branch above is what production host execution relies on.
+	if got := run([]string{}); got == "/agents/core/home/.scion" {
+		t.Errorf("without HOME the agent home must not leak into TOKEN_DIR, got %q", got)
 	}
 }
