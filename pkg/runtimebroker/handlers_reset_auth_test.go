@@ -22,6 +22,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -326,5 +327,29 @@ func TestResetAuth_MissingTokenIsValidationError(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest && w.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected a client error for missing token, got %d (%s)", w.Code, w.Body.String())
+	}
+}
+
+// TestScionTokenDirScript_AgentHomeFirst runs the shell script the
+// reset-auth handler ships to the runtime: SCION_AGENT_HOME, exported by
+// host-execution runtimes (tmux) that have no scion user, wins; without it
+// the container convention (scion user's home, else /home/scion) applies.
+func TestScionTokenDirScript_AgentHomeFirst(t *testing.T) {
+	run := func(env []string) string {
+		t.Helper()
+		cmd := exec.Command("sh", "-c", scionTokenDirScript+` && printf '%s' "$TOKEN_DIR"`)
+		cmd.Env = env
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("token dir script: %v", err)
+		}
+		return string(out)
+	}
+
+	if got := run([]string{"SCION_AGENT_HOME=/agents/core/home"}); got != "/agents/core/home/.scion" {
+		t.Errorf("with SCION_AGENT_HOME: TOKEN_DIR = %q, want %q", got, "/agents/core/home/.scion")
+	}
+	if got := run([]string{"HOME=/root"}); got == "/root/.scion" || got == "/.scion" {
+		t.Errorf("without SCION_AGENT_HOME, HOME must not decide TOKEN_DIR, got %q", got)
 	}
 }
