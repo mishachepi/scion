@@ -743,3 +743,43 @@ func TestHandleTemplateFileDelete_ResetsHarness(t *testing.T) {
 		t.Errorf("expected empty harness after config deletion, got %q", updated.Harness)
 	}
 }
+
+func TestDetectHarnessFromContent_Labels(t *testing.T) {
+	yaml := `
+schema_version: "1"
+harness_config: claude
+labels:
+  scion.ephemeral: "true"
+  team: platform
+`
+	got := detectHarnessFromContent([]byte(yaml), "my-template")
+	if got.Harness != "claude" {
+		t.Errorf("Harness = %q, want %q", got.Harness, "claude")
+	}
+	if got.Labels["scion.ephemeral"] != "true" || got.Labels["team"] != "platform" {
+		t.Errorf("Labels = %v, want scion.ephemeral=true team=platform", got.Labels)
+	}
+
+	noLabels := detectHarnessFromContent([]byte(`harness_config: claude`), "my-template")
+	if len(noLabels.Labels) != 0 {
+		t.Errorf("Labels = %v, want empty", noLabels.Labels)
+	}
+}
+
+func TestApplyTemplateConfigInfo_Labels(t *testing.T) {
+	tmpl := &store.Template{Name: "t"}
+
+	applyTemplateConfigInfo(tmpl, templateConfigInfo{
+		Harness: "claude",
+		Labels:  map[string]string{"scion.ephemeral": "true"},
+	})
+	if tmpl.Config == nil || tmpl.Config.Labels["scion.ephemeral"] != "true" {
+		t.Fatalf("Config.Labels = %+v, want scion.ephemeral=true", tmpl.Config)
+	}
+
+	// Config file dropped its labels — stale ones must be cleared.
+	applyTemplateConfigInfo(tmpl, templateConfigInfo{Harness: "claude"})
+	if tmpl.Config.Labels != nil {
+		t.Errorf("Config.Labels = %v, want nil after labels removed", tmpl.Config.Labels)
+	}
+}
