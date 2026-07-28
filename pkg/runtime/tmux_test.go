@@ -659,6 +659,9 @@ esac
 	return path
 }
 
+// The fake records no @scion-home, so this exercises the legacy fallback:
+// windows started before the agent-identity upgrade (or whose user-options
+// were dropped by a tmux server restart) still exec at the pane's cwd.
 func TestTmuxRuntime_Exec_RunsHostCommandAtPaneCwd(t *testing.T) {
 	tmpDir := t.TempDir()
 	logPath := filepath.Join(tmpDir, "tmux.log")
@@ -673,6 +676,57 @@ func TestTmuxRuntime_Exec_RunsHostCommandAtPaneCwd(t *testing.T) {
 	}
 	if strings.TrimSpace(out) != tmpDir {
 		t.Errorf("/bin/pwd via Exec = %q, want %q (agent cwd)", strings.TrimSpace(out), tmpDir)
+	}
+}
+
+// fakeTmuxAgentIdentity: list-windows returns "@5"; show-options returns the
+// window metadata an agent start would have recorded (home + workspace).
+func fakeTmuxAgentIdentity(t *testing.T, tmpDir, logPath, home, workspace string) string {
+	t.Helper()
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "` + logPath + `"
+case "$1" in
+  list-windows) printf '@5\n'; exit 0 ;;
+  show-options) printf '@scion-label-scion.name agent-1\n@scion-home ` + home + `\n@scion-workspace ` + workspace + `\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`
+	path := filepath.Join(tmpDir, "fake-tmux-identity")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake-tmux-identity: %v", err)
+	}
+	return path
+}
+
+func TestTmuxRuntime_Exec_RunsHostCommandAsAgent(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "tmux.log")
+	home := filepath.Join(tmpDir, "agent-home")
+	workspace := filepath.Join(tmpDir, "ws")
+	for _, d := range []string{home, workspace} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+	r := &TmuxRuntime{
+		Command: fakeTmuxAgentIdentity(t, tmpDir, logPath, home, workspace),
+		Session: "scion",
+	}
+
+	out, err := r.Exec(context.Background(), "scion:@5",
+		[]string{"/bin/sh", "-c", `printf '%s|%s|%s|%s' "$HOME" "$(pwd -P)" "$SCION_AGENT" "$SCION_AGENT_HOME"`})
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	// pwd -P reports the physical path; canonicalize the expectation
+	// (macOS t.TempDir lives under the /var -> /private/var symlink).
+	wsPhys, err := filepath.EvalSymlinks(workspace)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%s): %v", workspace, err)
+	}
+	want := home + "|" + wsPhys + "|agent-1|" + home
+	if got := strings.TrimSpace(out); got != want {
+		t.Errorf("agent-identity exec = %q, want %q", got, want)
 	}
 }
 
