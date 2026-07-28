@@ -1843,6 +1843,14 @@ func (s *Server) execCommand(w http.ResponseWriter, r *http.Request, id, project
 	})
 }
 
+// tokenDirExpr resolves the agent's ~/.scion directory at exec time. HOME
+// wins when the runtime's Exec provides it (host-execution runtimes such as
+// tmux impersonate the agent, exporting the agent home); the fallback is the
+// container convention — the scion user's passwd entry. Without the HOME
+// preference, host execution would resolve to the broker machine's (absent)
+// scion user and the token write would land in "/.scion".
+const tokenDirExpr = `TOKEN_DIR="${HOME:-$(getent passwd scion 2>/dev/null | cut -d: -f6 || echo /home/scion)}/.scion"`
+
 // resetAuth writes a fresh token into a running agent's container and signals
 // sciontool init (PID 1) to restart its token refresh loop via SIGUSR2.
 func (s *Server) resetAuth(w http.ResponseWriter, r *http.Request, id, projectID string) {
@@ -1870,7 +1878,7 @@ func (s *Server) resetAuth(w http.ResponseWriter, r *http.Request, id, projectID
 	// Pass the token as part of the script using a heredoc pattern to avoid
 	// exposing it in argv (visible in /proc).
 	writeCmd := []string{"sh", "-c",
-		"TOKEN_DIR=\"$(getent passwd scion 2>/dev/null | cut -d: -f6 || echo /home/scion)/.scion\" && " +
+		tokenDirExpr + " && " +
 			"mkdir -p \"$TOKEN_DIR\" && " +
 			"cat <<'SCION_TOKEN_EOF' > \"$TOKEN_DIR/scion-token.tmp\"\n" + req.Token + "\nSCION_TOKEN_EOF\n" +
 			"mv \"$TOKEN_DIR/scion-token.tmp\" \"$TOKEN_DIR/scion-token\"",
