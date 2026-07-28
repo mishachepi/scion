@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -967,4 +968,34 @@ func TestHasAnyKey_NoProgenyForDirectAgent(t *testing.T) {
 		assert.False(t, found,
 			"direct agent should not find secrets via progeny resolution")
 	})
+}
+
+func TestMergeTemplateLabels(t *testing.T) {
+	reqLabels := map[string]string{"env": "prod"}
+
+	// No template / no config / no labels: request labels pass through untouched.
+	if got := mergeTemplateLabels(reqLabels, nil); !maps.Equal(got, reqLabels) {
+		t.Errorf("nil template: got %v, want %v", got, reqLabels)
+	}
+	if got := mergeTemplateLabels(reqLabels, &store.Template{}); !maps.Equal(got, reqLabels) {
+		t.Errorf("no config: got %v, want %v", got, reqLabels)
+	}
+
+	tmpl := &store.Template{Config: &store.TemplateConfig{Labels: map[string]string{
+		"scion.ephemeral": "true",
+		"env":             "template",
+	}}}
+
+	got := mergeTemplateLabels(reqLabels, tmpl)
+	if got["scion.ephemeral"] != "true" {
+		t.Errorf("template label missing: got %v", got)
+	}
+	if got["env"] != "prod" {
+		t.Errorf("request label must win: got env=%q, want %q", got["env"], "prod")
+	}
+
+	// Template labels alone (nil request labels).
+	if got := mergeTemplateLabels(nil, tmpl); got["scion.ephemeral"] != "true" || len(got) != 2 {
+		t.Errorf("nil request labels: got %v", got)
+	}
 }

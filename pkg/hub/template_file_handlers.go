@@ -90,9 +90,10 @@ const scionAgentConfigFile = "scion-agent.yaml"
 // Falls back to templateName-based inference.
 func detectHarnessFromContent(data []byte, templateName string) templateConfigInfo {
 	var raw struct {
-		HarnessConfig        string `yaml:"harness_config"`
-		DefaultHarnessConfig string `yaml:"default_harness_config"`
-		Harness              string `yaml:"harness"`
+		HarnessConfig        string            `yaml:"harness_config"`
+		DefaultHarnessConfig string            `yaml:"default_harness_config"`
+		Harness              string            `yaml:"harness"`
+		Labels               map[string]string `yaml:"labels"`
 	}
 
 	// Normalize hyphenated keys to underscored before parsing
@@ -117,18 +118,36 @@ func detectHarnessFromContent(data []byte, templateName string) templateConfigIn
 		return templateConfigInfo{
 			Harness:              inferHarnessFromName(raw.HarnessConfig),
 			DefaultHarnessConfig: raw.HarnessConfig,
+			Labels:               raw.Labels,
 		}
 	}
 	if raw.DefaultHarnessConfig != "" {
 		return templateConfigInfo{
 			Harness:              inferHarnessFromName(raw.DefaultHarnessConfig),
 			DefaultHarnessConfig: raw.DefaultHarnessConfig,
+			Labels:               raw.Labels,
 		}
 	}
 	if raw.Harness != "" {
-		return templateConfigInfo{Harness: raw.Harness}
+		return templateConfigInfo{Harness: raw.Harness, Labels: raw.Labels}
 	}
-	return templateConfigInfo{Harness: inferHarnessFromName(templateName)}
+	return templateConfigInfo{Harness: inferHarnessFromName(templateName), Labels: raw.Labels}
+}
+
+// applyTemplateConfigInfo writes the fields extracted from scion-agent.yaml
+// onto the template record, including default agent labels under Config.
+func applyTemplateConfigInfo(template *store.Template, cfgInfo templateConfigInfo) {
+	template.Harness = cfgInfo.Harness
+	template.DefaultHarnessConfig = cfgInfo.DefaultHarnessConfig
+	if len(cfgInfo.Labels) > 0 {
+		if template.Config == nil {
+			template.Config = &store.TemplateConfig{}
+		}
+		template.Config.Labels = cfgInfo.Labels
+	} else if template.Config != nil {
+		// The config file no longer declares labels — clear stale ones.
+		template.Config.Labels = nil
+	}
 }
 
 // handleTemplateFiles dispatches template file operations.
@@ -376,8 +395,7 @@ func (s *Server) handleTemplateFileWrite(w http.ResponseWriter, r *http.Request,
 	// Re-detect harness type and default harness config when the config file changes
 	if filePath == scionAgentConfigFile {
 		cfgInfo := detectHarnessFromContent(content, template.Name)
-		template.Harness = cfgInfo.Harness
-		template.DefaultHarnessConfig = cfgInfo.DefaultHarnessConfig
+		applyTemplateConfigInfo(template, cfgInfo)
 	}
 
 	if err := s.store.UpdateTemplate(ctx, template); err != nil {
@@ -450,8 +468,7 @@ func (s *Server) handleTemplateFileWriteRaw(w http.ResponseWriter, r *http.Reque
 	// Re-detect harness type and default harness config when the config file changes
 	if filePath == scionAgentConfigFile {
 		cfgInfo := detectHarnessFromContent(data, template.Name)
-		template.Harness = cfgInfo.Harness
-		template.DefaultHarnessConfig = cfgInfo.DefaultHarnessConfig
+		applyTemplateConfigInfo(template, cfgInfo)
 	}
 
 	if err := s.store.UpdateTemplate(ctx, template); err != nil {
@@ -560,8 +577,7 @@ func (s *Server) handleTemplateFileUpload(w http.ResponseWriter, r *http.Request
 			// Re-detect harness type and default harness config when the config file changes
 			if relPath == scionAgentConfigFile {
 				cfgInfo := detectHarnessFromContent(data, template.Name)
-				template.Harness = cfgInfo.Harness
-				template.DefaultHarnessConfig = cfgInfo.DefaultHarnessConfig
+				applyTemplateConfigInfo(template, cfgInfo)
 			}
 
 			uploaded = append(uploaded, TemplateFileEntry{

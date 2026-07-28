@@ -708,6 +708,9 @@ type TemplateConfig struct {
 	Secrets     []api.RequiredSecret `json:"secrets,omitempty"`
 	Telemetry   *api.TelemetryConfig `json:"telemetry,omitempty"`
 	MessageMode string               `json:"messageMode,omitempty"` // none, lineage, branch, project
+	// Labels are default labels stamped onto agents created from this
+	// template. Request-supplied labels win on key conflict.
+	Labels map[string]string `json:"labels,omitempty"`
 }
 
 // HubAccessConfig defines what Hub API scopes an agent created from this template receives.
