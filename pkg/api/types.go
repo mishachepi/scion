@@ -471,6 +471,10 @@ type ScionConfig struct {
 
 	Secrets []RequiredSecret `json:"secrets,omitempty" yaml:"secrets,omitempty"`
 
+	// Labels declares default labels stamped onto agents created from this
+	// template/config. Request-supplied labels win on key conflict.
+	Labels map[string]string `json:"labels,omitempty" yaml:"labels,omitempty"`
+
 	// Skills declares skill references to resolve at provision time.
 	Skills []SkillReference `json:"skills,omitempty" yaml:"skills,omitempty" koanf:"skills"`
 
