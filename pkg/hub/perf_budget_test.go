@@ -162,8 +162,9 @@ var perfBudgets = []perfBudget{
 		// with main fb721f16f merged (its #3536 edit rows) plus the TX
 		// config.agent_plugins editability row (ptone/scion#4933). 14680: CI's
 		// measurement with the claude harness's agent_plugins capability row
-		// added (default-claude, ptone/scion#4933 U4).
-		baseline: perfBudgetCounts{authzStoreCalls: 15, decisions: 10, dbReads: 0, bytes: 14680},
+		// added (default-claude, ptone/scion#4933 U4). The fork adds the
+		// config.labels editability row (+159).
+		baseline: perfBudgetCounts{authzStoreCalls: 15, decisions: 10, dbReads: 0, bytes: 14839},
 	},
 	{
 		// Store calls: per-request sender standing (upstream #3101).
@@ -178,8 +179,9 @@ var perfBudgets = []perfBudget{
 		// with main fb721f16f merged (its #3536 edit rows) plus the TX
 		// config.agent_plugins editability row (ptone/scion#4933). 14680: CI's
 		// measurement with the claude harness's agent_plugins capability row
-		// added (default-claude, ptone/scion#4933 U4).
-		baseline: perfBudgetCounts{authzStoreCalls: 15, decisions: 10, dbReads: 0, bytes: 14680},
+		// added (default-claude, ptone/scion#4933 U4). The fork adds the
+		// config.labels editability row (+159).
+		baseline: perfBudgetCounts{authzStoreCalls: 15, decisions: 10, dbReads: 0, bytes: 14839},
 	},
 }
 

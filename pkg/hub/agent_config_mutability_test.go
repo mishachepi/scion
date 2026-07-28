@@ -75,6 +75,7 @@ var wantEditTier = map[string]EditTier{
 	"profile":                          EditTierImmutable,
 	"branch":                           EditTierImmutable,
 	"config.branch":                    EditTierImmutable,
+	"config.labels":                    EditTierImmutable,
 	"config.clone_depth":               EditTierImmutable,
 	"config.explicit_workspace":        EditTierImmutable,
 	"config.empty_per_agent_workspace": EditTierImmutable,
