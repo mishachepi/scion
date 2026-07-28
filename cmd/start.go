@@ -85,6 +85,7 @@ func init() {
 
 	// Label flags
 	startCmd.Flags().StringArrayVar(&labelFlags, "label", nil, "Label in key=value format (repeatable)")
+	startCmd.Flags().BoolVar(&ephemeralFlag, "ephemeral", false, "Mark the agent as ephemeral: expected to flap with its broker, STALLED notifications are suppressed")
 
 	// Agent role flag
 	startCmd.Flags().StringVar(&agentRoleFlag, "role", "",

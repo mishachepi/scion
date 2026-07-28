@@ -348,6 +348,61 @@ func TestNotificationDispatcher_DifferentStatuses(t *testing.T) {
 	assert.Contains(t, calls[1].Message, "WAITING_FOR_INPUT")
 }
 
+// addStalledSubscription subscribes env's subscriber agent to STALLED and ERROR
+// on the watched agent, mirroring the trigger set of the --notify auto-subscription.
+func (env *notificationTestEnv) addStalledSubscription(t *testing.T) {
+	t.Helper()
+	sub := &store.NotificationSubscription{
+		ID:                api.NewUUID(),
+		Scope:             store.SubscriptionScopeAgent,
+		AgentID:           env.watched.ID,
+		SubscriberType:    store.SubscriberTypeAgent,
+		SubscriberID:      env.subscriber.Slug,
+		ProjectID:         env.project.ID,
+		TriggerActivities: []string{"STALLED", "ERROR"},
+		CreatedAt:         time.Now().Add(-time.Minute),
+		CreatedBy:         "test",
+	}
+	require.NoError(t, env.store.CreateNotificationSubscription(context.Background(), sub))
+}
+
+func TestNotificationDispatcher_EphemeralAgentStalledSuppressed(t *testing.T) {
+	env := setupNotificationTest(t)
+	env.addStalledSubscription(t)
+
+	env.watched.Labels = map[string]string{api.LabelEphemeral: "true"}
+	require.NoError(t, env.store.UpdateAgent(context.Background(), env.watched))
+
+	env.nd.Start()
+	defer env.nd.Stop()
+
+	// STALLED carries no signal for an ephemeral agent — no notification.
+	env.publishStatus("stalled")
+	time.Sleep(200 * time.Millisecond)
+	assert.Empty(t, env.dispatcher.getCalls())
+
+	// ERROR is still actionable and must be delivered.
+	env.publishStatusWithPhase(string(state.PhaseError), "")
+	require.Eventually(t, func() bool {
+		return len(env.dispatcher.getCalls()) == 1
+	}, 2*time.Second, 50*time.Millisecond)
+	assert.Contains(t, env.dispatcher.getCalls()[0].Message, "ERROR")
+}
+
+func TestNotificationDispatcher_StalledNotifiesNonEphemeralAgent(t *testing.T) {
+	env := setupNotificationTest(t)
+	env.addStalledSubscription(t)
+
+	env.nd.Start()
+	defer env.nd.Stop()
+
+	env.publishStatus("stalled")
+	require.Eventually(t, func() bool {
+		return len(env.dispatcher.getCalls()) == 1
+	}, 2*time.Second, 50*time.Millisecond)
+	assert.Contains(t, env.dispatcher.getCalls()[0].Message, "STALLED")
+}
+
 func TestNotificationDispatcher_NoSubscriptions(t *testing.T) {
 	env := setupNotificationTest(t)
 	env.nd.Start()

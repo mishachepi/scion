@@ -159,6 +159,14 @@ func (nd *NotificationDispatcher) handleEvent(evt Event) {
 		matchStatus = statusEvt.Phase
 	}
 
+	// Ephemeral agents are expected to flap along with their broker, so a
+	// STALLED transition carries no actionable signal. Suppress it for every
+	// subscriber (agent- and project-scoped alike); ERROR and all other
+	// activities still notify, and the stalled state stays visible in listings.
+	if strings.EqualFold(matchStatus, "STALLED") && nd.isEphemeralAgent(ctx, statusEvt.AgentID) {
+		return
+	}
+
 	// Deduplicate: one notification per (subscriber_type, subscriber_id).
 	// Agent-scoped subscriptions are checked first since they are more specific.
 	seen := make(map[string]bool)
@@ -190,6 +198,17 @@ func (nd *NotificationDispatcher) handleEvent(evt Event) {
 		seen[dedupeKey] = true
 		nd.storeAndDispatch(ctx, sub, statusEvt)
 	}
+}
+
+// isEphemeralAgent reports whether the agent carries the ephemeral label.
+// A lookup failure counts as not ephemeral so a store hiccup can only cause
+// an extra notification, never a silently dropped one.
+func (nd *NotificationDispatcher) isEphemeralAgent(ctx context.Context, agentID string) bool {
+	agent, err := nd.store.GetAgent(ctx, agentID)
+	if err != nil || agent == nil {
+		return false
+	}
+	return agent.Labels[api.LabelEphemeral] == "true"
 }
 
 // handleDeletedEvent processes an agent deletion event.
