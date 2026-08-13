@@ -48,7 +48,12 @@ func (m *hubDefaultsCapturingManager) Provision(ctx context.Context, opts api.St
 	return &api.ScionConfig{Harness: "claude", HarnessConfig: "claude"}, nil
 }
 
-func newHubDefaultsWiringServer() (*Server, *hubDefaultsCapturingManager) {
+func newHubDefaultsWiringServer(t *testing.T) (*Server, *hubDefaultsCapturingManager) {
+	t.Helper()
+	// Settings resolve to "docker" so resolveManagerForOpts matches the
+	// MockRuntime below without touching the developer's real environment.
+	isolateTestScion(t, "docker")
+
 	cfg := DefaultServerConfig()
 	cfg.BrokerID = "test-broker-id"
 	cfg.BrokerName = "test-host"
@@ -87,7 +92,7 @@ func postCreateAgent(t *testing.T, srv *Server, body string) {
 // The assertion is made from INSIDE Provision on purpose. Reading the context
 // anywhere else would test a context this test built.
 func TestCreateAgent_WiresHubAgentDefaultsOntoProvisionContext(t *testing.T) {
-	srv, mgr := newHubDefaultsWiringServer()
+	srv, mgr := newHubDefaultsWiringServer(t)
 
 	postCreateAgent(t, srv, `{
 		"name": "hubdefaults-agent",
@@ -133,7 +138,7 @@ func TestCreateAgent_WiresHubAgentDefaultsOntoProvisionContext(t *testing.T) {
 // it, so the broker's own tiers stay in charge. This is what every file-mode
 // dispatch and every old hub produces.
 func TestCreateAgent_NoHubAgentDefaultsLeavesContextClean(t *testing.T) {
-	srv, mgr := newHubDefaultsWiringServer()
+	srv, mgr := newHubDefaultsWiringServer(t)
 
 	postCreateAgent(t, srv, `{
 		"name": "nohubdefaults-agent",
