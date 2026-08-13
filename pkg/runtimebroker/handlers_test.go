@@ -95,35 +95,22 @@ func (m *mockManager) Watch(ctx context.Context, agentID string) (<-chan api.Sta
 
 func (m *mockManager) Close() {}
 
-func newTestServer(t *testing.T) *Server {
+// writeTestScionDir populates dir with a minimal .scion corpus (settings,
+// templates, harness-configs) so config resolution is fully self-contained.
+// runtimeType is what settings.yaml resolves to.
+func writeTestScionDir(t *testing.T, dotScion, runtimeType string) {
 	t.Helper()
-	t.Setenv("HOME", t.TempDir())
-
-	// Isolate from repo .scion by changing CWD to a temp dir containing its own .scion
-	origWd, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmpDir := t.TempDir()
-	if err := os.Chdir(tmpDir); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = os.Chdir(origWd)
-	})
-
-	dotScion := filepath.Join(tmpDir, ".scion")
-	if err := os.Mkdir(dotScion, 0755); err != nil {
+	if err := os.MkdirAll(dotScion, 0755); err != nil {
 		t.Fatal(err)
 	}
 	settingsYAML := `schema_version: "1"
 active_profile: local
 profiles:
     local:
-        runtime: mock
+        runtime: ` + runtimeType + `
 runtimes:
-    mock:
-        type: mock
+    ` + runtimeType + `:
+        type: ` + runtimeType + `
 `
 	if err := os.WriteFile(filepath.Join(dotScion, "settings.yaml"), []byte(settingsYAML), 0644); err != nil {
 		t.Fatal(err)
@@ -154,6 +141,38 @@ runtimes:
 			t.Fatal(err)
 		}
 	}
+}
+
+// isolateTestScion redirects HOME and CWD to temp dirs containing their own
+// .scion so tests never read the developer's real ~/.scion or write into the
+// repository working directory. runtimeType is what settings.yaml resolves to.
+func isolateTestScion(t *testing.T, runtimeType string) {
+	t.Helper()
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	// Populate the isolated global dir too: slug-resolved project paths live
+	// under it and must find templates/harness-configs there.
+	writeTestScionDir(t, filepath.Join(fakeHome, ".scion"), runtimeType)
+
+	// Isolate from repo .scion by changing CWD to a temp dir containing its own .scion
+	origWd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpDir := t.TempDir()
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(origWd)
+	})
+
+	writeTestScionDir(t, filepath.Join(tmpDir, ".scion"), runtimeType)
+}
+
+func newTestServer(t *testing.T) *Server {
+	t.Helper()
+	isolateTestScion(t, "mock")
 
 	cfg := DefaultServerConfig()
 	cfg.BrokerID = "test-broker-id"
@@ -767,7 +786,12 @@ func (m *envCapturingManager) Start(ctx context.Context, opts api.StartOptions) 
 	return m.mockManager.Start(ctx, opts)
 }
 
-func newTestServerWithEnvCapture() (*Server, *envCapturingManager) {
+func newTestServerWithEnvCapture(t *testing.T) (*Server, *envCapturingManager) {
+	t.Helper()
+	// Settings resolve to "docker" so resolveManagerForOpts matches the
+	// MockRuntime below without touching the developer's real environment.
+	isolateTestScion(t, "docker")
+
 	cfg := DefaultServerConfig()
 	cfg.BrokerID = "test-broker-id"
 	cfg.BrokerName = "test-host"
@@ -785,7 +809,7 @@ func newTestServerWithEnvCapture() (*Server, *envCapturingManager) {
 // TestCreateAgentWithHubCredentials tests that Hub authentication env vars are passed to agent.
 // This verifies the fix from progress-report.md: RuntimeBroker sets SCION_HUB_URL, SCION_AUTH_TOKEN, SCION_AGENT_ID.
 func TestCreateAgentWithHubCredentials(t *testing.T) {
-	srv, mgr := newTestServerWithEnvCapture()
+	srv, mgr := newTestServerWithEnvCapture(t)
 
 	body := `{
 		"name": "test-agent",
@@ -839,7 +863,7 @@ func TestCreateAgentWithHubCredentials(t *testing.T) {
 // TestCreateAgentWithDebugMode tests that SCION_DEBUG env var is set when debug mode is enabled.
 // This verifies Fix 4 from progress-report.md: Pass SCION_DEBUG env var.
 func TestCreateAgentWithDebugMode(t *testing.T) {
-	srv, mgr := newTestServerWithEnvCapture()
+	srv, mgr := newTestServerWithEnvCapture(t)
 
 	body := `{"name": "debug-agent"}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(body))
@@ -864,7 +888,7 @@ func TestCreateAgentWithDebugMode(t *testing.T) {
 
 // TestCreateAgentWithBrokerID tests that SCION_BROKER_ID env var is set from server config.
 func TestCreateAgentWithBrokerID(t *testing.T) {
-	srv, mgr := newTestServerWithEnvCapture()
+	srv, mgr := newTestServerWithEnvCapture(t)
 
 	body := `{"name": "broker-id-agent"}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(body))
@@ -892,7 +916,7 @@ func TestCreateAgentWithBrokerID(t *testing.T) {
 
 // TestCreateAgentWithResolvedEnv tests that resolvedEnv from Hub is merged with config.Env.
 func TestCreateAgentWithResolvedEnv(t *testing.T) {
-	srv, mgr := newTestServerWithEnvCapture()
+	srv, mgr := newTestServerWithEnvCapture(t)
 
 	// resolvedEnv contains Hub-provided secrets and variables
 	// config.Env contains explicit overrides (takes precedence)
@@ -941,7 +965,7 @@ func TestCreateAgentWithoutHubCredentials(t *testing.T) {
 	// Clear dev token env var to prevent broker from forwarding it to agents
 	t.Setenv("SCION_AUTH_TOKEN", "")
 
-	srv, mgr := newTestServerWithEnvCapture()
+	srv, mgr := newTestServerWithEnvCapture(t)
 
 	body := `{"name": "local-agent"}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(body))
@@ -997,7 +1021,12 @@ func (m *provisionCapturingManager) Start(ctx context.Context, opts api.StartOpt
 	return m.mockManager.Start(ctx, opts)
 }
 
-func newTestServerWithProvisionCapture() (*Server, *provisionCapturingManager) {
+func newTestServerWithProvisionCapture(t *testing.T) (*Server, *provisionCapturingManager) {
+	t.Helper()
+	// Settings resolve to "docker" so resolveManagerForOpts matches the
+	// MockRuntime below without touching the developer's real environment.
+	isolateTestScion(t, "docker")
+
 	cfg := DefaultServerConfig()
 	cfg.BrokerID = "test-broker-id"
 	cfg.BrokerName = "test-host"
@@ -1011,7 +1040,7 @@ func newTestServerWithProvisionCapture() (*Server, *provisionCapturingManager) {
 }
 
 func TestCreateAgentProvisionOnly(t *testing.T) {
-	srv, mgr := newTestServerWithProvisionCapture()
+	srv, mgr := newTestServerWithProvisionCapture(t)
 
 	body := `{
 		"name": "provisioned-agent",
@@ -1066,7 +1095,7 @@ func TestCreateAgentProvisionOnly(t *testing.T) {
 }
 
 func TestCreateAgentProvisionOnlyHarnessConfig(t *testing.T) {
-	srv, _ := newTestServerWithProvisionCapture()
+	srv, _ := newTestServerWithProvisionCapture(t)
 
 	body := `{
 		"name": "harness-agent",
@@ -1106,7 +1135,7 @@ func TestCreateAgentProvisionOnlyHarnessConfig(t *testing.T) {
 }
 
 func TestCreateAgentFullStart(t *testing.T) {
-	srv, mgr := newTestServerWithProvisionCapture()
+	srv, mgr := newTestServerWithProvisionCapture(t)
 
 	body := `{
 		"name": "running-agent",
@@ -1146,7 +1175,7 @@ func TestCreateAgentFullStart(t *testing.T) {
 }
 
 func TestCreateAgentProvisionOnlyWithTask(t *testing.T) {
-	srv, mgr := newTestServerWithProvisionCapture()
+	srv, mgr := newTestServerWithProvisionCapture(t)
 
 	body := `{
 		"name": "agent-with-task",
@@ -1193,7 +1222,7 @@ func TestCreateAgentProvisionOnlyWithTask(t *testing.T) {
 }
 
 func TestCreateAgentWithWorkspace(t *testing.T) {
-	srv, mgr := newTestServerWithProvisionCapture()
+	srv, mgr := newTestServerWithProvisionCapture(t)
 
 	body := `{
 		"name": "workspace-agent",
@@ -1219,7 +1248,7 @@ func TestCreateAgentWithWorkspace(t *testing.T) {
 }
 
 func TestCreateAgentProvisionOnlyWithWorkspace(t *testing.T) {
-	srv, mgr := newTestServerWithProvisionCapture()
+	srv, mgr := newTestServerWithProvisionCapture(t)
 
 	body := `{
 		"name": "ws-provision-agent",
@@ -1248,7 +1277,7 @@ func TestCreateAgentProvisionOnlyWithWorkspace(t *testing.T) {
 }
 
 func TestCreateAgentWithCreatorName(t *testing.T) {
-	srv, mgr := newTestServerWithEnvCapture()
+	srv, mgr := newTestServerWithEnvCapture(t)
 
 	body := `{
 		"name": "creator-agent",
@@ -1275,7 +1304,7 @@ func TestCreateAgentWithCreatorName(t *testing.T) {
 }
 
 func TestCreateAgentWithoutCreatorName(t *testing.T) {
-	srv, mgr := newTestServerWithEnvCapture()
+	srv, mgr := newTestServerWithEnvCapture(t)
 
 	body := `{"name": "no-creator-agent"}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(body))
@@ -1329,14 +1358,17 @@ func TestStartAgentEndpoint(t *testing.T) {
 // from the project's settings.yaml when projectPath is provided.
 func TestCreateAgentHubEndpointFromProjectSettings(t *testing.T) {
 	t.Run("request hub endpoint takes priority over project settings", func(t *testing.T) {
-		srv, mgr := newTestServerWithEnvCapture()
+		srv, mgr := newTestServerWithEnvCapture(t)
 
 		// Create a project directory with settings.yaml containing hub.endpoint
 		projectDir := filepath.Join(t.TempDir(), ".scion")
 		if err := os.MkdirAll(projectDir, 0755); err != nil {
 			t.Fatalf("failed to create project dir: %v", err)
 		}
-		settingsContent := `hub:
+		settingsContent := `profiles:
+  local:
+    runtime: docker
+hub:
   endpoint: "https://scionhub.loophole.site"
 `
 		if err := os.WriteFile(filepath.Join(projectDir, "settings.yaml"), []byte(settingsContent), 0644); err != nil {
@@ -1374,13 +1406,16 @@ func TestCreateAgentHubEndpointFromProjectSettings(t *testing.T) {
 	})
 
 	t.Run("project settings used when request hub endpoint empty", func(t *testing.T) {
-		srv, mgr := newTestServerWithEnvCapture()
+		srv, mgr := newTestServerWithEnvCapture(t)
 
 		projectDir := filepath.Join(t.TempDir(), ".scion")
 		if err := os.MkdirAll(projectDir, 0755); err != nil {
 			t.Fatalf("failed to create project dir: %v", err)
 		}
-		settingsContent := `hub:
+		settingsContent := `profiles:
+  local:
+    runtime: docker
+hub:
   endpoint: "https://hub.example.com"
 `
 		if err := os.WriteFile(filepath.Join(projectDir, "settings.yaml"), []byte(settingsContent), 0644); err != nil {
@@ -1408,7 +1443,7 @@ func TestCreateAgentHubEndpointFromProjectSettings(t *testing.T) {
 	})
 
 	t.Run("no project path falls back to request endpoint", func(t *testing.T) {
-		srv, mgr := newTestServerWithEnvCapture()
+		srv, mgr := newTestServerWithEnvCapture(t)
 
 		body := `{
 			"name": "no-grove-agent",
@@ -1435,14 +1470,17 @@ func TestCreateAgentHubEndpointFromProjectSettings(t *testing.T) {
 // is suppressed when hub.enabled=false, while dispatcher-provided endpoint still works.
 func TestCreateAgentProjectHubEndpointSuppressedWhenDisabled(t *testing.T) {
 	t.Run("project hub endpoint suppressed when hub disabled", func(t *testing.T) {
-		srv, mgr := newTestServerWithEnvCapture()
+		srv, mgr := newTestServerWithEnvCapture(t)
 
 		// Create a project directory with hub.enabled=false but endpoint configured
 		projectDir := filepath.Join(t.TempDir(), ".scion")
 		if err := os.MkdirAll(projectDir, 0755); err != nil {
 			t.Fatalf("failed to create project dir: %v", err)
 		}
-		settingsContent := `hub:
+		settingsContent := `profiles:
+  local:
+    runtime: docker
+hub:
   enabled: false
   endpoint: "https://scionhub.loophole.site"
 `
@@ -1479,14 +1517,17 @@ func TestCreateAgentProjectHubEndpointSuppressedWhenDisabled(t *testing.T) {
 	})
 
 	t.Run("dispatcher endpoint still works when project hub disabled", func(t *testing.T) {
-		srv, mgr := newTestServerWithEnvCapture()
+		srv, mgr := newTestServerWithEnvCapture(t)
 
 		// Create a project directory with hub.enabled=false
 		projectDir := filepath.Join(t.TempDir(), ".scion")
 		if err := os.MkdirAll(projectDir, 0755); err != nil {
 			t.Fatalf("failed to create project dir: %v", err)
 		}
-		settingsContent := `hub:
+		settingsContent := `profiles:
+  local:
+    runtime: docker
+hub:
   enabled: false
   endpoint: "https://scionhub.loophole.site"
 `
@@ -1526,6 +1567,7 @@ func TestCreateAgentProjectHubEndpointSuppressedWhenDisabled(t *testing.T) {
 // hub-managed project (ProjectSlug set, no ProjectPath) correctly resolves the project
 // path and uses project settings hub.endpoint from the .scion subdirectory.
 func TestCreateAgentHubManagedProjectSettingsEndpoint(t *testing.T) {
+	isolateTestScion(t, "docker")
 	cfg := DefaultServerConfig()
 	cfg.BrokerID = "test-broker-id"
 	cfg.BrokerName = "test-host"
@@ -1550,7 +1592,7 @@ func TestCreateAgentHubManagedProjectSettingsEndpoint(t *testing.T) {
 	t.Cleanup(func() { _ = os.RemoveAll(projectPath) })
 
 	// Place settings.yaml in the .scion subdirectory (hub-managed project layout)
-	settingsContent := "hub:\n  endpoint: https://hub.external.example.com\n"
+	settingsContent := "profiles:\n  local:\n    runtime: docker\nhub:\n  endpoint: https://hub.external.example.com\n"
 	if err := os.WriteFile(filepath.Join(scionDir, "settings.yaml"), []byte(settingsContent), 0644); err != nil {
 		t.Fatalf("failed to write settings.yaml: %v", err)
 	}
@@ -1634,6 +1676,7 @@ func TestResolveProjectSettingsDir(t *testing.T) {
 // TestCreateAgentContainerHubEndpointOverride tests that ContainerHubEndpoint
 // overrides the dispatcher-provided endpoint for container injection.
 func TestCreateAgentContainerHubEndpointOverride(t *testing.T) {
+	isolateTestScion(t, "docker")
 	t.Run("container endpoint overrides request endpoint", func(t *testing.T) {
 		cfg := DefaultServerConfig()
 		cfg.BrokerID = "test-broker-id"
@@ -1691,6 +1734,13 @@ func TestCreateAgentContainerHubEndpointOverride(t *testing.T) {
 			t.Fatal(err)
 		}
 		settingsContent := `schema_version: "1"
+active_profile: local
+profiles:
+    local:
+        runtime: docker
+runtimes:
+    docker:
+        type: docker
 hub:
   enabled: true
   endpoint: "https://tunnel.example.com"
@@ -1722,7 +1772,7 @@ hub:
 	})
 
 	t.Run("no container endpoint uses request endpoint", func(t *testing.T) {
-		srv, mgr := newTestServerWithEnvCapture()
+		srv, mgr := newTestServerWithEnvCapture(t)
 
 		body := `{
 			"name": "test-agent",
@@ -1829,6 +1879,7 @@ runtimes:
 // instead of the broker's own config.HubEndpoint (which may point to a
 // different hub in multi-hub setups).
 func TestCreateAgentConnectionHubEndpoint(t *testing.T) {
+	isolateTestScion(t, "docker")
 	t.Run("connection endpoint used when request endpoint empty", func(t *testing.T) {
 		cfg := DefaultServerConfig()
 		cfg.BrokerID = "test-broker-id"
@@ -1927,7 +1978,12 @@ func (m *gitCloneCapturingManager) Start(ctx context.Context, opts api.StartOpti
 	return m.mockManager.Start(ctx, opts)
 }
 
-func newTestServerWithGitCloneCapture() (*Server, *gitCloneCapturingManager) {
+func newTestServerWithGitCloneCapture(t *testing.T) (*Server, *gitCloneCapturingManager) {
+	t.Helper()
+	// Settings resolve to "docker" so resolveManagerForOpts matches the
+	// MockRuntime below without touching the developer's real environment.
+	isolateTestScion(t, "docker")
+
 	cfg := DefaultServerConfig()
 	cfg.BrokerID = "test-broker-id"
 	cfg.BrokerName = "test-host"
@@ -1942,7 +1998,7 @@ func newTestServerWithGitCloneCapture() (*Server, *gitCloneCapturingManager) {
 }
 
 func TestCreateAgentWithGitClone(t *testing.T) {
-	srv, mgr := newTestServerWithGitCloneCapture()
+	srv, mgr := newTestServerWithGitCloneCapture(t)
 
 	body := `{
 		"name": "git-clone-agent",
@@ -1998,7 +2054,7 @@ func TestCreateAgentWithGitClone(t *testing.T) {
 }
 
 func TestCreateAgentWithGitCloneAndBranch(t *testing.T) {
-	srv, mgr := newTestServerWithGitCloneCapture()
+	srv, mgr := newTestServerWithGitCloneCapture(t)
 
 	body := `{
 		"name": "branch-agent",
@@ -2034,7 +2090,7 @@ func TestCreateAgentWithGitCloneAndBranch(t *testing.T) {
 }
 
 func TestCreateAgentWithoutGitClone(t *testing.T) {
-	srv, mgr := newTestServerWithGitCloneCapture()
+	srv, mgr := newTestServerWithGitCloneCapture(t)
 
 	body := `{
 		"name": "regular-agent",
@@ -2064,7 +2120,7 @@ func TestCreateAgentWithoutGitClone(t *testing.T) {
 }
 
 func TestResolveManagerForOpts_NoProfile(t *testing.T) {
-	srv, _ := newTestServerWithProvisionCapture()
+	srv, _ := newTestServerWithProvisionCapture(t)
 
 	opts := api.StartOptions{Name: "test-agent"}
 	mgr := srv.resolveManagerForOpts(opts)
@@ -2076,7 +2132,7 @@ func TestResolveManagerForOpts_NoProfile(t *testing.T) {
 }
 
 func TestResolveManagerForOpts_ProfileNotInSettings(t *testing.T) {
-	srv, _ := newTestServerWithProvisionCapture()
+	srv, _ := newTestServerWithProvisionCapture(t)
 
 	opts := api.StartOptions{
 		Name:    "test-agent",
@@ -2112,7 +2168,7 @@ runtimes:
 		t.Fatal(err)
 	}
 
-	srv, _ := newTestServerWithProvisionCapture()
+	srv, _ := newTestServerWithProvisionCapture(t)
 	srv.config.ForceRuntime = ""
 
 	opts := api.StartOptions{
@@ -2150,7 +2206,7 @@ runtimes:
 		t.Fatal(err)
 	}
 
-	srv, _ := newTestServerWithProvisionCapture()
+	srv, _ := newTestServerWithProvisionCapture(t)
 
 	opts := api.StartOptions{
 		Name:        "test-agent",
@@ -2167,7 +2223,7 @@ runtimes:
 }
 
 func TestCreateAgentWithProfile(t *testing.T) {
-	srv, mgr := newTestServerWithProvisionCapture()
+	srv, mgr := newTestServerWithProvisionCapture(t)
 
 	body := `{
 		"name": "profiled-agent",
@@ -2193,7 +2249,7 @@ func TestCreateAgentWithProfile(t *testing.T) {
 }
 
 func TestCreateAgentWithoutProfile(t *testing.T) {
-	srv, mgr := newTestServerWithProvisionCapture()
+	srv, mgr := newTestServerWithProvisionCapture(t)
 
 	body := `{
 		"name": "no-profile-agent",
@@ -2273,7 +2329,7 @@ func TestCreateAgentProjectSlugResolvesProjectPath(t *testing.T) {
 	// local provider path), the handler should resolve ProjectPath to the
 	// conventional ~/.scion.groves/<slug>/ path so the agent is created in the
 	// correct project instead of the broker's local project.
-	srv, mgr := newTestServerWithProvisionCapture()
+	srv, mgr := newTestServerWithProvisionCapture(t)
 
 	body := `{
 		"name": "hub-managed-agent",
@@ -2312,7 +2368,7 @@ func TestCreateAgentProjectSlugResolvesProjectPath(t *testing.T) {
 func TestCreateAgentProjectSlugNotUsedWhenProjectPathSet(t *testing.T) {
 	// When both ProjectPath and ProjectSlug are set, ProjectPath takes precedence
 	// (the broker has a local provider path for this project).
-	srv, mgr := newTestServerWithProvisionCapture()
+	srv, mgr := newTestServerWithProvisionCapture(t)
 
 	body := `{
 		"name": "local-grove-agent",
@@ -2348,6 +2404,7 @@ func TestCreateAgentProjectSlugNotUsedWhenProjectPathSet(t *testing.T) {
 // handler uses project settings hub.endpoint only as a fallback when no broker
 // config or dispatch endpoint is available.
 func TestStartAgentProjectSettingsFallbackHubEndpoint(t *testing.T) {
+	isolateTestScion(t, "docker")
 	t.Run("linked project with settings at projectPath", func(t *testing.T) {
 		cfg := DefaultServerConfig()
 		cfg.BrokerID = "test-broker-id"
@@ -2365,7 +2422,7 @@ func TestStartAgentProjectSettingsFallbackHubEndpoint(t *testing.T) {
 		if err := os.MkdirAll(projectDir, 0755); err != nil {
 			t.Fatalf("failed to create project dir: %v", err)
 		}
-		settingsContent := "hub:\n  endpoint: https://hub.production.example.com\n"
+		settingsContent := "profiles:\n  local:\n    runtime: docker\nhub:\n  endpoint: https://hub.production.example.com\n"
 		if err := os.WriteFile(filepath.Join(projectDir, "settings.yaml"), []byte(settingsContent), 0644); err != nil {
 			t.Fatalf("failed to write settings.yaml: %v", err)
 		}
@@ -2413,7 +2470,7 @@ func TestStartAgentProjectSettingsFallbackHubEndpoint(t *testing.T) {
 		if err := os.MkdirAll(scionDir, 0755); err != nil {
 			t.Fatalf("failed to create .scion dir: %v", err)
 		}
-		settingsContent := "hub:\n  endpoint: https://hub.native.example.com\n"
+		settingsContent := "profiles:\n  local:\n    runtime: docker\nhub:\n  endpoint: https://hub.native.example.com\n"
 		if err := os.WriteFile(filepath.Join(scionDir, "settings.yaml"), []byte(settingsContent), 0644); err != nil {
 			t.Fatalf("failed to write settings.yaml: %v", err)
 		}
@@ -2446,6 +2503,7 @@ func TestStartAgentProjectSettingsFallbackHubEndpoint(t *testing.T) {
 // TestStartAgentBrokerConfigUsedWhenNoProjectSettings verifies that the broker's
 // config HubEndpoint is used as fallback when project settings don't specify one.
 func TestStartAgentBrokerConfigUsedWhenNoProjectSettings(t *testing.T) {
+	isolateTestScion(t, "docker")
 	cfg := DefaultServerConfig()
 	cfg.BrokerID = "test-broker-id"
 	cfg.BrokerName = "test-host"
@@ -2459,7 +2517,7 @@ func TestStartAgentBrokerConfigUsedWhenNoProjectSettings(t *testing.T) {
 
 	// Create a temp project dir with settings.yaml but no hub endpoint
 	projectDir := t.TempDir()
-	settingsContent := "harnesses:\n  claude:\n    model: sonnet\n"
+	settingsContent := "profiles:\n  local:\n    runtime: docker\nharnesses:\n  claude:\n    model: sonnet\n"
 	if err := os.WriteFile(filepath.Join(projectDir, "settings.yaml"), []byte(settingsContent), 0644); err != nil {
 		t.Fatalf("failed to write settings.yaml: %v", err)
 	}
@@ -2489,6 +2547,7 @@ func TestStartAgentBrokerConfigUsedWhenNoProjectSettings(t *testing.T) {
 // has no HubEndpoint configured, the hub endpoint from resolvedEnv (sent by
 // the hub dispatcher) is used as a fallback.
 func TestStartAgentResolvedEnvHubEndpointFallback(t *testing.T) {
+	isolateTestScion(t, "docker")
 	cfg := DefaultServerConfig()
 	cfg.BrokerID = "test-broker-id"
 	cfg.BrokerName = "test-host"
@@ -2525,6 +2584,7 @@ func TestStartAgentResolvedEnvHubEndpointFallback(t *testing.T) {
 // has no HubEndpoint configured, SCION_HUB_URL from resolvedEnv is accepted as
 // the fallback endpoint in the start path.
 func TestStartAgentResolvedEnvHubURLFallback(t *testing.T) {
+	isolateTestScion(t, "docker")
 	cfg := DefaultServerConfig()
 	cfg.BrokerID = "test-broker-id"
 	cfg.BrokerName = "test-host"
@@ -2563,6 +2623,7 @@ func TestStartAgentResolvedEnvHubURLFallback(t *testing.T) {
 // the hub endpoint from resolvedEnv is localhost, the ContainerHubEndpoint
 // override is applied.
 func TestStartAgentResolvedEnvHubEndpointWithContainerOverride(t *testing.T) {
+	isolateTestScion(t, "docker")
 	cfg := DefaultServerConfig()
 	cfg.BrokerID = "test-broker-id"
 	cfg.BrokerName = "test-host"
@@ -2601,6 +2662,7 @@ func TestStartAgentResolvedEnvHubEndpointWithContainerOverride(t *testing.T) {
 // sends a localhost endpoint on port 8080 but the broker's ContainerHubEndpoint
 // was pre-computed with port 9810, the actual endpoint port (8080) is preserved.
 func TestCreateAgentPortPreservedAcrossBridge(t *testing.T) {
+	isolateTestScion(t, "docker")
 	cfg := DefaultServerConfig()
 	cfg.BrokerID = "test-broker-id"
 	cfg.BrokerName = "test-host"
@@ -2638,7 +2700,7 @@ func TestCreateAgentPortPreservedAcrossBridge(t *testing.T) {
 
 // TestStartAgentBrokerIDEnv verifies that startAgent sets SCION_BROKER_ID from broker config.
 func TestStartAgentBrokerIDEnv(t *testing.T) {
-	srv, mgr := newTestServerWithProvisionCapture()
+	srv, mgr := newTestServerWithProvisionCapture(t)
 
 	body := `{}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/test-agent/start", strings.NewReader(body))
@@ -2683,7 +2745,7 @@ func TestStartAgentProjectSlugResolvesProjectPath(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// When the startAgent handler receives projectSlug with no projectPath
 			// (hub-managed project), it should resolve ProjectPath from the slug.
-			srv, mgr := newTestServerWithProvisionCapture()
+			srv, mgr := newTestServerWithProvisionCapture(t)
 
 			req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/hub-managed-agent/start", strings.NewReader(tt.body))
 			req.Header.Set("Content-Type", "application/json")
@@ -2739,7 +2801,7 @@ func TestStartAgentProjectSlugNotUsedWhenProjectPathSet(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// When startAgent receives both projectPath and projectSlug,
 			// projectPath takes precedence.
-			srv, mgr := newTestServerWithProvisionCapture()
+			srv, mgr := newTestServerWithProvisionCapture(t)
 
 			req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/local-project-agent/start", strings.NewReader(tt.body))
 			req.Header.Set("Content-Type", "application/json")
@@ -2763,7 +2825,7 @@ func TestStartAgentProjectSlugNotUsedWhenProjectPathSet(t *testing.T) {
 }
 
 func TestStartAgentInlineConfigModelUpdatesExistingAgentConfig(t *testing.T) {
-	srv, mgr := newTestServerWithProvisionCapture()
+	srv, mgr := newTestServerWithProvisionCapture(t)
 
 	projectDir := filepath.Join(t.TempDir(), ".scion")
 	agentName := "configured-agent"
@@ -2817,7 +2879,7 @@ func TestStartAgentInlineConfigModelUpdatesExistingAgentConfig(t *testing.T) {
 }
 
 func TestStartAgentInlineConfigPassedForProvisionOnStart(t *testing.T) {
-	srv, mgr := newTestServerWithProvisionCapture()
+	srv, mgr := newTestServerWithProvisionCapture(t)
 
 	projectDir := filepath.Join(t.TempDir(), ".scion")
 	if err := os.MkdirAll(projectDir, 0755); err != nil {
@@ -2854,7 +2916,7 @@ func TestStartAgentTelemetryOverrideFromResolvedEnv(t *testing.T) {
 	// When resolvedEnv contains SCION_TELEMETRY_ENABLED=true, startAgent
 	// should translate it to opts.TelemetryOverride so that Start() enables
 	// harness telemetry env injection and cloud config merging.
-	srv, mgr := newTestServerWithProvisionCapture()
+	srv, mgr := newTestServerWithProvisionCapture(t)
 
 	body := `{"resolvedEnv": {"SCION_TELEMETRY_ENABLED": "true"}}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/telemetry-agent/start", strings.NewReader(body))
@@ -2880,7 +2942,7 @@ func TestStartAgentTelemetryOverrideFromResolvedEnv(t *testing.T) {
 func TestStartAgentTelemetryOverrideDisabled(t *testing.T) {
 	// When resolvedEnv contains SCION_TELEMETRY_ENABLED=false, startAgent
 	// should set TelemetryOverride to false.
-	srv, mgr := newTestServerWithProvisionCapture()
+	srv, mgr := newTestServerWithProvisionCapture(t)
 
 	body := `{"resolvedEnv": {"SCION_TELEMETRY_ENABLED": "false"}}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/telemetry-agent/start", strings.NewReader(body))
@@ -2919,7 +2981,13 @@ func TestCreateAgentProjectSlugInitializesScionDir(t *testing.T) {
 	// This prevents agents from being created at the wrong directory level.
 
 	// Use a temporary directory to simulate the project workspace.
-	tmpDir := t.TempDir()
+	// EvalSymlinks canonicalizes the path (on macOS the temp dir lives under
+	// /var, a symlink to /private/var) so it compares equal to what
+	// ResolveProjectPath returns.
+	tmpDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("failed to canonicalize temp dir: %v", err)
+	}
 	projectPath := filepath.Join(tmpDir, "test-grove")
 	if err := os.MkdirAll(projectPath, 0755); err != nil {
 		t.Fatalf("failed to create test project dir: %v", err)
@@ -3154,6 +3222,9 @@ func TestIsLocalhostEndpoint(t *testing.T) {
 // (e.g. auth resolution error), the broker cleans up provisioned agent files so
 // they don't become orphans that trigger spurious hub sync-registration.
 func TestCreateAgentStartFailure_CleansUpFiles(t *testing.T) {
+	// Isolate HOME so harness-config policy never reads the developer's real ~/.scion
+	t.Setenv("HOME", t.TempDir())
+
 	// Create a temp directory to act as the project path with agent files
 	tmpDir := t.TempDir()
 	projectPath := filepath.Join(tmpDir, ".scion")

@@ -1440,7 +1440,14 @@ func TestWorktreeWorkspace_RepoRootDerivesToBase(t *testing.T) {
 	bare := initBareRepoWithCommit(t)
 	gc := &api.GitCloneConfig{URL: bare, Branch: "main"}
 
-	projectPath := filepath.Join(t.TempDir(), "proj")
+	// EvalSymlinks canonicalizes the temp dir (on macOS it lives under /var,
+	// a symlink to /private/var) so paths derived from the git common dir
+	// compare equal to paths built from t.TempDir().
+	tmpDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectPath := filepath.Join(tmpDir, "proj")
 	if err := os.MkdirAll(projectPath, 0o755); err != nil {
 		t.Fatal(err)
 	}
