@@ -499,6 +499,20 @@ Examples:
 	},
 }
 
+// resolveOutboundSenderSlug returns the identifier of the sending agent for
+// outbound (agent->user) messages. Hub-provisioned containers set both
+// SCION_AGENT_SLUG (the bare, registry-resolvable slug, e.g. "area-scion")
+// and SCION_AGENT_NAME (the project-prefixed container name, e.g.
+// "demo--area-ops"); the hub's agent registry resolves by slug, so prefer
+// it. SCION_AGENT_NAME remains the fallback for provisioning contexts that
+// only set the legacy variable.
+func resolveOutboundSenderSlug() string {
+	if slug := os.Getenv("SCION_AGENT_SLUG"); slug != "" {
+		return slug
+	}
+	return os.Getenv("SCION_AGENT_NAME")
+}
+
 // resolveSenderIdentity determines the sender identity string for structured messages.
 // In agent context (SCION_AGENT_NAME set), returns "agent:<name>".
 // In user context, queries Hub for the current user and returns "user:<displayName>".
@@ -798,7 +812,7 @@ func sendMessageViaConversation(hubCtx *HubContext, ref *messaging.Reference, me
 	// CPM cutover (#1693): conv: references now route through the outbound
 	// endpoint like @email and #thread, eliminating the duplicate conversation
 	// send API path. Wake and attachments are fully supported.
-	senderAgent := os.Getenv("SCION_AGENT_NAME")
+	senderAgent := resolveOutboundSenderSlug()
 	if senderAgent != "" {
 		// DEF-164: agent-to-agent messages use the structured message
 		// endpoint, not the outbound (user-only) endpoint. The outbound
@@ -990,7 +1004,7 @@ func sendOutboundMessageViaHub(hubCtx *HubContext, userRecipient string, message
 
 	// Determine the sending agent's name. User-targeted messages require an
 	// agent identity so the server can attribute and route the message.
-	senderAgent := os.Getenv("SCION_AGENT_NAME")
+	senderAgent := resolveOutboundSenderSlug()
 	if senderAgent == "" {
 		return fmt.Errorf("user messaging requires an agent identity; it works inside an agent container where SCION_AGENT_NAME is set")
 	}
@@ -1371,7 +1385,7 @@ func sendGroupMessageViaHubCtx(hubCtx *HubContext, recipients []messages.GroupRe
 			record(idx, groupRecipientResult{Recipient: recipStr, Status: groupStatusDelivered, MessageID: messageResponseID(sendResp), AttachmentWarnings: warnings})
 
 		case messages.RecipientUser:
-			senderAgent := os.Getenv("SCION_AGENT_NAME")
+			senderAgent := resolveOutboundSenderSlug()
 			if senderAgent == "" {
 				record(idx, groupRecipientResult{Recipient: recipStr, Status: groupStatusFailed,
 					Error: "sending to users requires agent context (SCION_AGENT_NAME not set)"})
