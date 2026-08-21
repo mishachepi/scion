@@ -1,0 +1,69 @@
+# Fork-only CI: build proof for the fleet branch without frying local machines.
+# Runs `make web` + `make build` (+ sciontool) on macOS arm64 — the platform
+# the fleet (M1/M4/M5) actually runs — and uploads the binaries as artifacts.
+# Not an upstream candidate: this file exists only on fork working branches.
+
+name: Fork Build (tmux-unsafe)
+
+on:
+  push:
+    branches: [ tmux-unsafe ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-darwin-arm64:
+    name: Build darwin/arm64 (web + scion + sciontool)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: 'web/package-lock.json'
+
+      - name: Build Web UI
+        run: make web
+
+      - name: Build scion
+        run: make build
+
+      - name: Verify web embed in binary
+        run: |
+          ASSET=$(ls web/dist/client/assets | head -1)
+          if ! strings -a build/scion | grep -q "$ASSET"; then
+            echo "::error::Web asset $ASSET not embedded in build/scion — web UI missing from binary"
+            exit 1
+          fi
+          echo "web embed ok: $ASSET"
+
+      - name: Build sciontool
+        run: go build -o build/sciontool ./cmd/sciontool
+
+      - name: Smoke version
+        run: |
+          ./build/scion --version || true
+          ./build/sciontool --version || true
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: scion-darwin-arm64-${{ github.sha }}
+          path: |
+            build/scion
+            build/sciontool
+          retention-days: 7
