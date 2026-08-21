@@ -828,6 +828,20 @@ func printBroadcastAccepted(resp *hubclient.BroadcastResponse) {
 	}
 }
 
+// resolveOutboundSenderSlug returns the identifier of the sending agent for
+// outbound (agent->user) messages. Hub-provisioned containers set both
+// SCION_AGENT_SLUG (the bare, registry-resolvable slug, e.g. "area-scion")
+// and SCION_AGENT_NAME (the project-prefixed container name, e.g.
+// "demo--area-ops"); the hub's agent registry resolves by slug, so prefer
+// it. SCION_AGENT_NAME remains the fallback for provisioning contexts that
+// only set the legacy variable.
+func resolveOutboundSenderSlug() string {
+	if slug := os.Getenv("SCION_AGENT_SLUG"); slug != "" {
+		return slug
+	}
+	return os.Getenv("SCION_AGENT_NAME")
+}
+
 func sendOutboundMessageViaHub(hubCtx *HubContext, userRecipient string, message string, urgent bool) error {
 	if !isJSONOutput() {
 		PrintUsingHub(hubCtx.Endpoint)
@@ -840,9 +854,9 @@ func sendOutboundMessageViaHub(hubCtx *HubContext, userRecipient string, message
 		}
 	}
 
-	// Determine the sending agent's name. This command is intended for use
-	// by agents running inside containers, where SCION_AGENT_NAME is set.
-	senderAgent := os.Getenv("SCION_AGENT_NAME")
+	// Determine the sending agent's identity. This command is intended for
+	// use by agents running inside containers.
+	senderAgent := resolveOutboundSenderSlug()
 	if senderAgent == "" {
 		return fmt.Errorf("sending messages to users is only supported from within an agent container (SCION_AGENT_NAME not set)")
 	}
@@ -938,7 +952,7 @@ func sendGroupMessageViaHub(hubCtx *HubContext, recipients []messages.GroupRecip
 				}
 
 			case messages.RecipientUser:
-				senderAgent := os.Getenv("SCION_AGENT_NAME")
+				senderAgent := resolveOutboundSenderSlug()
 				if senderAgent == "" {
 					results[idx] = recipientResult{Recipient: recipStr, Status: "failed", Error: "sending to users requires agent context (SCION_AGENT_NAME not set)"}
 					if !isJSONOutput() {
