@@ -590,6 +590,7 @@ func TestSendOutboundMessageViaHub(t *testing.T) {
 		ProjectID: projectID,
 	}
 
+	t.Setenv("SCION_AGENT_SLUG", "")
 	t.Setenv("SCION_AGENT_NAME", "my-agent")
 
 	err = sendOutboundMessageViaHub(hubCtx, "user:alice", "I need help", false)
@@ -600,6 +601,63 @@ func TestSendOutboundMessageViaHub(t *testing.T) {
 	assert.Equal(t, "I need help", receivedMsg.Msg)
 	assert.Equal(t, "instruction", receivedMsg.Type)
 	assert.False(t, receivedMsg.Urgent)
+}
+
+func TestSendOutboundMessageViaHub_PrefersAgentSlugOverProjectPrefixedName(t *testing.T) {
+	orig := saveMessageTestState()
+	defer orig.restore()
+
+	projectID := "grove-msg-outbound-slug"
+
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/healthz" && r.Method == http.MethodGet:
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+		case r.Method == http.MethodPost:
+			gotPath = r.URL.Path
+			w.WriteHeader(http.StatusOK)
+			// apiclient.DecodeResponse requires a JSON body on 200 (only 204
+			// short-circuits); a real hub always returns the outbound-message
+			// result envelope, so the fake must too or SendOutboundMessage
+			// fails on "failed to decode response: EOF" before the test ever
+			// gets to check gotPath.
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"status": "sent", "recipient": "user:alice",
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := hubclient.New(server.URL)
+	require.NoError(t, err)
+
+	hubCtx := &HubContext{
+		Client:    client,
+		Endpoint:  server.URL,
+		ProjectID: projectID,
+	}
+
+	// Hub-provisioned containers set SCION_AGENT_NAME to the project-prefixed
+	// container name and SCION_AGENT_SLUG to the bare, registry-resolvable
+	// slug. The hub resolves agents by slug — the CLI must prefer it.
+	t.Setenv("SCION_AGENT_NAME", "demo--area-ops")
+	t.Setenv("SCION_AGENT_SLUG", "area-scion")
+
+	err = sendOutboundMessageViaHub(hubCtx, "user:alice", "hi", false)
+	require.NoError(t, err)
+
+	assert.Contains(t, gotPath, "/agents/area-scion/outbound-message")
+	assert.NotContains(t, gotPath, "demo--area-ops")
+}
+
+func TestResolveOutboundSenderSlug_FallsBackToAgentName(t *testing.T) {
+	t.Setenv("SCION_AGENT_SLUG", "")
+	t.Setenv("SCION_AGENT_NAME", "demo--area-ops")
+	assert.Equal(t, "demo--area-ops", resolveOutboundSenderSlug())
 }
 
 func TestSendOutboundMessageViaHub_RequiresAgentContext(t *testing.T) {
@@ -621,6 +679,7 @@ func TestSendOutboundMessageViaHub_RequiresAgentContext(t *testing.T) {
 		ProjectID: "project-test",
 	}
 
+	t.Setenv("SCION_AGENT_SLUG", "")
 	t.Setenv("SCION_AGENT_NAME", "")
 
 	err = sendOutboundMessageViaHub(hubCtx, "user:alice", "hello", false)
@@ -924,6 +983,7 @@ func TestSendGroupMessageViaHub_UserRecipientType(t *testing.T) {
 	defer orig.restore()
 
 	projectID := "project-msg-group-user"
+	t.Setenv("SCION_AGENT_SLUG", "")
 	t.Setenv("SCION_AGENT_NAME", "my-agent")
 
 	var receivedMsg *hubclient.OutboundMessageRequest
