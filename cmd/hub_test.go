@@ -15,12 +15,17 @@
 package cmd
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestGetAuthInfo_NoAuth(t *testing.T) {
@@ -112,6 +117,11 @@ func TestGetAuthInfo_DevAuthPreferredOverStaleAgentTokenOnLocalhost(t *testing.T
 	t.Setenv("SCION_DEV_TOKEN", "")
 	t.Setenv("SCION_DEV_TOKEN_FILE", "")
 	t.Setenv("SCION_HUB_TOKEN", "")
+	// This scenario models a human CLI invocation outside any agent
+	// container — clear the agent-context vars so the test is hermetic
+	// even when run from inside a real agent (see isInAgentContext).
+	t.Setenv("SCION_AGENT_SLUG", "")
+	t.Setenv("SCION_AGENT_NAME", "")
 
 	scionDir := filepath.Join(tmpDir, ".scion")
 	if err := os.MkdirAll(scionDir, 0755); err != nil {
@@ -133,6 +143,91 @@ func TestGetAuthInfo_DevAuthPreferredOverStaleAgentTokenOnLocalhost(t *testing.T
 	assert.Equal(t, "devauth", info.MethodType)
 	assert.Equal(t, "Dev auth", info.Method)
 	assert.True(t, info.IsDevAuth)
+}
+
+func TestGetAuthInfo_AgentTokenPreferredInAgentContextOnLocalhost(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+	t.Setenv("SCION_AUTH_TOKEN", "")
+	t.Setenv("SCION_DEV_TOKEN", "")
+	t.Setenv("SCION_DEV_TOKEN_FILE", "")
+	t.Setenv("SCION_HUB_TOKEN", "")
+	// Simulate a hub-provisioned agent container: the on-disk agent token is
+	// this process's real identity and must not be shadowed by dev auth,
+	// even against a localhost hub endpoint.
+	t.Setenv("SCION_AGENT_SLUG", "area-scion")
+	t.Setenv("SCION_AGENT_NAME", "mch--area-scion")
+
+	scionDir := filepath.Join(tmpDir, ".scion")
+	if err := os.MkdirAll(scionDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// A real (non-dev) agent token, as hub provisioning would write for a
+	// running container.
+	if err := os.WriteFile(filepath.Join(scionDir, "scion-token"), []byte("eyJhbGciOiJIUzI1NiJ9.real-agent-jwt"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// A dev token also present, e.g. because the local hub runs in dev mode.
+	if err := os.WriteFile(filepath.Join(scionDir, "dev-token"), []byte("scion_dev_abc123"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	settings := &config.Settings{}
+	info := getAuthInfo(settings, "http://localhost:8080")
+	assert.Equal(t, "agent_token", info.MethodType)
+	assert.Equal(t, "Agent token", info.Method)
+	assert.Equal(t, "scion-token file", info.Source)
+	assert.False(t, info.IsDevAuth)
+}
+
+// TestGetHubClient_AgentContextSendsAgentTokenHeaderNotDevBearer is the
+// wire-level regression test for the dev-token-preemption bug: on a
+// localhost hub, inside an agent container, the client built by
+// getHubClient must authenticate with the real agent token via
+// X-Scion-Agent-Token — not the dev token via a plain Bearer header. The
+// hub's agent-identity-scoped routes (e.g. outbound-message) require the
+// former and reject the latter with 401 regardless of endpoint.
+func TestGetHubClient_AgentContextSendsAgentTokenHeaderNotDevBearer(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+	t.Setenv("SCION_AUTH_TOKEN", "")
+	t.Setenv("SCION_DEV_TOKEN", "")
+	t.Setenv("SCION_DEV_TOKEN_FILE", "")
+	t.Setenv("SCION_HUB_TOKEN", "")
+	t.Setenv("SCION_AGENT_SLUG", "area-scion")
+	t.Setenv("SCION_AGENT_NAME", "mch--area-scion")
+
+	scionDir := filepath.Join(tmpDir, ".scion")
+	require.NoError(t, os.MkdirAll(scionDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(scionDir, "scion-token"), []byte("eyJhbGciOiJIUzI1NiJ9.real-agent-jwt"), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(scionDir, "dev-token"), []byte("scion_dev_abc123"), 0600))
+
+	var gotAgentTokenHeader, gotAuthHeader string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAgentTokenHeader = r.Header.Get("X-Scion-Agent-Token")
+		gotAuthHeader = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer server.Close()
+
+	origHubEndpoint := hubEndpoint
+	hubEndpoint = ""
+	defer func() { hubEndpoint = origHubEndpoint }()
+
+	settings := &config.Settings{Hub: &config.HubClientConfig{Endpoint: server.URL}}
+	client, err := getHubClient(settings)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _ = client.Health(ctx)
+
+	assert.Equal(t, "eyJhbGciOiJIUzI1NiJ9.real-agent-jwt", gotAgentTokenHeader,
+		"expected the real agent token on X-Scion-Agent-Token")
+	assert.Empty(t, gotAuthHeader, "dev token must not go out as a Bearer Authorization header in agent context")
 }
 
 func TestGetAuthInfo_AgentTokenUsedOnRemoteEndpoint(t *testing.T) {

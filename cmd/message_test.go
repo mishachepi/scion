@@ -639,6 +639,7 @@ func TestSendOutboundMessageViaHub(t *testing.T) {
 		ProjectID: projectID,
 	}
 
+	t.Setenv("SCION_AGENT_SLUG", "")
 	t.Setenv("SCION_AGENT_NAME", "my-agent")
 
 	err = sendOutboundMessageViaHub(hubCtx, "user:alice", "I need help", false)
@@ -649,6 +650,55 @@ func TestSendOutboundMessageViaHub(t *testing.T) {
 	assert.Equal(t, "I need help", receivedMsg.Msg)
 	assert.Equal(t, "instruction", receivedMsg.Type)
 	assert.False(t, receivedMsg.Urgent)
+}
+
+func TestSendOutboundMessageViaHub_PrefersAgentSlugOverProjectPrefixedName(t *testing.T) {
+	orig := saveMessageTestState()
+	defer orig.restore()
+
+	projectID := "grove-msg-outbound-slug"
+
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/healthz" && r.Method == http.MethodGet:
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+		case r.Method == http.MethodPost:
+			gotPath = r.URL.Path
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := hubclient.New(server.URL)
+	require.NoError(t, err)
+
+	hubCtx := &HubContext{
+		Client:    client,
+		Endpoint:  server.URL,
+		ProjectID: projectID,
+	}
+
+	// Hub-provisioned containers set SCION_AGENT_NAME to the project-prefixed
+	// container name and SCION_AGENT_SLUG to the bare, registry-resolvable
+	// slug. The hub resolves agents by slug — the CLI must prefer it.
+	t.Setenv("SCION_AGENT_NAME", "mch--area-scion")
+	t.Setenv("SCION_AGENT_SLUG", "area-scion")
+
+	err = sendOutboundMessageViaHub(hubCtx, "user:alice", "hi", false)
+	require.NoError(t, err)
+
+	assert.Contains(t, gotPath, "/agents/area-scion/outbound-message")
+	assert.NotContains(t, gotPath, "mch--area-scion")
+}
+
+func TestResolveOutboundSenderSlug_FallsBackToAgentName(t *testing.T) {
+	t.Setenv("SCION_AGENT_SLUG", "")
+	t.Setenv("SCION_AGENT_NAME", "mch--area-scion")
+	assert.Equal(t, "mch--area-scion", resolveOutboundSenderSlug())
 }
 
 func TestSendOutboundMessageViaHub_RequiresAgentContext(t *testing.T) {
@@ -670,6 +720,7 @@ func TestSendOutboundMessageViaHub_RequiresAgentContext(t *testing.T) {
 		ProjectID: "grove-test",
 	}
 
+	t.Setenv("SCION_AGENT_SLUG", "")
 	t.Setenv("SCION_AGENT_NAME", "")
 
 	err = sendOutboundMessageViaHub(hubCtx, "user:alice", "hello", false)
@@ -994,6 +1045,7 @@ func TestSendGroupMessageViaHub_UserRecipientType(t *testing.T) {
 	defer orig.restore()
 
 	projectID := "grove-msg-group-user"
+	t.Setenv("SCION_AGENT_SLUG", "")
 	t.Setenv("SCION_AGENT_NAME", "my-agent")
 
 	var receivedMsg *hubclient.OutboundMessageRequest
