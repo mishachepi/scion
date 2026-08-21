@@ -442,6 +442,16 @@ func isLocalhostEndpoint(endpoint string) bool {
 	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
+// isInAgentContext reports whether this process is running inside a
+// hub-provisioned agent container (SCION_AGENT_SLUG or the legacy
+// SCION_AGENT_NAME is set). In that context, the on-disk agent token is the
+// identity this process authenticates as — agent-identity-scoped Hub routes
+// (e.g. the outbound-message endpoint) reject dev auth outright, so it must
+// never be substituted for a real agent token here.
+func isInAgentContext() bool {
+	return os.Getenv("SCION_AGENT_SLUG") != "" || os.Getenv("SCION_AGENT_NAME") != ""
+}
+
 // readAgentTokenFile reads the canonical agent token from ~/.scion/scion-token.
 // Returns empty string if the file doesn't exist (e.g. not running in a container).
 func readAgentTokenFile() string {
@@ -481,6 +491,9 @@ func getAuthInfo(settings *config.Settings, endpoint string) authInfo {
 	// When the endpoint is localhost and dev auth is available, prefer dev auth
 	// over a non-dev agent token — the scion-token may be stale from a previous
 	// remote hub connection while the dev-token was written by the running local server.
+	// Exception: inside an agent container this token IS the identity we're
+	// authenticating as, so it must not be shadowed by dev auth — see
+	// isInAgentContext.
 	if token := readAgentTokenFile(); token != "" {
 		if apiclient.IsDevToken(token) {
 			info.Method = "Agent token (dev)"
@@ -490,7 +503,7 @@ func getAuthInfo(settings *config.Settings, endpoint string) authInfo {
 			info.TokenExpiry = parseJWTExpiry(token)
 			return info
 		}
-		if isLocalhostEndpoint(endpoint) {
+		if isLocalhostEndpoint(endpoint) && !isInAgentContext() {
 			if devToken, devSource := apiclient.ResolveDevTokenWithSource(); devToken != "" {
 				util.Debugf("Skipping non-dev agent token from scion-token file; using dev auth (%s) for localhost endpoint", devSource)
 				info.Method = "Dev auth"
@@ -578,10 +591,12 @@ func getHubClient(settings *config.Settings) (hubclient.Client, error) {
 		authConfigured = true
 	}
 
-	// Check for agent auth token from canonical token file, then bootstrap env var
+	// Check for agent auth token from canonical token file, then bootstrap env var.
+	// See isInAgentContext: inside an agent container the on-disk token must
+	// not be shadowed by dev auth, even on localhost.
 	if !authConfigured {
 		if token := readAgentTokenFile(); token != "" {
-			if !apiclient.IsDevToken(token) && isLocalhostEndpoint(endpoint) {
+			if !apiclient.IsDevToken(token) && isLocalhostEndpoint(endpoint) && !isInAgentContext() {
 				if devToken := apiclient.ResolveDevToken(); devToken != "" {
 					opts = append(opts, hubclient.WithBearerToken(devToken))
 					authConfigured = true
