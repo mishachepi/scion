@@ -143,7 +143,7 @@ NO_RENDERED_SETTINGS=(existing-secret)
 # -ne, so it fails in BOTH directions: short means something was skipped, over
 # means an assertion was added without the number being committed in the diff.
 # Update it in the same commit that changes the count, deliberately.
-EXPECTED_TOTAL=297
+EXPECTED_TOTAL=303
 
 failures=0
 assertions=0
@@ -1550,6 +1550,15 @@ declare -A PROBE_MUTATION=(
   [image.pullPolicy]='--set-string|image.pullPolicy=Never'
   [image.pullSecrets]='--set-string|image.pullSecrets[0].name=probe-secret'
   [image.repository]='--set-string|image.repository=other.test/probe-img'
+  [backup.enabled]='--set|persistence.enabled=true|--set|backup.enabled=true|--set-string|backup.image.repository=probe.test/sqlite|--set-string|backup.image.digest=sha256:abababababababababababababababababababababababababababababababab'
+  [backup.schedule]='--set|persistence.enabled=true|--set|backup.enabled=true|--set-string|backup.image.repository=probe.test/sqlite|--set-string|backup.image.digest=sha256:abababababababababababababababababababababababababababababababab|--set-string|backup.schedule=45 4 * * *'
+  [backup.retention]='--set|persistence.enabled=true|--set|backup.enabled=true|--set-string|backup.image.repository=probe.test/sqlite|--set-string|backup.image.digest=sha256:abababababababababababababababababababababababababababababababab|--set|backup.retention=9'
+  [backup.size]='--set|persistence.enabled=true|--set|backup.enabled=true|--set-string|backup.image.repository=probe.test/sqlite|--set-string|backup.image.digest=sha256:abababababababababababababababababababababababababababababababab|--set-string|backup.size=9Gi'
+  [backup.storageClass]='--set|persistence.enabled=true|--set|backup.enabled=true|--set-string|backup.image.repository=probe.test/sqlite|--set-string|backup.image.digest=sha256:abababababababababababababababababababababababababababababababab|--set-string|backup.storageClass=probe-sc'
+  [backup.image.repository]='--set|persistence.enabled=true|--set|backup.enabled=true|--set-string|backup.image.repository=other.test/probe-sqlite|--set-string|backup.image.digest=sha256:abababababababababababababababababababababababababababababababab'
+  [backup.image.tag]='--set|persistence.enabled=true|--set|backup.enabled=true|--set-string|backup.image.repository=probe.test/sqlite|--set-string|backup.image.tag=probe-tag'
+  [backup.image.digest]='--set|persistence.enabled=true|--set|backup.enabled=true|--set-string|backup.image.repository=probe.test/sqlite|--set-string|backup.image.digest=sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd'
+  [backup.image.pullPolicy]='--set|persistence.enabled=true|--set|backup.enabled=true|--set-string|backup.image.repository=probe.test/sqlite|--set-string|backup.image.digest=sha256:abababababababababababababababababababababababababababababababab|--set-string|backup.image.pullPolicy=Never'
   [gateway.enabled]='--set|gateway.enabled=true|--set-string|gateway.parentRefs[0].name=probe-gw'
   [gateway.hostnames]='--set|gateway.enabled=true|--set-string|gateway.parentRefs[0].name=probe-gw|--set-string|gateway.hostnames[0]=probe.example.com'
   [gateway.parentRefs]='--set|gateway.enabled=true|--set-string|gateway.parentRefs[0].name=probe-gw'
@@ -2627,7 +2636,7 @@ _ps_bad="$(_pipe_unguarded "$_self" | wc -l || true)"
 #
 # So: bump this number in the diff that adds the assignment. That is the same
 # contract every other pinned count in this suite carries.
-PIPE_SITES_EXPECTED=35
+PIPE_SITES_EXPECTED=37
 if [[ "$_ps_total" -ne "$PIPE_SITES_EXPECTED" ]]; then
   meta_failure "the pipeline-assignment sweep found $_ps_total sites in $_self, pinned at $PIPE_SITES_EXPECTED. If you added an assignment-from-a-pipeline, give it a || fallback and bump PIPE_SITES_EXPECTED in the same diff. If you did not, the pattern has stopped matching and the zero below would mean nothing."
 else
@@ -3121,6 +3130,67 @@ if grep -qF 'claimName: operator-owned-claim' <<<"$_vol_existing"; then
 else
   fail "the scion-home volume does not reference the operator's claim (got: ${_vol_existing:-<no volume found>})"
 fi
+
+# --------------------------------------------------------------------------
+step "backup"
+# --------------------------------------------------------------------------
+# The sqlite snapshot CronJob. Default false keeps every permutation above
+# job-free; the checks here cover the enabled render, the claim wiring, the
+# selector separation, and the two refusals.
+"$HELM" template "$RELEASE" "$CHART_DIR" \
+  --namespace "$NAMESPACE" \
+  "${BASE[@]}" \
+  --set persistence.enabled=true \
+  --set backup.enabled=true \
+  --set-string backup.image.repository=example.test/sqlite \
+  --set-string backup.image.digest=sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd \
+  > "$WORK/backup.yaml"
+
+if grep -qE '^kind: CronJob$' "$WORK/backup.yaml" \
+   && grep -qF 'schedule: "30 3 * * *"' "$WORK/backup.yaml"; then
+  pass "backup.enabled renders the CronJob on its schedule"
+else
+  fail "backup.enabled did not render a CronJob carrying backup.schedule - and the checks below prove nothing"
+fi
+if grep -qF 'helm.sh/resource-policy: keep' "$WORK/backup.yaml"; then
+  pass "the snapshot claim is kept through helm uninstall"
+else
+  fail "the snapshot claim lacks helm.sh/resource-policy: keep - uninstall deletes the backups with the data they back up"
+fi
+if grep -qE 'claimName: .*-data$' "$WORK/backup.yaml" \
+   && grep -qE 'claimName: .*-backups$' "$WORK/backup.yaml"; then
+  pass "the job mounts the data claim and its own snapshot claim"
+else
+  fail "the job does not mount both the data claim and the snapshot claim"
+fi
+# The backup pod must NOT match the Service's selector, or it joins the hub's
+# endpoints for the seconds it runs. The selector pair is name+instance, so a
+# backup pod whose app.kubernetes.io/name equals the hub's is the defect.
+_svc_name="$(sed -n '/^kind: Service$/,/^---/p' "$WORK/backup.yaml" | sed -n 's/^    app.kubernetes.io\/name: //p' | head -1 || true)"
+_job_name="$(sed -n '/^kind: CronJob$/,$p' "$WORK/backup.yaml" | sed -n 's/^            app.kubernetes.io\/name: //p' | head -1 || true)"
+if [[ -n "$_svc_name" && -n "$_job_name" ]]; then
+  if [[ "$_job_name" == "$_svc_name" ]]; then
+    fail "the backup pod carries the Service's app.kubernetes.io/name ($_svc_name) - it would join the hub's endpoints while it runs"
+  else
+    pass "the backup pod does not match the Service selector"
+  fi
+else
+  fail "could not extract both label values (service='$_svc_name', job='$_job_name') - the selector-separation check proves nothing"
+fi
+
+expect_render_failure \
+  "backup without persistence is refused" \
+  "on an emptyDir there is nothing durable to back up" \
+  "${BASE[@]}" \
+  --set backup.enabled=true \
+  --set-string backup.image.repository=example.test/sqlite \
+  --set-string backup.image.tag=probe
+expect_render_failure \
+  "backup without an image is refused" \
+  "backup.image.repository is required" \
+  "${BASE[@]}" \
+  --set persistence.enabled=true \
+  --set backup.enabled=true
 
 # --------------------------------------------------------------------------
 step "renders that must fail"

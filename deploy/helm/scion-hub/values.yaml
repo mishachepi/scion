@@ -306,6 +306,34 @@ service:
   port: 80
   annotations: {}
 
+backup:
+  # Daily consistent snapshot of the sqlite hub.db into its own PVC, via
+  # sqlite3's online .backup API (a cp of a live WAL-mode database misses
+  # every committed frame still in the WAL). Requires persistence.enabled:
+  # on an emptyDir there is nothing durable to back up, and with an external
+  # database this job would back up the wrong thing.
+  #
+  # The snapshot claim is stamped helm.sh/resource-policy: keep,
+  # unconditionally: a backup that helm uninstall deletes together with the
+  # data it backs up is a ritual, not a backup.
+  enabled: false
+  schedule: "30 3 * * *"
+  # Snapshots kept; older ones are rotated out after each run.
+  retention: 7
+  size: 5Gi
+  # Empty inherits persistence.storageClass (and empty again means the
+  # cluster default).
+  storageClass: ""
+  image:
+    # REQUIRED when enabled, and deliberately without a default: the job
+    # needs an image with sqlite3 on PATH, and every possible default would
+    # point at somebody else's artifact.
+    repository: ""
+    # tag and digest are mutually exclusive. Prefer digest.
+    tag: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+
 gateway:
   # Whether to render a Gateway API HTTPRoute for the hub's Service. The
   # ingress path this chart originally targeted is container-native load

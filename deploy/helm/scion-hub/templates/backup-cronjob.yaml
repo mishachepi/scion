@@ -1,0 +1,166 @@
+{{/*
+Copyright 2026 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/}}
+{{- /*
+Daily consistent snapshot of the sqlite hub.db, into its own PVC.
+
+sqlite3's online .backup API and not cp, because cp of a live WAL-mode
+database misses every committed frame still in the WAL. .backup reads the
+source through the sqlite locking protocol and writes only the destination,
+so the live database is not modified - which is also why the data volume is
+mounted read-write: the backup connection must be able to coordinate the
+-wal/-shm sidecar files with the hub process.
+
+The snapshots live on a separate claim with helm.sh/resource-policy: keep
+stamped on, unconditionally: a backup that helm uninstall deletes together
+with the data it backs up is a ritual, not a backup.
+
+Only meaningful when the database is the sqlite file inside the state
+directory, which is what persistence exists for - hence the two guards.
+*/}}
+{{- if .Values.backup.enabled -}}
+{{- if not .Values.persistence.enabled -}}
+{{- fail "backup.enabled is true but persistence.enabled is false. The backup snapshots hub.db inside the state directory; on an emptyDir there is nothing durable to back up, and with an external database this CronJob backs up the wrong thing. Enable persistence, or take backups where the database actually lives." -}}
+{{- end -}}
+{{- $img := .Values.backup.image -}}
+{{- if not $img.repository -}}
+{{- fail "backup.image.repository is required when backup.enabled is true, and deliberately has no default: the job needs an image with sqlite3 on PATH (for example an alpine sqlite image your cluster already trusts), and any default would point at somebody else's artifact." -}}
+{{- end -}}
+{{- if and $img.tag $img.digest -}}
+{{- fail "backup.image.tag and backup.image.digest are mutually exclusive. Prefer digest." -}}
+{{- end -}}
+{{- if not (or $img.tag $img.digest) -}}
+{{- fail "backup.image needs a tag or a digest. Prefer digest: a tag can be repointed underneath the cluster; a digest cannot." -}}
+{{- end -}}
+{{- $imageRef := ternary (printf "%s@%s" $img.repository $img.digest) (printf "%s:%s" $img.repository $img.tag) (ne ($img.digest | toString) "") -}}
+{{- $fullname := include "scion-hub.fullname" . -}}
+{{- $backupClaim := printf "%s-backups" $fullname -}}
+{{- $dataClaim := default (printf "%s-data" $fullname) .Values.persistence.existingClaim -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $backupClaim }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "scion-hub.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- with (default .Values.persistence.storageClass .Values.backup.storageClass) }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.backup.size | quote }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $fullname }}-backup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "scion-hub.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  {{- /*
+  Forbid, because two .backup connections against one source are pointless
+  and a job outliving its schedule slot is a signal, not a queue.
+  */}}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 600
+      template:
+        metadata:
+          {{- /*
+          Deliberately NOT the shared label helpers: both include the
+          selectorLabels pair, and any pod carrying that pair is matched by
+          the Service's selector - the backup pod would join the hub's
+          endpoints for the seconds it runs and receive traffic it cannot
+          answer. A distinct app.kubernetes.io/name keeps it out.
+          */}}
+          labels:
+            app.kubernetes.io/name: {{ include "scion-hub.name" . }}-backup
+            app.kubernetes.io/instance: {{ .Release.Name }}
+            app.kubernetes.io/component: backup
+        spec:
+          restartPolicy: OnFailure
+          automountServiceAccountToken: false
+          securityContext:
+            {{- include "scion-hub.nonRootSecurityContext" . | nindent 12 }}
+            seccompProfile:
+              type: RuntimeDefault
+            {{- /*
+            Same group and same policy as the hub pod (deployment.yaml), and
+            necessarily so: this pod writes the volumes that pod owns.
+            */}}
+            fsGroup: {{ int .Values.hub.securityContext.runAsGroup }}
+            fsGroupChangePolicy: OnRootMismatch
+          containers:
+            - name: backup
+              image: {{ $imageRef | quote }}
+              imagePullPolicy: {{ .Values.backup.image.pullPolicy }}
+              command: ["sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  TS=$(date +%Y%m%d-%H%M%S)
+                  OUT="/backup/hub-${TS}.db"
+                  echo "[backup] snapshotting hub.db -> ${OUT}"
+                  sqlite3 /data/hub.db ".backup '${OUT}'"
+                  echo "[backup] integrity: $(sqlite3 "${OUT}" 'PRAGMA integrity_check;')"
+                  KEEP={{ int .Values.backup.retention }}
+                  echo "[backup] rotating, keeping last ${KEEP}"
+                  ls -1t /backup/hub-*.db 2>/dev/null | tail -n +$((KEEP + 1)) | while read -r f; do
+                    echo "[backup] removing old $f"; rm -f "$f"
+                  done
+                  echo "[backup] done"
+              securityContext:
+                {{- include "scion-hub.nonRootSecurityContext" . | nindent 16 }}
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests:
+                  cpu: 25m
+                  memory: 64Mi
+                limits:
+                  cpu: 500m
+                  memory: 256Mi
+              volumeMounts:
+                - name: data
+                  mountPath: /data
+                - name: backup
+                  mountPath: /backup
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: {{ $dataClaim }}
+            - name: backup
+              persistentVolumeClaim:
+                claimName: {{ $backupClaim }}
+            - name: tmp
+              emptyDir:
+                sizeLimit: 64Mi
+{{- end }}
