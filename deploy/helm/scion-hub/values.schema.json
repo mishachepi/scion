@@ -304,6 +304,10 @@
       "additionalProperties": false,
       "required": ["listAllNamespaces"],
       "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether the hub runs an in-cluster runtime broker. false drops --enable-runtime-broker and the runtime RBAC together."
+        },
         "namespace": {
           "type": "string",
           "description": "Namespace agent pods are created in. Defaults to the release namespace."

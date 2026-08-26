@@ -143,7 +143,7 @@ NO_RENDERED_SETTINGS=(existing-secret)
 # -ne, so it fails in BOTH directions: short means something was skipped, over
 # means an assertion was added without the number being committed in the diff.
 # Update it in the same commit that changes the count, deliberately.
-EXPECTED_TOTAL=278
+EXPECTED_TOTAL=284
 
 failures=0
 assertions=0
@@ -2938,6 +2938,57 @@ if grep -Eq '^\s*-\s*"?--hosted"?$' <<<"$(sed -n '/^          args:$/,/^        
 else
   fail "the args extraction did not find --hosted - the config-flag checks above prove nothing"
 fi
+
+# --------------------------------------------------------------------------
+step "runtime.enabled"
+# --------------------------------------------------------------------------
+# The toggle for the in-cluster runtime broker. Default true preserves the
+# chart's original behaviour, so every permutation above already covers the
+# enabled side of the args; the checks here cover the disabled render and the
+# positive twins that keep the negatives from passing vacuously.
+"$HELM" template "$RELEASE" "$CHART_DIR" \
+  --namespace "$NAMESPACE" \
+  "${BASE[@]}" \
+  --set runtime.enabled=false > "$WORK/runtime-disabled.yaml"
+
+_rd_args="$(sed -n '/^          args:$/,/^          [a-z]/p' "$WORK/runtime-disabled.yaml")"
+# Subject guard first: a failed or empty render contains no flag at all and
+# would satisfy the absence check below silently.
+if grep -Eq '^\s*-\s*"?--hosted"?$' <<<"$_rd_args"; then
+  pass "the runtime-disabled render still carries the hub's arguments"
+else
+  fail "the args extraction found nothing in the runtime-disabled render - the absence check below proves nothing"
+fi
+if grep -Eq -- '--enable-runtime-broker' <<<"$_rd_args"; then
+  fail "runtime.enabled=false still renders --enable-runtime-broker"
+else
+  pass "runtime.enabled=false drops --enable-runtime-broker from the args"
+fi
+# The positive twin, against a permutation rendered with the default: the flag
+# is real and the absence above is the toggle's doing, not the extraction's.
+if grep -Eq -- '--enable-runtime-broker' "$WORK/minimal.yaml"; then
+  pass "the default render still passes --enable-runtime-broker"
+else
+  fail "the default render lost --enable-runtime-broker - the chart no longer starts the runtime broker anywhere"
+fi
+# RBAC travels with the toggle. Positive twin first, same reason as above.
+if grep -Eq '^kind: Role$' "$WORK/minimal.yaml"; then
+  pass "the default render creates the runtime RBAC"
+else
+  fail "the default render has no Role - the RBAC absence check below proves nothing"
+fi
+if grep -Eq '^kind: (Role|RoleBinding|ClusterRole|ClusterRoleBinding)$' "$WORK/runtime-disabled.yaml"; then
+  fail "runtime.enabled=false still renders runtime RBAC"
+else
+  pass "runtime.enabled=false renders no runtime RBAC"
+fi
+
+expect_render_failure \
+  "hub.args cannot re-enable the disabled runtime broker" \
+  "Set runtime.enabled: true instead" \
+  "${BASE[@]}" \
+  --set runtime.enabled=false \
+  --set 'hub.args[0]=--enable-runtime-broker'
 
 # --------------------------------------------------------------------------
 step "renders that must fail"

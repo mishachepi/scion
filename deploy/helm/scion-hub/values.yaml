@@ -320,6 +320,15 @@ rbac:
   agentNamespace: ""
 
 runtime:
+  # Whether the hub runs an in-cluster runtime broker that creates agent pods.
+  # false drops --enable-runtime-broker from the hub's arguments AND stops
+  # rendering the runtime RBAC (the Role/ClusterRole exist solely so that
+  # broker can create pods) - the two go together on purpose: a broker without
+  # the RBAC starts and can never launch an agent, and the RBAC without the
+  # broker is a standing grant nothing uses. Disable it when every runtime
+  # broker connects from outside the cluster and the hub is only the control
+  # plane. hub.args cannot re-enable it; this key is the one switch.
+  enabled: true
   # Namespace agent pods are created in. Defaults to the release namespace.
   namespace: ""
   # true renders a ClusterRole/ClusterRoleBinding instead of the namespaced

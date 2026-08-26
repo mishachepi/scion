@@ -1013,13 +1013,25 @@ way to override; names are handled by the exact-match reserved list instead.
     "server" "start"
     "--foreground"
     "--hosted"
-    "--enable-hub"
-    "--enable-runtime-broker"
+    "--enable-hub" }}
+{{- /*
+Conditional, and the matching $setByChart append lives beside the reservation
+lists below, inside the same condition, exactly as the invariant's block
+comment prescribes for a conditionally rendered flag. When runtime.enabled is
+false the flag is absent from BOTH, and hub.args still cannot smuggle it back
+in: a targeted guard in the hub.args walk refuses it by name, because a broker
+enabled behind the chart's back starts without the RBAC this value also
+removed and can never launch an agent.
+*/}}
+{{- if .Values.runtime.enabled }}
+{{- $args = append $args "--enable-runtime-broker" }}
+{{- end }}
+{{- $args = concat $args (list
     "--enable-web"
     "--web-port" (printf "%d" (int .Values.hub.webPort))
     "--host" "0.0.0.0"
     "--auto-provide"
-    "--global" }}
+    "--global") }}
 {{- /*
 Five lists, not one, because they are reserved for five different reasons and a
 flat list loses the reason. See the block comment above for why that matters:
@@ -1049,7 +1061,16 @@ Exactly one list is.
    Cross-references in these comments use the LIST VARIABLE NAME, never the list
    number. Numbers renumber; this comment was written while adding a fifth list.
 */}}
-{{- $setByChart := list "foreground" "hosted" "host" "web-port" "enable-hub" "enable-runtime-broker" "enable-web" "auto-provide" "global" }}
+{{- $setByChart := list "foreground" "hosted" "host" "web-port" "enable-hub" "enable-web" "auto-provide" "global" }}
+{{- /*
+Appended beside the conditional render above, inside the same condition - the
+invariant's own instruction for a conditionally rendered flag. When the flag is
+not rendered it is not listed, so both containments stay exact; the disabled
+case is guarded separately in the hub.args walk.
+*/}}
+{{- if .Values.runtime.enabled }}
+{{- $setByChart = append $setByChart "enable-runtime-broker" }}
+{{- end }}
 
 {{- /*
 2. NOTHING may pass these. Not the operator, and not a future phase of this
@@ -1600,6 +1621,16 @@ overlay on the other, and no single verb covers both.
 */}}
 {{- if hasPrefix "-" $arg }}
 {{- $flag := lower (trimPrefix "-" (trimPrefix "--" (first (splitList "=" $arg)))) }}
+{{- /*
+By name and not via $setByChart, because runtime.enabled=false removes the flag
+from that list - correctly, the chart no longer renders it - and removing it
+from the list is what would otherwise let hub.args pass it. A broker enabled
+this way starts without the RBAC that runtime.enabled=false also stopped
+rendering, reports Ready, and can never launch an agent.
+*/}}
+{{- if and (not $.Values.runtime.enabled) (eq $flag "enable-runtime-broker") }}
+{{- fail "hub.args may not contain -enable-runtime-broker: runtime.enabled is false, which also removes the runtime RBAC, so this flag would start a broker that cannot create pods and nothing would report why. Set runtime.enabled: true instead." }}
+{{- end }}
 {{- if has $flag $setByChart }}
 {{- fail (printf "hub.args may not contain -%s: the chart renders it, and pflag is last-wins, so this would silently replace the chart's value rather than conflict with it - disabling hosted mode, unbinding the listener, taking the daemon fork so PID 1 exits, leaving /readyz unregistered, or leaving the runtime broker off in a pod that still reports Ready and can never launch an agent." $flag) }}
 {{- end }}

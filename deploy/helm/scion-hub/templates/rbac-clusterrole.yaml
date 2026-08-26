@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */}}
-{{- if and .Values.rbac.create .Values.runtime.listAllNamespaces }}
+{{- if and .Values.rbac.create .Values.runtime.enabled .Values.runtime.listAllNamespaces }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
