@@ -704,13 +704,29 @@ instance that was not.
 */}}
 {{- define "scion-hub.updateStrategyType" -}}
 {{- $explicit := (.Values.updateStrategy | default dict).type | default "" }}
+{{- $resolved := "Recreate" }}
 {{- if $explicit }}
-{{- $explicit }}
+{{- $resolved = $explicit }}
 {{- else if gt (int .Values.replicaCount) 1 }}
-{{- "RollingUpdate" }}
-{{- else }}
-{{- "Recreate" }}
+{{- $resolved = "RollingUpdate" }}
 {{- end }}
+{{- /*
+Refused, not warned about, because both failure modes are silent until they
+are not. persistence backs scion-home with a ReadWriteOnce claim, and under
+RollingUpdate with maxUnavailable 0 the new pod must be Available before the
+old one dies - while the old one still holds the claim, so on a multi-node
+cluster the rollout deadlocks Pending. Where both pods do land on one node
+the claim mounts twice and the rollout proceeds - into something worse: two
+hubs writing one SQLite file through one WAL, which is the corruption the
+emptyDir reasoning below this field's values.yaml paragraph correctly says
+cannot happen WITHOUT a shared volume. persistence is exactly the shared
+volume arriving early, so the free choice this field otherwise offers ends
+where it starts.
+*/}}
+{{- if and (eq $resolved "RollingUpdate") .Values.persistence.enabled }}
+{{- fail "updateStrategy resolves to RollingUpdate while persistence.enabled is true. The PVC behind the hub's state directory is ReadWriteOnce, so the two-pod rollout window either deadlocks on the claim (multi-node) or has two hubs writing one SQLite file (same node). Use Recreate - with one replica it is also what the empty default resolves to." }}
+{{- end }}
+{{- $resolved }}
 {{- end }}
 
 {{/*

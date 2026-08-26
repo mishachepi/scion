@@ -96,6 +96,7 @@ PERMUTATIONS=(
   settings-oauth
   existing-secret
   varied
+  selfhost
 )
 
 # hub.home per permutation, held here rather than read out of the render.
@@ -117,6 +118,7 @@ declare -A HUB_HOME=(
   [settings-oauth]=/home/scion
   [existing-secret]=/home/scion
   [varied]=/srv/hub
+  [selfhost]=/home/scion
 )
 
 # Documents each permutation renders. A committed constant per values file, and
@@ -130,6 +132,11 @@ declare -A EXPECTED_DOCS=(
   [settings]=7
   [settings-oauth]=7
   [existing-secret]=6
+  # 10: the five always-rendered documents (Deployment, Service,
+  # ServiceAccount, env ConfigMap, settings Secret) - runtime.enabled=false
+  # removes the Role/RoleBinding pair - plus the data PVC, the HTTPRoute, the
+  # NetworkPolicy, and the backup pair (snapshot PVC + CronJob).
+  [selfhost]=10
   [varied]=7
 )
 
@@ -143,7 +150,7 @@ NO_RENDERED_SETTINGS=(existing-secret)
 # -ne, so it fails in BOTH directions: short means something was skipped, over
 # means an assertion was added without the number being committed in the diff.
 # Update it in the same commit that changes the count, deliberately.
-EXPECTED_TOTAL=307
+EXPECTED_TOTAL=328
 
 failures=0
 assertions=0
@@ -461,7 +468,15 @@ for name in "${PERMUTATIONS[@]}"; do
   # about what was checked. Skipped is asserted at 0 for the same reason one
   # layer down: a kind kubeconform has no schema for is a skip, not a failure,
   # the moment anyone adds --ignore-missing-schemas.
-  kcout="$("$KUBECONFORM" -strict -summary <"$WORK/$name.yaml" 2>&1 || true)"
+  # Two schema locations, not --ignore-missing-schemas. The selfhost
+  # permutation renders an HTTPRoute, a CRD kubeconform's default registry
+  # does not carry; the CRDs-catalog location supplies its real schema, so
+  # the route is VALIDATED rather than skipped - and Skipped stays asserted
+  # at 0, which is exactly the property the flag would have destroyed.
+  kcout="$("$KUBECONFORM" -strict -summary \
+    -schema-location default \
+    -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+    <"$WORK/$name.yaml" 2>&1 || true)"
   kcwant="Valid: ${EXPECTED_DOCS[$name]}, Invalid: 0, Errors: 0, Skipped: 0"
   if grep -qF "failed downloading schema" <<<"$kcout"; then
     # The preflight probe should have caught this. If it fires HERE the registry
@@ -1917,25 +1932,33 @@ for name in "${PERMUTATIONS[@]}"; do
   else
     fail "$name has ${#home_items[@]} scion-home list items, expected 2 (one volumeMount, one volume) - the read-only check below selects items by that name and passes vacuously against a rename"
   fi
-  # THE STATE DIRECTORY IS AN emptyDir, ASSERTED BECAUSE A COMMENT DEPENDS ON IT.
-  # values.yaml's updateStrategy paragraph used to say this chart "mounts no
-  # volumes, so replicas share no mutable state at all" and concluded that the
-  # strategy choice carries no data consequence. It mounts this one, and with no
-  # server.database.url the hub puts its SQLite file inside it
-  # (pkg/config/hub_config.go:691), so RollingUpdate's two-pod window has two
-  # divergent hub.db files. The corrected paragraph rests on this volume being an
-  # emptyDir; if Phase 4 makes it a PVC the paragraph changes again, and this is
-  # what will say so.
+  # THE STATE DIRECTORY IS AN emptyDir OR AN OPTED-IN PVC, AND WHICH ONE
+  # DECIDES WHAT ELSE MUST HOLD. values.yaml's updateStrategy paragraph used to
+  # say this chart "mounts no volumes, so replicas share no mutable state at
+  # all"; the corrected paragraph reasons from this volume being an emptyDir,
+  # and the persistence paragraph that joined it reasons from the PVC case
+  # being refused RollingUpdate at render time. So the assertion is a pair:
+  # an emptyDir permutation may run either strategy, a PVC permutation must
+  # render strategy Recreate - the refusal in scion-hub.updateStrategyType is
+  # what makes anything else unrenderable, and this is what will say so if
+  # that refusal is ever weakened.
   #
-  # CONTROL, 2026-08-17: the obvious mutation - edit emptyDir out of one golden -
-  # is caught by the golden-diff step first and never reaches here, so it proves
-  # nothing about THIS assertion. Mutating templates/deployment.yaml to render a
-  # persistentVolumeClaim and regenerating the goldens does reach it: 5 failures,
-  # one per permutation, 254/254 executed.
+  # CONTROL, 2026-08-17 (emptyDir arm): the obvious mutation - edit emptyDir
+  # out of one golden - is caught by the golden-diff step first and never
+  # reaches here, so it proves nothing about THIS assertion. Mutating
+  # templates/deployment.yaml to render a persistentVolumeClaim and
+  # regenerating the goldens does reach it: 5 failures, one per permutation,
+  # 254/254 executed.
   if [[ "${#home_items[@]}" -gt 0 ]] && printf '%s\n' "${home_items[@]}" | grep -qF 'emptyDir'; then
     pass "$name backs the hub's state directory with an emptyDir"
+  elif [[ "${#home_items[@]}" -gt 0 ]] && printf '%s\n' "${home_items[@]}" | grep -qF 'claimName'; then
+    if grep -qE '^    type: Recreate$' "$f"; then
+      pass "$name backs the hub's state directory with a PVC, under Recreate"
+    else
+      fail "$name backs the hub's state directory with a PVC but does not render strategy Recreate - the RollingUpdate refusal in scion-hub.updateStrategyType has been weakened, and a two-pod window over one ReadWriteOnce SQLite volume is a deadlock or a corruption"
+    fi
   else
-    fail "$name does not back the hub's state directory with an emptyDir. If that is deliberate, the updateStrategy paragraph in values.yaml and the same sentence in values.schema.json both reason from it and must be rewritten in this diff."
+    fail "$name backs the hub's state directory with neither an emptyDir nor a claim - the volume the updateStrategy reasoning stands on is gone"
   fi
   if [[ "${#home_items[@]}" -gt 0 ]] && printf '%s\n' "${home_items[@]}" | grep -qE 'readOnly: *true'; then
     fail "$name mounts the hub's state directory read-only; only settings.yaml may be read-only"
@@ -1948,7 +1971,19 @@ for name in "${PERMUTATIONS[@]}"; do
   else
     fail "$name does not mount settings.yaml read-only - the file is the one thing in that directory the hub may not write, and defaultMode 0444 alone does not stop a write by uid 0 or a rename by the owner"
   fi
-  if grep -qF 'fsGroup' "$f"; then
+  # fsGroup follows the volume, in both directions. On an emptyDir permutation
+  # it stays forbidden for the original reasons: pod-wide, grants every sidecar
+  # read access, and makes the kubelet recursively chown mounted volumes. On a
+  # PVC permutation it is REQUIRED, with OnRootMismatch confining that chown to
+  # the first mount of a fresh root-owned volume - without it the pod runs at a
+  # non-root uid against a volume it cannot write.
+  if printf '%s\n' "${home_items[@]}" | grep -qF 'claimName'; then
+    if grep -qF 'fsGroup:' "$f" && grep -qF 'fsGroupChangePolicy: OnRootMismatch' "$f"; then
+      pass "$name sets fsGroup with OnRootMismatch for its PVC"
+    else
+      fail "$name backs the state directory with a PVC but does not set fsGroup/OnRootMismatch - a fresh root-owned volume is unwritable at the pod's non-root uid"
+    fi
+  elif grep -qF 'fsGroup' "$f"; then
     fail "$name sets fsGroup: it is pod-wide, so it grants every sidecar read access, and it makes the kubelet recursively chown mounted volumes"
   else
     pass "$name sets no fsGroup"
@@ -2637,7 +2672,7 @@ _ps_bad="$(_pipe_unguarded "$_self" | wc -l || true)"
 #
 # So: bump this number in the diff that adds the assignment. That is the same
 # contract every other pinned count in this suite carries.
-PIPE_SITES_EXPECTED=37
+PIPE_SITES_EXPECTED=36
 if [[ "$_ps_total" -ne "$PIPE_SITES_EXPECTED" ]]; then
   meta_failure "the pipeline-assignment sweep found $_ps_total sites in $_self, pinned at $PIPE_SITES_EXPECTED. If you added an assignment-from-a-pipeline, give it a || fallback and bump PIPE_SITES_EXPECTED in the same diff. If you did not, the pattern has stopped matching and the zero below would mean nothing."
 else
@@ -3125,6 +3160,12 @@ if grep -qE '^kind: PersistentVolumeClaim$' "$WORK/persistence-existing.yaml"; t
 else
   pass "persistence.existingClaim renders no PVC of its own"
 fi
+expect_render_failure \
+  "persistence with RollingUpdate is refused" \
+  "two-pod rollout window" \
+  "${BASE[@]}" \
+  --set persistence.enabled=true \
+  --set-string updateStrategy.type=RollingUpdate
 _vol_existing="$(yaml_list_items "$WORK/persistence-existing.yaml" scion-home)"
 if grep -qF 'claimName: operator-owned-claim' <<<"$_vol_existing"; then
   pass "persistence.existingClaim backs scion-home with the named claim"

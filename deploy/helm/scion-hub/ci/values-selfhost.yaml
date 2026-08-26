@@ -1,0 +1,71 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# THE SELF-HOSTED SHAPE, AND UNLIKE values-varied.yaml THIS IS A DEPLOYMENT
+# SOMEBODY INSTALLS: a hub on a generic cluster - no NEG, no Cloud SQL, no
+# GCS - where the database is the sqlite file in the state directory, ingress
+# is a Gateway the operator already runs, and every runtime broker connects
+# from outside the cluster.
+#
+# It exists because each of the five toggles below defaults to off, so without
+# it none of their renders is in any golden: the PVC-backed scion-home with
+# its fsGroup, the deployment with no runtime broker and no RBAC, the
+# HTTPRoute with its baseUrl-derived hostname, the backup CronJob pair, and
+# the NetworkPolicy. Their per-toggle assertions live in hack/verify.sh; this
+# file is the one render where they all hold at once, which is the state the
+# self-hosted operator actually runs.
+
+hub:
+  hubId: ci-selfhost
+  name: CI Self-Hosted Hub
+  baseUrl: https://hub.selfhost.example.com
+
+image:
+  repository: registry.selfhost.example.com/scion-hub-gke
+  tag: ci
+
+# No in-cluster runtime: agents run on machines outside the cluster and their
+# brokers dial in. The deployment loses --enable-runtime-broker and the chart
+# renders no Role/RoleBinding - the two-fewer-documents count below is the
+# point, not a side effect.
+runtime:
+  enabled: false
+
+persistence:
+  enabled: true
+  annotations:
+    helm.sh/resource-policy: keep
+
+gateway:
+  enabled: true
+  parentRefs:
+    - name: main
+      namespace: gateway-system
+      sectionName: https
+  # No hostnames entry, deliberately: the golden must show the hostname
+  # derived from hub.baseUrl, because that derivation is the anti-drift
+  # property the gateway template exists to keep.
+
+backup:
+  enabled: true
+  image:
+    repository: registry.selfhost.example.com/sqlite
+    digest: sha256:1111111111111111111111111111111111111111111111111111111111111111
+
+networkPolicy:
+  enabled: true
+  ingressFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: gateway-system

@@ -93,6 +93,15 @@ updateStrategy:
   # database and a shared volume are exactly what they add - and the hub
   # coordinates concurrent instances through Postgres advisory locks when they do.
   #
+  # AND IT HAS ALREADY CHANGED ONCE, ON THE PERSISTENCE PATH: persistence.enabled
+  # replaces the emptyDir with a ReadWriteOnce claim, which is a shared volume
+  # with none of the advisory-lock coordination above. RollingUpdate's two-pod
+  # window then either deadlocks Pending on the claim (multi-node) or mounts it
+  # twice and has two hubs writing one SQLite file (same node) - so the chart
+  # REFUSES RollingUpdate while persistence is enabled rather than rendering
+  # either outcome. The paragraph above still holds verbatim for the emptyDir
+  # default it reasons from.
+  #
   # THE HOSTED HA PREFLIGHT IS A SEPARATE QUESTION AND IT DOES RUN. This
   # paragraph used to end "and the hub's hosted HA preflight does not run at any
   # replica count", which was true at Phase 0 and is false now: the preflight
