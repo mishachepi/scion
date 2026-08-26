@@ -264,6 +264,23 @@
         }
       }
     },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "description": "Ingress-only NetworkPolicy for the hub pod.",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "ingressFrom": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      }
+    },
     "backup": {
       "type": "object",
       "additionalProperties": false,

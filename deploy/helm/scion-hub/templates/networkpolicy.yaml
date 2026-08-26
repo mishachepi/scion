@@ -1,0 +1,55 @@
+{{/*
+Copyright 2026 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/}}
+{{- /*
+Ingress restriction for the hub pod: only the named sources reach the web
+port. The default source is the release's own namespace, which fits the NEG
+path (the load balancer health-checks and forwards from outside the policy's
+reach on most CNIs) poorly and a Gateway deployment well - a Gateway in
+another namespace needs an explicit networkPolicy.ingressFrom entry naming
+that namespace.
+
+Ingress ONLY, deliberately. An egress section was considered and rejected:
+the hub legitimately dials identity providers, container registries and
+whatever its integrations name, so any egress rule this chart could write
+would either break those or end in an allow-everything entry - and a policy
+that claims Egress and then allows everything is the appearance of a
+boundary, which is worse than stating none.
+*/}}
+{{- if .Values.networkPolicy.enabled -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "scion-hub.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "scion-hub.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "scion-hub.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        {{- if .Values.networkPolicy.ingressFrom }}
+        {{- toYaml .Values.networkPolicy.ingressFrom | nindent 8 }}
+        {{- else }}
+        - podSelector: {}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ int .Values.hub.webPort }}
+{{- end }}

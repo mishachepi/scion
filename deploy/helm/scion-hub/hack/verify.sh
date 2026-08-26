@@ -143,7 +143,7 @@ NO_RENDERED_SETTINGS=(existing-secret)
 # -ne, so it fails in BOTH directions: short means something was skipped, over
 # means an assertion was added without the number being committed in the diff.
 # Update it in the same commit that changes the count, deliberately.
-EXPECTED_TOTAL=303
+EXPECTED_TOTAL=307
 
 failures=0
 assertions=0
@@ -1563,6 +1563,7 @@ declare -A PROBE_MUTATION=(
   [gateway.hostnames]='--set|gateway.enabled=true|--set-string|gateway.parentRefs[0].name=probe-gw|--set-string|gateway.hostnames[0]=probe.example.com'
   [gateway.parentRefs]='--set|gateway.enabled=true|--set-string|gateway.parentRefs[0].name=probe-gw'
   [gateway.rules]='--set|gateway.enabled=true|--set-string|gateway.parentRefs[0].name=probe-gw|--set-string|gateway.rules[0].name=probe-rule'
+  [networkPolicy.ingressFrom]='--set|networkPolicy.enabled=true|--set-string|networkPolicy.ingressFrom[0].namespaceSelector.matchLabels.probe=x'
   [persistence.accessMode]='--set|persistence.enabled=true|--set-string|persistence.accessMode=ReadWriteMany'
   [persistence.annotations]='--set|persistence.enabled=true|--set-string|persistence.annotations.probe=x'
   [persistence.existingClaim]='--set|persistence.enabled=true|--set-string|persistence.existingClaim=probe-claim'
@@ -3191,6 +3192,52 @@ expect_render_failure \
   "${BASE[@]}" \
   --set persistence.enabled=true \
   --set backup.enabled=true
+
+# --------------------------------------------------------------------------
+step "networkPolicy"
+# --------------------------------------------------------------------------
+# Ingress-only restriction for the hub pod. Default false keeps every
+# permutation above policy-free.
+"$HELM" template "$RELEASE" "$CHART_DIR" \
+  --namespace "$NAMESPACE" \
+  "${BASE[@]}" \
+  --set networkPolicy.enabled=true > "$WORK/netpol-default.yaml"
+"$HELM" template "$RELEASE" "$CHART_DIR" \
+  --namespace "$NAMESPACE" \
+  "${BASE[@]}" \
+  --set networkPolicy.enabled=true \
+  --set-string 'networkPolicy.ingressFrom[0].namespaceSelector.matchLabels.kubernetes\.io/metadata\.name=probe-gw-ns' > "$WORK/netpol-from.yaml"
+
+if grep -qE '^kind: NetworkPolicy$' "$WORK/netpol-default.yaml" \
+   && grep -qF 'port: 8080' "$WORK/netpol-default.yaml" \
+   && grep -qF 'podSelector: {}' "$WORK/netpol-default.yaml"; then
+  pass "networkPolicy.enabled renders the ingress policy on the web port, same-namespace by default"
+else
+  fail "networkPolicy.enabled did not render the expected default policy - and the checks below prove nothing"
+fi
+if grep -qF 'probe-gw-ns' "$WORK/netpol-from.yaml" \
+   && ! grep -qF 'podSelector: {}' "$WORK/netpol-from.yaml"; then
+  pass "networkPolicy.ingressFrom replaces the default source"
+else
+  fail "networkPolicy.ingressFrom did not replace the same-namespace default"
+fi
+# Ingress only: an Egress claim beside an allow-everything rule is the
+# appearance of a boundary. The subject is the policy asserted above.
+if grep -qF -- '- Egress' "$WORK/netpol-default.yaml"; then
+  fail "the policy claims Egress - either it breaks the hub's outbound calls or it allows everything while claiming not to"
+else
+  pass "the policy claims Ingress only"
+fi
+# Subject guard via the Service, as for the other optional kinds.
+if grep -qE '^kind: Service$' "$WORK/minimal.yaml"; then
+  if grep -qE '^kind: NetworkPolicy$' "$WORK/minimal.yaml"; then
+    fail "the default render carries a NetworkPolicy - networkPolicy.enabled=false must render none"
+  else
+    pass "the default render carries no NetworkPolicy"
+  fi
+else
+  fail "the default render has no Service - the NetworkPolicy absence check proves nothing"
+fi
 
 # --------------------------------------------------------------------------
 step "renders that must fail"

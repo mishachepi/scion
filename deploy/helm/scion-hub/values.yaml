@@ -306,6 +306,24 @@ service:
   port: 80
   annotations: {}
 
+networkPolicy:
+  # Ingress restriction for the hub pod: only the sources below reach the web
+  # port. Ingress only - an egress rule here would either break the hub's
+  # legitimate outbound calls (identity providers, registries, integrations)
+  # or end in allow-everything, and a policy that claims Egress and allows
+  # everything is the appearance of a boundary.
+  enabled: false
+  # NetworkPolicyPeer entries allowed in. Empty allows the release's own
+  # namespace, which is rarely what a Gateway deployment wants - name the
+  # Gateway's namespace explicitly:
+  #
+  #   ingressFrom:
+  #     - namespaceSelector:
+  #         matchLabels:
+  #           kubernetes.io/metadata.name: envoy-gateway-system
+  #
+  ingressFrom: []
+
 backup:
   # Daily consistent snapshot of the sqlite hub.db into its own PVC, via
   # sqlite3's online .backup API (a cp of a live WAL-mode database misses
