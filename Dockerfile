@@ -27,7 +27,7 @@ COPY --from=frontend /web/dist/client web/dist/client
 RUN CGO_ENABLED=0 go build -o /scion ./cmd/scion/
 
 # Stage 3: Create a minimal runtime image
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim AS runtime
 WORKDIR /app
 
 # Install runtime dependencies used by the Hub broker and Cloud Run IAP exec path.
@@ -39,3 +39,28 @@ COPY --from=builder /scion /usr/local/bin/scion
 EXPOSE 8080
 
 ENTRYPOINT ["/usr/local/bin/scion"]
+
+# Stage 4: Hub image for the Kubernetes chart (deploy/helm/scion-hub).
+#
+# The chart's image contract (see the chart's values.yaml, image.repository):
+# non-root, uid 1000, web UI embedded, no baked KUBECONFIG. The web UI is
+# embedded because the builder stage compiles without the no_embed_web tag and
+# copies web/dist/client into the embed location. Nothing here writes a
+# kubeconfig; in-cluster the hub uses the pod's service account.
+#
+# uid/gid 1000 matches the chart's securityContext defaults
+# (hub.securityContext.runAsUser/runAsGroup), and a real passwd entry with a
+# home directory is required because the hub resolves its state directory from
+# the user's home (~/.scion) — the chart mounts its volumes there (hub.home).
+#
+#   docker build --target hub-gke -t <registry>/scion-hub-gke:<tag> .
+#
+# This stage is last, so a build without --target also produces it; the
+# root-running stage above remains reachable as --target runtime.
+FROM runtime AS hub-gke
+RUN useradd -m -d /home/scion -u 1000 scion \
+    && mkdir -p /home/scion/.scion \
+    && chown -R scion:scion /home/scion
+ENV HOME=/home/scion
+USER scion
+WORKDIR /home/scion
