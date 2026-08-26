@@ -264,6 +264,35 @@
         }
       }
     },
+    "persistence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "description": "PVC backing for the hub's state directory. Off by default: correct for the hosted deployment, required for a sqlite hub whose database lives in that directory.",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "existingClaim": {
+          "type": "string"
+        },
+        "storageClass": {
+          "type": "string"
+        },
+        "accessMode": {
+          "type": "string",
+          "enum": ["ReadWriteOnce", "ReadWriteOncePod", "ReadWriteMany", "ReadOnlyMany"]
+        },
+        "size": {
+          "type": "string",
+          "pattern": "^[0-9]+(\\.[0-9]+)?(Ei|Pi|Ti|Gi|Mi|Ki|E|P|T|G|M|k|m)?$",
+          "description": "A Kubernetes resource quantity."
+        },
+        "annotations": {
+          "type": "object"
+        }
+      }
+    },
     "serviceAccount": {
       "type": "object",
       "additionalProperties": false,

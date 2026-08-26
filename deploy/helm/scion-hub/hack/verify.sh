@@ -143,7 +143,7 @@ NO_RENDERED_SETTINGS=(existing-secret)
 # -ne, so it fails in BOTH directions: short means something was skipped, over
 # means an assertion was added without the number being committed in the diff.
 # Update it in the same commit that changes the count, deliberately.
-EXPECTED_TOTAL=284
+EXPECTED_TOTAL=292
 
 failures=0
 assertions=0
@@ -1550,6 +1550,11 @@ declare -A PROBE_MUTATION=(
   [image.pullPolicy]='--set-string|image.pullPolicy=Never'
   [image.pullSecrets]='--set-string|image.pullSecrets[0].name=probe-secret'
   [image.repository]='--set-string|image.repository=other.test/probe-img'
+  [persistence.accessMode]='--set|persistence.enabled=true|--set-string|persistence.accessMode=ReadWriteMany'
+  [persistence.annotations]='--set|persistence.enabled=true|--set-string|persistence.annotations.probe=x'
+  [persistence.existingClaim]='--set|persistence.enabled=true|--set-string|persistence.existingClaim=probe-claim'
+  [persistence.size]='--set|persistence.enabled=true|--set-string|persistence.size=9Gi'
+  [persistence.storageClass]='--set|persistence.enabled=true|--set-string|persistence.storageClass=probe-sc'
   [probes.liveness.failureThreshold]='--set|probes.liveness.enabled=true|--set|probes.liveness.failureThreshold=37'
   [probes.liveness.periodSeconds]='--set|probes.liveness.enabled=true|--set|probes.liveness.periodSeconds=37'
   [probes.liveness.timeoutSeconds]='--set|probes.liveness.enabled=true|--set|probes.liveness.timeoutSeconds=37'
@@ -2989,6 +2994,79 @@ expect_render_failure \
   "${BASE[@]}" \
   --set runtime.enabled=false \
   --set 'hub.args[0]=--enable-runtime-broker'
+
+# --------------------------------------------------------------------------
+step "persistence"
+# --------------------------------------------------------------------------
+# The PVC toggle for the hub's state directory. Default false preserves the
+# emptyDir renders every permutation above already covers; the checks here
+# cover both sides of the volume, the claim, and the fsGroup that travels with
+# the toggle.
+"$HELM" template "$RELEASE" "$CHART_DIR" \
+  --namespace "$NAMESPACE" \
+  "${BASE[@]}" \
+  --set persistence.enabled=true > "$WORK/persistence.yaml"
+"$HELM" template "$RELEASE" "$CHART_DIR" \
+  --namespace "$NAMESPACE" \
+  "${BASE[@]}" \
+  --set persistence.enabled=true \
+  --set persistence.existingClaim=operator-owned-claim > "$WORK/persistence-existing.yaml"
+
+# Positive first, and it doubles as the subject guard: an item that says
+# emptyDir exists, so the negatives below are not reading an empty file.
+_vol_default="$(yaml_list_items "$WORK/minimal.yaml" scion-home)"
+if grep -qF 'emptyDir:' <<<"$_vol_default"; then
+  pass "the default render backs scion-home with an emptyDir"
+else
+  fail "the default scion-home volume is not an emptyDir (got: ${_vol_default:-<no volume found>}) - and the PVC absence check below proves nothing"
+fi
+if grep -qE '^kind: PersistentVolumeClaim$' "$WORK/minimal.yaml"; then
+  fail "the default render creates a PVC - persistence.enabled=false must render none"
+else
+  pass "the default render creates no PVC"
+fi
+
+if grep -qE '^kind: PersistentVolumeClaim$' "$WORK/persistence.yaml" \
+   && grep -qE '^  name: .*-data$' "$WORK/persistence.yaml" \
+   && grep -qF 'storage: "5Gi"' "$WORK/persistence.yaml"; then
+  pass "persistence.enabled renders the data PVC with the requested size"
+else
+  fail "persistence.enabled did not render a -data PVC requesting 5Gi"
+fi
+_vol_pvc="$(yaml_list_items "$WORK/persistence.yaml" scion-home)"
+if grep -qE 'claimName: .*-data' <<<"$_vol_pvc"; then
+  pass "persistence.enabled backs scion-home with the rendered claim"
+else
+  fail "the persistent scion-home volume does not reference the rendered claim (got: ${_vol_pvc:-<no volume found>})"
+fi
+if grep -qF 'fsGroup:' "$WORK/persistence.yaml" \
+   && grep -qF 'fsGroupChangePolicy: OnRootMismatch' "$WORK/persistence.yaml"; then
+  pass "persistence.enabled sets fsGroup with OnRootMismatch"
+else
+  fail "persistence.enabled did not set fsGroup/OnRootMismatch - a fresh root-owned volume is unwritable at uid 1000"
+fi
+# Subject guard: the securityContext this negative reads is present.
+if grep -qF 'runAsNonRoot:' "$WORK/minimal.yaml"; then
+  if grep -qF 'fsGroup:' "$WORK/minimal.yaml"; then
+    fail "the default render sets fsGroup - the kubelet ownership walk must stay scoped to persistence"
+  else
+    pass "the default render sets no fsGroup"
+  fi
+else
+  fail "the default render has no securityContext - the fsGroup absence check proves nothing"
+fi
+
+if grep -qE '^kind: PersistentVolumeClaim$' "$WORK/persistence-existing.yaml"; then
+  fail "persistence.existingClaim still renders a chart-owned PVC beside the operator's claim"
+else
+  pass "persistence.existingClaim renders no PVC of its own"
+fi
+_vol_existing="$(yaml_list_items "$WORK/persistence-existing.yaml" scion-home)"
+if grep -qF 'claimName: operator-owned-claim' <<<"$_vol_existing"; then
+  pass "persistence.existingClaim backs scion-home with the named claim"
+else
+  fail "the scion-home volume does not reference the operator's claim (got: ${_vol_existing:-<no volume found>})"
+fi
 
 # --------------------------------------------------------------------------
 step "renders that must fail"

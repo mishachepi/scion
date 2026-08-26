@@ -155,6 +155,22 @@ spec:
         {{- include "scion-hub.nonRootSecurityContext" . | nindent 8 }}
         seccompProfile:
           type: RuntimeDefault
+        {{- /*
+        Scoped to persistence.enabled, and that scoping is the answer to the
+        settings-volume comment below that says not to add fsGroup: that
+        warning is about fixing the SETTINGS FILE's permissions with a
+        pod-wide group, and it stands - the file is 0444 and needs no group.
+        This is the other case: a freshly provisioned PersistentVolume is
+        root-owned, the pod runs as a non-root uid, and fsGroup is the
+        mechanism Kubernetes provides for making the volume writable.
+        OnRootMismatch confines the kubelet's recursive ownership walk - the
+        real hazard that comment names - to the first mount of a new volume;
+        an emptyDir deployment never renders this block at all.
+        */}}
+        {{- if .Values.persistence.enabled }}
+        fsGroup: {{ int .Values.hub.securityContext.runAsGroup }}
+        fsGroupChangePolicy: OnRootMismatch
+        {{- end }}
       containers:
         - name: hub
           image: {{ include "scion-hub.image" . | quote }}
@@ -246,10 +262,14 @@ spec:
             shortcut this shape exists to avoid - breaks the hub for reasons
             that have nothing to do with configuration.
 
-            emptyDir and not a PVC because none of it is data worth keeping. In
-            the hosted deployment the blob store is GCS, the database is Cloud
+            emptyDir by default because in the hosted deployment none of it is
+            data worth keeping: the blob store is GCS, the database is Cloud
             SQL and the workspace share is Filestore; what is left here is
-            scratch that is correct to lose with the pod.
+            scratch that is correct to lose with the pod. persistence.enabled
+            swaps the backing volume for a PVC, for the deployment where that
+            sentence is false: with the sqlite driver the database is hub.db
+            inside this directory, and losing it with the pod is losing the
+            hub's state on every restart. See values.yaml, persistence.
             */}}
             - name: scion-home
               mountPath: {{ include "scion-hub.scionDir" . | quote }}
@@ -273,7 +293,12 @@ spec:
               readOnly: true
       volumes:
         - name: scion-home
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ default (printf "%s-data" (include "scion-hub.fullname" .)) .Values.persistence.existingClaim }}
+          {{- else }}
           emptyDir: {}
+          {{- end }}
         - name: settings
           secret:
             secretName: {{ include "scion-hub.settingsSecretName" . }}
