@@ -402,7 +402,10 @@ persistence:
   # empty.
   #
   # Enabling this also sets fsGroup on the pod (see deployment.yaml for why
-  # that is scoped here and not unconditional).
+  # that is scoped here and not unconditional), and it pins the chart to one
+  # replica: the claim is ReadWriteOnce and holds a SQLite file, so both
+  # RollingUpdate and replicaCount above 1 are refused at render time rather
+  # than deadlocking on the claim or writing one database from two pods.
   enabled: false
   # Use a claim you manage instead of the one this chart renders. Only read
   # when enabled is true; when set, the chart renders no PVC of its own.

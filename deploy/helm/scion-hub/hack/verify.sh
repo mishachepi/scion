@@ -150,7 +150,7 @@ NO_RENDERED_SETTINGS=(existing-secret)
 # -ne, so it fails in BOTH directions: short means something was skipped, over
 # means an assertion was added without the number being committed in the diff.
 # Update it in the same commit that changes the count, deliberately.
-EXPECTED_TOTAL=328
+EXPECTED_TOTAL=329
 
 failures=0
 assertions=0
@@ -3166,6 +3166,16 @@ expect_render_failure \
   "${BASE[@]}" \
   --set persistence.enabled=true \
   --set-string updateStrategy.type=RollingUpdate
+# The steady-state twin: Recreate does not save a second REPLICA, only a
+# second rollout pod, and this input reached a rendered Deployment before the
+# guard existed.
+expect_render_failure \
+  "persistence above one replica is refused" \
+  "persistence.enabled requires replicaCount: 1" \
+  "${BASE[@]}" \
+  --set persistence.enabled=true \
+  --set replicaCount=2 \
+  --set-string updateStrategy.type=Recreate
 _vol_existing="$(yaml_list_items "$WORK/persistence-existing.yaml" scion-home)"
 if grep -qF 'claimName: operator-owned-claim' <<<"$_vol_existing"; then
   pass "persistence.existingClaim backs scion-home with the named claim"

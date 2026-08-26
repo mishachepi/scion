@@ -35,6 +35,19 @@ limitations under the License.
 {{- include "scion-hub.assertExtraEnv" . }}
 {{- include "scion-hub.assertHAUnlanded" . }}
 {{- /*
+Beside the strategy guard in scion-hub.updateStrategyType, and it closes the
+half that guard cannot see: the strategy guard refuses the two-pod ROLLOUT
+window over the persistent claim, but replicaCount above one is the same two
+pods as the STEADY STATE - Recreate or not - and reaches neither that guard
+nor assertHAUnlanded, which keys off the database configuration rather than
+the replica count. A ReadWriteOnce claim holding a SQLite file either
+deadlocks the second pod Pending (multi-node) or serves one database file to
+two writers (same node).
+*/}}
+{{- if and .Values.persistence.enabled (gt (int .Values.replicaCount) 1) }}
+{{- fail "persistence.enabled requires replicaCount: 1. The claim behind the state directory is ReadWriteOnce and holds a SQLite database, so a second replica either deadlocks Pending on the claim (multi-node) or writes the same database file concurrently (same node) - as the steady state, not a rollout window. Scale the hub only after the shared-database values (Cloud SQL/Filestore) land." }}
+{{- end }}
+{{- /*
 Called from here, and not only from the settings template, because the settings
 template is skipped entirely when config.existingSecret is set - which is the
 only case this assertion has anything to say about. The Deployment always
