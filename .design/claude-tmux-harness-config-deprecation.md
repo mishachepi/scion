@@ -88,7 +88,88 @@ decision**, not guessing at the fix.
    context, resume session-pinning) — that's the actual acceptance gate; this note is scoping
    only, not that test.
 
+## Decisions received (area-scion, 2026-08-26)
+
+- **Q1:** the sketch above *is* the design — trigger is `runtime_overlays.<name>` presence +
+  `RuntimeName` match, declarative opt-in at the YAML level, automatic at the operational level.
+  No per-harness-name branching in Go; generic merge mechanics only.
+- **Resume risk:** capability is injected *only* through the tmux overlay, never
+  unconditionally — and the merge must be **one shared function** called by both the agent launch
+  path and the hub's `harnessSupportsResume` (two independent merge paths is exactly the drift
+  class `c130918e` fixed).
+- **Q3 (backward-compat):** thin pointer-configs (`deprecated`, `harness: claude` redirect)
+  satisfy the no-downtime invariant for the transition window. Final fleet-template migration
+  (`.scion/templates/**`) is **orchestrator's lane**, not this task's — area-scion raises it
+  separately once the code is ready.
+- **Scope boundary:** code (fork) + pointer-configs + the DoD spawn-test are this task's scope.
+- Stale-comment fix: in scope, do it.
+
+## Implemented (this session, commit `e7a3fce3`)
+
+1. `HarnessConfigEntry.RuntimeOverlays map[string]*HarnessConfigEntry` (`pkg/config/settings_v1.go`).
+2. `harness.ResolveForRuntime(entry, runtimeName)` — the one shared merge path, built on an
+   extended `mergeHarnessConfigEntries` (was settings-overlay-only; now covers the full entry
+   field set: Provisioner/Command/Capabilities/Auth/NoAuthConfig/MCP replaced wholesale when the
+   overlay sets them, maps merged key-wise, scalars/slices replaced when non-empty).
+3. Wired into `harness.Resolve()` (`pkg/harness/resolve.go`), called from `pkg/agent/run.go`
+   (`m.Runtime.Name()` was already in scope there) — agent launch path.
+4. Wired into `pkg/hub/handlers_agent_lifecycle.go`'s `harnessSupportsResume` /
+   `installedHarnessCapabilities`, now taking `agent.Runtime` and resolving through the same
+   `ResolveForRuntime` — hub path.
+5. `pkg/agent/provision.go`'s `harness.Resolve()` call (skills-dir copy) intentionally left
+   without `RuntimeName` — no runtime is known at that provisioning stage yet; documented inline.
+6. Not build-verified locally (Mac local-build ban — I hit this mid-session, killed a `go build`
+   after it started downloading modules, no disk damage, but stopping the practice). `gofmt -l`
+   clean on all five touched files. **Needs the remote build/test channel before this is
+   considered gated**, same gap the epic's cadence cycles 4/5 already flagged for area-scion's
+   lane.
+
+## New finding — home-skeleton content is a second, separate gap (not yet solved)
+
+Diffing the **full directories**, not just `config.yaml` (`diff -rq claude/ claude-tmux/`)
+surfaces content the config.yaml overlay mechanism above does **not** touch, because
+`ProvisionAgent`'s file-copy steps (`pkg/agent/provision.go`, "Copy harness-config base home →
+agentHome") read `hcDir.Path/home/**` directly off disk — independent of the in-memory
+`HarnessConfigEntry` merge:
+
+- `claude-tmux/home/.claude/skills/README.md` — a default skill, **absent from `claude/home/`**.
+- `claude-tmux/home/.claude/settings.json` vs `claude/home/.claude/settings.json` — **not a
+  trivial diff**: claude-tmux's carries `outputStyle`, `enabledPlugins` (obsidian/qmd/playwright/
+  dotfiles), a tool `deny` list (13 entries — EnterPlanMode, SendMessage, PushNotification, etc.),
+  `disableBundledSkills`/`disableWorkflows`/`disableRemoteControl`/`disableClaudeAiConnectors`/
+  `disableArtifacts`, `skipDangerousModePermissionPrompt`, and a `statusLine` command — **none of
+  which exist in `claude/home/.claude/settings.json`**.
+- `claude/home/.bashrc` and `claude/home/.claude.json` exist only on the container side (make
+  sense — tmux runtime inherits the operator's real `$HOME`, doesn't need a container home
+  skeleton for those).
+- `claude/` also carries `provision.py` + `capture_auth.py` (container-script payloads) that
+  `claude-tmux` doesn't ship — harmless to leave in place (the merged `Provisioner.Type: builtin`
+  means `ContainerScriptHarness` never invokes them, confirmed by reading
+  `container_script_harness.go`'s builtin-type short-circuit), but worth a comment when the
+  directories consolidate so the next reader isn't confused why an unused script sits there.
+
+**Why this matters for "pointer-configs":** a thin `claude-tmux/config.yaml` that just says
+`harness: claude` (redirecting resolution to the `claude` directory) would silently drop the
+settings.json payload and the skills README for every tmux agent — a real behavioral regression,
+not a paper cut (the deny-list and disabled-features block in particular look like deliberate
+safety/scope choices for tmux-runtime agents specifically, not incidental drift).
+
+**Not deciding this myself** — two directions are visible and I don't know which the operator
+intends:
+(a) fold `claude-tmux/home/**` content into `claude/home/**` outright (on the theory that this is
+operator-preference config that should apply to every `claude` agent regardless of runtime, not a
+tmux-specific safety boundary), or
+(b) make `ProvisionAgent`'s home-copy step runtime-aware too — copy a `home/` overlay directory
+analogous to `runtime_overlays.tmux` in config.yaml (e.g. `runtime_overlays/tmux/home/**`) on top
+of the base `home/`, mirroring the config.yaml mechanism instead of collapsing content into one
+shared skeleton.
+(b) keeps parity with the "declarative, additive, opt-in" shape of the config.yaml change; (a) is
+simpler but changes behavior for every container-mode claude agent, which nobody asked for and
+which I have no evidence is intended.
+
 ## Next step
 
-Park here pending a decision on Q1 (auto vs. opt-in overlay) — that decision shapes the schema
-change, which shapes everything downstream. Task left `In Progress`, not started on code.
+Blocked on a decision for the home-skeleton question above before writing the pointer-configs —
+writing them without resolving this would ship a silent regression (missing skills + settings
+for tmux agents). Core config.yaml mechanism (schema + shared merge + hub wiring) is done and
+committed; this is the one remaining design question before the pointer-config + spawn-test steps.
