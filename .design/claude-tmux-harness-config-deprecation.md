@@ -167,9 +167,73 @@ shared skeleton.
 simpler but changes behavior for every container-mode claude agent, which nobody asked for and
 which I have no evidence is intended.
 
+## Decision received (area-scion, 2026-08-26, second round) + a correction to my own premise
+
+- My "deny-list only exists in claude-tmux" claim was wrong — checked only M5's installed copy.
+  area-scion checked M1 directly: the mesh-hardening block (deny-list, disable-flags, hooks,
+  `includeCoAuthoredBy`/`gitAttribution`) **is** in M1's installed `claude/home/` already. M5's
+  install had drifted (fleet-upgrade-plan gap #10, tracked separately, not this task).
+- Split decided: runtime-agnostic mesh-hardening → base `claude/home/` (canon = M1/newer). Tmux
+  host-specifics (`statusLine`, `enabledPlugins`, `outputStyle`, `tui: fullscreen`,
+  `skipDangerousModePermissionPrompt`, harness-level `skills/`) → `home-overlays/tmux/`, my
+  option (b), copied by `ProvisionAgent` on top of base when runtime matches — implemented, see
+  below. `settings.json` needs a real shallow JSON merge, not file-overwrite — implemented.
+
+## Re-grounded on the repo, not the installed configs (important correction)
+
+Everything above this point in the doc was diffed against **installed** `~/.scion/harness-configs/`
+on M5 — I hadn't checked whether `harnesses/claude/` in the **repo** (the actual
+upstream-contributable source, and what `home-overlays/tmux/` needs to be added to) matches. It
+doesn't — the repo is *further ahead* than either machine's install:
+
+- Repo `harnesses/claude/config.yaml` **already has** `resume_id_flag`, `capabilities.resume:
+  yes`, `auth.types.manual: {}`, and `command.base` using `--permission-mode bypassPermissions`
+  (not `--dangerously-skip-permissions`) — all things I thought were claude-tmux-only. Someone
+  already moved these into the fork's base `claude` ahead of this task.
+- Repo `harnesses/claude/home/.claude/settings.json` **already has** the full mesh-hardening
+  block (deny-list, disable-flags, hooks, `includeCoAuthoredBy`/`gitAttribution`) — matches what
+  area-scion confirmed on M1. Base is already correct; nothing to move here.
+- **True residual** (repo `claude` vs installed `claude-tmux`, clean diff, hooks-formatting noise
+  excluded): `outputStyle: "Assistant General"`, `enabledPlugins` (`obsidian@obsidian-skills`,
+  `qmd@qmd`, `playwright@claude-plugins-official`, `mch@dotfiles`),
+  `skipDangerousModePermissionPrompt: true`, `statusLine: {type: command, command:
+  "~/.claude/statusline.sh"}`, `tui: "fullscreen"`. `statusline.sh` itself is **not** shipped by
+  any harness-config — `~/.claude/statusline.sh` on the operator's real machine is a symlink into
+  their own dotfiles; the setting is just a path reference, nothing to copy.
+- `claude-tmux/home/.claude/skills/README.md` is documentation only (explains an empty
+  `skills/` directory convention) — no actual skill content, trivial to carry over as-is.
+- Remaining `provisioner`/`auth.default_type`/`env.CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD`
+  diffs from the original table still stand and are genuinely runtime-mechanical.
+
+**One more split I'm flagging rather than deciding:** of that residual settings.json list,
+`statusLine`/`tui: fullscreen`/`skipDangerousModePermissionPrompt` are runtime-mechanical (tmux
+agents own a real terminal, unlike containers — generic, upstream-clean). `outputStyle` and
+`enabledPlugins` name *this operator's* personal plugin ecosystem (`mch@dotfiles`,
+`obsidian@obsidian-skills`) — shipping those in `harnesses/claude/home-overlays/tmux/` would put
+personal config into the upstream-submittable fork source. My proposal: ship only the three
+mechanical keys in the repo overlay; `outputStyle`/`enabledPlugins` stay something the operator
+sets on their own *installed* config post-install (same tier as any other personal Claude Code
+preference), not fork-shipped. Proceeding on this reading unless told otherwise — it's a narrow,
+reversible call (one overlay JSON file) and blocking a `не срочно` task on it a third time doesn't
+pay for itself.
+
+## Implemented (continued)
+
+7. `api.ContextWithRuntimeName` / `RuntimeNameFromContext` (`pkg/api/types.go`) — threads the
+   resolved runtime name into `ProvisionAgent` via context (not a new positional parameter;
+   `GetAgent`/`ProvisionAgent` have 50+ existing positional test call sites, a context key needs
+   zero test changes since unset = "" = no-op).
+8. `applyRuntimeHomeOverlay` + `mergeJSONFileShallow` (`pkg/agent/provision.go`) — copies
+   `home-overlays/<runtime>/` onto the agent home between the base-home copy and the
+   template-home copy; `.json` files present in both get a shallow top-level-key merge instead of
+   an overwrite.
+9. Corrected an inaccurate comment from the previous commit ("no runtime known at
+   ProvisionAgent's point") — `Start()`/`Provision()` both have `m.Runtime` in scope before
+   calling `GetAgent`; I'd only checked `ProvisionAgent`'s own local scope, not its callers.
+
 ## Next step
 
-Blocked on a decision for the home-skeleton question above before writing the pointer-configs —
-writing them without resolving this would ship a silent regression (missing skills + settings
-for tmux agents). Core config.yaml mechanism (schema + shared merge + hub wiring) is done and
-committed; this is the one remaining design question before the pointer-config + spawn-test steps.
+Write `runtime_overlays.tmux` into `harnesses/claude/config.yaml` and
+`harnesses/claude/home-overlays/tmux/home/.claude/{settings.json,skills/README.md}` in the repo,
+deprecate-mark the installed `claude-tmux`/`claude-tmux-skills` as pointer configs, then the DoD
+spawn-test on M1+M5.
