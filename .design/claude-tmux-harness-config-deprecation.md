@@ -231,9 +231,37 @@ pay for itself.
    ProvisionAgent's point") — `Start()`/`Provision()` both have `m.Runtime` in scope before
    calling `GetAgent`; I'd only checked `ProvisionAgent`'s own local scope, not its callers.
 
-## Next step
+## Implemented (continued, commit `8376541a`)
 
-Write `runtime_overlays.tmux` into `harnesses/claude/config.yaml` and
-`harnesses/claude/home-overlays/tmux/home/.claude/{settings.json,skills/README.md}` in the repo,
-deprecate-mark the installed `claude-tmux`/`claude-tmux-skills` as pointer configs, then the DoD
-spawn-test on M1+M5.
+10. `runtime_overlays.tmux` written into the repo's `harnesses/claude/config.yaml`: provisioner→
+    builtin, `env.CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1` (the one genuinely-missing env
+    key — command/base args needed no overlay, base config.yaml already converged), a matching
+    `capabilities` block, and `auth` restricted to manual/api-key. YAML validated (isolated venv,
+    pyyaml — no repo/system dependency added; can't run `go build` locally to validate via the
+    real parser).
+11. `harnesses/claude/home-overlays/tmux/home/.claude/settings.json` — the three mechanical
+    residual keys (`statusLine`, `tui`, `skipDangerousModePermissionPrompt`). Deliberately
+    excludes `outputStyle`/`enabledPlugins` (operator-personal, see decision below).
+12. `harnesses/claude/home-overlays/tmux/home/.claude/skills/README.md` — carried over from the
+    installed claude-tmux copy, reworded off the "claude-tmux" name onto "claude (tmux runtime)".
+13. Needed `git add -f` for the new `home-overlays/**/.claude/` paths — a repo-wide `.claude/`
+    gitignore rule matches them; the pre-existing base `harnesses/claude/home/.claude/` predates
+    that rule and stayed tracked regardless.
+
+## What's left (blocked on infrastructure I don't own, not a design question)
+
+- **Pointer-configs** for the *installed* `claude-tmux`/`claude-tmux-skills` on M1/M5 — these
+  never existed in the repo (confirmed: no `harnesses/claude-tmux/` at any point), so there is
+  nothing to deprecate in-repo. This is an operational step against each machine's
+  `~/.scion/harness-configs/`, not a commit.
+- **Remote build** — none of the code above is compiled or tested; local `go build` is banned on
+  this Mac (disk incident) and I have no vm3/CI access of my own from the M5 agent environment.
+  Needs the remote build channel (`scion-vm3-build.sh` or fork CI) before any of this can be
+  trusted, same gate every cadence cycle in this epic has needed.
+- **DoD spawn-test on M1+M5** depends on both of the above: the installed `claude/` config needs
+  the new `config.yaml`/`home-overlays/` content, and the binary running needs to actually be
+  built from this branch — testing against the currently-installed stale binaries would validate
+  nothing.
+
+Reported to area-scion; task stays `In Progress` pending the build channel and a
+go/no-go on the outputStyle/enabledPlugins exclusion.
