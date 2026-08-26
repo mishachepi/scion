@@ -306,6 +306,33 @@ service:
   port: 80
   annotations: {}
 
+gateway:
+  # Whether to render a Gateway API HTTPRoute for the hub's Service. The
+  # ingress path this chart originally targeted is container-native load
+  # balancing through a network endpoint group, which needs no route object;
+  # this is the path for every other cluster, where a Gateway (Envoy Gateway,
+  # Istio, anything conformant) already terminates TLS and routes by hostname.
+  # The Service stays ClusterIP in both cases.
+  enabled: false
+  # REQUIRED when enabled, and deliberately without a default: the Gateway's
+  # name and namespace are cluster facts this chart cannot guess, and a route
+  # with no parent attaches to nothing without an error reaching anyone.
+  # Each entry: name, and optionally namespace, kind, group, sectionName, port.
+  #
+  #   parentRefs:
+  #     - name: main
+  #       namespace: envoy-gateway-system
+  #       sectionName: https
+  #
+  parentRefs: []
+  # Hostnames the route answers. Empty derives the one hostname that cannot
+  # drift: the host of hub.baseUrl - the URL the hub announces itself at is
+  # the URL the route should serve. Set this only for extra names.
+  hostnames: []
+  # Override the routing rules entirely. Empty renders the sensible default:
+  # PathPrefix / to the chart's Service on service.port.
+  rules: []
+
 persistence:
   # Whether the hub's state directory (~/.scion) is backed by a
   # PersistentVolumeClaim instead of an emptyDir.

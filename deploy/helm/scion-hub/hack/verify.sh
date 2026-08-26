@@ -143,7 +143,7 @@ NO_RENDERED_SETTINGS=(existing-secret)
 # -ne, so it fails in BOTH directions: short means something was skipped, over
 # means an assertion was added without the number being committed in the diff.
 # Update it in the same commit that changes the count, deliberately.
-EXPECTED_TOTAL=292
+EXPECTED_TOTAL=297
 
 failures=0
 assertions=0
@@ -1550,6 +1550,10 @@ declare -A PROBE_MUTATION=(
   [image.pullPolicy]='--set-string|image.pullPolicy=Never'
   [image.pullSecrets]='--set-string|image.pullSecrets[0].name=probe-secret'
   [image.repository]='--set-string|image.repository=other.test/probe-img'
+  [gateway.enabled]='--set|gateway.enabled=true|--set-string|gateway.parentRefs[0].name=probe-gw'
+  [gateway.hostnames]='--set|gateway.enabled=true|--set-string|gateway.parentRefs[0].name=probe-gw|--set-string|gateway.hostnames[0]=probe.example.com'
+  [gateway.parentRefs]='--set|gateway.enabled=true|--set-string|gateway.parentRefs[0].name=probe-gw'
+  [gateway.rules]='--set|gateway.enabled=true|--set-string|gateway.parentRefs[0].name=probe-gw|--set-string|gateway.rules[0].name=probe-rule'
   [persistence.accessMode]='--set|persistence.enabled=true|--set-string|persistence.accessMode=ReadWriteMany'
   [persistence.annotations]='--set|persistence.enabled=true|--set-string|persistence.annotations.probe=x'
   [persistence.existingClaim]='--set|persistence.enabled=true|--set-string|persistence.existingClaim=probe-claim'
@@ -2994,6 +2998,56 @@ expect_render_failure \
   "${BASE[@]}" \
   --set runtime.enabled=false \
   --set 'hub.args[0]=--enable-runtime-broker'
+
+# --------------------------------------------------------------------------
+step "gateway"
+# --------------------------------------------------------------------------
+# The Gateway API ingress path. Default false keeps every permutation above
+# route-free; the checks here cover the enabled render, the hostname
+# derivation from hub.baseUrl, and the refusal to render a parentless route.
+"$HELM" template "$RELEASE" "$CHART_DIR" \
+  --namespace "$NAMESPACE" \
+  "${BASE[@]}" \
+  --set gateway.enabled=true \
+  --set-string 'gateway.parentRefs[0].name=probe-gw' \
+  --set-string 'gateway.parentRefs[0].namespace=gw-ns' > "$WORK/gateway.yaml"
+
+if grep -qE '^kind: HTTPRoute$' "$WORK/gateway.yaml" \
+   && grep -qF 'name: "probe-gw"' "$WORK/gateway.yaml" \
+   && grep -qF 'namespace: "gw-ns"' "$WORK/gateway.yaml"; then
+  pass "gateway.enabled renders an HTTPRoute bound to the named Gateway"
+else
+  fail "gateway.enabled did not render an HTTPRoute carrying the parentRef - and the checks below prove nothing"
+fi
+# BASE sets hub.baseUrl=https://neg.example.com, so the derived hostname is
+# its host - asserted against that INDEPENDENT source, not against a hostname
+# this render was also given.
+if grep -qF -- '- "neg.example.com"' "$WORK/gateway.yaml"; then
+  pass "the route's hostname is derived from hub.baseUrl"
+else
+  fail "the route does not serve hub.baseUrl's host - the one hostname that must not drift"
+fi
+if grep -qF 'value: /' "$WORK/gateway.yaml" && grep -qF 'port: 80' "$WORK/gateway.yaml"; then
+  pass "the default rule routes PathPrefix / to the Service on service.port"
+else
+  fail "the default rule does not route / to the chart's Service port"
+fi
+# Subject guard for the negative: the default render exists and has manifests.
+if grep -qE '^kind: Service$' "$WORK/minimal.yaml"; then
+  if grep -qE '^kind: HTTPRoute$' "$WORK/minimal.yaml"; then
+    fail "the default render carries an HTTPRoute - gateway.enabled=false must render none"
+  else
+    pass "the default render carries no HTTPRoute"
+  fi
+else
+  fail "the default render has no Service - the HTTPRoute absence check proves nothing"
+fi
+
+expect_render_failure \
+  "gateway.enabled without parentRefs is refused" \
+  "gateway.parentRefs is empty" \
+  "${BASE[@]}" \
+  --set gateway.enabled=true
 
 # --------------------------------------------------------------------------
 step "persistence"

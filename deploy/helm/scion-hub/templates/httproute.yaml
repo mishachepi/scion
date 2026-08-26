@@ -1,0 +1,83 @@
+{{/*
+Copyright 2026 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/}}
+{{- /*
+The Gateway API ingress path, for clusters that are not fronted by a network
+endpoint group. The Service stays ClusterIP either way - see values.yaml,
+service - and this route binds it to a Gateway the operator already runs.
+
+parentRefs has no default because a Gateway's name and namespace are cluster
+facts this chart cannot know, and an HTTPRoute with no parent attaches to
+nothing without an error reaching the operator.
+
+hostnames DOES have a default, derived from hub.baseUrl: the external URL the
+hub is reached at is already a required value, and a route serving a hostname
+other than the one the hub announces is drift between two spellings of the
+same fact. Set gateway.hostnames only when the route must answer names beyond
+the base URL's host.
+*/}}
+{{- if .Values.gateway.enabled -}}
+{{- if not .Values.gateway.parentRefs -}}
+{{- fail "gateway.enabled is true but gateway.parentRefs is empty. An HTTPRoute with no parentRefs attaches to no Gateway and serves nothing, silently - name the Gateway (and its namespace when it is not the release's) that should carry this route." -}}
+{{- end -}}
+{{- $derivedHost := first (splitList ":" (first (splitList "/" (trimPrefix "https://" .Values.hub.baseUrl)))) -}}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ include "scion-hub.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "scion-hub.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    {{- range .Values.gateway.parentRefs }}
+    - name: {{ .name | quote }}
+      {{- with .namespace }}
+      namespace: {{ . | quote }}
+      {{- end }}
+      {{- with .kind }}
+      kind: {{ . | quote }}
+      {{- end }}
+      {{- with .group }}
+      group: {{ . | quote }}
+      {{- end }}
+      {{- with .sectionName }}
+      sectionName: {{ . | quote }}
+      {{- end }}
+      {{- with .port }}
+      port: {{ int . }}
+      {{- end }}
+    {{- end }}
+  hostnames:
+    {{- if .Values.gateway.hostnames }}
+    {{- range .Values.gateway.hostnames }}
+    - {{ . | quote }}
+    {{- end }}
+    {{- else }}
+    - {{ $derivedHost | quote }}
+    {{- end }}
+  rules:
+    {{- if .Values.gateway.rules }}
+    {{- toYaml .Values.gateway.rules | nindent 4 }}
+    {{- else }}
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: {{ include "scion-hub.fullname" . }}
+          port: {{ int .Values.service.port }}
+    {{- end }}
+{{- end }}
