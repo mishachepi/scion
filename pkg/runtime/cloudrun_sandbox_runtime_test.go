@@ -938,7 +938,7 @@ func (h *mockHarness) Name() string { return "mock" }
 func (h *mockHarness) AdvancedCapabilities() api.HarnessAdvancedCapabilities {
 	return api.HarnessAdvancedCapabilities{}
 }
-func (h *mockHarness) GetCommand(task string, resume bool, baseArgs []string) []string {
+func (h *mockHarness) GetCommand(task string, resume bool, sessionID string, baseArgs []string) []string {
 	return h.command
 }
 func (h *mockHarness) GetEnv(agentName, agentHome, unixUsername string) map[string]string {
