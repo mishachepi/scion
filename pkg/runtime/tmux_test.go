@@ -1265,3 +1265,129 @@ func TestTmuxRuntime_RunPreStartScript_SkippedInSystemMode(t *testing.T) {
 		t.Errorf("stderr should warn about skipped script; got %q", stderr)
 	}
 }
+
+// fakeTmuxPanePID: list-windows returns "@5"; show-option resolves the agent
+// pane to "%7"; display-message returns the supplied pane_pid.
+func fakeTmuxPanePID(t *testing.T, tmpDir, logPath, pid string) string {
+	t.Helper()
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "` + logPath + `"
+case "$1" in
+  list-windows)    printf '@5\n'; exit 0 ;;
+  show-option)     printf '%%7\n'; exit 0 ;;
+  display-message) printf '%s\n' '` + pid + `'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`
+	path := filepath.Join(tmpDir, "fake-tmux-panepid")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake-tmux-panepid: %v", err)
+	}
+	return path
+}
+
+// stubKillAndPS puts fake `kill` and `ps` binaries at the front of PATH. kill
+// appends its arguments to killLog; ps reports psComm as the process name.
+func stubKillAndPS(t *testing.T, tmpDir, killLog, psComm string) {
+	t.Helper()
+	binDir := filepath.Join(tmpDir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	kill := `#!/bin/sh
+printf '%s\n' "$*" >> "` + killLog + `"
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(binDir, "kill"), []byte(kill), 0o755); err != nil {
+		t.Fatalf("write fake kill: %v", err)
+	}
+	ps := `#!/bin/sh
+printf '%s\n' '` + psComm + `'
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(binDir, "ps"), []byte(ps), 0o755); err != nil {
+		t.Fatalf("write fake ps: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// The container-shaped `kill -USR2 1` signals the broker host's init under a
+// host-execution runtime. SignalInit must address the pane's real PID instead.
+func TestTmuxRuntime_SignalInit_TargetsPanePIDNotOne(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmuxLog := filepath.Join(tmpDir, "tmux.log")
+	killLog := filepath.Join(tmpDir, "kill.log")
+	stubKillAndPS(t, tmpDir, killLog, "/usr/local/bin/sciontool")
+
+	r := &TmuxRuntime{
+		Command:   fakeTmuxPanePID(t, tmpDir, tmuxLog, "4242"),
+		Session:   "scion",
+		Sciontool: "/usr/local/bin/sciontool",
+	}
+
+	if err := r.SignalInit(context.Background(), "scion:@5", "USR2"); err != nil {
+		t.Fatalf("SignalInit: %v", err)
+	}
+
+	got := strings.TrimSpace(readLog(t, killLog))
+	if got != "-USR2 4242" {
+		t.Errorf("kill invoked with %q, want %q", got, "-USR2 4242")
+	}
+	if strings.HasSuffix(got, " 1") {
+		t.Errorf("signal addressed PID 1 (the broker host's init), not the agent: %q", got)
+	}
+	if tl := readLog(t, tmuxLog); !strings.Contains(tl, "#{pane_pid}") {
+		t.Errorf("pane_pid was never resolved from tmux; log: %s", tl)
+	}
+}
+
+// An unwrapped pane runs the bare harness, and SIGUSR2's default disposition
+// terminates it — SignalInit must refuse rather than kill the agent.
+func TestTmuxRuntime_SignalInit_RefusesNonSciontoolPane(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmuxLog := filepath.Join(tmpDir, "tmux.log")
+	killLog := filepath.Join(tmpDir, "kill.log")
+	stubKillAndPS(t, tmpDir, killLog, "claude")
+
+	r := &TmuxRuntime{
+		Command:   fakeTmuxPanePID(t, tmpDir, tmuxLog, "4242"),
+		Session:   "scion",
+		Sciontool: "/usr/local/bin/sciontool",
+	}
+
+	err := r.SignalInit(context.Background(), "scion:@5", "USR2")
+	if err == nil {
+		t.Fatal("SignalInit should refuse to signal a pane whose root process is not sciontool")
+	}
+	if !strings.Contains(err.Error(), "refusing to signal") {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if _, statErr := os.Stat(killLog); statErr == nil {
+		t.Errorf("kill was invoked despite the refusal: %q", readLog(t, killLog))
+	}
+}
+
+func TestTmuxRuntime_SignalInit_RequiresSciontoolWrapper(t *testing.T) {
+	tmpDir := t.TempDir()
+	r := &TmuxRuntime{
+		Command: fakeTmuxPanePID(t, tmpDir, filepath.Join(tmpDir, "tmux.log"), "4242"),
+		Session: "scion",
+	}
+
+	err := r.SignalInit(context.Background(), "scion:@5", "USR2")
+	if err == nil || !strings.Contains(err.Error(), "not wrapped in sciontool") {
+		t.Fatalf("SignalInit without a sciontool wrapper: got %v, want a refusal", err)
+	}
+}
+
+func TestTmuxRuntime_PanePID_RejectsNonNumeric(t *testing.T) {
+	tmpDir := t.TempDir()
+	r := &TmuxRuntime{
+		Command: fakeTmuxPanePID(t, tmpDir, filepath.Join(tmpDir, "tmux.log"), "not-a-pid"),
+		Session: "scion",
+	}
+
+	if _, err := r.panePID(context.Background(), "scion:@5"); err == nil {
+		t.Fatal("panePID must reject a non-numeric pane_pid rather than pass it to kill")
+	}
+}
