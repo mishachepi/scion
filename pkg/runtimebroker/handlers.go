@@ -4819,7 +4819,7 @@ func (s *Server) resetAuth(w http.ResponseWriter, r *http.Request, id, projectID
 	// is expected and not an error since the token is on disk.
 	signalCmd := []string{"kill", "-USR2", "1"}
 	signaled := true
-	if _, err := rt.Exec(ctx, target, signalCmd); err != nil {
+	if err := signalAgentInit(ctx, rt, target, signalCmd); err != nil {
 		signaled = false
 		s.agentLifecycleLog.Warn("reset-auth: failed to signal PID 1 (token still written, poller will reload)", "agent_id", id, "error", err)
 	}
