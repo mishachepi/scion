@@ -208,7 +208,14 @@ func runInit(args []string) int {
 			// Continue anyway - telemetry failure shouldn't block agent
 		} else {
 			telemetryPipeline = pipeline
-			log.Info("Telemetry pipeline started")
+			// The receiver may have landed on a different port than the
+			// configured one (another agent on this host holds it). sciontool
+			// is the harness's parent process, so pointing the inherited
+			// environment at the port actually bound is all it takes to keep
+			// the harness and its receiver paired.
+			telemetry.AlignHarnessOTLPEndpoint(pipeline)
+			log.Info("Telemetry pipeline started (OTLP gRPC :%d, HTTP :%d)",
+				pipeline.GRPCPort(), pipeline.HTTPPort())
 			defer func() {
 				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				if err := telemetryPipeline.Stop(shutdownCtx); err != nil {
