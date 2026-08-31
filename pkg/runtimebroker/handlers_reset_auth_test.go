@@ -55,8 +55,8 @@ func doResetAuth(t *testing.T, srv *Server, token string) *httptest.ResponseReco
 
 // TestResetAuth_SignalFailureStillReturns200 verifies that when the SIGUSR2
 // signal to PID 1 fails (e.g. EPERM in rootless containers), the handler still
-// returns 200 OK because the token was successfully written — the agent's
-// file poller will pick it up within seconds.
+// returns 200 OK because the token was successfully written — the agent adopts
+// the on-disk token on its next auth failure.
 func TestResetAuth_SignalFailureStillReturns200(t *testing.T) {
 	mgr := resetAuthAgents()
 
@@ -159,5 +159,74 @@ func TestTokenDirExpr_ResolvesHomeFirst(t *testing.T) {
 	// HOME-first branch above is what production host execution relies on.
 	if got := run([]string{}); got == "/agents/core/home/.scion" {
 		t.Errorf("without HOME the agent home must not leak into TOKEN_DIR, got %q", got)
+	}
+}
+
+// signalingMockRuntime is a runtime that knows how to reach its agent's init
+// process directly — the shape host-execution runtimes (tmux) implement.
+type signalingMockRuntime struct {
+	*scionrt.MockRuntime
+	gotSignal string
+	gotTarget string
+	err       error
+}
+
+func (r *signalingMockRuntime) SignalInit(_ context.Context, id, signal string) error {
+	r.gotTarget = id
+	r.gotSignal = signal
+	return r.err
+}
+
+// A host-execution runtime must not be sent `kill -USR2 1`: its Exec runs on
+// the broker host, where PID 1 is the host's own init. reset-auth has to
+// delegate the signal to the runtime instead.
+func TestResetAuth_HostExecutionRuntimeSignalsInitDirectly(t *testing.T) {
+	mgr := resetAuthAgents()
+
+	rt := &signalingMockRuntime{MockRuntime: &scionrt.MockRuntime{
+		NameFunc: func() string { return "tmux" },
+		ExecFunc: func(_ context.Context, _ string, cmd []string) (string, error) {
+			if len(cmd) > 0 && cmd[0] == "kill" {
+				t.Errorf("reset-auth sent the container-shaped signal %v to a host-execution runtime", cmd)
+			}
+			return "", nil
+		},
+	}}
+	srv := New(DefaultServerConfig(), mgr, rt)
+
+	w := doResetAuth(t, srv, "fresh-token")
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (%s)", w.Code, w.Body.String())
+	}
+	if rt.gotSignal != "USR2" {
+		t.Errorf("SignalInit received signal %q, want %q", rt.gotSignal, "USR2")
+	}
+	if rt.gotTarget != "container-A" {
+		t.Errorf("SignalInit received target %q, want the agent's target %q", rt.gotTarget, "container-A")
+	}
+}
+
+// A runtime that reports a failed signal is not fatal: the token is on disk
+// and the agent adopts it on its next auth failure.
+func TestResetAuth_HostExecutionSignalFailureStillReturns200(t *testing.T) {
+	mgr := resetAuthAgents()
+
+	rt := &signalingMockRuntime{
+		MockRuntime: &scionrt.MockRuntime{
+			NameFunc: func() string { return "tmux" },
+			ExecFunc: func(_ context.Context, _ string, _ []string) (string, error) { return "", nil },
+		},
+		err: fmt.Errorf("pane process is \"claude\", not sciontool"),
+	}
+	srv := New(DefaultServerConfig(), mgr, rt)
+
+	w := doResetAuth(t, srv, "fresh-token")
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 even when the reset signal fails, got %d (%s)", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "signal failed") {
+		t.Errorf("response should mention signal failure, got %q", w.Body.String())
 	}
 }
