@@ -171,6 +171,13 @@ func (m *Manager) runOnce(ctx context.Context) (connected bool, err error) {
 			if resp.Body != nil {
 				body, _ = io.ReadAll(io.LimitReader(resp.Body, handshakeBodyLimit))
 			}
+			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+				// The token may have been rewritten on disk out of band (broker
+				// reset-auth, operator tooling); re-read it so the next dial uses it.
+				if m.client.AdoptTokenFromFile() {
+					log.Info("Port-forward tunnel: hub returned %d; adopted the token found on disk", resp.StatusCode)
+				}
+			}
 			return false, &scionhub.StatusError{StatusCode: resp.StatusCode, Body: string(body)}
 		}
 		return false, err
