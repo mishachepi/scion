@@ -15,6 +15,8 @@ import (
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	colmetricpb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/log"
 	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
 	metricpb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
@@ -41,6 +43,67 @@ type Receiver struct {
 	logHandler    LogHandler
 	mu            sync.Mutex
 	running       bool
+	grpcPort      int
+	httpPort      int
+}
+
+// GRPCPort reports the port the gRPC receiver is actually listening on, which
+// differs from the configured one when that port was taken. Zero before Start.
+func (r *Receiver) GRPCPort() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.grpcPort
+}
+
+// HTTPPort reports the port the HTTP receiver is actually listening on.
+// Zero before Start.
+func (r *Receiver) HTTPPort() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.httpPort
+}
+
+// listenLocal binds the configured receiver port, falling back to an ephemeral
+// one when it is unavailable.
+//
+// The receiver is per-agent; the port is not. Agents sharing a network
+// namespace — every agent on a host-execution runtime — compete for the same
+// 4317/4318 defaults: the first to bind wins and every other agent's telemetry
+// start fails outright, losing all of its data silently. An ephemeral port
+// keeps those receivers working, and the port actually bound is published to
+// the harness through the OTLP endpoint environment so the pair stays matched.
+func listenLocal(port int, label string) (net.Listener, int, error) {
+	lis, listenErr := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if listenErr != nil {
+		fallback, fallbackErr := net.Listen("tcp", ":0")
+		if fallbackErr != nil {
+			return nil, 0, fmt.Errorf("failed to listen on %s port %d: %w", label, port, listenErr)
+		}
+		actual, ok := listenerPort(fallback)
+		if !ok {
+			_ = fallback.Close()
+			return nil, 0, fmt.Errorf("failed to listen on %s port %d: %w", label, port, listenErr)
+		}
+		log.Info("Telemetry %s port %d unavailable (%v); listening on %d instead",
+			label, port, listenErr, actual)
+		return fallback, actual, nil
+	}
+	actual, ok := listenerPort(lis)
+	if !ok {
+		_ = lis.Close()
+		return nil, 0, fmt.Errorf("failed to resolve the %s listener address on port %d", label, port)
+	}
+	return lis, actual, nil
+}
+
+// listenerPort reports the TCP port a listener bound, resolving the ":0"
+// ephemeral case to the port the kernel actually assigned.
+func listenerPort(lis net.Listener) (int, bool) {
+	addr, ok := lis.Addr().(*net.TCPAddr)
+	if !ok {
+		return 0, false
+	}
+	return addr.Port, true
 }
 
 // NewReceiver creates a new OTLP receiver.
@@ -82,11 +145,11 @@ func (r *Receiver) Start(ctx context.Context) error {
 	}
 
 	// Start gRPC server
-	grpcAddr := fmt.Sprintf(":%d", r.config.GRPCPort)
-	grpcLis, err := net.Listen("tcp", grpcAddr)
+	grpcLis, grpcPort, err := listenLocal(r.config.GRPCPort, "gRPC")
 	if err != nil {
-		return fmt.Errorf("failed to listen on gRPC port %d: %w", r.config.GRPCPort, err)
+		return err
 	}
+	r.grpcPort = grpcPort
 
 	r.grpcServer = grpc.NewServer()
 	coltracepb.RegisterTraceServiceServer(r.grpcServer, &traceServiceServer{handler: r.handler})
@@ -100,12 +163,12 @@ func (r *Receiver) Start(ctx context.Context) error {
 	}()
 
 	// Start HTTP server
-	httpAddr := fmt.Sprintf(":%d", r.config.HTTPPort)
-	httpLis, err := net.Listen("tcp", httpAddr)
+	httpLis, httpPort, err := listenLocal(r.config.HTTPPort, "HTTP")
 	if err != nil {
 		r.grpcServer.Stop()
-		return fmt.Errorf("failed to listen on HTTP port %d: %w", r.config.HTTPPort, err)
+		return err
 	}
+	r.httpPort = httpPort
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/traces", r.handleHTTPTraces)
