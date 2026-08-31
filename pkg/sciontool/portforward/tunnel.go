@@ -90,8 +90,22 @@ func (m *Manager) runOnce(ctx context.Context) error {
 	if err := m.client.ApplyTransportHeaders(header); err != nil {
 		log.Debug("Port-forward tunnel: no transport credential available: %v", err)
 	}
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, endpoint, header)
+	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, endpoint, header)
 	if err != nil {
+		// A rejected token surfaces here as "bad handshake" and nothing else:
+		// the tunnel would keep redialling with the dead token for as long as
+		// the agent lives. Give it the same contract the token refresh loop
+		// follows — re-read the canonical file, which an out-of-band recovery
+		// (broker reset-auth, operator tooling) may already have rewritten —
+		// so the next reconnect dials with the live token.
+		if resp != nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+				if m.client.AdoptTokenFromFile() {
+					log.Info("Port-forward tunnel: hub returned %d; adopted the token found on disk", resp.StatusCode)
+				}
+			}
+		}
 		return err
 	}
 	defer func() { _ = conn.Close() }()
