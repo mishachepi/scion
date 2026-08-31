@@ -1857,8 +1857,29 @@ func (s *Server) execCommand(w http.ResponseWriter, r *http.Request, id, project
 // scion user and the token write would land in "/.scion".
 const tokenDirExpr = `TOKEN_DIR="${HOME:-$(getent passwd scion 2>/dev/null | cut -d: -f6 || echo /home/scion)}/.scion"`
 
+// initSignaler is implemented by runtimes whose agent init process is not
+// PID 1 in the exec target. Container runtimes run `sciontool init` as PID 1
+// inside the container, so `kill -USR2 1` reaches it; host-execution runtimes
+// such as tmux run Exec on the broker host, where PID 1 is the host's own
+// init and the container-shaped command signals the wrong process.
+type initSignaler interface {
+	SignalInit(ctx context.Context, id, signal string) error
+}
+
+// signalAgentInit delivers SIGUSR2 to the agent's sciontool init process so it
+// re-reads the token file and restarts its refresh loop immediately.
+func signalAgentInit(ctx context.Context, rt scionrt.Runtime, target string) error {
+	if signaler, ok := rt.(initSignaler); ok {
+		return signaler.SignalInit(ctx, target, "USR2")
+	}
+	// In rootless containers the broker execs as the scion user and
+	// `kill -USR2 1` against the root-owned PID 1 fails with EPERM.
+	_, err := rt.Exec(ctx, target, []string{"kill", "-USR2", "1"})
+	return err
+}
+
 // resetAuth writes a fresh token into a running agent's container and signals
-// sciontool init (PID 1) to restart its token refresh loop via SIGUSR2.
+// sciontool init to restart its token refresh loop via SIGUSR2.
 func (s *Server) resetAuth(w http.ResponseWriter, r *http.Request, id, projectID string) {
 	ctx := r.Context()
 
@@ -1897,18 +1918,15 @@ func (s *Server) resetAuth(w http.ResponseWriter, r *http.Request, id, projectID
 		return
 	}
 
-	// Signal sciontool init (PID 1) to re-read the token and restart its refresh
-	// loop immediately. The token was already written above, and the refresh
-	// loop re-reads the token file whenever a refresh attempt is auth-rejected,
-	// so the agent recovers on its next retry (≤5min backoff) even if this
-	// signal fails. In rootless containers the broker execs as the scion user
-	// and `kill -USR2 1` against the root-owned PID 1 fails with EPERM — this
-	// is expected and not an error since the token is on disk.
-	signalCmd := []string{"kill", "-USR2", "1"}
+	// Signal sciontool init to re-read the token and restart its refresh loop
+	// immediately. The token was already written above, and the agent re-reads
+	// the token file whenever a request is auth-rejected, so it recovers on its
+	// next retry even if this signal fails — expected in rootless containers,
+	// where signalling the root-owned PID 1 yields EPERM.
 	signaled := true
-	if _, err := rt.Exec(ctx, target, signalCmd); err != nil {
+	if err := signalAgentInit(ctx, rt, target); err != nil {
 		signaled = false
-		s.agentLifecycleLog.Warn("reset-auth: failed to signal PID 1 (token still written, poller will reload)", "agent_id", id, "error", err)
+		s.agentLifecycleLog.Warn("reset-auth: failed to signal agent init (token still written, agent adopts it on its next auth failure)", "agent_id", id, "error", err)
 	}
 
 	s.agentLifecycleLog.Info("Auth reset completed", "agent_id", id, "signaled", signaled)
