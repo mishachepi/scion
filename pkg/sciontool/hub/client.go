@@ -290,6 +290,7 @@ func (c *Client) UpdateStatus(ctx context.Context, status StatusUpdate) error {
 	c.tokenMu.RUnlock()
 
 	var lastErr error
+	adoptedToken := false
 	attempts := c.maxRetries + 1
 	for attempt := 0; attempt < attempts; attempt++ {
 		if attempt > 0 {
@@ -330,6 +331,26 @@ func (c *Client) UpdateStatus(ctx context.Context, status StatusUpdate) error {
 		// Success
 		if resp.StatusCode < 400 {
 			return nil
+		}
+
+		// The hub rejected this token. An out-of-band recovery (broker
+		// reset-auth, operator tooling) may already have written a fresh one
+		// to the canonical file — adopt it and spend one more attempt on it.
+		//
+		// Without this, the only consumer that ever re-reads the token file is
+		// the refresh loop, and it is asleep until two hours before expiry: a
+		// token rejected while still unexpired (hub signing-key rotation, a
+		// reissued agent identity) leaves the resident heartbeat presenting the
+		// dead token indefinitely, even though the good one is already on disk.
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			if !adoptedToken {
+				if _, ok := c.adoptTokenFromFile(); ok {
+					adoptedToken = true
+					currentToken = c.GetToken()
+					attempts++
+					continue
+				}
+			}
 		}
 
 		// 4xx errors are client errors - don't retry
@@ -1019,6 +1040,16 @@ func (c *Client) StartTokenRefresh(ctx context.Context, config *TokenRefreshConf
 	}()
 
 	return done
+}
+
+// AdoptTokenFromFile re-reads the canonical token file and installs it as the
+// client's token when it differs from the in-memory one and has not expired.
+// Reports whether adoption happened. Exported for auth-failure paths that live
+// outside this package (the port-forward tunnel), so every consumer of the
+// token recovers from an out-of-band rewrite the same way.
+func (c *Client) AdoptTokenFromFile() bool {
+	_, ok := c.adoptTokenFromFile()
+	return ok
 }
 
 // adoptTokenFromFile re-reads the canonical token file and, when it holds a

@@ -1639,3 +1639,68 @@ func TestClient_SetSecret_ServerError(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "500")
 }
+
+// A token the hub rejects while it is still unexpired never reaches the
+// refresh loop's adoption path: that loop sleeps until two hours before
+// expiry. The heartbeat runs every minute — it is the path that must notice.
+func TestUpdateStatus_AdoptsTokenFileOnAuthRejection(t *testing.T) {
+	cleanup := SetTokenHome(t.TempDir())
+	defer cleanup()
+
+	// Distinct expiries so the two tokens are distinct strings — adoption is
+	// a no-op when the file holds the token already in memory.
+	staleToken := makeJWTWithExpiry(t, time.Now().Add(10*time.Hour))
+	freshToken := makeJWTWithExpiry(t, time.Now().Add(11*time.Hour))
+
+	var presented []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := r.Header.Get("X-Scion-Agent-Token")
+		presented = append(presented, token)
+		if token != freshToken {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte("invalid agent token: failed to verify token"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := NewClientWithConfig(server.URL, staleToken, "agent-123")
+	require.NoError(t, WriteTokenFile(freshToken))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	require.NoError(t, client.Heartbeat(ctx), "heartbeat should succeed after adopting the on-disk token")
+	assert.Equal(t, freshToken, client.GetToken(), "client should hold the token from the file")
+	require.Len(t, presented, 2, "expected one rejected attempt and one with the adopted token")
+	assert.Equal(t, staleToken, presented[0])
+	assert.Equal(t, freshToken, presented[1])
+}
+
+// Adoption must not turn a genuine 401 into a retry storm: with nothing newer
+// on disk the call still fails fast.
+func TestUpdateStatus_AuthRejectionWithoutFreshFileFailsFast(t *testing.T) {
+	cleanup := SetTokenHome(t.TempDir())
+	defer cleanup()
+
+	token := makeJWTWithExpiry(t, time.Now().Add(10*time.Hour))
+
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("invalid agent token"))
+	}))
+	defer server.Close()
+
+	client := NewClientWithConfig(server.URL, token, "agent-123")
+	require.NoError(t, WriteTokenFile(token))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := client.Heartbeat(ctx)
+	require.Error(t, err, "a 401 with no newer token on disk must still be an error")
+	assert.Equal(t, 1, calls, "the hub should be called once, not retried")
+}
