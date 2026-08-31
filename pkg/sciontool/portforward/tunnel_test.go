@@ -14,7 +14,17 @@
 
 package portforward
 
-import "testing"
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	scionhub "github.com/GoogleCloudPlatform/scion/pkg/sciontool/hub"
+)
 
 func TestIsLoopbackHost(t *testing.T) {
 	tests := []struct {
@@ -40,5 +50,78 @@ func TestIsLoopbackHost(t *testing.T) {
 				t.Errorf("isLoopbackHost(%q) = %v, want %v", tt.host, got, tt.want)
 			}
 		})
+	}
+}
+
+func jwtWithExpiry(t *testing.T, exp time.Time) string {
+	t.Helper()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+	payloadJSON, err := json.Marshal(struct {
+		Exp int64 `json:"exp"`
+	}{Exp: exp.Unix()})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	return header + "." + base64.RawURLEncoding.EncodeToString(payloadJSON) + ".sig"
+}
+
+// A hub that rejects the tunnel's token answers the websocket upgrade with a
+// plain 401, which gorilla surfaces only as "bad handshake". Without adoption
+// the tunnel redials with the same dead token forever, even once a recovery
+// has written a live one to the canonical file.
+func TestTunnel_AdoptsTokenFileOnUnauthorizedHandshake(t *testing.T) {
+	cleanup := scionhub.SetTokenHome(t.TempDir())
+	defer cleanup()
+
+	staleToken := jwtWithExpiry(t, time.Now().Add(10*time.Hour))
+	freshToken := jwtWithExpiry(t, time.Now().Add(11*time.Hour))
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
+	client := scionhub.NewClientWithConfig(server.URL, staleToken, "agent-1")
+	if err := scionhub.WriteTokenFile(freshToken); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := NewManager(client).runOnce(ctx); err == nil {
+		t.Fatal("runOnce should report the failed handshake")
+	}
+	if got := client.GetToken(); got != freshToken {
+		t.Errorf("tunnel still holds %q; want the token adopted from disk", got)
+	}
+}
+
+// A handshake that fails for any other reason must leave the token alone.
+func TestTunnel_KeepsTokenOnNonAuthHandshakeFailure(t *testing.T) {
+	cleanup := scionhub.SetTokenHome(t.TempDir())
+	defer cleanup()
+
+	staleToken := jwtWithExpiry(t, time.Now().Add(10*time.Hour))
+	freshToken := jwtWithExpiry(t, time.Now().Add(11*time.Hour))
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client := scionhub.NewClientWithConfig(server.URL, staleToken, "agent-1")
+	if err := scionhub.WriteTokenFile(freshToken); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := NewManager(client).runOnce(ctx); err == nil {
+		t.Fatal("runOnce should report the failed handshake")
+	}
+	if got := client.GetToken(); got != staleToken {
+		t.Errorf("a 500 must not trigger token adoption; token changed to %q", got)
 	}
 }
