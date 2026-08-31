@@ -799,6 +799,88 @@ func (r *TmuxRuntime) Exec(ctx context.Context, id string, cmd []string) (string
 	return r.execAsAgent(ctx, id, cmd)
 }
 
+// SignalInit delivers a signal to the agent's init process — the sciontool
+// wrapper tmux runs as the root process of the agent's pane.
+//
+// Container runtimes reach that process as PID 1 inside the container, which
+// is why the broker's reset-auth path signals it with `kill -SIG 1` through
+// Exec. The tmux runtime executes on the broker host, where PID 1 is the
+// host's own init (launchd/systemd): the container-shaped command would
+// address the wrong process entirely, and unprivileged it merely fails with
+// EPERM — so reset-auth's signal never reached a tmux agent. Resolve the
+// pane's real PID instead.
+//
+// Signalling is refused unless harnesses are wrapped in sciontool and the pane
+// process still looks like sciontool: an unwrapped pane runs the bare harness,
+// and the default disposition of SIGUSR2 is to terminate it.
+func (r *TmuxRuntime) SignalInit(ctx context.Context, id, sig string) error {
+	if id == "" {
+		return fmt.Errorf("tmux runtime: SignalInit requires a non-empty id")
+	}
+	if sig == "" {
+		return fmt.Errorf("tmux runtime: SignalInit requires a signal name")
+	}
+	if r.Sciontool == "" {
+		return fmt.Errorf("tmux runtime: harnesses are not wrapped in sciontool — there is no init process to signal")
+	}
+	target := r.resolveTarget(ctx, id)
+	if !r.windowExists(ctx, target) {
+		return fmt.Errorf("tmux runtime: agent window %s not found", target)
+	}
+	pid, err := r.panePID(ctx, r.resolvePaneTarget(ctx, target))
+	if err != nil {
+		return err
+	}
+	if err := verifySciontoolPID(ctx, pid); err != nil {
+		return err
+	}
+	if out, err := exec.CommandContext(ctx, "kill", "-"+sig, pid).CombinedOutput(); err != nil {
+		return fmt.Errorf("tmux runtime: kill -%s %s (window %s): %w (output: %s)",
+			sig, pid, target, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// panePID returns the PID of the process tmux started in the agent's pane.
+// new-window receives the sciontool argv directly, with no shell wrapper
+// (see buildNewWindowArgs), so the pane's root process is
+// `sciontool init --tmuxruntime -- <harness>` and the harness is its child.
+func (r *TmuxRuntime) panePID(ctx context.Context, target string) (string, error) {
+	out, err := exec.CommandContext(ctx, r.Command,
+		"display-message", "-p", "-t", target, "#{pane_pid}").Output()
+	if err != nil {
+		return "", fmt.Errorf("tmux display-message #{pane_pid} -t %s: %w", target, err)
+	}
+	pid := strings.TrimSpace(string(out))
+	if pid == "" {
+		return "", fmt.Errorf("tmux runtime: window %s reported an empty pane_pid", target)
+	}
+	if strings.TrimLeft(pid, "0123456789") != "" {
+		return "", fmt.Errorf("tmux runtime: window %s reported a non-numeric pane_pid %q", target, pid)
+	}
+	return pid, nil
+}
+
+// verifySciontoolPID refuses to signal a pane whose root process is
+// demonstrably not sciontool. A failing or silent `ps` is not treated as a
+// refusal: the caller only signals runtimes that wrap harnesses in sciontool,
+// and the recovery path the signal accelerates (the agent adopting the on-disk
+// token at its next auth failure) stays correct if the signal is skipped.
+func verifySciontoolPID(ctx context.Context, pid string) error {
+	out, err := exec.CommandContext(ctx, "ps", "-p", pid, "-o", "comm=").Output()
+	if err != nil {
+		return nil
+	}
+	comm := strings.TrimSpace(string(out))
+	if comm == "" {
+		return nil
+	}
+	if !strings.Contains(filepath.Base(comm), "sciontool") {
+		return fmt.Errorf("tmux runtime: pane process %s is %q, not sciontool — refusing to signal it", pid, comm)
+	}
+	return nil
+}
+
 // execAsAgent runs a host command impersonating the agent: cwd is the
 // agent's workspace, HOME is the agent home recorded at start in the
 // @scion-home window option, and the SCION_* identity variables mirror
