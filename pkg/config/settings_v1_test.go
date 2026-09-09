@@ -1135,6 +1135,8 @@ runtimes:
     default_tmux_session: scion
     home_mode: agent
     sciontool: auto
+    env:
+      DISABLE_AUTOUPDATER: "1"
 profiles:
   tmux-local:
     runtime: tmux

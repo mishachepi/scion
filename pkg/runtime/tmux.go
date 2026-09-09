@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
@@ -81,6 +82,14 @@ type TmuxRuntime struct {
 
 	// HomeMode controls HOME and env injection. See V1RuntimeConfig.HomeMode.
 	HomeMode string
+
+	// Env holds operator-configured environment variables from
+	// V1RuntimeConfig.Env (settings.yaml `runtimes.<name>.env`), injected
+	// into every new session in HomeModeAgent. Emitted before per-agent
+	// RunConfig.Env and resolved secrets, so both can override. Ignored in
+	// HomeModeSystem, which exports exactly SCION_AGENT_HOME and nothing
+	// more.
+	Env map[string]string
 
 	// Sciontool is an absolute sciontool-binary path used to wrap each
 	// harness in `sciontool init --tmuxruntime --`. Empty disables wrapping.
@@ -346,6 +355,27 @@ func (r *TmuxRuntime) ensureSession(ctx context.Context, session string) error {
 	return nil
 }
 
+// runtimeEnvEntries returns r.Env as sorted KEY=VAL strings. Sorted so the
+// emitted flags are deterministic (map iteration order is not).
+func (r *TmuxRuntime) runtimeEnvEntries() []string {
+	if len(r.Env) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(r.Env))
+	for k := range r.Env {
+		if k == "" {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	entries := make([]string, 0, len(keys))
+	for _, k := range keys {
+		entries = append(entries, fmt.Sprintf("%s=%s", k, r.Env[k]))
+	}
+	return entries
+}
+
 // buildEnvFlags produces tmux -e KEY=VAL flags. SCION_AGENT_HOME is always
 // emitted; everything else depends on r.HomeMode. HomeModeSystem returns
 // exactly `-e SCION_AGENT_HOME=<agentHome>` and nothing more.
@@ -358,7 +388,17 @@ func (r *TmuxRuntime) buildEnvFlags(config RunConfig) []string {
 		fmt.Sprintf("HOME=%s", config.HomeDir),
 		fmt.Sprintf("SCION_AGENT=%s", config.Name),
 		fmt.Sprintf("SCION_AGENT_HOME=%s", config.HomeDir),
+		// Every agent on the host shares one network namespace, so each
+		// sciontool telemetry receiver takes an ephemeral port instead of the
+		// fixed 4317/4318; sciontool publishes the bound ports to the harness
+		// and its hooks. Runtime or agent env can still pin explicit ports.
+		"SCION_OTEL_GRPC_PORT=0",
+		"SCION_OTEL_HTTP_PORT=0",
 	}
+	// Operator-level runtime env goes before per-agent env and secrets:
+	// with `tmux new-window -e` the last occurrence of a name wins, so
+	// anything later in the flag list overrides these.
+	entries = append(entries, r.runtimeEnvEntries()...)
 	if config.Project != "" {
 		entries = append(entries,
 			fmt.Sprintf("SCION_PROJECT=%s", config.Project),
@@ -932,6 +972,10 @@ func (r *TmuxRuntime) execAsAgent(ctx context.Context, id string, cmd []string) 
 		"HOME="+meta.home,
 		"SCION_AGENT_HOME="+meta.home,
 	)
+	// Mirror the operator-level runtime env the session was started with,
+	// so host-exec sees the same environment as the agent itself. Appended
+	// after os.Environ(), and exec.Cmd gives the last duplicate precedence.
+	env = append(env, r.runtimeEnvEntries()...)
 	if name := meta.labels["scion.name"]; name != "" {
 		env = append(env, "SCION_AGENT="+name)
 	}
