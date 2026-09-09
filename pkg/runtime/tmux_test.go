@@ -1053,7 +1053,10 @@ func TestTmuxRuntime_BuildEnvFlags_ScionAgentHomeAlwaysSet(t *testing.T) {
 // No HOME, no SCION_AGENT, no SCION_PROJECT, no Env passthrough, no resolved
 // secrets, no *_CONFIG_DIR, nothing else. Load-bearing contract for the mode.
 func TestTmuxRuntime_BuildEnvFlags_SystemModeOnlyScionAgentHome(t *testing.T) {
-	r := &TmuxRuntime{HomeMode: HomeModeSystem}
+	r := &TmuxRuntime{
+		HomeMode: HomeModeSystem,
+		Env:      map[string]string{"DISABLE_AUTOUPDATER": "1"},
+	}
 	flags := r.buildEnvFlags(RunConfig{
 		HomeDir:   "/agent-home",
 		Name:      "agent-1",
@@ -1068,6 +1071,41 @@ func TestTmuxRuntime_BuildEnvFlags_SystemModeOnlyScionAgentHome(t *testing.T) {
 	want := []string{"-e", "SCION_AGENT_HOME=/agent-home"}
 	if !slices.Equal(flags, want) {
 		t.Errorf("system mode buildEnvFlags = %v, want %v (exactly one entry)", flags, want)
+	}
+}
+
+// Operator-level runtime env (V1RuntimeConfig.Env → TmuxRuntime.Env) is
+// emitted in agent mode: every pair present, keys in sorted order, and each
+// pair placed BEFORE per-agent RunConfig.Env — tmux gives the last duplicate
+// -e precedence, so per-agent env must come later to be able to override.
+func TestTmuxRuntime_BuildEnvFlags_RuntimeEnvEmittedSortedAndOverridable(t *testing.T) {
+	r := &TmuxRuntime{Env: map[string]string{
+		"DISABLE_AUTOUPDATER": "1",
+		"AAA_FIRST":           "x",
+		"":                    "dropped-empty-key",
+	}}
+	flags := r.buildEnvFlags(RunConfig{
+		HomeDir: "/h",
+		Name:    "agent-1",
+		Env:     []string{"DISABLE_AUTOUPDATER=0"},
+	})
+
+	idx := func(kv string) int { return slices.Index(flags, kv) }
+	for _, want := range []string{"AAA_FIRST=x", "DISABLE_AUTOUPDATER=1", "DISABLE_AUTOUPDATER=0"} {
+		if idx(want) < 0 {
+			t.Fatalf("flags missing %q: %v", want, flags)
+		}
+	}
+	if idx("AAA_FIRST=x") > idx("DISABLE_AUTOUPDATER=1") {
+		t.Errorf("runtime env not sorted by key: %v", flags)
+	}
+	if idx("DISABLE_AUTOUPDATER=1") > idx("DISABLE_AUTOUPDATER=0") {
+		t.Errorf("runtime env must precede per-agent env (override contract): %v", flags)
+	}
+	for _, kv := range flags {
+		if strings.Contains(kv, "dropped-empty-key") {
+			t.Errorf("empty-key entry leaked: %v", flags)
+		}
 	}
 }
 
