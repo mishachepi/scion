@@ -289,12 +289,12 @@
         },
         "pre_start_script": {
           "type": "string",
-          "description": "tmux runtime: path (absolute or ~-prefixed) to a shell script invoked before tmux new-window with arguments <agentHome> <operator-$HOME>. Skipped when home_mode is 'system'."
+          "description": "tmux runtime: path (absolute or ~-prefixed) to a shell script invoked before tmux new-window with arguments <agentHome> <operator-$HOME>."
         },
         "home_mode": {
           "type": "string",
-          "enum": ["agent", "system"],
-          "description": "tmux runtime: HOME handling. 'agent' (default) overrides HOME=<agentHome>. 'system' preserves operator HOME and only exports SCION_AGENT_HOME."
+          "enum": ["agent"],
+          "description": "tmux runtime: HOME handling. 'agent' (default, and the only accepted value) overrides HOME=<agentHome>."
         },
         "sciontool": {
           "type": "string",
