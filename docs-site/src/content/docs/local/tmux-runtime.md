@@ -93,10 +93,10 @@ This leaves `<agentHome>` empty of operator credentials. Run any auth-requiring 
 runtimes:
   tmux:
     type: tmux
-    home_mode: agent      # currently the only supported value
+    home_mode: agent      # the only supported value
 ```
 
-`home_mode` is reserved for future modes that preserve the operator's `$HOME` and OAuth/Keychain state; today only `agent` is supported.
+`agent` is the only accepted `home_mode`: the tmux runtime never hands an agent the operator's `$HOME`. Any other value is rejected at startup rather than silently defaulted.
 
 ## Auth
 
