@@ -99,6 +99,19 @@ func NewTmuxRuntime() *TmuxRuntime {
 
 func (r *TmuxRuntime) Name() string { return "tmux" }
 
+var _ CapabilityReporter = (*TmuxRuntime)(nil)
+
+// Capabilities reports that agents run as host processes: there is no image
+// behind an agent, so nothing should resolve, check or pull one. The
+// ImageExists/PullImage stubs below stay for callers that hold a bare Runtime,
+// but a caller that consults capabilities no longer needs to ask.
+func (r *TmuxRuntime) Capabilities() Capabilities {
+	return Capabilities{
+		Images:          false,
+		LocalImageStore: false,
+	}
+}
+
 // ExecUser returns "" — the agent runs as the current host user.
 func (r *TmuxRuntime) ExecUser() string { return "" }
 
