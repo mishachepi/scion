@@ -356,21 +356,16 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 	// Two-phase image resolution: for short-form (bare) images, prefer a
 	// locally-built image over the registry version. If no local image
 	// exists, fall back to the registry rewrite.
-	// NOTE: The local-exists check only applies to runtimes with local image
-	// storage (docker, podman, container). Runtimes like kubernetes and cloudrun
-	// always return true from ImageExists (images are pulled on demand by the
-	// node), so we must skip the local check to ensure registry rewrite applies.
+	// NOTE: The local-exists check only applies to runtimes that keep images on
+	// this machine. Kubernetes and Cloud Run pull on the node and always return
+	// true from ImageExists, and a host-execution runtime has no images at all,
+	// so both must skip the local check for the registry rewrite to apply.
+	// Which is which is the runtime's own answer, not a list maintained here.
 	if settings != nil && resolvedImage != "" {
 		imageRegistry := settings.ResolveImageRegistry(opts.Profile)
 		if imageRegistry != "" && imagecheck.IsBareImageName(resolvedImage) {
-			runtimeName := ""
-			if m.Runtime != nil {
-				runtimeName = m.Runtime.Name()
-			}
-			hasLocalImages := runtimeName == "docker" || runtimeName == "podman" ||
-				runtimeName == "container" || runtimeName == "apple-container"
 			localExists := false
-			if hasLocalImages {
+			if runtime.CapabilitiesOf(m.Runtime).LocalImageStore {
 				var localErr error
 				localExists, localErr = m.Runtime.ImageExists(ctx, resolvedImage)
 				if localErr != nil {
@@ -395,7 +390,9 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 		}
 	}
 
-	if resolvedImage == "" {
+	// A runtime without images has nothing to resolve — demanding one would
+	// force host-execution harness-configs to name an image nobody ever uses.
+	if resolvedImage == "" && runtime.CapabilitiesOf(m.Runtime).Images {
 		util.Debugf("image resolution FAILED: harnessConfigName=%q, finalScionCfg.Image=%q, opts.Image=%q, projectDir=%s",
 			harnessConfigName, finalScionCfg.Image, opts.Image, projectDir)
 		return nil, fmt.Errorf("no container image resolved for agent %q. Set 'image' in the harness-config config.yaml, specify --image, or configure a harness-config in settings", opts.Name)
@@ -638,10 +635,16 @@ authDone:
 		detached = *opts.Detached
 	}
 
-	exists, err := m.Runtime.ImageExists(ctx, resolvedImage)
-	if err != nil || !exists {
-		if err := m.Runtime.PullImage(ctx, resolvedImage); err != nil {
-			return nil, fmt.Errorf("failed to pull image '%s': %w", resolvedImage, err)
+	// Only ask about an image when the runtime has one. This check used to run
+	// unconditionally, which is why the tmux runtime answers true from
+	// ImageExists — a runtime with no images had no way to say the question did
+	// not apply, so it lied to keep the pull from firing.
+	if runtime.CapabilitiesOf(m.Runtime).Images {
+		exists, err := m.Runtime.ImageExists(ctx, resolvedImage)
+		if err != nil || !exists {
+			if err := m.Runtime.PullImage(ctx, resolvedImage); err != nil {
+				return nil, fmt.Errorf("failed to pull image '%s': %w", resolvedImage, err)
+			}
 		}
 	}
 

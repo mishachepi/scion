@@ -96,6 +96,18 @@ func (r *KubernetesRuntime) Name() string {
 	return "kubernetes"
 }
 
+var _ CapabilityReporter = (*KubernetesRuntime)(nil)
+
+// Capabilities reports images without a local store: pods pull on the node
+// that schedules them, so asking whether an image exists on the machine
+// running scion answers nothing about whether the pod will start.
+func (r *KubernetesRuntime) Capabilities() Capabilities {
+	return Capabilities{
+		Images:          true,
+		LocalImageStore: false,
+	}
+}
+
 func (r *KubernetesRuntime) ExecUser() string {
 	return "scion"
 }
