@@ -265,3 +265,124 @@ pay for itself.
 
 Reported to area-scion; task stays `In Progress` pending the build channel and a
 go/no-go on the outputStyle/enabledPlugins exclusion.
+
+## Design reversal (user directive, 2026-09-08) and what step 1 actually found
+
+The overlay above is being reverted. User's thesis: runtime differences must be solved inside the
+tmux runtime implementation, and every standard harness must keep working unchanged. Agreed plan:
+(1) capability surface on `Runtime`; (2) runtime-aware provisioner execution instead of swapping
+`provisioner.type` to `builtin`; (3) auth gate by capability instead of pruning `auth.types`;
+(4) instructions via the normal path so `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD` and
+`--add-dir` disappear; (5) revert `e7a3fce3`/`14732ad1`/`8376541a`; (6) pointer-configs on M1/M5.
+
+Scoping step 1 surfaced something that reframes steps 2–4.
+
+### The overlay's justification rests on a premise that is false in this code
+
+`harnesses/claude/config.yaml:147-157` states the tmux agent "runs as a host process inheriting the
+operator's real HOME (never a container)", and derives from that: builtin provisioner (nothing to
+provision), auth restricted to manual/api-key (no "provisioned container credential path"), and
+`--add-dir` + `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD` as "the only route" for agent
+instructions.
+
+The tmux agent does **not** run in the operator's HOME:
+
+- `buildEnvFlags` sets `HOME=config.HomeDir`, the agent's own home (`pkg/runtime/tmux.go:326`).
+  `home_mode=system` — the mode that would have preserved the operator's HOME — was removed in
+  `1274ca1b` and was never set in any real settings.yaml on this fleet.
+- Verified live on 2026-09-09: a tmux agent's Claude wrote its session transcript to
+  `<agentHome>/.claude/projects/…jsonl`, not to the operator's `~/.claude/projects`.
+- The agent home **is** a provisioned credential path: `serializeSecrets(config.HomeDir, …)`
+  (`tmux.go:126`) stages file secrets to targets expanded against the agent home, and
+  `sciontool init --tmuxruntime` writes them — the same pipeline docker/podman/k8s use. Env
+  secrets are injected as tmux `-e` flags (`tmux.go:343-348`).
+
+So tmux has its own home, its own credential staging, and its own env injection. Each of the three
+justifications above is unsupported by the code as it now stands.
+
+### Consequence: steps 2–4 are mostly deletions, not capability checks
+
+- **Provisioner (step 2).** Execution is already runtime-neutral: `sciontool` runs the provisioner
+  as a plain subprocess (`cmd/sciontool/commands/harness.go:169`), and under tmux sciontool already
+  runs on the host with `HOME=agentHome`. The one container-shaped thing is the literal path in
+  `provisioner.command` (`["python3", "/home/scion/.scion/harness/provision.py"]`). Every other
+  manifest path is already `$HOME`-relative and expanded by `resolveManifestHomePaths`
+  (`harness.go:237-261`) — which does not cover `Provisioner.Command`. Making the command
+  `$HOME`-relative and resolving it there very likely removes the need for the `builtin` swap
+  outright. Confirmed empirically that live tmux agents ship `provisioner: {type: builtin}` with
+  no command at all, so `provision.py` never runs on this fleet today.
+- **Auth (step 3).** No Go code branches on auth type — repo-wide grep for `"manual"` outside tests
+  returns nothing; the restriction is 100% the YAML's own `types:` map. With file-secret staging
+  working under tmux, `auth-file` has no mechanical reason to be disabled.
+- **Instructions (step 4).** `instructions_file: .claude/CLAUDE.md` is declarative and the agent
+  home is a real host directory, so instructions can be written to the well-known path exactly as
+  in container mode. `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD` and `--add-dir` appear only in
+  this config's own overlay block — no Go or Python code references either.
+
+### What that leaves for a capability surface
+
+Genuine, non-dissolving differences: tmux has no image (`ImageExists`/`ImageID`/`PullImage`/
+`RemoveImage` are meaningless) and transfers no workspace (`Sync`, and the client-side workspace
+collection at `cmd/common.go:899` — measured at ~34 s against the vault, for files the tmux runtime
+will never move).
+
+The workspace one cannot be gated on a runtime capability as things stand: `startAgentViaHub` has
+no `Runtime` in scope, and the runtime is resolved **broker-side** — confirmed 2026-09-09,
+`scion start -p m5t` put the agent in `RUNTIME=container` twice, because the client profile does
+not reach the broker. Gating it needs the hub to tell the client whether workspace files are
+wanted; that is a protocol change, not a capability interface. Left alone.
+
+## Step 1 implemented — `Runtime` capability surface
+
+Shape mirrors `Diagnosable` (`pkg/runtime/doctor.go:32`): an optional interface, so adding a
+capability never forces an edit to runtimes it does not concern.
+
+- `pkg/runtime/capabilities.go` — `Capabilities{Images, LocalImageStore}`, `CapabilityReporter`,
+  `ContainerCapabilities()` (the shape every call site already assumed), and `CapabilitiesOf(rt)`.
+  A nil runtime reports the zero value, not the default: callers guard nil precisely so they can
+  skip work that would dereference it, and container defaults would turn a skipped step into a
+  panic. Found while wiring — the original code guarded `m.Runtime != nil` for exactly that reason.
+- Reporters on the three runtimes that differ from the Docker-shaped default: `TmuxRuntime`
+  (no images at all), `KubernetesRuntime` and `CloudRunRuntime` (images, but pulled on the node,
+  so a local existence check answers nothing). Docker/Podman/Apple Container stay untouched and
+  keep the default.
+
+Only fields with a real caller are included. A capability nobody reads is undetectable when wrong,
+which is how the reverted overlay shipped half-wired. `WorkspaceSync` was drafted and dropped for
+that reason: its only consumer would be `cmd/sync.go:261`, where the tmux runtime returns `nil`
+from `Sync` so `scion sync` reports success while doing nothing — a real bug, but fixing it is a
+user-visible UX change unrelated to this task. Flagged, not changed.
+
+### Consumers wired (all in `pkg/agent/run.go`)
+
+1. The local-image check no longer keys on a hardcoded name list
+   (`"docker" || "podman" || "container" || "apple-container"`) but on `LocalImageStore`. That list
+   carried a dead entry: `AppleContainerRuntime.Name()` is `"container"`, never `"apple-container"`
+   — the kind of silent drift a self-describing runtime cannot produce.
+2. `no container image resolved` is no longer fatal for a runtime without images. Host-execution
+   harness-configs currently name an image nobody uses, purely to satisfy this check.
+3. The pre-launch `ImageExists`/`PullImage` pair now runs only when the runtime has images. This
+   check was unconditional, and it is *why* `TmuxRuntime.ImageExists` returns `true, nil`: a
+   runtime with no images had no way to say the question did not apply, so it lied to stop the
+   pull from firing. The stub stays for callers holding a bare `Runtime`; callers that consult
+   capabilities no longer need it.
+
+### Verification
+
+`TestCapabilities_LocalImageStoreMatchesReplacedNameList` pins the refactor to the same answer the
+name list gave for every runtime it covered, so a behaviour change has to be deliberate. Removing
+the tmux reporter makes it and `TestCapabilitiesOf_Reporters/tmux` fail — checked by stash, not
+assumed. The `pkg/agent` suite has 4 pre-existing failures (`TestProvisionAgent*`,
+`TestProvisionGeminiAgentSettings`), identical on the clean base — verified by stashing all six
+changed files, including moving the two untracked ones aside, after a first attempt silently
+stashed nothing and produced a worthless comparison.
+
+End to end on the local hub: a `claude-tmux` agent created, started (`RUNTIME=tmux`), booted in
+tmux window `global--cap-e2e#` under the branch `sciontool`, and torn down cleanly — with the image
+checks now skipped rather than answered by a stub.
+
+### Correction to this document
+
+Item 5 above (`pkg/agent/provision.go`'s `harness.Resolve` "intentionally left without
+`RuntimeName`") is stale: the code at `provision.go:838-853` now passes it from context. The
+inline comment claiming otherwise went with the change and the doc did not.

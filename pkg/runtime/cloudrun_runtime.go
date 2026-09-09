@@ -114,6 +114,17 @@ func NewCloudRunRuntimeFromInstances(cfg *config.V1CloudRunInstancesConfig) (*Cl
 
 func (r *CloudRunRuntime) Name() string { return "cloudrun" }
 
+var _ CapabilityReporter = (*CloudRunRuntime)(nil)
+
+// Capabilities reports images without a local store: Cloud Run pulls from the
+// registry at deploy time, so a local existence check is meaningless here.
+func (r *CloudRunRuntime) Capabilities() Capabilities {
+	return Capabilities{
+		Images:          true,
+		LocalImageStore: false,
+	}
+}
+
 func (r *CloudRunRuntime) ExecUser() string {
 	return "scion"
 }
