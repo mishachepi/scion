@@ -251,6 +251,21 @@ func resolveManifestHomePaths(m *containerProvisionManifest, home string) {
 	m.Outputs.ResolvedAuth = resolve(m.Outputs.ResolvedAuth)
 	m.Outputs.Status = resolve(m.Outputs.Status)
 
+	// The provisioner command is the last path in the manifest that a
+	// harness-config author writes by hand, so it is the one place a literal
+	// container path still appears (`/home/scion/.scion/harness/provision.py`).
+	// Resolving $HOME here lets a single config.yaml name its script once and
+	// run correctly wherever the agent's home actually is — the container's
+	// /home/scion or a host directory under the tmux runtime.
+	//
+	// Elements without the prefix, including the interpreter ("python3", found
+	// via PATH), are left untouched.
+	if m.HarnessConfig.Provisioner != nil {
+		for i, arg := range m.HarnessConfig.Provisioner.Command {
+			m.HarnessConfig.Provisioner.Command[i] = resolve(arg)
+		}
+	}
+
 	if m.Inputs != nil {
 		resolved := make(map[string]string, len(m.Inputs))
 		for k, v := range m.Inputs {
