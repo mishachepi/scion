@@ -31,7 +31,7 @@ The external, vendor-supplied agent software that Scion drives, such as Claude C
 A named, reusable, harness-specific resource that configures a particular harness — which harness, plus its image, auth, secrets, model settings, and skills. The harness-specific counterpart to the (harness-agnostic) **Template**.
 
 ### Container-script provisioner
-The script-based provisioning model (`provisioner.type: container-script`) by which a harness-config extends agent setup with a container-side `provision.py`, making harness provisioning extensible — as opposed to a compiled-in (built-in) provisioner.
+The script-based provisioning model (`provisioner.type: container-script`) by which a harness-config extends agent setup with its own `provision.py`, making harness provisioning extensible — as opposed to a compiled-in (built-in) provisioner. The script runs in the agent's environment, wherever that is: inside the container for container runtimes, and on the host under the tmux runtime. Name it with a `$HOME`-relative path so one config.yaml works in both.
 
 ### Skill
 A reusable, harness-agnostic instruction snippet contributed by a template and mounted into the harness's skills directory at provisioning. Follows the open [Agent Skills](https://agentskills.io/home) convention.

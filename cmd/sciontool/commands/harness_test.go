@@ -368,6 +368,49 @@ func TestResolveManifestHomePaths(t *testing.T) {
 	}
 }
 
+// The provisioner command is the one manifest path a harness-config author
+// writes by hand, and it used to be a literal container path. Under the tmux
+// runtime the agent home is a host directory, so an unresolved
+// /home/scion/... aborted startup with "can't open file ... No such file or
+// directory" — reproduced live on 2026-09-10 before this resolution existed.
+func TestResolveManifestHomePaths_ProvisionerCommand(t *testing.T) {
+	agentHome := "/Users/mch/.scion/agents/probe/home"
+	m := &containerProvisionManifest{
+		HarnessConfig: containerHarnessCfg{
+			Harness: "claude",
+			Provisioner: &containerProvisioner{
+				Type:    "container-script",
+				Command: []string{"python3", "$HOME/.scion/harness/provision.py"},
+			},
+		},
+	}
+
+	resolveManifestHomePaths(m, agentHome)
+
+	got := m.HarnessConfig.Provisioner.Command
+	want := []string{"python3", agentHome + "/.scion/harness/provision.py"}
+	if len(got) != len(want) {
+		t.Fatalf("Command = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			// The interpreter must survive untouched: it is resolved via PATH,
+			// not as a path under the agent home.
+			t.Errorf("Command[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// A manifest without a provisioner block must not panic — the field is
+// optional and builtin provisioners carry no command at all.
+func TestResolveManifestHomePaths_NoProvisioner(t *testing.T) {
+	m := &containerProvisionManifest{AgentHome: "$HOME"}
+	resolveManifestHomePaths(m, "/home/scion")
+	if m.AgentHome != "/home/scion" {
+		t.Errorf("AgentHome = %q, want /home/scion", m.AgentHome)
+	}
+}
+
 func TestScrubSecrets_RedactsAuthCandidateValues(t *testing.T) {
 	home := t.TempDir()
 	bundle := filepath.Join(home, ".scion", "harness")
