@@ -281,6 +281,41 @@ profiles:
 		}
 	})
 
+	// runtimes.<name>.env must reach TmuxRuntime.Env — this is the plumbing
+	// that lets an operator inject fleet-wide session env (e.g.
+	// DISABLE_AUTOUPDATER=1 to stop per-agent-HOME claude store bloat).
+	t.Run("Tmux_Env_Plumbed", func(t *testing.T) {
+		tmpHome := t.TempDir()
+		t.Setenv("HOME", tmpHome)
+		globalDir := filepath.Join(tmpHome, ".scion")
+		if err := os.MkdirAll(globalDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		settings := `
+schema_version: "1"
+active_profile: tmux
+runtimes:
+  tmux:
+    type: tmux
+    env:
+      DISABLE_AUTOUPDATER: "1"
+profiles:
+  tmux:
+    runtime: tmux
+`
+		if err := os.WriteFile(filepath.Join(globalDir, "settings.yaml"), []byte(settings), 0644); err != nil {
+			t.Fatal(err)
+		}
+		r := GetRuntime("", "")
+		tr, ok := r.(*TmuxRuntime)
+		if !ok {
+			t.Fatalf("expected *TmuxRuntime, got %T", r)
+		}
+		if got := tr.Env["DISABLE_AUTOUPDATER"]; got != "1" {
+			t.Errorf("Env[DISABLE_AUTOUPDATER] = %q, want %q (runtimes.tmux.env not plumbed)", got, "1")
+		}
+	})
+
 	t.Run("Tmux_HomeMode_InvalidRejected", func(t *testing.T) {
 		tmpHome := t.TempDir()
 		t.Setenv("HOME", tmpHome)
