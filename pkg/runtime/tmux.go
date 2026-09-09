@@ -32,11 +32,9 @@ import (
 // is unset.
 const DefaultTmuxSession = "scion"
 
-// HomeMode values for TmuxRuntime.HomeMode. Empty defaults to HomeModeAgent.
-const (
-	HomeModeAgent  = "agent"
-	HomeModeSystem = "system"
-)
+// HomeModeAgent is the only supported TmuxRuntime.HomeMode: the agent's HOME
+// is overridden to its own agent home. Empty defaults to it.
+const HomeModeAgent = "agent"
 
 // User-option key namespaces. tmux requires user-option names to start with "@".
 const (
@@ -76,18 +74,17 @@ type TmuxRuntime struct {
 	Session string
 
 	// PreStartScript is invoked before each new-window with arguments
-	// <agentHome> <operator-$HOME>. Skipped in HomeModeSystem.
+	// <agentHome> <operator-$HOME>.
 	PreStartScript string
 
 	// HomeMode controls HOME and env injection. See V1RuntimeConfig.HomeMode.
+	// HomeModeAgent is the only supported value.
 	HomeMode string
 
 	// Env holds operator-configured environment variables from
 	// V1RuntimeConfig.Env (settings.yaml `runtimes.<name>.env`), injected
-	// into every new session in HomeModeAgent. Emitted before per-agent
-	// RunConfig.Env and resolved secrets, so both can override. Ignored in
-	// HomeModeSystem, which exports exactly SCION_AGENT_HOME and nothing
-	// more.
+	// into every new session. Emitted before per-agent RunConfig.Env and
+	// resolved secrets, so both can override.
 	Env map[string]string
 
 	// Sciontool is an absolute sciontool-binary path used to wrap each
@@ -255,17 +252,15 @@ func (r *TmuxRuntime) buildNewWindowArgs(config RunConfig, session string) ([]st
 	args = append(args, r.buildEnvFlags(config)...)
 	// Harnesses emit container-side paths (e.g. /home/scion/.gemini/...);
 	// rewrite to host-side agentHome so they resolve under tmux.
-	if r.HomeMode != HomeModeSystem {
-		containerHome := util.GetHomeDir(config.UnixUsername)
-		for k, v := range harnessEnv {
-			if k == "" || v == "" {
-				continue
-			}
-			if containerHome != "" && strings.HasPrefix(v, containerHome+"/") {
-				v = config.HomeDir + v[len(containerHome):]
-			}
-			args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
+	containerHome := util.GetHomeDir(config.UnixUsername)
+	for k, v := range harnessEnv {
+		if k == "" || v == "" {
+			continue
 		}
+		if containerHome != "" && strings.HasPrefix(v, containerHome+"/") {
+			v = config.HomeDir + v[len(containerHome):]
+		}
+		args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
 	}
 	// -P -F prints the new window_id on stdout.
 	args = append(args, "-P", "-F", "#{window_id}")
@@ -352,14 +347,9 @@ func (r *TmuxRuntime) runtimeEnvEntries() []string {
 	return entries
 }
 
-// buildEnvFlags produces tmux -e KEY=VAL flags. SCION_AGENT_HOME is always
-// emitted; everything else depends on r.HomeMode. HomeModeSystem returns
-// exactly `-e SCION_AGENT_HOME=<agentHome>` and nothing more.
+// buildEnvFlags produces tmux -e KEY=VAL flags: HOME points at the agent home,
+// alongside SCION_AGENT, SCION_AGENT_HOME and the project identifiers.
 func (r *TmuxRuntime) buildEnvFlags(config RunConfig) []string {
-	if r.HomeMode == HomeModeSystem {
-		return []string{"-e", fmt.Sprintf("SCION_AGENT_HOME=%s", config.HomeDir)}
-	}
-
 	entries := []string{
 		fmt.Sprintf("HOME=%s", config.HomeDir),
 		fmt.Sprintf("SCION_AGENT=%s", config.Name),
@@ -552,16 +542,9 @@ func (r *TmuxRuntime) windowExists(ctx context.Context, id string) bool {
 }
 
 // runPreStartScript invokes PreStartScript with arguments <agentHome>
-// <operator-$HOME>. Skipped in HomeModeSystem (operator HOME is already
-// inherited; the bridge would be redundant).
+// <operator-$HOME>.
 func (r *TmuxRuntime) runPreStartScript(ctx context.Context, agentHome string) error {
 	if r.PreStartScript == "" {
-		return nil
-	}
-	if r.HomeMode == HomeModeSystem {
-		fmt.Fprintf(os.Stderr,
-			"Warning: tmux runtime: pre_start_script %q skipped in home_mode=system (operator HOME is preserved natively)\n",
-			r.PreStartScript)
 		return nil
 	}
 	operatorHome := os.Getenv("HOME")

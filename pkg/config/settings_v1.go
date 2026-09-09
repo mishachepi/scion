@@ -924,9 +924,9 @@ type V1RuntimeConfig struct {
 	// arguments <agentHome> <operator-$HOME>. Tmux only.
 	PreStartScript string `json:"pre_start_script,omitempty" yaml:"pre_start_script,omitempty" koanf:"pre_start_script"`
 
-	// HomeMode controls HOME handling for tmux-runtime agents.
-	// "agent" (default; HOME=<agentHome>) for full isolation.
-	// "system" preserves operator HOME and only exports SCION_AGENT_HOME.
+	// HomeMode controls HOME handling for tmux-runtime agents. "agent"
+	// (default, and the only accepted value) sets HOME=<agentHome> for full
+	// isolation.
 	HomeMode string `json:"home_mode,omitempty" yaml:"home_mode,omitempty" koanf:"home_mode"`
 
 	// Sciontool is the absolute path to the sciontool binary used to wrap

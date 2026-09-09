@@ -250,7 +250,7 @@ active_profile: apple
 		}
 	})
 
-	t.Run("Tmux_HomeMode_System", func(t *testing.T) {
+	t.Run("Tmux_HomeMode_SystemRejected", func(t *testing.T) {
 		tmpHome := t.TempDir()
 		t.Setenv("HOME", tmpHome)
 		globalDir := filepath.Join(tmpHome, ".scion")
@@ -272,12 +272,12 @@ profiles:
 			t.Fatal(err)
 		}
 		r := GetRuntime("", "")
-		tr, ok := r.(*TmuxRuntime)
+		er, ok := r.(*ErrorRuntime)
 		if !ok {
-			t.Fatalf("expected *TmuxRuntime, got %T", r)
+			t.Fatalf("expected *ErrorRuntime, got %T", r)
 		}
-		if tr.HomeMode != HomeModeSystem {
-			t.Errorf("HomeMode = %q, want %q", tr.HomeMode, HomeModeSystem)
+		if !strings.Contains(er.Err.Error(), "invalid home_mode") {
+			t.Errorf("error = %v, want invalid home_mode", er.Err)
 		}
 	})
 
