@@ -1038,7 +1038,7 @@ func TestTmuxRuntime_BuildEnvFlags_AgentModeDefaultBackCompat(t *testing.T) {
 }
 
 func TestTmuxRuntime_BuildEnvFlags_ScionAgentHomeAlwaysSet(t *testing.T) {
-	for _, mode := range []string{"", HomeModeAgent, HomeModeSystem} {
+	for _, mode := range []string{"", HomeModeAgent} {
 		t.Run("mode="+mode, func(t *testing.T) {
 			r := &TmuxRuntime{HomeMode: mode}
 			flags := r.buildEnvFlags(RunConfig{HomeDir: "/agent-home", Name: "a"})
@@ -1049,14 +1049,11 @@ func TestTmuxRuntime_BuildEnvFlags_ScionAgentHomeAlwaysSet(t *testing.T) {
 	}
 }
 
-// SystemMode = absolute minimum. Exactly one -e flag, exactly SCION_AGENT_HOME.
-// No HOME, no SCION_AGENT, no SCION_PROJECT, no Env passthrough, no resolved
-// secrets, no *_CONFIG_DIR, nothing else. Load-bearing contract for the mode.
-func TestTmuxRuntime_BuildEnvFlags_SystemModeOnlyScionAgentHome(t *testing.T) {
-	r := &TmuxRuntime{
-		HomeMode: HomeModeSystem,
-		Env:      map[string]string{"DISABLE_AUTOUPDATER": "1"},
-	}
+// Agent mode owns the agent's environment: HOME is redirected to the agent
+// home, and project/secret/harness env all pass through. Load-bearing contract
+// — the tmux runtime never leaks the operator's HOME to an agent.
+func TestTmuxRuntime_BuildEnvFlags_AgentModeOwnsEnvironment(t *testing.T) {
+	r := &TmuxRuntime{HomeMode: HomeModeAgent}
 	flags := r.buildEnvFlags(RunConfig{
 		HomeDir:   "/agent-home",
 		Name:      "agent-1",
@@ -1068,9 +1065,18 @@ func TestTmuxRuntime_BuildEnvFlags_SystemModeOnlyScionAgentHome(t *testing.T) {
 		},
 		Harness: &stubHarness{name: "claude"},
 	})
-	want := []string{"-e", "SCION_AGENT_HOME=/agent-home"}
-	if !slices.Equal(flags, want) {
-		t.Errorf("system mode buildEnvFlags = %v, want %v (exactly one entry)", flags, want)
+	for _, want := range []string{
+		"HOME=/agent-home",
+		"SCION_AGENT=agent-1",
+		"SCION_AGENT_HOME=/agent-home",
+		"SCION_PROJECT=myproj",
+		"SCION_PROJECT_ID=id-7",
+		"FOO=bar",
+		"ANTHROPIC_API_KEY=sk-test",
+	} {
+		if !slices.Contains(flags, want) {
+			t.Errorf("agent mode buildEnvFlags missing %q: %v", want, flags)
+		}
 	}
 }
 
@@ -1106,28 +1112,6 @@ func TestTmuxRuntime_BuildEnvFlags_RuntimeEnvEmittedSortedAndOverridable(t *test
 		if strings.Contains(kv, "dropped-empty-key") {
 			t.Errorf("empty-key entry leaked: %v", flags)
 		}
-	}
-}
-
-// SystemMode also suppresses harness env passthrough done in buildNewWindowArgs.
-func TestTmuxRuntime_BuildNewWindowArgs_SystemModeSkipsHarnessEnv(t *testing.T) {
-	r := &TmuxRuntime{Command: "tmux", Session: "scion", HomeMode: HomeModeSystem}
-	args, err := r.buildNewWindowArgs(RunConfig{
-		Name:    "agent-1",
-		HomeDir: "/agent-home",
-		Harness: &MockHarness{},
-	}, r.Session)
-	if err != nil {
-		t.Fatalf("buildNewWindowArgs: %v", err)
-	}
-	eCount := 0
-	for _, a := range args {
-		if a == "-e" {
-			eCount++
-		}
-	}
-	if eCount != 1 {
-		t.Errorf("system mode emitted %d -e flags, want exactly 1 (SCION_AGENT_HOME): args=%v", eCount, args)
 	}
 }
 
@@ -1282,25 +1266,22 @@ func TestResolveSciontool(t *testing.T) {
 	}
 }
 
-func TestTmuxRuntime_RunPreStartScript_SkippedInSystemMode(t *testing.T) {
+// The pre-start bridge always runs when configured: it is the only channel by
+// which operator-side state reaches an agent home.
+func TestTmuxRuntime_RunPreStartScript_RunsInAgentMode(t *testing.T) {
 	tmp := t.TempDir()
-	scriptPath := filepath.Join(tmp, "should-not-run.sh")
+	scriptPath := filepath.Join(tmp, "should-run.sh")
 	canary := filepath.Join(tmp, "canary.txt")
 	body := "#!/bin/sh\ntouch " + canary + "\nexit 0\n"
 	if err := os.WriteFile(scriptPath, []byte(body), 0o755); err != nil {
 		t.Fatalf("write script: %v", err)
 	}
-	r := &TmuxRuntime{PreStartScript: scriptPath, HomeMode: HomeModeSystem}
-	stderr := captureStderr(t, func() {
-		if err := r.runPreStartScript(context.Background(), "/tmp/agent-home"); err != nil {
-			t.Fatalf("runPreStartScript: %v", err)
-		}
-	})
-	if _, err := os.Stat(canary); err == nil {
-		t.Errorf("script must not run in system mode (canary created)")
+	r := &TmuxRuntime{PreStartScript: scriptPath, HomeMode: HomeModeAgent}
+	if err := r.runPreStartScript(context.Background(), "/tmp/agent-home"); err != nil {
+		t.Fatalf("runPreStartScript: %v", err)
 	}
-	if !strings.Contains(stderr, "skipped in home_mode=system") {
-		t.Errorf("stderr should warn about skipped script; got %q", stderr)
+	if _, err := os.Stat(canary); err != nil {
+		t.Errorf("script must run in agent mode (canary missing): %v", err)
 	}
 }
 

@@ -3551,7 +3551,7 @@ func TestValidateSettings_TmuxHomeModeEnum(t *testing.T) {
 		wantErr bool
 	}{
 		{"agent", false},
-		{"system", false},
+		{"system", true}, // removed mode — must fail closed, not silently accept
 		{"mixed", true},
 		{"nonsense", true},
 		{"AGENT", true}, // case-sensitive enum
