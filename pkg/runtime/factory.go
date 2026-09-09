@@ -258,6 +258,9 @@ func (s runtimeSelection) build() Runtime {
 				rtConfig.HomeMode, HomeModeAgent, HomeModeSystem)}
 		}
 		tr.Sciontool = resolveSciontool(rtConfig.Sciontool)
+		if len(rtConfig.Env) > 0 {
+			tr.Env = rtConfig.Env
+		}
 		return tr
 	case "container":
 		return NewAppleContainerRuntime()
