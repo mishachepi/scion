@@ -17,7 +17,6 @@ package transfer
 import (
 	"fmt"
 	"io/fs"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -31,12 +30,22 @@ import (
 // one pattern covers both layouts. A bare ".scion" pattern is deliberately
 // absent: simple patterns also match by basename, which would drop nested
 // .scion entries that are ordinary workspace content.
+//
+// The macOS entries matter for projects that sit at the root of a volume
+// (/Volumes/<name>): the OS keeps its own bookkeeping directories there, they
+// are never part of a workspace, and .Trashes is not even readable by its
+// owner (mode d-wx--x--t), so walking into it fails outright.
 var DefaultExcludePatterns = []string{
 	".git",
 	".git/**",
 	".DS_Store",
 	"**/.DS_Store",
 	".scion/**",
+	".Trashes",
+	".fseventsd",
+	".Spotlight-V100",
+	".DocumentRevisions-V100",
+	".TemporaryItems",
 }
 
 // ManifestBuilder builds a manifest from local files.
@@ -115,9 +124,14 @@ func (b *ManifestBuilder) CollectFiles() ([]FileInfo, error) {
 			return nil
 		}
 
-		// Skip symlinks — they may be dangling (e.g. .claude/debug/latest)
-		// and cannot be meaningfully transferred between environments.
-		if d.Type()&os.ModeSymlink != 0 {
+		// Only regular files can be hashed and transferred. This covers
+		// symlinks, which may be dangling (e.g. .claude/debug/latest), and
+		// equally sockets, FIFOs and device nodes: opening a unix socket
+		// returns "operation not supported on socket" and used to abort the
+		// entire walk. Live agent homes contain such sockets (keyring and
+		// gpg-agent control files), so any project holding one was
+		// uncollectable.
+		if !d.Type().IsRegular() {
 			return nil
 		}
 
