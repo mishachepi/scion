@@ -26,8 +26,7 @@ package runtime
 // wrong question and the runtime cannot say "that does not apply to me".
 //
 // Every field here must have a real caller. A capability nobody reads is
-// undetectable when it is wrong, which is how the reverted runtime_overlays
-// mechanism shipped half-wired.
+// undetectable when it is wrong.
 type Capabilities struct {
 	// Images reports whether the agent's filesystem comes from a container
 	// image. When false, an image name is neither required nor meaningful:

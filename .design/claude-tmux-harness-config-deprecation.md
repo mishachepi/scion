@@ -386,3 +386,58 @@ checks now skipped rather than answered by a stub.
 Item 5 above (`pkg/agent/provision.go`'s `harness.Resolve` "intentionally left without
 `RuntimeName`") is stale: the code at `provision.go:838-853` now passes it from context. The
 inline comment claiming otherwise went with the change and the doc did not.
+
+## Step 5 done — the overlay mechanism is gone from the branch
+
+`runtime_overlays` and the home-overlay copy are removed. They were never pushed anywhere, so the
+removal is a history rewrite rather than a revert commit: rebasing this branch onto
+`origin/tmux-unsafe` dropped the three commits that carried them, and every later commit was
+replayed on top.
+
+Everything the sections above describe under **Implemented** — `e7a3fce3`, `14732ad1`, `8376541a` —
+therefore no longer exists on this branch. Those hashes resolve only in the pre-sync backup tag.
+The sections stay because they record why the mechanism was built and what building it revealed;
+they do not describe current code.
+
+What the removal restores:
+
+- `HarnessConfigEntry` loses the `runtime_overlays` field, and `pkg/harness/resolve.go` loses the
+  merge logic that applied it.
+- `pkg/agent/provision.go` loses the runtime-aware home-overlay directory copy and `pkg/api`
+  the types that carried it.
+- `harnesses/claude/config.yaml` loses the `runtime_overlays.tmux` block, along with the
+  `home-overlays/tmux/**` skeleton it pointed at. The config is back to one shape for every
+  runtime, plus the `$HOME`-relative provisioner command from step 2.
+
+The measurable effect: the four `TestClaude*` failures in `pkg/harness` are gone. They were red
+because `harnesses/claude/config.yaml` no longer validated against the settings schema — the
+in-tree symptom of the same defect the smoke test hit on the fleet. `pkg/harness` is green.
+
+### Verification
+
+Full `go test ./pkg/... ./cmd/...` on this branch and on `origin/tmux-unsafe`, failure sets
+compared: identical, package for package (`pkg/agent`, `pkg/config`, `pkg/hub`, `pkg/hubsync`) —
+all pre-existing on the shared branch, none introduced here. At test-name granularity for the
+three fast packages the two runs differ only in reported durations. `pkg/harness`, red before the
+rebase, is green on both.
+
+## Synced with the shared branch (2026-09-10)
+
+This branch had drifted onto an old base: its merge-base with `upstream/main` was `25714622`
+(late August), while `origin/tmux-unsafe` had been rebased forward and carried five commits of
+parallel work this branch lacked, including `runtimes.<name>.env` plumbing into tmux sessions.
+
+The nine commits unique to this line were replayed onto `origin/tmux-unsafe`. Two conflicts, both
+real overlaps rather than noise:
+
+1. `pkg/runtime/tmux.go` / `tmux_test.go` — the parallel `runtimeEnvEntries` helper landed in the
+   same region as the `home_mode=system` removal. Resolved by keeping both: the helper, the
+   agent-mode env contract test, and the runtime-env ordering test. The system-mode tests went
+   with the mode.
+2. `pkg/runtime/cloudrun_runtime.go` — the shared branch carries a newer Cloud Run Instances
+   implementation. Only the capability reporter was carried over onto it.
+
+`origin/tmux-unsafe` itself is 35 commits behind `upstream/main`. Pulling it forward rewrites a
+branch someone else is working on, so that is a shared decision, not a local one. One of those 35
+is directly relevant here: `84c58a44 fix(harness/claude): remove invalid settings that block agent
+startup (#1513)`.
