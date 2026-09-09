@@ -15,20 +15,30 @@
 package transfer
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 )
 
 // DefaultExcludePatterns are patterns commonly excluded from file transfers.
+//
+// The macOS entries matter for projects that sit at the root of a volume
+// (/Volumes/<name>): the OS keeps its own bookkeeping directories there, they
+// are never part of a workspace, and .Trashes is not even readable by its
+// owner (mode d-wx--x--t), so walking into it fails outright.
 var DefaultExcludePatterns = []string{
 	".git",
 	".git/**",
 	".DS_Store",
 	"**/.DS_Store",
+	".Trashes",
+	".fseventsd",
+	".Spotlight-V100",
+	".DocumentRevisions-V100",
+	".TemporaryItems",
 }
 
 // ManifestBuilder builds a manifest from local files.
@@ -77,6 +87,18 @@ func (b *ManifestBuilder) CollectFiles() ([]FileInfo, error) {
 
 	err := filepath.WalkDir(b.BasePath, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
+			// One unreadable entry must not abort the whole walk. Without this,
+			// a single directory the process cannot open — .Trashes on a macOS
+			// volume root is the case seen in the wild — makes CollectFiles
+			// return zero files and an error, and every `scion start` in that
+			// project fails. Such an entry cannot be transferred anyway, so
+			// skipping it loses nothing that was ever available.
+			//
+			// The base path stays fatal: if the root itself is unreadable there
+			// is no workspace to collect and the caller must hear about it.
+			if errors.Is(err, fs.ErrPermission) && path != b.BasePath {
+				return nil
+			}
 			return err
 		}
 
@@ -107,9 +129,14 @@ func (b *ManifestBuilder) CollectFiles() ([]FileInfo, error) {
 			return nil
 		}
 
-		// Skip symlinks — they may be dangling (e.g. .claude/debug/latest)
-		// and cannot be meaningfully transferred between environments.
-		if d.Type()&os.ModeSymlink != 0 {
+		// Only regular files can be hashed and transferred. This covers
+		// symlinks, which may be dangling (e.g. .claude/debug/latest), and
+		// equally sockets, FIFOs and device nodes: opening a unix socket
+		// returns "operation not supported on socket" and used to abort the
+		// entire walk. Live agent homes contain such sockets (keyring and
+		// gpg-agent control files), so any project holding one was
+		// uncollectable.
+		if !d.Type().IsRegular() {
 			return nil
 		}
 
