@@ -27,15 +27,25 @@ if [ "$(uname)" = "Darwin" ]; then
 fi
 
 # Claude
-[ -f "$OP_HOME/.claude.json" ] && ln -snf "$OP_HOME/.claude.json" "$AGENT_HOME/.claude.json"
+# Deliberately NOT linked: ~/.claude.json. The harness-config home skeleton
+# seeds the agent's own copy (onboarding + bypass-mode acceptance), and the
+# provisioner keys project trust into it; a symlink to the operator's file
+# would clobber that seed. Credentials arrive via auth-file staging
+# (~/.claude/.credentials.json), not through .claude.json.
 
 mkdir -p "$AGENT_HOME/.claude"
+# Per-agent REAL session store (never a symlink): claude --resume dies when
+# the pinned transcript's projects dir is absent, and sharing the operator's
+# store cross-contaminates resume between agents.
+mkdir -p "$AGENT_HOME/.claude/projects"
 if [ -d "$OP_HOME/.claude" ]; then
     for entry in "$OP_HOME/.claude/"* "$OP_HOME/.claude/".[!.]*; do
         name=$(basename "$entry")
         case "$name" in
             "*"|".[!.]*"|"."|"..") continue ;;
             CLAUDE.md|skills|system-prompt.md) continue ;;  # scion-provisioned
+            projects) continue ;;  # per-agent session store — sharing it cross-contaminates resume
+            settings.json|settings.local.json) continue ;;  # seeded by harness-config; operator settings must not leak into agents
         esac
         [ -e "$entry" ] || continue
         [ -e "$AGENT_HOME/.claude/$name" ] && continue
