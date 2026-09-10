@@ -760,5 +760,30 @@ class TestOriginalAPI(unittest.TestCase):
             self.assertIn("scion_harness: test warning", fake_stderr.getvalue())
 
 
+class TestWorkspaceResolution(unittest.TestCase):
+    """ctx.workspace: manifest value, then SCION_AGENT_WORKSPACE, then the
+    container literal. The env fallback is what carries the real path when
+    the manifest omits agent_workspace (shared-workspace mode)."""
+
+    def _ctx(self, manifest):
+        return sh.ProvisionContext("claude", manifest)
+
+    def test_manifest_value_wins(self):
+        with mock.patch.dict(os.environ, {"SCION_AGENT_WORKSPACE": "/from-env"}):
+            ctx = self._ctx({"agent_workspace": "/from-manifest"})
+            self.assertEqual(ctx.workspace, "/from-manifest")
+
+    def test_env_fallback_when_manifest_empty(self):
+        with mock.patch.dict(os.environ, {"SCION_AGENT_WORKSPACE": "/from-env"}):
+            ctx = self._ctx({})
+            self.assertEqual(ctx.workspace, "/from-env")
+
+    def test_container_literal_is_last_resort(self):
+        env = {k: v for k, v in os.environ.items() if k != "SCION_AGENT_WORKSPACE"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            ctx = self._ctx({})
+            self.assertEqual(ctx.workspace, "/workspace")
+
+
 if __name__ == "__main__":
     unittest.main()
