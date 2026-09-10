@@ -441,3 +441,52 @@ real overlaps rather than noise:
 branch someone else is working on, so that is a shared decision, not a local one. One of those 35
 is directly relevant here: `84c58a44 fix(harness/claude): remove invalid settings that block agent
 startup (#1513)`.
+
+## Stand campaign (2026-09-10 evening) — stock `claude` under tmux, full boot matrix
+
+Local hub on build `009c0caf`+`d9220199`, stock `claude` harness-config, tmux runtime. Every
+claim below was watched live on agents t1–t5; probes were deleted afterwards.
+
+**What now demonstrably works, stock, under tmux:** create → provision (`method=auth-file`) →
+harness boots to a working REPL with **no trust dialog and no bypass dialog**; instructions land
+on the native path (`~/.claude/CLAUDE.md`) and the agent confirms them in context; `HOME` is the
+agent home and cwd the workspace at the process level; suspend → resume relaunches with
+`--resume <exact-session-uuid>` (captured by the SessionStart hook); duplicate create/start is
+refused by the hub (409) with no window duplication.
+
+**Root cause found and fixed (`d9220199`):** in shared-workspace mode the manifest carries an
+empty `agent_workspace`, and the script-side fallback is the container literal `/workspace` —
+so Claude Code's project trust was keyed to a directory the harness never runs in, and every
+boot re-asked the trust wizard. The pre-start hook runs in the agent's environment with cwd =
+the workspace in both worlds (container WORKDIR, `tmux new-window -c`), so sciontool now fills
+the empty field from cwd (byte-identical in containers) and `ProvisionContext.workspace` gains
+an env fallback. Suppressing the trust wizard also suppresses the bypass-mode dialog — they are
+one first-run flow.
+
+**The `.claude.json` skeleton mystery, resolved as not-a-bug:** a 100ms-poll of the file during
+boot shows the skeleton arrive (1007B, `bypassPermissionsModeAccepted: true`), the provisioner
+merge preserve it, and then Claude Code itself rewrite its state without the key — it is a
+legacy key (2.1.197-era) the current version consumes and migrates. The operator's own
+`.claude.json` and a long-running fleet agent's both lack it too. Boot is promptless regardless.
+
+**The operator bridge (`pre_start`) was the third layer of the old model, and it must shrink:**
+the fleet script symlinks the operator's `~/.claude.json` over the agent's, which used to be the
+auth mechanism under `claude-tmux`+builtin, but under the real provisioner it only destroys the
+skeleton seed (provision.py then reads operator content through the symlink and atomically
+replaces it — the operator's file survives only because the write is tmp+rename). The shipped
+example now documents the boundary: link `~/.claude/.credentials.json` (credential bridge — what
+pre_start is for), never `~/.claude.json`. The fleet script keeps the old symlink until the
+step-6 rollout switches M5/M1 off `claude-tmux`.
+
+**Flagged, not fixed:**
+- `no_auth.behavior: drop-to-shell` only triggers when auth-candidates.json is entirely absent;
+  an empty-candidates file fails provisioning instead (fail-closed, arguably correct, but the
+  config reads as if drop-to-shell would kick in).
+- The hub's storage copy of `claude` (stand: `templates/hubs/.../global/claude`) is stale — old
+  container-literal provisioner command. Local `~/.scion/harness-configs` won today; a broker
+  that falls back to hub storage regresses. Step-6 rollout must refresh hub storage too.
+- `claude.provision_test.ModelResolutionTest` is red (3F+8E) on the shared branch independent of
+  this work — verified identical on the parent commit.
+- The upstream fix `6591cf14` (#1447, as_needed secret keys → broker env-gather) is among the 35
+  commits `origin/tmux-unsafe` is behind; without it the hub's `CLAUDE_CODE_OAUTH_TOKEN`
+  (as_needed) never reaches a tmux agent, which is why auth rides the file bridge today.
