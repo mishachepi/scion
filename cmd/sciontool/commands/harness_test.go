@@ -431,3 +431,77 @@ func TestScrubSecrets_RedactsAuthCandidateValues(t *testing.T) {
 		t.Errorf("missing redaction marker: %q", scrubbed)
 	}
 }
+
+// A manifest without agent_workspace (shared-workspace mode) must hand the
+// provisioner the hook's working directory, not nothing: the script-side
+// fallback is the container literal "/workspace", which is wrong everywhere
+// but a container. The hook runs with cwd = the workspace in both worlds
+// (container WORKDIR, tmux new-window -c), so cwd is the honest value.
+func TestRunHarnessProvision_EmptyWorkspaceFallsBackToCwd(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	bundle := filepath.Join(home, ".scion", "harness")
+	if err := os.MkdirAll(filepath.Join(bundle, "outputs"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	captured := filepath.Join(bundle, "outputs", "seen-workspace")
+	scriptPath := filepath.Join(bundle, "provision.sh")
+	writeTestFile(t, scriptPath, "#!/bin/sh\nprintf '%s' \"$SCION_AGENT_WORKSPACE\" > \""+captured+"\"\nexit 0\n")
+	if err := os.Chmod(scriptPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	manifest := baseManifest(t, home, scriptPath)
+	manifest.AgentWorkspace = ""
+	manifestPath := writeManifest(t, bundle, manifest)
+
+	if err := runHarnessProvision(context.Background(), manifestPath); err != nil {
+		t.Fatalf("runHarnessProvision: %v", err)
+	}
+
+	got, err := os.ReadFile(captured)
+	if err != nil {
+		t.Fatalf("script did not capture SCION_AGENT_WORKSPACE: %v", err)
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != cwd {
+		t.Errorf("SCION_AGENT_WORKSPACE = %q, want the hook cwd %q", got, cwd)
+	}
+}
+
+// A manifest that names its workspace keeps it: the cwd fallback must not
+// second-guess an explicit per-agent workspace path.
+func TestRunHarnessProvision_ExplicitWorkspaceIsNotOverridden(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	bundle := filepath.Join(home, ".scion", "harness")
+	if err := os.MkdirAll(filepath.Join(bundle, "outputs"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	captured := filepath.Join(bundle, "outputs", "seen-workspace")
+	scriptPath := filepath.Join(bundle, "provision.sh")
+	writeTestFile(t, scriptPath, "#!/bin/sh\nprintf '%s' \"$SCION_AGENT_WORKSPACE\" > \""+captured+"\"\nexit 0\n")
+	if err := os.Chmod(scriptPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	manifest := baseManifest(t, home, scriptPath)
+	manifestPath := writeManifest(t, bundle, manifest)
+
+	if err := runHarnessProvision(context.Background(), manifestPath); err != nil {
+		t.Fatalf("runHarnessProvision: %v", err)
+	}
+
+	got, err := os.ReadFile(captured)
+	if err != nil {
+		t.Fatalf("script did not capture SCION_AGENT_WORKSPACE: %v", err)
+	}
+	if want := manifest.AgentWorkspace; string(got) != want {
+		t.Errorf("SCION_AGENT_WORKSPACE = %q, want the manifest value %q", got, want)
+	}
+}

@@ -355,7 +355,16 @@ class ProvisionContext:
 
     @property
     def workspace(self) -> str:
-        return str(self.manifest.get("agent_workspace") or "/workspace")
+        # The manifest omits agent_workspace in shared-workspace mode. The
+        # sciontool wrapper that runs this script exports the real path as
+        # SCION_AGENT_WORKSPACE (falling back to its own working directory),
+        # so prefer that over the container-shaped "/workspace" literal —
+        # which stays only as the last resort for pre-wrapper callers.
+        return str(
+            self.manifest.get("agent_workspace")
+            or os.environ.get("SCION_AGENT_WORKSPACE")
+            or "/workspace"
+        )
 
     @property
     def home(self) -> str:
