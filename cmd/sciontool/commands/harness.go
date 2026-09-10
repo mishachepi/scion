@@ -186,6 +186,25 @@ func runHarnessProvisionSteps(ctx context.Context, manifestPath string, rec *pro
 	manifest.Outputs.ResolvedAuth = dirs.OutputPath(manifest.Outputs.ResolvedAuth)
 	manifest.Outputs.Status = dirs.OutputPath(manifest.Outputs.Status)
 
+	// In shared-workspace mode the manifest carries no agent_workspace: the
+	// broker has no per-agent workspace dir to name, and container-side code
+	// has always fallen back to the literal "/workspace" mount point. That
+	// fallback is a lie outside a container — under the tmux runtime the
+	// harness runs in the real workspace directory, and a provisioner that
+	// keys state to "/workspace" (Claude Code's project trust, MCP project
+	// paths) writes it where the harness will never look. This hook runs in
+	// the agent's own environment with cwd = the workspace (container
+	// WORKDIR /workspace; tmux new-window -c <workspace>), so the working
+	// directory is the honest, runtime-agnostic answer: in a container it
+	// resolves to the same /workspace as before, anywhere else to the real
+	// path.
+	if manifest.AgentWorkspace == "" {
+		if cwd, err := os.Getwd(); err == nil {
+			manifest.AgentWorkspace = cwd
+			log.TaggedInfo("provision", "agent_workspace empty in manifest; using working directory %s", cwd)
+		}
+	}
+
 	if err := validateManifestPaths(manifest, bundleRoot, home, dirs.ExtraRoots()...); err != nil {
 		return err
 	}
