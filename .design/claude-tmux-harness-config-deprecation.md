@@ -289,7 +289,9 @@ The tmux agent does **not** run in the operator's HOME:
 
 - `buildEnvFlags` sets `HOME=config.HomeDir`, the agent's own home (`pkg/runtime/tmux.go:326`).
   `home_mode=system` — the mode that would have preserved the operator's HOME — was removed in
-  `1274ca1b` and was never set in any real settings.yaml on this fleet.
+  `1274ca1b`. (Correction 2026-09-11: "never set in any real settings.yaml on this fleet" was
+  wrong — M1's global settings.yaml carried it in the unused `tmux-hub` profile; the new binary
+  rejects it, and the profile entry was dropped during the step-6 rollout.)
 - Verified live on 2026-09-09: a tmux agent's Claude wrote its session transcript to
   `<agentHome>/.claude/projects/…jsonl`, not to the operator's `~/.claude/projects`.
 - The agent home **is** a provisioned credential path: `serializeSecrets(config.HomeDir, …)`
@@ -490,3 +492,31 @@ step-6 rollout switches M5/M1 off `claude-tmux`.
 - The upstream fix `6591cf14` (#1447, as_needed secret keys → broker env-gather) is among the 35
   commits `origin/tmux-unsafe` is behind; without it the hub's `CLAUDE_CODE_OAUTH_TOKEN`
   (as_needed) never reaches a tmux agent, which is why auth rides the file bridge today.
+
+## 2026-09-11 — Step 6 executed: the fleet left `claude-tmux`
+
+The rollout ran as a two-agent campaign (tmux-unsafe-m5 from M5, epic-scion-tmux on M1/vm3) and
+finished the deprecation in one day:
+
+- **Pointers:** all 40 vault templates' `lsa.harness_config` → `claude`; both
+  `default_harness_config` pointers in the project settings.yaml; hub-storage copy of `claude`
+  refreshed (the stale-copy flag above is resolved); the hub project pre-start hook no longer
+  symlinks `~/.claude.json` (the fourth and last carrier of the legacy bridge).
+- **Binaries:** branch rebased onto `upstream/main` (`ea506bbe`, 52 commits) with the full test
+  gate identical to upstream, pushed as `2e4fb62f`. M5 broker, vm3 hub (native build,
+  `/opt/scion-hub/bin`, systemd restart, both brokers reconnected in ~1s), M1 broker
+  (darwin cross-build on vm3, `~/go/bin`) all run it.
+- **Fleet:** M5 — 7 areas + 3 running epics + orchestrator respawned, 2 parked epics re-recorded;
+  M1 — 16/16 agents migrated (env preserved; `NUTRI_PERSON_DIR` via `--config` inline), then the
+  executor itself respawned last. **0/33 first-run dialogs** — the skeleton + real provisioner
+  boot promptless everywhere.
+- **Found on the way:** vault agents resolve their runtime from the *project*
+  `/Volumes/mch/.scion/settings.yaml` (profile `tmux-obsi`), not the global one — a prior
+  `DISABLE_AUTOUPDATER` env fix sat inactive in the global file; and the broker caches runtime
+  config at start, so `runtimes.<name>.env` edits need a broker restart to reach new sessions.
+- **Upstream candidate:** under an agent-scoped token, `scion start` is denied
+  (`project:template:write`) while `scion stop --rm` is allowed — an asymmetry in the
+  delegation scopes worth a look.
+
+Remaining `claude-tmux` records: none in the running fleet. The `claude-tmux`/`claude-tmux-skills`
+config directories stay on disk as rollback fallback until the operator deletes them.
