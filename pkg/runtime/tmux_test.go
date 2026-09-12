@@ -578,7 +578,7 @@ case "$1" in
 ` + captureOutput + `PANE
     exit 0 ;;
   show-option)
-    option="${@: -1}"
+    for option; do :; done
     case "$option" in
 ` + optCases.String() + `
       *) printf ''; exit 0 ;;
