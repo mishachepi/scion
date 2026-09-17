@@ -77,9 +77,11 @@ func TestContainerScriptHarness_GetCommand_ResumeByID(t *testing.T) {
 	h, _ := newTestContainerScriptHarness(t)
 	// newTestContainerScriptHarness sets ResumeFlag="--resume" but no
 	// ResumeIDFlag; with an id present and no template, must stay on
-	// the bare resume flag (regression check).
+	// the bare resume flag (regression check). Since the harness declares
+	// task_flag, a resume without a task also gains the upstream synthetic
+	// prompt (#1638) — asserted here so the resume tokens stay in focus.
 	got := h.GetCommand("", true, "uuid-1", nil)
-	want := []string{"testcli", "--resume"}
+	want := []string{"testcli", "--resume", "--prompt", "Continue your previous task. Check for pending work or new messages."}
 	if strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Errorf("resume id with no template: got %v want %v", got, want)
 	}
