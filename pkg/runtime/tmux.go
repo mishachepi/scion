@@ -25,6 +25,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
+	"github.com/GoogleCloudPlatform/scion/pkg/stagedsecrets"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 )
 
@@ -136,7 +137,7 @@ func (r *TmuxRuntime) Run(ctx context.Context, config RunConfig) (string, error)
 	}
 
 	warnIgnoredFeatures(config)
-	// Serialize file + variable secrets into the StagedSecretEnvVar blob.
+	// Serialize file + variable secrets into the stagedsecrets.EnvVar blob.
 	// `sciontool init --tmuxruntime` (the wrapper that fronts every harness
 	// in tmux runtime) decodes the env var and writes secrets to disk —
 	// file secrets to their target paths, variable secrets to
@@ -148,7 +149,7 @@ func (r *TmuxRuntime) Run(ctx context.Context, config RunConfig) (string, error)
 			return "", fmt.Errorf("tmux runtime: serialize secrets: %w", err)
 		}
 		if encoded != "" {
-			config.Env = append(config.Env, StagedSecretEnvVar+"="+encoded)
+			config.Env = append(config.Env, stagedsecrets.EnvVar+"="+encoded)
 		}
 	}
 	if err := cloneWorkspaceIfRequested(ctx, config); err != nil {
