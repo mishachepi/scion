@@ -65,6 +65,11 @@ const (
 	EnvAgentID = "SCION_AGENT_ID"
 	// EnvAgentMode is the environment variable for the agent mode.
 	EnvAgentMode = "SCION_AGENT_MODE"
+	// EnvLaunchStartedAt carries the launch time sciontool init registered
+	// with the hub for this generation of the agent. init sets it before
+	// starting the harness, so every process of the generation (init, hooks,
+	// `sciontool status`) inherits it and tags its status reports with it.
+	EnvLaunchStartedAt = "SCION_LAUNCH_STARTED_AT"
 
 	// AgentModeHosted indicates the agent is running in hosted mode.
 	AgentModeHosted = "hosted"
@@ -146,6 +151,10 @@ type StatusUpdate struct {
 	CurrentTurns      *int   `json:"currentTurns,omitempty"`
 	CurrentModelCalls *int   `json:"currentModelCalls,omitempty"`
 	StartedAt         string `json:"startedAt,omitempty"`
+
+	// LaunchStartedAt tags the report with the sender's launch; see
+	// EnvLaunchStartedAt. UpdateStatus fills it in.
+	LaunchStartedAt string `json:"launchStartedAt,omitempty"`
 
 	// Exit tracking
 	ExitCode *int `json:"exitCode,omitempty"`
@@ -278,6 +287,13 @@ func (c *Client) UpdateStatus(ctx context.Context, status StatusUpdate) error {
 	}
 
 	endpoint := fmt.Sprintf("%s/api/v1/agents/%s/status", strings.TrimSuffix(c.hubURL, "/"), c.agentID)
+
+	// Tag the report with this process's launch so the hub can reject it if
+	// the agent has since been restarted. The launch-registering report
+	// (StartedAt set) is the one tag the hub must not check against itself.
+	if status.StartedAt == "" && status.LaunchStartedAt == "" {
+		status.LaunchStartedAt = os.Getenv(EnvLaunchStartedAt)
+	}
 
 	body, err := json.Marshal(status)
 	if err != nil {
