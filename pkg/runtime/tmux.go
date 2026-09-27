@@ -17,6 +17,7 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -374,16 +375,10 @@ func (r *TmuxRuntime) buildEnvFlags(config RunConfig) []string {
 	// anything later in the flag list overrides these.
 	entries = append(entries, r.runtimeEnvEntries()...)
 	if config.Project != "" {
-		entries = append(entries,
-			fmt.Sprintf("SCION_PROJECT=%s", config.Project),
-			fmt.Sprintf("SCION_GROVE=%s", config.Project),
-		)
+		entries = append(entries, "SCION_PROJECT="+config.Project)
 	}
 	if config.ProjectID != "" {
-		entries = append(entries,
-			fmt.Sprintf("SCION_PROJECT_ID=%s", config.ProjectID),
-			fmt.Sprintf("SCION_GROVE_ID=%s", config.ProjectID),
-		)
+		entries = append(entries, "SCION_PROJECT_ID="+config.ProjectID)
 	}
 	entries = append(entries, config.Env...)
 	for _, s := range config.ResolvedSecrets {
@@ -827,7 +822,27 @@ func (r *TmuxRuntime) Exec(ctx context.Context, id string, cmd []string) (string
 	if !r.windowExists(ctx, id) {
 		return "", fmt.Errorf("tmux runtime: agent window %s not found", id)
 	}
-	return r.execAsAgent(ctx, id, cmd)
+	return r.execAsAgent(ctx, id, cmd, nil)
+}
+
+// ExecWithStdin mirrors Exec but pipes cmd's stdin from the given reader,
+// for callers (e.g. the broker's reset-auth path, #1355) that must not put
+// sensitive data like a fresh auth token on argv, where it would be readable
+// via /proc/<pid>/cmdline for the lifetime of the exec. Unlike Exec, this has
+// no isTmuxBinary branch — control-plane tmux commands (has-session, etc.)
+// never need stdin, only the plain agent-exec path does.
+func (r *TmuxRuntime) ExecWithStdin(ctx context.Context, id string, cmd []string, stdin io.Reader) (string, error) {
+	if id == "" {
+		return "", fmt.Errorf("tmux runtime: ExecWithStdin requires a non-empty id")
+	}
+	if len(cmd) == 0 {
+		return "", fmt.Errorf("tmux runtime: ExecWithStdin requires a non-empty command")
+	}
+	id = r.resolveTarget(ctx, id)
+	if !r.windowExists(ctx, id) {
+		return "", fmt.Errorf("tmux runtime: agent window %s not found", id)
+	}
+	return r.execAsAgent(ctx, id, cmd, stdin)
 }
 
 // SignalInit delivers a signal to the agent's init process — the sciontool
@@ -920,35 +935,21 @@ func verifySciontoolPID(ctx context.Context, pid string) error {
 // commands read them exactly the way the agent does. When no home is
 // recorded the command degrades to execWithPaneCwd rather than failing,
 // keeping exec working against windows started before this option existed.
-func (r *TmuxRuntime) execAsAgent(ctx context.Context, id string, cmd []string) (string, error) {
+// stdin may be nil (the child then reads from the null device, as exec.Cmd
+// does by default).
+func (r *TmuxRuntime) execAsAgent(ctx context.Context, id string, cmd []string, stdin io.Reader) (string, error) {
 	meta, err := r.readMetadata(ctx, id)
 	if err != nil || meta.home == "" {
-		return r.execWithPaneCwd(ctx, id, cmd)
+		return r.execWithPaneCwd(ctx, id, cmd, stdin)
 	}
 	workdir := meta.workspace
 	if workdir == "" {
 		workdir = meta.home
 	}
-	env := append(os.Environ(),
-		"HOME="+meta.home,
-		"SCION_AGENT_HOME="+meta.home,
-	)
-	// Mirror the operator-level runtime env the session was started with,
-	// so host-exec sees the same environment as the agent itself. Appended
-	// after os.Environ(), and exec.Cmd gives the last duplicate precedence.
-	env = append(env, r.runtimeEnvEntries()...)
-	if name := meta.labels["scion.name"]; name != "" {
-		env = append(env, "SCION_AGENT="+name)
-	}
-	if project := projectcompat.ProjectNameFromLabels(meta.labels); project != "" {
-		env = append(env, "SCION_PROJECT="+project, "SCION_GROVE="+project)
-	}
-	if projectID := projectcompat.ProjectIDFromLabels(meta.labels); projectID != "" {
-		env = append(env, "SCION_PROJECT_ID="+projectID, "SCION_GROVE_ID="+projectID)
-	}
 	c := exec.CommandContext(ctx, cmd[0], cmd[1:]...)
 	c.Dir = workdir
-	c.Env = env
+	c.Env = r.agentExecEnv(meta)
+	c.Stdin = stdin
 	out, runErr := c.CombinedOutput()
 	if runErr != nil {
 		return string(out), fmt.Errorf("exec %v on %s (cwd=%s, home=%s): %w (output: %s)",
@@ -957,16 +958,40 @@ func (r *TmuxRuntime) execAsAgent(ctx context.Context, id string, cmd []string) 
 	return string(out), nil
 }
 
+// agentExecEnv builds the environment for a command executed as the agent:
+// the broker's own environment, then the agent identity, then the
+// operator-level runtime env the session was started with, so host-exec
+// sees the same environment as the agent itself. exec.Cmd gives the last
+// duplicate precedence, so later entries override the broker's.
+func (r *TmuxRuntime) agentExecEnv(meta windowMetadata) []string {
+	env := append(os.Environ(),
+		"HOME="+meta.home,
+		"SCION_AGENT_HOME="+meta.home,
+	)
+	env = append(env, r.runtimeEnvEntries()...)
+	if name := meta.labels["scion.name"]; name != "" {
+		env = append(env, "SCION_AGENT="+name)
+	}
+	if project := projectcompat.ProjectNameFromLabels(meta.labels); project != "" {
+		env = append(env, "SCION_PROJECT="+project)
+	}
+	if projectID := projectcompat.ProjectIDFromLabels(meta.labels); projectID != "" {
+		env = append(env, "SCION_PROJECT_ID="+projectID)
+	}
+	return env
+}
+
 // execWithPaneCwd is the legacy Exec semantics: run as the broker user with
 // cwd taken from the window's live pane. Kept as the fallback for windows
-// with no recorded @scion-home.
-func (r *TmuxRuntime) execWithPaneCwd(ctx context.Context, id string, cmd []string) (string, error) {
+// with no recorded @scion-home. stdin may be nil.
+func (r *TmuxRuntime) execWithPaneCwd(ctx context.Context, id string, cmd []string, stdin io.Reader) (string, error) {
 	workdir, err := r.readPaneCwd(ctx, id)
 	if err != nil {
 		workdir = ""
 	}
 	c := exec.CommandContext(ctx, cmd[0], cmd[1:]...)
 	c.Dir = workdir
+	c.Stdin = stdin
 	out, runErr := c.CombinedOutput()
 	if runErr != nil {
 		return string(out), fmt.Errorf("exec %v on %s (cwd=%s): %w (output: %s)",
