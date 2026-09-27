@@ -88,9 +88,7 @@ func TestTmuxRuntime_BuildEnvFlags(t *testing.T) {
 		"SCION_AGENT=agent-1",
 		"SCION_AGENT_HOME=/h",
 		"SCION_PROJECT=myproj",
-		"SCION_GROVE=myproj",
 		"SCION_PROJECT_ID=id-7",
-		"SCION_GROVE_ID=id-7",
 		"FOO=bar",
 		"ANTHROPIC_API_KEY=sk-test",
 	} {
@@ -101,6 +99,10 @@ func TestTmuxRuntime_BuildEnvFlags(t *testing.T) {
 	for _, kv := range flags {
 		if kv == "" {
 			t.Errorf("empty KV slipped into flags: %v", flags)
+		}
+		// Upstream stopped injecting and reading SCION_GROVE* (#2016).
+		if strings.HasPrefix(kv, "SCION_GROVE") {
+			t.Errorf("legacy SCION_GROVE* var still injected: %q", kv)
 		}
 		if strings.Contains(kv, "ignored") || strings.Contains(kv, "dropped") {
 			t.Errorf("non-environment secret leaked: %q", kv)
@@ -727,6 +729,55 @@ func TestTmuxRuntime_Exec_RunsHostCommandAsAgent(t *testing.T) {
 	want := home + "|" + wsPhys + "|agent-1|" + home
 	if got := strings.TrimSpace(out); got != want {
 		t.Errorf("agent-identity exec = %q, want %q", got, want)
+	}
+}
+
+// ExecWithStdin shares execAsAgent with Exec; this pins that stdin reaches
+// the child on the agent-identity path, together with the identity itself.
+func TestTmuxRuntime_ExecWithStdin_AsAgentPipesStdin(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "tmux.log")
+	home := filepath.Join(tmpDir, "agent-home")
+	workspace := filepath.Join(tmpDir, "ws")
+	for _, d := range []string{home, workspace} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+	r := &TmuxRuntime{
+		Command: fakeTmuxAgentIdentity(t, tmpDir, logPath, home, workspace),
+		Session: "scion",
+	}
+
+	out, err := r.ExecWithStdin(context.Background(), "scion:@5",
+		[]string{"/bin/sh", "-c", `printf '%s|%s|' "$HOME" "$SCION_AGENT"; cat`},
+		strings.NewReader("secret-token"))
+	if err != nil {
+		t.Fatalf("ExecWithStdin: %v", err)
+	}
+	want := home + "|agent-1|secret-token"
+	if got := strings.TrimSpace(out); got != want {
+		t.Errorf("ExecWithStdin as agent = %q, want %q", got, want)
+	}
+}
+
+// Without a recorded @scion-home ExecWithStdin degrades to the pane-cwd
+// fallback, and stdin must still be wired there.
+func TestTmuxRuntime_ExecWithStdin_PaneCwdFallbackPipesStdin(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "tmux.log")
+	r := &TmuxRuntime{
+		Command: fakeTmuxExecWithCwd(t, tmpDir, logPath, tmpDir),
+		Session: "scion",
+	}
+
+	out, err := r.ExecWithStdin(context.Background(), "scion:@5",
+		[]string{"/bin/cat"}, strings.NewReader("via-fallback"))
+	if err != nil {
+		t.Fatalf("ExecWithStdin: %v", err)
+	}
+	if got := strings.TrimSpace(out); got != "via-fallback" {
+		t.Errorf("ExecWithStdin fallback = %q, want %q", got, "via-fallback")
 	}
 }
 
