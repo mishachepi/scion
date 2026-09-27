@@ -468,6 +468,12 @@ type AgentStatusUpdate struct {
 	CurrentModelCalls *int   `json:"currentModelCalls,omitempty"`
 	StartedAt         string `json:"startedAt,omitempty"`
 
+	// LaunchStartedAt tags a report with the launch (sciontool init
+	// generation) that sent it: the startedAt that launch registered. It is
+	// not persisted; the hub compares it with the agent's registered
+	// StartedAt to reject reports from a previous generation.
+	LaunchStartedAt string `json:"launchStartedAt,omitempty"`
+
 	// Exit tracking
 	ExitCode   *int   `json:"exitCode,omitempty"`
 	ExitReason string `json:"exitReason,omitempty"`

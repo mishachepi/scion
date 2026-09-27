@@ -175,6 +175,10 @@ const (
 	// match the current revision of the constraint (optimistic concurrency).
 	ErrCodeRevisionConflict = "revision_conflict"
 
+	// ErrCodeStaleLaunch is returned when an agent status report comes from
+	// a previous launch (generation) of the agent than the one registered.
+	ErrCodeStaleLaunch = "stale_launch"
+
 	// ErrCodeRecoveryDisabledImmutable is returned when a mutation targets a
 	// recovery-disabled constraint, which cannot be modified via HTTP.
 	ErrCodeRecoveryDisabledImmutable = "recovery_disabled_immutable"

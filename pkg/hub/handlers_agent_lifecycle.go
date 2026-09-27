@@ -70,6 +70,30 @@ func (s *Server) updateAgentStatus(w http.ResponseWriter, r *http.Request, id st
 		return
 	}
 
+	// Reject reports from a previous launch of the agent. After a restart
+	// (stop/start, suspend/resume) the old generation's sciontool may still
+	// be exiting; it re-reads the shared token file, so it authenticates as
+	// the agent and its final "stopped" would overwrite the new generation's
+	// "running". Each launch registers its startedAt with its first report
+	// and tags every later report with it, so a tag older than the registered
+	// launch identifies the sender as a generation the hub has moved past.
+	if status.StartedAt == "" && status.LaunchStartedAt != "" {
+		agent, err := s.store.GetAgent(ctx, id)
+		if err != nil {
+			writeErrorFromErr(w, err, "")
+			return
+		}
+		if isStaleLaunch(agent, status.LaunchStartedAt) {
+			s.agentLifecycleLog.Info("Rejected status report from a previous launch",
+				"agent_id", id, "report_launch", status.LaunchStartedAt,
+				"current_launch", agent.StartedAt.UTC().Format(time.RFC3339),
+				"phase", status.Phase, "activity", status.Activity)
+			writeError(w, http.StatusConflict, ErrCodeStaleLaunch,
+				"Status report is from a previous launch of this agent", nil)
+			return
+		}
+	}
+
 	// Validate ExitReason before passing to the store: only terminal
 	// activities are valid exit reasons. Silently drop invalid values
 	// rather than rejecting the entire status update.
@@ -106,6 +130,25 @@ func (s *Server) updateAgentStatus(w http.ResponseWriter, r *http.Request, id st
 	}
 
 	w.WriteHeader(http.StatusOK)
+}
+
+// isStaleLaunch reports whether a status report tagged with launch comes from
+// an earlier launch than the one the agent last registered. A later launch is
+// not stale: the new generation's hooks may report before its init has
+// registered. Only a definite answer counts — an agent with no registered
+// launch, or a tag that does not parse, is not stale, so reports degrade to
+// the untagged behavior rather than being dropped. Launch times are compared
+// at second resolution, the precision sciontool reports them with; launches
+// within the same second are indistinguishable and treated as current.
+func isStaleLaunch(agent *store.Agent, launch string) bool {
+	if agent.StartedAt.IsZero() {
+		return false
+	}
+	t, err := time.Parse(time.RFC3339Nano, launch)
+	if err != nil {
+		return false
+	}
+	return t.Truncate(time.Second).Before(agent.StartedAt.Truncate(time.Second))
 }
 
 // guardAgentPhaseTransition applies two guards to a status update:
