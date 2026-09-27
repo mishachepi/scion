@@ -37,7 +37,7 @@ func postSharedDirCreate(t *testing.T, srv *Server, body string) *httptest.Respo
 // A reprovision passes the shared dir backend change to Manager.Reprovision
 // and confirms it in the response.
 func TestCreateAgentReprovision_SharedDirBackendChange(t *testing.T) {
-	srv, mgr := newTestServerWithProvisionCapture()
+	srv, mgr := newTestServerWithProvisionCapture(t)
 	w := postSharedDirCreate(t, srv, `{
 		"name": "reprovisioned-agent", "id": "agent-uuid-reprov", "slug": "reprovisioned-agent",
 		"provisionOnly": true, "reprovision": true, "config": {"template": "claude"},
@@ -55,7 +55,7 @@ func TestCreateAgentReprovision_SharedDirBackendChange(t *testing.T) {
 
 // A change back to local takes the same path.
 func TestCreateAgentReprovision_SharedDirBackendChangeToLocal(t *testing.T) {
-	srv, mgr := newTestServerWithProvisionCapture()
+	srv, mgr := newTestServerWithProvisionCapture(t)
 	w := postSharedDirCreate(t, srv, `{
 		"name": "reprovisioned-agent", "id": "agent-uuid-reprov", "slug": "reprovisioned-agent",
 		"provisionOnly": true, "reprovision": true, "config": {"template": "claude"},
@@ -72,7 +72,7 @@ func TestCreateAgentReprovision_SharedDirBackendChangeToLocal(t *testing.T) {
 
 // A reprovision without a change does not claim one.
 func TestCreateAgentReprovision_NoSharedDirBackendChangeNoEcho(t *testing.T) {
-	srv, mgr := newTestServerWithProvisionCapture()
+	srv, mgr := newTestServerWithProvisionCapture(t)
 	w := postSharedDirCreate(t, srv, `{
 		"name": "reprovisioned-agent", "id": "agent-uuid-reprov", "slug": "reprovisioned-agent",
 		"provisionOnly": true, "reprovision": true, "config": {"template": "claude"}
@@ -93,7 +93,7 @@ func TestCreateAgent_SharedDirBackendChangeWithoutReprovisionRefused(t *testing.
 		"allow empty":     `"allowEmptySharedDir": true`,
 	} {
 		t.Run(name, func(t *testing.T) {
-			srv, mgr := newTestServerWithProvisionCapture()
+			srv, mgr := newTestServerWithProvisionCapture(t)
 			w := postSharedDirCreate(t, srv, `{
 				"name": "plain-agent", "id": "agent-uuid-plain", "slug": "plain-agent",
 				"provisionOnly": true, "config": {"template": "claude"}, `+extra+`

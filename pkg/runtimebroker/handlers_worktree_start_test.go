@@ -47,7 +47,7 @@ import (
 // directory that already exists for the project.
 func TestStartAgentAfterCreate_WorktreePerAgent_RealHTTPHandlers(t *testing.T) {
 	requireWorktreeGit(t)
-	srv, mgr := newTestServerWithGitCloneCapture()
+	srv, mgr := newTestServerWithGitCloneCapture(t)
 
 	bare := initBareRepoWithCommit(t)
 	projectPath := filepath.Join(t.TempDir(), "proj")
@@ -134,7 +134,7 @@ func TestStartAgentAfterCreate_WorktreePerAgent_RealHTTPHandlers(t *testing.T) {
 // survive untouched.
 func TestStartAgentAfterCreate_WorktreePerAgent_NeverRemovesSharedWorktreesDir(t *testing.T) {
 	requireWorktreeGit(t)
-	srv, mgr := newTestServerWithGitCloneCapture()
+	srv, mgr := newTestServerWithGitCloneCapture(t)
 
 	bare := initBareRepoWithCommit(t)
 	projectPath := filepath.Join(t.TempDir(), "proj")
@@ -348,7 +348,7 @@ func TestStartAgentAfterCreate_WorktreePerAgent_RealManagerPreservesWorkspace(t 
 // create used for the same agent.
 func TestStartAgentAfterCreate_WorktreePerAgent_UsesSlugForBranchKey(t *testing.T) {
 	requireWorktreeGit(t)
-	srv, mgr := newTestServerWithGitCloneCapture()
+	srv, mgr := newTestServerWithGitCloneCapture(t)
 
 	bare := initBareRepoWithCommit(t)
 	projectPath := filepath.Join(t.TempDir(), "proj")
@@ -535,7 +535,7 @@ func TestStartAgentAfterCreate_EnvAgentNameIgnored(t *testing.T) {
 // is not exempted: the gate applies to it exactly as it would to any other
 // method.
 func TestHandleAgentByID_InvalidIDRejected(t *testing.T) {
-	srv, _ := newTestServerWithGitCloneCapture()
+	srv, _ := newTestServerWithGitCloneCapture(t)
 
 	for _, tc := range []struct {
 		name   string
@@ -575,7 +575,7 @@ func TestHandleAgentByID_InvalidIDRejected(t *testing.T) {
 // prove the broker validates a non-empty projectId as a single path element
 // before it reaches buildStartContext, on both entry points that accept one.
 func TestStartAgent_InvalidProjectIDRejected(t *testing.T) {
-	srv, _ := newTestServerWithGitCloneCapture()
+	srv, _ := newTestServerWithGitCloneCapture(t)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/some-agent/start?projectId=..", strings.NewReader(`{}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -587,7 +587,7 @@ func TestStartAgent_InvalidProjectIDRejected(t *testing.T) {
 }
 
 func TestCreateAgent_InvalidProjectIDRejected(t *testing.T) {
-	srv, _ := newTestServerWithGitCloneCapture()
+	srv, _ := newTestServerWithGitCloneCapture(t)
 
 	body := `{"name": "some-agent", "projectId": ".."}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(body))

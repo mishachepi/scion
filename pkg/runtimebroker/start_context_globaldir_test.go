@@ -337,7 +337,7 @@ func TestCreateAgent_HubGlobalSlugWithGlobalDirPath(t *testing.T) {
 		{"no slug", "", http.StatusConflict},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, mgr := newTestServerWithProvisionCapture()
+			srv, mgr := newTestServerWithProvisionCapture(t)
 			home := t.TempDir()
 			t.Setenv("HOME", home)
 			t.Setenv("SCION_PROJECT_ID", "")

@@ -56,7 +56,7 @@ func postMoveProvision(t *testing.T, srv *Server, expect string) *httptest.Respo
 }
 
 func newMoveCheckServer(mgr *moveCheckingManager) *Server {
-	srv, _ := newTestServerWithProvisionCapture()
+	srv, _ := newTestServerWithProvisionCapture(t)
 	srv.manager = mgr
 	return srv
 }
@@ -98,7 +98,7 @@ func TestCreateAgentProvisionOnly_MovedWorkspacePresent_Provisions(t *testing.T)
 
 // A manager that cannot confirm the workspace fails closed with 409.
 func TestCreateAgentProvisionOnly_MovedWorkspaceUnconfirmable_Returns409(t *testing.T) {
-	srv, mgr := newTestServerWithProvisionCapture()
+	srv, mgr := newTestServerWithProvisionCapture(t)
 	w := postMoveProvision(t, srv, agent.MoveWorkspaceAgentDir)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("expected 409, got %d: %s", w.Code, w.Body.String())

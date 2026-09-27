@@ -62,7 +62,7 @@ func readAgentSkills(t *testing.T, cfgPath string) []api.SkillReference {
 // applying the same inline config on every start leaves the skill list in
 // scion-agent.json unchanged instead of appending another copy each time.
 func TestApplyInlineConfigUpdate_RepeatedStartsDoNotGrowSkills(t *testing.T) {
-	srv, _ := newTestServerWithProvisionCapture()
+	srv, _ := newTestServerWithProvisionCapture(t)
 	projectDir := filepath.Join(t.TempDir(), ".scion")
 	agentName := "skills-agent"
 
@@ -98,7 +98,7 @@ func TestApplyInlineConfigUpdate_RepeatedStartsDoNotGrowSkills(t *testing.T) {
 // scion-agent.json already carrying repeated skill entries is reduced to one
 // entry per URI and install name on the next start.
 func TestApplyInlineConfigUpdate_CollapsesExistingDuplicates(t *testing.T) {
-	srv, _ := newTestServerWithProvisionCapture()
+	srv, _ := newTestServerWithProvisionCapture(t)
 	projectDir := filepath.Join(t.TempDir(), ".scion")
 	agentName := "dup-agent"
 
@@ -123,7 +123,7 @@ func TestApplyInlineConfigUpdate_CollapsesExistingDuplicates(t *testing.T) {
 // replaces an existing entry for the same skill whatever the scopes, and
 // moves to its own position at the end.
 func TestApplyInlineConfigUpdate_HubEntryReplacesExisting(t *testing.T) {
-	srv, _ := newTestServerWithProvisionCapture()
+	srv, _ := newTestServerWithProvisionCapture(t)
 	projectDir := filepath.Join(t.TempDir(), ".scion")
 	agentName := "replace-agent"
 
@@ -282,7 +282,7 @@ func TestDedupeSkillReferences(t *testing.T) {
 // carries, the later version replaces the earlier one and the skill count
 // does not grow across repeated starts.
 func TestApplyInlineConfigUpdate_VersionCollapse(t *testing.T) {
-	srv, _ := newTestServerWithProvisionCapture()
+	srv, _ := newTestServerWithProvisionCapture(t)
 	projectDir := filepath.Join(t.TempDir(), ".scion")
 	agentName := "version-agent"
 
@@ -405,7 +405,7 @@ func TestDedupeSkillReferences_HubResolveUnchanged(t *testing.T) {
 // longer sends is pruned, and the broker's own template, platform and
 // unscoped entries survive (ptone/scion#2908).
 func TestApplyInlineConfigUpdate_PrunesAndReplacesHubSkills(t *testing.T) {
-	srv, _ := newTestServerWithProvisionCapture()
+	srv, _ := newTestServerWithProvisionCapture(t)
 	projectDir := filepath.Join(t.TempDir(), ".scion")
 	agentName := "prune-agent"
 
@@ -444,7 +444,7 @@ func TestApplyInlineConfigUpdate_PrunesAndReplacesHubSkills(t *testing.T) {
 // TestApplyInlineConfigUpdate_NoSkillsLeavesSkillsUnchanged verifies that an
 // inline config without skills does not prune the agent's existing skills.
 func TestApplyInlineConfigUpdate_NoSkillsLeavesSkillsUnchanged(t *testing.T) {
-	srv, _ := newTestServerWithProvisionCapture()
+	srv, _ := newTestServerWithProvisionCapture(t)
 	projectDir := filepath.Join(t.TempDir(), ".scion")
 	agentName := "noskills-agent"
 

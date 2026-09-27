@@ -104,7 +104,7 @@ const sharedWorkspaceCloneJSON = `"sharedWorkspace": true,
 		"sharedWorkspaceClone": {"url": "https://github.com/org/shared.git", "branch": "main", "depth": 0}`
 
 func TestCreateAgent_SharedWorkspaceClone_PassedThrough(t *testing.T) {
-	srv, mgr := newTestServerWithGitCloneCapture()
+	srv, mgr := newTestServerWithGitCloneCapture(t)
 	body := `{"name": "shared-agent", "config": {"template": "claude", "workspace": "` + t.TempDir() + `", ` + sharedWorkspaceCloneJSON + `}}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -122,7 +122,7 @@ func TestCreateAgent_SharedWorkspaceClone_PassedThrough(t *testing.T) {
 }
 
 func TestStartAgent_SharedWorkspaceClone_PassedThrough(t *testing.T) {
-	srv, mgr := newTestServerWithGitCloneCapture()
+	srv, mgr := newTestServerWithGitCloneCapture(t)
 	body := `{` + sharedWorkspaceCloneJSON + `}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/shared-agent/start", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
