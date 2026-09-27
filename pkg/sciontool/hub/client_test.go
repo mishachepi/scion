@@ -204,6 +204,55 @@ func TestClient_UpdateStatus(t *testing.T) {
 	assert.Equal(t, "test message", receivedStatus.Message)
 }
 
+// TestClient_UpdateStatus_TagsLaunch: every report carries the launch the
+// process belongs to (inherited via EnvLaunchStartedAt), except the report
+// that registers the launch itself, which carries startedAt instead.
+func TestClient_UpdateStatus_TagsLaunch(t *testing.T) {
+	const launch = "2026-09-27T12:00:00Z"
+	t.Setenv(EnvLaunchStartedAt, launch)
+
+	var got []map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		got = append(got, body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	client := NewClientWithConfig(server.URL, "test-token", "agent-123")
+	ctx := context.Background()
+
+	require.NoError(t, client.UpdateStatus(ctx, StatusUpdate{Phase: state.PhaseRunning, StartedAt: launch}))
+	require.NoError(t, client.ReportState(ctx, state.PhaseStopped, "", "Agent stopped"))
+	require.NoError(t, client.Heartbeat(ctx))
+	require.Len(t, got, 3)
+
+	assert.Equal(t, launch, got[0]["startedAt"])
+	assert.NotContains(t, got[0], "launchStartedAt", "the registering report must not be checked against itself")
+	assert.Equal(t, launch, got[1]["launchStartedAt"], "final stopped report must carry its launch")
+	assert.Equal(t, launch, got[2]["launchStartedAt"], "heartbeat must carry its launch")
+}
+
+// Without a recorded launch (older init, or outside an agent) reports stay
+// untagged, which the hub treats exactly as before.
+func TestClient_UpdateStatus_NoLaunchNoTag(t *testing.T) {
+	t.Setenv(EnvLaunchStartedAt, "")
+
+	var body map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	client := NewClientWithConfig(server.URL, "test-token", "agent-123")
+
+	require.NoError(t, client.ReportState(context.Background(), state.PhaseStopped, "", "Agent stopped"))
+	assert.NotContains(t, body, "launchStartedAt")
+}
+
 func TestClient_UpdateStatus_Errors(t *testing.T) {
 	t.Run("not configured", func(t *testing.T) {
 		client := &Client{}
