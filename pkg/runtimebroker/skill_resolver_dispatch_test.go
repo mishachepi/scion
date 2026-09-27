@@ -108,7 +108,7 @@ func TestRestartAgent_AttachesSkillResolver_PreResolvedSkills(t *testing.T) {
 }
 
 func TestCreateAgent_AttachesSkillResolver_PreResolvedSkills(t *testing.T) {
-	srv, mgr := newTestServerWithProvisionCapture()
+	srv, mgr := newTestServerWithProvisionCapture(t)
 
 	const uri = "skill://scion/global/test-skill@1.0.0"
 	body := `{
@@ -158,7 +158,7 @@ func TestCreateAgent_AttachesSkillResolver_PreResolvedSkills(t *testing.T) {
 // attaches (#1960), so a reprovision resolves the hub's pre-resolved skills
 // exactly as create does.
 func TestCreateAgent_Reprovision_AttachesSkillResolver(t *testing.T) {
-	srv, mgr := newTestServerWithProvisionCapture()
+	srv, mgr := newTestServerWithProvisionCapture(t)
 
 	const uri = "skill://scion/global/test-skill@1.0.0"
 	body := `{
