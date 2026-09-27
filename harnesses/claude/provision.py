@@ -364,22 +364,32 @@ def _apply_model(
 
 def _build_env_overlay(ctx: scion_harness.ProvisionContext, auth: scion_harness.ResolvedAuth) -> dict[str, str]:
     """Build the env vars overlay for outputs/env.json."""
+    # CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST suppresses model upgrade/fallback
+    # dialogs when Scion is actually managing the provider via env — i.e. only
+    # on the branches below that inject provider credentials. It must NOT be
+    # set for the `else` (empty-env) branch, which is what `manual` auth (and
+    # any other auth method scion doesn't inject env for) falls into: those
+    # agents authenticate out-of-band (e.g. macOS Keychain), and setting this
+    # flag there makes Claude Code start "Not logged in" instead of picking up
+    # the out-of-band credentials (upstream #1663 sets it unconditionally;
+    # this fork's tmux-runtime deploys rely on the conditional form).
     if auth.method == "api-key" and auth.env_key:
         env = {auth.env_key: _resolve(ctx, auth.env_key)}
+        env["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"] = "1"
     elif auth.method == "oauth-token":
         env = {"CLAUDE_CODE_OAUTH_TOKEN": _resolve(ctx, "CLAUDE_CODE_OAUTH_TOKEN")}
+        env["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"] = "1"
     elif auth.method == "vertex-ai":
         region_key = auth.env_key or "GOOGLE_CLOUD_REGION"
         env = {
             "CLAUDE_CODE_USE_VERTEX": "1",
             "ANTHROPIC_VERTEX_PROJECT_ID": _resolve(ctx, "GOOGLE_CLOUD_PROJECT"),
             "CLOUD_ML_REGION": _resolve(ctx, region_key),
+            "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST": "1",
         }
     else:
         env = {}
 
-    # Suppress model upgrade/fallback dialogs — Scion manages the provider.
-    env["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"] = "1"
     # Prevent non-root container process from failing background npm self-updates.
     env["DISABLE_AUTOUPDATER"] = "1"
 
