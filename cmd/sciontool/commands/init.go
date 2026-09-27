@@ -907,6 +907,16 @@ func RunInit(args []string, opts InitRunOptions) int {
 		}
 	}
 
+	// Record this launch before anything reports to the hub or the harness
+	// starts: the harness and its hooks inherit the variable, so every status
+	// report of this generation carries it, and the hub can tell a late report
+	// from a previous generation (e.g. this init's own predecessor exiting
+	// after a resume) apart from the current one. See hub.EnvLaunchStartedAt.
+	launchStartedAt := time.Now().UTC().Format(time.RFC3339)
+	if err := os.Setenv(hub.EnvLaunchStartedAt, launchStartedAt); err != nil {
+		log.Error("Failed to export %s: %v", hub.EnvLaunchStartedAt, err)
+	}
+
 	// Initialize hubClient early so the metadata server's fetch callbacks
 	// can use it without data races or startup race conditions.
 	hubClient := hub.NewClient()
@@ -1136,7 +1146,7 @@ func RunInit(args []string, opts InitRunOptions) int {
 			os.Getenv("SCION_HUB_ENDPOINT"), os.Getenv("SCION_HUB_URL"), hub.ReadTokenFile() != "", os.Getenv("SCION_AGENT_ID"))
 		if hubClient != nil && hubClient.IsConfigured() {
 			hubCtx, hubCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			startedAtStr := time.Now().UTC().Format(time.RFC3339)
+			startedAtStr := launchStartedAt
 			zeroCount := 0
 			// The harness process is up but not yet known to read input:
 			// report initializing; the readiness watcher started below

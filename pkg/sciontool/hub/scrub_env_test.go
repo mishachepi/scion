@@ -45,6 +45,7 @@ var scrubbedClientEnv = map[string]string{
 // the reason.
 var unscrubbedClientEnv = map[string]string{
 	"EnvLaunchID":                        "run id header value only; does not locate or authenticate to a Hub",
+	"EnvLaunchStartedAt":                 "launch time tag on reports only; does not locate or authenticate to a Hub",
 	"EnvHubOIDCAudience":                 "token request setting; used only once a Hub endpoint is set",
 	"transportauth.EnvHubOIDCAudience":   "token request setting; used only once a Hub endpoint is set",
 	"EnvTransportAudience":               "token request setting; used only once a Hub endpoint is set",
