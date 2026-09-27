@@ -1892,5 +1892,60 @@ class ClaudeOwnershipTest(_ClaudePluginsBase):
         self.assertNotIn("p", self.state())
 
 
+class BuildEnvOverlayTest(unittest.TestCase):
+    """CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST is set only when scion injects
+    provider auth env. On the `manual` / no-env-inject branch it would make
+    Claude Code treat the provider as host-managed with no credentials and
+    start "Not logged in" instead of using out-of-band (Keychain) auth.
+    """
+
+    def test_manual_auth_does_not_get_the_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp):
+            ctx = make_ctx(tmp)
+            auth = scion_harness.ResolvedAuth(method="manual")
+            env = provision._build_env_overlay(ctx, auth)
+
+        self.assertEqual(env, {"DISABLE_AUTOUPDATER": "1"})
+        self.assertNotIn("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", env)
+
+    def test_unrecognized_auth_method_does_not_get_the_flag(self) -> None:
+        """Same else-branch as manual — any future/unknown method must be
+        just as safe, not only the literal string "manual"."""
+        with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp):
+            ctx = make_ctx(tmp)
+            auth = scion_harness.ResolvedAuth(method="some-future-method")
+            env = provision._build_env_overlay(ctx, auth)
+
+        self.assertEqual(env, {"DISABLE_AUTOUPDATER": "1"})
+        self.assertNotIn("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", env)
+
+    def test_oauth_token_auth_gets_the_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp):
+            ctx = make_ctx(tmp)
+            auth = scion_harness.ResolvedAuth(method="oauth-token")
+            env = provision._build_env_overlay(ctx, auth)
+
+        self.assertIn("CLAUDE_CODE_OAUTH_TOKEN", env)
+        self.assertEqual(env["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"], "1")
+
+    def test_api_key_auth_gets_the_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp):
+            ctx = make_ctx(tmp)
+            auth = scion_harness.ResolvedAuth(method="api-key", env_key="ANTHROPIC_API_KEY")
+            env = provision._build_env_overlay(ctx, auth)
+
+        self.assertIn("ANTHROPIC_API_KEY", env)
+        self.assertEqual(env["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"], "1")
+
+    def test_vertex_ai_auth_gets_the_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp):
+            ctx = make_ctx(tmp)
+            auth = scion_harness.ResolvedAuth(method="vertex-ai")
+            env = provision._build_env_overlay(ctx, auth)
+
+        self.assertEqual(env["CLAUDE_CODE_USE_VERTEX"], "1")
+        self.assertEqual(env["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"], "1")
+
+
 if __name__ == "__main__":
     unittest.main()
