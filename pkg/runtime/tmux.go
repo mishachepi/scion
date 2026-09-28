@@ -22,7 +22,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
@@ -93,7 +96,15 @@ type TmuxRuntime struct {
 	// harness in `sciontool init --tmuxruntime --`. Empty disables wrapping.
 	// The "auto" sentinel is resolved to an absolute path in factory.GetRuntime.
 	Sciontool string
+
+	// StopTimeout bounds how long Stop and Delete wait for the pane's root
+	// process to exit after its window is killed before sending SIGKILL.
+	// Zero means DefaultTmuxStopTimeout.
+	StopTimeout time.Duration
 }
+
+// DefaultTmuxStopTimeout matches the default grace period of `docker stop`.
+const DefaultTmuxStopTimeout = 10 * time.Second
 
 func NewTmuxRuntime() *TmuxRuntime {
 	return &TmuxRuntime{Command: "tmux", Session: DefaultTmuxSession, HomeMode: HomeModeAgent}
@@ -489,7 +500,8 @@ func (r *TmuxRuntime) setUserOption(ctx context.Context, target, name, value str
 	return nil
 }
 
-// Stop sends Ctrl-C to the harness, then kills the window. Idempotent.
+// Stop sends Ctrl-C to the harness, then kills the window and waits for the
+// pane's init to exit (see killWindow). Idempotent.
 func (r *TmuxRuntime) Stop(ctx context.Context, id string) error {
 	if id == "" {
 		return fmt.Errorf("tmux runtime: Stop requires a non-empty id")
@@ -515,18 +527,77 @@ func (r *TmuxRuntime) Delete(ctx context.Context, id string) error {
 	return r.killWindow(ctx, id)
 }
 
+// killWindow kills the agent's window and, like `docker stop`, returns only
+// once the pane's root process (sciontool init) has exited. tmux signals the
+// pane with SIGHUP and returns immediately, so without the wait the previous
+// init is still shutting down — and still reporting to the hub from the
+// agent's shared home — while a restart or resume launches the next one.
 func (r *TmuxRuntime) killWindow(ctx context.Context, id string) error {
+	pid := 0
+	if s, err := r.panePID(ctx, r.resolvePaneTarget(ctx, id)); err == nil {
+		pid, _ = strconv.Atoi(s)
+	}
 	out, err := exec.CommandContext(ctx, r.Command, "kill-window", "-t", id).CombinedOutput()
 	if err == nil {
+		r.waitPaneExit(ctx, pid)
 		return nil
 	}
 	// Race: another caller may have killed the window between windowExists
 	// and kill-window. tmux prints "can't find window: <id>" — treat as no-op.
 	outStr := strings.TrimSpace(string(out))
 	if strings.Contains(outStr, "can't find window") || !r.windowExists(ctx, id) {
+		r.waitPaneExit(ctx, pid)
 		return nil
 	}
 	return fmt.Errorf("tmux kill-window %s: %w (output: %s)", id, err, outStr)
+}
+
+// waitPaneExit waits for a killed pane's root process to exit, sending
+// SIGKILL once StopTimeout elapses (or ctx ends). pid <= 0 is a no-op.
+func (r *TmuxRuntime) waitPaneExit(ctx context.Context, pid int) {
+	if pid <= 0 {
+		return
+	}
+	timeout := r.StopTimeout
+	if timeout <= 0 {
+		timeout = DefaultTmuxStopTimeout
+	}
+	if waitProcessGone(ctx, pid, timeout) {
+		return
+	}
+	if p, err := os.FindProcess(pid); err == nil {
+		_ = p.Signal(syscall.SIGKILL)
+	}
+	waitProcessGone(context.Background(), pid, 2*time.Second)
+}
+
+// waitProcessGone polls until pid no longer exists, the timeout elapses, or
+// ctx ends. It reports whether the process is gone.
+func waitProcessGone(ctx context.Context, pid int, timeout time.Duration) bool {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if !processAlive(pid) {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return !processAlive(pid)
+		case <-deadline.C:
+			return !processAlive(pid)
+		case <-tick.C:
+		}
+	}
+}
+
+func processAlive(pid int) bool {
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return p.Signal(syscall.Signal(0)) == nil
 }
 
 // windowExists checks `list-windows` for an exact window_id match.

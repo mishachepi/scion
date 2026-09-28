@@ -17,12 +17,17 @@ package runtime
 import (
 	"context"
 	"embed"
+	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 )
@@ -1459,5 +1464,81 @@ func TestTmuxRuntime_PanePID_RejectsNonNumeric(t *testing.T) {
 
 	if _, err := r.panePID(context.Background(), "scion:@5"); err == nil {
 		t.Fatal("panePID must reject a non-numeric pane_pid rather than pass it to kill")
+	}
+}
+
+// startPaneProcess stands in for a pane's sciontool init: a real process the
+// test reaps as soon as it exits, like the tmux server reaps its panes.
+func startPaneProcess(t *testing.T, script string) (pid int, exited <-chan error) {
+	t.Helper()
+	cmd := exec.Command("/bin/sh", "-c", script)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start pane process: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	return cmd.Process.Pid, done
+}
+
+// TestTmuxRuntime_Stop_WaitsForPaneInitExit: like `docker stop`, Stop returns
+// only after the pane's init has exited, so a restart or resume can never
+// overlap the previous init's shutdown and final status report.
+func TestTmuxRuntime_Stop_WaitsForPaneInitExit(t *testing.T) {
+	tmpDir := t.TempDir()
+	pid, exited := startPaneProcess(t, "sleep 0.4")
+	r := &TmuxRuntime{
+		Command:     fakeTmuxPanePID(t, tmpDir, filepath.Join(tmpDir, "tmux.log"), strconv.Itoa(pid)),
+		Session:     "scion",
+		StopTimeout: 10 * time.Second,
+	}
+
+	start := time.Now()
+	if err := r.Stop(context.Background(), "scion:@5"); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	elapsed := time.Since(start)
+	if elapsed < 350*time.Millisecond {
+		t.Errorf("Stop returned after %s, before the pane's init exited (~400ms)", elapsed)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("Stop took %s; it must return as soon as the init exits", elapsed)
+	}
+	select {
+	case err := <-exited:
+		if err != nil {
+			t.Errorf("pane process should have exited on its own, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pane's init still running after Stop returned")
+	}
+}
+
+// TestTmuxRuntime_Delete_KillsPaneInitAfterTimeout: an init that outlives the
+// grace period is SIGKILLed, and Delete still returns only once it is gone.
+func TestTmuxRuntime_Delete_KillsPaneInitAfterTimeout(t *testing.T) {
+	tmpDir := t.TempDir()
+	pid, exited := startPaneProcess(t, "exec sleep 30")
+	r := &TmuxRuntime{
+		Command:     fakeTmuxPanePID(t, tmpDir, filepath.Join(tmpDir, "tmux.log"), strconv.Itoa(pid)),
+		Session:     "scion",
+		StopTimeout: 200 * time.Millisecond,
+	}
+
+	start := time.Now()
+	if err := r.Delete(context.Background(), "scion:@5"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	select {
+	case err := <-exited:
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) || ee.Sys().(syscall.WaitStatus).Signal() != syscall.SIGKILL {
+			t.Errorf("pane process should have been SIGKILLed, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Delete returned while the pane's init was still running")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("Delete took %s; the timeout is 200ms", elapsed)
 	}
 }
