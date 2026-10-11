@@ -72,6 +72,37 @@ type PerProfileInstancesRuntime interface {
 	PerProfileInstances() bool
 }
 
+// HarnessReadinessExemptRuntime is implemented by a runtime whose agents do
+// not take part in the harness-readiness protocol: the init-run file and
+// ready marker under /tmp that the broker probes through Exec before pasting
+// a buffered message. Message delivery does not wait for readiness on such a
+// runtime and pastes as soon as the debounce window ends.
+type HarnessReadinessExemptRuntime interface {
+	HarnessReadinessExempt() bool
+}
+
+// HostWorkspaceRuntime is implemented by a runtime whose harness runs on the
+// broker host in the agent's workspace directory itself (RunConfig.Workspace,
+// or RunConfig.HomeDir when no workspace is set) instead of a container mount
+// of it. Paths handed to the harness's provisioner are then host paths.
+type HostWorkspaceRuntime interface {
+	RunsHarnessInHostWorkspace() bool
+}
+
+// RunsHarnessInHostWorkspace reports whether rt implements
+// HostWorkspaceRuntime and reports true.
+func RunsHarnessInHostWorkspace(rt Runtime) bool {
+	h, ok := rt.(HostWorkspaceRuntime)
+	return ok && h.RunsHarnessInHostWorkspace()
+}
+
+// IsHarnessReadinessExempt reports whether rt implements
+// HarnessReadinessExemptRuntime and reports true.
+func IsHarnessReadinessExempt(rt Runtime) bool {
+	e, ok := rt.(HarnessReadinessExemptRuntime)
+	return ok && e.HarnessReadinessExempt()
+}
+
 // HasPerProfileInstances reports whether rt implements
 // PerProfileInstancesRuntime and reports true.
 func HasPerProfileInstances(rt Runtime) bool {

@@ -240,6 +240,9 @@ func parseReadinessProbe(out string, settleFallback, settle time.Duration) readi
 // never waits. Any error resolving the target returns at once too: delivery
 // then reports it as before.
 func (m *AgentManager) waitHarnessReady(ctx context.Context, agentID, projectID string) {
+	if runtime.IsHarnessReadinessExempt(m.Runtime) {
+		return
+	}
 	timings := m.readyTimings.withDefaults()
 	start := time.Now()
 	deadline := start.Add(timings.Deadline)
