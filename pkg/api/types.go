@@ -805,6 +805,10 @@ type AgentInfo struct {
 	// client that merges responses clear a previously seen true.
 	ProvisionedOnly bool `json:"provisionedOnly"`
 
+	// HarnessSessionID is the harness's native session id from the most
+	// recent SessionStart hook; a resume requests that exact session.
+	HarnessSessionID string `json:"harnessSessionId,omitempty"`
+
 	// Optimistic locking
 	StateVersion int64 `json:"stateVersion,omitempty"` // Version for concurrent update detection
 }
@@ -1383,6 +1387,7 @@ type StartOptions struct {
 	TrustedHubEndpoint string
 	Detached           *bool
 	Resume             bool
+	HarnessSessionID   string // exact harness session to resume; see AgentInfo.HarnessSessionID
 	NoAuth             bool
 	Branch             string
 	Workspace          string

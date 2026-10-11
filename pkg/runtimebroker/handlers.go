@@ -3715,6 +3715,9 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 			opts.Resume = true
 		}
 	}
+	if opts.Resume && opts.ProjectPath != "" {
+		opts.HarnessSessionID = agent.GetSavedHarnessSessionID(id, opts.ProjectPath)
+	}
 
 	ctx = s.withHarnessConfigPolicy(ctx)
 	if ss != nil {

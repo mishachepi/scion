@@ -149,7 +149,7 @@ func harnessCmdLine(cfg RunConfig, opts harnessCmdLineOptions) (cmdLine string, 
 		return buildNoAuthCmdLine(cfg.NoAuthMessage, cfg.NoAuthCommand), true
 	}
 	if cfg.Harness != nil {
-		harnessArgs := cfg.Harness.GetCommand(cfg.Task, cfg.Resume, cfg.CommandArgs)
+		harnessArgs := api.HarnessCommand(cfg.Harness, cfg.Task, cfg.Resume, cfg.HarnessSessionID, cfg.CommandArgs)
 		if cfg.Resume && opts.FreshStartOnFailedResume {
 			freshArgs := cfg.Harness.GetCommand(cfg.Task, false, cfg.CommandArgs)
 			if !slices.Equal(harnessArgs, freshArgs) {

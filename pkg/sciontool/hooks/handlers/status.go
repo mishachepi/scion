@@ -227,6 +227,9 @@ func (h *StatusHandler) Handle(event *hooks.Event) error {
 	if h.tmuxPaneSink != nil && event.Name == hooks.EventSessionStart {
 		h.tmuxPaneSink.Apply()
 	}
+	if err := h.captureHarnessSessionID(event); err != nil {
+		return err
+	}
 
 	result := eventToPhaseActivity(event)
 	if result == nil {

@@ -41,10 +41,13 @@ type RunConfig struct {
 	Task               string
 	CommandArgs        []string
 	Resume             bool
-	TelemetryEnabled   bool
-	Resources          *api.ResourceSpec
-	Kubernetes         *api.KubernetesConfig
-	GitClone           *api.GitCloneConfig
+	// HarnessSessionID, with Resume, asks for that exact harness session
+	// (api.SessionResumer); empty uses the harness's latest-session flag.
+	HarnessSessionID string
+	TelemetryEnabled bool
+	Resources        *api.ResourceSpec
+	Kubernetes       *api.KubernetesConfig
+	GitClone         *api.GitCloneConfig
 	// AgentOwnWorkspace marks Workspace as the agent's own directory
 	// (<agent dir>/workspace: its worktree or private checkout), as the
 	// broker decided from its own paths. That workspace's .scion is the

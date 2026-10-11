@@ -2622,6 +2622,7 @@ authDone:
 		}(),
 		Debug:                util.DebugEnabled(),
 		Resume:               opts.Resume,
+		HarnessSessionID:     opts.HarnessSessionID,
 		MetadataInterception: metadataInterceptionGranted(m.Runtime.Name(), networkMode, agentEnv),
 		ExtraHosts:           mergeExtraHosts(opts.ExtraHosts, runtime.BridgeExtraHosts(m.Runtime.Name(), agentEnv)),
 		NetworkMode:          networkMode,
