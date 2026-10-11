@@ -173,7 +173,7 @@ func (r *TmuxRuntime) buildNewWindowArgs(config RunConfig) ([]string, error) {
 		return nil, fmt.Errorf("tmux runtime: Name is required")
 	}
 	harnessEnv := config.Harness.GetEnv(config.Name, config.HomeDir, config.UnixUsername)
-	harnessArgs := config.Harness.GetCommand(config.Task, config.Resume, config.CommandArgs)
+	harnessArgs := api.HarnessCommand(config.Harness, config.Task, config.Resume, config.HarnessSessionID, config.CommandArgs)
 	if len(harnessArgs) == 0 {
 		return nil, fmt.Errorf("tmux runtime: harness %s returned empty command", config.Harness.Name())
 	}

@@ -41,10 +41,13 @@ type RunConfig struct {
 	Task               string
 	CommandArgs        []string
 	Resume             bool
-	TelemetryEnabled   bool
-	Resources          *api.ResourceSpec
-	Kubernetes         *api.KubernetesConfig
-	GitClone           *api.GitCloneConfig
+	// HarnessSessionID, with Resume, asks for that exact harness session
+	// (api.SessionResumer); empty uses the harness's latest-session flag.
+	HarnessSessionID string
+	TelemetryEnabled bool
+	Resources        *api.ResourceSpec
+	Kubernetes       *api.KubernetesConfig
+	GitClone         *api.GitCloneConfig
 	// TrustedHubEndpoint is the hub endpoint Substrate's egress allowlist
 	// trusts. In broker mode, this field arrives already resolved by the
 	// runtime broker from operator-controlled tiers only — the request's
