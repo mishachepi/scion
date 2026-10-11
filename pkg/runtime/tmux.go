@@ -88,6 +88,29 @@ func NewTmuxRuntime() *TmuxRuntime {
 	return &TmuxRuntime{Command: "tmux", Session: DefaultTmuxSession, HomeMode: HomeModeAgent}
 }
 
+// PerProfileInstances implements PerProfileInstancesRuntime: a tmux
+// instance carries its profile's session (and pre-start script and env), so
+// two tmux profiles must not share one manager.
+func (r *TmuxRuntime) PerProfileInstances() bool { return true }
+
+var _ PerProfileInstancesRuntime = (*TmuxRuntime)(nil)
+
+// HarnessReadinessExempt implements HarnessReadinessExemptRuntime. tmux
+// agents run on the broker host and share its /tmp, so the per-container
+// readiness files do not exist for them, and the probe's in-container tmux
+// session check has nothing to find. Waiting would hold every buffered
+// message for the full readiness deadline.
+func (r *TmuxRuntime) HarnessReadinessExempt() bool { return true }
+
+var _ HarnessReadinessExemptRuntime = (*TmuxRuntime)(nil)
+
+// RunsHarnessInHostWorkspace implements HostWorkspaceRuntime: the agent's
+// window is opened with its working directory set to the workspace, or the
+// agent home when there is none (see Run).
+func (r *TmuxRuntime) RunsHarnessInHostWorkspace() bool { return true }
+
+var _ HostWorkspaceRuntime = (*TmuxRuntime)(nil)
+
 func (r *TmuxRuntime) Name() string { return "tmux" }
 
 // ExecUser returns "" — the agent runs as the current host user.

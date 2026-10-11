@@ -2338,7 +2338,8 @@ authDone:
 	// one, pre-trusts agent_workspace; a host path there leaves the agent
 	// blocked on Claude Code's folder-trust dialog.
 	if _, isContainerScript := h.(*harness.ContainerScriptHarness); isContainerScript {
-		if err := writeAgentHome(ctx, func() error { return harness.SetManifestAgentWorkspace(agentHome, containerWorkspace) }); err != nil {
+		manifestWorkspace := provisionManifestWorkspace(m.Runtime, containerWorkspace, effectiveWorkspace, agentHome)
+		if err := writeAgentHome(ctx, func() error { return harness.SetManifestAgentWorkspace(agentHome, manifestWorkspace) }); err != nil {
 			return nil, fmt.Errorf("stage harness manifest workspace: %w", err)
 		}
 	}
@@ -3786,4 +3787,19 @@ func hostCredentialSecretPresent(secrets []api.ResolvedSecret, name, suffix stri
 		}
 	}
 	return false
+}
+
+// provisionManifestWorkspace is the workspace path a container-script
+// provisioner is handed: the container-side mount point, or, on a runtime
+// whose harness runs in the host workspace directory, that directory (the
+// agent home when there is no workspace), which is where the harness keys
+// its per-project state such as Claude Code's folder trust.
+func provisionManifestWorkspace(rt runtime.Runtime, containerWorkspace, hostWorkspace, agentHome string) string {
+	if !runtime.RunsHarnessInHostWorkspace(rt) {
+		return containerWorkspace
+	}
+	if hostWorkspace != "" {
+		return hostWorkspace
+	}
+	return agentHome
 }
