@@ -88,6 +88,13 @@ func NewTmuxRuntime() *TmuxRuntime {
 	return &TmuxRuntime{Command: "tmux", Session: DefaultTmuxSession, HomeMode: HomeModeAgent}
 }
 
+// PerProfileInstances implements PerProfileInstancesRuntime: a tmux
+// instance carries its profile's session (and pre-start script and env), so
+// two tmux profiles must not share one manager.
+func (r *TmuxRuntime) PerProfileInstances() bool { return true }
+
+var _ PerProfileInstancesRuntime = (*TmuxRuntime)(nil)
+
 func (r *TmuxRuntime) Name() string { return "tmux" }
 
 // ExecUser returns "" — the agent runs as the current host user.
