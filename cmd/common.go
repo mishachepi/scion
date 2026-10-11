@@ -940,11 +940,17 @@ func RunAgent(cmd *cobra.Command, args []string, resume bool) error {
 		Image:         resolvedImage,
 		ProjectPath:   projectPath,
 		Resume:        effectiveResume,
-		Detached:      detached,
-		NoAuth:        noAuth,
-		Branch:        effectiveBranch,
-		Workspace:     workspace,
-		InlineConfig:  inlineCfg,
+		HarnessSessionID: func() string {
+			if !effectiveResume {
+				return ""
+			}
+			return agent.GetSavedHarnessSessionID(agentName, projectPath)
+		}(),
+		Detached:     detached,
+		NoAuth:       noAuth,
+		Branch:       effectiveBranch,
+		Workspace:    workspace,
+		InlineConfig: inlineCfg,
 	}
 
 	// Apply telemetry override from CLI flags

@@ -123,7 +123,7 @@ func harnessCmdLine(cfg RunConfig) (cmdLine string, ok bool) {
 		return buildNoAuthCmdLine(cfg.NoAuthMessage, cfg.NoAuthCommand), true
 	}
 	if cfg.Harness != nil {
-		harnessArgs := cfg.Harness.GetCommand(cfg.Task, cfg.Resume, cfg.CommandArgs)
+		harnessArgs := api.HarnessCommand(cfg.Harness, cfg.Task, cfg.Resume, cfg.HarnessSessionID, cfg.CommandArgs)
 		quotedArgs := make([]string, 0, len(harnessArgs))
 		for _, a := range harnessArgs {
 			quotedArgs = append(quotedArgs, shellQuote(a))

@@ -2775,11 +2775,14 @@ type HarnessProvisionerConfig struct {
 
 // HarnessCommandConfig describes harness CLI command construction.
 type HarnessCommandConfig struct {
-	Base             []string `json:"base,omitempty" yaml:"base,omitempty" koanf:"base"`
-	ResumeFlag       string   `json:"resume_flag,omitempty" yaml:"resume_flag,omitempty" koanf:"resume_flag"`
-	TaskFlag         string   `json:"task_flag,omitempty" yaml:"task_flag,omitempty" koanf:"task_flag"`
-	TaskPosition     string   `json:"task_position,omitempty" yaml:"task_position,omitempty" koanf:"task_position"`
-	SystemPromptFlag string   `json:"system_prompt_flag,omitempty" yaml:"system_prompt_flag,omitempty" koanf:"system_prompt_flag"`
+	Base       []string `json:"base,omitempty" yaml:"base,omitempty" koanf:"base"`
+	ResumeFlag string   `json:"resume_flag,omitempty" yaml:"resume_flag,omitempty" koanf:"resume_flag"`
+	// ResumeIDFlag resumes one exact session, e.g. "--resume {session_id}";
+	// preferred over ResumeFlag when a session id is known.
+	ResumeIDFlag     string `json:"resume_id_flag,omitempty" yaml:"resume_id_flag,omitempty" koanf:"resume_id_flag"`
+	TaskFlag         string `json:"task_flag,omitempty" yaml:"task_flag,omitempty" koanf:"task_flag"`
+	TaskPosition     string `json:"task_position,omitempty" yaml:"task_position,omitempty" koanf:"task_position"`
+	SystemPromptFlag string `json:"system_prompt_flag,omitempty" yaml:"system_prompt_flag,omitempty" koanf:"system_prompt_flag"`
 }
 
 // HarnessAuthMetadata is defined in pkg/api to avoid import cycles.

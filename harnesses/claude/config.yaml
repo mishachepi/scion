@@ -72,6 +72,7 @@ env:
 command:
   base: ["claude", "--no-chrome", "--permission-mode", "bypassPermissions"]
   resume_flag: "--continue"
+  resume_id_flag: "--resume {session_id}"
   task_position: after_base_args
   system_prompt_flag: "--system-prompt"
 capabilities:
