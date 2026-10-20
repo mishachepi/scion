@@ -486,6 +486,13 @@ func getAuthInfo(settings *config.Settings, endpoint string) authInfo {
 		MethodType: "none",
 	}
 
+	if hubsync.ExplicitHubToken(endpoint) != "" {
+		info.Method = "Bearer token"
+		info.MethodType = "bearer"
+		info.Source = "--hub-config token_file"
+		return info
+	}
+
 	// Check for OAuth credentials from scion hub auth login
 	if endpoint != "" {
 		if creds, err := credentials.Load(endpoint); err == nil && creds.AccessToken != "" {
@@ -671,8 +678,15 @@ func hubClientAndAuthSourceForEndpoint(settings *config.Settings, endpoint strin
 	// comment on createHubClient in pkg/hubsync/sync.go for why.
 	authConfigured := false
 
+	// An explicit token bound to this endpoint (--hub-config) outranks
+	// every other source.
+	if token := hubsync.ExplicitHubToken(endpoint); token != "" {
+		opts = append(opts, hubclient.WithBearerToken(token))
+		authConfigured = true
+	}
+
 	// Check for OAuth credentials from scion hub auth login
-	if accessToken := credentials.GetAccessToken(endpoint); accessToken != "" {
+	if accessToken := credentials.GetAccessToken(endpoint); !authConfigured && accessToken != "" {
 		opts = append(opts, hubclient.WithBearerToken(accessToken))
 		authConfigured = true
 		source = hubAuthSourceStoredLogin

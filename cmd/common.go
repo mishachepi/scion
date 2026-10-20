@@ -313,6 +313,11 @@ type HubContext struct {
 // SCION_AUTH_TOKEN) are intentionally omitted here: an agent identity token
 // cannot authenticate a human attach.
 func getHubAccessToken(endpoint string) string {
+	// An explicit token bound to this endpoint (--hub-config) comes first.
+	if token := hubsync.ExplicitHubToken(endpoint); token != "" {
+		return token
+	}
+
 	// Priority 1: OAuth credentials from scion hub auth login
 	if token := credentials.GetAccessToken(endpoint); token != "" {
 		return token

@@ -103,6 +103,9 @@ func runProjectUse(cmd *cobra.Command, args []string) error {
 	if contextDisabled(resolveMode()) {
 		return errors.New("'scion use' is not available inside an agent")
 	}
+	if hubConfigApplied != "" && (useClear || len(args) > 0) {
+		return errUseWithHubConfig
+	}
 	if useClear {
 		if len(args) > 0 {
 			return errors.New("--clear takes no project")
@@ -149,6 +152,7 @@ func loadUseContext(stderr io.Writer) *config.CLIContext {
 // display labels.
 const (
 	useSourceFlag      = "flag"
+	useSourceHubConfig = "hub-config"
 	useSourceEnv       = "env"
 	useSourceDirectory = targetSourceDirectory
 	useSourceContext   = targetSourceContext
@@ -194,6 +198,9 @@ func describeUseTarget(c *config.CLIContext) useTarget {
 		t.ProjectSource, t.ProjectLabel = useSourceGlobal, "global project"
 		t.ProjectSlug = "global"
 		t.ProjectDir = displayProjectDir(dir)
+	case projectFromHubConfig:
+		t.ProjectSource, t.ProjectLabel = useSourceHubConfig, "hub config "+hubConfigApplied
+		t.ProjectID = projectPath
 	case projectPath != "" && hubsync.IsHubProjectRef(projectPath):
 		t.ProjectSource, t.ProjectLabel = useSourceFlag, "--project flag"
 		t.ProjectSlug = projectPath

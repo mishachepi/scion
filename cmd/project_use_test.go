@@ -548,3 +548,24 @@ func TestUseSelectProject_UsesCommandContext(t *testing.T) {
 	assertNothingSelected(t)
 	assert.Empty(t, readTestContext(t).Projects, "nothing is saved")
 }
+
+// TestUse_HubConfigIsNeverSaved: a hub config applies to one command, so
+// bare 'scion use' shows it as the source and saves nothing, and selecting
+// or clearing a project under it is refused.
+func TestUse_HubConfigIsNeverSaved(t *testing.T) {
+	srv, _ := setupUseTest(t)
+	t.Cleanup(func() { hubConfigFlag, hubConfigApplied, projectFromHubConfig = "", "", false })
+	path := filepath.Join(t.TempDir(), "hub.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("hub:\n  endpoint: "+srv.URL+"\n  project_id: "+ctxTestProjectID+"\n"), 0o600))
+
+	stdout, _, err := runScion(t, "--hub-config", path, "use")
+	require.NoError(t, err)
+	assert.Contains(t, stdout, "(hub config "+path+")")
+	assertNothingSelected(t)
+
+	for _, args := range [][]string{{"use", "some-project"}, {"use", "--clear"}} {
+		_, _, err := runScion(t, append([]string{"--hub-config", path}, args...)...)
+		require.ErrorIs(t, err, errUseWithHubConfig, "%v", args)
+	}
+	assertNothingSelected(t)
+}

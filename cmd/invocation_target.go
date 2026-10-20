@@ -127,14 +127,16 @@ type cliHub struct {
 	// Endpoint is the resolved hub URL, or "".
 	Endpoint string
 	// Source is the JSON source code shared with 'scion use': "flag",
-	// "env", "directory", "context" or "none".
+	// "hub-config", "env", "directory", "context" or "none".
 	Source string
-	// Label is the display label of Source: "--hub flag", the name of the
-	// environment variable, "directory link", "current context" or "none".
+	// Label is the display label of Source: "--hub flag", "hub config
+	// <path>", the name of the environment variable, "directory link",
+	// "current context" or "none".
 	Label string
 }
 
 // resolveCLIHub returns the hub of this invocation: hubEndpoint, which
+// applyHubConfig filled from a hub config file (source "hub-config") or
 // resolveInvocationTarget filled from the --hub flag, the link entry of the
 // directory project or the current context (source "flag", "directory" or
 // "context"), else SCION_HUB_ENDPOINT or SCION_HUB_URL ("env"), else ""
@@ -142,6 +144,8 @@ type cliHub struct {
 // configuration.
 func resolveCLIHub() cliHub {
 	switch {
+	case hubEndpoint != "" && hubConfigApplied != "":
+		return cliHub{Endpoint: hubEndpoint, Source: useSourceHubConfig, Label: "hub config " + hubConfigApplied}
 	case hubEndpoint != "" && hubSource == targetSourceContext:
 		return cliHub{Endpoint: hubEndpoint, Source: useSourceContext, Label: "current context"}
 	case hubEndpoint != "" && hubSource == targetSourceDirectory:
@@ -480,10 +484,11 @@ func resolveInvocationTargetWith(cmd *cobra.Command, mode CLIMode, r targetResol
 
 // hubFlagEndpoint returns the --hub flag value: hubEndpoint, unless
 // resolveInvocationTarget filled it from the current context or from a
-// link entry. Code that persists "the endpoint given with --hub" must use
-// this, so a hub from the hub list is never written into settings.
+// link entry, or applyHubConfig from a hub config file. Code that persists
+// "the endpoint given with --hub" must use this, so a hub from the hub list
+// or a hub config is never written into settings.
 func hubFlagEndpoint() string {
-	if hubSource != "" {
+	if hubSource != "" || hubConfigApplied != "" {
 		return ""
 	}
 	return hubEndpoint

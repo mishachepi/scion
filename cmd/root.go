@@ -133,6 +133,12 @@ return an error instead of blocking.`,
 			return errNoHubRemoved
 		}
 
+		// A hub config file (--hub-config, SCION_HUB_CONFIG) selects the
+		// hub, project and token before anything resolves them.
+		if err := applyHubConfig(); err != nil {
+			return err
+		}
+
 		// Target-hub profiles (ptone/scion#4240): refuse commands outside
 		// the profile allow-list, and apply the agent-mode target rule.
 		if err := checkHubProfileGate(cmd, mode); err != nil {

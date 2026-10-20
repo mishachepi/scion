@@ -2014,6 +2014,12 @@ func createHubClient(settings *config.Settings, endpoint string) (hubclient.Clie
 // reports which kind of credential it is. It makes no network calls. The
 // option is nil when no credential is sent (CredentialKindNone).
 func selectHubCredential(endpoint string) (hubclient.Option, CredentialKind) {
+	// 0. An explicit token bound to this endpoint (--hub-config) outranks
+	// every other source.
+	if token := ExplicitHubToken(endpoint); token != "" {
+		return hubclient.WithBearerToken(token), CredentialKindHubToken
+	}
+
 	// 1. Check for OAuth credentials from scion hub auth login
 	if accessToken := credentials.GetAccessToken(endpoint); accessToken != "" {
 		return hubclient.WithBearerToken(accessToken), CredentialKindOAuth
@@ -2082,7 +2088,13 @@ func IsLocalWorkstationEndpoint(endpoint string) bool {
 // that is a user access token (UAT): a token scoped to a single project and
 // a set of action scopes. See 'scion hub token'.
 func UsesUserAccessToken(kind CredentialKind) bool {
-	return kind == CredentialKindHubToken && IsUserAccessToken(os.Getenv("SCION_HUB_TOKEN"))
+	if kind != CredentialKindHubToken {
+		return false
+	}
+	explicitToken.mu.RLock()
+	explicit := explicitToken.token
+	explicitToken.mu.RUnlock()
+	return IsUserAccessToken(explicit) || IsUserAccessToken(os.Getenv("SCION_HUB_TOKEN"))
 }
 
 // IsUserAccessToken reports whether token is a user access token.
