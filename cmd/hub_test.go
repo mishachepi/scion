@@ -262,12 +262,13 @@ func TestGetHubClient_AgentContextSendsAgentTokenHeaderNotDevBearer(t *testing.T
 	}))
 	defer server.Close()
 
+	// getHubClient takes the hub from the invocation (--hub), not from
+	// settings.
 	origHubEndpoint := hubEndpoint
-	hubEndpoint = ""
+	hubEndpoint = server.URL
 	defer func() { hubEndpoint = origHubEndpoint }()
 
-	settings := &config.Settings{Hub: &config.HubClientConfig{Endpoint: server.URL}}
-	client, err := getHubClient(settings)
+	client, err := getHubClient(&config.Settings{})
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
