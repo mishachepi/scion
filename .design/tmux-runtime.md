@@ -25,10 +25,13 @@ Container runtimes remain the right choice for filesystem isolation, CPU/memory 
 
 ```go
 type TmuxRuntime struct {
-    Command   string // defaults to "tmux"
-    Session   string // defaults to "scion"
-    HomeMode  string // currently always "agent"
-    Sciontool string
+    Command        string            // defaults to "tmux"
+    Session        string            // default_tmux_session; defaults to "scion"
+    HomeMode       string            // home_mode; "agent" is the only accepted value
+    PreStartScript string            // runs before each new-window: <agentHome> <operator-$HOME>
+    Env            map[string]string // runtimes.<name>.env, exported into every window
+    Sciontool      string            // "" or an absolute path, resolved by the factory
+    StopTimeout    time.Duration     // how long Stop/Delete wait for the pane's init to exit
 }
 ```
 
@@ -36,9 +39,9 @@ type TmuxRuntime struct {
 
 Agent metadata that container runtimes store as Docker labels is mapped to tmux user-options at window scope (`@scion-label-<key>`, `@scion-annotation-<key>`, `@scion-workspace`). The `-w` flag is mandatory — without it tmux defaults to session scope and every `Run` would overwrite the previous agent's labels.
 
-### 2. HOME mode
+### 2. HOME
 
-Only `home_mode: agent` is supported today. `HOME=<agentHome>` overrides for the whole tmux window; `SCION_AGENT_HOME`, `SCION_AGENT`, and `SCION_PROJECT` are exported alongside the harness's own env. Resolved env-secrets and Env passthrough land via `-e` flags. The field reserves space for follow-up modes that preserve the operator's `$HOME`.
+`home_mode: agent` is the only accepted value. `HOME=<agentHome>` overrides for the whole tmux window; `SCION_AGENT_HOME`, `SCION_AGENT`, and `SCION_PROJECT` are exported alongside the harness's own env. Resolved env-secrets and Env passthrough land via `-e` flags.
 
 ### 3. Sciontool wrapper (`sciontool: auto`)
 
@@ -72,19 +75,19 @@ Resolution happens in `factory.GetRuntime`; the runtime sees only an empty strin
 
 ### Factory registration
 
-`pkg/runtime/factory.go` registers `tmux` in the runtime type switch. Invalid `home_mode` values fail closed with `ErrorRuntime` rather than silently defaulting.
+`pkg/runtime/factory.go` registers `tmux` in the runtime type switch.
 
 ### Settings schema
 
 `pkg/config/schemas/settings-v1.schema.json` declares the tmux-specific fields under `runtimeConfig.properties` so `scion config validate` and legacy → v1 migration both accept them:
 
 ```json
-"session":   { "type": "string" },
-"home_mode": { "type": "string", "enum": ["agent"] },
-"sciontool": { "type": "string" }
+"default_tmux_session": { "type": "string" },
+"pre_start_script":     { "type": "string" },
+"home_mode":            { "type": "string", "enum": ["agent"] },
+"env":                  { "type": "object" },
+"sciontool":            { "type": "string" }
 ```
-
-The `home_mode` enum is constrained so typos fail at the schema layer rather than at `GetRuntime` time.
 
 ### Image registry bypass
 
@@ -102,6 +105,17 @@ The `home_mode` enum is constrained so typos fail at the schema layer rather tha
 
 `cloneWorkspaceIfRequested` clones hub-managed git workspaces before `tmux new-window`. The same logic runs inside `sciontool init` in container mode; in tmux mode the runtime handles it directly so the wrapper's `--tmuxruntime` branch can skip `gitCloneWorkspace`. `GITHUB_TOKEN` (if present) is woven into the URL via `https://oauth2:<token>@...`; `sanitizeGitOutput` redacts it before any error surface.
 
+### Optional runtime capabilities
+
+The tmux runtime implements these optional runtime interfaces:
+
+| Interface | Effect |
+|---|---|
+| `PerProfileInstancesRuntime` | The broker builds one manager per tmux profile, so profiles that differ in session, pre-start script or env do not share an instance. |
+| `HarnessReadinessExemptRuntime` | Message delivery does not wait on the container readiness files, which do not exist on the host. |
+| `HostWorkspaceRuntime` | A container-script provisioner is handed the host workspace instead of the container mount point. |
+| `InitSignaler` (`pkg/runtime/init_signal.go`) | reset-auth signals the pane's `sciontool init` by PID instead of `kill -USR2 1`, which on the host would hit the host's init. |
+
 ## Method notes
 
 | Method | Approach |
@@ -109,13 +123,13 @@ The `home_mode` enum is constrained so typos fail at the schema layer rather tha
 | `Name()` | Return `"tmux"`. |
 | `ExecUser()` | Return `""` — agent runs as the current host user. |
 | `Run()` | `buildNewWindowArgs`, `writeHostFileSecrets` / `writeVariableSecrets`, `cloneWorkspaceIfRequested`, `ensureSession`, name-collision check, `tmux new-window`, `lockWindowName` (disable auto-rename), `applyMetadata`. |
-| `Stop()` | Send `C-c` then `kill-window`. Idempotent. |
-| `Delete()` | `kill-window`. Idempotent — treats missing window as success. |
+| `Stop()` | Send `C-c`, `kill-window`, then wait up to `StopTimeout` for the pane's init to exit. Idempotent. |
+| `Delete()` | `kill-window` and the same wait. Idempotent — a missing window is success; a window labelled with another `scion.run_id` is left alone (`ErrRunMismatch`). |
 | `List()` | `tmux list-windows -a` (all sessions), then `show-options -w -t <target>` per window. Filters non-scion windows (no `scion.name` label). |
 | `GetLogs()` | `capture-pane -p -J -S - -E -` for full scrollback. |
 | `Attach()` | `runInteractiveCommand("tmux", "attach", "-t", target)`. Takes over the terminal. |
 | `Sync()` | No-op — host filesystem is already visible. |
-| `Exec()` | A `tmux` subcommand is forwarded with `-t` rewritten to the agent's target; any other binary runs on the host with `cwd = pane_current_path`. |
+| `Exec()` | A `tmux` subcommand is forwarded with `-t` rewritten to the agent's target; any other binary runs on the host with the agent's identity (`HOME` = agent home from `@scion-home`, `cwd` = workspace, `SCION_*` markers), falling back to `pane_current_path` for windows without `@scion-home`. |
 | `GetWorkspacePath()` | `show-option -w -v -t <target> @scion-workspace`. |
 | `ImageExists`/`PullImage` | Return success — no images. |
 
@@ -123,9 +137,8 @@ The `home_mode` enum is constrained so typos fail at the schema layer rather tha
 
 | # | Topic | Decision |
 |---|---|---|
-| 1 | **`home_mode`** | Only `agent` for the initial release. The constant + field reserve space for future modes. |
-| 2 | **Sciontool wrapper default** | Off (`sciontool: ""`). Opt-in via `auto` or explicit path. |
-| 3 | **`sciontool: auto` on miss** | Graceful fallback to direct exec with one-line stderr warning, never hard error. |
-| 4 | **Invalid `home_mode`** | Fail closed at `GetRuntime` time with `ErrorRuntime`. |
-| 5 | **Volumes** | Silently dropped with stderr warning. Host FS is already visible. |
-| 6 | **File/variable secrets** | Materialize under `<agentHome>` — touches per-agent state, not operator HOME. |
+| 1 | **Sciontool wrapper default** | Off (`sciontool: ""`). Opt-in via `auto` or explicit path. |
+| 2 | **`sciontool: auto` on miss** | Graceful fallback to direct exec with one-line stderr warning, never hard error. |
+| 3 | **Volumes** | Silently dropped with stderr warning. Host FS is already visible. |
+| 4 | **File/variable secrets** | Materialize under `<agentHome>` — touches per-agent state, not operator HOME. |
+| 5 | **`home_mode`** | Only `agent`; any other value fails at `GetRuntime` with `ErrorRuntime`, never silently defaulted. |
