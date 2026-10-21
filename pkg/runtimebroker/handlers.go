@@ -3369,6 +3369,9 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 		LaunchID               string `json:"launchId,omitempty"`
 		LaunchTimeoutSeconds   int    `json:"launchTimeoutSeconds,omitempty"`
 		LaunchKeepaliveSeconds int    `json:"launchKeepaliveSeconds,omitempty"`
+		// ProjectPreStartHookScript is the hook stamped on the agent at
+		// create; see CreateAgentConfig.ProjectPreStartHookScript.
+		ProjectPreStartHookScript string `json:"projectPreStartHookScript,omitempty"`
 	}
 	if r.Body != nil && r.ContentLength != 0 {
 		if err := json.NewDecoder(r.Body).Decode(&startReq); err != nil {
@@ -3581,6 +3584,7 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 		return
 	}
 	opts := sc.Opts
+	opts.ProjectPreStartHookScript = startReq.ProjectPreStartHookScript
 
 	// Once ProjectPath is resolved, confirm id's agent directory actually
 	// resolves under this project's agents root before applyInlineConfigUpdate,
@@ -4628,6 +4632,8 @@ func (s *Server) restartAgent(w http.ResponseWriter, r *http.Request, id, projec
 		// Image mirrors the same field on the start path: the user's
 		// explicit image, applied as the top tier (ptone/scion#1799).
 		Image string `json:"image,omitempty"`
+		// ProjectPreStartHookScript mirrors the same field on the start path.
+		ProjectPreStartHookScript string `json:"projectPreStartHookScript,omitempty"`
 		// SharedWorkspace mirrors the start path's field, so a restart of a
 		// shared-workspace agent resolves the agent's state from the same
 		// broker-side external root as its start (ptone/scion#1799).
@@ -4825,6 +4831,7 @@ func (s *Server) restartAgent(w http.ResponseWriter, r *http.Request, id, projec
 		return
 	}
 	opts := sc.Opts
+	opts.ProjectPreStartHookScript = restartReq.ProjectPreStartHookScript
 	if restartReq.Image != "" {
 		opts.Image = restartReq.Image
 	}

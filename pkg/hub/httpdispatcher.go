@@ -3760,6 +3760,7 @@ func (d *HTTPAgentDispatcher) dispatchAgentStart(ctx context.Context, agent *sto
 	}
 	extras.TemplateID, extras.TemplateHash = dispatchTemplateIdentity(agent)
 	extras.Profile = dispatchProfile(agent)
+	extras.ProjectPreStartHookScript = stampedPreStartHook(agent)
 	// A flat Runtime Broker receives the agent's valid pinned target.
 	extras.ExpectedRuntimeTargetID = validPinnedTarget(agent)
 	if d.creatorSkillPreResolver != nil {
@@ -4036,6 +4037,7 @@ func (d *HTTPAgentDispatcher) DispatchAgentRestart(ctx context.Context, agent *s
 	}
 	extras.TemplateID, extras.TemplateHash = dispatchTemplateIdentity(agent)
 	extras.Profile = dispatchProfile(agent)
+	extras.ProjectPreStartHookScript = stampedPreStartHook(agent)
 	if agent.AppliedConfig != nil {
 		extras.HarnessConfig = agent.AppliedConfig.HarnessConfig
 		extras.HarnessConfigID = agent.AppliedConfig.HarnessConfigID
@@ -5112,4 +5114,13 @@ func withRecordedRuntimeURL(ctx context.Context, endpoint string) string {
 		return endpoint + "&" + param
 	}
 	return endpoint + "?" + param
+}
+
+// stampedPreStartHook returns the pre-start hook script stamped on agent at
+// create, or "" when none applies.
+func stampedPreStartHook(agent *store.Agent) string {
+	if agent == nil || agent.AppliedConfig == nil {
+		return ""
+	}
+	return agent.AppliedConfig.ProjectPreStartHookScript
 }

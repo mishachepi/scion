@@ -851,6 +851,11 @@ type StartExtras struct {
 	// (wire key previousProjectIds; see previousProjectIDs). Set on start
 	// and restart; empty sends nothing.
 	PreviousProjectIDs []string
+	// ProjectPreStartHookScript is the pre-start hook stamped on the agent
+	// at create (AppliedConfig.ProjectPreStartHookScript). Every start and
+	// restart re-stages the hook from the request, so it is sent each time;
+	// empty means no hook applies (wire key projectPreStartHookScript).
+	ProjectPreStartHookScript string
 }
 
 // applyStartExtras writes extras onto payload as flat top-level wire keys.
@@ -897,6 +902,9 @@ func applyStartExtras(payload map[string]interface{}, extras StartExtras) {
 	}
 	if extras.SharedWorkspace {
 		payload["sharedWorkspace"] = true
+	}
+	if extras.ProjectPreStartHookScript != "" {
+		payload["projectPreStartHookScript"] = extras.ProjectPreStartHookScript
 	}
 	if extras.TemplateName != "" && !transfer.IsContentHash(extras.TemplateName) {
 		payload["templateName"] = extras.TemplateName

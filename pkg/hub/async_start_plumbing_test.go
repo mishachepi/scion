@@ -586,3 +586,16 @@ func TestHubInstanceSnapshot_MaxFeaturesFitRowCap(t *testing.T) {
 	assert.LessOrEqual(t, len(b), api.HubInstanceRowMaxBytes)
 	assert.Equal(t, features, snap.Stats.Features, "features are never cut")
 }
+
+func TestApplyStartExtras_ProjectPreStartHookScript(t *testing.T) {
+	empty := map[string]interface{}{}
+	applyStartExtras(empty, StartExtras{})
+	if _, ok := empty["projectPreStartHookScript"]; ok {
+		t.Errorf("no hook must send no projectPreStartHookScript key: %v", empty)
+	}
+	payload := map[string]interface{}{}
+	applyStartExtras(payload, StartExtras{ProjectPreStartHookScript: "#!/bin/sh\n"})
+	if got := payload["projectPreStartHookScript"]; got != "#!/bin/sh\n" {
+		t.Errorf("projectPreStartHookScript = %v, want the stamped script", got)
+	}
+}
