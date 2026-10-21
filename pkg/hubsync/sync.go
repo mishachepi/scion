@@ -479,10 +479,11 @@ func EnsureHubReady(projectPath string, opts EnsureHubReadyOptions) (*HubContext
 	// project for this agent. The workspace may contain a cloned repo whose
 	// .scion/settings has a different project_id (e.g. template-sync from an
 	// external repo). An explicit target skips this (see explicitTarget).
-	var projectID string
+	var envProjectID string
 	if hubContext && !explicitTarget {
-		projectID = projectkeys.ProjectIDFromEnv(os.Getenv)
+		envProjectID = projectkeys.ProjectIDFromEnv(os.Getenv)
 	}
+	projectID := envProjectID
 	if projectID == "" {
 		projectID = settings.ProjectID
 	}
@@ -548,8 +549,11 @@ func EnsureHubReady(projectPath string, opts EnsureHubReadyOptions) (*HubContext
 	// operator's global hub project and syncs against it — comparing this
 	// project's local agents with the global project's hub agents and
 	// offering to delete the difference.
+	//
+	// The dispatcher's project ID is already the ID the hub knows the agent's
+	// project by, so a hub link in the workspace settings never replaces it.
 	effectiveProjectID := projectID
-	if hgid := settings.GetHubProjectID(); hgid != "" {
+	if hgid := settings.GetHubProjectID(); hgid != "" && envProjectID == "" {
 		if isGlobal || hubContext || config.ProjectSettingsDefineHubLink(resolvedPath) {
 			effectiveProjectID = hgid
 		} else {

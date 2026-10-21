@@ -311,6 +311,60 @@ func TestEnsureHubReady_HubContextEnvVars(t *testing.T) {
 	}
 }
 
+// An agent's workspace can be a checkout whose .scion links it to a project
+// on another hub. In hub context the dispatcher's SCION_PROJECT_ID names the
+// agent's project, and that workspace link must not replace it.
+func TestEnsureHubReady_HubContextEnvProjectOutranksWorkspaceHubLink(t *testing.T) {
+	const agentProjectID = "aaaaaaaa-0000-4000-8000-000000000001"
+	const workspaceHubProjectID = "bbbbbbbb-0000-4000-8000-000000000002"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/healthz" {
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	tmpHome := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpHome, ".scion"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	workspace := t.TempDir()
+	wsScion := filepath.Join(workspace, ".scion")
+	if err := os.MkdirAll(wsScion, 0755); err != nil {
+		t.Fatal(err)
+	}
+	wsSettings := "schema_version: \"1\"\nhub:\n  endpoint: https://other-hub.example.com\n  project_id: " + workspaceHubProjectID + "\n"
+	if err := os.WriteFile(filepath.Join(wsScion, "settings.yaml"), []byte(wsSettings), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("SCION_HUB_ENDPOINT", server.URL)
+	t.Setenv("SCION_HUB_URL", "")
+	t.Setenv("SCION_HUB_PROJECT_ID", "")
+	t.Setenv("SCION_PROJECT_ID", agentProjectID)
+	t.Setenv("SCION_AUTH_TOKEN", "test-agent-token")
+	t.Setenv("SCION_DEV_TOKEN", "")
+
+	origDir, _ := os.Getwd()
+	if err := os.Chdir(workspace); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(origDir) }()
+
+	hubCtx, err := EnsureHubReady("", EnsureHubReadyOptions{AutoConfirm: true, NonInteractive: true})
+	if err != nil {
+		t.Fatalf("EnsureHubReady returned error: %v", err)
+	}
+	if hubCtx.ProjectID != agentProjectID {
+		t.Errorf("ProjectID = %q, want the agent's project %q (not the workspace's hub link %q)", hubCtx.ProjectID, agentProjectID, workspaceHubProjectID)
+	}
+}
+
 func TestEnsureHubReady_HubContextSkipsSyncAndRegistration(t *testing.T) {
 	// When running in hub context (container), EnsureHubReady should skip
 	// project registration and sync checks. Verify that no registration or
