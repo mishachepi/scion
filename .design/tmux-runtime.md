@@ -28,7 +28,6 @@ type TmuxRuntime struct {
     Command        string            // defaults to "tmux"
     Session        string            // default_tmux_session; defaults to "scion"
     HomeMode       string            // home_mode; "agent" is the only accepted value
-    PreStartScript string            // runs before each new-window: <agentHome> <operator-$HOME>
     Env            map[string]string // runtimes.<name>.env, exported into every window
     Sciontool      string            // "" or an absolute path, resolved by the factory
     StopTimeout    time.Duration     // how long Stop/Delete wait for the pane's init to exit
@@ -83,7 +82,6 @@ Resolution happens in `factory.GetRuntime`; the runtime sees only an empty strin
 
 ```json
 "default_tmux_session": { "type": "string" },
-"pre_start_script":     { "type": "string" },
 "home_mode":            { "type": "string", "enum": ["agent"] },
 "env":                  { "type": "object" },
 "sciontool":            { "type": "string" }
@@ -111,7 +109,7 @@ The tmux runtime implements these optional runtime interfaces:
 
 | Interface | Effect |
 |---|---|
-| `PerProfileInstancesRuntime` | The broker builds one manager per tmux profile, so profiles that differ in session, pre-start script or env do not share an instance. |
+| `PerProfileInstancesRuntime` | The broker builds one manager per tmux profile, so profiles that differ in session or env do not share an instance. |
 | `HarnessReadinessExemptRuntime` | Message delivery does not wait on the container readiness files, which do not exist on the host. |
 | `HostWorkspaceRuntime` | A container-script provisioner is handed the host workspace instead of the container mount point. |
 | `InitSignaler` (`pkg/runtime/init_signal.go`) | reset-auth signals the pane's `sciontool init` by PID instead of `kill -USR2 1`, which on the host would hit the host's init. |

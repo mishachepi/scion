@@ -104,22 +104,25 @@ For Claude pick one of `api-key` (`ANTHROPIC_API_KEY`), `oauth-token` (`CLAUDE_C
 
 ### Claude through the macOS Keychain
 
-Claude Code keeps its login in the macOS Keychain, which has no file to copy. A tmux agent can use the operator's login directly: a `pre_start_script` links the operator's Keychain into `<agentHome>`, and the profile selects `manual`, so scion injects no credentials and does not require `ANTHROPIC_API_KEY`. This works on a hosted server and without dev auth.
+Claude Code keeps its login in the macOS Keychain, which has no file to copy. A tmux agent can use the operator's login directly: a [project pre-start hook](/scion/hosted/user/pre-start-hooks/) links the operator's Keychain into `<agentHome>`, and the harness config selects `manual`, so scion injects no credentials and does not require `ANTHROPIC_API_KEY`. This works on a hosted server and without dev auth.
 
 ```yaml
 runtimes:
   tmux:
     type: tmux
-    pre_start_script: ~/.scion/scripts/pre_start_tmux.sh   # ln -snf "$2/Library/Keychains" "$1/Library/Keychains"
-profiles:
-  tmux:
-    runtime: tmux
-    harness_overrides:
-      claude:
-        auth_selected_type: manual
+    sciontool: auto            # hooks run inside sciontool init
+harness_configs:
+  claude:
+    harness: claude
+    auth_selected_type: manual
 ```
 
-A server stores its profiles when it starts, so restart it after changing them. A single agent can also select it with `--harness-auth manual`.
+```sh
+scion project hook create my-project --name "tmux keychain" \
+  --script scripts/examples/tmux-keychain-hook.sh.example
+```
+
+The hook is stamped into an agent when the agent is created, so agents created before the hook need to be recreated. A server stores its harness configs and profiles when it starts, so restart it after changing them. A single agent can also select manual auth with `--harness-auth manual`.
 
 ## Isolation model
 

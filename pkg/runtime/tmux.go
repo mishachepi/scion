@@ -78,10 +78,6 @@ type TmuxRuntime struct {
 	Command string
 	Session string
 
-	// PreStartScript is invoked before each new-window with arguments
-	// <agentHome> <operator-$HOME>.
-	PreStartScript string
-
 	// HomeMode controls HOME and env injection. See V1RuntimeConfig.HomeMode.
 	// HomeModeAgent is the only supported value.
 	HomeMode string
@@ -111,7 +107,7 @@ func NewTmuxRuntime() *TmuxRuntime {
 }
 
 // PerProfileInstances implements PerProfileInstancesRuntime: a tmux
-// instance carries its profile's session (and pre-start script and env), so
+// instance carries its profile's session and env, so
 // two tmux profiles must not share one manager.
 func (r *TmuxRuntime) PerProfileInstances() bool { return true }
 
@@ -193,10 +189,6 @@ func (r *TmuxRuntime) Run(ctx context.Context, config RunConfig) (string, error)
 				"tmux runtime: agent %q already exists at %s — delete it first (scion delete %s) or attach (scion attach %s)",
 				scionName, existing[0].ContainerID, scionName, scionName)
 		}
-	}
-
-	if err := r.runPreStartScript(ctx, config.HomeDir); err != nil {
-		return "", err
 	}
 
 	// Reap a stale window with the same name in the target session. Tmux
@@ -646,40 +638,6 @@ func (r *TmuxRuntime) windowExists(ctx context.Context, id string) bool {
 		}
 	}
 	return false
-}
-
-// runPreStartScript invokes PreStartScript with arguments <agentHome>
-// <operator-$HOME>.
-func (r *TmuxRuntime) runPreStartScript(ctx context.Context, agentHome string) error {
-	if r.PreStartScript == "" {
-		return nil
-	}
-	operatorHome := os.Getenv("HOME")
-	scriptPath := r.PreStartScript
-	if strings.HasPrefix(scriptPath, "~/") {
-		scriptPath = filepath.Join(operatorHome, scriptPath[2:])
-	} else if scriptPath == "~" {
-		scriptPath = operatorHome
-	}
-	if !filepath.IsAbs(scriptPath) {
-		scriptPath = filepath.Join(operatorHome, scriptPath)
-	}
-	info, err := os.Stat(scriptPath)
-	if err != nil {
-		return fmt.Errorf("tmux runtime: pre_start_script %q: %w", scriptPath, err)
-	}
-	if info.IsDir() {
-		return fmt.Errorf("tmux runtime: pre_start_script %q is a directory", scriptPath)
-	}
-	if info.Mode()&0o111 == 0 {
-		return fmt.Errorf("tmux runtime: pre_start_script %q is not executable (chmod +x)", scriptPath)
-	}
-	out, err := exec.CommandContext(ctx, scriptPath, agentHome, operatorHome).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("tmux runtime: pre_start_script %q failed: %w (output: %s)",
-			scriptPath, err, strings.TrimSpace(string(out)))
-	}
-	return nil
 }
 
 func splitWindowTarget(id string) (session, windowID string, ok bool) {

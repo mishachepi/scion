@@ -1,0 +1,25 @@
+#!/bin/sh
+# Example project pre-start hook for tmux-runtime agents on macOS.
+#
+# Gives the agent (HOME=<agentHome>) the operator's macOS Keychain, so Claude
+# Code uses the operator's login. Pair it with auth_selected_type: manual on
+# the claude harness config. Register it at the Hub:
+#
+#   scion project hook create <project> --name "tmux keychain" \
+#       --script scripts/examples/tmux-keychain-hook.sh.example
+#
+# sciontool init runs it after harness provisioning, with HOME set to the
+# agent home. The hook reaches every agent of the project, so it does nothing
+# outside macOS.
+
+set -eu
+
+[ "$(uname -s)" = "Darwin" ] || exit 0
+
+AGENT_HOME="${SCION_AGENT_HOME:-$HOME}"
+OP_HOME=$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory | awk '{print $2}')
+[ -d "$OP_HOME" ] || { echo "tmux-keychain-hook: cannot resolve operator home" >&2; exit 1; }
+[ "$AGENT_HOME" = "$OP_HOME" ] && exit 0
+
+mkdir -p "$AGENT_HOME/Library"
+ln -snf "$OP_HOME/Library/Keychains" "$AGENT_HOME/Library/Keychains"

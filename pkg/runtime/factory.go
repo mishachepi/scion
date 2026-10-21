@@ -245,9 +245,6 @@ func (s runtimeSelection) build() Runtime {
 			}
 			tr.Session = rtConfig.DefaultTmuxSession
 		}
-		if rtConfig.PreStartScript != "" {
-			tr.PreStartScript = rtConfig.PreStartScript
-		}
 		switch rtConfig.HomeMode {
 		case "", HomeModeAgent:
 			tr.HomeMode = HomeModeAgent
