@@ -153,6 +153,9 @@ func (r *TmuxRuntime) Run(ctx context.Context, config RunConfig) (string, error)
 	if err != nil {
 		return "", err
 	}
+	if args, err = fitTmuxCommand(args, config.HomeDir); err != nil {
+		return "", err
+	}
 
 	warnIgnoredFeatures(config)
 	// Serialize file + variable secrets into the stagedsecrets.EnvVar blob.
@@ -294,6 +297,78 @@ func (r *TmuxRuntime) buildNewWindowArgs(config RunConfig, session string) ([]st
 	args = append(args, "-P", "-F", "#{window_id}")
 	args = append(args, harnessArgs...)
 	return args, nil
+}
+
+// tmuxCommandBudget is the largest new-window argv, in bytes, sent to tmux as
+// is. tmux carries a whole command in one client message of at most 16 KiB
+// and refuses a longer one with "command too long"; the budget leaves room for
+// the message header and the env flags appended after the check.
+const tmuxCommandBudget = 12 << 10
+
+// tmuxLaunchScript is the agent-home path of the launcher written when the
+// harness command does not fit in the new-window message.
+const tmuxLaunchScript = ".scion/tmux-launch.sh"
+
+// fitTmuxCommand keeps the new-window argv within tmuxCommandBudget. A
+// harness command is mostly its system prompt, which can outgrow the tmux
+// message alone; when the argv is too long, the harness command (everything
+// after "-F #{window_id}") moves into <homeDir>/.scion/tmux-launch.sh and the
+// window runs that script. The script execs the command, so the pane's root
+// process is still the harness or its sciontool wrapper.
+func fitTmuxCommand(args []string, homeDir string) ([]string, error) {
+	if argvSize(args) <= tmuxCommandBudget {
+		return args, nil
+	}
+	cmdStart := indexOfArg(args, "#{window_id}") + 1
+	if cmdStart <= 0 || cmdStart >= len(args) {
+		return nil, fmt.Errorf("tmux runtime: new-window command is %d bytes and has no harness command to move out", argvSize(args))
+	}
+	var b strings.Builder
+	b.WriteString("#!/bin/sh\n# Written by the scion tmux runtime at each start; the command is too long for tmux.\nexec")
+	for _, a := range args[cmdStart:] {
+		b.WriteString(" ")
+		b.WriteString(shellSingleQuote(a))
+	}
+	b.WriteString("\n")
+	path := filepath.Join(homeDir, tmuxLaunchScript)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("tmux runtime: launcher dir: %w", err)
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o700); err != nil {
+		return nil, fmt.Errorf("tmux runtime: write launcher: %w", err)
+	}
+	if err := os.Chmod(path, 0o700); err != nil {
+		return nil, fmt.Errorf("tmux runtime: chmod launcher: %w", err)
+	}
+	fitted := append(append([]string{}, args[:cmdStart]...), "/bin/sh", path)
+	if size := argvSize(fitted); size > tmuxCommandBudget {
+		return nil, fmt.Errorf("tmux runtime: new-window command is %d bytes without the harness command (limit %d); reduce the agent's environment", size, tmuxCommandBudget)
+	}
+	return fitted, nil
+}
+
+// argvSize is the size of args as tmux packs them: each argument plus its
+// terminating NUL.
+func argvSize(args []string) int {
+	n := 0
+	for _, a := range args {
+		n += len(a) + 1
+	}
+	return n
+}
+
+func indexOfArg(args []string, want string) int {
+	for i, a := range args {
+		if a == want {
+			return i
+		}
+	}
+	return -1
+}
+
+// shellSingleQuote quotes s for a POSIX shell.
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // findWindowByName returns the tmux window id (e.g. "@42") for the first

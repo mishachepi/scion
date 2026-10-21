@@ -210,3 +210,4 @@ This is **per-agent**, not operator-wide. Treat the per-agent hooks dir as the c
 - **Detaching tmux does not stop agents.** They only stop on `scion stop` / `scion delete` or harness exit.
 - **`scion attach` takes over your terminal.** It runs `tmux attach -t <id>` directly; press your tmux prefix + `d` to detach.
 - **No resource caps.** A misbehaving harness can consume host RAM/CPU without scion noticing.
+- **Long harness commands go through a launcher.** tmux takes a command of at most 16 KiB. When the harness command (mostly its system prompt) makes `new-window` longer than 12 KiB, the runtime writes it to `<agentHome>/.scion/tmux-launch.sh` and the window runs that script.

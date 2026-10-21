@@ -1456,3 +1456,52 @@ func TestTmuxRuntime_Delete_KillsPaneInitAfterTimeout(t *testing.T) {
 		t.Errorf("Delete took %s; the timeout is 200ms", elapsed)
 	}
 }
+
+func TestFitTmuxCommand_ShortCommandUnchanged(t *testing.T) {
+	args := []string{"new-window", "-d", "-P", "-F", "#{window_id}", "/bin/echo", "hi"}
+	got, err := fitTmuxCommand(args, t.TempDir())
+	if err != nil {
+		t.Fatalf("fitTmuxCommand: %v", err)
+	}
+	if !slices.Equal(got, args) {
+		t.Errorf("short argv changed: %v", got)
+	}
+}
+
+func TestFitTmuxCommand_LongCommandMovesToLauncher(t *testing.T) {
+	home := t.TempDir()
+	prompt := strings.Repeat("system prompt line with 'quotes' and $VARS\n", 600)
+	args := []string{"new-window", "-d", "-e", "FOO=bar", "-P", "-F", "#{window_id}",
+		"/usr/bin/printf", "%s|", "--system-prompt", prompt}
+	got, err := fitTmuxCommand(args, home)
+	if err != nil {
+		t.Fatalf("fitTmuxCommand: %v", err)
+	}
+	script := filepath.Join(home, tmuxLaunchScript)
+	want := []string{"new-window", "-d", "-e", "FOO=bar", "-P", "-F", "#{window_id}", "/bin/sh", script}
+	if !slices.Equal(got, want) {
+		t.Fatalf("fitted argv = %v, want %v", got, want)
+	}
+	info, err := os.Stat(script)
+	if err != nil {
+		t.Fatalf("launcher missing: %v", err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Errorf("launcher mode = %v, want 0700", info.Mode().Perm())
+	}
+	out, err := exec.Command("/bin/sh", script).Output()
+	if err != nil {
+		t.Fatalf("run launcher: %v", err)
+	}
+	if string(out) != "--system-prompt|"+prompt+"|" {
+		t.Errorf("launcher did not pass the arguments through intact (got %d bytes)", len(out))
+	}
+}
+
+func TestFitTmuxCommand_LongEnvironmentFails(t *testing.T) {
+	args := []string{"new-window", "-e", "BIG=" + strings.Repeat("x", tmuxCommandBudget),
+		"-P", "-F", "#{window_id}", "/bin/echo"}
+	if _, err := fitTmuxCommand(args, t.TempDir()); err == nil || !strings.Contains(err.Error(), "environment") {
+		t.Errorf("want an environment-size error, got %v", err)
+	}
+}
