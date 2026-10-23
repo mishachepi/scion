@@ -158,8 +158,7 @@ func (r *AppleContainerRuntime) Run(ctx context.Context, config RunConfig) (stri
 		return "", fmt.Errorf("container run failed: %w (output: %s)", err, out)
 	}
 
-	// The output of 'container run -d' is the container ID
-	id := strings.TrimSpace(out)
+	id := appleRunContainerID(out)
 	reportAppleContainerCreated(hooks, config.Name, id)
 	if masked {
 		err := r.verifyMasks(ctx, id, maskTargets)
@@ -375,6 +374,20 @@ func (r *AppleContainerRuntime) verifyMask(ctx context.Context, id, target strin
 		return fmt.Errorf("the mask is not mounted at %s in the container", target)
 	}
 	return nil
+}
+
+// appleRunContainerID returns the container ID from the output of
+// 'container run -d': its last non-empty line. With -t, container CLI 1.6
+// prints its progress lines ("[1/6] Fetching image [0s]", carriage-return
+// updates included) before the ID on the same stream.
+func appleRunContainerID(out string) string {
+	lines := strings.FieldsFunc(out, func(r rune) bool { return r == '\n' || r == '\r' })
+	for i := len(lines) - 1; i >= 0; i-- {
+		if id := strings.TrimSpace(lines[i]); id != "" {
+			return id
+		}
+	}
+	return ""
 }
 
 // truncateCheckOutput trims s and cuts it to at most 200 bytes, for an
