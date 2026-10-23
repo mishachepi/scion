@@ -295,9 +295,11 @@ type colocatedRewrite struct {
 //     containerHubEndpoint.
 //
 // Other runtimes (cloudrun, Apple container) keep the public URL: they do
-// not run on this host's Docker bridge.
+// not run on this host's Docker bridge. The tmux runtime runs agents on the
+// broker host itself, so its endpoint is never rewritten: a loopback hub URL
+// is the right one there, and a container bridge hostname may not resolve.
 func applyContainerBridgeOverride(endpoint, containerHubEndpoint string, colocated colocatedRewrite, runtimeName string) string {
-	if isKubernetesRuntimeName(runtimeName) {
+	if isKubernetesRuntimeName(runtimeName) || runtimeName == "tmux" {
 		return endpoint
 	}
 	if isBridgeContainerRuntimeName(runtimeName) && sameEndpoint(endpoint, colocated.PublicHubEndpoint) {

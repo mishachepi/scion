@@ -447,6 +447,20 @@ func TestApplyContainerBridgeOverride(t *testing.T) {
 			want:                 "https://other.example.com",
 		},
 		{
+			name:                 "tmux keeps a localhost endpoint",
+			endpoint:             "http://127.0.0.1:9820",
+			containerHubEndpoint: "http://host.containers.internal:9820",
+			runtimeName:          "tmux",
+			want:                 "http://127.0.0.1:9820",
+		},
+		{
+			name:                 "Apple container gets the configured endpoint for a localhost hub",
+			endpoint:             "http://127.0.0.1:9820",
+			containerHubEndpoint: "http://host.containers.internal:9820",
+			runtimeName:          "container",
+			want:                 "http://host.containers.internal:9820",
+		},
+		{
 			name:                 "localhost still rewritten when colocated public is set",
 			endpoint:             "http://localhost:8080",
 			containerHubEndpoint: "http://scion-hub.internal:8080",
