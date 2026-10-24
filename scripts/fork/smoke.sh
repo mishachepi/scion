@@ -2,16 +2,17 @@
 # smoke.sh — дымовой прогон сборки против живого хаба: версии, жизненный цикл агента, сообщения,
 # расписание, --project по слагу. Каждая проверка печатает PASS/FAIL; любой FAIL — код выхода 1.
 #
-#   scripts/fork/smoke.sh <hub-endpoint> [--expect <тег>] [--other-project <слаг>] [--docker] [--brokers a,b]
+#   scripts/fork/smoke.sh <hub-endpoint> [--expect <тег>] [--other-project <слаг>] [--container <профиль>] [--brokers a,b]
 #
 #   --expect          ожидаемая версия хаба и CLI (по умолчанию — версия CLI из `scion version`)
 #   --other-project   слаг проекта на хабе, отличного от проекта текущего каталога, для проверки (д);
 #                     без него (д) — SKIP
-#   --docker          прогнать жизненный цикл ещё и docker-агентом (профиль $SMOKE_DOCKER_PROFILE)
+#   --container       прогнать жизненный цикл ещё и агентом в контейнере на этом профиле брокера
+#                     (Apple container на macOS — профиль с runtime type: container; Docker/Podman — свои профили)
 #   --brokers         брокеры, которые обязаны быть online (по умолчанию — все брокеры хаба)
 #
 # Окружение: SCION_BIN (по умолчанию scion из PATH); SCION_HUB_CONFIG — токен и проект хаба, его читает
-# сам scion; SMOKE_PROFILE (tmux), SMOKE_DOCKER_PROFILE (docker), SMOKE_TIMEOUT (секунд на каждое ожидание, 180).
+# сам scion; SMOKE_PROFILE (tmux-профиль, по умолчанию tmux), SMOKE_TIMEOUT (секунд на каждое ожидание, 180).
 #
 # Запуск — из каталога проекта, в котором создаются агенты: его .scion/state.yaml сверяется до и после.
 # Агенты — из шаблона smoke-templates/smoke-tmux (на любое сообщение отвечает pong); шаблон заливается
@@ -21,14 +22,14 @@
 # пока Claude Code показывает стартовый диалог; ping тогда повторяется один раз.
 set -uo pipefail
 
-HUB=${1:?использование: smoke.sh <hub-endpoint> [--expect <тег>] [--other-project <слаг>] [--docker] [--brokers a,b]}
+HUB=${1:?использование: smoke.sh <hub-endpoint> [--expect <тег>] [--other-project <слаг>] [--container <профиль>] [--brokers a,b]}
 shift
-EXPECT="" OTHER="" DOCKER=0 BROKERS=""
+EXPECT="" OTHER="" CONTAINER="" BROKERS=""
 while [[ $# -gt 0 ]]; do
   case $1 in
     --expect) EXPECT=$2; shift 2 ;;
     --other-project) OTHER=$2; shift 2 ;;
-    --docker) DOCKER=1; shift ;;
+    --container) CONTAINER=$2; shift 2 ;;
     --brokers) BROKERS=$2; shift 2 ;;
     *) echo "неизвестный аргумент: $1" >&2; exit 2 ;;
   esac
@@ -36,7 +37,6 @@ done
 
 SCION_BIN=${SCION_BIN:-scion}
 PROFILE=${SMOKE_PROFILE:-tmux}
-DOCKER_PROFILE=${SMOKE_DOCKER_PROFILE:-docker}
 TIMEOUT=${SMOKE_TIMEOUT:-180}
 HERE=$(cd "$(dirname "$0")" && pwd)
 TEMPLATE_SRC=$HERE/smoke-templates/smoke-tmux
@@ -51,7 +51,7 @@ fail() { echo "FAIL  $*"; FAILS=$((FAILS + 1)); }
 known() { echo "KNOWN $*"; }
 skip() { echo "SKIP  $*"; }
 check() { local name=$1; shift; if "$@"; then pass "$name"; else fail "$name"; fi; }
-json() { python3 -c "import json,sys; d=json.load(sys.stdin); $1"; }
+json() { python3 -c "import json,sys; d=json.load(sys.stdin); $1" 2>/dev/null; }
 
 cleanup() {
   rm -rf "$HOME/.scion/templates/$TEMPLATE.smoke-$RUN"
@@ -217,11 +217,11 @@ fi
 check "(в) scion list --format json читается" list_ok
 S delete "$A" "$B" >/dev/null 2>&1
 
-# (г) docker-агент
-if ((DOCKER)); then
-  lifecycle "smoke-$RUN-d" "$DOCKER_PROFILE" "(г) docker"
+# (г) агент в контейнере
+if [[ -n $CONTAINER ]]; then
+  lifecycle "smoke-$RUN-c" "$CONTAINER" "(г) контейнер ($CONTAINER)"
 else
-  skip "(г) docker (без --docker)"
+  skip "(г) контейнер (без --container)"
 fi
 
 check "state.yaml проекта не изменился" test "$(state_sum)" = "$STATE0"

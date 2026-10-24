@@ -225,7 +225,7 @@ If you see the exact message from me: "System: Please Continue." You must ignore
 2. `scripts/fork/gate.sh dev`: `go build ./...` чист, упавшие тесты ⊆ упавших на `main` (тесты с пустым HOME).
 3. `git checkout mch && git merge --ff-only dev` (или обычный merge), тег `mch-YYYY.MM.DD[.N]`, push ветки и тега.
 4. `SCION_STAGED=<каталог> scripts/fork/fork-release.sh <тег>` на одной сборочной машине → `$SCION_STAGED/<тег>.partial/` с `SHA256SUMS` и `BUILD-INFO.md`. На узлах флота не собираем.
-5. Хаб для дымового прогона ставится из `.partial`, затем `fork-release.sh <тег> --publish <hub-endpoint> [--other-project <слаг>] [--docker]`: `scripts/fork/smoke.sh` с CLI из `.partial`; при PASS каталог становится `$SCION_STAGED/<тег>/`.
+5. Хаб для дымового прогона ставится из `.partial`, затем `fork-release.sh <тег> --publish <hub-endpoint> [--other-project <слаг>] [--container <профиль>]`: `scripts/fork/smoke.sh` с CLI из `.partial`; при PASS каталог становится `$SCION_STAGED/<тег>/`.
 6. Раскатка по одному узлу, каждый шаг по слову оператора. Порядок узлов, команды, проверки и откат хранятся вне репозитория.
 
 `scion version` и `/healthz` показывают тег и коммит; все узлы флота стоят на одном теге.
