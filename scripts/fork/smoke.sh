@@ -219,7 +219,16 @@ S delete "$A" "$B" >/dev/null 2>&1
 
 # (г) агент в контейнере
 if [[ -n $CONTAINER ]]; then
-  lifecycle "smoke-$RUN-c" "$CONTAINER" "(г) контейнер ($CONTAINER)"
+  # The broker advertises each profile with the runtime type it resolves to (from the Hub's stored
+  # settings on a database-backed Hub, which win over settings.yaml).
+  CTYPE=$(S hub brokers --format json 2>/dev/null | json "
+print(next((p.get('type','') for b in d for p in b.get('profiles',[]) if p.get('name')=='$CONTAINER'),''))")
+  if [[ $CTYPE =~ ^(container|docker|podman)$ ]]; then
+    pass "(г) профиль $CONTAINER на брокере: рантайм $CTYPE"
+    lifecycle "smoke-$RUN-c" "$CONTAINER" "(г) контейнер ($CONTAINER, $CTYPE)"
+  else
+    fail "(г) профиль $CONTAINER на брокере: рантайм ${CTYPE:-не объявлен}, нужен container, docker или podman"
+  fi
 else
   skip "(г) контейнер (без --container)"
 fi
