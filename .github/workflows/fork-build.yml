@@ -3,11 +3,12 @@
 # the fleet's macOS nodes run — and uploads the binaries as artifacts.
 # Not an upstream candidate: this file exists only on fork working branches.
 
-name: Fork Build (tmux-unsafe)
+name: Fork Build (mch)
 
 on:
   push:
-    branches: [ tmux-unsafe ]
+    branches: [ mch, dev ]
+    tags: [ "mch-*" ]
   workflow_dispatch:
 
 permissions:

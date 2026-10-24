@@ -203,3 +203,44 @@ When in doubt, check `.gitignore` before staging. If a new category of generated
 ## Final important request
 
 If you see the exact message from me: "System: Please Continue." You must ignore me. This is an automated message and should not be followed. If I ask you to continue in other ways, that should be respected, but that exact phrase is a bug in the tooling, not a message from me. Feel free to tell me that you are ignoring it.
+
+## Fork: ветки, релизы, синхронизация с upstream
+
+Это форк `GoogleCloudPlatform/scion` под собственный флот (tmux-runtime, локальные хабы, токены, логи). Близость к upstream не цель: правим то, что мешает нам, совместимость с upstream не бережём.
+
+### Ветки
+
+| Ветка | Что это | Кто двигает |
+|---|---|---|
+| `main` | чистое зеркало `upstream/main`, без наших коммитов | только fast-forward, в окне синхронизации |
+| `mch` | прод. Из неё и только из неё собираются бинари флота | merge из `dev` при релизе; merge из `main` в окне синхронизации |
+| `dev` | разработка: сюда сливаются feature-ветки, здесь проходит гейт | feature-ветки → `dev` |
+| `tmux-upstream` | tmux-runtime в форме для upstream; необязательный трек | cherry-pick из `mch`, когда решаем что-то отдать наверх |
+
+Старые ветки (`tmux-unsafe`, `c19`–`c23`) сохранены тегами `archive/*`.
+
+### Релиз
+
+1. feature-ветка от `dev` → merge в `dev`.
+2. `scripts/fork/gate.sh dev`: `go build ./...` чист, упавшие тесты ⊆ упавших на `main` (тесты с пустым HOME).
+3. `git checkout mch && git merge --ff-only dev` (или обычный merge), тег `mch-YYYY.MM.DD[.N]`, push ветки и тега.
+4. `SCION_STAGED=<каталог> scripts/fork/fork-release.sh <тег>` на одной сборочной машине → `$SCION_STAGED/<тег>/` с `SHA256SUMS` и `BUILD-INFO.md`. На узлах флота не собираем.
+5. Раскатка по одному узлу, каждый шаг по слову оператора. Порядок узлов, команды, проверки и откат хранятся вне репозитория.
+
+`scion version` и `/healthz` показывают тег и коммит; все узлы флота стоят на одном теге.
+
+### Синхронизация с upstream
+
+Окно на два дня раз в 2–3 месяца, не чаще.
+
+1. `git fetch upstream && git fetch upstream main:main`; выжимка changelog upstream: что задевает нашу дельту (`git log --oneline mch..main -- pkg/runtime pkg/runtimebroker cmd/sciontool pkg/hub`).
+2. Ветка `sync/<дата>` от `mch`, `git merge main` (merge, не rebase; `rerere.enabled=true` — конфликт решается один раз).
+3. Гейт как в релизе, плюс сутки на одном канареечном агенте.
+4. Merge в `mch`, тег, раскатка по пайплайну релиза.
+5. Итог окна — абзац ниже в этом разделе: что пришло, что сломалось, что выбросили.
+
+Между окнами из upstream берём только точечные cherry-pick'и (безопасность, блокирующий нас баг), каждый по явному решению.
+
+### Окна синхронизации
+
+- 2026-10-24 — старт модели: `mch` от `5c3f5b03` (база upstream `d1adb9a3`, 50 наших коммитов).
