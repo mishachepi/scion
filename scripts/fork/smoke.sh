@@ -11,7 +11,7 @@
 #   --brokers         брокеры, которые обязаны быть online (по умолчанию — все брокеры хаба)
 #
 # Окружение: SCION_BIN (по умолчанию scion из PATH); SCION_HUB_CONFIG — токен и проект хаба, его читает
-# сам scion; SMOKE_PROFILE (tmux), SMOKE_DOCKER_PROFILE (docker), SMOKE_TIMEOUT (секунд на ожидание, 180).
+# сам scion; SMOKE_PROFILE (tmux), SMOKE_DOCKER_PROFILE (docker), SMOKE_TIMEOUT (секунд на каждое ожидание, 180).
 #
 # Запуск — из каталога проекта, в котором создаются агенты: его .scion/state.yaml сверяется до и после.
 # Агенты — из шаблона smoke-templates/smoke-tmux (на любое сообщение отвечает pong); шаблон заливается
@@ -77,17 +77,17 @@ a=[x for x in d if x.get('name')=='$1']
 print(a[0].get('$2') or '' if a else '')"
 }
 wait_for() { # wait_for <agent> <field> <regex>
-  local i
-  for ((i = 0; i < TIMEOUT; i += 5)); do
+  local end=$((SECONDS + TIMEOUT))
+  while ((SECONDS < end)); do
     [[ $(agent_field "$1" "$2") =~ $3 ]] && return 0
     sleep 5
   done
   return 1
 }
 schedule_fired() { # the event's status becomes fired, with no error
-  local i st
+  local st end=$((SECONDS + TIMEOUT))
   [[ -n $1 ]] || return 1
-  for ((i = 0; i < TIMEOUT; i += 5)); do
+  while ((SECONDS < end)); do
     st=$(S schedule get "$1" --format json 2>/dev/null | json "print(d.get('status',''), 'error' if d.get('error') else '')")
     [[ $st == "fired " ]] && return 0
     [[ $st == failed* ]] && return 1
@@ -97,8 +97,8 @@ schedule_fired() { # the event's status becomes fired, with no error
 }
 list_ok() { S list --format json 2>/dev/null | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; }
 gone() {
-  local i
-  for ((i = 0; i < TIMEOUT; i += 5)); do
+  local end=$((SECONDS + TIMEOUT))
+  while ((SECONDS < end)); do
     [[ -z $(S list --format json 2>/dev/null | json "print(' '.join(x.get('name','') for x in d))" | tr ' ' '\n' | grep -x "$1") ]] && return 0
     sleep 5
   done
@@ -113,12 +113,14 @@ print(c[0] if c else '')"
 count_msgs() { # count_msgs <agent> <text>: messages from the agent with exactly <text> in the DM
   local c; c=$(conv_id "$1")
   [[ -z $c ]] && { echo 0; return; }
-  S conversation messages "conv:$c" --format json 2>/dev/null | json "
-print(sum(1 for m in d.get('items',[]) if m.get('sender')=='agent:$1' and m.get('msg','').strip()=='$2'))"
+  local n
+  n=$(S conversation messages "conv:$c" --format json 2>/dev/null | json "
+print(sum(1 for m in d.get('items',[]) if m.get('sender')=='agent:$1' and m.get('msg','').strip()=='$2'))" 2>/dev/null)
+  echo "${n:-0}"
 }
 wait_count() { # wait_count <agent> <text> <more-than>
-  local i
-  for ((i = 0; i < TIMEOUT; i += 5)); do
+  local end=$((SECONDS + TIMEOUT))
+  while ((SECONDS < end)); do
     (($(count_msgs "$1" "$2") > $3)) && return 0
     sleep 5
   done
