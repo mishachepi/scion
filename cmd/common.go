@@ -294,6 +294,10 @@ type HubContext struct {
 	BrokerID    string
 	ProjectPath string
 	IsGlobal    bool
+	// ForeignProject mirrors hubsync.HubContext.ForeignProject: the target
+	// project is not the one at ProjectPath, so ProjectPath supplies only
+	// hub settings — no workspace files, no local sync state.
+	ForeignProject bool
 	// CredentialKind mirrors hubsync.HubContext.CredentialKind — see its doc
 	// for what it records and why (ptone/scion#2146). Zero value
 	// (hubsync.CredentialKindUnknown) on any HubContext not built via
@@ -303,6 +307,23 @@ type HubContext struct {
 	// from (profileAgentHubContext), or is empty. A profile context has no
 	// local project: commands using it touch no local project state.
 	TargetProfile string
+}
+
+// ownsLocalProject reports whether ProjectPath is the target project's own
+// local directory, so its workspace and sync state belong to the target.
+func (h *HubContext) ownsLocalProject() bool {
+	return h != nil && h.ProjectPath != "" && !h.ForeignProject
+}
+
+// recordSyncedAgent advances the local sync watermark to created and adds
+// agentName to the synced agents of the local project, when the target
+// project is that local project.
+func (h *HubContext) recordSyncedAgent(agentName string, created time.Time) {
+	if !h.ownsLocalProject() {
+		return
+	}
+	hubsync.UpdateLastSyncedAt(h.ProjectPath, created)
+	hubsync.AddSyncedAgent(h.ProjectPath, agentName)
 }
 
 // getHubAccessToken returns an access token for authenticating to the Hub over
@@ -432,6 +453,7 @@ func requireHubWith(projectPath string, skipProjectLink bool) (*HubContext, erro
 		BrokerID:       hubCtx.BrokerID,
 		ProjectPath:    hubCtx.ProjectPath,
 		IsGlobal:       hubCtx.IsGlobal,
+		ForeignProject: hubCtx.ForeignProject,
 		CredentialKind: hubCtx.CredentialKind,
 	}, nil
 }
@@ -1235,7 +1257,7 @@ func startAgentViaHub(cmd *cobra.Command, hubCtx *HubContext, agentName, task st
 	// every file in the project directory, which is extremely expensive for
 	// large workspaces.
 	var workspaceFiles []transfer.FileInfo
-	if hubCtx.ProjectPath != "" && !hubCtx.IsGlobal && !config.IsHubContext() {
+	if hubCtx.ProjectPath != "" && !hubCtx.IsGlobal && !hubCtx.ForeignProject && !config.IsHubContext() {
 		projectDir := filepath.Dir(hubCtx.ProjectPath) // parent of .scion
 		if _, statErr := os.Stat(projectDir); statErr == nil && !util.IsGitRepoDir(projectDir) {
 			if debugMode {
@@ -1426,8 +1448,7 @@ func startAgentViaHub(cmd *cobra.Command, hubCtx *HubContext, agentName, task st
 	// Advance watermark to the hub-assigned creation time so this agent
 	// won't trigger a sync warning on the next 'scion ls'.
 	if resp.Agent != nil && !resp.Agent.Created.IsZero() {
-		hubsync.UpdateLastSyncedAt(hubCtx.ProjectPath, resp.Agent.Created)
-		hubsync.AddSyncedAgent(hubCtx.ProjectPath, agentName)
+		hubCtx.recordSyncedAgent(agentName, resp.Agent.Created)
 	}
 
 	// Print info line when broker was auto-resolved (not explicitly specified)

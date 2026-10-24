@@ -288,7 +288,7 @@ func cleanupAfterHubDelete(hubCtx *HubContext, agentName string, removeBranch bo
 
 	// Keep sync watermark current after a successful Hub delete. If hub server
 	// time is unavailable in this flow, UpdateLastSyncedAt falls back to local UTC.
-	if hubCtx != nil && hubCtx.ProjectPath != "" {
+	if hubCtx.ownsLocalProject() {
 		hubsync.UpdateLastSyncedAt(hubCtx.ProjectPath, time.Time{})
 		hubsync.RemoveSyncedAgent(hubCtx.ProjectPath, agentName)
 	}

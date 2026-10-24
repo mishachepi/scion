@@ -125,11 +125,30 @@ func resolveHubProjectRef(ref string, opts EnsureHubReadyOptions) (*HubContext, 
 		// Use the fallback project path for settings access, not the target project
 		ProjectPath:    fallbackPath,
 		IsGlobal:       isGlobal,
+		ForeignProject: isForeignProject(settings, fallbackPath, isGlobal, project.ID),
 		CredentialKind: credentialKind,
 	}
 
 	debugf("resolveHubProjectRef: resolved project %s (ID: %s) via hub", project.Name, project.ID)
 	return hubCtx, nil
+}
+
+// isForeignProject reports whether the hub project projectID is not the
+// project at fallbackPath. The two are the same project only when projectID
+// is the fallback's own project_id or a hub link the fallback defines
+// itself (a link inherited from global settings does not count, as in
+// EnsureHubReady).
+func isForeignProject(settings *config.Settings, fallbackPath string, isGlobal bool, projectID string) bool {
+	if settings == nil || projectID == "" {
+		return true
+	}
+	if settings.ProjectID == projectID {
+		return false
+	}
+	if hgid := settings.GetHubProjectID(); hgid == projectID {
+		return !(isGlobal || config.ProjectSettingsDefineHubLink(fallbackPath))
+	}
+	return true
 }
 
 // ResolveProjectOnHub resolves a project reference on the hub, trying multiple

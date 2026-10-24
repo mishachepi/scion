@@ -164,6 +164,12 @@ type HubContext struct {
 	BrokerID    string
 	ProjectPath string
 	IsGlobal    bool
+	// ForeignProject is set when the target project was named by a hub
+	// reference (--project <slug|UUID|URL>) and is not the project at
+	// ProjectPath. ProjectPath then only supplies hub settings: callers
+	// must not read its files as the target's workspace or record the
+	// target's agents in its local state.
+	ForeignProject bool
 	// CredentialKind records which authentication mechanism createHubClient
 	// selected for Client, so a caller that needs to know "is this actually
 	// an agent token" — not just "is the CLI running in agent mode" — can

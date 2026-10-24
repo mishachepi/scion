@@ -25,7 +25,6 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
-	"github.com/GoogleCloudPlatform/scion/pkg/hubsync"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 	"github.com/spf13/cobra"
 )
@@ -315,8 +314,7 @@ func createAgentViaHub(hubCtx *HubContext, agentName string, task string, inline
 	// Advance watermark to the hub-assigned creation time so this agent
 	// won't trigger a sync warning on the next 'scion ls'.
 	if resp.Agent != nil && !resp.Agent.Created.IsZero() {
-		hubsync.UpdateLastSyncedAt(hubCtx.ProjectPath, resp.Agent.Created)
-		hubsync.AddSyncedAgent(hubCtx.ProjectPath, agentName)
+		hubCtx.recordSyncedAgent(agentName, resp.Agent.Created)
 	}
 
 	// Print info line when broker was auto-resolved (not explicitly specified)
@@ -329,7 +327,7 @@ func createAgentViaHub(hubCtx *HubContext, agentName string, task string, inline
 	// For a local broker, print the agent directory path so the user can
 	// inspect or tweak its files.
 	agentDir := ""
-	if resp.Agent != nil && hubCtx.BrokerID != "" && hubCtx.ProjectPath != "" {
+	if resp.Agent != nil && hubCtx.BrokerID != "" && hubCtx.ownsLocalProject() {
 		agentDir = filepath.Join(hubCtx.ProjectPath, "agents", agentName)
 	}
 	writeHubCreateText(os.Stderr, agentName, resp, agentDir)
