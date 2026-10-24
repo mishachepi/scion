@@ -3,7 +3,8 @@
 #
 #   scripts/fork/gate.sh [ветка-или-коммит, по умолчанию dev]
 #
-# Тесты идут с пустым HOME: без этого они читают ~/.scion оператора и создают настоящих агентов.
+# Тесты идут с пустым HOME и без переменных SCION_* и TMUX*: без этого они читают ~/.scion оператора,
+# создают настоящих агентов и, запущенные из сессии агента, видят его окружение.
 # «Зелёный» прогон на macOS недостижим (часть тестов upstream красная на Mac сама по себе), поэтому
 # критерий — отсутствие новых падений относительно main.
 set -euo pipefail
@@ -19,7 +20,8 @@ cleanup() { git worktree remove --force "$A" 2>/dev/null || true; git worktree r
 trap cleanup EXIT
 
 # Упавший тест — строка «--- FAIL: Имя»; пакет, тесты которого не собрались, — «FAIL пакет [build failed]».
-fails() { ( cd "$1" && HOME=$(mktemp -d) go test -tags no_sqlite ./... 2>&1 \
+clean_env() { env | sed -nE 's/^((SCION_|TMUX)[A-Za-z0-9_]*)=.*/-u \1/p'; }
+fails() { ( cd "$1" && env $(clean_env) HOME=$(mktemp -d) go test -tags no_sqlite ./... 2>&1 \
   | grep -E '^--- FAIL|^FAIL[[:space:]].*\[(build|setup) failed\]' | sed 's/ (.*//; s/[[:space:]]\{1,\}/ /g' | sort -u ) || true; }
 
 echo "==> go build ./... ($REF)"

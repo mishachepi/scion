@@ -37,6 +37,7 @@ func TestReportSSHHostKey(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
+	t.Setenv(EnvLaunchStartedAt, "") // the test may run inside an agent, which has it set
 	c := NewClientWithConfig(srv.URL, "tok", "agent-1")
 	c.runID = "run-1"
 	c.maxRetries = 0
