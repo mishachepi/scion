@@ -1,0 +1,5 @@
+schema_version: "1"
+# Smoke-test agent for scripts/fork/smoke.sh: answers every message with pong.
+description: "Smoke test agent: replies pong to every message"
+default_harness_config: claude
+system_prompt: system-prompt.md

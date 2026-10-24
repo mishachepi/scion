@@ -18,7 +18,9 @@ git worktree add -q --detach "$B" main
 cleanup() { git worktree remove --force "$A" 2>/dev/null || true; git worktree remove --force "$B" 2>/dev/null || true; }
 trap cleanup EXIT
 
-fails() { ( cd "$1" && HOME=$(mktemp -d) go test -tags no_sqlite ./... 2>&1 | grep -E '^--- FAIL' | sed 's/ (.*//' | sort -u ) || true; }
+# Упавший тест — строка «--- FAIL: Имя»; пакет, тесты которого не собрались, — «FAIL пакет [build failed]».
+fails() { ( cd "$1" && HOME=$(mktemp -d) go test -tags no_sqlite ./... 2>&1 \
+  | grep -E '^--- FAIL|^FAIL[[:space:]].*\[(build|setup) failed\]' | sed 's/ (.*//; s/[[:space:]]\{1,\}/ /g' | sort -u ) || true; }
 
 echo "==> go build ./... ($REF)"
 ( cd "$A" && go build ./... ) || { echo "сборка $REF упала"; exit 1; }

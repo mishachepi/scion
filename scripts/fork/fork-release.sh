@@ -2,6 +2,10 @@
 # fork-release.sh — сборка релиза форка из тега mch-* в $SCION_STAGED/<тег>/.
 #
 #   SCION_STAGED=<каталог сборок> scripts/fork/fork-release.sh mch-2026.10.24
+#       сборка в $SCION_STAGED/<тег>.partial/
+#   SCION_STAGED=<каталог сборок> scripts/fork/fork-release.sh mch-2026.10.24 --publish <hub-endpoint> [аргументы smoke.sh]
+#       scripts/fork/smoke.sh против хаба, уже поставленного из .partial, с CLI из .partial;
+#       при PASS — выкладка: .partial → $SCION_STAGED/<тег>/
 #
 # Нужны go и node. Собирается только тег, лежащий на ветке mch.
 # Результат: darwin-arm64/{scion,sciontool} — macOS-узлы (брокеры, локальные хабы);
@@ -12,6 +16,7 @@
 set -euo pipefail
 
 TAG=${1:?тег вида mch-YYYY.MM.DD[.N]}
+shift
 STAGED=${SCION_STAGED:?задай SCION_STAGED — каталог, куда класть сборки}
 REPO=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 REPO=$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir); REPO=${REPO%/.git}
@@ -22,8 +27,23 @@ cd "$REPO"
 git rev-parse -q --verify "refs/tags/$TAG^{commit}" >/dev/null || die "нет тега $TAG"
 git merge-base --is-ancestor "$TAG" mch || die "$TAG не лежит на ветке mch"
 SHA=$(git rev-parse "$TAG^{commit}"); SHORT=${SHA:0:8}
-OUT=$STAGED/$TAG
-[[ -e $OUT ]] && die "$OUT уже существует — релиз собирается один раз; для пересборки удали каталог"
+FINAL=$STAGED/$TAG
+OUT=$FINAL.partial
+[[ -e $FINAL ]] && die "$FINAL уже существует — релиз собирается один раз; для пересборки удали каталог"
+
+if [[ ${1:-} == --publish ]]; then
+  HUB=${2:?--publish <hub-endpoint>}; shift 2
+  [[ -d $OUT ]] || die "нет $OUT — сначала сборка без --publish"
+  ( cd "$OUT" && shasum -a 256 -c SHA256SUMS >/dev/null ) || die "SHA256SUMS в $OUT не сходятся"
+  git -C "$WT" checkout -q --detach "$TAG"
+  echo "==> smoke против $HUB"
+  SCION_BIN=$OUT/darwin-arm64/scion "$WT/scripts/fork/smoke.sh" "$HUB" --expect "$TAG" "$@" || die "smoke не прошёл — релиз не выложен"
+  mv "$OUT" "$FINAL"
+  echo "выложено: $FINAL"
+  exit 0
+fi
+[[ $# -eq 0 ]] || die "лишние аргументы: $*"
+[[ -e $OUT ]] && die "$OUT уже существует — для пересборки удали каталог"
 
 if [[ -d $WT ]]; then git -C "$WT" checkout -q --detach "$TAG"; else git worktree add -q --detach "$WT" "$TAG"; fi
 cd "$WT"
@@ -60,5 +80,5 @@ cat > "$OUT/BUILD-INFO.md" <<EOF
 - linux-arm64/{scion,sciontool} — агенты в arm64-Linux-контейнерах
 - scion version: $V
 EOF
-echo "готово: $OUT"
+echo "собрано: $OUT — поставь хаб для smoke из этой сборки и запусти: $0 $TAG --publish <hub-endpoint>"
 cat "$OUT/BUILD-INFO.md"
