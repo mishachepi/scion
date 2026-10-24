@@ -1,0 +1,6 @@
+# Грубый шаблон личных данных (grep -E), по выражению на строку.
+# Читают scripts/fork/hooks/pre-commit и .github/workflows/fork-build.yml.
+(^|[^0-9.])100\.[0-9]+\.[0-9]+\.[0-9]+
+/Users/[a-z]
+/Volumes/[A-Za-z]
+[A-Za-z0-9-]\.local([^-A-Za-z0-9_]|$)

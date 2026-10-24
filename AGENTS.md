@@ -229,6 +229,14 @@ If you see the exact message from me: "System: Please Continue." You must ignore
 
 `scion version` и `/healthz` показывают тег и коммит; все узлы флота стоят на одном теге.
 
+### Личные данные
+
+Форк публичный: имена машин, адреса, пути домашних каталогов, id хабов и слаги агентов в коммиты не попадают — в тестах и примерах только синтетические значения.
+
+- `git config core.hooksPath scripts/fork/hooks` (один раз на клон) — `pre-commit` проверяет добавленные строки по грубому шаблону `scripts/fork/private-pattern.txt` и по списку личных строк из `$SCION_DENYLIST` (сам список в репозитории не лежит), а также адрес автора.
+- Тот же грубый шаблон проверяет CI (`fork-build.yml`, job `private-data`) на каждом push.
+- Ложное срабатывание — `git commit --no-verify`.
+
 ### Синхронизация с upstream
 
 Окно на два дня раз в 2–3 месяца, не чаще.

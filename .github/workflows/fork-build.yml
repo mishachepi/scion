@@ -15,6 +15,33 @@ permissions:
   contents: read
 
 jobs:
+  private-data:
+    name: No private data in pushed lines
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Scan added lines against scripts/fork/private-pattern.txt
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [[ -z "$BEFORE" || "$BEFORE" =~ ^0+$ ]] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            BEFORE=$(git rev-parse HEAD~1)
+          fi
+          hits=$(git diff -U0 --no-color "$BEFORE" HEAD --diff-filter=ACMR \
+            | awk '/^\+\+\+ b\//{f=substr($0,7);next} /^\+/ && f !~ /^(scripts\/fork\/hooks\/|scripts\/fork\/private-pattern\.txt$)/ {print f": "substr($0,2)}' \
+            | grep -E -f <(grep -v '^#' scripts/fork/private-pattern.txt | sed '/^$/d') || true)
+          authors=$(git log --format='%h %ae' "$BEFORE"..HEAD | grep -E '\.local$' || true)
+          if [[ -n "$hits$authors" ]]; then
+            echo "::error::private data in pushed commits"
+            printf '%s\n' "$hits" "$authors"
+            exit 1
+          fi
+
   build-darwin-arm64:
     name: Build darwin/arm64 (web + scion + sciontool)
     runs-on: macos-latest

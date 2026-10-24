@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# pre-commit — не пускает в коммит личные строки: имена машин, адреса, пути, id хабов.
+#
+# Подключение (один раз на клон): git config core.hooksPath scripts/fork/hooks
+#
+# Проверяются добавленные строки индекса и автор коммита:
+#   1. грубый шаблон (scripts/fork/private-pattern.txt): адреса 100.x, /Users/, /Volumes/, *.local;
+#   2. список личных строк из $SCION_DENYLIST (по умолчанию ~/dotscion/scion-denylist.txt):
+#      по строке на запись, точное совпадение целым словом, без учёта регистра, # — комментарий.
+#      Сам список в форке не хранится. Нет файла — проверка 2 пропускается с предупреждением.
+# Ложное срабатывание: git commit --no-verify.
+set -euo pipefail
+
+ROOT=$(git rev-parse --show-toplevel)
+PATTERN_FILE=$ROOT/scripts/fork/private-pattern.txt
+DENYLIST=${SCION_DENYLIST:-$HOME/dotscion/scion-denylist.txt}
+# Файлы, где шаблоны записаны намеренно.
+SKIP='^(scripts/fork/hooks/|scripts/fork/private-pattern\.txt$)'
+
+added() {
+  git diff --cached -U0 --no-color --diff-filter=ACMR | awk -v skip="$SKIP" '
+    /^\+\+\+ b\// { f = substr($0, 7); next }
+    /^\+/ && f !~ skip { print f ": " substr($0, 2) }'
+}
+
+fail=0
+report() { echo "pre-commit: $1" >&2; echo "$2" | sed 's/^/  /' >&2; fail=1; }
+
+LINES=$(added)
+if [[ -n $LINES ]]; then
+  hit=$(grep -E -f <(grep -v '^#' "$PATTERN_FILE" | sed '/^$/d') <<<"$LINES" || true)
+  [[ -n $hit ]] && report "личные адреса или пути в добавленных строках:" "$hit"
+  if [[ -r $DENYLIST ]]; then
+    hit=$(grep -Fiw -f <(grep -v '^#' "$DENYLIST" | sed '/^$/d') <<<"$LINES" || true)
+    [[ -n $hit ]] && report "строки из $DENYLIST в добавленных строках:" "$hit"
+  else
+    echo "pre-commit: нет $DENYLIST — проверка по списку личных строк пропущена" >&2
+  fi
+fi
+
+ident=$(git var GIT_AUTHOR_IDENT)
+if grep -qE '\.local>' <<<"$ident"; then
+  report "адрес автора с именем машины — задай user.email:" "$ident"
+fi
+
+exit $fail
