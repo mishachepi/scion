@@ -530,3 +530,59 @@ func TestHealthEndpointsConcurrentSwapRuntime(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildInfoProfiles_TmuxBrokerOffersContainerProfiles: a broker whose
+// default runtime is tmux runs on a workstation, so it offers that host's
+// container profiles (Apple container, Docker) next to its tmux ones; a
+// hosted (Kubernetes) broker offers neither.
+func TestBuildInfoProfiles_TmuxBrokerOffersContainerProfiles(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+	scionDir := filepath.Join(tmpDir, ".scion")
+	if err := os.MkdirAll(scionDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	settingsYAML := `schema_version: "1"
+active_profile: tmux
+runtimes:
+  tmux:
+    type: tmux
+  apple:
+    type: container
+  docker:
+    type: docker
+profiles:
+  tmux:
+    runtime: tmux
+  apple:
+    runtime: apple
+  docker:
+    runtime: docker
+`
+	if err := os.WriteFile(filepath.Join(scionDir, "settings.yaml"), []byte(settingsYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := &Server{}
+	types := func(defaultRuntime string) map[string]string {
+		got := map[string]string{}
+		for _, p := range srv.buildInfoProfiles(defaultRuntime) {
+			got[p.Name] = p.Type
+		}
+		return got
+	}
+
+	onTmux := types("tmux")
+	for name, want := range map[string]string{"tmux": "tmux", "apple": "container", "docker": "docker"} {
+		if onTmux[name] != want {
+			t.Errorf("tmux broker: profile %q type = %q, want %q (profiles %v)", name, onTmux[name], want, onTmux)
+		}
+	}
+
+	onK8s := types("kubernetes")
+	for _, name := range []string{"tmux", "apple", "docker"} {
+		if _, ok := onK8s[name]; ok {
+			t.Errorf("kubernetes broker offers local-only profile %q (profiles %v)", name, onK8s)
+		}
+	}
+}

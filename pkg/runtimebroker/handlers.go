@@ -327,10 +327,13 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 }
 
 // isLocalOnlyRuntime returns true for runtime types that require a local daemon
-// or hardware and cannot function in a hosted cloud environment.
+// or hardware and cannot function in a hosted cloud environment. tmux runs
+// the harness as a process on the broker host, so it is local-only too: a
+// tmux broker offers the host's container profiles, and a hosted broker does
+// not offer tmux profiles.
 func isLocalOnlyRuntime(runtimeType string) bool {
 	switch runtimeType {
-	case "docker", "podman", "container":
+	case "docker", "podman", "container", "tmux":
 		return true
 	}
 	return false
