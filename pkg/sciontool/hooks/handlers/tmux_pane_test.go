@@ -5,6 +5,7 @@ Copyright 2025 The Scion Authors.
 package handlers
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/hooks"
@@ -50,7 +51,8 @@ func TestTmuxPaneSink_WritesPaneIdToWindow(t *testing.T) {
 }
 
 func TestStatusHandler_SessionStart_RefreshesPaneSink(t *testing.T) {
-	tmpDir := t.TempDir()
+	tmpDir, err := filepath.EvalSymlinks(t.TempDir()) // macOS: TempDir is under the /var symlink
+	require.NoError(t, err)
 	statusSink, statusCalls := recorderSink(t, "%17")
 	paneSink, paneCalls := recorderPaneSink(t, "%17")
 	h := &StatusHandler{
@@ -59,7 +61,7 @@ func TestStatusHandler_SessionStart_RefreshesPaneSink(t *testing.T) {
 		tmuxPaneSink: paneSink,
 	}
 
-	err := h.Handle(&hooks.Event{Name: hooks.EventSessionStart, Dialect: "claude"})
+	err = h.Handle(&hooks.Event{Name: hooks.EventSessionStart, Dialect: "claude"})
 	require.NoError(t, err)
 
 	// SessionStart hits the pane sink exactly once with the current pane_id.
@@ -74,14 +76,15 @@ func TestStatusHandler_SessionStart_RefreshesPaneSink(t *testing.T) {
 }
 
 func TestStatusHandler_NonSessionStart_DoesNotRefreshPaneSink(t *testing.T) {
-	tmpDir := t.TempDir()
+	tmpDir, err := filepath.EvalSymlinks(t.TempDir()) // macOS: TempDir is under the /var symlink
+	require.NoError(t, err)
 	paneSink, paneCalls := recorderPaneSink(t, "%17")
 	h := &StatusHandler{
 		StatusPath:   tmpDir + "/agent-info.json",
 		tmuxPaneSink: paneSink,
 	}
 
-	err := h.Handle(&hooks.Event{Name: hooks.EventToolStart, Dialect: "claude"})
+	err = h.Handle(&hooks.Event{Name: hooks.EventToolStart, Dialect: "claude"})
 	require.NoError(t, err)
 	assert.Empty(t, *paneCalls, "pane sink must only fire on SessionStart")
 }

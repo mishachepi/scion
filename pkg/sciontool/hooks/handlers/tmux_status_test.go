@@ -5,6 +5,7 @@ Copyright 2025 The Scion Authors.
 package handlers
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -134,7 +135,8 @@ func TestTmuxStatusSink_AllActivitiesMapped(t *testing.T) {
 func TestStatusHandler_Integration_MirrorsActivityToSink(t *testing.T) {
 	// Wire the recorder sink into a StatusHandler and confirm
 	// UpdateActivity propagates through writeAgentInfoLocked.
-	tmpDir := t.TempDir()
+	tmpDir, err := filepath.EvalSymlinks(t.TempDir()) // macOS: TempDir is under the /var symlink
+	require.NoError(t, err)
 	sink, calls := recorderSink(t, "%5")
 	h := &StatusHandler{
 		StatusPath: tmpDir + "/agent-info.json",
