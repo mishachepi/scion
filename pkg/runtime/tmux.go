@@ -1221,7 +1221,12 @@ func cloneWorkspaceIfRequested(ctx context.Context, config RunConfig) error {
 	}
 	token := os.Getenv("GITHUB_TOKEN")
 	args := buildGitCloneArgs(config.GitClone, config.Workspace, token)
-	out, err := exec.CommandContext(ctx, "git", args...).CombinedOutput()
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	if token != "" {
+		cmd.Env = append(cmd.Env, gitCloneTokenEnv+"="+token)
+	}
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("tmux runtime: git clone failed: %w (output: %s)",
 			err, sanitizeGitOutput(string(out), token))
@@ -1229,8 +1234,19 @@ func cloneWorkspaceIfRequested(ctx context.Context, config RunConfig) error {
 	return nil
 }
 
-// buildGitCloneArgs is the pure half of cloneWorkspaceIfRequested. Token is
-// woven into the URL via https://oauth2:<token>@ when present; never logged.
+// gitCloneTokenEnv carries the clone token to the credential helper of
+// buildGitCloneArgs, so the token is in neither the command line nor the
+// clone's .git/config.
+const gitCloneTokenEnv = "SCION_GIT_CLONE_TOKEN"
+
+// gitCloneCredentialHelper answers git's credential request with the token
+// from gitCloneTokenEnv (user oauth2, as GitHub expects for tokens).
+const gitCloneCredentialHelper = `!f() { test "$1" = get || exit 0; echo username=oauth2; echo "password=$` + gitCloneTokenEnv + `"; }; f`
+
+// buildGitCloneArgs is the pure half of cloneWorkspaceIfRequested. With a
+// token, an HTTPS clone gets a one-command credential helper (after clearing
+// the configured ones) that reads the token from gitCloneTokenEnv; the
+// caller sets that variable. The URL itself never carries the token.
 func buildGitCloneArgs(gc *api.GitCloneConfig, workspace, token string) []string {
 	branch := gc.Branch
 	if branch == "" {
@@ -1240,25 +1256,15 @@ func buildGitCloneArgs(gc *api.GitCloneConfig, workspace, token string) []string
 	if gc.Depth != nil {
 		depth = *gc.Depth
 	}
-	url := gc.URL
-	if token != "" {
-		url = injectGitToken(url, token)
+	var args []string
+	if token != "" && strings.HasPrefix(gc.URL, "https://") {
+		args = append(args, "-c", "credential.helper=", "-c", "credential.helper="+gitCloneCredentialHelper)
 	}
-	args := []string{"clone"}
+	args = append(args, "clone")
 	if depth > 0 {
 		args = append(args, "--depth", fmt.Sprintf("%d", depth))
 	}
-	return append(args, "--branch", branch, url, workspace)
-}
-
-// injectGitToken weaves an OAuth token into an HTTPS git URL. Non-HTTPS URLs
-// pass through unchanged (token would not be applicable).
-func injectGitToken(rawURL, token string) string {
-	const httpsPrefix = "https://"
-	if !strings.HasPrefix(rawURL, httpsPrefix) {
-		return rawURL
-	}
-	return httpsPrefix + "oauth2:" + token + "@" + rawURL[len(httpsPrefix):]
+	return append(args, "--branch", branch, gc.URL, workspace)
 }
 
 // sanitizeGitOutput redacts the token from git stderr before surfacing it.

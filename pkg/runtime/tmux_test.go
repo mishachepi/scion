@@ -940,10 +940,12 @@ func TestBuildGitCloneArgs(t *testing.T) {
 			wantURLIn: "https://github.com/example/repo.git",
 		},
 		{
-			name:      "token injected into https URL",
-			gc:        api.GitCloneConfig{URL: "https://github.com/example/repo.git"},
-			token:     "ghp_secret",
-			wantURLIn: "https://oauth2:ghp_secret@github.com/example/repo.git",
+			name:  "token goes to a credential helper, not the URL",
+			gc:    api.GitCloneConfig{URL: "https://github.com/example/repo.git"},
+			token: "ghp_secret",
+			wantArgs: []string{"-c", "credential.helper=", "-c", "credential.helper=" + gitCloneCredentialHelper,
+				"clone", "--depth", "1", "--branch", "main", "https://github.com/example/repo.git", "/ws"},
+			wantURLIn: "https://github.com/example/repo.git",
 		},
 		{
 			name:      "ssh URL passed through unchanged",
@@ -964,7 +966,31 @@ func TestBuildGitCloneArgs(t *testing.T) {
 			if tc.wantArgs != nil && !slices.Equal(got, tc.wantArgs) {
 				t.Errorf("args = %v, want %v", got, tc.wantArgs)
 			}
+			if tc.token != "" && strings.Contains(strings.Join(got, " "), tc.token) {
+				t.Errorf("token in args: %v", got)
+			}
 		})
+	}
+}
+
+// TestGitCloneCredentialHelper runs the helper the way git does and checks
+// it answers get with the token from the environment and nothing otherwise.
+func TestGitCloneCredentialHelper(t *testing.T) {
+	script := strings.TrimPrefix(gitCloneCredentialHelper, "!")
+	run := func(op string) string {
+		cmd := exec.Command("sh", "-c", script+" \"$@\"", "git-credential-helper", op)
+		cmd.Env = append(os.Environ(), gitCloneTokenEnv+"=ghp_secret")
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("helper %s: %v", op, err)
+		}
+		return string(out)
+	}
+	if got := run("get"); got != "username=oauth2\npassword=ghp_secret\n" {
+		t.Errorf("get = %q", got)
+	}
+	if got := run("store"); got != "" {
+		t.Errorf("store = %q, want no output", got)
 	}
 }
 
