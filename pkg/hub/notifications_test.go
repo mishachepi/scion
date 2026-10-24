@@ -143,30 +143,7 @@ func (env *notificationTestEnv) addStalledSubscription(t *testing.T) {
 	require.NoError(t, env.store.CreateNotificationSubscription(context.Background(), sub))
 }
 
-func TestNotificationDispatcher_EphemeralAgentStalledSuppressed(t *testing.T) {
-	env := setupNotificationTest(t)
-	env.addStalledSubscription(t)
-
-	env.watched.Labels = map[string]string{api.LabelEphemeral: "true"}
-	require.NoError(t, env.store.UpdateAgent(context.Background(), env.watched))
-
-	env.nd.Start()
-	defer env.nd.Stop()
-
-	// STALLED carries no signal for an ephemeral agent — no notification.
-	env.publishStatus("stalled")
-	time.Sleep(200 * time.Millisecond)
-	assert.Empty(t, env.dispatcher.getCalls())
-
-	// ERROR is still actionable and must be delivered.
-	env.publishStatusWithPhase(string(state.PhaseError), "")
-	require.Eventually(t, func() bool {
-		return len(env.dispatcher.getCalls()) == 1
-	}, 2*time.Second, 50*time.Millisecond)
-	assert.Contains(t, env.dispatcher.getCalls()[0].Message, "ERROR")
-}
-
-func TestNotificationDispatcher_StalledNotifiesNonEphemeralAgent(t *testing.T) {
+func TestNotificationDispatcher_StalledNotifies(t *testing.T) {
 	env := setupNotificationTest(t)
 	env.addStalledSubscription(t)
 

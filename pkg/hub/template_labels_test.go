@@ -29,7 +29,7 @@ func TestMergeTemplateLabels_FromParsedAgentConfig(t *testing.T) {
 schema_version: "1"
 default_harness_config: claude
 labels:
-  scion.ephemeral: "true"
+  tier: batch
   team: platform
 `))
 	if err != nil {
@@ -38,8 +38,8 @@ labels:
 	tmpl := &store.Template{AgentConfig: cfg}
 
 	got := mergeTemplateLabels(map[string]string{"team": "request"}, tmpl)
-	if got["scion.ephemeral"] != "true" {
-		t.Errorf("template label scion.ephemeral missing: %v", got)
+	if got["tier"] != "batch" {
+		t.Errorf("template label tier missing: %v", got)
 	}
 	if got["team"] != "request" {
 		t.Errorf("request label must win: team=%q", got["team"])

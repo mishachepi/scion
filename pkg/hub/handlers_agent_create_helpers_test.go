@@ -1370,12 +1370,12 @@ func TestMergeTemplateLabels(t *testing.T) {
 	}
 
 	tmpl := &store.Template{AgentConfig: &api.ScionConfig{Labels: map[string]string{
-		"scion.ephemeral": "true",
-		"env":             "template",
+		"tier": "batch",
+		"env":  "template",
 	}}}
 
 	got := mergeTemplateLabels(reqLabels, tmpl)
-	if got["scion.ephemeral"] != "true" {
+	if got["tier"] != "batch" {
 		t.Errorf("template label missing: got %v", got)
 	}
 	if got["env"] != "prod" {
@@ -1383,7 +1383,7 @@ func TestMergeTemplateLabels(t *testing.T) {
 	}
 
 	// Template labels alone (nil request labels).
-	if got := mergeTemplateLabels(nil, tmpl); got["scion.ephemeral"] != "true" || len(got) != 2 {
+	if got := mergeTemplateLabels(nil, tmpl); got["tier"] != "batch" || len(got) != 2 {
 		t.Errorf("nil request labels: got %v", got)
 	}
 }
