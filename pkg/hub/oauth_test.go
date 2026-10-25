@@ -957,10 +957,14 @@ func TestOAuthService_ConfiguredProvidersForClient_OIDC(t *testing.T) {
 	}
 
 	cliProviders := service.ConfiguredProvidersForClient(OAuthClientTypeCLI)
+	hasOIDC = false
 	for _, p := range cliProviders {
 		if p == hubclient.OAuthProviderOIDC {
-			t.Errorf("did not expect OIDC in CLI providers, got: %v", cliProviders)
+			hasOIDC = true
 		}
+	}
+	if !hasOIDC {
+		t.Errorf("expected OIDC in CLI providers (localhost-callback flow), got: %v", cliProviders)
 	}
 }
 
