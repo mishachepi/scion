@@ -358,6 +358,12 @@ func (mb *MessageBuffer) flush(agentID, key string, waitForReady bool) {
 	for attempt := 1; attempt <= mb.maxFlushAttempts; attempt++ {
 		err = mb.deliverFunc(agentID, projectID, combined, false)
 		if err == nil {
+			slog.Info("msgbuffer: messages delivered",
+				"agent_id", agentID,
+				"project_id", projectID,
+				"count", len(pending),
+				"attempt", attempt,
+			)
 			return
 		}
 
