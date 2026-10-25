@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # rollout.sh — раскатка выложенного релиза по узлам флота одной командой, после fork-release.sh … --publish.
 #
-#   scripts/fork/rollout.sh <тег> [--only hub,hub-broker,mac,local] [--dry-run]
+#   scripts/fork/rollout.sh <тег> [--only hub,hub-broker,mac,local] [--partial] [--dry-run]
 #
 #   hub         хаб на Linux-хосте: плагин TG (install во временный файл + mv, старый — .<прежний тег>), затем
 #               плейбук scion-hub-rebuild.yaml (hub_binary, hub_commit, hub_version)
@@ -9,6 +9,9 @@
 #   mac         брокер на удалённом Mac: scp darwin-arm64 + shasum, rm+cp в каталог бинарей, kickstart -k
 #   local       брокер на этом Mac: rm+cp darwin-arm64 и linux-arm64 (каталог runtimes.<имя>.binaries
 #               контейнерного рантайма), bootout + bootstrap + kickstart
+#   --partial   брать сборку из $SCION_STAGED/<тег>.partial (ещё не выложенную): так хаб ставится под smoke
+#               релиза, когда тестового хаба нет — `--only hub,hub-broker --partial`, затем fork-release.sh --publish,
+#               затем обычный rollout брокеров
 #   --dry-run   напечатать команды, ничего не выполнять
 #
 # Порядок фиксирован: хаб раньше брокеров. Старые бинари остаются рядом как <имя>.<прежний тег>. В конце —
@@ -18,10 +21,11 @@
 # scripts/fork/fleet.env.example. Релиз берётся из $SCION_STAGED/<тег>/.
 set -euo pipefail
 TAG=${1:?тег (mch-YYYY.MM.DD[.N])}; shift
-ONLY="hub,hub-broker,mac,local" DRY=0
+ONLY="hub,hub-broker,mac,local" DRY=0 PARTIAL=""
 while (($#)); do
   case $1 in
     --only) ONLY=$2; shift 2 ;;
+    --partial) PARTIAL=.partial; shift ;;
     --dry-run) DRY=1; shift ;;
     *) echo "неизвестный аргумент: $1" >&2; exit 2 ;;
   esac
@@ -34,8 +38,8 @@ for v in HUB_URL HUB_SSH HUB_BIN HUB_BROKER_HOME INFRA_DIR ANSIBLE_KEY MAC_SSH M
   [[ -n ${!v:-} ]] || { echo "$SCION_FLEET_ENV: не задана $v" >&2; exit 2; }
 done
 
-REL=${SCION_STAGED:?каталог выложенных релизов}/$TAG
-[[ -f $REL/SHA256SUMS ]] || { echo "нет релиза $REL (fork-release.sh … --publish выкладывает его только при PASS smoke)" >&2; exit 2; }
+REL=${SCION_STAGED:?каталог выложенных релизов}/$TAG$PARTIAL
+[[ -f $REL/SHA256SUMS ]] || { echo "нет релиза $REL (fork-release.sh … --publish выкладывает его только при PASS smoke; сборка под smoke — --partial)" >&2; exit 2; }
 (cd "$REL" && shasum -a 256 -c SHA256SUMS >/dev/null) || { echo "$REL: SHA256SUMS не сходится" >&2; exit 1; }
 COMMIT=$(git -C "$(dirname "$0")" rev-parse "$TAG^{commit}")
 
