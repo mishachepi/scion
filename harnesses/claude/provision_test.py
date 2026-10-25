@@ -365,6 +365,27 @@ def make_thinking_ctx(home: str, thinking: Any = CLAUDE_THINKING, *, omit_thinki
     return ctx
 
 
+class ClaudeJsonTest(unittest.TestCase):
+    def test_startup_prompts_are_marked_answered(self) -> None:
+        """A provisioned .claude.json answers the one-time startup prompts.
+
+        Claude Code drops keys it has migrated, so a seeded .claude.json is
+        not enough: the provisioner sets them on every start, keeping the
+        rest of the file.
+        """
+        with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp):
+            path = os.path.join(tmp, ".claude.json")
+            with open(path, "w") as f:
+                json.dump({"numStartups": 7}, f)
+
+            provision._update_project_paths(make_ctx(tmp), claude_version="")
+
+            with open(path) as f:
+                cfg = json.load(f)
+        self.assertIs(cfg["hasSeenAutoDefaultNudge"], True)
+        self.assertEqual(cfg["numStartups"], 7)
+
+
 class EffortTest(unittest.TestCase):
     """ptone/scion#3011: SCION_THINKING_LEVEL -> CLAUDE_CODE_EFFORT_LEVEL."""
 

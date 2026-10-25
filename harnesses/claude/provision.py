@@ -79,6 +79,14 @@ assert scion_harness.INTERFACE_VERSION >= 3, (  # 3: resolve_thinking
 CLAUDE_JSON_FILE = "~/.claude.json"
 CLAUDE_AUTH_FILE = "~/.claude/.credentials.json"
 
+# One-time startup prompts Claude Code shows before its input box takes
+# text, recorded as already answered in .claude.json. A message delivered
+# while one is on screen answers it instead of reaching the model: the
+# auto-mode offer selects "Yes, set auto mode" on the message's Enter.
+DISMISSED_STARTUP_PROMPTS: dict[str, Any] = {
+    "hasSeenAutoDefaultNudge": True,
+}
+
 # Model used when the agent config does not request one. This preserves the
 # historical default that used to live in config.yaml's env block
 # (ANTHROPIC_MODEL: "opus"); it now lives here because a static env entry in
@@ -213,7 +221,8 @@ def _update_project_paths(
 
     Also pre-trusts /workspace so the trust dialog does not fire when
     Claude Code is launched there for git-clone-per-agent agents whose
-    ctx.workspace is a subdirectory of /workspace.
+    ctx.workspace is a subdirectory of /workspace, and marks
+    DISMISSED_STARTUP_PROMPTS as answered.
     """
     claude_json_path = scion_harness.expand_path(CLAUDE_JSON_FILE)
 
@@ -259,6 +268,7 @@ def _update_project_paths(
         }
 
     cfg["projects"] = new_projects
+    cfg.update(DISMISSED_STARTUP_PROMPTS)
 
     version = _detect_claude_version() if claude_version is None else claude_version
     if version:
