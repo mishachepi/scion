@@ -24,6 +24,7 @@ import (
 	"maps"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"sort"
@@ -2530,8 +2531,11 @@ func (s *Server) createAgentInProject(
 	// workspace the hub serves, which lives on the hub's workspace storage.
 	// A remote broker can reach it only through the same shared storage.
 	// A remote broker without it is refused with 409 before dispatch;
-	// clone-per-agent and empty-per-agent are unaffected.
-	if mountsHubProjectWorkspace(project) && runtimeBrokerID != "" && !s.isEmbeddedBroker(runtimeBrokerID) {
+	// clone-per-agent and empty-per-agent are unaffected, and so is an
+	// explicit absolute workspace: the broker mounts that host path as it
+	// is and never reaches for the hub's copy.
+	if mountsHubProjectWorkspace(project) && runtimeBrokerID != "" && !s.isEmbeddedBroker(runtimeBrokerID) &&
+		!filepath.IsAbs(req.Workspace) {
 		if msg, refused := s.remoteBrokerWorkspaceRefusal(ctx, project, runtimeBrokerID); refused {
 			s.agentLifecycleLog.Warn("Remote runtime broker cannot reach the project workspace; failing agent create",
 				"agent_id", agent.ID, "project_id", project.ID, "broker_id", runtimeBrokerID)

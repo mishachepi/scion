@@ -232,6 +232,22 @@ func TestCreateAgent_RemoteBroker_LocalHubWorkspace_Refused409(t *testing.T) {
 		"lives on the hub's local disk, which a remote runtime broker cannot reach")
 }
 
+// TestCreateAgent_RemoteBroker_AbsoluteWorkspace_Dispatched: an explicit
+// absolute workspace is a path on the broker host, which the broker mounts
+// as it is, so a hub-managed project on a remote broker is not refused and
+// the path reaches the broker unchanged.
+func TestCreateAgent_RemoteBroker_AbsoluteWorkspace_Dispatched(t *testing.T) {
+	srv, _, project, disp := setupRemoteBrokerWorkspaceServer(t)
+	require.False(t, project.IsLinkedOrigin(), "fixture check: hub-managed project")
+
+	rec := doRequest(t, srv, http.MethodPost, "/api/v1/agents", CreateAgentRequest{
+		Name: "abs-workspace", ProjectID: project.ID, Workspace: "/srv/work",
+	})
+	require.Equal(t, http.StatusCreated, rec.Code, "body: %s", rec.Body.String())
+	require.NotNil(t, disp.capturedAgent, "dispatched")
+	assert.Equal(t, "/srv/work", disp.capturedAgent.AppliedConfig.Workspace)
+}
+
 // TestCreateAgent_RemoteBroker_LinkedNonGitLocalHub_CarveOut pins the
 // linked non-git exception: a
 // LINKED non-git project on a local-backend hub dispatched to a remote
