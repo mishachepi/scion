@@ -29,6 +29,9 @@ trap cleanup EXIT
 
 # Упавший тест — строка «--- FAIL: Имя»; пакет, тесты которого не собрались, — «FAIL пакет [build failed]».
 clean_env() { env | sed -nE 's/^((SCION_|TMUX)[A-Za-z0-9_]*)=.*/-u \1/p'; }
+# TMPDIR — канонический путь: на macOS /var → /private/var, и тесты, сравнивающие
+# пути после EvalSymlinks, падают с TMPDIR=/var/folders/... (ложные «регрессии»).
+export TMPDIR=$(cd "${TMPDIR:-/tmp}" && pwd -P)
 fails() { ( cd "$1" && env $(clean_env) HOME=$(mktemp -d) go test -tags no_sqlite ./... 2>&1 \
   | grep -E '^--- FAIL|^FAIL[[:space:]].*\[(build|setup) failed\]' | sed 's/ (.*//; s/[[:space:]]\{1,\}/ /g' | sort -u ) || true; }
 
