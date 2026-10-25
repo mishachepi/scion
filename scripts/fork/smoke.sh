@@ -114,12 +114,13 @@ conv_id() { # the user's DM conversation with <agent>
 c=[x['id'] for x in d.get('conversations',[]) if (x.get('dmPeer') or {}).get('name')=='$1']
 print(c[0] if c else '')"
 }
-count_msgs() { # count_msgs <agent> <text>: messages from the agent with exactly <text> in the DM
+count_msgs() { # count_msgs <agent> <regex>: messages from the agent whose whole text matches <regex> in the DM
   local c; c=$(conv_id "$1")
   [[ -z $c ]] && { echo 0; return; }
   local n
   n=$(H conversation messages "conv:$c" --format json 2>/dev/null | json "
-print(sum(1 for m in d.get('items',[]) if m.get('sender')=='agent:$1' and m.get('msg','').strip()=='$2'))" 2>/dev/null)
+import re
+print(sum(1 for m in d.get('items',[]) if m.get('sender')=='agent:$1' and re.fullmatch(r'''$2''', m.get('msg','').strip())))" 2>/dev/null)
   echo "${n:-0}"
 }
 wait_count() { # wait_count <agent> <text> <more-than>
@@ -146,14 +147,15 @@ ping() {
 }
 
 # relay <a> <b>: a messages b, b's pong makes a report relay-ok. A lost hop is retried once and
-# reported as KNOWN: a pong can stay "dispatched" without reaching a.
+# reported as KNOWN: a pong can stay "dispatched" without reaching a. The agent copies the sender
+# field either verbatim ("agent:<b>") or as the bare name — both count.
 relay() {
-  local l="(в) $1 пишет $2, $2 отвечает (relay-ok)" before; before=$(count_msgs "$1" "relay-ok agent:$2")
+  local l="(в) $1 пишет $2, $2 отвечает (relay-ok)" ok="relay-ok (agent:)?$2" before; before=$(count_msgs "$1" "$ok")
   S message "@$1" "relay $2" >/dev/null 2>&1
-  wait_count "$1" "relay-ok agent:$2" "$before" && { pass "$l"; return; }
+  wait_count "$1" "$ok" "$before" && { pass "$l"; return; }
   known "(в) relay $1 → $2 потерян, повтор"
   S message "@$1" "relay $2" >/dev/null 2>&1
-  wait_count "$1" "relay-ok agent:$2" "$before" && { pass "$l (повтор)"; return; }
+  wait_count "$1" "$ok" "$before" && { pass "$l (повтор)"; return; }
   fail "$l"
 }
 
