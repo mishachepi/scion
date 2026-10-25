@@ -110,7 +110,12 @@ if wants local; then
   run swap "$LOCAL_BIN" "$REL/darwin-arm64" scion sciontool
   run swap "$LOCAL_LINUX_BIN" "$REL/linux-arm64" scion sciontool
   run launchctl bootout "gui/$(id -u)/$BROKER_LABEL" || true
-  run launchctl bootstrap "gui/$(id -u)" "$LOCAL_BROKER_PLIST"
+  # bootstrap сразу после bootout может упасть с «Input/output error» (служба ещё выгружается) — повторить
+  for _ in 1 2 3 4 5; do
+    if run launchctl bootstrap "gui/$(id -u)" "$LOCAL_BROKER_PLIST"; then break; fi
+    ((DRY)) && break
+    sleep 2
+  done
   run launchctl kickstart "gui/$(id -u)/$BROKER_LABEL"
 fi
 
