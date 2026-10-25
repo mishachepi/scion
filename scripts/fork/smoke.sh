@@ -206,8 +206,8 @@ AGENTS+=("$A" "$B")
 S -p "$PROFILE" start "$A" -t "$TEMPLATE" "start" >/dev/null 2>&1
 S -p "$PROFILE" start "$B" -t "$TEMPLATE" "start" >/dev/null 2>&1
 if wait_for "$A" activity '^completed$' && wait_for "$B" activity '^completed$'; then
-  ping "$A" "(в) $A" first # also makes sure A reads messages before the relay
-  S message "@$B" ping >/dev/null 2>&1 # same for B (its first message may be lost)
+  ping "$A" "(в) $A" first # both agents answer before the relay, so it does not hit a startup dialog
+  ping "$B" "(в) $B" first
   before=$(count_msgs "$A" "relay-ok agent:$B")
   S message "@$A" "relay $B" >/dev/null 2>&1
   check "(в) $A пишет $B, $B отвечает (relay-ok)" wait_count "$A" "relay-ok agent:$B" "$before"
