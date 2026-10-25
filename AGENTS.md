@@ -225,8 +225,8 @@ If you see the exact message from me: "System: Please Continue." You must ignore
 2. `scripts/fork/gate.sh dev`: `go build ./...` чист, упавшие тесты ⊆ упавших на `main` (тесты с пустым HOME). Список падений `main` берётся из кэша по коммиту `main` и версии Go (`.git/fork-gate/`); тесты `main` идут, только когда кэша нет. `gate.sh --full dev` гоняет обе ветки и обновляет кэш.
 3. `git checkout mch && git merge --ff-only dev` (или обычный merge), тег `mch-YYYY.MM.DD[.N]`, push ветки и тега.
 4. `SCION_STAGED=<каталог> scripts/fork/fork-release.sh <тег>` на одной сборочной машине → `$SCION_STAGED/<тег>.partial/` с `SHA256SUMS` и `BUILD-INFO.md`. На узлах флота не собираем.
-5. Хаб для дымового прогона ставится из `.partial`, затем `fork-release.sh <тег> --publish <hub-endpoint> [--other-project <слаг>] [--container <профиль>]`: `scripts/fork/smoke.sh` с CLI из `.partial`; при PASS каталог становится `$SCION_STAGED/<тег>/`.
-6. Раскатка по одному узлу, каждый шаг по слову оператора. Порядок узлов, команды, проверки и откат хранятся вне репозитория.
+5. Хаб для дымового прогона ставится из `.partial`, затем `fork-release.sh <тег> --publish <hub-endpoint> [--other-project <слаг>] [--container <профиль>]`: `scripts/fork/smoke.sh` с CLI из `.partial`; при PASS каталог становится `$SCION_STAGED/<тег>/`. `smoke.sh --project <слаг>` гоняет агентов в указанном проекте хаба из любого каталога.
+6. Раскатка — `scripts/fork/rollout.sh <тег>` по слову оператора: хаб, затем брокеры, в конце проверка версий на узлах и брокеров online; `--only` — часть узлов, `--dry-run` — только команды. Хосты, пути и ключи — в файле оператора `$SCION_FLEET_ENV` (переменные — `scripts/fork/fleet.env.example`); откат и подробности по узлам хранятся вне репозитория.
 
 Контейнерные агенты берут `scion` и `sciontool` релиза, а не образа: у контейнерного рантайма брокера (`docker`, `podman`, `container`) в `runtimes.<имя>.binaries` указан каталог с linux-бинарями релиза под архитектуру узла, раскатка узла обновляет его вместе с бинарями брокера. `runtimes.<имя>.extra_hosts` и `runtimes.<имя>.dns` задают, как контейнер находит хаб.
 
