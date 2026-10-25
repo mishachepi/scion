@@ -200,6 +200,9 @@ CLIV=$("$SCION_BIN" version 2>/dev/null | tail -1)
 [[ $EXPECT == dev ]] && EXPECT=$(sed -nE 's/.*\(commit ([0-9a-f]+)\).*/\1/p' <<<"$CLIV")
 check "(а) /healthz scionVersion = $EXPECT (хаб: ${HUBV:-нет ответа})" test "$HUBV" = "$EXPECT"
 check "(а) scion version = $EXPECT (CLI: $CLIV)" grep -qE "[ (]$EXPECT[ )]" <<<"$CLIV "
+# Анонимный запрос к API должен получать 401: 200 означает dev-режим за прокси (любой гость = admin).
+ANON=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "$HUB/api/v1/agents" 2>/dev/null || echo 000)
+check "(а) анонимный GET /api/v1/agents → 401 (получено $ANON)" test "$ANON" = 401
 BJSON=$(H hub brokers --format json 2>/dev/null || echo '[]')
 if [[ -n $BROKERS ]]; then
   for b in ${BROKERS//,/ }; do
