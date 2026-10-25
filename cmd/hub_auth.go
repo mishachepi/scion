@@ -103,7 +103,10 @@ Example:
   scion --hub https://hub.example.com hub auth login
   scion --hub prod hub auth login
   scion hub auth login --no-browser
-  scion hub auth login --provider github`,
+  scion hub auth login --provider github
+
+  # Log in through the hub's OIDC provider (server.oidc_login)
+  scion hub auth login --provider oidc`,
 	RunE: runHubAuthLogin,
 }
 
@@ -126,7 +129,7 @@ func init() {
 	// prints the deprecation on stderr when it is used.
 	_ = hubAuthLoginCmd.Flags().MarkDeprecated("hub-url", "use --hub")
 	hubAuthLoginCmd.Flags().BoolVar(&hubAuthNoBrowser, "no-browser", false, "Use device flow instead of opening a browser")
-	hubAuthLoginCmd.Flags().String("provider", "", "OAuth provider to use (google or github)")
+	hubAuthLoginCmd.Flags().String("provider", "", "OAuth provider to use (google, github or oidc)")
 }
 
 func runHubAuthLogin(cmd *cobra.Command, args []string) error {

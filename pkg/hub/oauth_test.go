@@ -507,7 +507,7 @@ func TestOAuthService_IsProviderConfiguredForClient_OIDC(t *testing.T) {
 		}
 	})
 
-	t.Run("oidc not configured for cli", func(t *testing.T) {
+	t.Run("oidc configured for cli", func(t *testing.T) {
 		oidcCfg := &config.OIDCLoginConfig{
 			Enabled:   true,
 			IssuerURL: "https://idp.example.com",
@@ -515,8 +515,8 @@ func TestOAuthService_IsProviderConfiguredForClient_OIDC(t *testing.T) {
 		}
 		service := NewOAuthService(OAuthConfig{}, oidcCfg)
 
-		if service.IsProviderConfiguredForClient(OAuthClientTypeCLI, hubclient.OAuthProviderOIDC) {
-			t.Error("expected OIDC NOT configured for CLI")
+		if !service.IsProviderConfiguredForClient(OAuthClientTypeCLI, hubclient.OAuthProviderOIDC) {
+			t.Error("expected OIDC configured for CLI")
 		}
 	})
 

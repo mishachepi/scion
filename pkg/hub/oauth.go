@@ -193,8 +193,9 @@ func (s *OAuthService) getClientConfig(clientType OAuthClientType) OAuthClientCo
 // for the given client type.
 func (s *OAuthService) IsProviderConfiguredForClient(clientType OAuthClientType, provider string) bool {
 	if provider == hubclient.OAuthProviderOIDC {
-		// V1: OIDC login is web-only
-		return clientType == OAuthClientTypeWeb &&
+		// OIDC login serves the web and the CLI localhost-callback flow with the
+		// same client; the device flow is not wired for OIDC.
+		return (clientType == OAuthClientTypeWeb || clientType == OAuthClientTypeCLI) &&
 			s.oidcLoginConfig != nil &&
 			s.oidcLoginConfig.Enabled &&
 			s.oidcLoginConfig.ClientID != "" &&
