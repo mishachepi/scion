@@ -30,7 +30,7 @@ done
 [[ -n $HOST ]] || { echo "--host <user@host> обязателен" >&2; exit 2; }
 [[ $TAG =~ ^mch-[0-9]{4}\.[0-9]{2}\.[0-9]{2}(\.[0-9]+)?$ ]] || { echo "тег не похож на mch-YYYY.MM.DD[.N]: $TAG" >&2; exit 2; }
 
-remote() { $SSH "$HOST" bash -s -- "$@"; }
+remote() { $SSH "$HOST" bash -s -- "$(printf '%q ' "$@")"; } # аргументы экранируются: ssh склеивает их в одну строку
 
 case $MODE in
 build)
