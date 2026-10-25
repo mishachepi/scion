@@ -69,6 +69,19 @@ import {
 /** GET /api/v1/admin/server-config returns this in place of each secret. */
 const MASKED_VALUE = '********';
 
+/** Runtime types accepted by `runtimes.<name>.type` (settings-v1 schema enum). */
+export const RUNTIME_TYPES = [
+  'docker',
+  'podman',
+  'container',
+  'kubernetes',
+  'cloudrun',
+  'cloudrun-instances',
+  'cloudrun-sandbox',
+  'substrate',
+  'tmux',
+] as const;
+
 /** True when obj has a key whose value is not undefined (null counts). */
 function hasDefinedValue(obj: Record<string, unknown>): boolean {
   return Object.values(obj).some((v) => v !== undefined);
@@ -5108,11 +5121,7 @@ export class ScionPageAdminServerConfig extends LitElement {
                 this.updateRuntimeField(name, 'type', (e.target as HTMLSelectElement).value);
               }}
             >
-              <sl-option value="docker">docker</sl-option>
-              <sl-option value="podman">podman</sl-option>
-              <sl-option value="kubernetes">kubernetes</sl-option>
-              <sl-option value="cloudrun">cloudrun</sl-option>
-              <sl-option value="cloudrun-instances">cloudrun-instances</sl-option>
+              ${RUNTIME_TYPES.map((t) => html`<sl-option value=${t}>${t}</sl-option>`)}
             </sl-select>
           </div>
           <div class="form-field">
