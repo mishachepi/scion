@@ -543,6 +543,20 @@
           "type": "string",
           "description": "tmux runtime: wrap each harness in 'sciontool init --tmuxruntime --'. '' (default) disables wrapping; 'auto' looks up sciontool on PATH with graceful fallback; any other value is an explicit absolute path."
         },
+        "binaries": {
+          "type": "string",
+          "description": "docker, podman, container: absolute host directory with linux scion and sciontool binaries, mounted read-only at /opt/scion/bin in every agent container in place of the image's binaries."
+        },
+        "extra_hosts": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "docker, podman: extra /etc/hosts entries for every agent container, as name:ip or name:host-gateway."
+        },
+        "dns": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "docker, podman, container: nameserver IPs for every agent container."
+        },
         "cloudrun": {
           "type": "object",
           "description": "Cloud Run settings when type is \"cloudrun\".",

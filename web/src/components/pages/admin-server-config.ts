@@ -369,6 +369,9 @@ interface V1RuntimeConfig {
   shared_dir_storage_backend?: string;
   home_storage_backend?: string;
   home_storage_leaf?: string;
+  binaries?: string;
+  extra_hosts?: string[];
+  dns?: string[];
 }
 
 // Sets or clears one key in a runtime's Cloud Run block, and drops the
@@ -5220,6 +5223,60 @@ export class ScionPageAdminServerConfig extends LitElement {
                   ></sl-input>
                 </div>
                 <div class="form-field">
+                  <label>Binaries</label>
+                  <span class="hint"
+                    >docker, podman, container. Host directory with linux scion and sciontool,
+                    mounted at /opt/scion/bin in agent containers in place of the image's.</span
+                  >
+                  <sl-input
+                    class="runtime-binaries"
+                    value=${rt.binaries || ''}
+                    ?disabled=${readOnly}
+                    @sl-input=${(e: Event) => {
+                      this.updateRuntimeField(
+                        name,
+                        'binaries',
+                        (e.target as HTMLInputElement).value
+                      );
+                    }}
+                  ></sl-input>
+                </div>
+                <div class="form-field">
+                  <label>Extra Hosts</label>
+                  <span class="hint"
+                    >docker, podman. Comma-separated /etc/hosts entries for agent containers, as
+                    name:ip or name:host-gateway.</span
+                  >
+                  <sl-input
+                    class="runtime-extra-hosts"
+                    value=${(rt.extra_hosts || []).join(', ')}
+                    placeholder="hub.example:host-gateway"
+                    ?disabled=${readOnly}
+                    @sl-change=${(e: Event) => {
+                      this.updateRuntimeList(
+                        name,
+                        'extra_hosts',
+                        (e.target as HTMLInputElement).value
+                      );
+                    }}
+                  ></sl-input>
+                </div>
+                <div class="form-field">
+                  <label>DNS</label>
+                  <span class="hint"
+                    >docker, podman, container. Comma-separated nameserver IPs for agent
+                    containers.</span
+                  >
+                  <sl-input
+                    class="runtime-dns"
+                    value=${(rt.dns || []).join(', ')}
+                    ?disabled=${readOnly}
+                    @sl-change=${(e: Event) => {
+                      this.updateRuntimeList(name, 'dns', (e.target as HTMLInputElement).value);
+                    }}
+                  ></sl-input>
+                </div>
+                <div class="form-field">
                   <label>Context</label>
                   <sl-input
                     value=${rt.context || ''}
@@ -5321,6 +5378,21 @@ export class ScionPageAdminServerConfig extends LitElement {
     `;
   }
 
+  /** Sets a list field from comma-separated text; empty text removes it. */
+  private updateRuntimeList(name: string, field: 'extra_hosts' | 'dns', value: string): void {
+    const items = value
+      .split(',')
+      .map((v) => v.trim())
+      .filter(Boolean);
+    const rt = { ...this.runtimes[name] };
+    if (items.length) {
+      rt[field] = items;
+    } else {
+      delete rt[field];
+    }
+    this.runtimes = { ...this.runtimes, [name]: rt };
+  }
+
   private updateRuntimeField(name: string, field: keyof V1RuntimeConfig, value: string): void {
     const updated = { ...this.runtimes };
     const rt = { ...updated[name] };
@@ -5336,6 +5408,9 @@ export class ScionPageAdminServerConfig extends LitElement {
       if (isCloudRun) {
         // Switching to Cloud Run — clear container/k8s fields
         delete rt.host;
+        delete rt.binaries;
+        delete rt.extra_hosts;
+        delete rt.dns;
         delete rt.context;
         delete rt.namespace;
         delete rt.gke;

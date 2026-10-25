@@ -1022,6 +1022,62 @@ func TestDevBinariesMountNotSetOrInvalid(t *testing.T) {
 	}
 }
 
+func TestContainerOptionsRunArgs(t *testing.T) {
+	// A runtime entry's binaries, extra_hosts and dns reach every run and
+	// add to the run's own hosts; the configured binaries beat
+	// SCION_DEV_BINARIES.
+	binDir := t.TempDir()
+	t.Setenv("SCION_DEV_BINARIES", t.TempDir())
+
+	config := RunConfig{
+		Harness:      &harness.Generic{},
+		Name:         "test-agent",
+		UnixUsername: "scion",
+		Image:        "scion-agent:latest",
+		ExtraHosts:   []string{"hub.test:host-gateway"},
+	}
+	ContainerOptions{
+		BinariesDir: binDir,
+		ExtraHosts:  []string{"hub.example:host-gateway"},
+		DNS:         []string{"192.0.2.53"},
+	}.apply(&config)
+
+	args, err := buildCommonRunArgs(config)
+	if err != nil {
+		t.Fatalf("buildCommonRunArgs failed: %v", err)
+	}
+	argStr := strings.Join(args, " ")
+	for _, want := range []string{
+		fmt.Sprintf("-v %s:/opt/scion/bin:ro", binDir),
+		"--add-host hub.test:host-gateway --add-host hub.example:host-gateway",
+		"--dns 192.0.2.53",
+	} {
+		if !strings.Contains(argStr, want) {
+			t.Errorf("expected %q in args, got: %s", want, argStr)
+		}
+	}
+	if n := strings.Count(argStr, ":/opt/scion/bin"); n != 1 {
+		t.Errorf("expected one /opt/scion/bin mount, got %d: %s", n, argStr)
+	}
+}
+
+func TestContainerOptionsMissingBinariesDir(t *testing.T) {
+	// A configured binaries directory that does not exist fails the start
+	// instead of silently running the image's binaries.
+	for _, dir := range []string{"/nonexistent/scion-bin", "relative/bin"} {
+		_, err := buildCommonRunArgs(RunConfig{
+			Harness:      &harness.Generic{},
+			Name:         "test-agent",
+			UnixUsername: "scion",
+			Image:        "scion-agent:latest",
+			BinariesDir:  dir,
+		})
+		if err == nil || !strings.Contains(err.Error(), dir) {
+			t.Errorf("BinariesDir %q: expected an error naming it, got %v", dir, err)
+		}
+	}
+}
+
 func TestGcloudMountPreCreatesDirectory(t *testing.T) {
 	// The gcloud auto-mount in buildCommonRunArgs should pre-create the
 	// mount-point directory inside the agent home so Docker does not create

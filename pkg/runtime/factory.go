@@ -258,7 +258,9 @@ func (s runtimeSelection) build() Runtime {
 		}
 		return tr
 	case "container":
-		return NewAppleContainerRuntime()
+		ar := NewAppleContainerRuntime()
+		ar.Options = containerOptions(rtConfig)
+		return ar
 	case "docker":
 		// On Cloud Run Instances the docker daemon is unavailable.
 		// CLOUD_RUN_INSTANCE is set on Instances (K_SERVICE is NOT).
@@ -306,6 +308,7 @@ func (s runtimeSelection) build() Runtime {
 		if rtConfig.Host != "" {
 			dr.Host = rtConfig.Host
 		}
+		dr.Options = containerOptions(rtConfig)
 		return dr
 	case "podman":
 		podmanCmd := ""
@@ -315,10 +318,11 @@ func (s runtimeSelection) build() Runtime {
 			}
 		}
 		pr := NewPodmanRuntime(podmanCmd)
-		if rtConfig.Host != "" {
-			if p, ok := pr.(*PodmanRuntime); ok {
+		if p, ok := pr.(*PodmanRuntime); ok {
+			if rtConfig.Host != "" {
 				p.Host = rtConfig.Host
 			}
+			p.Options = containerOptions(rtConfig)
 		}
 		return pr
 	case "kubernetes", "k8s":
@@ -466,6 +470,11 @@ func findPodmanNonStandardPath() string {
 		}
 	}
 	return ""
+}
+
+// containerOptions returns a container runtime entry's per-container settings.
+func containerOptions(rtConfig config.V1RuntimeConfig) ContainerOptions {
+	return ContainerOptions{BinariesDir: rtConfig.Binaries, ExtraHosts: rtConfig.ExtraHosts, DNS: rtConfig.DNS}
 }
 
 // resolveSciontool maps a settings.yaml `sciontool` value to an absolute path.

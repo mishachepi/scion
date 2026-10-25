@@ -3038,6 +3038,54 @@ describe('scion-page-admin-server-config', () => {
     });
   });
 
+  describe('container runtime binaries, extra hosts and dns', () => {
+    async function saveAndCapture(el: HTMLElement): Promise<void> {
+      await (el as any).updateComplete;
+      const buttons = queryAll(el, 'sl-button[variant="primary"]');
+      const saveBtn = buttons.find((b) => b.textContent?.trim() === 'Save & Reload');
+      (saveBtn as HTMLElement).click();
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+
+    it('shows the lists and saves edited text as trimmed lists', async () => {
+      let capturedPayload: Record<string, any> | null = null;
+      element = await createComponent(
+        createFetchHandler(
+          makeBaseConfig({
+            runtimes: {
+              apple: { type: 'container', binaries: '/srv/bin', dns: ['192.0.2.53'] },
+            },
+          }),
+          {
+            putHandler: (body) => {
+              if ('runtimes' in body) capturedPayload = body;
+              return { status: 200, body: { reload: { applied: [] } } };
+            },
+          }
+        )
+      );
+
+      const dns = query(element, 'sl-input.runtime-dns') as HTMLElement & { value: string };
+      expect(dns.getAttribute('value')).toBe('192.0.2.53');
+      dns.value = ' 192.0.2.53 , 192.0.2.54, ';
+      dns.dispatchEvent(new Event('sl-change'));
+      const hosts = query(element, 'sl-input.runtime-extra-hosts') as HTMLElement & {
+        value: string;
+      };
+      hosts.value = 'hub.example:host-gateway';
+      hosts.dispatchEvent(new Event('sl-change'));
+      await saveAndCapture(element);
+
+      expect(capturedPayload).not.toBeNull();
+      expect(capturedPayload!.runtimes.apple).toEqual({
+        type: 'container',
+        binaries: '/srv/bin',
+        dns: ['192.0.2.53', '192.0.2.54'],
+        extra_hosts: ['hub.example:host-gateway'],
+      });
+    });
+  });
+
   describe('Cloud Run runtime editor field names (ptone/scion#3475)', () => {
     function cloudRunConfig(
       tier: Record<string, unknown>,

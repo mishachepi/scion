@@ -290,6 +290,24 @@ func buildTmuxStartCmd(agentWindowCmd string, end tmuxSessionEnd) string {
 	}
 }
 
+// ContainerOptions are a runtime entry's settings for every container it
+// starts: `binaries`, `extra_hosts` and `dns` in runtimes.<name>.
+type ContainerOptions struct {
+	BinariesDir string
+	ExtraHosts  []string
+	DNS         []string
+}
+
+// apply adds the options to a run's config. Hosts and nameservers add to the
+// run's own; a run's own binaries directory wins.
+func (o ContainerOptions) apply(config *RunConfig) {
+	if config.BinariesDir == "" {
+		config.BinariesDir = o.BinariesDir
+	}
+	config.ExtraHosts = append(slices.Clone(config.ExtraHosts), o.ExtraHosts...)
+	config.DNS = append(slices.Clone(config.DNS), o.DNS...)
+}
+
 // buildCommonRunArgs constructs the common arguments for 'run' command across different runtimes.
 func buildCommonRunArgs(config RunConfig) ([]string, error) {
 	args := []string{"run", "-d", "-i"}
@@ -747,11 +765,16 @@ func buildCommonRunArgs(config RunConfig) ([]string, error) {
 		addArg("-e", fmt.Sprintf("%s=%s", s.Target, s.Value))
 	}
 
-	// Dev-mode binary override: if SCION_DEV_BINARIES points to a local
-	// directory containing scion/sciontool binaries, bind-mount it to
-	// /opt/scion/bin which has highest PATH priority in the container.
-	// This allows rapid iteration without rebuilding images.
-	if devBinDir := os.Getenv("SCION_DEV_BINARIES"); devBinDir != "" {
+	// Binary override: the runtime's `binaries` directory, or in dev mode
+	// SCION_DEV_BINARIES, is bind-mounted to /opt/scion/bin, which has
+	// highest PATH priority in the container. A configured directory must
+	// exist; the dev variable is ignored when it does not.
+	if config.BinariesDir != "" {
+		if !filepath.IsAbs(config.BinariesDir) || !isDir(config.BinariesDir) {
+			return nil, fmt.Errorf("runtime binaries %q is not an existing absolute directory", config.BinariesDir)
+		}
+		registerMount(config.BinariesDir, "/opt/scion/bin", true, true)
+	} else if devBinDir := os.Getenv("SCION_DEV_BINARIES"); devBinDir != "" {
 		if abs, err := filepath.Abs(devBinDir); err == nil {
 			if info, err := os.Stat(abs); err == nil && info.IsDir() {
 				registerMount(abs, "/opt/scion/bin", true, true)
@@ -865,6 +888,7 @@ func buildCommonRunArgs(config RunConfig) ([]string, error) {
 	for _, h := range config.ExtraHosts {
 		addArg("--add-host", h)
 	}
+	addArg("--dns", config.DNS...)
 
 	if len(fuseMounts) > 0 {
 		addArg("--cap-add", "SYS_ADMIN")

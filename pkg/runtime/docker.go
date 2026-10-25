@@ -34,6 +34,7 @@ import (
 type DockerRuntime struct {
 	Command string
 	Host    string
+	Options ContainerOptions
 
 	// listGroup collapses concurrent List calls into a single `docker ps`
 	// exec. Every caller (PTY lookup, message delivery, heartbeat) issues
@@ -62,6 +63,7 @@ func (r *DockerRuntime) Run(ctx context.Context, config RunConfig) (string, erro
 		return "", err
 	}
 	config.RuntimeName = r.Name()
+	r.Options.apply(&config)
 
 	args, err := buildCommonRunArgs(config)
 	if err != nil {

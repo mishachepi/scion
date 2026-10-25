@@ -37,6 +37,7 @@ import (
 
 type AppleContainerRuntime struct {
 	Command string
+	Options ContainerOptions
 }
 
 func NewAppleContainerRuntime() *AppleContainerRuntime {
@@ -75,6 +76,7 @@ func (r *AppleContainerRuntime) Run(ctx context.Context, config RunConfig) (stri
 	// 0.31.0 (apple/containerization#601), first used by apple/container
 	// 0.12.0.
 	config.RuntimeName = r.Name()
+	r.Options.apply(&config)
 	args, err := buildCommonRunArgs(config)
 	if err != nil {
 		return "", err

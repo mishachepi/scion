@@ -228,6 +228,8 @@ If you see the exact message from me: "System: Please Continue." You must ignore
 5. Хаб для дымового прогона ставится из `.partial`, затем `fork-release.sh <тег> --publish <hub-endpoint> [--other-project <слаг>] [--container <профиль>]`: `scripts/fork/smoke.sh` с CLI из `.partial`; при PASS каталог становится `$SCION_STAGED/<тег>/`.
 6. Раскатка по одному узлу, каждый шаг по слову оператора. Порядок узлов, команды, проверки и откат хранятся вне репозитория.
 
+Контейнерные агенты берут `scion` и `sciontool` релиза, а не образа: у контейнерного рантайма брокера (`docker`, `podman`, `container`) в `runtimes.<имя>.binaries` указан каталог с linux-бинарями релиза под архитектуру узла, раскатка узла обновляет его вместе с бинарями брокера. `runtimes.<имя>.extra_hosts` и `runtimes.<имя>.dns` задают, как контейнер находит хаб.
+
 `scion version` и `/healthz` показывают тег и коммит; все узлы флота стоят на одном теге.
 
 ### Личные данные

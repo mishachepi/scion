@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -83,6 +84,39 @@ func TestGetRuntime(t *testing.T) {
 		r := GetRuntime("", "")
 		if _, ok := r.(*AppleContainerRuntime); !ok {
 			t.Errorf("expected *AppleContainerRuntime from settings, got %T", r)
+		}
+	})
+
+	t.Run("Settings_Global_ContainerOptions", func(t *testing.T) {
+		tmpHome := t.TempDir()
+		t.Setenv("HOME", tmpHome)
+
+		globalDir := filepath.Join(tmpHome, ".scion")
+		if err := os.MkdirAll(globalDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		err := os.WriteFile(filepath.Join(globalDir, "settings.json"), []byte(`{"active_profile": "local",
+			"runtimes": {"apple": {"type": "container", "binaries": "/srv/scion-bin", "dns": ["192.0.2.53"]},
+				"docker": {"extra_hosts": ["hub.example:host-gateway"]}},
+			"profiles": {"local": {"runtime": "apple"}, "box": {"runtime": "docker"}}}`), 0644)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		ar, ok := GetRuntime("", "").(*AppleContainerRuntime)
+		if !ok {
+			t.Fatalf("expected *AppleContainerRuntime from settings")
+		}
+		if want := (ContainerOptions{BinariesDir: "/srv/scion-bin", DNS: []string{"192.0.2.53"}}); !reflect.DeepEqual(ar.Options, want) {
+			t.Errorf("apple Options = %+v, want %+v", ar.Options, want)
+		}
+		dr, ok := GetRuntime("", "box").(*DockerRuntime)
+		if !ok {
+			t.Fatalf("expected *DockerRuntime for profile box")
+		}
+		if want := (ContainerOptions{ExtraHosts: []string{"hub.example:host-gateway"}}); !reflect.DeepEqual(dr.Options, want) {
+			t.Errorf("docker Options = %+v, want %+v", dr.Options, want)
 		}
 	})
 

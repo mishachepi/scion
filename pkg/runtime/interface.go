@@ -100,6 +100,8 @@ type RunConfig struct {
 	Debug                bool
 	MetadataInterception bool     // Add NET_ADMIN cap for iptables-based metadata server interception
 	ExtraHosts           []string // Extra /etc/hosts entries (e.g. "host.docker.internal:host-gateway")
+	DNS                  []string // Nameserver IPs (--dns)
+	BinariesDir          string   // Host directory mounted read-only at /opt/scion/bin
 	NetworkMode          string   // Container network mode (e.g. "host" for --network=host)
 	Project              string   // Project name (e.g., "global" or "my-project")
 	ProjectID            string   // Project ID (e.g., "550e8400-e29b-41d4-a716-446655440000")

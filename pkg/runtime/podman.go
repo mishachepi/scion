@@ -33,6 +33,7 @@ type PodmanRuntime struct {
 	Command  string
 	Host     string
 	Rootless bool // true when Podman is running in rootless mode
+	Options  ContainerOptions
 }
 
 // NewPodmanRuntime creates a new PodmanRuntime after verifying that the podman
@@ -149,6 +150,7 @@ func (r *PodmanRuntime) Run(ctx context.Context, config RunConfig) (string, erro
 	if err := prepareContainerSecretEnv(&config); err != nil {
 		return "", err
 	}
+	r.Options.apply(&config)
 
 	args, err := buildCommonRunArgs(config)
 	if err != nil {

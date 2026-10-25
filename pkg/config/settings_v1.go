@@ -3103,6 +3103,21 @@ type V1RuntimeConfig struct {
 	// each harness in `sciontool init --tmuxruntime`. Empty disables
 	// wrapping; "auto" resolves the binary on PATH.
 	Sciontool string `json:"sciontool,omitempty" yaml:"sciontool,omitempty" koanf:"sciontool"`
+
+	// Binaries is an absolute host directory holding linux scion and
+	// sciontool builds, bind-mounted read-only at /opt/scion/bin (first on
+	// PATH) in every container the runtime starts, so agents run these
+	// binaries instead of the image's. docker, podman and container only.
+	Binaries string `json:"binaries,omitempty" yaml:"binaries,omitempty" koanf:"binaries"`
+
+	// ExtraHosts are extra /etc/hosts entries ("name:ip" or
+	// "name:host-gateway") for every container the runtime starts.
+	// docker and podman only.
+	ExtraHosts []string `json:"extra_hosts,omitempty" yaml:"extra_hosts,omitempty" koanf:"extra_hosts"`
+
+	// DNS are nameserver IPs for every container the runtime starts, in
+	// place of the runtime's default resolver. docker, podman and container.
+	DNS []string `json:"dns,omitempty" yaml:"dns,omitempty" koanf:"dns"`
 }
 
 // V1RuntimeDefaultsConfig holds runtime-wide behaviour that is not specific to
