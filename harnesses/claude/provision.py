@@ -209,6 +209,47 @@ def _requires_opus_5_5_min_version(model: str) -> bool:
     return lowered == "opus" or lowered.startswith("claude-opus-5-5")
 
 
+def _trusted_project_roots(workspace: str) -> list[str]:
+    """Paths Claude Code may key the trust dialog on besides the workspace itself.
+
+    Claude Code resolves the working directory to its real path before the
+    trust lookup, and for a linked git worktree it treats the main worktree
+    as the project (applies its project-local settings and checks trust
+    for it), so a workspace-only entry still fires the trust dialog and a
+    tmux agent hangs on it. Returns the real path and the main worktree root
+    (where they differ from the workspace); errors leave the list shorter.
+    """
+    roots: list[str] = []
+
+    def add(path: str) -> None:
+        if path and path != workspace and path not in roots:
+            roots.append(path)
+
+    try:
+        add(os.path.realpath(workspace))
+    except OSError:
+        pass
+
+    try:
+        proc = subprocess.run(
+            ["git", "-C", workspace, "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return roots
+    common = proc.stdout.strip() if proc.returncode == 0 else ""
+    if common:
+        if not os.path.isabs(common):
+            common = os.path.join(workspace, common)
+        common = os.path.realpath(common)
+        if os.path.basename(common) == ".git":
+            add(os.path.dirname(common))
+    return roots
+
+
 def _update_project_paths(
     ctx: scion_harness.ProvisionContext,
     claude_version: str | None = None,
@@ -266,6 +307,12 @@ def _update_project_paths(
             "hasTrustDialogAccepted": True,
             "projectOnboardingSeenCount": 1,
         }
+
+    for root in _trusted_project_roots(ctx.workspace):
+        new_projects.setdefault(
+            root,
+            {"hasTrustDialogAccepted": True, "projectOnboardingSeenCount": 1},
+        )
 
     cfg["projects"] = new_projects
     cfg.update(DISMISSED_STARTUP_PROMPTS)

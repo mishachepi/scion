@@ -385,6 +385,31 @@ class ClaudeJsonTest(unittest.TestCase):
         self.assertIs(cfg["hasSeenAutoDefaultNudge"], True)
         self.assertEqual(cfg["numStartups"], 7)
 
+    def test_pretrusts_real_path_and_main_worktree(self) -> None:
+        """A linked git worktree workspace also pre-trusts the main worktree.
+
+        Claude Code checks trust for the resolved real path and, for a linked
+        worktree, for the main repository root (whose project-local settings
+        it applies); without those entries a tmux agent hangs on the trust
+        dialog.
+        """
+        with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp):
+            repo = os.path.join(tmp, "repo")
+            os.makedirs(repo)
+            git = ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-C", repo]
+            subprocess.run(git + ["init", "-q"], check=True)
+            subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", "init"], check=True)
+            ctx = make_ctx(tmp)
+            subprocess.run(git + ["worktree", "add", "-q", ctx.workspace], check=True)
+
+            provision._update_project_paths(ctx, claude_version="")
+
+            with open(os.path.join(tmp, ".claude.json")) as f:
+                projects = json.load(f)["projects"]
+        self.assertIs(projects[ctx.workspace]["hasTrustDialogAccepted"], True)
+        for root in (os.path.realpath(ctx.workspace), os.path.realpath(repo)):
+            self.assertIs(projects[root]["hasTrustDialogAccepted"], True, root)
+
 
 class EffortTest(unittest.TestCase):
     """ptone/scion#3011: SCION_THINKING_LEVEL -> CLAUDE_CODE_EFFORT_LEVEL."""
