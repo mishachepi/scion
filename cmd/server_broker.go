@@ -403,16 +403,6 @@ func registerGlobalProjectAndBrokerPresence(ctx context.Context, s store.Store, 
 	return brokerID, nil
 }
 
-// isLocalOnlyRuntime returns true for runtime types that require a local daemon
-// or hardware and cannot function in a hosted cloud environment.
-func isLocalOnlyRuntime(runtimeType string) bool {
-	switch runtimeType {
-	case "docker", "podman", "container":
-		return true
-	}
-	return false
-}
-
 // loadBrokerProfileTypeSettings loads the global settings (plus the DB
 // settings overlay, when installed) that buildStoreBrokerProfiles resolves
 // profile runtime types from. On failure it logs a warning and returns nil:
@@ -471,7 +461,7 @@ func buildStoreBrokerProfiles(settings *config.Settings, profileTypeSettings *co
 			runtimeType = resolveProfileRuntimeType(profileTypeSettings, name, profileCfg.Runtime)
 		}
 
-		if !isLocalOnlyRuntime(defaultRuntimeType) && isLocalOnlyRuntime(runtimeType) {
+		if !runtimebroker.IsLocalOnlyRuntime(defaultRuntimeType) && runtimebroker.IsLocalOnlyRuntime(runtimeType) {
 			continue
 		}
 

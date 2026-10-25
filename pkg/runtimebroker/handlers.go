@@ -326,12 +326,12 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// isLocalOnlyRuntime returns true for runtime types that require a local daemon
+// IsLocalOnlyRuntime returns true for runtime types that require a local daemon
 // or hardware and cannot function in a hosted cloud environment. tmux runs
 // the harness as a process on the broker host, so it is local-only too: a
 // tmux broker offers the host's container profiles, and a hosted broker does
 // not offer tmux profiles.
-func isLocalOnlyRuntime(runtimeType string) bool {
+func IsLocalOnlyRuntime(runtimeType string) bool {
 	switch runtimeType {
 	case "docker", "podman", "container", "tmux":
 		return true
@@ -376,7 +376,7 @@ func (s *Server) buildInfoProfiles(defaultRuntimeType string) []BrokerProfile {
 	for _, name := range names {
 		rtType, rtCfg := resolveInfoProfileRuntime(vs, name, defaultRuntimeType)
 
-		if !isLocalOnlyRuntime(defaultRuntimeType) && isLocalOnlyRuntime(rtType) {
+		if !IsLocalOnlyRuntime(defaultRuntimeType) && IsLocalOnlyRuntime(rtType) {
 			continue
 		}
 

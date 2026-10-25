@@ -296,6 +296,25 @@ func TestBuildStoreBrokerProfiles_DockerDefaultKeepsAllProfiles(t *testing.T) {
 	assert.True(t, types["kubernetes"])
 }
 
+func TestBuildStoreBrokerProfiles_TmuxDefaultKeepsContainerProfiles(t *testing.T) {
+	settings := &config.Settings{
+		Profiles: map[string]config.ProfileConfig{
+			"tmux":   {Runtime: "tmux"},
+			"apple":  {Runtime: "container"},
+			"remote": {Runtime: "kubernetes"},
+		},
+	}
+
+	profiles := buildStoreBrokerProfiles(settings, nil, "tmux", nil)
+
+	types := map[string]string{}
+	for _, p := range profiles {
+		types[p.Name] = p.Type
+	}
+	assert.Equal(t, map[string]string{"tmux": "tmux", "apple": "container", "remote": "kubernetes"}, types,
+		"a tmux broker runs on the host, so it offers the host's container profiles")
+}
+
 func TestBuildStoreBrokerProfiles_EmptyAfterFilterFallsBackToDefault(t *testing.T) {
 	settings := &config.Settings{
 		Profiles: map[string]config.ProfileConfig{

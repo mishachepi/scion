@@ -272,7 +272,7 @@ profiles:
 //
 // This test also verifies the workstation case (docker broker) is unaffected
 // by the filter: when the broker IS local, the filter condition
-// !isLocalOnlyRuntime(defaultRuntimeType) is false, so NO profiles are
+// !IsLocalOnlyRuntime(defaultRuntimeType) is false, so NO profiles are
 // dropped — kubernetes remains available as a legitimate product feature.
 //
 // These three facts were measured by a verification instrument that was
@@ -311,8 +311,8 @@ profiles:
 
 	// === FACT 1: Current filter behavior on cloudrun-sandbox broker ===
 	// With workstation defaults, only remote/kubernetes survives the filter.
-	// local/docker is dropped because isLocalOnlyRuntime("docker")=true and
-	// the broker is non-local (!isLocalOnlyRuntime("cloudrun-sandbox")=true).
+	// local/docker is dropped because IsLocalOnlyRuntime("docker")=true and
+	// the broker is non-local (!IsLocalOnlyRuntime("cloudrun-sandbox")=true).
 	profiles := srv.buildInfoProfiles("cloudrun-sandbox")
 	if len(profiles) != 1 {
 		t.Fatalf("FACT 1: expected 1 profile (remote/kubernetes only), got %d", len(profiles))
@@ -322,18 +322,18 @@ profiles:
 	}
 
 	// === FACT 2: Filter predicate analysis ===
-	// isLocalOnlyRuntime("kubernetes") is false — this is WHY kubernetes
+	// IsLocalOnlyRuntime("kubernetes") is false — this is WHY kubernetes
 	// survives the filter. The filter asks "is this local-only?" when it
 	// should ask "can this broker serve this runtime?".
-	if isLocalOnlyRuntime("kubernetes") {
-		t.Fatal("FACT 2: isLocalOnlyRuntime('kubernetes') should be false — this is load-bearing")
+	if IsLocalOnlyRuntime("kubernetes") {
+		t.Fatal("FACT 2: IsLocalOnlyRuntime('kubernetes') should be false — this is load-bearing")
 	}
-	if !isLocalOnlyRuntime("docker") {
-		t.Fatal("FACT 2: isLocalOnlyRuntime('docker') should be true")
+	if !IsLocalOnlyRuntime("docker") {
+		t.Fatal("FACT 2: IsLocalOnlyRuntime('docker') should be true")
 	}
 
 	// === FACT 3: Workstation broker preserves all profiles ===
-	// On a docker broker, !isLocalOnlyRuntime("docker") = !true = false,
+	// On a docker broker, !IsLocalOnlyRuntime("docker") = !true = false,
 	// so the filter condition is false for ALL profiles → nothing is dropped.
 	// This means kubernetes IS available on a workstation, which is correct
 	// (a workstation legitimately offers k8s as a product feature).
