@@ -141,6 +141,18 @@ ping() {
   fail "$2: ping → pong"
 }
 
+# relay <a> <b>: a messages b, b's pong makes a report relay-ok. A lost hop is retried once and
+# reported as KNOWN: a pong can stay "dispatched" without reaching a.
+relay() {
+  local l="(в) $1 пишет $2, $2 отвечает (relay-ok)" before; before=$(count_msgs "$1" "relay-ok agent:$2")
+  S message "@$1" "relay $2" >/dev/null 2>&1
+  wait_count "$1" "relay-ok agent:$2" "$before" && { pass "$l"; return; }
+  known "(в) relay $1 → $2 потерян, повтор"
+  S message "@$1" "relay $2" >/dev/null 2>&1
+  wait_count "$1" "relay-ok agent:$2" "$before" && { pass "$l (повтор)"; return; }
+  fail "$l"
+}
+
 push_template() {
   local tmp=$HOME/.scion/templates/$TEMPLATE.smoke-$RUN
   S templates delete "$TEMPLATE" --hub >/dev/null 2>&1 # every scope: a stale copy must not shadow the new one
@@ -208,9 +220,7 @@ S -p "$PROFILE" start "$B" -t "$TEMPLATE" "start" >/dev/null 2>&1
 if wait_for "$A" activity '^completed$' && wait_for "$B" activity '^completed$'; then
   ping "$A" "(в) $A" first # both agents answer before the relay, so it does not hit a startup dialog
   ping "$B" "(в) $B" first
-  before=$(count_msgs "$A" "relay-ok agent:$B")
-  S message "@$A" "relay $B" >/dev/null 2>&1
-  check "(в) $A пишет $B, $B отвечает (relay-ok)" wait_count "$A" "relay-ok agent:$B" "$before"
+  relay "$A" "$B"
   ev=$(S schedule create --in 20s --agent "$A" --message ping 2>&1 | sed -n 's/^Scheduled event created: //p')
   check "(в) schedule: одноразовое событие сработало (${ev:-не создано})" schedule_fired "$ev"
 else
