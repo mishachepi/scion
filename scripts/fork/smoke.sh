@@ -178,8 +178,10 @@ HEALTH=$(curl -fsS -m 10 "$HUB/healthz" 2>/dev/null || echo '{}')
 HUBV=$(json "print(d.get('scionVersion',''))" <<<"$HEALTH")
 CLIV=$("$SCION_BIN" version 2>/dev/null | tail -1)
 [[ -z $EXPECT ]] && EXPECT=$(awk '{print $2}' <<<"$CLIV")
+# Сборка без тега: CLI пишет «dev (commit <sha>)», хаб — <sha>.
+[[ $EXPECT == dev ]] && EXPECT=$(sed -nE 's/.*\(commit ([0-9a-f]+)\).*/\1/p' <<<"$CLIV")
 check "(а) /healthz scionVersion = $EXPECT (хаб: ${HUBV:-нет ответа})" test "$HUBV" = "$EXPECT"
-check "(а) scion version = $EXPECT (CLI: $CLIV)" grep -q " $EXPECT " <<<"$CLIV "
+check "(а) scion version = $EXPECT (CLI: $CLIV)" grep -qE "[ (]$EXPECT[ )]" <<<"$CLIV "
 BJSON=$(S hub brokers --format json 2>/dev/null || echo '[]')
 if [[ -n $BROKERS ]]; then
   for b in ${BROKERS//,/ }; do
