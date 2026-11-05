@@ -2,14 +2,18 @@
 # smoke.sh — дымовой прогон сборки против живого хаба: версии, жизненный цикл агента, сообщения,
 # расписание, --project по слагу. Каждая проверка печатает PASS/FAIL; любой FAIL — код выхода 1.
 #
-#   scripts/fork/smoke.sh <hub-endpoint> [--project <слаг>] [--expect <тег>] [--other-project <слаг>] [--container <профиль>] [--brokers a,b]
+#   scripts/fork/smoke.sh <hub-endpoint> [--project <слаг>] [--expect <тег>] [--other-project <слаг>] [--container <профиль>]
+#                         [--container-project <слаг>] [--brokers a,b]
 #
 #   --project         проект хаба, в котором создаются агенты (по умолчанию — проект текущего каталога)
 #   --expect          ожидаемая версия хаба и CLI (по умолчанию — версия CLI из `scion version`)
 #   --other-project   слаг проекта на хабе, отличного от проекта агентов, для проверки (д);
 #                     без него (д) — SKIP
 #   --container       прогнать жизненный цикл ещё и агентом в контейнере на этом профиле брокера
-#                     (Apple container на macOS — профиль с runtime type: container; Docker/Podman — свои профили)
+#                     (Apple container на macOS — профиль с runtime type: container; Docker/Podman — свои профили);
+#                     агент обязан встать на рантайм этого профиля, а не на другой
+#   --container-project  проект для (г), если контейнерный брокер не может работать в --project
+#                     (например, проект с приватными workspace для удалённого docker-брокера)
 #   --brokers         брокеры, которые обязаны быть online (по умолчанию — все брокеры хаба)
 #
 # Окружение: SCION_BIN (по умолчанию scion из PATH); SCION_HUB_CONFIG — токен и проект хаба, его читает
@@ -23,15 +27,16 @@
 # KNOWN — потерянное сообщение (первый ping агенту или relay) повторено один раз; на код выхода не влияет.
 set -uo pipefail
 
-HUB=${1:?использование: smoke.sh <hub-endpoint> [--project <слаг>] [--expect <тег>] [--other-project <слаг>] [--container <профиль>] [--brokers a,b]}
+HUB=${1:?использование: smoke.sh <hub-endpoint> [--project <слаг>] [--expect <тег>] [--other-project <слаг>] [--container <профиль>] [--container-project <слаг>] [--brokers a,b]}
 shift
-PROJECT="" EXPECT="" OTHER="" CONTAINER="" BROKERS=""
+PROJECT="" EXPECT="" OTHER="" CONTAINER="" CPROJECT="" BROKERS=""
 while [[ $# -gt 0 ]]; do
   case $1 in
     --project) PROJECT=$2; shift 2 ;;
     --expect) EXPECT=$2; shift 2 ;;
     --other-project) OTHER=$2; shift 2 ;;
     --container) CONTAINER=$2; shift 2 ;;
+    --container-project) CPROJECT=$2; shift 2 ;;
     --brokers) BROKERS=$2; shift 2 ;;
     *) echo "неизвестный аргумент: $1" >&2; exit 2 ;;
   esac
@@ -62,6 +67,7 @@ cleanup() {
   local a
   for a in "${AGENTS[@]}"; do S delete "$a" >/dev/null 2>&1 || true; done
   [[ -n $OTHER ]] && H --project "$OTHER" delete "smoke-$RUN-e" >/dev/null 2>&1 || true
+  [[ -n $CPROJECT ]] && H --project "$CPROJECT" delete "smoke-$RUN-c" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -169,14 +175,20 @@ push_template() {
   return $rc
 }
 
-# lifecycle <agent> <profile> <label>: start → running → ping → suspend → resume → ping → delete.
+# lifecycle <agent> <profile> <label> [runtime]: start → running → ping → suspend → resume → ping → delete.
+# With [runtime], the agent must run on that runtime type.
 lifecycle() {
-  local a=$1 p=$2 l=$3 out
+  local a=$1 p=$2 l=$3 rt=${4:-} out
   AGENTS+=("$a")
   out=$(S -p "$p" start "$a" -t "$TEMPLATE" "start" 2>&1)
   check "$l: start" grep -q "started" <<<"$out"
+  grep -q "started" <<<"$out" || echo "      $(tail -1 <<<"$out")"
   check "$l: нет 'Uploading workspace'" bash -c '! grep -q "Uploading workspace" <<<"$1"' _ "$out"
   check "$l: running" wait_for "$a" phase '^running$'
+  if [[ -n $rt ]]; then
+    local got; got=$(agent_field "$a" runtime)
+    check "$l: рантайм $rt (брокер $(agent_field "$a" runtimeBrokerName), рантайм ${got:-?})" test "$got" = "$rt"
+  fi
   wait_for "$a" activity '^completed$' >/dev/null
   ping "$a" "$l" first
   S suspend "$a" >/dev/null 2>&1
@@ -246,7 +258,7 @@ if [[ -n $CONTAINER ]]; then
 print(next((p.get('type','') for b in d for p in b.get('profiles',[]) if p.get('name')=='$CONTAINER'),''))")
   if [[ $CTYPE =~ ^(container|docker|podman)$ ]]; then
     pass "(г) профиль $CONTAINER на брокере: рантайм $CTYPE"
-    lifecycle "smoke-$RUN-c" "$CONTAINER" "(г) контейнер ($CONTAINER, $CTYPE)"
+    PROJECT=${CPROJECT:-$PROJECT} lifecycle "smoke-$RUN-c" "$CONTAINER" "(г) контейнер ($CONTAINER, $CTYPE)" "$CTYPE"
   else
     fail "(г) профиль $CONTAINER на брокере: рантайм ${CTYPE:-не объявлен}, нужен container, docker или podman"
   fi
