@@ -7191,10 +7191,10 @@ const (
 	// broker-side image provenance: errSavedProfileUnresolved, naming the
 	// provisioned profile and how to recover.
 	profileStrictProvisioned
-	// profileRequested is for a create that names a profile: a profile or
-	// runtime the settings do not define returns errProfileUnresolved
-	// instead of running the new agent on the broker's default runtime,
-	// where its later start or resume would refuse the saved profile.
+	// profileRequested is for a create that names a profile: a profile the
+	// settings do not define returns errProfileUnresolved instead of
+	// running the new agent on the broker's default runtime, where its
+	// later start or resume would refuse the saved profile.
 	profileRequested
 )
 
@@ -7362,7 +7362,7 @@ func (s *Server) resolveManagerForOptsStrict(opts api.StartOptions, mode profile
 			return s.savedProfileUnresolved(opts, projectDir, mode, err,
 				fmt.Errorf("%w: agent %q: %v", errSavedProfileUnresolved, opts.Name, err))
 		}
-		if mode == profileRequested && opts.Profile != "" {
+		if _, defined := vs.Profiles[opts.Profile]; mode == profileRequested && opts.Profile != "" && !defined {
 			s.agentLifecycleLog.Warn("requested profile cannot be resolved on this broker",
 				"agent", opts.Name, "profile", opts.Profile, "projectDir", projectDir, "error", err)
 			return defaultResolution(defMgr, defRT, defRec, resolutionDefaultFallback), fmt.Errorf("%w: agent %q: %v", errProfileUnresolved, opts.Name, err)
