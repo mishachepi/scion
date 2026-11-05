@@ -5,7 +5,9 @@
 #
 #   hub         хаб на Linux-хосте: плагин TG (install во временный файл + mv, старый — .<прежний тег>), затем
 #               плейбук scion-hub-rebuild.yaml (hub_binary, hub_commit, hub_version)
-#   hub-broker  брокер на хосте хаба: рестарт user-юнита scion-broker (плейбук его не трогает), runtime-broker status
+#   hub-broker  брокер на хосте хаба: linux-amd64 scion+sciontool в каталог runtimes.<имя>.binaries контейнерного
+#               рантайма ($HUB_LINUX_BIN, если задан), рестарт user-юнита scion-broker (плейбук его не трогает),
+#               runtime-broker status
 #   mac         брокер на удалённом Mac: scp darwin-arm64 + shasum, rm+cp в каталог бинарей, kickstart -k
 #   local       брокер на этом Mac: rm+cp darwin-arm64 и linux-arm64 (каталог runtimes.<имя>.binaries
 #               контейнерного рантайма), bootout + bootstrap + kickstart
@@ -84,6 +86,18 @@ SH
 fi
 
 if wants hub-broker; then
+  if [[ -n ${HUB_LINUX_BIN:-} ]]; then
+    step "брокер на хосте хаба: бинари для контейнеров ($HUB_LINUX_BIN)"
+    run ssh "$HUB_SSH" mkdir -p "/tmp/$TAG"
+    run scp "$REL/linux-amd64/scion" "$REL/linux-amd64/sciontool" "$REL/SHA256SUMS" "$HUB_SSH:/tmp/$TAG/"
+    remote "$HUB_SSH" "$TAG" <<'SH'
+set -euo pipefail
+cd "/tmp/$1" && mkdir -p linux-amd64 && mv scion sciontool linux-amd64/ &&
+  grep -E ' linux-amd64/(scion|sciontool)$' SHA256SUMS | sha256sum -c - >/dev/null
+SH
+    remote "$HUB_SSH" "$HUB_LINUX_BIN" "/tmp/$TAG/linux-amd64" scion sciontool <<<"$SWAP"
+    run ssh "$HUB_SSH" rm -rf "/tmp/$TAG"
+  fi
   step "брокер на хосте хаба: рестарт"
   remote "$HUB_SSH" "$HUB_BIN" "$HUB_BROKER_HOME" <<'SH'
 set -euo pipefail
