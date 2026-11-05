@@ -2329,6 +2329,69 @@ func (s *Server) resolveRuntimeBroker(ctx context.Context, w http.ResponseWriter
 // agent's project can only be compared against a broker via this lookup. It is a
 // shared helper rather than an inlined query so that callers of
 // canDispatchToBroker cannot drift on the definition.
+// resolveRuntimeBrokerForProfile is resolveRuntimeBroker for a create that
+// names a runtime profile without a broker. When the broker the project
+// would default to does not offer that profile and exactly one usable
+// online broker of the project does, the agent goes to that broker instead
+// of to one that would run it on some other runtime. Every other case is
+// resolveRuntimeBroker's; a broker that lacks the profile then refuses the
+// create itself.
+func (s *Server) resolveRuntimeBrokerForProfile(ctx context.Context, w http.ResponseWriter, requestedBrokerID string, project *store.Project, profile string) (string, error) {
+	if requestedBrokerID == "" && profile != "" {
+		if id, ok := s.brokerOfferingProfile(ctx, project, profile); ok {
+			return id, nil
+		}
+	}
+	return s.resolveRuntimeBroker(ctx, w, requestedBrokerID, project)
+}
+
+// brokerOfferingProfile picks the broker for profile among the project's
+// usable online brokers: the project's or the hub's default broker when it
+// offers the profile, else the only broker that does. ok is false when
+// none or several do.
+func (s *Server) brokerOfferingProfile(ctx context.Context, project *store.Project, profile string) (string, bool) {
+	available, err := s.getAvailableBrokersForProject(ctx, project.ID)
+	if err != nil {
+		return "", false
+	}
+	var offering []store.RuntimeBroker
+	for i := range available {
+		if brokerOffersProfile(&available[i], profile) && s.canUseBrokerForProject(ctx, &available[i], project) {
+			offering = append(offering, available[i])
+		}
+	}
+	hubDefault := s.hubAgentDefaults().DefaultRuntimeBroker
+	for _, b := range offering {
+		if b.ID == project.DefaultRuntimeBrokerID {
+			return b.ID, true
+		}
+	}
+	if hubDefault != "" {
+		for _, b := range offering {
+			if b.ID == hubDefault || strings.EqualFold(b.Name, hubDefault) || strings.EqualFold(b.Slug, hubDefault) {
+				return b.ID, true
+			}
+		}
+	}
+	if len(offering) == 1 {
+		slog.Info("Routing agent create to the only broker offering the requested profile",
+			"profile", profile, "broker", offering[0].Name, "brokerID", offering[0].ID, "project_id", project.ID)
+		return offering[0].ID, true
+	}
+	return "", false
+}
+
+// brokerOffersProfile reports whether the broker advertises an available
+// runtime profile of that name.
+func brokerOffersProfile(broker *store.RuntimeBroker, profile string) bool {
+	for _, p := range broker.Profiles {
+		if p.Name == profile && p.Available {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) brokerServesProject(ctx context.Context, brokerID, projectID string) bool {
 	if brokerID == "" || projectID == "" {
 		return false

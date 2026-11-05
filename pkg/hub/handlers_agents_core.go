@@ -1672,7 +1672,7 @@ func (s *Server) createAgentInProject(
 	}
 
 	// Resolve the runtime broker
-	runtimeBrokerID, err := s.resolveRuntimeBroker(ctx, w, req.RuntimeBrokerID, project)
+	runtimeBrokerID, err := s.resolveRuntimeBrokerForProfile(ctx, w, req.RuntimeBrokerID, project, req.Profile)
 	if err != nil {
 		// Error response already written by resolveRuntimeBroker
 		return

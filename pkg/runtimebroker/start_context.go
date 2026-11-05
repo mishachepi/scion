@@ -496,6 +496,9 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 		gcpIdentityProfile = profile
 		profileMode = existingAgentProfileResolution(gcpIdentityProfile, provisioned)
 	}
+	if in.Operation == opCreate && gcpIdentityProfile != "" && !s.isFlat() {
+		profileMode = profileRequested
+	}
 	// A saved profile that no longer resolves fails here, with the same
 	// 503 as start/restart's own later resolution, rather than classifying
 	// the dispatch against the default runtime first (ptone/scion#2709).
