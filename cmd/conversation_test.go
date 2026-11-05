@@ -650,7 +650,8 @@ func TestRunConversationList_ExplicitProjectFlag_Wins(t *testing.T) {
 	require.True(t, sawRequest, "expected the list request to reach the mock hub")
 	assert.Equal(t, "0e5f8c7a-0000-4000-8000-00000000f1a9", gotProjectID,
 		"an explicit --project flag must win over the hub-linked project, and must map to project_id")
-	assert.Empty(t, gotIncludeProjectGroups, "an explicit --project must not also send include_project_groups")
+	assert.Equal(t, "0e5f8c7a-0000-4000-8000-00000000f1a9", gotIncludeProjectGroups,
+		"an explicit --project also adds the project's readable groups the caller is not a participant of")
 }
 
 // setupProjectWithoutHubEnabled creates a project ".scion" directory with no

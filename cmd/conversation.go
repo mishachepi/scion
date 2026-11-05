@@ -324,7 +324,11 @@ func runConversationList(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
+		// project_id only narrows the caller's own participations; the
+		// project's group conversations the caller can read but is not a
+		// participant of come from the include_project_groups union.
 		opts.ProjectID = projectID
+		opts.IncludeProjectGroups = projectID
 	} else if resolved, resolveErr := resolveProjectID(settings, ""); resolveErr == nil {
 		opts.IncludeProjectGroups = resolved
 	}
