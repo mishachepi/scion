@@ -107,6 +107,13 @@ func brokerFailureCategory(bf brokerFailure) string {
 	case "runtime_error":
 		return "the runtime broker's container runtime operation failed (for example, an image pull or container runtime failure)"
 	case "runtime_unavailable":
+		// A runtime profile the broker cannot resolve: the broker's reason
+		// names the agent and the profile (no paths or internal errors).
+		if detail("cause") == "profile_unresolved" {
+			if reason := boundedBrokerText(detail("reason")); reason != "" {
+				return "the runtime broker cannot resolve the agent's runtime profile: " + reason
+			}
+		}
 		return "the container runtime is not available on the runtime broker; retry later"
 	case "hub_unreachable":
 		return "the runtime broker could not reach the Hub"

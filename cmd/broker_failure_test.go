@@ -72,6 +72,12 @@ func TestWrapHubError_BrokerFailureCategories(t *testing.T) {
 			want:   []string{"container runtime is not available on the runtime broker"},
 		},
 		{
+			name:   "runtime profile unresolved",
+			status: 503,
+			body:   `{"error":{"code":"runtime_unavailable","message":"x","details":{"cause":"profile_unresolved","reason":"requested runtime profile cannot be resolved: agent \"a\": profile \"docker\" not found"}}}`,
+			want:   []string{"cannot resolve the agent's runtime profile", `profile "docker" not found`},
+		},
+		{
 			name:       "reload unconfirmed",
 			status:     502,
 			body:       `{"error":{"code":"reload_unconfirmed","message":"raw broker text"}}`,

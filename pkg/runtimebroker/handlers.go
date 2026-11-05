@@ -7519,7 +7519,11 @@ func writeProfileUnresolved(w http.ResponseWriter, err error) {
 		suffix = "; retry once the profile is one of the hub's stored profiles, or choose one of them"
 	}
 	w.Header().Set("Retry-After", recordedRuntimeRetryAfterSeconds)
-	RuntimeUnavailable(w, err.Error()+suffix)
+	// The text names only the agent, the profile and the stored profile
+	// names, so it also travels as a detail the CLI shows to the user.
+	msg := err.Error() + suffix
+	writeError(w, http.StatusServiceUnavailable, ErrCodeRuntimeUnavailable, msg,
+		map[string]interface{}{"cause": "profile_unresolved", "reason": msg})
 }
 
 // recheckHubDefaultPassthrough re-runs the hub-default passthrough gate's
