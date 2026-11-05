@@ -262,7 +262,7 @@ func init() {
 	for _, cmd := range []*cobra.Command{conversationCmd, conversationListCmd} {
 		cmd.Flags().StringVar(&convKind, "kind", "", "Filter by kind (direct, group)")
 		cmd.Flags().StringVar(&convSurface, "surface", "", "Filter by surface (native, discord, slack, etc.)")
-		cmd.Flags().StringVar(&convProject, "project", "", "Filter by project ID")
+		cmd.Flags().StringVar(&convProject, "project", "", "Filter by project (slug, name or ID)")
 		cmd.Flags().BoolVar(&convJSON, "json", false, "Output in JSON format")
 		cmd.Flags().IntVar(&convLimit, "limit", 50, "Maximum number of conversations to show")
 	}
@@ -274,7 +274,7 @@ func init() {
 	conversationMessagesCmd.Flags().BoolVar(&convMsgJSON, "json", false, "Output in JSON format")
 
 	// Create flags
-	conversationCreateCmd.Flags().StringVar(&convProject, "project", "", "Project ID (defaults to current project)")
+	conversationCreateCmd.Flags().StringVar(&convProject, "project", "", "Project slug, name or ID (defaults to current project)")
 	conversationCreateCmd.Flags().BoolVar(&convCreateJSON, "json", false, "Output in JSON format")
 
 	// Get flags
@@ -320,7 +320,11 @@ func runConversationList(cmd *cobra.Command, args []string) error {
 	// is not an error: it just falls back to today's behavior (nothing
 	// sent, so the caller's participations plus canonical DMs).
 	if convProject != "" {
-		opts.ProjectID = convProject
+		projectID, err := resolveConversationProjectRef(ctx, client, convProject)
+		if err != nil {
+			return err
+		}
+		opts.ProjectID = projectID
 	} else if resolved, resolveErr := resolveProjectID(settings, ""); resolveErr == nil {
 		opts.IncludeProjectGroups = resolved
 	}
@@ -424,6 +428,7 @@ func runConversationCreate(cmd *cobra.Command, args []string) error {
 	// for a user identity with neither, a clear "projectId is required"
 	// error) still applies.
 	var projectResolveErr error
+	projectFromFlag := convProject != ""
 	if convProject == "" {
 		if resolved, resolveErr := resolveProjectID(settings, convProject); resolveErr == nil {
 			convProject = resolved
@@ -434,6 +439,14 @@ func runConversationCreate(cmd *cobra.Command, args []string) error {
 
 	ctx, cancel := context.WithTimeout(cmd.Context(), 30*time.Second)
 	defer cancel()
+
+	if projectFromFlag {
+		projectID, err := resolveConversationProjectRef(ctx, client, convProject)
+		if err != nil {
+			return err
+		}
+		convProject = projectID
+	}
 
 	req := &hubclient.CreateConversationRequest{
 		DisplayName: args[0],
@@ -933,4 +946,19 @@ func truncateRunes(s string, max int, ellipsis bool) string {
 		return string(runes[:max-3]) + "..."
 	}
 	return string(runes[:max])
+}
+
+// resolveConversationProjectRef turns the --project value of the
+// conversation commands into a hub project ID. The hub filters and files
+// conversations by ID only, so a slug or name sent as-is matches nothing.
+// A UUID-shaped value is used as given.
+func resolveConversationProjectRef(ctx context.Context, client hubclient.Client, ref string) (string, error) {
+	if isUUIDLike(ref) {
+		return ref, nil
+	}
+	project, err := resolveProjectByNameOrID(ctx, client, ref)
+	if err != nil {
+		return "", fmt.Errorf("project %q: %w", ref, err)
+	}
+	return project.ID, nil
 }

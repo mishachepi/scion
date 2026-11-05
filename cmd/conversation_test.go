@@ -640,7 +640,7 @@ func TestRunConversationList_ExplicitProjectFlag_Wins(t *testing.T) {
 	_ = os.Setenv("HOME", tmpHome)
 	projectDir := setupConversationCreateProject(t, tmpHome, server.URL, "hub-linked-project-id")
 	projectPath = projectDir
-	convProject = "explicit-flag-project-id"
+	convProject = "0e5f8c7a-0000-4000-8000-00000000f1a9"
 	convJSON = true
 
 	cmd := &cobra.Command{}
@@ -648,7 +648,7 @@ func TestRunConversationList_ExplicitProjectFlag_Wins(t *testing.T) {
 	err := runConversationList(cmd, nil)
 	require.NoError(t, err)
 	require.True(t, sawRequest, "expected the list request to reach the mock hub")
-	assert.Equal(t, "explicit-flag-project-id", gotProjectID,
+	assert.Equal(t, "0e5f8c7a-0000-4000-8000-00000000f1a9", gotProjectID,
 		"an explicit --project flag must win over the hub-linked project, and must map to project_id")
 	assert.Empty(t, gotIncludeProjectGroups, "an explicit --project must not also send include_project_groups")
 }
@@ -971,4 +971,80 @@ func TestConversationParticipantDetail_JSON(t *testing.T) {
 	require.Len(t, back.Participants, 1)
 	assert.Equal(t, "lineage", back.Participants[0].MessageMode)
 	assert.Equal(t, "a1", back.Participants[0].PrincipalID)
+}
+
+// newConversationProjectRefServer is a hub that knows one project (id
+// "8d6c7f0e-0000-4000-8000-000000000001", slug "mch") and records the
+// project_id of conversation list requests and the projectId of create
+// requests.
+func newConversationProjectRefServer(t *testing.T, gotListProject, gotCreateProject *string) *httptest.Server {
+	t.Helper()
+	const id = "8d6c7f0e-0000-4000-8000-000000000001"
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/api/v1/projects/mch" && r.Method == http.MethodGet:
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"code":"not_found","message":"project not found"}}`))
+		case r.URL.Path == "/api/v1/projects" && r.Method == http.MethodGet:
+			if r.URL.Query().Get("slug") == "mch" {
+				_, _ = w.Write([]byte(`{"projects":[{"id":"` + id + `","slug":"mch","name":"mch"}]}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"projects":[]}`))
+		case r.URL.Path == "/api/v1/conversations" && r.Method == http.MethodGet:
+			*gotListProject = r.URL.Query().Get("project_id")
+			_, _ = w.Write([]byte(`{"conversations":[]}`))
+		case r.URL.Path == "/api/v1/conversations" && r.Method == http.MethodPost:
+			var req struct {
+				ProjectID string `json:"projectId"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			*gotCreateProject = req.ProjectID
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(store.Conversation{ID: "c1", Kind: "group", Surface: "native", DriftState: "active"})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+}
+
+// TestConversationProjectFlag_ResolvesSlug: the hub filters and files
+// conversations by project ID only, so `--project <slug>` must reach it as
+// the project's ID — sent as-is, the slug matched nothing and the list was
+// empty.
+func TestConversationProjectFlag_ResolvesSlug(t *testing.T) {
+	orig := saveConversationCreateTestState()
+	defer orig.restore()
+
+	var gotList, gotCreate string
+	server := newConversationProjectRefServer(t, &gotList, &gotCreate)
+	defer server.Close()
+
+	isolateHubEnvForTest(t, server.URL, "")
+	tmpHome := t.TempDir()
+	_ = os.Setenv("HOME", tmpHome)
+	projectPath = setupConversationCreateProject(t, tmpHome, server.URL, "")
+	convCreateJSON = true
+	outputFormat = "json"
+
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+
+	convProject = "mch"
+	require.NoError(t, runConversationList(cmd, nil))
+	assert.Equal(t, "8d6c7f0e-0000-4000-8000-000000000001", gotList, "list: slug must be sent as the project ID")
+
+	convProject = "mch"
+	require.NoError(t, runConversationCreate(cmd, []string{"slug-test"}))
+	assert.Equal(t, "8d6c7f0e-0000-4000-8000-000000000001", gotCreate, "create: slug must be sent as the project ID")
+
+	convProject = "8d6c7f0e-0000-4000-8000-000000000002"
+	require.NoError(t, runConversationList(cmd, nil))
+	assert.Equal(t, "8d6c7f0e-0000-4000-8000-000000000002", gotList, "a UUID is sent as given")
+
+	convProject = "nope"
+	err := runConversationList(cmd, nil)
+	require.Error(t, err, "an unknown project must fail, not list nothing")
+	assert.Contains(t, err.Error(), `project "nope"`)
 }
