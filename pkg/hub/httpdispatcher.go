@@ -909,6 +909,14 @@ func (d *HTTPAgentDispatcher) buildCreateRequestFor(ctx context.Context, agent *
 			workspace = projectInfo.workspace
 			wsSpec.GitClone = nil
 		}
+		// An absolute workspace the requester gave (-w) is a path on the
+		// broker host and wins over the project's: the broker mounts it as
+		// given, or refuses it when it is not an allowed workspace path,
+		// instead of the agent silently landing in the project root.
+		if explicit := explicitAbsoluteWorkspace(agent); explicit != "" {
+			workspace = explicit
+			wsSpec.GitClone = nil
+		}
 		var remoteGCPIdentity *RemoteGCPIdentityConfig
 		if gcpID := agent.AppliedConfig.GCPIdentity; gcpID != nil {
 			remoteGCPIdentity = &RemoteGCPIdentityConfig{
@@ -1360,6 +1368,19 @@ func (d *HTTPAgentDispatcher) buildCreateRequestFor(ctx context.Context, agent *
 // arrives at the broker as Workspace="", GitClone=nil, which
 // Manager.Reprovision correctly refuses only after the agent has already
 // been stopped.
+// explicitAbsoluteWorkspace is the absolute workspace the agent's create
+// request named, or "". Only CreateInputs tells a requested path from the
+// one the hub filled in for the project.
+func explicitAbsoluteWorkspace(agent *store.Agent) string {
+	if agent == nil || agent.AppliedConfig == nil || agent.AppliedConfig.CreateInputs == nil {
+		return ""
+	}
+	if ws := agent.AppliedConfig.CreateInputs.Workspace; filepath.IsAbs(ws) {
+		return ws
+	}
+	return ""
+}
+
 func effectiveDispatchWorkspace(workspace, linkedProjectPath string) string {
 	if linkedProjectPath != "" {
 		if workspace == "" || filepath.IsAbs(workspace) {

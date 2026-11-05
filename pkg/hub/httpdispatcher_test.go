@@ -4171,6 +4171,69 @@ func TestHTTPAgentDispatcher_DispatchAgentCreate_InPlaceWorkspace(t *testing.T) 
 	}
 }
 
+// TestHTTPAgentDispatcher_DispatchAgentCreate_ExplicitWorkspaceWins: an
+// absolute -w the requester gave reaches the broker as given, for an
+// in-place project and for a linked one, instead of being replaced by the
+// project root or cleared. The hub's own fill-in (no CreateInputs workspace)
+// keeps the project-derived value.
+func TestHTTPAgentDispatcher_DispatchAgentCreate_ExplicitWorkspaceWins(t *testing.T) {
+	cases := []struct {
+		name          string
+		inPlace       bool
+		requested     string // CreateInputs.Workspace
+		wantWorkspace string
+	}{
+		{name: "in-place, explicit -w", inPlace: true, requested: "/srv/elsewhere", wantWorkspace: "/srv/elsewhere"},
+		{name: "in-place, no -w", inPlace: true, requested: "", wantWorkspace: "/srv/data"},
+		{name: "in-place, relative -w", inPlace: true, requested: "sub", wantWorkspace: "/srv/data"},
+		{name: "linked, explicit -w", inPlace: false, requested: "/srv/elsewhere", wantWorkspace: "/srv/elsewhere"},
+		{name: "linked, no -w", inPlace: false, requested: "", wantWorkspace: ""},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			memStore := createTestStore(t)
+			projectID := tid(fmt.Sprintf("project-explicit-ws-%d", i))
+			brokerID := tid(fmt.Sprintf("broker-explicit-ws-%d", i))
+			project := &store.Project{ID: projectID, Name: "data", Slug: fmt.Sprintf("data-%d", i), Labels: map[string]string{}}
+			if tc.inPlace {
+				project.Labels[store.LabelWorkspaceMode] = store.WorkspaceModeInPlace
+			}
+			require.NoError(t, memStore.CreateProject(ctx, project))
+			require.NoError(t, memStore.CreateRuntimeBroker(ctx, &store.RuntimeBroker{
+				ID: brokerID, Name: "host", Slug: fmt.Sprintf("host-%d", i), Endpoint: "http://localhost:9801", Status: store.BrokerStatusOnline,
+			}))
+			require.NoError(t, memStore.AddProjectProvider(ctx, &store.ProjectProvider{
+				ProjectID: projectID, BrokerID: brokerID, BrokerName: "host", LocalPath: "/srv/data/.scion", Status: store.BrokerStatusOnline,
+			}))
+			mockClient := &mockRuntimeBrokerClient{}
+			dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+
+			applied := tc.requested
+			if applied == "" {
+				applied = "/hub/filled/path" // populateAgentConfig's project path
+			}
+			agent := &store.Agent{
+				ID: fmt.Sprintf("agent-explicit-ws-%d", i), Name: "a", Slug: "a", ProjectID: projectID, RuntimeBrokerID: brokerID,
+				AppliedConfig: &store.AgentAppliedConfig{
+					HarnessConfig: "claude",
+					Workspace:     applied,
+					GitClone:      &api.GitCloneConfig{URL: "https://example.com/r.git", Branch: "main"},
+					CreateInputs:  &store.AgentCreateInputs{Workspace: tc.requested},
+				},
+			}
+			_, err := dispatcher.DispatchAgentCreate(ctx, agent)
+			require.NoError(t, err)
+			req := mockClient.lastCreateReq
+			require.NotNil(t, req.Config)
+			assert.Equal(t, tc.wantWorkspace, req.Config.Workspace)
+			if tc.requested != "" && tc.requested[0] == '/' {
+				assert.Nil(t, req.Config.GitClone, "an explicit workspace is mounted, not cloned into")
+			}
+		})
+	}
+}
+
 // TestHTTPAgentDispatcher_DispatchAgentStart_InPlaceDropsGitClone: start
 // dispatch carries workspace-recreation inputs, but an in-place project runs
 // in the project root and must never be recreated as a per-agent clone, so
