@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -293,6 +294,11 @@ func (r *TmuxRuntime) buildNewWindowArgs(config RunConfig, session string) ([]st
 		}
 		args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
 	}
+	// The template env fallback is the LAST env step, as in every other
+	// runtime: only keys no source above emitted, never a suppressed key.
+	for _, e := range tmuxFallbackEnvEntries(config, envKeysOfArgs(args)) {
+		args = append(args, "-e", e)
+	}
 	// -P -F prints the new window_id on stdout.
 	args = append(args, "-P", "-F", "#{window_id}")
 	args = append(args, harnessArgs...)
@@ -449,6 +455,28 @@ func (r *TmuxRuntime) runtimeEnvEntries() []string {
 	}
 	return entries
 }
+
+// tmuxFallbackEnvEntries returns the template env fallback entries for a tmux
+// agent. A tmux agent runs on the broker host as the broker's user, but its
+// HOME is the agent home, so $HOME and ${HOME} in a template value are
+// replaced with the broker user's home: a template path like
+// "$HOME/src/repo" names the same directory on every broker. Other
+// references stay literal.
+func tmuxFallbackEnvEntries(config RunConfig, emitted map[string]bool) []string {
+	entries := FallbackEnvEntries(config.FallbackEnv, config.SuppressedFallbackKeys, emitted)
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return entries
+	}
+	for i, e := range entries {
+		k, v, _ := strings.Cut(e, "=")
+		entries[i] = k + "=" + tmuxTemplateHomeRef.ReplaceAllLiteralString(v, home)
+	}
+	return entries
+}
+
+// tmuxTemplateHomeRef matches $HOME and ${HOME}, not $HOMEDIR.
+var tmuxTemplateHomeRef = regexp.MustCompile(`\$\{HOME\}|\$HOME\b`)
 
 // buildEnvFlags produces tmux -e KEY=VAL flags: HOME points at the agent home,
 // alongside SCION_AGENT, SCION_AGENT_HOME and the project identifiers.

@@ -1531,3 +1531,55 @@ func TestFitTmuxCommand_LongEnvironmentFails(t *testing.T) {
 		t.Errorf("want an environment-size error, got %v", err)
 	}
 }
+
+func TestTmuxRuntime_BuildNewWindowArgs_TemplateFallbackEnv(t *testing.T) {
+	brokerHome := t.TempDir()
+	t.Setenv("HOME", brokerHome)
+	r := &TmuxRuntime{Command: "tmux", Session: "scion"}
+	args, err := r.buildNewWindowArgs(RunConfig{
+		Name:    "agent-1",
+		HomeDir: "/tmp/agent-home",
+		Env:     []string{"KEEP=from-env"},
+		Harness: &MockHarness{},
+		FallbackEnv: map[string]string{
+			"CODE_REPO":  "$HOME/src/repo",
+			"BRACED":     "${HOME}/x",
+			"OTHER_REF":  "$HOMEDIR/y",
+			"KEEP":       "from-template",
+			"SUPPRESSED": "secret",
+			"SCION_X":    "reserved",
+		},
+		SuppressedFallbackKeys: []string{"SUPPRESSED"},
+	}, r.Session)
+	if err != nil {
+		t.Fatalf("buildNewWindowArgs: %v", err)
+	}
+	got := map[string][]string{}
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "-e" {
+			k, v, _ := strings.Cut(args[i+1], "=")
+			got[k] = append(got[k], v)
+			i++
+		}
+	}
+	want := map[string]string{
+		"CODE_REPO": brokerHome + "/src/repo",
+		"BRACED":    brokerHome + "/x",
+		"OTHER_REF": "$HOMEDIR/y",
+		"KEEP":      "from-env",
+		"HOME":      "/tmp/agent-home",
+	}
+	for k, v := range want {
+		if len(got[k]) != 1 || got[k][0] != v {
+			t.Errorf("%s = %v, want exactly [%q]", k, got[k], v)
+		}
+	}
+	for _, k := range []string{"SUPPRESSED", "SCION_X"} {
+		if len(got[k]) != 0 {
+			t.Errorf("%s leaked: %v", k, got[k])
+		}
+	}
+	if pIdx := indexOf(args, "-P"); pIdx < 0 || pIdx < indexOf(args, "CODE_REPO="+brokerHome+"/src/repo") {
+		t.Errorf("fallback env must precede -P: %v", args)
+	}
+}
