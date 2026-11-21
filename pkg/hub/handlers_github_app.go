@@ -17,11 +17,13 @@ package hub
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -30,6 +32,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/config/opsettings"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/githubapp"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
+	"github.com/GoogleCloudPlatform/scion/pkg/util"
 	yamlv3 "gopkg.in/yaml.v3"
 )
 
@@ -42,14 +45,53 @@ const (
 // GitHubAppConfigResponse is the API response for GitHub App configuration.
 // Sensitive fields (private key, webhook secret) are never returned.
 type GitHubAppConfigResponse struct {
-	AppID            int64                    `json:"app_id"`
-	APIBaseURL       string                   `json:"api_base_url,omitempty"`
-	WebhooksEnabled  bool                     `json:"webhooks_enabled"`
-	Configured       bool                     `json:"configured"`
-	HasPrivateKey    bool                     `json:"has_private_key"`
-	HasWebhookSecret bool                     `json:"has_webhook_secret"`
-	InstallationURL  string                   `json:"installation_url,omitempty"`
-	RateLimit        *githubapp.RateLimitInfo `json:"rate_limit,omitempty"`
+	AppID           int64  `json:"app_id"`
+	APIBaseURL      string `json:"api_base_url,omitempty"`
+	WebhooksEnabled bool   `json:"webhooks_enabled"`
+	Configured      bool   `json:"configured"`
+	HasPrivateKey   bool   `json:"has_private_key"`
+	// PrivateKeySource reports which private key source is active: "config", "file", or "secret".
+	PrivateKeySource string `json:"private_key_source,omitempty"`
+	// PrivateKeyOverridesSecret is true when a configured private key or private_key_path
+	// takes precedence over a stored GITHUB_APP_PRIVATE_KEY hub secret.
+	PrivateKeyOverridesSecret bool                     `json:"private_key_overrides_secret,omitempty"`
+	HasWebhookSecret          bool                     `json:"has_webhook_secret"`
+	InstallationURL           string                   `json:"installation_url,omitempty"`
+	RateLimit                 *githubapp.RateLimitInfo `json:"rate_limit,omitempty"`
+	Triggers                  *GitHubTriggersReadiness `json:"triggers,omitempty"`
+}
+
+const githubAppHealthCheckName = "github-app-health-check"
+
+// syncGitHubAppHealthCheckSchedule registers, reschedules, or unregisters the
+// periodic GitHub App health check on the scheduler to match the current
+// GitHubAppConfig (AppID and WebhooksEnabled). Safe to call at startup and on
+// live config updates without creating duplicate registrations.
+//
+// githubAppScheduleMu is held across the config read and scheduler mutation
+// (and acquired before s.mu) so concurrent updates cannot apply a stale state.
+func (s *Server) syncGitHubAppHealthCheckSchedule() {
+	s.githubAppScheduleMu.Lock()
+	defer s.githubAppScheduleMu.Unlock()
+
+	s.mu.RLock()
+	sched := s.scheduler
+	appConfigured := s.config.GitHubAppConfig.AppID != 0
+	webhooksEnabled := s.config.GitHubAppConfig.WebhooksEnabled
+	s.mu.RUnlock()
+
+	if sched == nil {
+		return
+	}
+	if !appConfigured {
+		sched.UnregisterRecurring(githubAppHealthCheckName)
+		return
+	}
+	interval := 360 // 6 hours in minutes when webhooks are disabled
+	if webhooksEnabled {
+		interval = 1440 // 24 hours when webhooks are enabled
+	}
+	sched.UpsertRecurringSingleton(githubAppHealthCheckName, interval, store.LockGitHubAppHealthCheck, s.githubAppHealthCheckHandler())
 }
 
 // GitHubAppConfigUpdateRequest is the API request to update GitHub App configuration.
@@ -63,39 +105,36 @@ type GitHubAppConfigUpdateRequest struct {
 }
 
 func (s *Server) handleGetGitHubApp(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	cfg, keyStatus := s.githubAppPrivateKeyStatus(ctx)
+	hasPrivateKey := keyStatus.hasPrivateKey
+	hasWebhookSecret := cfg.WebhookSecret != ""
+	if !hasWebhookSecret {
+		hasWebhookSecret = s.hasStoredGitHubAppSecret(ctx, GitHubAppSecretWebhookSecret)
+	}
+
+	var triggers *GitHubTriggersReadiness
+	if s.githubTriggersEnabled() {
+		readiness := s.computeGitHubTriggersReadiness(ctx, cfg, hasWebhookSecret)
+		triggers = &readiness
+	}
+
 	s.mu.RLock()
-	cfg := s.config.GitHubAppConfig
 	rateLimit := s.githubAppRateLimit
 	s.mu.RUnlock()
 
-	hasPrivateKey := cfg.PrivateKey != "" || cfg.PrivateKeyPath != ""
-	hasWebhookSecret := cfg.WebhookSecret != ""
-
-	// Also check secrets backend for stored credentials
-	if !hasPrivateKey || !hasWebhookSecret {
-		if s.secretBackend != nil {
-			if !hasPrivateKey {
-				if meta, err := s.secretBackend.GetMeta(r.Context(), GitHubAppSecretPrivateKey, store.ScopeHub, s.hubID); err == nil && meta != nil {
-					hasPrivateKey = true
-				}
-			}
-			if !hasWebhookSecret {
-				if meta, err := s.secretBackend.GetMeta(r.Context(), GitHubAppSecretWebhookSecret, store.ScopeHub, s.hubID); err == nil && meta != nil {
-					hasWebhookSecret = true
-				}
-			}
-		}
-	}
-
 	writeJSON(w, http.StatusOK, GitHubAppConfigResponse{
-		AppID:            cfg.AppID,
-		APIBaseURL:       cfg.APIBaseURL,
-		WebhooksEnabled:  cfg.WebhooksEnabled,
-		Configured:       cfg.AppID != 0 && hasPrivateKey,
-		HasPrivateKey:    hasPrivateKey,
-		HasWebhookSecret: hasWebhookSecret,
-		InstallationURL:  cfg.InstallationURL,
-		RateLimit:        rateLimit,
+		AppID:                     cfg.AppID,
+		APIBaseURL:                cfg.APIBaseURL,
+		WebhooksEnabled:           cfg.WebhooksEnabled,
+		Configured:                cfg.AppID != 0 && hasPrivateKey,
+		HasPrivateKey:             hasPrivateKey,
+		PrivateKeySource:          keyStatus.source,
+		PrivateKeyOverridesSecret: keyStatus.overridesSecret,
+		HasWebhookSecret:          hasWebhookSecret,
+		InstallationURL:           cfg.InstallationURL,
+		RateLimit:                 rateLimit,
+		Triggers:                  triggers,
 	})
 }
 
@@ -124,7 +163,21 @@ func (s *Server) handleUpdateGitHubApp(w http.ResponseWriter, r *http.Request) {
 		// Update in-memory config so it's immediately available
 		s.mu.Lock()
 		s.config.GitHubAppConfig.PrivateKey = *req.PrivateKey
+		s.githubAppPrivateKeyFromSecret = true
+		overrideSource := ""
+		if s.startupGitHubAppPrivateKey {
+			overrideSource = GitHubAppPrivateKeySourceConfig
+		} else if s.config.GitHubAppConfig.PrivateKeyPath != "" {
+			overrideSource = GitHubAppPrivateKeySourceFile
+		}
+		s.githubAppIdentity.reset()
 		s.mu.Unlock()
+		if overrideSource != "" {
+			slog.Warn("GitHub App private key saved to hub secrets, but a configured private key or private_key_path will take precedence after restart",
+				"override_source", overrideSource,
+				"secret_name", GitHubAppSecretPrivateKey,
+			)
+		}
 	}
 
 	if req.WebhookSecret != nil && *req.WebhookSecret != "" {
@@ -151,8 +204,15 @@ func (s *Server) handleUpdateGitHubApp(w http.ResponseWriter, r *http.Request) {
 	if req.InstallationURL != nil {
 		s.config.GitHubAppConfig.InstallationURL = *req.InstallationURL
 	}
+	if req.AppID != nil || req.APIBaseURL != nil {
+		s.githubAppIdentity.reset()
+	}
 	cfg := s.config.GitHubAppConfig
 	s.mu.Unlock()
+
+	if req.AppID != nil || req.WebhooksEnabled != nil {
+		s.syncGitHubAppHealthCheckSchedule()
+	}
 
 	// Persist the non-sensitive config. Whenever OperationalSettings is wired
 	// (every DB driver, SQLite included, since #1432) the durable home for
@@ -176,30 +236,25 @@ func (s *Server) handleUpdateGitHubApp(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("Failed to persist GitHub App config to settings.yaml (in-memory config updated successfully)", "error", err)
 	}
 
-	hasPrivateKey := cfg.PrivateKey != "" || cfg.PrivateKeyPath != ""
+	_, keyStatus := s.githubAppPrivateKeyStatus(ctx)
+	hasPrivateKey := keyStatus.hasPrivateKey
 	hasWebhookSecret := cfg.WebhookSecret != ""
-	// Check secrets backend too
-	if !hasPrivateKey && s.secretBackend != nil {
-		if meta, err := s.secretBackend.GetMeta(ctx, GitHubAppSecretPrivateKey, store.ScopeHub, s.hubID); err == nil && meta != nil {
-			hasPrivateKey = true
-		}
-	}
-	if !hasWebhookSecret && s.secretBackend != nil {
-		if meta, err := s.secretBackend.GetMeta(ctx, GitHubAppSecretWebhookSecret, store.ScopeHub, s.hubID); err == nil && meta != nil {
-			hasWebhookSecret = true
-		}
+	if !hasWebhookSecret {
+		hasWebhookSecret = s.hasStoredGitHubAppSecret(ctx, GitHubAppSecretWebhookSecret)
 	}
 
 	slog.Info("GitHub App configuration updated via admin API", "user", userID, "app_id", cfg.AppID)
 
 	writeJSON(w, http.StatusOK, GitHubAppConfigResponse{
-		AppID:            cfg.AppID,
-		APIBaseURL:       cfg.APIBaseURL,
-		WebhooksEnabled:  cfg.WebhooksEnabled,
-		Configured:       cfg.AppID != 0 && hasPrivateKey,
-		HasPrivateKey:    hasPrivateKey,
-		HasWebhookSecret: hasWebhookSecret,
-		InstallationURL:  cfg.InstallationURL,
+		AppID:                     cfg.AppID,
+		APIBaseURL:                cfg.APIBaseURL,
+		WebhooksEnabled:           cfg.WebhooksEnabled,
+		Configured:                cfg.AppID != 0 && hasPrivateKey,
+		HasPrivateKey:             hasPrivateKey,
+		PrivateKeySource:          keyStatus.source,
+		PrivateKeyOverridesSecret: keyStatus.overridesSecret,
+		HasWebhookSecret:          hasWebhookSecret,
+		InstallationURL:           cfg.InstallationURL,
 	})
 }
 
@@ -221,7 +276,11 @@ func (s *Server) loadGitHubAppSecret(ctx context.Context, name string) (string, 
 	}
 
 	// Fallback: read directly from the database
-	return s.store.GetSecretValue(ctx, name, store.ScopeHub, s.hubID)
+	stored, err := s.store.GetSecretValue(ctx, name, store.ScopeHub, s.hubID)
+	if err != nil {
+		return "", err
+	}
+	return s.openHubSecret(ctx, stored)
 }
 
 // persistGitHubAppConfigToDB writes the non-sensitive GitHub App configuration
@@ -240,17 +299,28 @@ func (s *Server) persistGitHubAppConfigToDB(ctx context.Context, ops *Operationa
 	// who pre-staged the path in settings.yaml before creating the App would
 	// otherwise have it overwritten with "" by this first write. Fall back to
 	// the merged snapshot, which sees the path regardless of app_id.
+	snap := ops.Snapshot()
 	privateKeyPath := cfg.PrivateKeyPath
 	if privateKeyPath == "" {
-		privateKeyPath = ops.Snapshot().GitHubPrivateKeyPath
+		privateKeyPath = snap.GitHubPrivateKeyPath
+	}
+	appSlug := cfg.AppSlug
+	if appSlug == "" {
+		appSlug = snap.GitHubAppSlug
+	}
+	aliases := slices.Clone(cfg.CommandMentionAliases)
+	if len(aliases) == 0 {
+		aliases = slices.Clone(snap.GitHubCommandMentionAliases)
 	}
 
 	doc := &opsettings.GitHubAppSettings{
-		AppID:           cfg.AppID,
-		APIBaseURL:      cfg.APIBaseURL,
-		WebhooksEnabled: &webhooksEnabled,
-		InstallationURL: cfg.InstallationURL,
-		PrivateKeyPath:  privateKeyPath,
+		AppID:                 cfg.AppID,
+		APIBaseURL:            cfg.APIBaseURL,
+		WebhooksEnabled:       &webhooksEnabled,
+		InstallationURL:       cfg.InstallationURL,
+		PrivateKeyPath:        privateKeyPath,
+		AppSlug:               appSlug,
+		CommandMentionAliases: aliases,
 	}
 
 	docBytes, err := json.Marshal(doc)
@@ -313,6 +383,12 @@ func (s *Server) persistGitHubAppConfig(cfg GitHubAppServerConfig) error {
 	if cfg.InstallationURL != "" {
 		ghApp["installation_url"] = cfg.InstallationURL
 	}
+	if cfg.AppSlug != "" {
+		ghApp["app_slug"] = cfg.AppSlug
+	}
+	if len(cfg.CommandMentionAliases) > 0 {
+		ghApp["command_mention_aliases"] = slices.Clone(cfg.CommandMentionAliases)
+	}
 
 	if len(ghApp) > 0 {
 		serverRaw, _ := raw["server"].(map[string]interface{})
@@ -364,12 +440,15 @@ func (s *Server) handleCreateGitHubAppInstallation(w http.ResponseWriter, r *htt
 		return
 	}
 
+	var missing []settingsFieldError
 	if installation.InstallationID == 0 {
-		writeError(w, http.StatusBadRequest, ErrCodeValidationError, "installation_id is required", nil)
-		return
+		missing = append(missing, settingsFieldError{Field: "installation_id", Message: "installation_id is required"})
 	}
 	if installation.AccountLogin == "" {
-		writeError(w, http.StatusBadRequest, ErrCodeValidationError, "account_login is required", nil)
+		missing = append(missing, settingsFieldError{Field: "account_login", Message: "account_login is required"})
+	}
+	if len(missing) > 0 {
+		writeSettingsValidation(w, missing[0].Message, missing, nil)
 		return
 	}
 
@@ -396,8 +475,58 @@ func parseInstallationIDFromPath(r *http.Request) (int64, error) {
 	return strconv.ParseInt(path, 10, 64)
 }
 
-// handleGitHubAppInstallationByIDRead handles GET /api/v1/github-app/installations/{id}.
+// handleGitHubAssociationReport serves the cached admin association report
+// (githubAssociationReport). ?refresh=true asks for a full rebuild, which is
+// refused with 429 and Retry-After inside the rebuild interval.
+func (s *Server) handleGitHubAssociationReport(w http.ResponseWriter, r *http.Request) {
+	refresh := false
+	if v := r.URL.Query().Get("refresh"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "refresh must be true or false", nil)
+			return
+		}
+		refresh = b
+	}
+	report, retryAfter, err := s.githubAssociationReport(r.Context(), refresh)
+	if errors.Is(err, errGitHubAssociationReportRateLimited) {
+		seconds := int((retryAfter + time.Second - 1) / time.Second)
+		if seconds < 1 {
+			seconds = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+		writeError(w, http.StatusTooManyRequests, ErrCodeRateLimited,
+			"the association report was rebuilt recently; retry later", map[string]interface{}{"retry_after_seconds": seconds})
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to build association report", nil)
+		return
+	}
+	unauthorized := 0
+	for _, e := range report.Entries {
+		if !e.Authorized {
+			unauthorized++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"associations": report.Entries,
+		"total":        len(report.Entries),
+		"unauthorized": unauthorized,
+		"generated_at": report.GeneratedAt.UTC().Format(time.RFC3339),
+		"truncated":    report.Truncated,
+	})
+}
+
+// handleGitHubAppInstallationByIDRead handles GET /api/v1/github-app/installations/{id}
+// and the read-only association report at
+// GET /api/v1/github-app/installations/association-report (same hub-admin
+// route guard: hub.github_app.read).
 func (s *Server) handleGitHubAppInstallationByIDRead(w http.ResponseWriter, r *http.Request) {
+	if strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/github-app/installations/"), "/") == githubAssociationReportPath {
+		s.handleGitHubAssociationReport(w, r)
+		return
+	}
 	installationID, err := parseInstallationIDFromPath(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "invalid installation ID", nil)
@@ -520,10 +649,33 @@ func projectGitHubRouteAction(method string) Action {
 	}
 }
 
+// githubInstallationBindPermission is the permission a caller needs to bind
+// a GitHub App installation to a project: the same hub GitHub App update
+// permission the hub-admin GitHub App routes require. Binding is admin-only;
+// a non-admin project gets an installation token only through the
+// creator-access proof (authorizeGitHubAppAssociation).
+var githubInstallationBindPermission = RouteMetadata{
+	RouteID:    "projects.githubInstallation.bind",
+	Permission: "hub.github_app.update",
+	Resource:   "hub",
+	Action:     "update",
+}
+
 // handleProjectGitHubInstallation handles PUT and DELETE /api/v1/projects/{id}/github-installation.
+//
+// PUT is an explicit admin binding: the caller must hold
+// githubInstallationBindPermission (in addition to project update, checked
+// by the router), the project's remote must be on the configured GitHub
+// host, and the installation must be active and belong to the remote's
+// owner. The binding is recorded in githubInstallationBindingAnnotation and
+// re-validated at every token mint. DELETE removes the association and any
+// binding; it needs only project update access.
 func (s *Server) handleProjectGitHubInstallation(w http.ResponseWriter, r *http.Request, project *store.Project) {
 	switch r.Method {
 	case http.MethodPut:
+		if !s.enforceRoutePermission(w, r, githubInstallationBindPermission) {
+			return
+		}
 		var req struct {
 			InstallationID int64 `json:"installation_id"`
 		}
@@ -532,12 +684,13 @@ func (s *Server) handleProjectGitHubInstallation(w http.ResponseWriter, r *http.
 			return
 		}
 		if req.InstallationID == 0 {
-			writeError(w, http.StatusBadRequest, ErrCodeValidationError, "installation_id is required", nil)
+			writeSettingsFieldError(w, "installation_id", "installation_id is required")
 			return
 		}
 
 		// Verify installation exists
-		if _, err := s.store.GetGitHubInstallation(r.Context(), req.InstallationID); err != nil {
+		inst, err := s.store.GetGitHubInstallation(r.Context(), req.InstallationID)
+		if err != nil {
 			if err == store.ErrNotFound {
 				writeError(w, http.StatusNotFound, ErrCodeNotFound, "installation not found", nil)
 				return
@@ -546,16 +699,56 @@ func (s *Server) handleProjectGitHubInstallation(w http.ResponseWriter, r *http.
 			return
 		}
 
-		project.GitHubInstallationID = &req.InstallationID
-		project.GitHubAppStatus = &store.GitHubAppProjectStatus{
-			State:       store.GitHubAppStateUnchecked,
-			LastChecked: timeNow(),
+		// An admin binding still has to name the right host and the
+		// installation of the repository's owner.
+		host := s.githubAppWebHost()
+		owner, _, ok := githubapp.RemoteOwnerRepo(project.GitRemote, host)
+		if !ok {
+			writeError(w, http.StatusUnprocessableEntity, ErrCodeValidationError,
+				fmt.Sprintf("project git remote is not an owner/repo on the configured GitHub host %q", host), nil)
+			return
 		}
+		if inst.Status != store.GitHubInstallationStatusActive {
+			writeError(w, http.StatusUnprocessableEntity, ErrCodeValidationError, "installation is not active", nil)
+			return
+		}
+		if inst.AccountLogin == "" || !strings.EqualFold(inst.AccountLogin, owner) {
+			writeError(w, http.StatusUnprocessableEntity, ErrCodeValidationError,
+				fmt.Sprintf("installation belongs to account %q, not the repository owner %q", inst.AccountLogin, owner), nil)
+			return
+		}
+
+		boundBy := ""
+		if user := GetUserIdentityFromContext(r.Context()); user != nil {
+			boundBy = user.ID()
+		}
+		if boundBy == "" {
+			Forbidden(w)
+			return
+		}
+		binding, err := json.Marshal(githubInstallationBinding{
+			InstallationID: req.InstallationID,
+			Remote:         util.NormalizeGitRemote(project.GitRemote),
+			BoundBy:        boundBy,
+			BoundAt:        timeNow().UTC(),
+		})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to record binding", nil)
+			return
+		}
+		if project.Annotations == nil {
+			project.Annotations = make(map[string]string)
+		}
+		project.Annotations[githubInstallationBindingAnnotation] = string(binding)
+		s.setGitHubInstallationAssociation(project, req.InstallationID)
 
 		if err := s.store.UpdateProject(r.Context(), project); err != nil {
 			writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to update project", nil)
 			return
 		}
+		// Again after the write, so a report read between the two cannot
+		// keep the pre-change outcome.
+		s.invalidateGitHubAssociation(project.ID)
 		s.events.PublishProjectUpdated(r.Context(), project)
 
 		writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -567,11 +760,17 @@ func (s *Server) handleProjectGitHubInstallation(w http.ResponseWriter, r *http.
 	case http.MethodDelete:
 		project.GitHubInstallationID = nil
 		project.GitHubAppStatus = nil
+		// When the binding is present the map stays non-nil (possibly
+		// empty), so the store writes it, clearing the binding; delete is a
+		// no-op on a nil map.
+		delete(project.Annotations, githubInstallationBindingAnnotation)
+		s.invalidateGitHubAssociation(project.ID)
 
 		if err := s.store.UpdateProject(r.Context(), project); err != nil {
 			writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to update project", nil)
 			return
 		}
+		s.invalidateGitHubAssociation(project.ID)
 		s.events.PublishProjectUpdated(r.Context(), project)
 
 		w.WriteHeader(http.StatusNoContent)
@@ -645,20 +844,29 @@ func (s *Server) handleProjectGitHubPermissions(w http.ResponseWriter, r *http.R
 	switch r.Method {
 	case http.MethodGet:
 		perms := project.GitHubPermissions
-		if perms == nil {
-			// Return defaults
-			perms = &store.GitHubTokenPermissions{
-				Contents:     "write",
-				PullRequests: "write",
-				Metadata:     "read",
-			}
+		if perms == nil || *perms == (store.GitHubTokenPermissions{}) {
+			// Return the same defaults token minting falls back to.
+			defaults := store.GitHubTokenPermissions(githubapp.DefaultTokenPermissions())
+			perms = &defaults
 		}
 		writeJSON(w, http.StatusOK, perms)
 
 	case http.MethodPut:
+		// Only the known fields, each "", "read" or "write", with at least one
+		// non-empty permission. Use DELETE to reset to default permissions.
 		var perms store.GitHubTokenPermissions
-		if err := readJSON(r, &perms); err != nil {
-			writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "invalid request body", nil)
+		if err := readJSONStrict(r, &perms); err != nil {
+			writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "invalid request body: only contents, pull_requests, issues, metadata, checks and actions are accepted", nil)
+			return
+		}
+		if field, ok := validateGitHubTokenPermissions(perms); !ok {
+			writeError(w, http.StatusBadRequest, ErrCodeValidationError,
+				fmt.Sprintf("%s must be \"read\", \"write\" or empty", field), nil)
+			return
+		}
+		if perms == (store.GitHubTokenPermissions{}) {
+			writeError(w, http.StatusBadRequest, ErrCodeValidationError,
+				"at least one permission must be set; use DELETE to reset to default permissions", nil)
 			return
 		}
 
@@ -703,11 +911,19 @@ func (s *Server) handleProjectGitIdentity(w http.ResponseWriter, r *http.Request
 		switch identity.Mode {
 		case "bot", "custom", "co-authored":
 		default:
-			writeError(w, http.StatusBadRequest, ErrCodeValidationError, "mode must be 'bot', 'custom', or 'co-authored'", nil)
+			writeSettingsFieldError(w, "mode", "mode must be 'bot', 'custom', or 'co-authored'")
 			return
 		}
 		if identity.Mode == "custom" && (identity.Name == "" || identity.Email == "") {
-			writeError(w, http.StatusBadRequest, ErrCodeValidationError, "name and email are required when mode is 'custom'", nil)
+			const msg = "name and email are required when mode is 'custom'"
+			var missing []settingsFieldError
+			if identity.Name == "" {
+				missing = append(missing, settingsFieldError{Field: "name", Message: msg})
+			}
+			if identity.Email == "" {
+				missing = append(missing, settingsFieldError{Field: "email", Message: msg})
+			}
+			writeSettingsValidation(w, msg, missing, nil)
 			return
 		}
 		project.GitIdentity = &identity
@@ -763,50 +979,30 @@ func (s *Server) handleGitHubAppSyncPermissions(w http.ResponseWriter, r *http.R
 // permissions the app no longer has are set to degraded state.
 // Returns the app's current permissions and a list of affected projects.
 func (s *Server) syncAppPermissions(ctx context.Context) (map[string]string, []map[string]interface{}, error) {
-	client, err := s.getGitHubAppClient()
+	identity, err := s.refreshGitHubAppIdentity(ctx)
 	if err != nil {
-		return nil, nil, fmt.Errorf("GitHub App not configured: %v", err)
+		return nil, nil, err
 	}
 
-	appInfo, err := client.GetApp(ctx)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to fetch app info from GitHub: %v", err)
-	}
-
-	// Extract permissions map from the app response
-	appPermissions := make(map[string]string)
-	if permsRaw, ok := appInfo["permissions"]; ok {
-		if permsMap, ok := permsRaw.(map[string]interface{}); ok {
-			for k, v := range permsMap {
-				if vs, ok := v.(string); ok {
-					appPermissions[k] = vs
-				}
-			}
-		}
-	}
+	appPermissions := identity.Permissions
 
 	slog.Info("Synced GitHub App permissions",
 		"permission_count", len(appPermissions),
 	)
 
-	// List all projects and check their requested permissions against the app's permissions
-	projects, err := s.store.ListProjects(ctx, store.ProjectFilter{}, store.ListOptions{Limit: 10000})
-	if err != nil {
-		return appPermissions, nil, fmt.Errorf("failed to list projects: %v", err)
-	}
-
+	// Page through all projects and check their requested permissions against the app's permissions
 	var affectedProjects []map[string]interface{}
 	now := timeNow()
 
-	for _, project := range projects.Items {
+	if err := s.forEachGitHubAppProject(ctx, func(project *store.Project) {
 		if project.GitHubInstallationID == nil || project.GitHubPermissions == nil {
-			continue
+			return
 		}
 
 		// Compare each project's requested permissions against the app's permissions
 		missingPerms := comparePermissions(project.GitHubPermissions, appPermissions)
 		if len(missingPerms) == 0 {
-			continue
+			return
 		}
 
 		// Project requests permissions the app doesn't have — mark as degraded
@@ -820,10 +1016,10 @@ func (s *Server) syncAppPermissions(ctx context.Context) (map[string]string, []m
 			LastError:    &now,
 		}
 
-		if err := s.store.UpdateProject(ctx, &project); err != nil {
+		if err := s.store.UpdateProject(ctx, project); err != nil {
 			slog.Error("Failed to update project after permission sync",
 				"project_id", project.ID, "error", err)
-			continue
+			return
 		}
 
 		affectedProjects = append(affectedProjects, map[string]interface{}{
@@ -836,6 +1032,8 @@ func (s *Server) syncAppPermissions(ctx context.Context) (map[string]string, []m
 			"project_id", project.ID, "project_name", project.Name,
 			"missing_permissions", missingPerms,
 		)
+	}); err != nil {
+		return appPermissions, nil, fmt.Errorf("failed to list projects: %w", err)
 	}
 
 	return appPermissions, affectedProjects, nil

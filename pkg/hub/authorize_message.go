@@ -17,7 +17,6 @@ package hub
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
@@ -55,6 +54,7 @@ const (
 	MessageDenialAttachmentUnauthorized          MessageDenialCode = "attachment_unauthorized"
 	MessageDenialDeliveryDuplicate               MessageDenialCode = "delivery_duplicate" // reserved: delivery deduplication guard
 
+	MessageDenialPolicyRejected MessageDenialCode = "message_policy_rejected"
 )
 
 // MessageDecision captures the outcome of an agent message authorization
@@ -64,6 +64,8 @@ type MessageDecision struct {
 	Allowed               bool              `json:"allowed"`
 	Code                  MessageDenialCode `json:"code,omitempty"`
 	Reason                string            `json:"reason,omitempty"`
+	Policy                string            `json:"policy,omitempty"`
+	Class                 string            `json:"class,omitempty"`
 	CrossProject          bool              `json:"crossProject,omitempty"`
 	HubPolicyRevision     int64             `json:"hubPolicyRevision,omitempty"`
 	ProjectPolicyRevision int64             `json:"projectPolicyRevision,omitempty"`
@@ -77,8 +79,26 @@ type MessageDecision struct {
 // error. Both refuse delivery, but infrastructure failure should be retryable.
 type EffectiveMembershipResult struct {
 	IsMember bool
-	Role     string // highest built-in role found: owner, admin, member, or "" (custom-only or non-member)
+	Role     string // highest built-in role found: owner, admin, member, viewer, or "" (custom-only or non-member)
 	Err      error  // non-nil only for infrastructure/store errors
+	// ViewerOnly is true when the only membership the user holds is the
+	// built-in project-viewer role (it reads chat and cannot post messages). That membership does
+	// not admit a principal to act through the project: the cross-project
+	// "members" inbound policy and material runtime admission refuse it
+	// (ptone/scion#5519, AdmitsBeyondViewer).
+	ViewerOnly bool
+}
+
+// AdmitsBeyondViewer reports whether the result is a membership that admits
+// acting through the project: any membership other than project-viewer
+// alone.
+func (r EffectiveMembershipResult) AdmitsBeyondViewer() bool {
+	return r.IsMember && !r.ViewerOnly
+}
+
+// isBuiltInViewerRole reports whether rd is the seeded project-viewer role.
+func isBuiltInViewerRole(rd *store.RoleDefinition) bool {
+	return rd != nil && rd.System && rd.Name == store.ProjectRoleViewer
 }
 
 // CheckEffectiveMembership checks whether a user is an active member of a
@@ -140,6 +160,7 @@ func checkEffectiveMembership(ctx context.Context, st store.Store, authz *AuthzS
 	}
 
 	isMember := false
+	beyondViewer := false
 	bestRole := ""
 	for _, rb := range directBindings {
 		if rb.ScopeType != store.RoleScopeProject || rb.ScopeID != projectID {
@@ -160,7 +181,10 @@ func checkEffectiveMembership(ctx context.Context, st store.Store, authz *AuthzS
 		// Any other active project binding confers membership; Role
 		// tracks only the built-in tier.
 		isMember = true
-		if store.IsBuiltInProjectMembershipRole(rd.Name) {
+		if !isBuiltInViewerRole(rd) {
+			beyondViewer = true
+		}
+		if store.IsBuiltInProjectMembershipRoleDef(rd) {
 			bestRole = higherProjectRole(bestRole, rd.Name)
 		}
 	}
@@ -198,11 +222,14 @@ func checkEffectiveMembership(ctx context.Context, st store.Store, authz *AuthzS
 			// check is defensive: the store binds such a role only to a user
 			// principal (CreateVisitorRoleBinding), so no group binding of
 			// one is written today.
-			if rd.Name == store.ProjectRoleOwner || !rd.ConfersProjectMembership() {
+			if builtInRoleName(rd) == store.ProjectRoleOwner || !rd.ConfersProjectMembership() {
 				continue
 			}
 			isMember = true
-			if store.IsBuiltInProjectMembershipRole(rd.Name) {
+			if !isBuiltInViewerRole(rd) {
+				beyondViewer = true
+			}
+			if store.IsBuiltInProjectMembershipRoleDef(rd) {
 				bestRole = higherProjectRole(bestRole, rd.Name)
 			}
 		}
@@ -211,7 +238,7 @@ func checkEffectiveMembership(ctx context.Context, st store.Store, authz *AuthzS
 	if !isMember {
 		return EffectiveMembershipResult{IsMember: false}
 	}
-	return EffectiveMembershipResult{IsMember: true, Role: bestRole}
+	return EffectiveMembershipResult{IsMember: true, Role: bestRole, ViewerOnly: !beyondViewer}
 }
 
 // messageReasonSenderNotPermitted is the message denial reason for an agent
@@ -502,8 +529,9 @@ func (s *Server) EvaluateAgentMessage(
 	// Fetch the sender agent's record for mode, project, ancestry.
 	senderAgent, err := s.store.GetAgent(ctx, agentIdent.ID())
 	if err != nil {
-		slog.Warn("EvaluateAgentMessage: failed to fetch sender agent",
-			"sender_id", agentIdent.ID(), "error", err)
+		logAuthzCheckFault(ctx, nil, "message_sender_agent",
+			"EvaluateAgentMessage: failed to fetch sender agent", err,
+			"sender_id", agentIdent.ID())
 		return MessageDecision{Reason: "failed to fetch sender agent record"}
 	}
 	if senderAgent == nil {
@@ -627,8 +655,9 @@ func (s *Server) evaluateCrossProject(
 	// Gate (d): Destination project's crossProjectInbound policy.
 	destProject, err := s.store.GetProject(ctx, targetAgent.ProjectID)
 	if err != nil {
-		slog.Warn("EvaluateAgentMessage: failed to fetch destination project",
-			"project_id", targetAgent.ProjectID, "error", err)
+		logAuthzCheckFault(ctx, nil, "message_dest_project",
+			"EvaluateAgentMessage: failed to fetch destination project", err,
+			"project_id", targetAgent.ProjectID)
 		decision.Reason = "failed to fetch destination project"
 		return decision
 	}
@@ -673,14 +702,16 @@ func (s *Server) evaluateCrossProject(
 	if inboundPolicy == store.CrossProjectInboundMembers {
 		memberResult := s.CheckEffectiveMembership(ctx, originUserID, targetAgent.ProjectID)
 		if memberResult.Err != nil {
-			slog.Warn("EvaluateAgentMessage: membership check failed",
-				"user_id", originUserID, "project_id", targetAgent.ProjectID,
-				"error", memberResult.Err)
+			logAuthzCheckFault(ctx, nil, "message_membership",
+				"EvaluateAgentMessage: membership check failed", memberResult.Err,
+				"user_id", originUserID, "project_id", targetAgent.ProjectID)
 			// Infrastructure error → retryable denial, not a membership denial.
 			decision.Reason = "membership check failed: " + memberResult.Err.Error()
 			return decision
 		}
-		if !memberResult.IsMember {
+		// A project-viewer is not a member for this policy: the
+		// role does not let its holder act through the project.
+		if !memberResult.AdmitsBeyondViewer() {
 			decision.Code = MessageDenialCrossProjectNotMember
 			decision.Reason = "origin user is not an active member of the destination project"
 			return decision
@@ -723,8 +754,9 @@ func (s *Server) validateCrossProjectOrigin(ctx context.Context, agentIdent Agen
 
 	originUser, err := s.store.GetUser(ctx, originUserID)
 	if err != nil {
-		slog.Warn("validateCrossProjectOrigin: failed to fetch origin user",
-			"user_id", originUserID, "error", err)
+		logAuthzCheckFault(ctx, nil, "message_origin_user",
+			"validateCrossProjectOrigin: failed to fetch origin user", err,
+			"user_id", originUserID)
 		return "", &MessageDecision{
 			CrossProject: true,
 			Code:         MessageDenialCrossProjectUntrusted,
@@ -834,8 +866,9 @@ func (s *Server) authorizeCrossProjectAgentMessage(
 	// 4. Destination project's inbound policy.
 	targetProject, err := s.store.GetProject(ctx, targetAgent.ProjectID)
 	if err != nil || targetProject == nil {
-		slog.Warn("authorizeCrossProjectAgentMessage: failed to fetch target project",
-			"project_id", targetAgent.ProjectID, "error", err)
+		logAuthzCheckFault(ctx, nil, "message_target_project",
+			"authorizeCrossProjectAgentMessage: failed to fetch target project", err,
+			"project_id", targetAgent.ProjectID)
 		return false, "cross_project_target_project_unavailable"
 	}
 
@@ -1006,7 +1039,9 @@ func (a *AuthzService) messageAncestorProjectAccess(ctx context.Context, sender 
 	if err != nil {
 		if isProjectAccessLookupFault(err) {
 			if a.logger != nil {
-				a.logger.Warn("message ancestry project access check failed (fail-closed)", "project_id", projectID, "error", err)
+				logAuthzCheckFault(ctx, a.logger, "message_ancestry_project_access",
+					"message ancestry project access check failed (fail-closed)", err,
+					"project_id", projectID)
 			}
 			return false, true
 		}

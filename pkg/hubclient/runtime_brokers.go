@@ -18,12 +18,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/agentcontrol"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
 )
@@ -59,9 +61,19 @@ type RuntimeBrokerService interface {
 	Heartbeat(ctx context.Context, brokerID string, status *BrokerHeartbeat) (*BrokerHeartbeatResponse, error)
 
 	// ReportMessageFailures reports hub messages that the broker accepted
-	// into its delivery buffer but failed to deliver, so the hub can mark
-	// them failed instead of leaving them "dispatched".
-	ReportMessageFailures(ctx context.Context, brokerID string, req *MessageFailuresReport) error
+	// into its delivery buffer (or failed synchronously on interrupt) so the
+	// hub can mark them failed or hold them in awaiting_session. The response
+	// counts how many reported failures were marked, held, or ignored (zeroed
+	// when an older Hub replies with an empty 200 body).
+	ReportMessageFailures(ctx context.Context, brokerID string, req *MessageFailuresReport) (*MessageFailuresResponse, error)
+
+	// DeliverMessage asks the hub to run one deliver-message flush on the
+	// agent over its conduit session (design v2.22 §2.1). It returns the
+	// hub's status and decoded answer (zero when the body is not a
+	// deliver-message answer, as with a 404 for the experiment off). The
+	// request is sent once, never retried by the transport. err is set only
+	// for a transport failure, with status 0.
+	DeliverMessage(ctx context.Context, brokerID, agentID string, req *agentcontrol.DeliverRequest) (int, agentcontrol.DeliverResponse, error)
 
 	// ReportAgentLaunch sends one broker->hub launch report (design
 	// t1-async-create-v11.md §3.2, §7 P1b-1): a claim, checkpoint, progress
@@ -75,6 +87,15 @@ type RuntimeBrokerService interface {
 	// 409 stale_launch with its reason — is returned in the result with a nil
 	// error, so the sender can switch on it directly.
 	ReportAgentLaunch(ctx context.Context, brokerID, agentID string, req *AgentLaunchReport) (*AgentLaunchReportResult, error)
+
+	// WorkspaceDownload requests one page of the signed-URL workspace
+	// download for an agent this broker runs (POST
+	// /api/v1/runtime-brokers/{id}/agents/{agentId}/workspace-download). It
+	// is sent exactly once (no transport retry): the caller owns the retry
+	// budget. A non-200 answer is an *apiclient.APIError carrying the status
+	// and the error code only; the response body never reaches error text,
+	// because a 200 body holds signed URLs.
+	WorkspaceDownload(ctx context.Context, brokerID, agentID string, req *api.WorkspaceDownloadRequest) (*api.WorkspaceDownloadResponse, error)
 }
 
 // AgentLaunchReport is the broker->hub launch report wire type (design §3.2).
@@ -90,6 +111,7 @@ type AgentLaunchReport struct {
 	Message    string                 `json:"message,omitempty"`
 	ErrorCode  string                 `json:"errorCode,omitempty"`
 	Cause      string                 `json:"cause,omitempty"` // failed runtime_error only: an api.BrokerRuntimeCause code
+	RunID      string                 `json:"runId,omitempty"` // failed only: the run the launch started
 	Agent      *AgentLaunchReportInfo `json:"agent,omitempty"` // succeeded only
 	At         time.Time              `json:"at,omitzero"`
 }
@@ -133,6 +155,17 @@ type AgentLaunchReportInfo struct {
 	// WorkspacePlacement is where the launch's start placed the agent's
 	// workspace (api.WorkspacePlacementExport or WorkspacePlacementLocal).
 	WorkspacePlacement string `json:"workspacePlacement,omitempty"`
+	// The broker's effective configuration of the start (WP1 slice 3
+	// addendum v13 section 5): the template content hash, the harness and
+	// the effective model Start resolved, the harness-config revision, and
+	// the broker build (sent only when the start resolved the
+	// configuration). Older brokers omit them, and the hub then records
+	// nothing.
+	TemplateHash          string `json:"templateHash,omitempty"`
+	Harness               string `json:"harness,omitempty"`
+	Model                 string `json:"model,omitempty"`
+	HarnessConfigRevision string `json:"harnessConfigRevision,omitempty"`
+	BrokerBuild           string `json:"brokerBuild,omitempty"`
 }
 
 // AgentLaunchReportResult is ApplyLaunchReport's answer (design §3.2),
@@ -174,11 +207,17 @@ const (
 	AgentLaunchReportReasonOtherOwner  = "other_owner"
 )
 
+// MessageFailureCodeAwaitingSession is the enum code a broker sends on a
+// MessageFailure when its final deliver-message attempt received a hub 503
+// with reason=no_session and exec is unavailable (ptone/scion#7881).
+const MessageFailureCodeAwaitingSession = "awaiting_session"
+
 // MessageFailure is one buffered delivery that failed on the broker.
 type MessageFailure struct {
 	MessageID string `json:"messageId"`
 	AgentID   string `json:"agentId,omitempty"`
 	ProjectID string `json:"projectId,omitempty"`
+	Code      string `json:"code,omitempty"`
 	Reason    string `json:"reason,omitempty"`
 }
 
@@ -202,6 +241,14 @@ type MessageFailuresReport struct {
 	AttachmentOutcomes []AttachmentOutcome `json:"attachmentOutcomes,omitempty"`
 }
 
+// MessageFailuresResponse is the decoded body of a 200 answer from
+// POST /api/v1/runtime-brokers/{id}/message-failures.
+type MessageFailuresResponse struct {
+	Marked  int `json:"marked,omitempty"`
+	Held    int `json:"held,omitempty"`
+	Ignored int `json:"ignored,omitempty"`
+}
+
 // runtimeBrokerService is the implementation of RuntimeBrokerService.
 type runtimeBrokerService struct {
 	c *client
@@ -219,6 +266,10 @@ type ListBrokersOptions struct {
 type ListBrokersResponse struct {
 	Brokers []RuntimeBroker
 	Page    apiclient.PageResult
+	// HubVersion is the fleet hub version each broker's VersionStatus is
+	// compared with: a build token, "mixed", or "" when unknown or when an
+	// older Hub did not send it.
+	HubVersion string
 }
 
 // UpdateBrokerRequest is the request for updating a runtime broker.
@@ -237,6 +288,11 @@ type ListBrokerProjectsResponse struct {
 type BrokerHeartbeat struct {
 	Status   string             `json:"status"`
 	Projects []ProjectHeartbeat `json:"projects,omitempty"`
+	// Version is the broker's build token (version.Short()). The Hub
+	// refreshes the stored broker version from it on a heartbeat the broker
+	// sends itself (ptone/scion#5972). Omitted when empty; an older Hub
+	// ignores it.
+	Version string `json:"version,omitempty"`
 	// Capabilities refreshes the broker's reported capabilities on every
 	// heartbeat (design §3.4 Amendment A2.2(b)). Chosen over a hub->broker live /info query:
 	// no such query path exists today, and adding one would mean a new
@@ -305,6 +361,38 @@ type BrokerHeartbeat struct {
 	// older process can never overwrite a newer one's snapshot.
 	PresentationEpoch int64 `json:"presentationEpoch,omitempty"`
 	PresentationSeq   int64 `json:"presentationSeq,omitempty"`
+	// ConversionPlanPresentation is a legacy Runtime Broker's publishable
+	// plan for moving to flat Runtime Broker instances
+	// (brokerconvert.Presentation), sent on every heartbeat as a snapshot
+	// of the plan last computed from the broker's settings. The Hub stores
+	// it read-only, only from the broker's own credentials. A flat instance
+	// and an older broker omit it; the Hub then keeps the stored value.
+	ConversionPlanPresentation *api.ConversionPlanPresentation `json:"conversionPlanPresentation,omitempty"`
+	// WorkloadIdentityTargets lists the broker's Kubernetes runtime targets
+	// that have workload_identity_pool set (ptone/scion#3329 phase 5): one
+	// per profile for a legacy broker, at most one for a flat instance. It
+	// is sent on every heartbeat (it is small) together with
+	// Capabilities.WITargetsV1; the Hub stores it only when it changes. It
+	// has no omitempty: a nil list (the settings could not be read, or a
+	// broker that does not produce it) is sent as null and keeps the
+	// Hub's stored list, while an empty list replaces it. An older Hub
+	// ignores it.
+	WorkloadIdentityTargets []WorkloadIdentityTarget `json:"workloadIdentityTargets"`
+}
+
+// WorkloadIdentityTarget is one Kubernetes runtime target with a GKE
+// Workload Identity pool in a heartbeat (store.WorkloadIdentityTarget is its
+// counterpart). The Hub binds a GCP service account it mints to
+// serviceAccount:<Pool>[<Namespace>/<account ID>] for each.
+type WorkloadIdentityTarget struct {
+	// Profile is the legacy broker profile; empty for a flat instance.
+	Profile string `json:"profile,omitempty"`
+	// Pool is the Workload Identity pool, "<project>.svc.id.goog".
+	Pool string `json:"pool"`
+	// Namespace is the namespace the broker runs the target's agents in.
+	Namespace string `json:"namespace"`
+	// KSACreation reports create_service_accounts on the target (ptone/scion#7966).
+	KSACreation bool `json:"ksaCreation,omitempty"`
 }
 
 // StartInFlight identifies one agent start running on a broker.
@@ -370,6 +458,16 @@ type AgentHeartbeat struct {
 	Profile         string `json:"profile,omitempty"`     // Settings profile used
 	ExitCode        *int   `json:"exitCode,omitempty"`    // Structured exit code from runtime (nil = unknown)
 	ExitReason      string `json:"exitReason,omitempty"`  // Terminal reason (see state.ExitReason), e.g. "crashed", "preempted", "oom_killed"
+	// Template, HarnessConfig, HarnessConfigSource, Image and Runtime are
+	// the agent config the runtime resolved for the listed entry (its
+	// labels), the same values a synchronous dispatch answer carries. The
+	// Hub records them only for a create whose dispatch outcome was unknown
+	// (ptone/scion#4987). An older broker omits them.
+	Template            string `json:"template,omitempty"`
+	HarnessConfig       string `json:"harnessConfig,omitempty"`
+	HarnessConfigSource string `json:"harnessConfigSource,omitempty"`
+	Image               string `json:"image,omitempty"`
+	Runtime             string `json:"runtime,omitempty"`
 	// RuntimeTarget is the ID of the inventory target whose listing reported
 	// this agent (see InventoryTarget.ID).
 	RuntimeTarget string `json:"runtimeTarget,omitempty"`
@@ -377,6 +475,10 @@ type AgentHeartbeat struct {
 	// (api.AgentInfo.RunID); empty for an unlabelled entry. An older broker
 	// omits it.
 	RunID string `json:"runId,omitempty"`
+	// AgentID is the listed entry's Hub agent ID (its agent_id label, or
+	// the ID the runtime reports); empty when unknown. An older broker
+	// omits it, and the Hub then matches the entry by slug only.
+	AgentID string `json:"agentId,omitempty"`
 	// OtherEntries are the agent's entries listed by other targets of this
 	// broker, which the heartbeat does not report as agents of their own
 	// (one agent per project and name), each with its target and label.
@@ -401,6 +503,11 @@ type CreateBrokerRequest struct {
 	// RuntimeTarget is the flat Runtime Broker registration descriptor
 	// (.design/flat-runtime-brokers-contract.md section 6); nil is legacy.
 	RuntimeTarget *api.RuntimeTargetDescriptor `json:"runtimeTarget,omitempty"`
+	// GCPHostServiceAccountEmail and GCPHostProjectID claim the broker row's
+	// private GCP host pair on registration (subject to Hub actAs evaluation
+	// and fill-only-while-unset semantics).
+	GCPHostServiceAccountEmail string `json:"gcpHostServiceAccountEmail,omitempty"`
+	GCPHostProjectID           string `json:"gcpHostProjectId,omitempty"`
 	// JoinTokenTTLSeconds is the join token lifetime in seconds. Zero uses
 	// the hub default; otherwise the hub accepts 300 to 86400.
 	JoinTokenTTLSeconds int `json:"joinTokenTtlSeconds,omitempty"`
@@ -523,6 +630,7 @@ func (s *runtimeBrokerService) List(ctx context.Context, opts *ListBrokersOption
 		Brokers    []RuntimeBroker `json:"brokers"`
 		NextCursor string          `json:"nextCursor,omitempty"`
 		TotalCount int             `json:"totalCount,omitempty"`
+		HubVersion string          `json:"hubVersion,omitempty"`
 	}
 
 	result, err := apiclient.DecodeRequired[listResponse](resp)
@@ -536,12 +644,13 @@ func (s *runtimeBrokerService) List(ctx context.Context, opts *ListBrokersOption
 			NextCursor: result.NextCursor,
 			TotalCount: result.TotalCount,
 		},
+		HubVersion: result.HubVersion,
 	}, nil
 }
 
 // Get returns a single runtime broker by ID.
 func (s *runtimeBrokerService) Get(ctx context.Context, brokerID string) (*RuntimeBroker, error) {
-	resp, err := s.c.get(ctx, "/api/v1/runtime-brokers/"+brokerID, nil)
+	resp, err := s.c.get(ctx, "/api/v1/runtime-brokers/"+url.PathEscape(brokerID), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -550,7 +659,7 @@ func (s *runtimeBrokerService) Get(ctx context.Context, brokerID string) (*Runti
 
 // Update updates broker metadata.
 func (s *runtimeBrokerService) Update(ctx context.Context, brokerID string, req *UpdateBrokerRequest) (*RuntimeBroker, error) {
-	resp, err := s.c.patch(ctx, "/api/v1/runtime-brokers/"+brokerID, req, nil)
+	resp, err := s.c.patch(ctx, "/api/v1/runtime-brokers/"+url.PathEscape(brokerID), req, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -559,7 +668,7 @@ func (s *runtimeBrokerService) Update(ctx context.Context, brokerID string, req 
 
 // Delete removes a broker from all projects.
 func (s *runtimeBrokerService) Delete(ctx context.Context, brokerID string) error {
-	resp, err := s.c.delete(ctx, "/api/v1/runtime-brokers/"+brokerID, nil)
+	resp, err := s.c.delete(ctx, "/api/v1/runtime-brokers/"+url.PathEscape(brokerID), nil)
 	if err != nil {
 		return err
 	}
@@ -568,7 +677,7 @@ func (s *runtimeBrokerService) Delete(ctx context.Context, brokerID string) erro
 
 // ListProjects returns projects this broker contributes to.
 func (s *runtimeBrokerService) ListProjects(ctx context.Context, brokerID string) (*ListBrokerProjectsResponse, error) {
-	resp, err := s.c.get(ctx, "/api/v1/runtime-brokers/"+brokerID+"/projects", nil)
+	resp, err := s.c.get(ctx, "/api/v1/runtime-brokers/"+url.PathEscape(brokerID)+"/projects", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -577,7 +686,7 @@ func (s *runtimeBrokerService) ListProjects(ctx context.Context, brokerID string
 
 // Heartbeat sends a heartbeat for a broker.
 func (s *runtimeBrokerService) Heartbeat(ctx context.Context, brokerID string, status *BrokerHeartbeat) (*BrokerHeartbeatResponse, error) {
-	resp, err := s.c.post(ctx, "/api/v1/runtime-brokers/"+brokerID+"/heartbeat", status, nil)
+	resp, err := s.c.post(ctx, "/api/v1/runtime-brokers/"+url.PathEscape(brokerID)+"/heartbeat", status, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -599,12 +708,46 @@ func (s *runtimeBrokerService) Heartbeat(ctx context.Context, brokerID string, s
 }
 
 // ReportMessageFailures reports buffered deliveries that failed on the broker.
-func (s *runtimeBrokerService) ReportMessageFailures(ctx context.Context, brokerID string, req *MessageFailuresReport) error {
+func (s *runtimeBrokerService) ReportMessageFailures(ctx context.Context, brokerID string, req *MessageFailuresReport) (*MessageFailuresResponse, error) {
 	resp, err := s.c.post(ctx, "/api/v1/runtime-brokers/"+url.PathEscape(brokerID)+"/message-failures", req, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return apiclient.CheckResponse(resp)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 400 {
+		return nil, apiclient.ParseErrorResponse(resp)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil || len(bytes.TrimSpace(body)) == 0 {
+		return &MessageFailuresResponse{}, nil
+	}
+	var out MessageFailuresResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		return &MessageFailuresResponse{}, nil
+	}
+	return &out, nil
+}
+
+// DeliverMessage posts one deliver-message flush to the hub. See the
+// RuntimeBrokerService doc comment.
+func (s *runtimeBrokerService) DeliverMessage(ctx context.Context, brokerID, agentID string, req *agentcontrol.DeliverRequest) (int, agentcontrol.DeliverResponse, error) {
+	path := "/api/v1/runtime-brokers/" + url.PathEscape(brokerID) + "/agents/" + url.PathEscape(agentID) + "/deliver"
+	// The hub may hold the call for its whole 110 s budget (a readiness
+	// wait of up to 90 s, then the paste), longer than the client's
+	// default timeout: this request gets the broker's 115 s instead. The
+	// caller's ctx still applies when it is shorter (review R2).
+	ctx = apiclient.WithRequestTimeout(ctx, agentcontrol.BrokerDeliverTimeout)
+	resp, err := s.c.postNoRetry(ctx, path, req, nil)
+	if err != nil {
+		return 0, agentcontrol.DeliverResponse{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return 0, agentcontrol.DeliverResponse{}, fmt.Errorf("read deliver answer: %w", err)
+	}
+	out, _ := agentcontrol.DecodeDeliverResponse(body)
+	return resp.StatusCode, out, nil
 }
 
 // ReportAgentLaunch posts one launch report. See the RuntimeBrokerService
@@ -664,3 +807,41 @@ func (s *runtimeBrokerService) ReportAgentLaunch(ctx context.Context, brokerID, 
 		return nil, apiclient.ParseErrorResponse(resp)
 	}
 }
+
+// maxWorkspaceDownloadPageBytes bounds a workspace download page response
+// (500 files with their signed URLs is well under 4 MiB).
+const maxWorkspaceDownloadPageBytes = 8 << 20
+
+// WorkspaceDownload requests one workspace download page. See the
+// RuntimeBrokerService doc comment.
+func (s *runtimeBrokerService) WorkspaceDownload(ctx context.Context, brokerID, agentID string, req *api.WorkspaceDownloadRequest) (*api.WorkspaceDownloadResponse, error) {
+	path := "/api/v1/runtime-brokers/" + url.PathEscape(brokerID) + "/agents/" + url.PathEscape(agentID) + "/workspace-download"
+	resp, err := s.c.postNoRetry(ctx, path, req, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		// Only the error code is read from the error body; its message is
+		// not carried, so no response text can reach a log or error value.
+		var body struct {
+			Error struct {
+				Code string `json:"code"`
+			} `json:"error"`
+		}
+		_ = json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&body)
+		return nil, &apiclient.APIError{StatusCode: resp.StatusCode, Code: body.Error.Code, Message: "workspace download request refused"}
+	}
+	var out api.WorkspaceDownloadResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxWorkspaceDownloadPageBytes)).Decode(&out); err != nil {
+		// A decode error can quote the body, which holds signed URLs: it is
+		// replaced with fixed text.
+		return nil, ErrWorkspaceDownloadDecode
+	}
+	return &out, nil
+}
+
+// ErrWorkspaceDownloadDecode is returned for a 200 workspace download page
+// that does not decode. It is fixed text: a decode error could quote the
+// body, which holds signed URLs.
+var ErrWorkspaceDownloadDecode = errors.New("workspace download page did not decode")

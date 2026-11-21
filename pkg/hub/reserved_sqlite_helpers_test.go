@@ -31,6 +31,9 @@ type stripSiteKey struct{ file, function string }
 // helper) before rendering or dispatching to the site's recipient(s). This
 // is the P1+P2 site list from design §4.2 item 1 and §10 P1/P2.
 var strippedSites = map[stripSiteKey]bool{
+	// Shared decision-response delivery (answer, set, dismiss); strips
+	// sm.Metadata before populating hub-owned decision keys and dispatching.
+	{"decisions_answer.go", "dispatchDecisionResponse"}: true,
 	// P1: the two ExecuteAgentDM-routed entry points, covering the outbound
 	// endpoint, the handleAgentMessage agent fork, and #2083's agent mention
 	// fan-out (fanOutAgentMentions reaches dispatch through ExecuteAgentDM,
@@ -79,4 +82,5 @@ func (f *fakeProxyAuthenticator) Authenticate(_ *http.Request) (*ProxyUserInfo, 
 	return f.info, f.err
 }
 
-func (f *fakeProxyAuthenticator) Name() string { return "fake" }
+func (f *fakeProxyAuthenticator) Name() string               { return "fake" }
+func (f *fakeProxyAuthenticator) AssertionHeaders() []string { return nil }

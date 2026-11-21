@@ -29,6 +29,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import scion_harness as sh
+from json_depth_testutil import SIMULATED_DECODER_DEPTH_LIMIT, simulated_decoder_depth_limit
 
 
 class TestVersionContract(unittest.TestCase):
@@ -1665,6 +1666,52 @@ class TestAtomicWriteText(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# simulated JSON decoder depth limit (test helper, json_depth_testutil)
+# ---------------------------------------------------------------------------
+
+
+class TestSimulatedDecoderDepthLimit(unittest.TestCase):
+    """json_depth_testutil.simulated_decoder_depth_limit behaves like a real
+    decoder at its nesting limit (ptone/scion#6254)."""
+
+    def _loads(self, text, limit=2, **kwargs):
+        with simulated_decoder_depth_limit(limit):
+            return json.loads(text, **kwargs)
+
+    def test_within_limit_decodes_for_real(self):
+        n = SIMULATED_DECODER_DEPTH_LIMIT
+        self.assertEqual(self._loads("[" * n + "]" * n, limit=n), json.loads("[" * n + "]" * n))
+        self.assertEqual(self._loads('{"a": [1]}'), {"a": [1]})
+
+    def test_bracket_at_value_position_raises_recursion_error(self):
+        for text in ("[[[]]]", '{"a": {"b": {}}}', "[1, [[]]]", '["x", [ []]]', b"[[[]]]"):
+            with self.subTest(text=text), self.assertRaises(RecursionError):
+                self._loads(text)
+
+    def test_bracket_where_no_value_can_go_raises_decode_error(self):
+        for text, msg in (("[[1[]]]", "Expecting ',' delimiter"),
+                          ("[{{}}]", "Expecting property name enclosed in double quotes"),
+                          ('[{"a" []}]', "Expecting ':' delimiter")):
+            with self.subTest(text=text), self.assertRaises(json.JSONDecodeError) as cm:
+                self._loads(text)
+            self.assertEqual(cm.exception.msg, msg)
+
+    def test_errors_before_the_deep_part_are_raised_first(self):
+        with self.assertRaises(json.JSONDecodeError):
+            self._loads('{"a": 1,, "b": [[[]]]}')
+
+        def reject(_):
+            raise ValueError("hook")
+
+        with self.assertRaisesRegex(ValueError, "^hook$"):
+            self._loads('[NaN, [[]]]', parse_constant=reject)
+
+    def test_brackets_inside_strings_do_not_count(self):
+        text = '["[[[{{{", "\\\"[[[", ["x"]]'
+        self.assertEqual(self._loads(text), json.loads(text))
+
+
+# ---------------------------------------------------------------------------
 # read_json_skipping_comment_lines
 # ---------------------------------------------------------------------------
 
@@ -1718,9 +1765,18 @@ class TestReadJsonSkippingComments(unittest.TestCase):
         self._assert_provision_error(raw, "not valid JSON")
 
     def test_too_deep_raises_provision_error(self):
-        raw = ('{"key": "' + self.MARKER + '", "n": ' + "[" * 100000
-               + "]" * 100000 + "}").encode()
-        self._assert_provision_error(raw, "nested too deeply")
+        n = SIMULATED_DECODER_DEPTH_LIMIT
+        raw = ('{"key": "' + self.MARKER + '", "n": ' + "[" * n
+               + "]" * n + "}").encode()
+        with simulated_decoder_depth_limit():
+            self._assert_provision_error(raw, "nested too deeply")
+
+    def test_depth_within_limit_parses(self):
+        # Guards the simulation: one level shallower is decoded for real.
+        n = SIMULATED_DECODER_DEPTH_LIMIT - 1
+        path = self._write_raw(('{"n": ' + "[" * n + "]" * n + "}").encode())
+        with simulated_decoder_depth_limit():
+            self.assertIn("n", sh.read_json_skipping_comment_lines(path))
 
     def test_missing_file_raises_os_error(self):
         with self.assertRaises(FileNotFoundError):
@@ -2937,6 +2993,106 @@ class TestAgentPluginsReconcile(unittest.TestCase):
         sections = sh._skill_sections(self.env.home, ".claude/skills")
         self.assertEqual(len(sections), 1)
         self.assertIn("## real", sections[0])
+
+class TestCaptureAuthPendingApproval(unittest.TestCase):
+    """capture_auth_main with user-scope saves that wait for approval."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        bundle = os.path.join(self.tmp.name, "bundle")
+        os.makedirs(os.path.join(bundle, "inputs"))
+        self.source = os.path.join(self.tmp.name, "creds.json")
+        with open(self.source, "w", encoding="utf-8") as f:
+            f.write("{}")
+        with open(os.path.join(bundle, "inputs", "capture-auth-config.json"), "w", encoding="utf-8") as f:
+            json.dump({"credentials": [{"key": "TOOL_AUTH", "source": self.source,
+                                        "type": "file", "target": "~/.tool/creds.json"}]}, f)
+        self.bundle = bundle
+
+    def run_capture(self, results, argv=()):
+        """Run capture_auth_main with sciontool answering results in turn."""
+        calls = []
+
+        def fake_run(cmd, **_kwargs):
+            calls.append(cmd)
+            rc, stderr = results[min(len(calls), len(results)) - 1]
+            return sh.subprocess.CompletedProcess(cmd, rc, stdout="", stderr=stderr)
+
+        out = []
+        with mock.patch.object(sh.subprocess, "run", side_effect=fake_run), \
+                mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(str(x) for x in a))):
+            rc = sh.capture_auth_main(["--bundle", self.bundle, *argv])
+        return rc, calls, "\n".join(out)
+
+    def test_outcome_classification(self):
+        cp = sh.subprocess.CompletedProcess
+        cases = [
+            (cp([], 0, "", 'INFO Secret "K" saved, pending approval in Scion (scope: user)'), "pending"),
+            (cp([], 0, "", 'INFO Secret "K" stored (scope: project)'), "stored"),
+            (cp([], 1, "", "ERROR secret \"K\": ... (secret_pending_held_by_other_agent)"), "held"),
+            (cp([], 1, "", 'ERROR secret "K" already exists (use --force to overwrite)'), "conflict"),
+            (cp([], 1, "", "ERROR hub returned error 500"), "error"),
+        ]
+        for result, want in cases:
+            with self.subTest(want=want):
+                self.assertEqual(sh.secret_set_outcome(result), want)
+
+    def test_user_scope_save_is_pending_without_output(self):
+        # sciontool at a warn or error log level prints no info line; a
+        # successful user-scope save still waits for the owner's approval.
+        cp = sh.subprocess.CompletedProcess
+        self.assertEqual(sh.secret_set_outcome(cp([], 0, "", ""), "user"), "pending")
+        self.assertEqual(sh.secret_set_outcome(cp([], 0, "", ""), "project"), "stored")
+        rc, _, out = self.run_capture([(0, "")])
+        self.assertEqual(rc, sh._CA_EXIT_OK)
+        self.assertIn("capture-auth: TOOL_AUTH: captured (pending approval in Scion)", out)
+
+    def test_user_scope_reauth_completes_in_one_run(self):
+        # Re-auth for a name that already has an approved secret: the Hub
+        # accepts it for approval, so one run without --force succeeds.
+        rc, calls, out = self.run_capture(
+            [(0, 'INFO Secret "TOOL_AUTH" saved, pending approval in Scion (scope: user); '
+                 "it replaces your existing secret once approved")])
+        self.assertEqual(rc, sh._CA_EXIT_OK)
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("--force", calls[0])
+        self.assertIn("--scope", calls[0])
+        self.assertEqual(calls[0][calls[0].index("--scope") + 1], "user")
+        self.assertIn("capture-auth: TOOL_AUTH: captured (pending approval in Scion)", out)
+        self.assertNotIn("CONFLICT", out)
+
+    def test_force_still_accepted(self):
+        rc, calls, out = self.run_capture(
+            [(0, 'INFO Secret "TOOL_AUTH" saved, pending approval in Scion (scope: user)')], argv=["--force"])
+        self.assertEqual(rc, sh._CA_EXIT_OK)
+        self.assertIn("--force", calls[0])
+        self.assertIn("captured (pending approval in Scion)", out)
+
+    def test_held_by_other_agent_is_the_conflict(self):
+        rc, calls, out = self.run_capture(
+            [(1, 'ERROR secret "TOOL_AUTH": a pending secret with this name, saved by another agent, '
+                 "is awaiting your approval in Scion; approve or reject it before saving this one "
+                 "(secret_pending_held_by_other_agent)")])
+        self.assertEqual(rc, sh._CA_EXIT_CONFLICT)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("saved by another agent", out)
+        # Not the "already exists" line: --force would not help.
+        self.assertNotIn("already exists", out)
+
+    def test_project_scope_conflict_needs_force(self):
+        rc, _, out = self.run_capture(
+            [(1, 'ERROR secret "TOOL_AUTH" already exists (use --force to overwrite)')],
+            argv=["--scope", "project"])
+        self.assertEqual(rc, sh._CA_EXIT_CONFLICT)
+        self.assertIn('CONFLICT: secret "TOOL_AUTH" already exists (use --force to overwrite)', out)
+
+    def test_project_scope_stored_directly(self):
+        rc, _, out = self.run_capture(
+            [(0, 'INFO Secret "TOOL_AUTH" stored (scope: project)')], argv=["--scope", "project"])
+        self.assertEqual(rc, sh._CA_EXIT_OK)
+        self.assertIn(f"capture-auth: TOOL_AUTH: captured from {self.source}", out)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -91,6 +91,15 @@ type Client interface {
 	// Schedules returns the recurring schedule operations interface scoped to a project.
 	Schedules(projectID string) ScheduleService
 
+	// WebhookEndpoints returns the webhook endpoint operations interface scoped to a project.
+	WebhookEndpoints(projectID string) WebhookEndpointService
+
+	// Triggers returns the trigger definition operations interface scoped to a project.
+	Triggers(projectID string) TriggerService
+
+	// TriggerEvents returns the trigger event inspection interface scoped to a project.
+	TriggerEvents(projectID string) TriggerEventService
+
 	// GCPServiceAccounts returns the GCP service account operations interface.
 	// Scope is chosen per call, not pinned here -- hub-scoped accounts have no
 	// project to pin to.
@@ -114,6 +123,20 @@ type Client interface {
 
 	// Messaging returns the cross-project messaging operations interface.
 	Messaging() MessagingService
+
+	// AdminSettings returns the hub administrative settings operations
+	// interface (server configuration, project defaults, experiments).
+	AdminSettings() AdminSettingsService
+
+	// SystemOne returns the administrative System One provider instance
+	// operations interface (/api/v1/admin/system-one/instances).
+	SystemOne() SystemOneService
+
+	// GitHubApp returns the administrative GitHub App operations interface.
+	GitHubApp() GitHubAppService
+
+	// TriggerPresets returns the trigger rule preset schema and compilation service.
+	TriggerPresets() TriggerPresetService
 
 	// ProjectInjectedSkills returns an InjectedSkillsService scoped to a project.
 	ProjectInjectedSkills(projectID string) InjectedSkillsService
@@ -143,6 +166,25 @@ type Client interface {
 	// TestIdentityDelegations returns the workload issuer delegation
 	// operations interface.
 	TestIdentityDelegations() TestIdentityDelegationService
+
+	// AgentDelegations returns the agent delegation grant operations
+	// interface (.design/agent-delegation.md §18.6).
+	AgentDelegations() AgentDelegationService
+
+	// Decisions returns the agent self-service decision operations interface.
+	Decisions() DecisionService
+
+	// ProjectDecisions returns a project's Decisions as the calling user
+	// sees them (Waiting on you and Made).
+	ProjectDecisions(projectID string) ProjectDecisionService
+
+	// ProjectMessagePolicies returns the message policy operations interface
+	// scoped to a project (/api/v1/projects/{projectID}/message-policies).
+	ProjectMessagePolicies(projectID string) MessagePolicyService
+
+	// MyDecisions returns the calling user's Decisions roll-up across their
+	// member projects (GET /api/v1/users/me/decisions).
+	MyDecisions() MyDecisionService
 
 	// Health checks API availability.
 	Health(ctx context.Context) (*HealthResponse, error)
@@ -180,9 +222,20 @@ type client struct {
 	allowList             *allowListService
 	invites               *inviteService
 	messaging             *messagingService
+	adminSettings         *adminSettingsService
+	systemOne             *systemOneService
+	githubApp             *githubAppService
+	triggerPresets        *triggerPresetService
 	artifacts             *artifactService
 	testIdentities        *testIdentityService
 	testIdentityDelegs    *testIdentityDelegationService
+	agentDelegations      *agentDelegationService
+	decisions             *decisionService
+	myDecisions           *myDecisionService
+
+	// pluginName, when set (WithPluginName), is sent as
+	// X-Scion-Plugin-Name on the broker attachment requests.
+	pluginName string
 }
 
 // New creates a new Hub API client.
@@ -238,9 +291,16 @@ func New(baseURL string, opts ...Option) (Client, error) {
 	c.allowList = &allowListService{c: c}
 	c.invites = &inviteService{c: c}
 	c.messaging = &messagingService{c: c}
+	c.adminSettings = &adminSettingsService{c: c}
+	c.systemOne = &systemOneService{c: c}
+	c.githubApp = &githubAppService{c: c}
+	c.triggerPresets = &triggerPresetService{c: c}
 	c.artifacts = &artifactService{c: c}
 	c.testIdentities = &testIdentityService{c: c}
 	c.testIdentityDelegs = &testIdentityDelegationService{c: c}
+	c.agentDelegations = &agentDelegationService{c: c}
+	c.decisions = &decisionService{c: c}
+	c.myDecisions = &myDecisionService{c: c}
 
 	return c, nil
 }
@@ -340,6 +400,21 @@ func (c *client) Schedules(projectID string) ScheduleService {
 	return &scheduleService{c: c, projectID: projectID}
 }
 
+// WebhookEndpoints returns the webhook endpoint operations interface scoped to a project.
+func (c *client) WebhookEndpoints(projectID string) WebhookEndpointService {
+	return &webhookEndpointService{c: c, projectID: projectID}
+}
+
+// Triggers returns the trigger definition operations interface scoped to a project.
+func (c *client) Triggers(projectID string) TriggerService {
+	return &triggerService{c: c, projectID: projectID}
+}
+
+// TriggerEvents returns the trigger event inspection interface scoped to a project.
+func (c *client) TriggerEvents(projectID string) TriggerEventService {
+	return &triggerEventService{c: c, projectID: projectID}
+}
+
 // GCPServiceAccounts returns the GCP service account operations interface.
 //
 // No-arg, matching Templates() and HarnessConfigs(). It used to take a project
@@ -375,6 +450,26 @@ func (c *client) Invites() InviteService {
 	return c.invites
 }
 
+// AdminSettings returns the hub administrative settings operations interface.
+func (c *client) AdminSettings() AdminSettingsService {
+	return c.adminSettings
+}
+
+// SystemOne returns the administrative System One provider instance operations interface.
+func (c *client) SystemOne() SystemOneService {
+	return c.systemOne
+}
+
+// GitHubApp returns the administrative GitHub App operations interface.
+func (c *client) GitHubApp() GitHubAppService {
+	return c.githubApp
+}
+
+// TriggerPresets returns the trigger rule preset schema and compilation service.
+func (c *client) TriggerPresets() TriggerPresetService {
+	return c.triggerPresets
+}
+
 // Messaging returns the cross-project messaging operations interface.
 func (c *client) Messaging() MessagingService {
 	return c.messaging
@@ -392,6 +487,21 @@ func (c *client) TestIdentities() TestIdentityService {
 
 func (c *client) TestIdentityDelegations() TestIdentityDelegationService {
 	return c.testIdentityDelegs
+}
+
+// AgentDelegations returns the agent delegation grant operations interface.
+func (c *client) AgentDelegations() AgentDelegationService {
+	return c.agentDelegations
+}
+
+// Decisions returns the agent self-service decision operations interface.
+func (c *client) Decisions() DecisionService {
+	return c.decisions
+}
+
+// MyDecisions returns the calling user's cross-project Decisions roll-up service.
+func (c *client) MyDecisions() MyDecisionService {
+	return c.myDecisions
 }
 
 // get performs an HTTP GET request.
@@ -429,9 +539,19 @@ func (c *client) patch(ctx context.Context, path string, body interface{}, heade
 	return c.transport.Patch(ctx, path, body, headers)
 }
 
+// patchNoRetry performs an HTTP PATCH request exactly once via DoNoRetry.
+func (c *client) patchNoRetry(ctx context.Context, path string, body interface{}, headers http.Header) (*http.Response, error) {
+	return c.transport.PatchNoRetry(ctx, path, body, headers)
+}
+
 // delete performs an HTTP DELETE request.
 func (c *client) delete(ctx context.Context, path string, headers http.Header) (*http.Response, error) {
 	return c.transport.Delete(ctx, path, headers)
+}
+
+// deleteNoRetry performs an HTTP DELETE request exactly once via DoNoRetry.
+func (c *client) deleteNoRetry(ctx context.Context, path string, headers http.Header) (*http.Response, error) {
+	return c.transport.DeleteNoRetry(ctx, path, headers)
 }
 
 // isProxyIntercepted reports whether a 2xx response looks like a proxy
@@ -531,6 +651,9 @@ func WithHTTPClient(hc *http.Client) Option {
 // WithTimeout sets the request timeout.
 func WithTimeout(d time.Duration) Option {
 	return func(c *client) {
+		if c.transport.HTTPClient == nil {
+			c.transport.HTTPClient = &http.Client{}
+		}
 		c.transport.HTTPClient.Timeout = d
 	}
 }

@@ -35,6 +35,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectkeys"
 	scionrt "github.com/GoogleCloudPlatform/scion/pkg/runtime"
+	"github.com/google/uuid"
 )
 
 // heartbeatAgentKey returns a key that uniquely identifies an agent within the
@@ -140,6 +141,12 @@ type HeartbeatService struct {
 	sentSAMappingsAt  time.Time
 	hubReadsSAHashes  bool
 
+	// workloadIdentityTargets, when set, returns the broker's Kubernetes
+	// runtime targets that have a Workload Identity pool or opt-in KSA
+	// creation, or nil when they cannot be read (ptone/scion#3329 phase 5).
+	// Sent on every legacy and flat heartbeat with Capabilities.WITargetsV1.
+	workloadIdentityTargets func() []hubclient.WorkloadIdentityTarget
+
 	// defaultProfile, when set, returns the broker's default (active)
 	// profile name, reported on every heartbeat. A nil func, or a nil
 	// result (unknown), omits the field.
@@ -165,6 +172,11 @@ type HeartbeatService struct {
 	presentationTargetID string
 	presentationEpoch    int64
 	nextPresentationSeq  func() int64
+
+	// conversionPlan, when set, returns a legacy broker's conversion plan
+	// snapshot (Server.heartbeatConversionPlan), sent on every heartbeat.
+	// A nil result omits the field. Never consulted in flat mode.
+	conversionPlan func() *api.ConversionPlanPresentation
 
 	mu          sync.Mutex
 	listFailing map[string]bool // target key -> last listing failed (guarded by mu)
@@ -259,9 +271,18 @@ func defaultListingDeadline(interval time.Duration) time.Duration {
 	return deadline
 }
 
+// SetConversionPlanSource sets the source of a legacy broker's conversion
+// plan snapshot, called once per heartbeat; a nil result omits the field.
+// It has no effect in flat mode. Call it before Start.
+func (s *HeartbeatService) SetConversionPlanSource(fn func() *api.ConversionPlanPresentation) {
+	s.conversionPlan = fn
+}
+
 // SetVersion sets the broker version reported in heartbeats.
 func (s *HeartbeatService) SetVersion(version string) {
+	s.mu.Lock()
 	s.version = version
+	s.mu.Unlock()
 }
 
 // Start begins sending heartbeats in the background.
@@ -445,10 +466,14 @@ func (s *HeartbeatService) buildHeartbeat(ctx context.Context) *hubclient.Broker
 
 	s.mu.Lock()
 	defaultRuntime := s.defaultRuntime
+	brokerVersion := s.version
 	s.mu.Unlock()
 
 	heartbeat := &hubclient.BrokerHeartbeat{
 		Status: status,
+		// The build token refreshes the stored broker version on the Hub
+		// (ptone/scion#5972).
+		Version: brokerVersion,
 		// Design §3.4 Amendment A2.2(b): report capabilities on every heartbeat so the hub's
 		// `scion reincarnate` gate is never stuck on a stale join-time
 		// snapshot for an already-registered broker. The same static set is
@@ -475,6 +500,16 @@ func (s *HeartbeatService) buildHeartbeat(ctx context.Context) *hubclient.Broker
 		heartbeat.PresentationTargetID = s.presentationTargetID
 		heartbeat.PresentationEpoch = s.presentationEpoch
 		heartbeat.PresentationSeq = s.nextPresentationSeq()
+	}
+	if !s.flat && s.conversionPlan != nil {
+		heartbeat.ConversionPlanPresentation = s.conversionPlan()
+	}
+	if s.workloadIdentityTargets != nil {
+		// A nil list (settings unreadable) is sent as null and keeps the
+		// hub's stored targets; the capability tells the hub that an empty
+		// list means "no pool configured".
+		heartbeat.WorkloadIdentityTargets = s.workloadIdentityTargets()
+		heartbeat.Capabilities.WITargetsV1 = true
 	}
 
 	// Starts in flight are read BEFORE the agents are listed: a start that
@@ -837,6 +872,14 @@ func (s *HeartbeatService) gatherProjectAgents(ctx context.Context, startsBefore
 			ExitReason:      ag.ExitReason,
 			RuntimeTarget:   agentTargets[heartbeatAgentKey(ag)],
 			RunID:           ag.RunID,
+			AgentID:         heartbeatAgentID(ag),
+			// The resolved agent config, for a create the Hub kept after
+			// an unknown dispatch outcome (ptone/scion#4987).
+			Template:            ag.Template,
+			HarnessConfig:       ag.HarnessConfig,
+			HarnessConfigSource: ag.HarnessConfigSource,
+			Image:               ag.Image,
+			Runtime:             ag.Runtime,
 		}
 		// The other entries go with the first reported entry of the key.
 		if more := otherEntries[heartbeatAgentKey(ag)]; len(more) > 0 {
@@ -863,6 +906,21 @@ func (s *HeartbeatService) gatherProjectAgents(ctx context.Context, startsBefore
 	}
 
 	return projects, inventory
+}
+
+// heartbeatAgentID returns the Hub agent ID of a listed entry: the ID the
+// runtime reports, else its agent_id label, else "", in canonical UUID form. A value that is not a
+// UUID (a legacy container labels its name) is not an ID and gives "".
+func heartbeatAgentID(ag api.AgentInfo) string {
+	id := ag.ID
+	if id == "" {
+		id = ag.Labels[api.LabelAgentID]
+	}
+	u, err := uuid.Parse(id)
+	if err != nil {
+		return ""
+	}
+	return u.String() // canonical form
 }
 
 // dropVanishedPodReportsForStarts removes the entries a Kubernetes runtime

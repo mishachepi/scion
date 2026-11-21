@@ -40,6 +40,19 @@ export const brokerAreaStyles = css`
     margin-bottom: 1rem;
   }
 
+  .storage-mismatch-alert {
+    display: block;
+    margin-bottom: 1rem;
+  }
+
+  .storage-mismatch {
+    margin: 0.5rem 0 0;
+    padding-left: 1.25rem;
+    font-family: var(--scion-font-mono, monospace);
+    font-size: 0.8125rem;
+    word-break: break-word;
+  }
+
   .stats-row {
     display: flex;
     gap: 2rem;
@@ -413,7 +426,7 @@ export const brokerAreaStyles = css`
   .form-error {
     margin-bottom: 0.75rem;
     font-size: 0.8125rem;
-    color: var(--scion-danger, #dc2626);
+    color: var(--sl-color-danger-600, #dc2626);
   }
 
   .hosted-marker {

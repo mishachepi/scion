@@ -70,6 +70,81 @@ func TestAgentPluginsExperiment_Dispatched(t *testing.T) {
 	}
 }
 
+// hub.cloudrun_native_identity is a server-layer experiment, off by default,
+// and the hub puts it in HubAgentDefaults.Experiments only while it is on.
+func TestCloudRunNativeIdentityExperiment_Dispatched(t *testing.T) {
+	exp, ok := experiments.Default().Lookup(experiments.CloudRunNativeIdentity)
+	if !ok {
+		t.Fatalf("%s is not registered", experiments.CloudRunNativeIdentity)
+	}
+	if exp.Default || !exp.HasLayer(experiments.LayerServer) || exp.HasLayer(experiments.LayerWeb) {
+		t.Errorf("experiment = %+v, want default off, server layer only", exp)
+	}
+
+	on := dispatchExperimentsServer(t, `{"overrides":{"hub.cloudrun_native_identity":true}}`)
+	if got := on.dispatchExperiments(); !slices.Equal(got, []string{experiments.CloudRunNativeIdentity}) {
+		t.Errorf("on: dispatch experiments = %v, want [%s]", got, experiments.CloudRunNativeIdentity)
+	}
+	d := on.CreateAuthenticatedDispatcher()
+	start := startHubAgentDefaults(d.hubAgentDefaults(), d.autoExposePortsDefault(), d.dispatchExperiments(), nil)
+	if start == nil || !slices.Contains(start.Experiments, experiments.CloudRunNativeIdentity) {
+		t.Errorf("on: start dispatch defaults = %+v, want %s", start, experiments.CloudRunNativeIdentity)
+	}
+
+	off := dispatchExperimentsServer(t, `{"overrides":{"hub.k8s_nfs_home":true}}`)
+	if got := off.dispatchExperiments(); slices.Contains(got, experiments.CloudRunNativeIdentity) {
+		t.Errorf("off: dispatch experiments = %v include %s", got, experiments.CloudRunNativeIdentity)
+	}
+	d = off.CreateAuthenticatedDispatcher()
+	start = startHubAgentDefaults(d.hubAgentDefaults(), d.autoExposePortsDefault(), d.dispatchExperiments(), nil)
+	if start != nil && slices.Contains(start.Experiments, experiments.CloudRunNativeIdentity) {
+		t.Errorf("off: start dispatch defaults = %+v include %s", start, experiments.CloudRunNativeIdentity)
+	}
+}
+
+// web.decisions is in HubAgentDefaults.Experiments only while it is on,
+// so the broker can apply the scion-messaging skill gates
+// (ptone/scion#7830, ptone/scion#8223).
+func TestDecisionsExperiment_OnWire(t *testing.T) {
+	on := dispatchExperimentsServer(t, `{"overrides":{"web.decisions":true}}`)
+	if got := on.dispatchExperiments(); !slices.Equal(got, []string{experiments.Decisions}) {
+		t.Errorf("on: dispatch experiments = %v, want [%s]", got, experiments.Decisions)
+	}
+	d := on.CreateAuthenticatedDispatcher()
+	req, err := d.buildCreateRequest(context.Background(), hubDefaultsDispatchAgent(), "test")
+	if err != nil {
+		t.Fatalf("buildCreateRequest: %v", err)
+	}
+	if req.Config == nil || req.Config.HubAgentDefaults == nil || !slices.Contains(req.Config.HubAgentDefaults.Experiments, experiments.Decisions) {
+		t.Errorf("on: create dispatch does not carry %s: %+v", experiments.Decisions, req.Config)
+	}
+	off := dispatchExperimentsServer(t, `{"overrides":{"hub.k8s_nfs_home":true}}`)
+	if got := off.dispatchExperiments(); slices.Contains(got, experiments.Decisions) {
+		t.Errorf("off: dispatch experiments = %v include %s", got, experiments.Decisions)
+	}
+}
+
+// hub.artifacts is in HubAgentDefaults.Experiments only while it is on, so
+// the broker can apply the scion-artifacts skill gate (ptone/scion#7897).
+func TestArtifactsExperiment_OnWire(t *testing.T) {
+	on := dispatchExperimentsServer(t, `{"overrides":{"hub.artifacts":true}}`)
+	if got := on.dispatchExperiments(); !slices.Equal(got, []string{experiments.Artifacts}) {
+		t.Errorf("on: dispatch experiments = %v, want [%s]", got, experiments.Artifacts)
+	}
+	d := on.CreateAuthenticatedDispatcher()
+	req, err := d.buildCreateRequest(context.Background(), hubDefaultsDispatchAgent(), "test")
+	if err != nil {
+		t.Fatalf("buildCreateRequest: %v", err)
+	}
+	if req.Config == nil || req.Config.HubAgentDefaults == nil || !slices.Contains(req.Config.HubAgentDefaults.Experiments, experiments.Artifacts) {
+		t.Errorf("on: create dispatch does not carry %s: %+v", experiments.Artifacts, req.Config)
+	}
+	off := dispatchExperimentsServer(t, `{"overrides":{"hub.k8s_nfs_home":true}}`)
+	if got := off.dispatchExperiments(); slices.Contains(got, experiments.Artifacts) {
+		t.Errorf("off: dispatch experiments = %v include %s", got, experiments.Artifacts)
+	}
+}
+
 func dispatchExperimentsServer(t *testing.T, raw string) *Server {
 	t.Helper()
 	fakeStore := newFakeHubSettingStore()

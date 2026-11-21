@@ -15,6 +15,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -192,8 +193,7 @@ func TestUpdateVersionedSetting_NoOpLeavesFileUntouched(t *testing.T) {
 	for _, kv := range [][2]string{
 		{"active_profile", "local"},
 		{"hub.brokerId", "old-id"},
-		{"image_registry", ""},                         // deleting an absent key
-		{"hub_connections.foo.endpoint", "left-as-is"}, // accepted and left unchanged
+		{"image_registry", ""}, // deleting an absent key
 	} {
 		require.NoError(t, UpdateVersionedSetting(dir, kv[0], kv[1]), kv[0])
 	}
@@ -224,14 +224,19 @@ func assertNoTempFiles(t *testing.T, dir string) {
 
 func TestUpdateVersionedSetting_AtomicWrite(t *testing.T) {
 	t.Run("mode preserved and no temp files", func(t *testing.T) {
-		dir := writeSettingsFixture(t, writebackFixture)
-		path := filepath.Join(dir, "settings.yaml")
-		require.NoError(t, os.Chmod(path, 0600))
-		require.NoError(t, UpdateVersionedSetting(dir, "hub.brokerId", "new"))
-		info, err := os.Stat(path)
-		require.NoError(t, err)
-		assert.Equal(t, os.FileMode(0600), info.Mode().Perm())
-		assertNoTempFiles(t, dir)
+		for _, mask := range []int{0o022, 0o077} {
+			t.Run(fmt.Sprintf("umask_%03o", mask), func(t *testing.T) {
+				setTestUmask(t, mask)
+				dir := writeSettingsFixture(t, writebackFixture)
+				path := filepath.Join(dir, "settings.yaml")
+				require.NoError(t, os.Chmod(path, 0600))
+				require.NoError(t, UpdateVersionedSetting(dir, "hub.brokerId", "new"))
+				info, err := os.Stat(path)
+				require.NoError(t, err)
+				assert.Equal(t, os.FileMode(0600), info.Mode().Perm())
+				assertNoTempFiles(t, dir)
+			})
+		}
 	})
 
 	t.Run("replaces the file rather than writing through it", func(t *testing.T) {
@@ -253,21 +258,27 @@ func TestUpdateVersionedSetting_AtomicWrite(t *testing.T) {
 	})
 
 	t.Run("symlinked settings file keeps its link", func(t *testing.T) {
-		dir := t.TempDir()
-		real := filepath.Join(t.TempDir(), "real-settings.yaml")
-		require.NoError(t, os.WriteFile(real, []byte(writebackFixture), 0640))
-		link := filepath.Join(dir, "settings.yaml")
-		require.NoError(t, os.Symlink(real, link))
-		require.NoError(t, UpdateVersionedSetting(dir, "hub.brokerId", "new"))
-		fi, err := os.Lstat(link)
-		require.NoError(t, err)
-		assert.True(t, fi.Mode()&os.ModeSymlink != 0, "symlink was replaced by a regular file")
-		data, err := os.ReadFile(real)
-		require.NoError(t, err)
-		assert.Contains(t, string(data), "broker_id: new")
-		info, err := os.Stat(real)
-		require.NoError(t, err)
-		assert.Equal(t, os.FileMode(0640), info.Mode().Perm())
+		for _, mask := range []int{0o022, 0o077} {
+			t.Run(fmt.Sprintf("umask_%03o", mask), func(t *testing.T) {
+				setTestUmask(t, mask)
+				dir := t.TempDir()
+				real := filepath.Join(t.TempDir(), "real-settings.yaml")
+				require.NoError(t, os.WriteFile(real, []byte(writebackFixture), 0640))
+				require.NoError(t, os.Chmod(real, 0640))
+				link := filepath.Join(dir, "settings.yaml")
+				require.NoError(t, os.Symlink(real, link))
+				require.NoError(t, UpdateVersionedSetting(dir, "hub.brokerId", "new"))
+				fi, err := os.Lstat(link)
+				require.NoError(t, err)
+				assert.True(t, fi.Mode()&os.ModeSymlink != 0, "symlink was replaced by a regular file")
+				data, err := os.ReadFile(real)
+				require.NoError(t, err)
+				assert.Contains(t, string(data), "broker_id: new")
+				info, err := os.Stat(real)
+				require.NoError(t, err)
+				assert.Equal(t, os.FileMode(0640), info.Mode().Perm())
+			})
+		}
 	})
 }
 
@@ -395,20 +406,19 @@ func TestUpdateVersionedSetting_EdgeCases(t *testing.T) {
 // TestUpdateVersionedSetting_RejectsNotStoredKeys instead.
 var updateVersionedSettingKeys = []string{
 	"active_profile", "default_template", "default_harness_config", "workspace_path",
-	"image_registry", "cli.autohelp", "cli.mode", "hub.enabled", "hub.linked", "hub.endpoint",
-	"hub.local_only", "hub.brokerId", "hub.brokerToken", "hub.brokerNickname",
+	"image_registry", "image_tag", "cli.autohelp", "cli.mode", "hub.enabled", "hub.linked",
+	"hub.endpoint", "hub.local_only", "hub.brokerId", "hub.brokerToken", "hub.brokerNickname",
 	"server.auth.display_name", "server.auth.email", "server.auth.username",
 	"use_host_credentials",
 	"project_id", "hub.project_id",
-	"hub_connections.foo.endpoint",
 }
 
 func TestVersionedSettingKeys_MatchStructSwitch(t *testing.T) {
 	var want []string
 	for _, k := range updateVersionedSettingKeys {
-		edit, err := versionedSettingEditFor(k, "v")
+		_, err := versionedSettingEditFor(k, "v")
 		require.NoError(t, err, k)
-		if edit.noop || k == "project_id" || k == "hub.project_id" {
+		if k == "project_id" || k == "hub.project_id" {
 			continue
 		}
 		want = append(want, k)

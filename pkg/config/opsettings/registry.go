@@ -80,45 +80,32 @@ func DurationKeys(section string) []DurationKey {
 	return out
 }
 
-// dns1123SubdomainOrEmptyPattern mirrors the pattern used for
-// priority_class_name / priorityClassName in settings-v1.schema.json and
-// agent-v1.schema.json: a DNS-1123 subdomain (the Kubernetes PriorityClass
-// name format), or the empty string, which means unset to the runtime and
-// would otherwise fail the strict subdomain pattern.
-const dns1123SubdomainOrEmptyPattern = `^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
-
 // dns1123LabelOrEmptyPattern mirrors the runtime namespace pattern in
 // settings-v1.schema.json: a DNS-1123 label (the Kubernetes namespace name
 // format, at most 63 characters), or the empty string for the runtime's
 // default namespace.
 const dns1123LabelOrEmptyPattern = `^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 
-// kubernetesServiceAccountMappingsSchema mirrors
-// kubernetes_service_account_mappings in settings-v1.schema.json: lowercase
-// GCP service account email keys, Kubernetes ServiceAccount name values
-// (DNS-1123 subdomain, at most 253 characters).
+// kubernetesServiceAccountMappingsSchema is the JSON type of
+// kubernetes_service_account_mappings (an object of string values). The
+// value rules of settings-v1.schema.json (lowercase GCP service account
+// email keys, Kubernetes ServiceAccount name values) are checked on save
+// by config.RuntimeSaveChecks, which refuses a value the save sets and only
+// warns about one already stored (ptone/scion#6580), so they are not in
+// the section schema: there they would refuse every save that carries a
+// stored invalid value.
 func kubernetesServiceAccountMappingsSchema() map[string]interface{} {
 	return map[string]interface{}{
-		"type": "object",
-		"propertyNames": map[string]interface{}{
-			"pattern": `^[a-z0-9]([a-z0-9-]*[a-z0-9])?@([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+gserviceaccount\.com$`,
-		},
-		"additionalProperties": map[string]interface{}{
-			"type":      "string",
-			"pattern":   `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`,
-			"maxLength": 253,
-		},
+		"type":                 "object",
+		"additionalProperties": map[string]interface{}{"type": "string"},
 	}
 }
 
-// kubernetesBlockServiceAccountSchema mirrors kubernetes_block_service_account
-// in settings-v1.schema.json: empty, or a Kubernetes ServiceAccount name.
+// kubernetesBlockServiceAccountSchema is the JSON type of
+// kubernetes_block_service_account; its name rule is a save check, as for
+// kubernetesServiceAccountMappingsSchema.
 func kubernetesBlockServiceAccountSchema() map[string]interface{} {
-	return map[string]interface{}{
-		"type":      "string",
-		"pattern":   `^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`,
-		"maxLength": 253,
-	}
+	return map[string]interface{}{"type": "string"}
 }
 
 // profileCloneDepthSchema returns profileConfig.clone_depth from the
@@ -165,9 +152,9 @@ func init() {
 		},
 		{
 			Name:       "lifecycle",
-			KoanfPaths: []string{"server.hub.auto_suspend_stalled", "server.hub.stalled_threshold", "server.hub.soft_delete_retention", "server.hub.soft_delete_retain_files", "server.hub.start_claim_lease_ttl", "server.hub.start_max_duration", "server.hub.start_unconfirmed_hold", "server.hub.start_create_unconfirmed_hold"},
+			KoanfPaths: []string{"server.hub.auto_suspend_stalled", "server.hub.stalled_threshold", "server.hub.auto_suspend_idle", "server.hub.idle_suspend_after", "server.hub.soft_delete_retention", "server.hub.soft_delete_retain_files", "server.hub.start_claim_lease_ttl", "server.hub.start_max_duration", "server.hub.start_unconfirmed_hold", "server.hub.start_create_unconfirmed_hold"},
 			New:        func() any { return &LifecycleSettings{} },
-			Durations:  []string{"server.hub.stalled_threshold", "server.hub.soft_delete_retention", "server.hub.start_claim_lease_ttl", "server.hub.start_max_duration", "server.hub.start_unconfirmed_hold", "server.hub.start_create_unconfirmed_hold"},
+			Durations:  []string{"server.hub.stalled_threshold", "server.hub.idle_suspend_after", "server.hub.soft_delete_retention", "server.hub.start_claim_lease_ttl", "server.hub.start_max_duration", "server.hub.start_unconfirmed_hold", "server.hub.start_create_unconfirmed_hold"},
 		},
 		{
 			// maintenance is durable via DB but has no settings.yaml representation.
@@ -240,6 +227,13 @@ func init() {
 			RestartRequired: []string{config.HubMetricsEnabledKey, config.HubTracingEnabledKey},
 		},
 		{
+			// branding holds Hub-wide UI branding settings (server.hub.branding),
+			// applied live across replicas via OperationalSettings.
+			Name:       BrandingSectionName,
+			KoanfPaths: BrandingKoanfPaths,
+			New:        func() any { return &BrandingSettings{} },
+		},
+		{
 			Name: "agent_secrets",
 			KoanfPaths: []string{
 				"agent_secrets.user_scope_only",
@@ -264,7 +258,7 @@ func init() {
 		},
 		{
 			Name:       "endpoints",
-			KoanfPaths: []string{"server.hub.public_url", "server.hub.hub_name", "image_registry", "server.hub.monitoring_dashboard_url"},
+			KoanfPaths: []string{"server.hub.public_url", "server.hub.hub_name", "server.hub.content_url", "server.hub.content_url_allow_same_site", "image_registry", "server.hub.monitoring_dashboard_url"},
 			New:        func() any { return &EndpointsSettings{} },
 			// public_url is resolved into the hub endpoint at startup.
 			RestartRequired: []string{"server.hub.public_url"},
@@ -274,7 +268,8 @@ func init() {
 			KoanfPaths: []string{
 				"server.github_app", "server.github_app.app_id", "server.github_app.api_base_url",
 				"server.github_app.webhooks_enabled", "server.github_app.installation_url",
-				"server.github_app.private_key_path",
+				"server.github_app.private_key_path", "server.github_app.app_slug",
+				"server.github_app.command_mention_aliases",
 			},
 			New: func() any { return &GitHubAppSettings{} },
 			// The agent dispatcher sets up its GitHub App token minter at
@@ -371,6 +366,15 @@ func init() {
 			Name:       AgentDelegationPolicySectionName,
 			KoanfPaths: nil,
 			New:        func() any { return &AgentDelegationPolicySettings{} },
+		},
+		{
+			// chat_retention is durable via DB but has no settings.yaml
+			// representation; it is written through PUT
+			// /api/v1/admin/chat-retention. Absent DB row = retention off,
+			// no window. Seeding skips this section (KoanfPaths nil).
+			Name:       ChatRetentionSectionName,
+			KoanfPaths: nil,
+			New:        func() any { return &ChatRetentionSettings{} },
 		},
 	}
 
@@ -528,6 +532,8 @@ func compileSchemas() {
 			"properties": map[string]interface{}{
 				"auto_suspend_stalled":          getSchemaProperty(root, "server", "hub", "auto_suspend_stalled"),
 				"stalled_threshold":             getSchemaProperty(root, "server", "hub", "stalled_threshold"),
+				"auto_suspend_idle":             getSchemaProperty(root, "server", "hub", "auto_suspend_idle"),
+				"idle_suspend_after":            getSchemaProperty(root, "server", "hub", "idle_suspend_after"),
 				"soft_delete_retention":         getSchemaProperty(root, "server", "hub", "soft_delete_retention"),
 				"soft_delete_retain_files":      getSchemaProperty(root, "server", "hub", "soft_delete_retain_files"),
 				"start_claim_lease_ttl":         getSchemaProperty(root, "server", "hub", "start_claim_lease_ttl"),
@@ -563,6 +569,7 @@ func compileSchemas() {
 				"offload_threshold_runes":         map[string]interface{}{"type": "integer", "minimum": 0},
 				"attachment_delivery_max_bytes":   map[string]interface{}{"type": "integer", "minimum": 0},
 				"attachment_inbox_retention_days": map[string]interface{}{"type": "integer", "minimum": 1},
+				"failed_message_retention_days":   map[string]interface{}{"type": "integer", "minimum": 1},
 			},
 			"additionalProperties": false,
 		},
@@ -574,6 +581,8 @@ func compileSchemas() {
 		// hub_observability is derived from settings-v1.schema.json
 		// (server.hub.observability) like the sections above.
 		"hub_observability": schemaObject(getSchemaProperty(root, "server", "hub", "observability")),
+		// branding is derived from settings-v1.schema.json (server.hub.branding).
+		BrandingSectionName: schemaObject(getSchemaProperty(root, "server", "hub", "branding")),
 		"quotas":            schemaObject(getSchemaProperty(root, "quotas")),
 		"agent_secrets":     schemaObject(getSchemaProperty(root, "agent_secrets")),
 		// gcp_iam schema is hand-written -- the keys have no definition in
@@ -627,6 +636,9 @@ func compileSchemas() {
 		// agent_delegation_policy schema is hand-written -- runtime state
 		// with no $defs in settings-v1.schema.json.
 		AgentDelegationPolicySectionName: agentDelegationPolicySchema(),
+		// chat_retention schema is hand-written -- runtime state with no
+		// $defs in settings-v1.schema.json.
+		ChatRetentionSectionName: chatRetentionSchema(),
 		"artifacts": {
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -670,10 +682,12 @@ func compileSchemas() {
 		"endpoints": {
 			"type": "object",
 			"properties": map[string]interface{}{
-				"public_url":               getSchemaProperty(root, "server", "hub", "public_url"),
-				"hub_name":                 getSchemaProperty(root, "server", "hub", "hub_name"),
-				"image_registry":           getSchemaProperty(root, "image_registry"),
-				"monitoring_dashboard_url": getSchemaProperty(root, "server", "hub", "monitoring_dashboard_url"),
+				"public_url":                  getSchemaProperty(root, "server", "hub", "public_url"),
+				"hub_name":                    getSchemaProperty(root, "server", "hub", "hub_name"),
+				"content_url":                 getSchemaProperty(root, "server", "hub", "content_url"),
+				"content_url_allow_same_site": getSchemaProperty(root, "server", "hub", "content_url_allow_same_site"),
+				"image_registry":              getSchemaProperty(root, "image_registry"),
+				"monitoring_dashboard_url":    getSchemaProperty(root, "server", "hub", "monitoring_dashboard_url"),
 			},
 			"additionalProperties": false,
 		},
@@ -697,7 +711,7 @@ func compileSchemas() {
 					"sync":                        map[string]interface{}{"type": "string"},
 					"gke":                         map[string]interface{}{"type": "boolean"},
 					"list_all_namespaces":         map[string]interface{}{"type": "boolean"},
-					"priority_class_name":         map[string]interface{}{"type": "string", "maxLength": 253, "pattern": dns1123SubdomainOrEmptyPattern},
+					"priority_class_name":         map[string]interface{}{"type": "string"}, // name rule: config.RuntimeSaveChecks
 					"cloudrun":                    map[string]interface{}{"type": "object"},
 					"shared_dir_storage_class":    map[string]interface{}{"type": "string"},
 					"shared_dir_size":             map[string]interface{}{"type": "string"},
@@ -709,6 +723,28 @@ func compileSchemas() {
 
 					// GCP identity "assign" on Kubernetes.
 					"kubernetes_service_account_mappings": kubernetesServiceAccountMappingsSchema(),
+
+					// Kubernetes placement and identity (ptone/scion#6580): the
+					// JSON types of settings-v1.schema.json's runtimeConfig
+					// (pinned by TestRuntimesSectionSchema_KubernetesFieldTypes).
+					// The value rules (label syntax, toleration operators and
+					// effects, DNS-1123 names) are checked on save by
+					// config.RuntimeSaveChecks, which refuses a value the save
+					// sets and only warns about one already stored, so a stored
+					// value never blocks an unrelated save.
+					"node_selector":                    map[string]interface{}{"type": "object", "additionalProperties": map[string]interface{}{"type": "string"}},
+					"tolerations":                      map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "object"}},
+					"runtime_class_name":               map[string]interface{}{"type": "string"},
+					"kubernetes_block_service_account": map[string]interface{}{"type": "string"},
+
+					// Workload Identity pool reported to the hub for binding
+					// at mint (ptone/scion#3329 phase 5). Value rule:
+					// config.ValidateWorkloadIdentityPool.
+					"workload_identity_pool": map[string]interface{}{"type": "string", "pattern": config.WorkloadIdentityPoolPattern},
+
+					// Opt-in broker creation of conventional Kubernetes
+					// ServiceAccounts for Hub-minted GSAs (ptone/scion#7966).
+					"create_service_accounts": map[string]interface{}{"type": "boolean"},
 				},
 			},
 		},
@@ -723,6 +759,7 @@ func compileSchemas() {
 					"default_template":       map[string]interface{}{"type": "string"},
 					"default_harness_config": map[string]interface{}{"type": "string"},
 					"image_registry":         map[string]interface{}{"type": "string"},
+					"image_tag":              map[string]interface{}{"type": "string", "pattern": config.ImageTagSettingPattern},
 					"volumes":                map[string]interface{}{"type": "array"},
 					"resources":              map[string]interface{}{"type": "object"},
 					"harness_overrides": map[string]interface{}{
@@ -1056,9 +1093,10 @@ func buildNotificationsSchema() map[string]interface{} {
 	}
 }
 
-// Validate validates a section document (JSON) against the section's schema.
-// Returns nil if valid, or a list of ValidationErrors on failure.
-func Validate(section string, doc json.RawMessage) []config.ValidationError {
+// ValidateSchema validates a section document (JSON) against the section's
+// JSON schema only, without cross-field semantic rules. Used when checking
+// carried-forward keys individually during partial deep-merge updates.
+func ValidateSchema(section string, doc json.RawMessage) []config.ValidationError {
 	if schemaCompileErr != nil {
 		return []config.ValidationError{{Message: schemaCompileErr.Error()}}
 	}
@@ -1080,23 +1118,50 @@ func Validate(section string, doc json.RawMessage) []config.ValidationError {
 	if err != nil {
 		return extractValidationErrors(err)
 	}
+	return nil
+}
+
+// Validate validates a section document (JSON) against the section's schema
+// and any cross-field semantic rules. Returns nil if valid, or a list of
+// ValidationErrors on failure.
+func Validate(section string, doc json.RawMessage) []config.ValidationError {
+	if errs := ValidateSchema(section, doc); len(errs) > 0 {
+		return errs
+	}
 	return validateCrossField(section, doc)
 }
 
 // validateCrossField applies the rules a JSON schema cannot express, so a
 // write that would leave a section unusable is refused instead of stored.
 func validateCrossField(section string, doc json.RawMessage) []config.ValidationError {
-	if section != "artifacts" {
+	switch section {
+	case "artifacts":
+		cfg, err := ParseArtifactsDoc(doc)
+		if err != nil {
+			return []config.ValidationError{{Message: err.Error()}}
+		}
+		if cfg.RemoteImagesInvalid != "" {
+			return []config.ValidationError{{Message: "artifacts settings: " + cfg.RemoteImagesInvalid}}
+		}
+		return nil
+	case BrandingSectionName:
+		var cfg config.BrandingConfig
+		if err := json.Unmarshal(doc, &cfg); err != nil {
+			return []config.ValidationError{{Message: fmt.Sprintf("invalid branding JSON: %v", err)}}
+		}
+		errs := config.ValidateBranding(&cfg)
+		prefix := config.BrandingSectionKey + "."
+		for i := range errs {
+			if errs[i].Path == config.BrandingSectionKey {
+				errs[i].Path = ""
+			} else {
+				errs[i].Path = strings.TrimPrefix(errs[i].Path, prefix)
+			}
+		}
+		return errs
+	default:
 		return nil
 	}
-	cfg, err := ParseArtifactsDoc(doc)
-	if err != nil {
-		return []config.ValidationError{{Message: err.Error()}}
-	}
-	if cfg.RemoteImagesInvalid != "" {
-		return []config.ValidationError{{Message: "artifacts settings: " + cfg.RemoteImagesInvalid}}
-	}
-	return nil
 }
 
 func extractValidationErrors(err error) []config.ValidationError {

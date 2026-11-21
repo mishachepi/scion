@@ -976,11 +976,13 @@ func TestProjectRoles_AttachAndPortAccessLockIn(t *testing.T) {
 	// R6/R6/R5 added artifact.read and artifact.create; R8/R7 added agent
 	// delegation grant management for project-bounded grants; R9/R8 added
 	// project.manage_visitors; owner R10 added artifact.steward;
-	// R11/R9/R6 added project.chat_post.
+	// R11/R9/R6 added project.chat_post; R12/R10/R7 added github_trigger.{comment,configure};
+	// R13/R11/R8 added trigger.* and webhook_endpoint.* (ptone/scion#8028);
+	// R14/R12/R9 added message policy permissions (ptone/scion#8047).
 	revisions := map[string]int{
-		store.ProjectRoleOwner:  11,
-		store.ProjectRoleAdmin:  9,
-		store.ProjectRoleMember: 6,
+		store.ProjectRoleOwner:  14,
+		store.ProjectRoleAdmin:  12,
+		store.ProjectRoleMember: 9,
 	}
 	portAccess := map[string]bool{
 		store.ProjectRoleOwner: true,

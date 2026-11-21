@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"slices"
 	"sort"
 	"strings"
 
@@ -65,13 +66,18 @@ import (
 // AppliedConfig, or a workspace storage timeout from deriveAgentConfig,
 // which wraps errWorkspaceStorageUnavailable).
 func (s *Server) buildFreshAppliedConfig(ctx context.Context, agent *store.Agent, project *store.Project, imageRegistry string) (*store.AgentAppliedConfig, []string, error) {
-	return s.buildPatchedAppliedConfig(ctx, agent, project, fixedImageRegistry(imageRegistry), nil)
+	return s.buildPatchedAppliedConfig(ctx, agent, project, fixedImageRegistry(imageRegistry), nil, nil)
 }
 
 // imageRegistryResolver returns the registry the hub rewrites an agent's
 // explicit image to for the new generation's profile ("" = no rewrite). It
 // is bound to the broker the new generation runs on (ptone/scion#3916).
 type imageRegistryResolver func(profile string) string
+
+// imageTagResolver returns the image_tag the hub applies to an agent's
+// images for the new generation's profile ("" = none), bound to the broker
+// the new generation runs on (ptone/scion#6625). Nil = none.
+type imageTagResolver func(profile string) string
 
 // fixedImageRegistry is an imageRegistryResolver that ignores the profile.
 func fixedImageRegistry(registry string) imageRegistryResolver {
@@ -86,9 +92,10 @@ func fixedImageRegistry(registry string) imageRegistryResolver {
 // Role and GCPIdentity replace the kept values. A nil patch is exactly
 // buildFreshAppliedConfig. agent.AppliedConfig is never mutated.
 //
-// resolveRegistry is called once the new generation's profile is settled,
-// so the stored image is rewritten for that profile and the target broker.
-func (s *Server) buildPatchedAppliedConfig(ctx context.Context, agent *store.Agent, project *store.Project, resolveRegistry imageRegistryResolver, patch *reincarnatePatch) (*store.AgentAppliedConfig, []string, error) {
+// resolveRegistry and resolveTag (nil = no tag) are called once the new
+// generation's profile is settled, so the stored image is rewritten for
+// that profile and the target broker.
+func (s *Server) buildPatchedAppliedConfig(ctx context.Context, agent *store.Agent, project *store.Project, resolveRegistry imageRegistryResolver, resolveTag imageTagResolver, patch *reincarnatePatch) (*store.AgentAppliedConfig, []string, error) {
 	old := agent.AppliedConfig
 	if old == nil {
 		return nil, nil, fmt.Errorf("agent %s has no applied config", agent.ID)
@@ -121,7 +128,21 @@ func (s *Server) buildPatchedAppliedConfig(ctx context.Context, agent *store.Age
 		// A copy: createInputs may be the outgoing generation's own record
 		// (old.CreateInputs, also saved as PreviousAppliedConfig).
 		createInputs = cloneCreateInputs(createInputs)
-		recordReincarnatePatchEdits(createInputs, patch)
+		dropped := recordReincarnatePatchEdits(createInputs, patch)
+		if dropped.Image != "" {
+			warnings = append(warnings, fmt.Sprintf("explicit image %s dropped (images are harness-specific); pass --image to pin one", dropped.Image))
+		}
+		if dropped.Model != "" {
+			warnings = append(warnings, fmt.Sprintf("explicit model %s dropped (models are harness-specific); pass --model to set one", dropped.Model))
+		}
+		for _, f := range dropped.Fields {
+			warnings = append(warnings, fmt.Sprintf("explicit %s dropped (it belongs to the previous harness)", f))
+		}
+		if patch.HarnessConfig != nil {
+			if w := s.templateForeignHarnessDirWarning(ctx, agent, resolvedTemplate, patch.HarnessConfig.Harness); w != "" {
+				warnings = append(warnings, w)
+			}
+		}
 	}
 
 	fresh := &store.AgentAppliedConfig{
@@ -340,8 +361,14 @@ func (s *Server) buildPatchedAppliedConfig(ctx context.Context, agent *store.Age
 	// rewrites every image to its registry at send time and the broker echoes
 	// that form back. RewriteImageRegistry is a no-op for an empty registry
 	// and for an already-qualified name. The registry is the one for the
-	// new generation's profile on the broker it runs on.
-	fresh.Image = config.RewriteImageRegistry(fresh.Image, resolveRegistry(fresh.Profile))
+	// new generation's profile on the broker it runs on. The image_tag
+	// for that profile and broker is applied first (RewriteImageRef), as
+	// the dispatcher and the broker apply it (ptone/scion#6625).
+	tag := ""
+	if resolveTag != nil {
+		tag = resolveTag(fresh.Profile)
+	}
+	fresh.Image = config.RewriteImageRef(fresh.Image, resolveRegistry(fresh.Profile), tag)
 
 	// deriveAgentConfig's timezone capture already stripped TZ from the
 	// fresh env copies; strip again so no step after it can leave one.
@@ -409,6 +436,12 @@ type imageRegistryProvider interface {
 	ImageRegistryFor(brokerID, profile string) string
 }
 
+// imageTagProvider is implemented by dispatchers that apply image_tag to
+// the images they send (ptone/scion#6625).
+type imageTagProvider interface {
+	ImageTagFor(brokerID, profile string) string
+}
+
 // agentImageRegistryTarget returns the broker and profile an agent's image
 // registry is resolved for: its runtime broker and its saved profile.
 func agentImageRegistryTarget(agent *store.Agent) (brokerID, profile string) {
@@ -445,6 +478,18 @@ func dispatchImageRegistryForTarget(dispatcher AgentDispatcher, brokerID, profil
 func reincarnateImageRegistry(dispatcher AgentDispatcher, brokerID string) imageRegistryResolver {
 	return func(profile string) string {
 		return dispatchImageRegistryForTarget(dispatcher, brokerID, profile)
+	}
+}
+
+// reincarnateImageTag returns the image_tag resolver for a reincarnation's
+// new generation on brokerID, as reincarnateImageRegistry does for the
+// registry.
+func reincarnateImageTag(dispatcher AgentDispatcher, brokerID string) imageTagResolver {
+	return func(profile string) string {
+		if p, ok := dispatcher.(imageTagProvider); ok {
+			return p.ImageTagFor(brokerID, profile)
+		}
+		return ""
 	}
 }
 
@@ -570,9 +615,6 @@ func computeReincarnationPlan(old, fresh *store.AgentAppliedConfig, warnings []s
 		EnvKeys:    diffEnvKeys(old.Env, fresh.Env),
 		Branch:     fresh.Branch,
 		Warnings:   warnings,
-
-		SharedDirBackends:   fresh.SharedDirBackendChanges,
-		AllowEmptySharedDir: fresh.AllowEmptySharedDir,
 	}
 	if old.Image != "" && config.RewriteImageRegistry(old.Image, imageRegistry) == fresh.Image {
 		plan.Image.Old = fresh.Image
@@ -601,3 +643,89 @@ func diffEnvKeys(oldEnv, newEnv map[string]string) KeyDiff {
 	sort.Strings(diff.Changed)
 	return diff
 }
+
+// templateForeignHarnessDirWarning is a best-effort plan warning for a
+// harness switch (ptone/scion#7757 §3.3.3): the agent's template ships files
+// in its home under the config dir of the harness the agent leaves, which
+// the new harness does not use. It never blocks, and returns "" when the
+// template manifest is unknown or nothing matches.
+func (s *Server) templateForeignHarnessDirWarning(ctx context.Context, agent *store.Agent, tmpl *store.Template, targetHarness string) string {
+	if tmpl == nil || len(tmpl.Files) == 0 {
+		return ""
+	}
+	oldHarness := s.resolveAgentHarnessType(ctx, agent)
+	if oldHarness == "" || oldHarness == targetHarness {
+		return ""
+	}
+	oldDir := harness.New(oldHarness).DefaultConfigDir()
+	if oldDir == "" || oldDir == ".scion" || oldDir == harness.New(targetHarness).DefaultConfigDir() {
+		return ""
+	}
+	prefix := "home/" + strings.Trim(oldDir, "/") + "/"
+	for _, f := range tmpl.Files {
+		if strings.HasPrefix(f.Path, prefix) {
+			return fmt.Sprintf("template %s ships files under %s, the config dir of harness %s; the new harness %s does not use them",
+				tmpl.Slug, oldDir, oldHarness, targetHarness)
+		}
+	}
+	return ""
+}
+
+// resetHomeRuntimeRefusal returns the 412 message for a harness switch on
+// runtime rt, which resets the agent's home, when the broker cannot reset a
+// home there (supported is its ReprovisionResetHomeRuntimes), or "" when it
+// can (ptone/scion#7757). An empty runtime is refused.
+func resetHomeRuntimeRefusal(rt string, supported []string) string {
+	switch {
+	case rt == "":
+		return "cannot determine the agent's runtime, so its home cannot be reset; --harness is refused"
+	case rt == "cloudrun-sandbox" || rt == "substrate":
+		return fmt.Sprintf("--harness (a home reset) is not supported on runtime %s", rt)
+	case !slices.Contains(supported, rt):
+		return fmt.Sprintf("runtime broker cannot reset an agent home on runtime %s; upgrade the broker", rt)
+	}
+	return ""
+}
+
+// reincarnateHomeResetWarning is the plan's first warning on a harness
+// switch: the agent's home is lost (ptone/scion#7757; warning only, no
+// acknowledgment).
+func reincarnateHomeResetWarning(newHarnessConfig string, unchanged bool) string {
+	head := "HOME RESET: the agent's home directory will be deleted and rebuilt for harness config " + newHarnessConfig + "."
+	if unchanged {
+		head = "HOME RESET: harness config " + newHarnessConfig + " is unchanged; the agent's home directory will still be deleted and rebuilt."
+	}
+	return head + " Lost: the harness session and transcripts, harness memory edits, skills/tools/caches the agent " +
+		"installed in $HOME, shell history and dotfile edits. There is no rollback. " +
+		"Kept: the workspace and branch, hub conversations and history, and the handoff, which is the " +
+		"only continuity into the new generation."
+}
+
+// addHarnessSwitchToPlan adds a harness switch to plan: the harness-config
+// name change, the harness auth change (always shown on a switch),
+// HomeReset, and the home-reset warning ahead of every other warning.
+// A nil or non-switching patch leaves plan unchanged.
+func addHarnessSwitchToPlan(plan *ReincarnationPlan, old, fresh *store.AgentAppliedConfig, patch *reincarnatePatch) {
+	if patch == nil || patch.HarnessConfig == nil {
+		return
+	}
+	oldName := ""
+	if old != nil {
+		oldName = old.HarnessConfig
+	}
+	plan.Harness = &FieldChange{Old: oldName, New: fresh.HarnessConfig}
+	oldAuth := ""
+	if old != nil {
+		oldAuth = old.HarnessAuth
+	}
+	plan.HarnessAuth = &FieldChange{Old: oldAuth, New: fresh.HarnessAuth}
+	plan.HomeReset = true
+	if fresh.NoAuth && fresh.CreateInputs != nil && fresh.CreateInputs.NoAuth {
+		plan.Warnings = append(plan.Warnings, reincarnateSwitchNoAuthKeptWarning)
+	}
+	plan.Warnings = append([]string{reincarnateHomeResetWarning(fresh.HarnessConfig, oldName == fresh.HarnessConfig)}, plan.Warnings...)
+}
+
+// reincarnateSwitchNoAuthKeptWarning is the plan warning for a harness
+// switch of an agent whose create-time no-credentials request is kept.
+const reincarnateSwitchNoAuthKeptWarning = "the agent keeps running with no injected credentials on the new harness: it was created with --no-auth or role none, and reincarnate keeps that setting"

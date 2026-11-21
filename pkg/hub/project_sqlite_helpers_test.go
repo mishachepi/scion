@@ -786,13 +786,20 @@ func createTestGitProject(t *testing.T, srv *Server, name, remote string) *store
 	return &project
 }
 
-// addSharedDirToProject adds a shared directory to a project via the API.
+// addSharedDirToProject declares a shared directory on a project in the
+// store, without creating its leaf: the fixture state of a declared shared
+// dir whose backing directory does not exist yet, which tests then lay out
+// (or plant symlinks in) themselves. POST /shared-dirs also creates the
+// leaf (ptone/scion#5834); tests of that call the endpoint directly.
 func addSharedDirToProject(t *testing.T, srv *Server, projectID, dirName string) {
 	t.Helper()
-	rec := doRequest(t, srv, http.MethodPost, fmt.Sprintf("/api/v1/projects/%s/shared-dirs", projectID), map[string]interface{}{
-		"name": dirName,
-	})
-	require.Equal(t, http.StatusCreated, rec.Code, "body: %s", rec.Body.String())
+	ctx := context.Background()
+	project, err := srv.store.GetProject(ctx, projectID)
+	require.NoError(t, err)
+	sd := api.SharedDir{Name: dirName}
+	require.NoError(t, api.ValidateSharedDirs([]api.SharedDir{sd}))
+	project.SharedDirs = append(project.SharedDirs, sd)
+	require.NoError(t, srv.store.UpdateProject(ctx, project))
 }
 
 // setNFSSharedDirStorageGlobalSettings writes a global settings.yaml with
@@ -827,12 +834,17 @@ server:
 	return hostBase
 }
 
-// useNFSSharedDirStorage gives srv the server.shared_dir_storage block that
-// setNFSSharedDirStorageGlobalSettings wrote, the way the hub holds it after
-// loading its server config at startup: the shared-dir browser reads only
-// the in-memory ServerConfig, never the settings file per request.
+// useNFSSharedDirStorage gives srv the storage configuration a hub with
+// only the server.shared_dir_storage nfs block (the one
+// setNFSSharedDirStorageGlobalSettings writes) resolves to at startup: the
+// transitional split, with shared dirs on that export and workspaces on the
+// local backend (config.SynthesizeProjectStorage). The shared-dir browser
+// reads only this in-memory ServerConfig, never the settings file per
+// request.
 func useNFSSharedDirStorage(srv *Server, hostBase string) {
-	srv.config.SharedDirStorageConfig = nfsSharedDirStorageTestConfig(hostBase)
+	srv.config.ProjectStorageConfig = &config.V1ProjectStorageConfig{
+		LegacySharedDirsNFS: nfsSharedDirStorageTestConfig(hostBase).NFS,
+	}
 }
 
 // nfsSharedDirStorageTestConfig is the in-memory form of the block
@@ -847,10 +859,11 @@ func nfsSharedDirStorageTestConfig(hostBase string) *config.V1SharedDirStorageCo
 	}
 }
 
-// invalidNFSSharedDirStorageTestConfig is an nfs block that fails
-// V1SharedDirStorageConfig.Validate (no mount_root).
-func invalidNFSSharedDirStorageTestConfig() *config.V1SharedDirStorageConfig {
-	return &config.V1SharedDirStorageConfig{
+// invalidNFSSharedDirStorageTestConfig is a server.project_storage nfs block
+// the hub cannot build a Layout from (no mount_root, so the share's host
+// base is relative).
+func invalidNFSSharedDirStorageTestConfig() *config.V1ProjectStorageConfig {
+	return &config.V1ProjectStorageConfig{
 		Backend: "nfs",
 		NFS:     &config.V1NFSConfig{Shares: []config.V1NFSShare{{ID: "nfs-export"}}},
 	}

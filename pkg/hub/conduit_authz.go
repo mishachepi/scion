@@ -16,6 +16,7 @@ package hub
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -162,6 +163,16 @@ func (s *Server) authorizeConduitAction(ctx context.Context, identity Identity, 
 	return nil
 }
 
+// conduitAgentPolicy returns the conduit.EnvPolicy value, or "" when
+// nothing is restricted.
+func (s *Server) conduitAgentPolicy() string {
+	b, _ := json.Marshal(s.config.ConduitPolicy)
+	if string(b) == "{}" {
+		return ""
+	}
+	return string(b)
+}
+
 // conduitStreamParams builds the params signed into a grant: the caller's
 // params, restricted to the stream kind's allow-list, plus the params the hub
 // sets itself. tcp allows exactly host and port from the caller; pty allows
@@ -247,11 +258,14 @@ func conduitPTYTarget(params map[string]string) error {
 }
 
 // authorizeConduitTCPTarget checks that port is an authorized agent-local
-// target: never a reserved port, and either exposed by the agent or on the
-// operator allow-list.
+// target: never a reserved port or one on the operator deny-list, and
+// either exposed by the agent or on the operator allow-list.
 func (s *Server) authorizeConduitTCPTarget(agent *store.Agent, port int) error {
 	if reason := deniedExposedPorts[port]; reason != "" {
 		return fmt.Errorf("%w: port %d is reserved for %s", errConduitForbidden, port, reason)
+	}
+	if s.config.ConduitPolicy.PortDenied(port) {
+		return fmt.Errorf("%w: port %d is denied by server.hub.conduit.deny_ports", errConduitForbidden, port)
 	}
 	if findExposedPort(agent.ExposedPorts, port) != nil || slices.Contains(s.config.ConduitTCPAllowedPorts, port) {
 		return nil
@@ -424,6 +438,9 @@ func (s *Server) mintConduitGrant(ctx context.Context, req conduitGrantRequest) 
 	if err != nil {
 		return nil, nil, err
 	}
+	if req.Stream.Kind == grant.StreamKindSSH && s.config.ConduitPolicy.DisableSSH {
+		return nil, nil, fmt.Errorf("%w: ssh is disabled by server.hub.conduit.disable_ssh", errConduitForbidden)
+	}
 	if req.Stream.Kind == grant.StreamKindTCP {
 		port, err := conduitTCPTarget(params, req.Target.Kind == grant.TargetKindBroker)
 		if err != nil {
@@ -534,6 +551,11 @@ type conduitRenewalRequest struct {
 	// inconsistency: unavailable, logged at error level (design v2.21.40
 	// §3.9, Session binding).
 	RelayHeld bool
+	// SessionGen is the session generation the stream's user session was
+	// authenticated with, when SessionGenSet: the re-check then also
+	// requires it to be the user row's current one (conduitUserStatus).
+	SessionGen    int64
+	SessionGenSet bool
 }
 
 // conduitRenewal is a minted renewal grant and the deadline it carries.
@@ -616,10 +638,20 @@ func (s *Server) renewConduitStream(ctx context.Context, req conduitRenewalReque
 		}
 	}
 
+	// The rebuilt identity carries the session generation the stream's
+	// session was authenticated with, which the user-status check compares
+	// with the user row (conduit_session_generation.go).
+	renewalIdentity := func() (Identity, error) {
+		ident, err := s.conduitRenewalIdentity(ctx, c, userID)
+		if err != nil || !req.SessionGenSet {
+			return ident, err
+		}
+		return conduitIdentityWithSessionGeneration(ident, req.SessionGen), nil
+	}
 	if verdict, _, err := s.evaluateConduitStream(ctx, conduitStreamEval{
 		AgentID:     target.ID,
 		ProjectID:   c.ProjectID,
-		Identity:    func() (Identity, error) { return s.conduitRenewalIdentity(ctx, c, userID) },
+		Identity:    renewalIdentity,
 		Kind:        c.Stream.Kind,
 		ViaTunnel:   c.Via == grant.ViaTunnel,
 		Port:        port,
@@ -694,7 +726,7 @@ func (s *Server) conduitRenewalIdentity(ctx context.Context, c *grant.RecheckCla
 	}
 	var ident UserIdentity
 	if devUser {
-		ident = NewDevUser(s.authConfig.DevUserCfg)
+		ident = s.authConfig.currentDevUser()
 	} else {
 		ident = NewAuthenticatedUser(user.ID, user.Email, user.DisplayName, user.Role, "")
 	}

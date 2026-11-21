@@ -154,6 +154,33 @@ func (m *mockUATStore) CountUserAccessTokens(_ context.Context, userID string) (
 	return count, nil
 }
 
+func (m *mockUATStore) RevokeUserAccessTokensForUser(_ context.Context, userID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, t := range m.tokens {
+		if t.UserID == userID && !t.Revoked {
+			t.Revoked = true
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (m *mockUATStore) RevokeUserAccessTokensForUserProject(_ context.Context, userID, projectID string) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ids := []string{}
+	for _, t := range m.tokens {
+		if t.UserID == userID && t.ProjectID == projectID &&
+			t.BoundaryKind == string(permissions.BoundaryKindProject) && !t.Revoked {
+			t.Revoked = true
+			ids = append(ids, t.ID)
+		}
+	}
+	return ids, nil
+}
+
 func (m *mockUATStore) DeleteUserAccessTokensByProject(_ context.Context, projectID string) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

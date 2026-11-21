@@ -17,6 +17,7 @@ package hub
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -27,7 +28,7 @@ import (
 
 // CreateScheduledEventRequest is the API request for creating a scheduled event.
 type CreateScheduledEventRequest struct {
-	EventType string `json:"eventType"`         // Required: "message" or "dispatch_agent"
+	EventType string `json:"eventType"`         // Required: "message", "dispatch_agent" or "exec"
 	FireAt    string `json:"fireAt,omitempty"`  // ISO 8601 absolute time
 	FireIn    string `json:"fireIn,omitempty"`  // Duration string (e.g. "30m")
 	Payload   string `json:"payload,omitempty"` // Raw JSON payload (advanced)
@@ -38,6 +39,8 @@ type CreateScheduledEventRequest struct {
 	Message   string `json:"message,omitempty"`
 	Interrupt bool   `json:"interrupt,omitempty"`
 	Plain     bool   `json:"plain,omitempty"`
+	// Wake resumes a suspended target before delivery (ptone/scion#7734).
+	Wake bool `json:"wake,omitempty"`
 
 	// There is no top-level raw convenience field. This request surface
 	// never accepted one: a "raw" key here is an unknown field that JSON
@@ -51,19 +54,21 @@ type CreateScheduledEventRequest struct {
 	Template string `json:"template,omitempty"`
 	Task     string `json:"task,omitempty"`
 	Branch   string `json:"branch,omitempty"`
-}
+	NoAuth   bool   `json:"noAuth,omitempty"`
 
-// ScheduledEventResponse is the API response for a single scheduled event.
-type ScheduledEventResponse struct {
-	store.ScheduledEvent
+	// Convenience fields for "exec" events (ptone/scion#7883), with
+	// AgentID/AgentName: the argv and its timeout (0: 60 seconds).
+	Command        []string `json:"command,omitempty"`
+	TimeoutSeconds int      `json:"timeoutSeconds,omitempty"`
 }
 
 // ListScheduledEventsResponse is the API response for listing scheduled events.
 type ListScheduledEventsResponse struct {
-	Events     []store.ScheduledEvent `json:"events"`
-	NextCursor string                 `json:"nextCursor,omitempty"`
-	TotalCount int                    `json:"totalCount,omitempty"`
-	ServerTime time.Time              `json:"serverTime"`
+	Scope      string                   `json:"scope,omitempty"`
+	Events     []ScheduledEventResponse `json:"events"`
+	NextCursor string                   `json:"nextCursor,omitempty"`
+	TotalCount int                      `json:"totalCount,omitempty"`
+	ServerTime time.Time                `json:"serverTime"`
 }
 
 // authorizeScheduledEventAccess is the project-level gate the scheduled-event
@@ -96,6 +101,8 @@ func (s *Server) authorizeScheduledEventRow(w http.ResponseWriter, r *http.Reque
 	logAuthzDenial(r, identity, scheduledEventResource(projectID), action, d.reason)
 	if d.byPolicy {
 		writeForbidden(w, "You don't have permission to access scheduled events in this project")
+	} else if d.notHeldByAgent {
+		writeForbidden(w, "Schedule or scheduled event is not visible to this agent (agent callers can only access schedules and events they hold)")
 	} else {
 		writeForbidden(w, "")
 	}
@@ -108,8 +115,11 @@ type scheduledEventAccess struct {
 	// reason is logged for a denial.
 	reason string
 	// byPolicy is true when the authorization service denied the request,
-	// the one denial authorizeScheduledEventRow explains to the caller.
+	// the one user denial authorizeScheduledEventRow explains to the caller.
 	byPolicy bool
+	// notHeldByAgent is true when an agent caller addressed a row in its
+	// project whose authority is held by another principal (or legacy unknown).
+	notHeldByAgent bool
 }
 
 // scheduledEventRow is the row a scheduled-event decision is about: a
@@ -178,7 +188,10 @@ func (s *Server) scheduledEventAccessDecision(ctx context.Context, projectID str
 			return scheduledEventAccess{reason: "agent callers do not edit schedule definitions"}
 		}
 		if !s.agentHoldsScheduledRow(identity, row.attribution) {
-			return scheduledEventAccess{reason: "agent does not hold authority for this scheduled row"}
+			return scheduledEventAccess{
+				reason:         "agent does not hold authority for this scheduled row",
+				notHeldByAgent: true,
+			}
 		}
 		return scheduledEventAccess{allowed: true}
 
@@ -307,6 +320,7 @@ func (s *Server) handleScheduledEvents(w http.ResponseWriter, r *http.Request, p
 // createScheduledEvent handles POST /api/v1/projects/{projectId}/scheduled-events
 func (s *Server) createScheduledEvent(w http.ResponseWriter, r *http.Request, projectID string) {
 	var req CreateScheduledEventRequest
+	r.Body = http.MaxBytesReader(w, r.Body, scheduleRequestBodyLimit)
 	if err := readJSON(r, &req); err != nil {
 		BadRequest(w, "Invalid request body: "+err.Error())
 		return
@@ -317,8 +331,28 @@ func (s *Server) createScheduledEvent(w http.ResponseWriter, r *http.Request, pr
 		ValidationError(w, "eventType is required", nil)
 		return
 	}
-	if req.EventType != "message" && req.EventType != "dispatch_agent" {
-		ValidationError(w, fmt.Sprintf("unsupported event type: %s (supported: message, dispatch_agent)", req.EventType), nil)
+	if !s.scheduledEventTypeSupported(req.EventType) {
+		ValidationError(w, fmt.Sprintf("unsupported event type: %s (supported: %s)", req.EventType, s.supportedScheduledEventTypes()), nil)
+		return
+	}
+	if req.NoAuth && req.EventType != "dispatch_agent" {
+		ValidationError(w, "noAuth applies to dispatch_agent events only", nil)
+		return
+	}
+	if req.EventType == scheduledEventTypeExec {
+		s.createScheduledExecEvent(w, r, projectID, &req)
+		return
+	}
+	if len(req.Command) > 0 || req.TimeoutSeconds != 0 {
+		ValidationError(w, "command and timeoutSeconds apply to exec events only", nil)
+		return
+	}
+	if req.Wake && req.EventType != "message" {
+		ValidationError(w, "wake applies to message events only", nil)
+		return
+	}
+	if req.NoAuth && req.Payload != "" {
+		ValidationError(w, "give either payload or noAuth, not both", nil)
 		return
 	}
 	// The payload "raw" tombstone applies to both supported event types:
@@ -349,39 +383,9 @@ func (s *Server) createScheduledEvent(w http.ResponseWriter, r *http.Request, pr
 		}
 	}
 
-	// Validate fire time: exactly one of FireAt or FireIn must be provided
-	if req.FireAt == "" && req.FireIn == "" {
-		ValidationError(w, "either fireAt or fireIn is required", nil)
+	fireAt, ok := parseScheduledFireTime(w, &req)
+	if !ok {
 		return
-	}
-	if req.FireAt != "" && req.FireIn != "" {
-		ValidationError(w, "fireAt and fireIn are mutually exclusive", nil)
-		return
-	}
-
-	var fireAt time.Time
-	if req.FireAt != "" {
-		var err error
-		fireAt, err = time.Parse(time.RFC3339, req.FireAt)
-		if err != nil {
-			ValidationError(w, "fireAt must be a valid ISO 8601 / RFC 3339 timestamp", nil)
-			return
-		}
-		if fireAt.Before(time.Now()) {
-			ValidationError(w, "fireAt must be in the future", nil)
-			return
-		}
-	} else {
-		duration, err := time.ParseDuration(req.FireIn)
-		if err != nil {
-			ValidationError(w, "fireIn must be a valid Go duration string (e.g. 30m, 1h)", nil)
-			return
-		}
-		if duration <= 0 {
-			ValidationError(w, "fireIn must be a positive duration", nil)
-			return
-		}
-		fireAt = time.Now().Add(duration)
 	}
 
 	// Build payload
@@ -391,11 +395,16 @@ func (s *Server) createScheduledEvent(w http.ResponseWriter, r *http.Request, pr
 			ValidationError(w, "agentName is required for dispatch_agent events", nil)
 			return
 		}
+		if !templateRefAllowed(req.Template) {
+			ValidationError(w, templateRefRefusal, nil)
+			return
+		}
 		p := DispatchAgentEventPayload{
 			AgentName: req.AgentName,
 			Template:  req.Template,
 			Task:      req.Task,
 			Branch:    req.Branch,
+			NoAuth:    req.NoAuth,
 		}
 		payloadBytes, err := json.Marshal(p)
 		if err != nil {
@@ -420,6 +429,7 @@ func (s *Server) createScheduledEvent(w http.ResponseWriter, r *http.Request, pr
 			Message:   req.Message,
 			Interrupt: req.Interrupt,
 			Plain:     req.Plain,
+			Wake:      req.Wake,
 		}
 		payloadBytes, err := json.Marshal(p)
 		if err != nil {
@@ -461,26 +471,71 @@ func (s *Server) createScheduledEvent(w http.ResponseWriter, r *http.Request, pr
 		writeErrorFromErr(w, err, "")
 		return
 	}
+	s.writeCreatedScheduledEvent(w, r, evt)
+}
 
-	// Fetch the created event to get the full record (with CreatedAt etc.)
+// writeCreatedScheduledEvent writes the 201 of a created event, read back
+// for its full record (CreatedAt etc.), through the response serializer.
+func (s *Server) writeCreatedScheduledEvent(w http.ResponseWriter, r *http.Request, evt store.ScheduledEvent) {
+	rev := s.newExecRevealer(r.Context())
 	created, err := s.store.GetScheduledEvent(r.Context(), evt.ID)
 	if err != nil {
 		// Event was created successfully, but we can't fetch it back — return what we have
-		writeJSON(w, http.StatusCreated, evt)
+		writeJSON(w, http.StatusCreated, s.scheduledEventResponse(r.Context(), rev, evt))
 		return
 	}
+	writeJSON(w, http.StatusCreated, s.scheduledEventResponse(r.Context(), rev, *created))
+}
 
-	writeJSON(w, http.StatusCreated, created)
+// parseScheduledFireTime validates the request's fire time: exactly one of
+// FireAt (RFC 3339, in the future) or FireIn (a positive duration). On an
+// error it writes the 400 and returns ok=false.
+func parseScheduledFireTime(w http.ResponseWriter, req *CreateScheduledEventRequest) (time.Time, bool) {
+	if req.FireAt == "" && req.FireIn == "" {
+		ValidationError(w, "either fireAt or fireIn is required", nil)
+		return time.Time{}, false
+	}
+	if req.FireAt != "" && req.FireIn != "" {
+		ValidationError(w, "fireAt and fireIn are mutually exclusive", nil)
+		return time.Time{}, false
+	}
+	if req.FireAt != "" {
+		fireAt, err := time.Parse(time.RFC3339, req.FireAt)
+		if err != nil {
+			ValidationError(w, "fireAt must be a valid ISO 8601 / RFC 3339 timestamp", nil)
+			return time.Time{}, false
+		}
+		if fireAt.Before(time.Now()) {
+			ValidationError(w, "fireAt must be in the future", nil)
+			return time.Time{}, false
+		}
+		return fireAt, true
+	}
+	duration, err := time.ParseDuration(req.FireIn)
+	if err != nil {
+		ValidationError(w, "fireIn must be a valid Go duration string (e.g. 30m, 1h)", nil)
+		return time.Time{}, false
+	}
+	if duration <= 0 {
+		ValidationError(w, "fireIn must be a positive duration", nil)
+		return time.Time{}, false
+	}
+	return time.Now().Add(duration), true
 }
 
 // listScheduledEvents handles GET /api/v1/projects/{projectId}/scheduled-events
 func (s *Server) listScheduledEvents(w http.ResponseWriter, r *http.Request, projectID string) {
 	query := r.URL.Query()
+	scope := scheduleListScope(r.Context())
 
 	// An agent caller lists only the events it holds.
 	agentID, ok := agentListFilter(r.Context())
 	if !ok {
-		writeJSON(w, http.StatusOK, ListScheduledEventsResponse{Events: []store.ScheduledEvent{}, ServerTime: time.Now().UTC()})
+		writeJSON(w, http.StatusOK, ListScheduledEventsResponse{
+			Scope:      scope,
+			Events:     []ScheduledEventResponse{},
+			ServerTime: time.Now().UTC(),
+		})
 		return
 	}
 	filter := store.ScheduledEventFilter{
@@ -498,11 +553,21 @@ func (s *Server) listScheduledEvents(w http.ResponseWriter, r *http.Request, pro
 
 	events, totalCount := visibleScheduledRows(r.Context(), s, projectID, result.Items, result.TotalCount, scheduledEventRowOf)
 	writeJSON(w, http.StatusOK, ListScheduledEventsResponse{
-		Events:     events,
+		Scope:      scope,
+		Events:     s.scheduledEventResponses(r.Context(), s.newExecRevealer(r.Context()), events),
 		NextCursor: result.NextCursor,
 		TotalCount: totalCount,
 		ServerTime: time.Now().UTC(),
 	})
+}
+
+// scheduleListScope returns ScheduleListScopeCaller when the caller's list is
+// narrowed to rows held by the calling agent, and "" otherwise.
+func scheduleListScope(ctx context.Context) string {
+	if isAgentCaller(ctx) {
+		return ScheduleListScopeCaller
+	}
+	return ""
 }
 
 // visibleScheduledRows keeps the rows of one list page that the caller may
@@ -539,36 +604,52 @@ func agentListFilter(ctx context.Context) (agentID string, ok bool) {
 	return agentID, agentID != ""
 }
 
-// getScheduledEvent handles GET /api/v1/projects/{projectId}/scheduled-events/{id}
-func (s *Server) getScheduledEvent(w http.ResponseWriter, r *http.Request, projectID, eventID string) {
-	evt, err := s.store.GetScheduledEvent(r.Context(), eventID)
-	if err != nil {
-		writeErrorFromErr(w, err, "")
+// writeScheduledEventNotFound writes the per-ID 404 response for scheduled
+// events. Both missing IDs (including non-UUID names) and cross-project IDs
+// go through this helper so the two cases return the exact same body.
+func writeScheduledEventNotFound(w http.ResponseWriter, r *http.Request) {
+	if isAgentCaller(r.Context()) {
+		writeError(w, http.StatusNotFound, ErrCodeNotFound,
+			"Scheduled event not found (per-ID scheduled-event endpoints take an event ID; events held by another agent or user are hidden from agent lists and return 403 by ID)", nil)
 		return
 	}
+	NotFound(w, "Scheduled event")
+}
 
-	// Verify the event belongs to the requested project
+func (s *Server) loadScheduledEventForProject(w http.ResponseWriter, r *http.Request, projectID, eventID string) (*store.ScheduledEvent, bool) {
+	evt, err := s.store.GetScheduledEvent(r.Context(), eventID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeScheduledEventNotFound(w, r)
+			return nil, false
+		}
+		writeErrorFromErr(w, err, "")
+		return nil, false
+	}
 	if evt.ProjectID != projectID {
-		NotFound(w, "Scheduled event")
+		writeScheduledEventNotFound(w, r)
+		return nil, false
+	}
+	return evt, true
+}
+
+// getScheduledEvent handles GET /api/v1/projects/{projectId}/scheduled-events/{id}
+func (s *Server) getScheduledEvent(w http.ResponseWriter, r *http.Request, projectID, eventID string) {
+	evt, ok := s.loadScheduledEventForProject(w, r, projectID, eventID)
+	if !ok {
 		return
 	}
 	if !s.authorizeScheduledEventRow(w, r, projectID, ActionRead, scheduledEventRowOf(evt)) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, evt)
+	writeJSON(w, http.StatusOK, s.scheduledEventResponse(r.Context(), s.newExecRevealer(r.Context()), *evt))
 }
 
 // cancelScheduledEvent handles DELETE /api/v1/projects/{projectId}/scheduled-events/{id}
 func (s *Server) cancelScheduledEvent(w http.ResponseWriter, r *http.Request, projectID, eventID string) {
-	// Verify event exists and belongs to the project
-	evt, err := s.store.GetScheduledEvent(r.Context(), eventID)
-	if err != nil {
-		writeErrorFromErr(w, err, "")
-		return
-	}
-	if evt.ProjectID != projectID {
-		NotFound(w, "Scheduled event")
+	evt, ok := s.loadScheduledEventForProject(w, r, projectID, eventID)
+	if !ok {
 		return
 	}
 	if !s.authorizeScheduledEventRow(w, r, projectID, ActionDelete, scheduledEventRowOf(evt)) {
@@ -592,6 +673,9 @@ func (s *Server) cancelScheduledEvent(w http.ResponseWriter, r *http.Request, pr
 	}
 	if s.scheduler != nil {
 		s.scheduler.StopEventTimer(eventID)
+	}
+	if evt.EventType == scheduledEventTypeExec {
+		s.auditScheduledExecCancel(r.Context(), *evt)
 	}
 
 	w.WriteHeader(http.StatusNoContent)

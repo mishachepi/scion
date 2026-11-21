@@ -355,14 +355,33 @@ describe('chat page — @mention click opens a DM', () => {
     expect(el.v2Conversation).toMatchObject({ peerId: 'agent-2', peerKind: 'agent' });
   });
 
-  it('resolves a human by display name or email prefix', () => {
+  it('resolves a human by display name, email prefix, or full email', () => {
     const byName = createPage();
     clickMention(byName, 'ada-lovelace');
     expect(byName.v2Conversation).toMatchObject({ peerId: 'user-1', peerKind: 'user' });
 
-    const byEmail = createPage();
-    clickMention(byEmail, 'ada');
-    expect(byEmail.v2Conversation).toMatchObject({ peerId: 'user-1', peerKind: 'user' });
+    const byEmailPrefix = createPage();
+    clickMention(byEmailPrefix, 'ada');
+    expect(byEmailPrefix.v2Conversation).toMatchObject({ peerId: 'user-1', peerKind: 'user' });
+
+    const byFullEmail = createPage();
+    clickMention(byFullEmail, 'Ada@Example.com');
+    expect(byFullEmail.v2Conversation).toMatchObject({
+      peerId: 'user-1',
+      peerKind: 'user',
+      peerName: 'Ada Lovelace',
+    });
+
+    const noDisplayName = createPage();
+    noDisplayName.v2HumanMembers = [
+      { id: 'user-2', kind: 'user', displayName: '', email: 'grace@example.com' },
+    ];
+    clickMention(noDisplayName, 'grace@example.com');
+    expect(noDisplayName.v2Conversation).toMatchObject({
+      peerId: 'user-2',
+      peerKind: 'user',
+      peerName: 'grace@example.com',
+    });
   });
 
   it('leaves the view alone for an unknown mention', () => {
@@ -3354,12 +3373,21 @@ describe('conversation header More menu', () => {
       'export-print',
       'export-clipboard',
     ]);
-    // The mobile row trades the density toggle for the back button.
-    expect(page.fullHeaderActionCount(conv)).toBe(9);
+    // The mobile row trades the density toggle for the back button. The
+    // starred messages button counts while its experiment is on (the default).
+    expect(page.fullHeaderActionCount(conv)).toBe(10);
     // Density does nothing in the mobile layout; the desktop menu offers it.
     page.isMobileLayout = false;
     expect(page.headerMoreActions(conv).map((a: { id: string }) => a.id)).toContain('density');
-    expect(page.fullHeaderActionCount(conv)).toBe(9);
+    expect(page.fullHeaderActionCount(conv)).toBe(10);
+    (window as unknown as { __SCION_FEATURES__?: Record<string, boolean> }).__SCION_FEATURES__ = {
+      'web.chat_starred_messages': false,
+    };
+    try {
+      expect(page.fullHeaderActionCount(conv)).toBe(9);
+    } finally {
+      delete (window as unknown as { __SCION_FEATURES__?: unknown }).__SCION_FEATURES__;
+    }
 
     const exportMarkdown = vi.spyOn(page, 'exportMarkdown').mockImplementation(() => {});
     page.headerSheetOpen = true;

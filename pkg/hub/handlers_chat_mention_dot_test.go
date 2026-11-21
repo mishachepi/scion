@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/artifacts"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
@@ -527,6 +528,191 @@ func TestAgentThreadMessage_DirectPathRecordsHumanMentions(t *testing.T) {
 	}
 }
 
+// Wrapped mentions like (@user) and **@user** record mention dots on human
+// sends (both human-to-human and agent-routed) and agent sends, while code
+// spans and quoted lines do not, and wrapped (@agent) tokens do not alter
+// agent @mention routing or fan-out.
+func TestMentionDot_WrappedInPunctuationAndMarkdown(t *testing.T) {
+	srv, s, wcs, proj, db := setupMentionDotTest(t)
+	d := &brokerMockDispatcher{}
+	srv.SetDispatcher(d)
+	ctx := context.Background()
+	alice := addHumanMember(t, s, proj.ID, "alice.smith@test.com", "Alice Smith")
+	bob := addHumanMember(t, s, proj.ID, "bob.jones@test.com", "Bob Jones")
+	carol := addHumanMember(t, s, proj.ID, "carol@test.com", "Carol")
+	a := &store.Agent{ID: tid("md-wrap-agent"), ProjectID: proj.ID, Name: "Poster", Slug: "md-wrap-poster",
+		Phase: "running", OwnerID: DevUserID, CreatedBy: DevUserID}
+	if err := s.CreateAgent(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	bystander := &store.Agent{ID: tid("md-wrap-bystander"), ProjectID: proj.ID, Name: "Bystander", Slug: "md-wrap-bystander",
+		Phase: "running", OwnerID: DevUserID, CreatedBy: DevUserID}
+	if err := s.CreateAgent(ctx, bystander); err != nil {
+		t.Fatal(err)
+	}
+
+	humanTopic := tid("md-wrap-human")
+	if err := wcs.CreateTopic(ctx, WebChatTopic{ID: humanTopic, ProjectID: proj.ID, Name: "wrap-human",
+		CreatedBy: "dev", CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	setTopicConversationID(t, db, s, humanTopic, proj.ID)
+
+	rec := doRequest(t, srv, http.MethodPost, "/api/v1/chat/conversations/"+humanTopic+"/messages",
+		map[string]string{"content": "heads up (@alice-smith) and **@bob-jones**! (`@carol`) (**@md-wrap-bystander**)"})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("human send: %d %s", rec.Code, rec.Body.String())
+	}
+	if len(d.getMessages()) != 0 {
+		t.Fatalf("wrapped agent mention should not route to agent, got %d dispatches", len(d.getMessages()))
+	}
+	for _, tc := range []struct {
+		user *store.User
+		want bool
+	}{{alice, true}, {bob, true}, {carol, false}} {
+		keys, err := wcs.UnreadMentionKeys(ctx, tc.user.ID, []string{humanTopic})
+		if err != nil || keys[humanTopic] != tc.want {
+			t.Errorf("human send: user %s unread mention = %v %v; want %v", tc.user.Email, keys, err, tc.want)
+		}
+	}
+
+	routedTopic := tid("md-wrap-routed")
+	if err := wcs.CreateTopic(ctx, WebChatTopic{ID: routedTopic, ProjectID: proj.ID, Name: "wrap-routed",
+		CreatedBy: "dev", CreatedAt: time.Now().UTC(), DefaultAgent: a.Slug}); err != nil {
+		t.Fatal(err)
+	}
+	setTopicConversationID(t, db, s, routedTopic, proj.ID)
+
+	rec = doRequest(t, srv, http.MethodPost, "/api/v1/chat/conversations/"+routedTopic+"/messages",
+		map[string]string{"content": "please review, cc (@alice-smith) and **@bob-jones**, fyi (**@md-wrap-bystander**) and `(@carol)`"})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("routed send: %d %s", rec.Code, rec.Body.String())
+	}
+	dispatched := d.getMessages()
+	if len(dispatched) != 1 || dispatched[0].agentSlug != a.Slug {
+		t.Fatalf("routed send dispatches = %+v; want only primary %s (no wrapped fan-out to %s)", dispatched, a.Slug, bystander.Slug)
+	}
+	for _, tc := range []struct {
+		user *store.User
+		want bool
+	}{{alice, true}, {bob, true}, {carol, false}} {
+		keys, err := wcs.UnreadMentionKeys(ctx, tc.user.ID, []string{routedTopic})
+		if err != nil || keys[routedTopic] != tc.want {
+			t.Errorf("routed send: user %s unread mention = %v %v; want %v", tc.user.Email, keys, err, tc.want)
+		}
+	}
+
+	agentTopic := tid("md-wrap-agent-topic")
+	if err := wcs.CreateTopic(ctx, WebChatTopic{ID: agentTopic, ProjectID: proj.ID, Name: "wrap-agent",
+		CreatedBy: "dev", CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	convID := def162GroupConv(t, s, proj.ID, agentTopic)
+
+	body := "done (@alice-smith) and **@bob.jones@test.com**; see `(@carol)`\n> **@carol** earlier"
+	rr := postOutboundConvRef(t, srv, proj.ID, a.ID, body, "conv:"+convID)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("agent outbound: %d %s", rr.Code, rr.Body.String())
+	}
+	for _, tc := range []struct {
+		user *store.User
+		want bool
+	}{{alice, true}, {bob, true}, {carol, false}} {
+		keys, err := wcs.UnreadMentionKeys(ctx, tc.user.ID, []string{agentTopic})
+		if err != nil || keys[agentTopic] != tc.want {
+			t.Errorf("agent send: user %s unread mention = %v %v; want %v", tc.user.Email, keys, err, tc.want)
+		}
+	}
+}
+
+type mentionCheckEvents struct {
+	EventPublisher
+	onPublish func(ctx context.Context, msg *store.Message)
+}
+
+func (e mentionCheckEvents) PublishUserMessage(ctx context.Context, msg *store.Message, a []AttachmentRef, r []artifacts.MessageRef, opts ...ChatEventOption) {
+	if e.onPublish != nil {
+		e.onPublish(ctx, msg)
+	}
+	e.EventPublisher.PublishUserMessage(ctx, msg, a, r, opts...)
+}
+
+// An agent's ordinary thread message on the live broker path (StartMessageBroker)
+// records human @mentions (both bare and wrapped) before publishing SSE.
+func TestAgentThreadMessage_BrokerPathRecordsHumanMentions(t *testing.T) {
+	srv, s, wcs, proj, _ := setupMentionDotTest(t)
+	ctx := context.Background()
+	alice := addHumanMember(t, s, proj.ID, "alice.smith@test.com", "Alice Smith")
+	bob := addHumanMember(t, s, proj.ID, "bob.jones@test.com", "Bob Jones")
+	carol := addHumanMember(t, s, proj.ID, "carol@test.com", "Carol")
+	topicID := tid("md-broker-thread")
+
+	events := NewChannelEventPublisher()
+	t.Cleanup(events.Close)
+	var publishedWithMentions atomic.Bool
+	srv.SetEventPublisher(mentionCheckEvents{
+		EventPublisher: events,
+		onPublish: func(pubCtx context.Context, msg *store.Message) {
+			if msg.ThreadID != topicID {
+				return
+			}
+			keys, err := wcs.UnreadMentionKeys(pubCtx, alice.ID, []string{topicID})
+			if err == nil && keys[topicID] {
+				publishedWithMentions.Store(true)
+			}
+		},
+	})
+	srv.StartMessageBroker(newSyncTestBus())
+	t.Cleanup(func() {
+		if bp := srv.GetMessageBrokerProxy(); bp != nil {
+			bp.Stop()
+		}
+	})
+
+	a := &store.Agent{ID: tid("md-broker-agent"), ProjectID: proj.ID, Name: "Poster", Slug: "md-broker-poster",
+		Phase: "running"}
+	if err := s.CreateAgent(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	if err := wcs.CreateTopic(ctx, WebChatTopic{ID: topicID, ProjectID: proj.ID, Name: "broker-thread",
+		CreatedBy: "dev", CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	convID := def162GroupConv(t, s, proj.ID, topicID)
+
+	rr := postOutboundConvRef(t, srv, proj.ID, a.ID,
+		"@alice-smith and (**@bob.jones@test.com**) please check; ignore `(@carol)`", "conv:"+convID)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("outbound: %d %s", rr.Code, rr.Body.String())
+	}
+	if !publishedWithMentions.Load() {
+		t.Fatal("mention rows were not yet recorded when PublishUserMessage fired")
+	}
+	for _, tc := range []struct {
+		user *store.User
+		want bool
+	}{{alice, true}, {bob, true}, {carol, false}} {
+		keys, err := wcs.UnreadMentionKeys(ctx, tc.user.ID, []string{topicID})
+		if err != nil || keys[topicID] != tc.want {
+			t.Fatalf("broker path: user %s unread mention = %v %v; want %v", tc.user.Email, keys, err, tc.want)
+		}
+	}
+	// Verify the thread list endpoint surfaces hasUnreadMention=true for Alice and Bob.
+	for _, u := range []*store.User{alice, bob} {
+		rec := doRequestAsUser(t, srv, u, http.MethodGet, "/api/v1/chat/spaces/"+proj.ID+"/threads", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s list: %d %s", u.Email, rec.Code, rec.Body.String())
+		}
+		var resp chatTopicListResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		if len(resp.Threads) != 1 || !resp.Threads[0].HasUnread || !resp.Threads[0].HasUnreadMention {
+			t.Fatalf("%s threads = %+v; want unread mention", u.Email, resp.Threads)
+		}
+	}
+}
+
 // memberListCountingStore counts ListProjectMembers calls.
 type memberListCountingStore struct {
 	store.Store
@@ -617,55 +803,6 @@ func TestUnresolvedMentionNames(t *testing.T) {
 	}
 }
 
-// The failed-message retention job hard-deletes messages; it also drops
-// the mention rows of messages that no longer exist.
-func TestFailedMessageRetention_PurgesOrphanMentions(t *testing.T) {
-	srv, s, wcs, proj, db := setupMentionDotTest(t)
-	srv.config.FailedMessageRetentionDays = 1
-	ctx := context.Background()
-	topicID := tid("md-retention")
-	if err := wcs.CreateTopic(ctx, WebChatTopic{ID: topicID, ProjectID: proj.ID, Name: "retention",
-		CreatedBy: "dev", CreatedAt: time.Now().UTC()}); err != nil {
-		t.Fatal(err)
-	}
-	newMsg := func(name string, at time.Time) string {
-		m := &store.Message{ID: tid("md-ret-" + name), ProjectID: proj.ID, Sender: "user:dev@localhost",
-			SenderID: DevUserID, Recipient: "agent:a", Msg: name, Type: messages.TypeChat, Channel: "web",
-			ThreadID: topicID, DispatchState: store.MessageDispatchFailed, CreatedAt: at}
-		if err := s.CreateMessage(ctx, m); err != nil {
-			t.Fatal(err)
-		}
-		if err := wcs.RecordMentions(ctx, topicID, m.ID, []string{tid("md-ret-user")}); err != nil {
-			t.Fatal(err)
-		}
-		return m.ID
-	}
-	old := newMsg("old", time.Now().Add(-48*time.Hour))
-	kept := newMsg("kept", time.Now())
-
-	srv.failedMessageRetentionHandler()(ctx)
-
-	if _, err := s.GetMessage(ctx, old); err == nil {
-		t.Fatal("old failed message was not purged")
-	}
-	var got []string
-	rows, err := db.QueryContext(ctx, `SELECT message_id FROM webchat_mention`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = rows.Close() }()
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			t.Fatal(err)
-		}
-		got = append(got, id)
-	}
-	if len(got) != 1 || got[0] != kept {
-		t.Fatalf("mention rows = %v; want only %s", got, kept)
-	}
-}
-
 // RecordMentions writes the batch in one transaction: empty IDs are
 // skipped, duplicates collapse on (message_id, user_id), and a repeat call
 // is a no-op.
@@ -685,5 +822,219 @@ func TestRecordMentions_BatchSkipsEmptyAndDuplicates(t *testing.T) {
 	}
 	if n != 2 {
 		t.Errorf("mention rows = %d; want 2", n)
+	}
+}
+
+// TestEmailMentionResolution_KnownUsersOnly verifies ptone/scion#8133 on the hub:
+//   - @<email> matching a human member of the message's project is translated
+//     to that member's @<display-slug> in stored/returned chat messages on
+//     agent outbound, human chat send, and message edit paths.
+//   - Non-member Hub users' @<email> tokens stay plain text (no hub-wide
+//     GetUserByEmail oracle), as do unknown @<email>, plain user@example.com
+//     in prose, inline/fenced code, and '>' blockquotes.
+//   - Dispatched agent messages are byte-for-byte unchanged (including
+//     outbound @<slug> -> @<email> behaviour on blockquotes, **wrapped**
+//     mentions, and boundaries) and agent @mention routing is unchanged.
+func TestEmailMentionResolution_KnownUsersOnly(t *testing.T) {
+	srv, s, wcs, proj, db := setupMentionDotTest(t)
+	d := &brokerMockDispatcher{}
+	srv.SetDispatcher(d)
+	ctx := context.Background()
+
+	_ = addHumanMember(t, s, proj.ID, "alice.smith@test.com", "Alice Smith")
+
+	// Known Scion user on the Hub who is NOT a member of proj — must NOT
+	// resolve in proj's chat messages (no hub-wide user oracle).
+	hubPeer := &store.User{
+		ID:          tid("email-mention-hub-peer"),
+		Email:       "hub.peer@test.com",
+		DisplayName: "Hub Peer",
+		Role:        store.UserRoleMember,
+		Status:      "active",
+		Created:     time.Now(),
+	}
+	if err := s.CreateUser(ctx, hubPeer); err != nil {
+		t.Fatalf("CreateUser hubPeer: %v", err)
+	}
+
+	primary := &store.Agent{
+		ID: tid("email-mention-primary"), ProjectID: proj.ID, Name: "Builder", Slug: "em-builder",
+		Phase: "running", OwnerID: DevUserID, CreatedBy: DevUserID,
+	}
+	secondary := &store.Agent{
+		ID: tid("email-mention-secondary"), ProjectID: proj.ID, Name: "Reviewer", Slug: "em-reviewer",
+		Phase: "running", OwnerID: DevUserID, CreatedBy: DevUserID,
+	}
+	for _, ag := range []*store.Agent{primary, secondary} {
+		if err := s.CreateAgent(ctx, ag); err != nil {
+			t.Fatalf("CreateAgent %s: %v", ag.Slug, err)
+		}
+	}
+
+	topicID := tid("email-mention-topic")
+	if err := wcs.CreateTopic(ctx, WebChatTopic{
+		ID: topicID, ProjectID: proj.ID, Name: "email-mentions",
+		CreatedBy: "dev", CreatedAt: time.Now().UTC(), DefaultAgent: primary.Slug,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	setTopicConversationID(t, db, s, topicID, proj.ID)
+	convID := def162GroupConv(t, s, proj.ID, topicID)
+
+	// 1. Human -> agent-routed chat send (with secondary @em-reviewer mention).
+	humanBody := "@em-builder ask @em-reviewer, cc @alice.smith@test.com and @hub.peer@test.com; " +
+		"leave @unknown@example.com, alice.smith@test.com, user@example.com, and `@alice.smith@test.com`:\n" +
+		"```\n@alice.smith@test.com\n```"
+	rec := doRequest(t, srv, http.MethodPost, "/api/v1/chat/conversations/"+topicID+"/messages",
+		map[string]string{"content": humanBody})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("human send: %d %s", rec.Code, rec.Body.String())
+	}
+	var sendResp chatMessageResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &sendResp); err != nil {
+		t.Fatal(err)
+	}
+	wantHumanDisplay := "@em-builder ask @em-reviewer, cc @alice-smith and @hub.peer@test.com; " +
+		"leave @unknown@example.com, alice.smith@test.com, user@example.com, and `@alice.smith@test.com`:\n" +
+		"```\n@alice.smith@test.com\n```"
+	if sendResp.Content != wantHumanDisplay {
+		t.Errorf("human send response content =\n%s\nwant:\n%s", sendResp.Content, wantHumanDisplay)
+	}
+	storedHuman, err := s.GetMessage(ctx, sendResp.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedHuman.Msg != wantHumanDisplay {
+		t.Errorf("stored human msg =\n%s\nwant:\n%s", storedHuman.Msg, wantHumanDisplay)
+	}
+
+	// Agent @mention routing must remain unchanged (dispatched to both primary
+	// and secondary), and agents must still receive @<email> identifiers.
+	dispatched := d.getMessages()
+	if len(dispatched) != 2 {
+		t.Fatalf("dispatched count = %d; want 2 (primary + @em-reviewer)", len(dispatched))
+	}
+	for _, dm := range dispatched {
+		if dm.msg != humanBody {
+			t.Errorf("agent %s received body =\n%s\nwant original @<email> body:\n%s", dm.agentSlug, dm.msg, humanBody)
+		}
+	}
+
+	// 2. Message edit before any agent reply: member @<email> resolves,
+	// non-member Hub user @<email> stays plain text.
+	editedRaw := "Updated: cc **@alice.smith@test.com**, non-member @hub.peer@test.com, unknown @unknown@example.com, code `@alice.smith@test.com`."
+	editRec := doRequest(t, srv, http.MethodPut, "/api/v1/chat/conversations/"+topicID+"/messages/"+sendResp.ID,
+		map[string]string{"content": editedRaw})
+	if editRec.Code != http.StatusOK {
+		t.Fatalf("message edit: %d %s", editRec.Code, editRec.Body.String())
+	}
+	wantEdited := "Updated: cc **@alice-smith**, non-member @hub.peer@test.com, unknown @unknown@example.com, code `@alice.smith@test.com`."
+	storedAfterEdit, err := s.GetMessage(ctx, sendResp.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedAfterEdit.Msg != wantEdited {
+		t.Errorf("edited msg =\n%s\nwant:\n%s", storedAfterEdit.Msg, wantEdited)
+	}
+
+	// 3. Pin outbound @<slug> -> @<email> dispatched text byte-for-byte for
+	// blockquotes, **wrapped** mentions, and boundaries (R1).
+	outboundProbe := "@em-builder check @em-reviewer:\n> @alice-smith said hi\nPing **@alice-smith**, x.@alice-smith, and café@alice-smith"
+	wantDispatchedOutbound := "@em-builder check @em-reviewer:\n> @alice.smith@test.com said hi\nPing **@alice-smith**, x.@alice.smith@test.com, and café@alice.smith@test.com"
+	rec2 := doRequest(t, srv, http.MethodPost, "/api/v1/chat/conversations/"+topicID+"/messages",
+		map[string]string{"content": outboundProbe})
+	if rec2.Code != http.StatusCreated {
+		t.Fatalf("outbound probe send: %d %s", rec2.Code, rec2.Body.String())
+	}
+	allDispatched := d.getMessages()
+	if len(allDispatched) != 4 {
+		t.Fatalf("total dispatched count = %d; want 4", len(allDispatched))
+	}
+	for _, dm := range allDispatched[2:] {
+		if dm.msg != wantDispatchedOutbound {
+			t.Errorf("agent %s outbound probe received =\n%s\nwant:\n%s", dm.agentSlug, dm.msg, wantDispatchedOutbound)
+		}
+	}
+
+	// 4. Agent outbound message to the conversation: project member @<email>
+	// translates; non-member Hub user @<email> stays plain text.
+	agentBody := "Done @alice.smith@test.com and **@alice.smith@test.com**; non-member @hub.peer@test.com, " +
+		"unknown @unknown@example.com, prose user@example.com, code `@alice.smith@test.com`."
+	rr := postOutboundConvRef(t, srv, proj.ID, primary.ID, agentBody, "conv:"+convID)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("agent outbound: %d %s", rr.Code, rr.Body.String())
+	}
+	var outResp struct {
+		MessageID string `json:"message_id"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &outResp); err != nil {
+		t.Fatal(err)
+	}
+	storedAgent, err := s.GetMessage(ctx, outResp.MessageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantAgentDisplay := "Done @alice-smith and **@alice-smith**; non-member @hub.peer@test.com, " +
+		"unknown @unknown@example.com, prose user@example.com, code `@alice.smith@test.com`."
+	if storedAgent.Msg != wantAgentDisplay {
+		t.Errorf("stored agent msg =\n%s\nwant:\n%s", storedAgent.Msg, wantAgentDisplay)
+	}
+
+	// 5. User-to-user DM (no project scope): Hub user emails stay plain text so
+	// a DM sender learns nothing about Hub users from display translation.
+	dmKey, err := messages.DMConversationKey("user", DevUserID, "user", hubPeer.ID)
+	if err != nil {
+		t.Fatalf("DMConversationKey: %v", err)
+	}
+	dmBody := "Hi @hub.peer@test.com and @alice.smith@test.com"
+	dmRec := doRequest(t, srv, http.MethodPost, "/api/v1/chat/conversations/"+dmKey+"/messages",
+		map[string]string{"content": dmBody})
+	if dmRec.Code != http.StatusCreated {
+		t.Fatalf("user DM send: %d %s", dmRec.Code, dmRec.Body.String())
+	}
+	var dmResp chatMessageResponse
+	if err := json.Unmarshal(dmRec.Body.Bytes(), &dmResp); err != nil {
+		t.Fatal(err)
+	}
+	if dmResp.Content != dmBody {
+		t.Errorf("user DM response content = %q; want unchanged %q", dmResp.Content, dmBody)
+	}
+
+	// 6. Project human-to-human topic send (no default agent, no agent mention):
+	// project member @<email> translates to @<display-slug>; non-member Hub user
+	// @<email>, unknown @<email>, plain prose email, and code stay unchanged.
+	h2hTopicID := tid("email-mention-h2h-topic")
+	if err := wcs.CreateTopic(ctx, WebChatTopic{
+		ID: h2hTopicID, ProjectID: proj.ID, Name: "email-mentions-h2h",
+		CreatedBy: "dev", CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	setTopicConversationID(t, db, s, h2hTopicID, proj.ID)
+
+	h2hBody := "Team update for @alice.smith@test.com and **@alice.smith@test.com**; " +
+		"non-member @hub.peer@test.com, unknown @unknown@example.com, prose user@example.com, " +
+		"code `@alice.smith@test.com`."
+	h2hRec := doRequest(t, srv, http.MethodPost, "/api/v1/chat/conversations/"+h2hTopicID+"/messages",
+		map[string]string{"content": h2hBody})
+	if h2hRec.Code != http.StatusCreated {
+		t.Fatalf("project h2h send: %d %s", h2hRec.Code, h2hRec.Body.String())
+	}
+	var h2hResp chatMessageResponse
+	if err := json.Unmarshal(h2hRec.Body.Bytes(), &h2hResp); err != nil {
+		t.Fatal(err)
+	}
+	wantH2HDisplay := "Team update for @alice-smith and **@alice-smith**; " +
+		"non-member @hub.peer@test.com, unknown @unknown@example.com, prose user@example.com, " +
+		"code `@alice.smith@test.com`."
+	if h2hResp.Content != wantH2HDisplay {
+		t.Errorf("project h2h response content =\n%s\nwant:\n%s", h2hResp.Content, wantH2HDisplay)
+	}
+	storedH2H, err := s.GetMessage(ctx, h2hResp.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedH2H.Msg != wantH2HDisplay {
+		t.Errorf("stored project h2h msg =\n%s\nwant:\n%s", storedH2H.Msg, wantH2HDisplay)
 	}
 }

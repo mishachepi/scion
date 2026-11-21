@@ -80,6 +80,16 @@ func isBrokerRuntimeUnavailable(err error) bool {
 		se.brokerErrorCode() == brokerCodeRuntimeUnavailable
 }
 
+// isStartRefusedBeforeCreate reports whether err is a start error where no
+// container was created on the broker: either isConfirmedStartNotActedOnError
+// accepts err, or the broker refused the start with 503 runtime_unavailable
+// before entering Manager.Start (no startAttempted marker). It leaves
+// isConfirmedStartNotActedOnError unchanged.
+func isStartRefusedBeforeCreate(err error) bool {
+	return isConfirmedStartNotActedOnError(err) ||
+		(isBrokerRuntimeUnavailable(err) && !brokerStartAttempted(err))
+}
+
 // isBrokerDraining reports whether err is a runtime broker's 503 answer with
 // error code broker_draining (api.BrokerErrCodeBrokerDraining): the broker
 // is shutting down and refused the request before any start tracker,
@@ -197,6 +207,14 @@ func writeRestartStopFailed(w http.ResponseWriter, stopErr error) {
 // is shutting down and did not act, so the request can be retried
 // (ptone/scion#4669, design wave 3 Optional-2). The broker sends it only
 // for creates, starts and restarts, so the other relay sites never see it.
+//
+// A runtime_unavailable answer whose details carry
+// api.BrokerErrorReasonProfileUnresolved (a stored-profile miss on a
+// co-located broker, ptone/scion#4955, or an unresolvable settings profile on
+// a legacy broker, ptone/scion#3817) keeps the code and the 503, but gets
+// the hub's own text naming the profile, without the retry-later wording
+// and without Retry-After: it lasts until the profiles or runtimes are
+// changed. The broker's message is not relayed.
 func writeBrokerRuntimeUnavailable(w http.ResponseWriter, err error, runtime string) bool {
 	if isBrokerDraining(err) {
 		w.Header().Set("Retry-After", brokerRetryAfter(err, defaultBrokerDrainingRetryAfter))
@@ -205,6 +223,10 @@ func writeBrokerRuntimeUnavailable(w http.ResponseWriter, err error, runtime str
 	}
 	if !isBrokerRuntimeUnavailable(err) {
 		return false
+	}
+	if profile, ok := brokerProfileUnresolved(err); ok {
+		writeError(w, http.StatusServiceUnavailable, brokerCodeRuntimeUnavailable, brokerProfileUnresolvedMessage(profile), nil)
+		return true
 	}
 	w.Header().Set("Retry-After", brokerRuntimeRetryAfter(err))
 	writeError(w, http.StatusServiceUnavailable, brokerCodeRuntimeUnavailable, brokerRuntimeUnavailableMessage(runtime), nil)
@@ -238,6 +260,43 @@ func brokerRuntimeUnavailableMessage(runtime string) string {
 		return fmt.Sprintf("Runtime %q is not available on the agent's runtime broker; retry later or check the broker's runtime configuration", rt)
 	}
 	return "The agent's runtime is not available on its runtime broker; retry later or check the broker's runtime configuration"
+}
+
+// maxRelayedProfileNameLen bounds the broker-supplied profile name the hub
+// puts in its own text.
+const maxRelayedProfileNameLen = 128
+
+// brokerProfileUnresolved reports whether err is a broker answer whose
+// details carry api.BrokerErrorReasonProfileUnresolved, and returns the
+// profile it names ("" for an unset active_profile). A profile detail that
+// is not a string, or is longer than maxRelayedProfileNameLen, is dropped
+// to "".
+func brokerProfileUnresolved(err error) (string, bool) {
+	var se *brokerStatusError
+	if !errors.As(err, &se) {
+		return "", false
+	}
+	details := se.brokerErrorDetails()
+	if reason, _ := details[api.BrokerErrorDetailReason].(string); reason != api.BrokerErrorReasonProfileUnresolved {
+		return "", false
+	}
+	profile, _ := details[api.BrokerErrorDetailProfile].(string)
+	if len(profile) > maxRelayedProfileNameLen {
+		profile = ""
+	}
+	return profile, true
+}
+
+// brokerProfileUnresolvedMessage is the hub's client-facing text for a
+// broker's profile_unresolved refusal — returned for both Hub stored-profile
+// misses on a co-located broker and settings-profile misses on a legacy
+// broker; profile is "" when the dispatch needed the default profile and
+// active_profile is unset.
+func brokerProfileUnresolvedMessage(profile string) string {
+	if profile == "" {
+		return "The agent's runtime profile cannot be resolved on its runtime broker: active_profile is unset or is not configured for this broker; set active_profile to an available profile, or give the agent an explicit profile"
+	}
+	return fmt.Sprintf("Runtime profile %q cannot be resolved on the agent's runtime broker: the profile or its runtime is not configured for this broker; choose an available profile, or check the profiles and runtimes configured on the broker or hub", profile)
 }
 
 // RuntimeTargetRefusal is a typed flat Runtime Broker refusal raised by the

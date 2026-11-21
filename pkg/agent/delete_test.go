@@ -216,6 +216,10 @@ func TestDeleteAgentFiles_CleansSharedWorkspaceExternalState(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(extAgentDir, "home"), 0755); err != nil {
 		t.Fatalf("mkdir home: %v", err)
 	}
+	// A home a reset moved aside sits beside the home (ptone/scion#7757).
+	if err := os.MkdirAll(filepath.Join(extAgentDir, removingHomePrefix+"r1", ".claude"), 0755); err != nil {
+		t.Fatalf("mkdir moved-aside home: %v", err)
+	}
 
 	// DeleteAgentFiles takes projectPath; pass scionDir like real callers do.
 	if _, err := DeleteAgentFiles(agentName, scionDir, false); err != nil {
@@ -313,6 +317,7 @@ func initBareRepo(t *testing.T) string {
 	run("-C", wc, "add", "-A")
 	run("-C", wc, "commit", "-m", "init")
 	run("-C", wc, "push", "origin", "main")
+	provision.AllowLocalCloneFixture(t, bare)
 	return bare
 }
 

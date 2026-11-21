@@ -56,6 +56,7 @@ type mockScheduledEventStore struct {
 	audits          []*store.MutationAuditRecord
 	schedules       map[string]*store.Schedule
 	notifications   []*store.Notification
+	messages        map[string]*store.Message
 	getUserErr      error  // when set, GetUser fails with it
 	getUserErrID    string // when set, getUserErr applies to this ID only
 	// saAssignments holds the active service-account assignment rows by agent ID.
@@ -69,6 +70,7 @@ func newMockStore() *mockScheduledEventStore {
 		projects:        make(map[string]*store.Project),
 		users:           make(map[string]*store.User),
 		roleDefinitions: make(map[string]*store.RoleDefinition),
+		messages:        make(map[string]*store.Message),
 	}
 }
 
@@ -80,7 +82,7 @@ func seedFullRoleDispatchCreator(ms *mockScheduledEventStore, projectID string) 
 	ms.users[ownerID] = &store.User{ID: ownerID, Email: "creator-owner@test.example", Role: store.UserRoleMember, Status: store.UserStatusActive}
 	ms.roleDefinitions["rd-creator-member"] = &store.RoleDefinition{
 		ID: "rd-creator-member", Name: store.ProjectRoleMember, ScopeType: store.RoleScopeProject,
-		Permissions: []string{"agent.read"},
+		Permissions: []string{"agent.read"}, System: true,
 	}
 	ms.roleBindings = append(ms.roleBindings, &store.RoleBinding{
 		ID: "rb-creator-member", RoleDefinitionID: "rd-creator-member",
@@ -129,6 +131,51 @@ func (m *mockScheduledEventStore) getNotifications() []*store.Notification {
 
 // HasActiveAgentHold reports no holds: the mock records none.
 func (m *mockScheduledEventStore) HasActiveAgentHold(_ context.Context, _ string) (bool, error) {
+	return false, nil
+}
+
+func (m *mockScheduledEventStore) CreateMessage(_ context.Context, msg *store.Message) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.messages == nil {
+		m.messages = make(map[string]*store.Message)
+	}
+	cp := *msg
+	m.messages[msg.ID] = &cp
+	return nil
+}
+
+func (m *mockScheduledEventStore) GetMessage(_ context.Context, id string) (*store.Message, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if msg, ok := m.messages[id]; ok {
+		cp := *msg
+		return &cp, nil
+	}
+	return nil, store.ErrNotFound
+}
+
+func (m *mockScheduledEventStore) MarkMessageFailed(_ context.Context, id, reason string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if msg, ok := m.messages[id]; ok {
+		msg.DispatchState = store.MessageDispatchFailed
+		msg.DispatchFailureReason = &reason
+	}
+	return nil
+}
+
+func (m *mockScheduledEventStore) PrepareOrHoldMessage(_ context.Context, agentID, _ string, _ int) (store.PrepareOrHoldResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var runID string
+	if a, ok := m.agents[agentID]; ok && a != nil {
+		runID = a.RunID
+	}
+	return store.PrepareOrHoldResult{HoldLaunchID: runID}, nil
+}
+
+func (m *mockScheduledEventStore) HasAgentDeliveryHold(_ context.Context, _ string) (bool, error) {
 	return false, nil
 }
 
@@ -185,6 +232,61 @@ func (m *mockScheduledEventStore) UpdateScheduledEventStatus(_ context.Context, 
 	return nil
 }
 
+func (m *mockScheduledEventStore) CompleteFiringScheduledEvent(_ context.Context, id string, status string, firedAt time.Time, errMsg string, scheduleID string, ranAt time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	evt, ok := m.events[id]
+	if !ok || evt.Status != store.ScheduledEventFiring {
+		return false, nil
+	}
+	evt.Status = status
+	cpFired := firedAt
+	evt.FiredAt = &cpFired
+	evt.Error = errMsg
+	if scheduleID != "" {
+		if sc, ok := m.schedules[scheduleID]; ok {
+			sc.RunCount++
+			if errMsg != "" {
+				sc.ErrorCount++
+			}
+			if sc.LastRunAt == nil || sc.LastRunAt.Before(ranAt) {
+				cpRan := ranAt
+				sc.LastRunAt = &cpRan
+				if errMsg != "" {
+					sc.LastRunStatus = store.ScheduleRunError
+					sc.LastRunError = errMsg
+				} else {
+					sc.LastRunStatus = store.ScheduleRunSuccess
+					sc.LastRunError = ""
+				}
+			}
+		}
+	}
+	return true, nil
+}
+
+func (m *mockScheduledEventStore) ListFiringScheduledEvents(_ context.Context, cutoff time.Time, limit int) ([]store.ScheduledEvent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []store.ScheduledEvent
+	for _, evt := range m.events {
+		if evt.Status != store.ScheduledEventFiring {
+			continue
+		}
+		ts := evt.FireAt
+		if evt.FiredAt != nil {
+			ts = *evt.FiredAt
+		}
+		if !ts.After(cutoff) {
+			out = append(out, *evt)
+		}
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
 func (m *mockScheduledEventStore) CancelScheduledEvent(_ context.Context, id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -239,6 +341,23 @@ func (m *mockScheduledEventStore) GetAgent(_ context.Context, id string) (*store
 	return nil, store.ErrNotFound
 }
 
+func (m *mockScheduledEventStore) MarkAgentDelivery(_ context.Context, id string) (*store.Agent, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.agents[id]
+	if !ok {
+		return nil, false, store.ErrNotFound
+	}
+	now := time.Now().UTC()
+	claimActive := a.HasActiveIdleSuspendClaim(now)
+	if !claimActive && (a.Phase == "running" || a.Phase == "starting") {
+		a.LastDeliveryAt = &now
+	}
+	cp := *a
+	cp.IdleSuspendClaimActive = claimActive
+	return &cp, claimActive, nil
+}
+
 func (m *mockScheduledEventStore) GetUser(_ context.Context, id string) (*store.User, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -274,8 +393,45 @@ func (m *mockScheduledEventStore) GetProject(_ context.Context, id string) (*sto
 	return nil, store.ErrNotFound
 }
 
-func (m *mockScheduledEventStore) GetProjectProviders(_ context.Context, _ string) ([]store.ProjectProvider, error) {
-	return nil, nil
+// mockSchedulerBrokerID is the single runtime broker every project in the
+// mock store is served by. A scheduled fire selects its broker the way
+// interactive create does (ptone/scion#7868), so a project needs a usable
+// provider: an online auto-provide broker is usable by any authenticated
+// fire identity.
+const mockSchedulerBrokerID = "mock-scheduler-broker"
+
+func (m *mockScheduledEventStore) GetProjectProviders(_ context.Context, projectID string) ([]store.ProjectProvider, error) {
+	return []store.ProjectProvider{{
+		ProjectID:  projectID,
+		BrokerID:   mockSchedulerBrokerID,
+		BrokerName: mockSchedulerBrokerID,
+		Status:     store.BrokerStatusOnline,
+	}}, nil
+}
+
+func (m *mockScheduledEventStore) GetProjectProvider(_ context.Context, projectID, brokerID string) (*store.ProjectProvider, error) {
+	if brokerID != mockSchedulerBrokerID {
+		return nil, store.ErrNotFound
+	}
+	return &store.ProjectProvider{
+		ProjectID:  projectID,
+		BrokerID:   mockSchedulerBrokerID,
+		BrokerName: mockSchedulerBrokerID,
+		Status:     store.BrokerStatusOnline,
+	}, nil
+}
+
+func (m *mockScheduledEventStore) GetRuntimeBroker(_ context.Context, id string) (*store.RuntimeBroker, error) {
+	if id != mockSchedulerBrokerID {
+		return nil, store.ErrNotFound
+	}
+	return &store.RuntimeBroker{
+		ID:          mockSchedulerBrokerID,
+		Name:        mockSchedulerBrokerID,
+		Slug:        mockSchedulerBrokerID,
+		Status:      store.BrokerStatusOnline,
+		AutoProvide: true,
+	}, nil
 }
 
 func (m *mockScheduledEventStore) CreateAgent(_ context.Context, agent *store.Agent) error {

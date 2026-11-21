@@ -1384,8 +1384,8 @@ type httpReprovisionDispatcher struct {
 	http *HTTPAgentDispatcher
 }
 
-func (d *httpReprovisionDispatcher) DispatchAgentReprovision(ctx context.Context, agent *store.Agent) error {
-	return d.http.DispatchAgentReprovision(ctx, agent)
+func (d *httpReprovisionDispatcher) DispatchAgentReprovision(ctx context.Context, agent *store.Agent, opts ReprovisionOptions) error {
+	return d.http.DispatchAgentReprovision(ctx, agent, opts)
 }
 
 // TestReincarnateAgent_RowEnvMatchesFreshConfigAfterReprovision proves the
@@ -2325,12 +2325,12 @@ func (d *phaseObservingDispatcher) DispatchAgentStop(ctx context.Context, a *sto
 	return d.reincarnateTestDispatcher.DispatchAgentStop(ctx, a)
 }
 
-func (d *phaseObservingDispatcher) DispatchAgentReprovision(ctx context.Context, a *store.Agent) error {
+func (d *phaseObservingDispatcher) DispatchAgentReprovision(ctx context.Context, a *store.Agent, opts ReprovisionOptions) error {
 	cur, err := d.s.GetAgent(ctx, a.ID)
 	if err == nil {
 		d.phaseAtReprovision = cur.Phase
 	}
-	return d.reincarnateTestDispatcher.DispatchAgentReprovision(ctx, a)
+	return d.reincarnateTestDispatcher.DispatchAgentReprovision(ctx, a, opts)
 }
 
 // TestReincarnateAgent_WorkerDoesNotClobberReportedPhase: the worker's
@@ -4180,13 +4180,13 @@ func (d *gatedDispatcher) gate() error {
 	return nil
 }
 
-func (d *gatedDispatcher) DispatchAgentReprovision(ctx context.Context, a *store.Agent) error {
+func (d *gatedDispatcher) DispatchAgentReprovision(ctx context.Context, a *store.Agent, opts ReprovisionOptions) error {
 	if d.step == "reprovision" {
 		if err := d.gate(); err != nil {
 			return err
 		}
 	}
-	return d.reincarnateTestDispatcher.DispatchAgentReprovision(ctx, a)
+	return d.reincarnateTestDispatcher.DispatchAgentReprovision(ctx, a, opts)
 }
 
 func (d *gatedDispatcher) DispatchAgentStart(ctx context.Context, a *store.Agent, task string, resume bool) error {
@@ -4836,10 +4836,10 @@ type twoGateDispatcher struct {
 	inReprov, relReprov, inStart, relStart chan struct{}
 }
 
-func (d *twoGateDispatcher) DispatchAgentReprovision(ctx context.Context, a *store.Agent) error {
+func (d *twoGateDispatcher) DispatchAgentReprovision(ctx context.Context, a *store.Agent, opts ReprovisionOptions) error {
 	close(d.inReprov)
 	<-d.relReprov
-	return d.reincarnateTestDispatcher.DispatchAgentReprovision(ctx, a)
+	return d.reincarnateTestDispatcher.DispatchAgentReprovision(ctx, a, opts)
 }
 
 func (d *twoGateDispatcher) DispatchAgentStart(ctx context.Context, a *store.Agent, task string, resume bool) error {
@@ -5104,15 +5104,16 @@ func TestReincarnateAgent_StepCASPersistentErrorEndsFailed(t *testing.T) {
 // not just the in-process Go error value a fake dispatcher would hand back
 // directly. It proves a 409 from the broker (a refused reprovision, e.g.
 // agent.ErrReprovisionRefused) ends with the record failed and its Error
-// field carrying the broker's reason, and the agent at reincarnation_state=
+// field carrying the broker's status, code and filtered message
+// (brokerRecordText, never the raw body), and the agent at reincarnation_state=
 // failed / phase=error, exactly like any other reprovision-dispatch failure.
 func TestReincarnateAgent_E2E_BrokerReprovisionRefusal409EndsInFailedRecord(t *testing.T) {
 	const refusalReason = "reprovision refused: agent e2e-409-agent container is still running, stop it first"
 	fakeBroker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/api/v1/agents") {
 			// Mirrors runtimebroker/errors.go's Conflict(...) envelope exactly,
-			// so brokerHTTPError's "runtime broker returned error 409: <body>"
-			// carries the same text a real broker would send.
+			// so brokerHTTPError sees the same status and code a real broker
+			// would send.
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -5165,8 +5166,10 @@ func TestReincarnateAgent_E2E_BrokerReprovisionRefusal409EndsInFailedRecord(t *t
 
 	settled := waitForReincarnationSettled(t, s, agent.ID)
 	assert.Equal(t, store.AgentReincarnationStateFailed, settled.State)
-	assert.Contains(t, settled.Error, "409", "the record's error must surface the broker's HTTP status")
-	assert.Contains(t, settled.Error, refusalReason, "the record's error must surface the broker's refusal reason verbatim")
+	assert.Contains(t, settled.Error, "runtime broker returned error 409 (conflict): Failed to provision agent: "+refusalReason,
+		"the record carries the broker's status, code and rendered message: it passes the relay filter (brokerRecordText)")
+	assert.NotContains(t, settled.Error, `"error"`,
+		"the broker's raw JSON body stays in the hub log, out of the stored record")
 
 	after, err := s.GetAgent(ctx, agent.ID)
 	require.NoError(t, err)
@@ -5404,7 +5407,7 @@ func TestDispatchAgentEventHandler_SetsCreateInputs(t *testing.T) {
 	creatorID := seedFullRoleDispatchCreator(ms, "project-1")
 	srv := newEventHandlerTestServer(&resolvingTemplateStore{ms})
 
-	err := srv.dispatchAgentEventHandler()(context.Background(), withMockAgentRevision(store.ScheduledEvent{
+	err := fireScheduledActionForTest(context.Background(), srv, "dispatch_agent", withMockAgentRevision(store.ScheduledEvent{
 		ID:        "dispatch-createinputs-1",
 		ProjectID: "project-1",
 		EventType: "dispatch_agent",
@@ -5419,7 +5422,20 @@ func TestDispatchAgentEventHandler_SetsCreateInputs(t *testing.T) {
 	require.NotNil(t, created.AppliedConfig.CreateInputs,
 		"scheduled dispatch must persist CreateInputs, or the agent is stuck looking legacy to reincarnate forever")
 	assert.Equal(t, "sched-branch", created.AppliedConfig.CreateInputs.Branch)
-	assert.True(t, created.AppliedConfig.CreateInputs.NoAuth, "every scheduled agent is NoAuth by construction")
+	assert.False(t, created.AppliedConfig.CreateInputs.NoAuth, "default scheduled agent launches with credentials (NoAuth=false)")
+
+	err = fireScheduledActionForTest(context.Background(), srv, "dispatch_agent", withMockAgentRevision(store.ScheduledEvent{
+		ID:        "dispatch-createinputs-noauth",
+		ProjectID: "project-1",
+		EventType: "dispatch_agent",
+		Payload:   `{"agentName":"sched-createinputs-noauth","branch":"sched-branch","noAuth":true}`,
+		CreatedBy: creatorID,
+	}, creatorID))
+	require.NoError(t, err)
+	optOut := findMockAgent(ms, "sched-createinputs-noauth")
+	require.NotNil(t, optOut)
+	require.NotNil(t, optOut.AppliedConfig.CreateInputs)
+	assert.True(t, optOut.AppliedConfig.CreateInputs.NoAuth, "explicit payload.noAuth=true persists in CreateInputs")
 }
 
 func TestReincarnateAgent_AC2b_TemplateHarnessConfigBeatsHubDefault(t *testing.T) {

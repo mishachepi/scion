@@ -291,7 +291,9 @@ var visitorRefusedProfileRoutes = []string{
 	"/api/v1/auth/tokens",
 	"/api/v1/auth/tokens/",
 	"/api/v1/users/me/delegations",
+	"/api/v1/users/me/delegations/revoke-all",
 	"/api/v1/users/me/terminal-workspace",
+	"/api/v1/users/me/decisions",
 }
 
 // visitorRouteMethods returns the methods to try on a route pattern: the

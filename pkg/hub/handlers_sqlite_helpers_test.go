@@ -20,8 +20,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
-	"crypto/rand"
-	"crypto/rsa"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
@@ -32,6 +30,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -42,6 +41,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/artifacts"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/eventbus"
@@ -51,7 +51,6 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/plugin"
 	"github.com/GoogleCloudPlatform/scion/pkg/secret"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
-	"github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
 	"github.com/google/uuid"
 	"github.com/knadh/koanf/v2"
@@ -348,8 +347,6 @@ func def49Setup(t *testing.T) (srv *Server, s store.Store, projectID string, tar
 	return srv, s, projectID, targetAgent, userID
 }
 
-func strPtr(s string) *string { return &s }
-
 // alwaysDropUserBus is an eventbus.EventBus whose Publish always reports a
 // subscriber-buffer-full drop, simulating InProcessEventBus.Publish when a
 // project's user-message subscriber is saturated (ptone/scion#2311).
@@ -543,6 +540,13 @@ type reincarnateTestDispatcher struct {
 	lastStartTask    string
 	lastStartResume  *bool
 
+	// reprovisionGatheredEnvHolders, moveProvisionGatheredEnvHolders and
+	// startGatheredEnvHolders record, per call, the reprovisionGatheredEnv
+	// holder in the dispatch ctx (nil when none).
+	reprovisionGatheredEnvHolders   []*reprovisionGatheredEnv
+	moveProvisionGatheredEnvHolders []*reprovisionGatheredEnv
+	startGatheredEnvHolders         []*reprovisionGatheredEnv
+
 	stopErr        error
 	reprovisionErr error
 	startErr       error
@@ -573,6 +577,11 @@ type reincarnateTestDispatcher struct {
 	// HarnessAuth, Image, Profile).
 	reprovisionEcho func(cfg *store.AgentAppliedConfig)
 	startEcho       func(cfg *store.AgentAppliedConfig)
+	// startAgentEcho, when set, runs on a successful start against the
+	// dispatched agent itself, simulating the agent-level echo
+	// applyBrokerResponse writes in place (Template, Runtime,
+	// RuntimeState, ContainerStatus).
+	startAgentEcho func(agent *store.Agent)
 
 	// rerenderErr is returned by every reprovision call after the first:
 	// the worker's best-effort re-render of the previous config
@@ -625,6 +634,8 @@ type reincarnateTestDispatcher struct {
 	// reprovisionConfigs snapshots the AppliedConfig of every reprovision
 	// dispatch, in call order, as the worker sent it.
 	reprovisionConfigs []store.AgentAppliedConfig
+	// reprovisionOpts records the options of every reprovision dispatch.
+	reprovisionOpts []ReprovisionOptions
 }
 
 func newReincarnateTestDispatcher() *reincarnateTestDispatcher {
@@ -682,7 +693,18 @@ func waitForReincarnationSettled(t *testing.T, s store.Store, agentID string) *s
 // reprovision capability, and wires the given dispatcher.
 func setupReincarnateTestServer(t *testing.T, disp AgentDispatcher) (*Server, store.Store, *store.Project, *store.RuntimeBroker) {
 	t.Helper()
+	return setupReincarnateTestServerWith(t, disp, nil)
+}
+
+// setupReincarnateTestServerWith is setupReincarnateTestServer with a hook
+// that runs right after the server is constructed, before any setup: the
+// place to call installStoreFault (see store_fault_helpers_test.go).
+func setupReincarnateTestServerWith(t *testing.T, disp AgentDispatcher, afterNew func(srv *Server)) (*Server, store.Store, *store.Project, *store.RuntimeBroker) {
+	t.Helper()
 	srv, s := testServer(t)
+	if afterNew != nil {
+		afterNew(srv)
+	}
 	ctx := context.Background()
 
 	project := &store.Project{
@@ -868,10 +890,7 @@ func setupAgentSecretTest(t *testing.T) (*Server, store.Store, string, string, s
 		t.Fatalf("failed to create agent: %v", err)
 	}
 
-	agentToken, err := srv.agentTokenService.GenerateAgentToken(agentID, projectID, nil, nil)
-	if err != nil {
-		t.Fatalf("failed to generate agent token: %v", err)
-	}
+	agentToken := srv.generateRecordedAgentToken(t, agentID, projectID, nil, nil)
 
 	return srv, s, agentID, projectID, agentToken
 }
@@ -1054,10 +1073,7 @@ func clearCreateAgentProviderPath(t *testing.T, s store.Store, project *store.Pr
 // token with ScopeAgentStatusUpdate, the way sciontool does.
 func postAgentStatusAsAgent(t *testing.T, srv *Server, agent *store.Agent, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	tokenSvc := srv.GetAgentTokenService()
-	require.NotNil(t, tokenSvc)
-	token, err := tokenSvc.GenerateAgentToken(agent.ID, agent.ProjectID, []AgentTokenScope{ScopeAgentStatusUpdate}, nil)
-	require.NoError(t, err)
+	token := srv.generateRecordedAgentToken(t, agent.ID, agent.ProjectID, []AgentTokenScope{ScopeAgentStatusUpdate}, nil)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+agent.ID+"/status", bytes.NewReader([]byte(body)))
 	req.Header.Set("X-Scion-Agent-Token", token)
 	req.Header.Set("Content-Type", "application/json")
@@ -1631,6 +1647,14 @@ type routedTestEnv struct {
 func setupRoutedTestEnv(t *testing.T) routedTestEnv {
 	t.Helper()
 	srv, s := testServer(t)
+	return setupRoutedTestEnvOn(t, srv, s)
+}
+
+// setupRoutedTestEnvOn builds the routed test fixtures on an existing server
+// and its raw store, for a test that installs a store fault wrapper
+// (testServerWithStoreFault) before any setup.
+func setupRoutedTestEnvOn(t *testing.T, srv *Server, s store.Store) routedTestEnv {
+	t.Helper()
 	ctx := context.Background()
 
 	// Wire a recording dispatcher so dispatch tests exercise the full path.
@@ -1768,7 +1792,7 @@ func doBrokerSignedRequest(t *testing.T, srv *Server, brokerID string, key []byt
 	if onBehalfOfEmail != "" {
 		req.Header.Set(HeaderOnBehalfOf, "user:"+onBehalfOfEmail)
 	}
-	require.NoError(t, srv.brokerAuthService.SignRequest(req, brokerID, key))
+	require.NoError(t, (&apiclient.HMACAuth{BrokerID: brokerID, SecretKey: key}).ApplyAuth(req))
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, req)
 	return rec
@@ -1870,10 +1894,11 @@ func rotateSecretAsUser(t *testing.T, srv *Server, user *store.User, brokerID st
 	rec := httptest.NewRecorder()
 	if user == nil {
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/brokers/"+brokerID+"/rotate-secret", nil)
+		req.RemoteAddr = tpLoopbackPeer // the transport policy admits a client on the hub host
 		srv.handleBrokerRotateSecret(rec, req, brokerID)
 		return rec
 	}
-	return doRequestAsUser(t, srv, user, http.MethodPost, "/api/v1/brokers/"+brokerID+"/rotate-secret", nil)
+	return doRequestAsUserLoopback(t, srv, user, http.MethodPost, "/api/v1/brokers/"+brokerID+"/rotate-secret", nil)
 }
 
 // setupMutePinTest builds a server with a web chat store, one project and one
@@ -2965,6 +2990,29 @@ type mockGCPServiceAccountAdmin struct {
 
 	// Track IAM mutations for assertions.
 	iamPolicies []mockIAMPolicyCall // SA-level SetIAMPolicy calls
+
+	// addMembersCalls records each AddRoleMembers call; addMembersErr,
+	// when set, returns the error of a call (nil succeeds).
+	addMembersCalls []mockAddRoleMembersCall
+	addMembersErr   func(call int, members []string) error
+
+	// roleMembers holds unconditional role members keyed by
+	// strings.ToLower(saEmail)+"\x00"+role; roleMembersCalls records each
+	// RoleMembers call, and roleMembersErr injects read errors.
+	roleMembers      map[string][]string
+	roleMembersCalls []mockRoleMembersCall
+	roleMembersErr   func(call int, saEmail, role string) error
+}
+
+type mockAddRoleMembersCall struct {
+	SAEmail string
+	Role    string
+	Members []string
+}
+
+type mockRoleMembersCall struct {
+	SAEmail string
+	Role    string
 }
 
 func testServerWithMinting(t *testing.T) (*Server, store.Store, *mockGCPServiceAccountAdmin) {
@@ -3147,6 +3195,7 @@ type mockIntegrationManager struct {
 	configureErr       error
 	replaceConfigErr   error
 	reconnectErr       error
+	updateResult       plugin.UpdateResult
 	updateErr          error
 	installErr         error
 	configureCalls     []string
@@ -3425,35 +3474,18 @@ const testOIDCIssuerURL = "https://scion.example.com"
 
 // installTestOIDCKeyManager sets an OIDCKeyManager with a fresh RS256 key and
 // the testOIDCIssuerURL issuer on srv. Routes that New() registers only when
-// the OIDC provider is enabled stay unregistered.
+// the OIDC provider is enabled stay unregistered. The manager is built by
+// NewOIDCKeyManager with no store and no secret backend, so it generates
+// an RSA-2048 key in memory and persists nothing.
 func installTestOIDCKeyManager(t *testing.T, srv *Server) {
 	t.Helper()
 
-	// Generate a test RSA key pair.
-	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	mgr, err := NewOIDCKeyManager(context.Background(), OIDCKeyManagerConfig{
+		IssuerURL:   testOIDCIssuerURL,
+		Log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		ValueCipher: secret.NewLegacyValueCipher(""),
+	})
 	require.NoError(t, err)
-
-	kid := computeKeyID(&privKey.PublicKey)
-	signingKey := &OIDCSigningKey{
-		KeyID:      kid,
-		PrivateKey: privKey,
-		PublicKey:  &privKey.PublicKey,
-		Active:     true,
-	}
-
-	// Create the RS256 signer (needed by identity token endpoint).
-	signer, err := jose.NewSigner(
-		jose.SigningKey{Algorithm: jose.RS256, Key: privKey},
-		(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", kid),
-	)
-	require.NoError(t, err)
-
-	mgr := &OIDCKeyManager{
-		activeKey: signingKey,
-		allKeys:   []*OIDCSigningKey{signingKey},
-		signer:    signer,
-		issuerURL: testOIDCIssuerURL,
-	}
 
 	srv.oidcKeyManager = mgr
 	srv.oidcIssuerURL = testOIDCIssuerURL
@@ -4519,7 +4551,8 @@ func setupScheduledEventTest(t *testing.T) (*Server, store.Store, string) {
 
 	// Initialize the scheduler (normally done by Server.Start)
 	srv.scheduler = NewScheduler(s, slog.Default())
-	srv.scheduler.RegisterEventHandler("message", srv.messageEventHandler())
+	srv.scheduler.srv = srv
+	srv.RegisterAction(&messageAction{srv: srv})
 
 	project := &store.Project{
 		ID:   tid("project-sched-test"),
@@ -4570,7 +4603,8 @@ func initScheduleTest(t *testing.T, srv *Server, s store.Store) (*Server, store.
 	ctx := context.Background()
 
 	srv.scheduler = NewScheduler(s, slog.Default())
-	srv.scheduler.RegisterEventHandler("message", srv.messageEventHandler())
+	srv.scheduler.srv = srv
+	srv.RegisterAction(&messageAction{srv: srv})
 
 	project := &store.Project{
 		ID:   tid("project-sched-recurring"),
@@ -5223,9 +5257,11 @@ func (d *reincarnateTestDispatcher) DispatchAgentCreate(context.Context, *store.
 func (d *reincarnateTestDispatcher) DispatchAgentProvision(context.Context, *store.Agent) error {
 	return nil
 }
-func (d *reincarnateTestDispatcher) DispatchAgentReprovision(_ context.Context, agent *store.Agent) error {
+func (d *reincarnateTestDispatcher) DispatchAgentReprovision(ctx context.Context, agent *store.Agent, opts ReprovisionOptions) error {
 	d.mu.Lock()
 	d.reprovisionCalls++
+	d.reprovisionGatheredEnvHolders = append(d.reprovisionGatheredEnvHolders, reprovisionGatheredEnvFrom(ctx))
+	d.reprovisionOpts = append(d.reprovisionOpts, opts)
 	if agent.AppliedConfig != nil {
 		d.reprovisionConfigs = append(d.reprovisionConfigs, *agent.AppliedConfig)
 	}
@@ -5244,9 +5280,10 @@ func (d *reincarnateTestDispatcher) DispatchAgentReprovision(_ context.Context, 
 	}
 	return err
 }
-func (d *reincarnateTestDispatcher) DispatchAgentProvisionForMove(_ context.Context, agent *store.Agent, expect, moveID string) error {
+func (d *reincarnateTestDispatcher) DispatchAgentProvisionForMove(ctx context.Context, agent *store.Agent, expect, moveID string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.moveProvisionGatheredEnvHolders = append(d.moveProvisionGatheredEnvHolders, reprovisionGatheredEnvFrom(ctx))
 	d.moveProvisionCalls = append(d.moveProvisionCalls, agent.RuntimeBrokerID+"|"+expect)
 	d.moveProvisionIDs = append(d.moveProvisionIDs, moveID)
 	if d.moveProvisionErr != nil && (!errors.Is(d.moveProvisionErr, errProvisionSent) || d.moveProvisionFailsBeforeF4) {
@@ -5312,9 +5349,11 @@ func (d *reincarnateTestDispatcher) moveSnapshot() (provisions, localDeletes, st
 }
 func (d *reincarnateTestDispatcher) DispatchAgentStart(ctx context.Context, agent *store.Agent, task string, resume bool) error {
 	d.mu.Lock()
-	// A start the hub refused before sending (its run not begun, or the hub
-	// shutting down) records no run, as in production.
-	if d.runStore != nil && !errors.Is(d.startErr, errStartRunNotBegun) && !errors.Is(d.startErr, ErrHubShuttingDown) {
+	// A start the hub refused before sending (its run not begun, the hub
+	// shutting down, or its pending config fold refused) records no run,
+	// as in production.
+	if d.runStore != nil && !errors.Is(d.startErr, errStartRunNotBegun) && !errors.Is(d.startErr, ErrHubShuttingDown) &&
+		!errors.Is(d.startErr, errPendingConfigFold) {
 		runID := fmt.Sprintf("run-%s-%d", agent.RuntimeBrokerID, len(d.startBrokers)+1)
 		if _, err := d.runStore.SetAgentRunID(ctx, agent.ID, runID, nil); err == nil {
 			agent.RunID = runID
@@ -5325,17 +5364,22 @@ func (d *reincarnateTestDispatcher) DispatchAgentStart(ctx context.Context, agen
 	}
 	d.startBrokers = append(d.startBrokers, agent.RuntimeBrokerID)
 	d.startCalls++
+	d.startGatheredEnvHolders = append(d.startGatheredEnvHolders, reprovisionGatheredEnvFrom(ctx))
 	d.lastStartTask = task
 	d.lastStartResume = &resume
 	err := d.startErr
 	image := d.startImage
 	echo := d.startEcho
+	agentEcho := d.startAgentEcho
 	d.mu.Unlock()
 	if err == nil && image != "" && agent.AppliedConfig != nil {
 		agent.AppliedConfig.Image = image
 	}
 	if err == nil && echo != nil && agent.AppliedConfig != nil {
 		echo(agent.AppliedConfig)
+	}
+	if err == nil && agentEcho != nil {
+		agentEcho(agent)
 	}
 	return err
 }
@@ -5386,6 +5430,7 @@ func (d *reincarnateTestDispatcher) resetReprovisions(reprovisionErr error) {
 	defer d.mu.Unlock()
 	d.reprovisionCalls = 0
 	d.reprovisionConfigs = nil
+	d.reprovisionOpts = nil
 	d.reprovisionErr = reprovisionErr
 }
 
@@ -5424,7 +5469,7 @@ func (d *createAgentDispatcher) DispatchAgentProvision(_ context.Context, agent 
 	return nil
 }
 
-func (d *createAgentDispatcher) DispatchAgentReprovision(_ context.Context, agent *store.Agent) error {
+func (d *createAgentDispatcher) DispatchAgentReprovision(_ context.Context, agent *store.Agent, _ ReprovisionOptions) error {
 	agent.Phase = string(state.PhaseCreated)
 	return nil
 }
@@ -5722,7 +5767,7 @@ func (s *spaceMembersStore) ListProjectMembers(ctx context.Context, projectID st
 	return s.Store.ListProjectMembers(ctx, projectID)
 }
 
-func (p *readStateAtPublishSpy) PublishUserMessage(ctx context.Context, msg *store.Message, _ []AttachmentRef, _ []artifacts.MessageRef) {
+func (p *readStateAtPublishSpy) PublishUserMessage(ctx context.Context, msg *store.Message, _ []AttachmentRef, _ []artifacts.MessageRef, _ ...ChatEventOption) {
 	p.called = true
 	p.messageID = msg.ID
 	p.readStateAtPublish, _ = p.wcs.GetReadState(ctx, msg.SenderID, msg.ThreadID)
@@ -5825,6 +5870,48 @@ func (m *mockGCPServiceAccountAdmin) SetIAMPolicy(_ context.Context, saEmail, me
 		Role:    role,
 	})
 	return m.policyErr
+}
+
+func (m *mockGCPServiceAccountAdmin) AddRoleMembers(_ context.Context, saEmail, role string, members []string) error {
+	m.addMembersCalls = append(m.addMembersCalls, mockAddRoleMembersCall{
+		SAEmail: saEmail, Role: role, Members: append([]string(nil), members...),
+	})
+	if m.addMembersErr != nil {
+		if err := m.addMembersErr(len(m.addMembersCalls), members); err != nil {
+			return err
+		}
+	}
+	if m.roleMembers == nil {
+		m.roleMembers = map[string][]string{}
+	}
+	key := strings.ToLower(saEmail) + "\x00" + role
+	cur := m.roleMembers[key]
+	for _, mem := range members {
+		if !slices.Contains(cur, mem) {
+			cur = append(cur, mem)
+		}
+	}
+	m.roleMembers[key] = cur
+	return nil
+}
+
+func (m *mockGCPServiceAccountAdmin) RoleMembers(_ context.Context, saEmail, role string) ([]string, error) {
+	m.roleMembersCalls = append(m.roleMembersCalls, mockRoleMembersCall{SAEmail: saEmail, Role: role})
+	if m.roleMembersErr != nil {
+		if err := m.roleMembersErr(len(m.roleMembersCalls), saEmail, role); err != nil {
+			return nil, err
+		}
+	}
+	key := strings.ToLower(saEmail) + "\x00" + role
+	return append([]string(nil), m.roleMembers[key]...), nil
+}
+
+func (m *mockGCPServiceAccountAdmin) setRoleMembers(saEmail, role string, members []string) {
+	if m.roleMembers == nil {
+		m.roleMembers = map[string][]string{}
+	}
+	key := strings.ToLower(saEmail) + "\x00" + role
+	m.roleMembers[key] = append([]string(nil), members...)
 }
 
 type mockIAMPolicyCall struct {
@@ -5975,9 +6062,9 @@ func (m *mockIntegrationManager) BrokerInfo(name string) (string, string, []stri
 	return "v0.8.2", "telegram", []string{"send", "receive"}, nil
 }
 
-func (m *mockIntegrationManager) UpdatePlugin(name string, repoPath string) error {
+func (m *mockIntegrationManager) UpdatePlugin(name string, repoPath string) (plugin.UpdateResult, error) {
 	m.updateCalls = append(m.updateCalls, name)
-	return m.updateErr
+	return m.updateResult, m.updateErr
 }
 
 func (m *mockIntegrationManager) InstallPlugin(name, repoPath, pluginsDir, configFile string) error {
@@ -6048,36 +6135,24 @@ func (d *errorDispatcher) DispatchAgentMessage(_ context.Context, agent *store.A
 // "an agent reads its own project-scoped record" self-read path.
 func (f *projectAgentAuthzFixture) selfToken(t *testing.T, scopes ...AgentTokenScope) string {
 	t.Helper()
-	svc := f.srv.GetAgentTokenService()
-	require.NotNil(t, svc)
 	allScopes := append([]AgentTokenScope{ScopeProjectRead}, scopes...)
-	tok, err := svc.GenerateAgentToken(f.target.ID, f.target.ProjectID, allScopes, nil)
-	require.NoError(t, err)
-	return tok
+	return f.srv.generateRecordedAgentToken(t, f.target.ID, f.target.ProjectID, allScopes, nil)
 }
 
 // callerToken mints an agent JWT for f.caller -- a different agent from
 // f.target, in the same project.
 func (f *projectAgentAuthzFixture) callerToken(t *testing.T, scopes ...AgentTokenScope) string {
 	t.Helper()
-	svc := f.srv.GetAgentTokenService()
-	require.NotNil(t, svc)
 	allScopes := append([]AgentTokenScope{ScopeProjectRead}, scopes...)
-	tok, err := svc.GenerateAgentToken(f.caller.ID, f.caller.ProjectID, allScopes, nil)
-	require.NoError(t, err)
-	return tok
+	return f.srv.generateRecordedAgentToken(t, f.caller.ID, f.caller.ProjectID, allScopes, nil)
 }
 
 // strangerToken mints an agent JWT for f.stranger -- an agent in a different
 // project from f.target.
 func (f *projectAgentAuthzFixture) strangerToken(t *testing.T, scopes ...AgentTokenScope) string {
 	t.Helper()
-	svc := f.srv.GetAgentTokenService()
-	require.NotNil(t, svc)
 	allScopes := append([]AgentTokenScope{ScopeProjectRead}, scopes...)
-	tok, err := svc.GenerateAgentToken(f.stranger.ID, f.stranger.ProjectID, allScopes, nil)
-	require.NoError(t, err)
-	return tok
+	return f.srv.generateRecordedAgentToken(t, f.stranger.ID, f.stranger.ProjectID, allScopes, nil)
 }
 
 func (f *projectAgentAuthzFixture) targetPath() string {
@@ -6102,6 +6177,20 @@ func (g *getProjectErrStore) GetProject(ctx context.Context, id string) (*store.
 func (s *countingBrokerLoadStore) UpdateRuntimeBroker(ctx context.Context, broker *store.RuntimeBroker) error {
 	s.updateRuntimeBrokerCalls++
 	return s.Store.UpdateRuntimeBroker(ctx, broker)
+}
+
+// RefreshRuntimeBrokerState is the heartbeat's broker write; a refresh that
+// reports a change and is stored counts as one broker row write.
+func (s *countingBrokerLoadStore) RefreshRuntimeBrokerState(ctx context.Context, id string, refresh func(*store.RuntimeBroker) bool) error {
+	wrote := false
+	err := s.Store.RefreshRuntimeBrokerState(ctx, id, func(b *store.RuntimeBroker) bool {
+		wrote = refresh(b)
+		return wrote
+	})
+	if err == nil && wrote {
+		s.updateRuntimeBrokerCalls++
+	}
+	return err
 }
 
 func (s *countingBrokerLoadStore) GetRuntimeBroker(ctx context.Context, id string) (*store.RuntimeBroker, error) {
@@ -6401,7 +6490,7 @@ func (d *def135Dispatcher) DispatchAgentProvision(_ context.Context, _ *store.Ag
 	return nil
 }
 
-func (d *def135Dispatcher) DispatchAgentReprovision(_ context.Context, _ *store.Agent) error {
+func (d *def135Dispatcher) DispatchAgentReprovision(_ context.Context, _ *store.Agent, _ ReprovisionOptions) error {
 	return nil
 }
 func (d *def135Dispatcher) DispatchAgentStart(_ context.Context, _ *store.Agent, _ string, _ bool) error {
@@ -6557,11 +6646,8 @@ func (f *brokerAuthFixture) asAgent(t *testing.T, method, path string, body inte
 	_ = f.store.CreateAgent(ctx, agent)
 
 	// Mint an agent token.
-	svc := f.srv.GetAgentTokenService()
-	require.NotNil(t, svc)
-	tok, err := svc.GenerateAgentToken(agent.ID, agent.ProjectID,
+	tok := f.srv.generateRecordedAgentToken(t, agent.ID, agent.ProjectID,
 		[]AgentTokenScope{ScopeProjectRead}, nil)
-	require.NoError(t, err)
 
 	return doRequestWithAgentToken(t, f.srv, method, path, body, tok)
 }

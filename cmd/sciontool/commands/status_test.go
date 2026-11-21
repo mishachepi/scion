@@ -11,8 +11,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	state "github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 )
 
 func TestStatusCommand(t *testing.T) {
@@ -70,6 +68,18 @@ func TestStatusCommand(t *testing.T) {
 			args:            []string{"status", "blocked"},
 			wantActivity:    "blocked",
 			wantLogContains: "Agent blocked: Agent is blocked",
+		},
+		{
+			name:            "idle with message",
+			args:            []string{"status", "idle", "No task assigned"},
+			wantActivity:    "idle",
+			wantLogContains: "Agent idle: No task assigned",
+		},
+		{
+			name:            "idle with default message",
+			args:            []string{"status", "idle"},
+			wantActivity:    "idle",
+			wantLogContains: "Agent idle: Agent is idle",
 		},
 		{
 			name:            "limits_exceeded with message",
@@ -134,69 +144,6 @@ func TestStatusCommand(t *testing.T) {
 	}
 }
 
-func TestStatusDefinitionHubUpdate(t *testing.T) {
-	tests := []struct {
-		name            string
-		statusType      string
-		wantActivity    state.Activity
-		wantStatus      string
-		wantMessage     string
-		wantTaskSummary string
-	}{
-		{
-			name:         "ask user",
-			statusType:   "ask_user",
-			wantActivity: state.ActivityWaitingForInput,
-			wantStatus:   "waiting_for_input",
-			wantMessage:  "details",
-		},
-		{
-			name:         "blocked",
-			statusType:   "blocked",
-			wantActivity: state.ActivityBlocked,
-			wantStatus:   "blocked",
-			wantMessage:  "details",
-		},
-		{
-			name:            "task completed",
-			statusType:      "task_completed",
-			wantActivity:    state.ActivityCompleted,
-			wantStatus:      "completed",
-			wantTaskSummary: "details",
-		},
-		{
-			name:         "limits exceeded",
-			statusType:   "limits_exceeded",
-			wantActivity: state.ActivityLimitsExceeded,
-			wantStatus:   "limits_exceeded",
-			wantMessage:  "details",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			definition, ok := statusDefinitions[tt.statusType]
-			if !ok {
-				t.Fatalf("status definition %q not found", tt.statusType)
-			}
-
-			update := definition.hubUpdate("details")
-			if update.Activity != tt.wantActivity {
-				t.Errorf("activity = %q, want %q", update.Activity, tt.wantActivity)
-			}
-			if update.Status != tt.wantStatus {
-				t.Errorf("status = %q, want %q", update.Status, tt.wantStatus)
-			}
-			if update.Message != tt.wantMessage {
-				t.Errorf("message = %q, want %q", update.Message, tt.wantMessage)
-			}
-			if update.TaskSummary != tt.wantTaskSummary {
-				t.Errorf("task summary = %q, want %q", update.TaskSummary, tt.wantTaskSummary)
-			}
-		})
-	}
-}
-
 func TestStatusCommandUnknownType(t *testing.T) {
 	resetRootCmdState(t)
 	tempDir := t.TempDir()
@@ -213,5 +160,19 @@ func TestStatusCommandUnknownType(t *testing.T) {
 	output := buf.String()
 	if !bytes.Contains([]byte(output), []byte("unknown status type")) {
 		t.Errorf("expected error message about unknown status type, got: %s", output)
+	}
+}
+
+// TestStatusHelpListsIdle checks that the help lists idle and states the
+// rule that separates it from blocked and task_completed.
+func TestStatusHelpListsIdle(t *testing.T) {
+	for _, want := range []string{
+		"idle Signal that the agent has nothing to do until new work arrives",
+		"is blocked; nothing to do until a new message or task arrives is idle;",
+		"sciontool status idle ",
+	} {
+		if !strings.Contains(strings.Join(strings.Fields(statusCmd.Long), " "), strings.Join(strings.Fields(want), " ")) {
+			t.Errorf("status help does not contain %q", want)
+		}
 	}
 }

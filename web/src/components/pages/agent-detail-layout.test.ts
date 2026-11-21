@@ -94,6 +94,25 @@ describe('agent detail layout', () => {
     }
   });
 
+  it('bounds the Messages tab chat thread so its message list scrolls', () => {
+    // Unbounded, the thread grows to fit every message, so its list never
+    // scrolls and the composer sits below the fold.
+    expect(rules.get('.messages-chat-thread') ?? '').toMatch(
+      /(^|;)\s*height:\s*calc\(var\(--scion-app-height, 100dvh\) - 24rem\)/
+    );
+    const el = document.createElement('scion-page-agent-detail');
+    Object.assign(el, { agentId: 'a-1', agent: makeAgent({}) });
+    Object.defineProperty(el, 'nativeChatEnabled', { get: () => true });
+    const host = document.createElement('div');
+    render(
+      (el as unknown as { renderMessagesPanel: () => TemplateResult }).renderMessagesPanel(),
+      host
+    );
+    const thread = host.querySelector('scion-chat-thread');
+    expect(thread).not.toBeNull();
+    expect(thread!.classList.contains('messages-chat-thread')).toBe(true);
+  });
+
   /** Render one of the page's template methods for `agent`. */
   function renderPart(agent: Agent, method: 'renderHeader' | 'renderMessagingCard'): HTMLElement {
     const el = document.createElement('scion-page-agent-detail');
@@ -164,6 +183,7 @@ describe('agent detail layout', () => {
       expect(badges.map((c) => c.tagName.toLowerCase())).toEqual([
         'scion-status-badge',
         'scion-deletion-badge',
+        'scion-authority-badge',
         'scion-message-mode-badge',
       ]);
       expect(header.querySelector(':scope > sl-icon[slot="icon"]')?.getAttribute('name')).toBe(

@@ -19,6 +19,7 @@ import (
 	"errors"
 	"time"
 
+	entsql "entgo.io/ent/dialect/sql"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agent"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/brokerdispatch"
@@ -33,7 +34,15 @@ import (
 // execution across nodes is enforced by conditional (compare-and-swap) updates
 // on the state column — no SELECT ... FOR UPDATE, correct on SQLite + Postgres.
 type BrokerDispatchStore struct {
-	client *ent.Client
+	client    *ent.Client
+	inTx      bool
+	holdClock func() time.Time
+}
+
+// SetMessageHoldClockForTest overrides the clock used by MessageHoldStore
+// methods on SQLite (and in unit tests). Nil restores the database / wall clock.
+func (s *BrokerDispatchStore) SetMessageHoldClockForTest(fn func() time.Time) {
+	s.holdClock = fn
 }
 
 // NewBrokerDispatchStore creates a new Ent-backed BrokerDispatchStore.
@@ -289,21 +298,80 @@ func (s *BrokerDispatchStore) MarkMessageDispatched(ctx context.Context, id stri
 	return affected == 1, nil
 }
 
-// MarkMessageFailed sets a message's dispatch_state to "failed" and records the reason.
+// MarkMessageFailed sets a message's dispatch_state to "failed" and records
+// the reason. A failed or delivered row is left alone: a conduit delivery
+// that completed is never turned into a failure (review R4). See
+// failMessage for a delivering row.
 func (s *BrokerDispatchStore) MarkMessageFailed(ctx context.Context, id string, reason string) error {
+	_, err := s.failMessage(ctx, id, reason, nil)
+	return err
+}
+
+// FailUndeliveredMessage implements store.BrokerDispatchStore.
+func (s *BrokerDispatchStore) FailUndeliveredMessage(ctx context.Context, id string, reason string) (bool, error) {
+	return s.failMessage(ctx, id, reason, []string{
+		store.MessageDispatchPending, store.MessageDispatchDispatched,
+		store.MessageDispatchDelivering, store.MessageDispatchPartial,
+	})
+}
+
+// failMessage moves row id to failed with reason, from any state in from
+// (nil: any state but failed and delivered), and reports whether it did.
+// Each transition is one conditional UPDATE, so a racing /deliver finish
+// and this write can never both win. A row still delivering also gets the
+// stored outcome partial-unknown in the same write, so a same-id /deliver
+// replays it instead of answering bound, and the delivery's own finish
+// (compare-and-set on delivering) can no longer change it.
+func (s *BrokerDispatchStore) failMessage(ctx context.Context, id, reason string, from []string) (bool, error) {
 	uid, err := parseUUID(id)
 	if err != nil {
-		return err
+		return false, err
 	}
-	_, err = s.client.Message.Update().
-		Where(message.IDEQ(uid), message.DispatchStateNEQ(store.MessageDispatchFailed)).
-		SetDispatchState(store.MessageDispatchFailed).
+	allowed := func(state string) bool {
+		if from == nil {
+			return state != store.MessageDispatchFailed && state != store.MessageDispatchDelivered
+		}
+		for _, f := range from {
+			if f == state {
+				return true
+			}
+		}
+		return false
+	}
+	if allowed(store.MessageDispatchDelivering) {
+		n, err := s.client.Message.Update().
+			Where(message.IDEQ(uid), message.DispatchStateEQ(store.MessageDispatchDelivering)).
+			SetDispatchState(store.MessageDispatchFailed).
+			SetNillableDispatchFailureReason(&reason).
+			SetDeliveryOutcome(store.DeliveryOutcomeUnknownPartial).
+			ClearNotReached().
+			ClearNotReachedAt().
+			Save(ctx)
+		if err != nil {
+			return false, mapError(err)
+		}
+		if n > 0 {
+			return true, nil
+		}
+	}
+	q := s.client.Message.Update().Where(message.IDEQ(uid), message.DispatchStateNEQ(store.MessageDispatchDelivering))
+	if from == nil {
+		q = q.Where(message.DispatchStateNotIn(store.MessageDispatchFailed, store.MessageDispatchDelivered))
+	} else {
+		q = q.Where(message.DispatchStateIn(from...))
+	}
+	n, err := q.SetDispatchState(store.MessageDispatchFailed).
 		SetNillableDispatchFailureReason(&reason).
+		ClearNotReached().
+		ClearNotReachedAt().
 		Save(ctx)
 	if err != nil {
-		return mapError(err)
+		return false, mapError(err)
 	}
-	return nil
+	if n > 0 && from == nil {
+		s.syncHoldMarkerAfterDirectFail(ctx, uid)
+	}
+	return n > 0, nil
 }
 
 // CountBrokerDispatchHealth returns the number of in_progress dispatches whose
@@ -332,6 +400,30 @@ func (s *BrokerDispatchStore) CountBrokerDispatchHealth(ctx context.Context, stu
 	return stuck, failed, nil
 }
 
+// stuckPendingMessage returns the predicates every stuck-pending sweep query
+// shares: dispatch_state 'pending', created before the cutoff, and an agent
+// recipient. dispatch_state is compared with the literal 'pending' rather
+// than a bound parameter so the predicate textually implies the WHERE of the
+// partial index on (created, id) WHERE dispatch_state = 'pending'. SQLite
+// and a Postgres generic plan can only use a partial index when the query
+// proves its WHERE without knowing parameter values.
+func stuckPendingMessage(before time.Time) []predicate.Message {
+	return []predicate.Message{
+		messageDispatchPendingLiteral(),
+		message.CreatedLT(before),
+		message.RecipientHasPrefix("agent:"),
+	}
+}
+
+// messageDispatchPendingLiteral matches dispatch_state = 'pending' with the
+// value inlined as a literal, so the query can use the partial pending index
+// (see stuckPendingMessage).
+func messageDispatchPendingLiteral() predicate.Message {
+	return func(s *entsql.Selector) {
+		s.Where(entsql.ExprP(s.C(message.FieldDispatchState) + " = '" + store.MessageDispatchPending + "'"))
+	}
+}
+
 // CountStuckPendingMessages returns the number of messages still in
 // dispatch_state='pending' whose created timestamp is before the given
 // cutoff. Scoped to agent recipients only (message.RecipientHasPrefix
@@ -342,11 +434,7 @@ func (s *BrokerDispatchStore) CountBrokerDispatchHealth(ctx context.Context, stu
 // expired here.
 func (s *BrokerDispatchStore) CountStuckPendingMessages(ctx context.Context, before time.Time) (int, error) {
 	n, err := s.client.Message.Query().
-		Where(
-			message.DispatchStateEQ(store.MessageDispatchPending),
-			message.CreatedLT(before),
-			message.RecipientHasPrefix("agent:"),
-		).
+		Where(stuckPendingMessage(before)...).
 		Count(ctx)
 	if err != nil {
 		return 0, mapError(err)
@@ -362,11 +450,7 @@ func (s *BrokerDispatchStore) ListStuckPendingMessageIDs(ctx context.Context, be
 		return nil, nil
 	}
 	ids, err := s.client.Message.Query().
-		Where(
-			message.DispatchStateEQ(store.MessageDispatchPending),
-			message.CreatedLT(before),
-			message.RecipientHasPrefix("agent:"),
-		).
+		Where(stuckPendingMessage(before)...).
 		Order(ent.Asc(message.FieldCreated), ent.Asc(message.FieldID)).
 		Limit(limit).
 		IDs(ctx)
@@ -385,11 +469,7 @@ func (s *BrokerDispatchStore) ListStuckPendingMessageIDs(ctx context.Context, be
 // expired. Scoped to agent recipients only — see CountStuckPendingMessages.
 func (s *BrokerDispatchStore) ExpireStuckPendingMessages(ctx context.Context, before time.Time, reason string) (int, error) {
 	affected, err := s.client.Message.Update().
-		Where(
-			message.DispatchStateEQ(store.MessageDispatchPending),
-			message.CreatedLT(before),
-			message.RecipientHasPrefix("agent:"),
-		).
+		Where(stuckPendingMessage(before)...).
 		SetDispatchState(store.MessageDispatchFailed).
 		SetNillableDispatchFailureReason(&reason).
 		Save(ctx)
@@ -406,9 +486,11 @@ func (s *BrokerDispatchStore) ExpireStuckPendingMessages(ctx context.Context, be
 // are left untouched — a lookup miss there does not mean the recipient is
 // gone. Returns the number of messages transitioned.
 func (s *BrokerDispatchStore) FailPendingMessagesWithMissingRecipient(ctx context.Context, reason string) (int, error) {
+	// The literal lets this read scan the partial pending index instead of
+	// the whole table.
 	pending, err := s.client.Message.Query().
 		Where(
-			message.DispatchStateEQ(store.MessageDispatchPending),
+			messageDispatchPendingLiteral(),
 			message.RecipientHasPrefix("agent:"),
 			message.RecipientIDNEQ(""),
 		).
@@ -503,11 +585,7 @@ func (s *BrokerDispatchStore) ExpireAndListStuckPendingMessages(ctx context.Cont
 // which must be a transactional client.
 func expireAndListStuckPending(ctx context.Context, c *ent.Client, before time.Time, reason string) ([]store.ExpiredPendingMessage, error) {
 	candidates, err := c.Message.Query().
-		Where(
-			message.DispatchStateEQ(store.MessageDispatchPending),
-			message.CreatedLT(before),
-			message.RecipientHasPrefix("agent:"),
-		).
+		Where(stuckPendingMessage(before)...).
 		Order(ent.Asc(message.FieldCreated), ent.Asc(message.FieldID)).
 		Limit(expirePageSize).
 		Select(message.FieldID, message.FieldRecipient, message.FieldCreated).
@@ -548,7 +626,8 @@ var backfillPageSize = 500
 // the pre-fix nc-promote-busy bug (any writer that built a storeMsg without
 // stamping DispatchState). The exact complement of the R1 agent-only
 // allow-list: only an agent-addressed row is ever legitimately pending or
-// genuinely failed (see ExpireStuckPendingMessages/PurgeFailedMessages), so
+// genuinely failed (see ExpireStuckPendingMessages and
+// ChatRetentionStore.SelectFailedMessages), so
 // any other row in either state is this writer bug. Sets dispatch_state
 // "dispatched", clears the failure reason, and backdates dispatched_at to
 // the row's own created time when unset. Returns the number of rows

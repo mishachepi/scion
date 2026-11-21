@@ -15,6 +15,7 @@
 package hub
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -52,7 +53,9 @@ type EventPublisher interface {
 	// user (for example SCHEDULE_BLOCKED) on user.<subscriberID>.notification
 	// and nowhere else. A notification with no SubscriberID is dropped.
 	PublishUserNotification(ctx context.Context, notif *store.Notification)
-	PublishUserMessage(ctx context.Context, msg *store.Message, attachments []AttachmentRef, artifactRefs []artifacts.MessageRef)
+	// PublishUserMessage publishes a stored message. opts add to the
+	// payload of its chat subjects only (see ChatEventOption).
+	PublishUserMessage(ctx context.Context, msg *store.Message, attachments []AttachmentRef, artifactRefs []artifacts.MessageRef, opts ...ChatEventOption)
 	PublishAgentPorts(ctx context.Context, agent *store.Agent)
 	PublishAllowListChanged(ctx context.Context, action string, email string)
 	// PublishInviteChanged emits admin.invite.changed carrying only the
@@ -96,7 +99,7 @@ type EventPublisher interface {
 	// userIDs on user.<id>.chat.message. Callers pass only current members
 	// of the thread's conversation who can read its project; see
 	// fanOutThreadMessageToMembers.
-	PublishChatMemberMessage(ctx context.Context, msg *store.Message, attachments []AttachmentRef, artifactRefs []artifacts.MessageRef, userIDs []string)
+	PublishChatMemberMessage(ctx context.Context, msg *store.Message, attachments []AttachmentRef, artifactRefs []artifacts.MessageRef, userIDs []string, opts ...ChatEventOption)
 	// PublishChatMessageEdited publishes a message-edited event so SSE
 	// subscribers can update the message content in real time.
 	PublishChatMessageEdited(ctx context.Context, projectID, conversationKey string, evt ChatMessageEditedEvent)
@@ -111,6 +114,11 @@ type EventPublisher interface {
 	// scheduled chat messages on user.<id>.chat.scheduled. Only the
 	// sender is ever told about a scheduled message.
 	PublishChatScheduledEvent(ctx context.Context, userID string, evt ChatScheduledEvent)
+	// PublishChatStarsChanged tells the user's own sessions, on
+	// user.<id>.chat.stars, that their starred messages changed. The
+	// payload is a content-free invalidation ({"action":"changed"}):
+	// clients refetch current state. Only the owner is ever told.
+	PublishChatStarsChanged(ctx context.Context, userID string)
 	// Subscribe returns a channel that receives events matching the given
 	// subject patterns, along with an unsubscribe function. Patterns use
 	// NATS-style wildcards: '*' matches a single token, '>' matches the
@@ -137,7 +145,7 @@ func (noopEventPublisher) PublishBrokerDisconnected(_ context.Context, _ string,
 func (noopEventPublisher) PublishBrokerStatus(_ context.Context, _, _ string)                  {}
 func (noopEventPublisher) PublishNotification(_ context.Context, _ *store.Notification)        {}
 func (noopEventPublisher) PublishUserNotification(_ context.Context, _ *store.Notification)    {}
-func (noopEventPublisher) PublishUserMessage(_ context.Context, _ *store.Message, _ []AttachmentRef, _ []artifacts.MessageRef) {
+func (noopEventPublisher) PublishUserMessage(_ context.Context, _ *store.Message, _ []AttachmentRef, _ []artifacts.MessageRef, _ ...ChatEventOption) {
 }
 func (noopEventPublisher) PublishAgentPorts(_ context.Context, _ *store.Agent)    {}
 func (noopEventPublisher) PublishAllowListChanged(_ context.Context, _, _ string) {}
@@ -149,7 +157,7 @@ func (noopEventPublisher) PublishChatReadStateEvent(_ context.Context, _, _, _ s
 func (noopEventPublisher) PublishChatOwnReadStateEvent(_ context.Context, _, _, _ string) {}
 func (noopEventPublisher) PublishChatOwnStateChanged(_ context.Context, _, _, _ string, _ *bool) {
 }
-func (noopEventPublisher) PublishChatMemberMessage(_ context.Context, _ *store.Message, _ []AttachmentRef, _ []artifacts.MessageRef, _ []string) {
+func (noopEventPublisher) PublishChatMemberMessage(_ context.Context, _ *store.Message, _ []AttachmentRef, _ []artifacts.MessageRef, _ []string, _ ...ChatEventOption) {
 }
 func (noopEventPublisher) PublishChatMessageEdited(_ context.Context, _ string, _ string, _ ChatMessageEditedEvent) {
 }
@@ -161,6 +169,7 @@ func (noopEventPublisher) Close()                                               
 
 func (noopEventPublisher) PublishChatScheduledEvent(_ context.Context, _ string, _ ChatScheduledEvent) {
 }
+func (noopEventPublisher) PublishChatStarsChanged(_ context.Context, _ string) {}
 
 // Subscribe on the no-op publisher returns a nil channel (which blocks forever
 // on receive) and a no-op unsubscribe. Callers that need real subscriptions
@@ -195,8 +204,9 @@ type AgentStatusEvent struct {
 	AgentID           string             `json:"agentId"`
 	ProjectID         string             `json:"projectId"`
 	Phase             string             `json:"phase,omitempty"`
-	Activity          string             `json:"activity,omitempty"`
-	Detail            *AgentDetail       `json:"detail"` // always sent, so a cleared Message reaches the web as "" (ptone/scion#4415)
+	Activity          string             `json:"activity"`      // always sent, so a cleared Activity reaches the web as ""
+	SuspendReason     string             `json:"suspendReason"` // always sent, so a resume clears a reason the web merged earlier (see state.SuspendReason)
+	Detail            *AgentDetail       `json:"detail"`        // always sent, so a cleared Message reaches the web as "" (ptone/scion#4415)
 	ContainerStatus   string             `json:"containerStatus,omitempty"`
 	LastActivityEvent string             `json:"lastActivityEvent,omitempty"`
 	Launch            *store.AgentLaunch `json:"launch,omitempty"` // design §3.2; a snapshot taken at publish time
@@ -358,6 +368,18 @@ type UserMessageEvent struct {
 	// (metadata.artifacts, ptone/scion#3758) on the chat subjects only;
 	// see withChatArtifactRefs.
 	Metadata *UserMessageEventMetadata `json:"metadata,omitempty"`
+
+	// Decisions and DecisionIntro are set on a decision-prompt row, and
+	// DecisionResponse on a decision-response row, on the chat subjects only
+	// (design choices v4, 4.4); see withChatDecisionPayload. Only the
+	// handlers of the web.decisions experiment set them.
+	Decisions        []DecisionView        `json:"decisions,omitempty"`
+	DecisionIntro    string                `json:"decisionIntro,omitempty"`
+	DecisionResponse *DecisionResponseView `json:"decisionResponse,omitempty"`
+	// AnswerMode is set with Decisions, and DecisionResponseSet on the
+	// response row of a set submit (design choices v5, 5.1 and 5.2).
+	AnswerMode          string                   `json:"answerMode,omitempty"`
+	DecisionResponseSet *DecisionResponseSetView `json:"decisionResponseSet,omitempty"`
 }
 
 // UserMessageEventMetadata is the message metadata a live chat event
@@ -383,9 +405,27 @@ type NotificationCreatedEvent struct {
 // UserNotificationEvent is the payload for a non-chat notification addressed
 // to a single user (PublishUserNotification). SubscriberID is the client's
 // second gate; the subject already scopes delivery.
+//
+// Kind, ResourceType and ResourceID are fields of this event only, never of
+// the embedded NotificationCreatedEvent: that struct is also the payload of
+// the broadcast notification.created and project.<id>.notification
+// subjects, which reach other sessions. They are empty, and omitted, for a
+// notification that does not set them.
 type UserNotificationEvent struct {
 	NotificationCreatedEvent
 	SubscriberID string `json:"subscriberId"`
+	Kind         string `json:"kind,omitempty"`
+	ResourceType string `json:"resourceType,omitempty"`
+	ResourceID   string `json:"resourceId,omitempty"`
+	// Excerpt is the notification's text from another principal
+	// (store.Notification.Excerpt), on this event only for the same
+	// reason; empty and omitted for every kind but the review summary.
+	Excerpt string `json:"excerpt,omitempty"`
+	// Acknowledged is true when an in-place hub notice transitions to
+	// acknowledged (for example decisions_waiting clearing at N = 0 or
+	// updating quietly after Mark read). Omitted when false so existing
+	// unacknowledged event payloads stay byte-for-byte identical.
+	Acknowledged bool `json:"acknowledged,omitempty"`
 }
 
 // AllowListChangedEvent is published when the allow list is modified.
@@ -596,18 +636,15 @@ func (p *ChannelEventPublisher) Close() {
 	p.logger().Info("event publisher closed", "subscriber_channels", len(seen))
 }
 
-// PublishAgentStatus publishes an agent status event to both agent-specific
-// and project-scoped subjects (dual-publish pattern).
-//
-// An agent status event published with an eventstreams.WithHeartbeatTrigger
-// context counts as trigger=heartbeat on scion.hub.events.published.
-func (p *eventBuilder) PublishAgentStatus(ctx context.Context, agent *store.Agent) {
-	now := time.Now()
+// agentStatusEvent builds the status event of agent, with the computed
+// launch and deletion views taken at now.
+func agentStatusEvent(agent *store.Agent, now time.Time) AgentStatusEvent {
 	evt := AgentStatusEvent{
 		AgentID:         agent.ID,
 		ProjectID:       agent.ProjectID,
 		Phase:           agent.Phase,
 		Activity:        agent.Activity,
+		SuspendReason:   agent.SuspendReason,
 		ContainerStatus: agent.ContainerStatus,
 		Launch:          store.ComputeAgentLaunch(agent, now),
 		// The generic view for every subscriber (ptone/scion#3122): the
@@ -636,6 +673,34 @@ func (p *eventBuilder) PublishAgentStatus(ctx context.Context, agent *store.Agen
 	// Always set, even when every field is zero (for example before
 	// StartedAt during provisioning), so a cleared message is sent as "".
 	evt.Detail = &detail
+	return evt
+}
+
+// agentStatusVisiblyChanged reports whether after's status event differs
+// from before's, both built at the same instant: whether a status write
+// changed anything a subscriber sees. LastSeen and Updated are not in the
+// event, so a write that only bumps them reports false (ptone/scion#5233).
+// A marshal failure reports true, so the event is published.
+func agentStatusVisiblyChanged(before, after *store.Agent) bool {
+	if before == nil || after == nil {
+		return true
+	}
+	now := time.Now()
+	a, errA := json.Marshal(agentStatusEvent(before, now))
+	b, errB := json.Marshal(agentStatusEvent(after, now))
+	return errA != nil || errB != nil || !bytes.Equal(a, b)
+}
+
+// PublishAgentStatus publishes an agent status event to both agent-specific
+// and project-scoped subjects (dual-publish pattern).
+//
+// An event published with an eventstreams.WithHeartbeatTrigger context
+// counts as trigger=heartbeat on scion.hub.events.published. Since
+// ptone/scion#5233 no production caller sets it (heartbeats that change
+// nothing visible publish nothing), so that series stays at zero as a
+// regression signal.
+func (p *eventBuilder) PublishAgentStatus(ctx context.Context, agent *store.Agent) {
+	evt := agentStatusEvent(agent, time.Now())
 	sink := p.statusSink(ctx)
 	sink("agent."+agent.ID+".status", evt)
 	if agent.ProjectID != "" {
@@ -812,6 +877,11 @@ func (p *eventBuilder) PublishUserNotification(_ context.Context, notif *store.N
 			CreatedAt: notif.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
 		},
 		SubscriberID: notif.SubscriberID,
+		Kind:         notif.Kind,
+		ResourceType: notif.ResourceType,
+		ResourceID:   notif.ResourceID,
+		Excerpt:      notif.Excerpt,
+		Acknowledged: notif.Acknowledged,
 	}
 	p.sink("user."+notif.SubscriberID+".notification", evt)
 }
@@ -855,7 +925,7 @@ func (p *eventBuilder) PublishInviteChanged(_ context.Context, action, inviteID 
 //
 // artifactRefs are the references recorded for msg (recordMessageArtifacts);
 // they go only on the chat subjects (withChatArtifactRefs).
-func (p *eventBuilder) PublishUserMessage(_ context.Context, msg *store.Message, attachments []AttachmentRef, artifactRefs []artifacts.MessageRef) {
+func (p *eventBuilder) PublishUserMessage(ctx context.Context, msg *store.Message, attachments []AttachmentRef, artifactRefs []artifacts.MessageRef, opts ...ChatEventOption) {
 	// Attachments stored as artifacts (ptone/scion#4595) go only on the chat
 	// subjects, which reach sessions only, the same audience their history
 	// lists them to. agent.<id>.message, user.<id>.message and
@@ -863,7 +933,7 @@ func (p *eventBuilder) PublishUserMessage(_ context.Context, msg *store.Message,
 	// the hub's agent messages stream, which a user access token may open,
 	// reads agent.<id>.message (ptone/scion#4596).
 	evt := userMessageEvent(msg, legacyAttachmentRefs(attachments))
-	chatEvt := withChatArtifactRefs(userMessageEvent(msg, attachments), artifactRefs)
+	chatEvt := withChatDecisionPayload(withChatArtifactRefs(userMessageEvent(msg, attachments), artifactRefs), chatEventOptionsOf(opts).decision)
 	// Only fan out to user-inbox and project-level subjects when the
 	// recipient is actually a human user. For user→agent messages the
 	// RecipientID is the agent UUID, so publishing to user.<agentID>
@@ -925,6 +995,44 @@ func withChatArtifactRefs(evt UserMessageEvent, refs []artifacts.MessageRef) Use
 	return evt
 }
 
+// ChatEventOption adds to the payload a published message carries on its
+// chat subjects, explicitly, like artifactRefs: PublishUserMessage and
+// PublishChatMemberMessage take it, and the member fan-out passes it on.
+type ChatEventOption func(*chatEventOptions)
+
+type chatEventOptions struct {
+	// decision is a decision prompt's decisions or a decision response.
+	decision *decisionEventPayload
+}
+
+// chatEventOptionsOf applies opts.
+func chatEventOptionsOf(opts []ChatEventOption) chatEventOptions {
+	var o chatEventOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&o)
+		}
+	}
+	return o
+}
+
+// withChatDecisionPayload returns evt carrying a decision prompt's decisions and
+// intro, or a decision response, for the chat subjects (the subjects whose
+// history returns the same views to the same audience).
+func withChatDecisionPayload(evt UserMessageEvent, p *decisionEventPayload) UserMessageEvent {
+	if p == nil {
+		return evt
+	}
+	if p.Prompt != nil {
+		evt.Decisions = p.Prompt.Decisions
+		evt.DecisionIntro = p.Prompt.Intro
+		evt.AnswerMode = p.Prompt.AnswerMode
+	}
+	evt.DecisionResponse = p.Response
+	evt.DecisionResponseSet = p.ResponseSet
+	return evt
+}
+
 // userMessageEvent builds the UserMessageEvent payload for msg.
 func userMessageEvent(msg *store.Message, attachments []AttachmentRef) UserMessageEvent {
 	evt := UserMessageEvent{
@@ -965,11 +1073,11 @@ func userMessageEvent(msg *store.Message, attachments []AttachmentRef) UserMessa
 // user.<id>.chat.message, with the same payload as PublishUserMessage. It
 // adds no audience of its own: the caller has already narrowed userIDs to
 // current members of the thread who can read its project.
-func (p *eventBuilder) PublishChatMemberMessage(_ context.Context, msg *store.Message, attachments []AttachmentRef, artifactRefs []artifacts.MessageRef, userIDs []string) {
+func (p *eventBuilder) PublishChatMemberMessage(ctx context.Context, msg *store.Message, attachments []AttachmentRef, artifactRefs []artifacts.MessageRef, userIDs []string, opts ...ChatEventOption) {
 	if msg == nil || len(userIDs) == 0 {
 		return
 	}
-	evt := withChatArtifactRefs(userMessageEvent(msg, attachments), artifactRefs)
+	evt := withChatDecisionPayload(withChatArtifactRefs(userMessageEvent(msg, attachments), artifactRefs), chatEventOptionsOf(opts).decision)
 	seen := make(map[string]bool, len(userIDs))
 	for _, id := range userIDs {
 		if id == "" || seen[id] {
@@ -1100,6 +1208,22 @@ func (p *eventBuilder) PublishChatScheduledEvent(_ context.Context, userID strin
 		return
 	}
 	p.sink("user."+userID+".chat.scheduled", evt)
+}
+
+// ChatStarsEvent is the content-free invalidation published on
+// user.<id>.chat.stars when the user's starred messages changed.
+type ChatStarsEvent struct {
+	// Action is always "changed".
+	Action string `json:"action"`
+}
+
+// PublishChatStarsChanged publishes a starred-messages invalidation to its
+// owner only, on user.<userID>.chat.stars.
+func (p *eventBuilder) PublishChatStarsChanged(_ context.Context, userID string) {
+	if userID == "" {
+		return
+	}
+	p.sink("user."+userID+".chat.stars", ChatStarsEvent{Action: "changed"})
 }
 
 // PublishDispatchDone emits a slim completion event when a broker_dispatch row

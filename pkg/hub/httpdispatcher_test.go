@@ -27,6 +27,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -766,7 +767,7 @@ func TestHTTPAgentDispatcher_DispatchAgentReprovision(t *testing.T) {
 		},
 	}
 
-	if err := dispatcher.DispatchAgentReprovision(ctx, agent); err != nil {
+	if err := dispatcher.DispatchAgentReprovision(ctx, agent, ReprovisionOptions{}); err != nil {
 		t.Fatalf("DispatchAgentReprovision failed: %v", err)
 	}
 
@@ -844,7 +845,7 @@ func resolvedEnvDispatcher(t *testing.T) (*HTTPAgentDispatcher, *mockRuntimeBrok
 func TestHTTPAgentDispatcher_ReprovisionDoesNotMergeResolvedEnv(t *testing.T) {
 	dispatcher, mockClient, agent := resolvedEnvDispatcher(t)
 
-	require.NoError(t, dispatcher.DispatchAgentReprovision(context.Background(), agent))
+	require.NoError(t, dispatcher.DispatchAgentReprovision(context.Background(), agent, ReprovisionOptions{}))
 
 	require.NotNil(t, mockClient.lastCreateReq)
 	assert.Equal(t, "stored-value", mockClient.lastCreateReq.ResolvedEnv["STORED_VAR"], "the broker must still receive the storage env var")
@@ -859,7 +860,7 @@ func TestHTTPAgentDispatcher_ReprovisionDoesNotMergeResolvedEnv(t *testing.T) {
 func TestHTTPAgentDispatcher_ReprovisionSkipHoldsForPlainKeys(t *testing.T) {
 	dispatcher, mockClient, agent := resolvedEnvDispatcher(t)
 
-	require.NoError(t, dispatcher.DispatchAgentReprovision(context.Background(), agent))
+	require.NoError(t, dispatcher.DispatchAgentReprovision(context.Background(), agent, ReprovisionOptions{}))
 
 	require.NotNil(t, mockClient.lastCreateReq)
 	kind, ok := api.ClassifyEnvKey(mockClient.lastCreateReq.EnvClassifications, "STORED_VAR")
@@ -935,7 +936,7 @@ func TestHTTPAgentDispatcher_ReprovisionCarriesAgentEndpointOverride(t *testing.
 				RuntimeBrokerID: tid("host-1"),
 				AppliedConfig:   &store.AgentAppliedConfig{HarnessConfig: "claude"},
 			}
-			require.NoError(t, dispatcher.DispatchAgentReprovision(ctx, agent))
+			require.NoError(t, dispatcher.DispatchAgentReprovision(ctx, agent, ReprovisionOptions{}))
 
 			require.NotNil(t, mockClient.lastCreateReq)
 			assert.True(t, mockClient.lastCreateReq.Reprovision, "the captured request must be the reprovision request")
@@ -964,14 +965,12 @@ func TestHTTPAgentDispatcher_ReprovisionCarriesSkillDispatchMetadata(t *testing.
 	mockClient := &mockRuntimeBrokerClient{}
 	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
 	dispatcher.SetHubEndpoint(hubEndpoint)
-	dispatcher.SetSecretBackend(&mockProvisionCredsBackend{
-		projectSecrets: []secret.SecretMeta{
-			{Name: "GH_EXAMPLE", SecretType: "environment", Scope: secret.ScopeProject},
-		},
-		secretValues: map[string]*secret.SecretWithValue{
-			"GH_EXAMPLE": {SecretMeta: secret.SecretMeta{Name: "GH_EXAMPLE", SecretType: "environment"}, Value: "value-1"},
-		},
-	})
+	// The provision credential is a stored project secret whose name is the
+	// owner key of the agent's gh:// skill reference.
+	dispatcher.SetSecretBackend(launchSecretBackend(t, memStore, "test-hub", []secret.SecretWithValue{
+		{SecretMeta: secret.SecretMeta{Name: "GH_EXAMPLE", SecretType: "environment", Scope: secret.ScopeProject, ScopeID: tid("project-1")}, Value: "value-1"},
+	}))
+	dispatcher.SetSkillRefLister(provisionSkillRefs("gh://example/skills/test"))
 
 	wantPreResolved := &ResolveSkillsResponse{
 		Resolved: []ResolvedSkillResponse{{URI: "skill://scion/global/test@1.0.0", Name: "test"}},
@@ -991,7 +990,10 @@ func TestHTTPAgentDispatcher_ReprovisionCarriesSkillDispatchMetadata(t *testing.
 		RuntimeBrokerID: tid("host-1"),
 		AppliedConfig:   &store.AgentAppliedConfig{HarnessConfig: "claude"},
 	}
-	require.NoError(t, dispatcher.DispatchAgentReprovision(ctx, agent))
+	// The provision credential is delivered to the agent under the
+	// delivery credential, which needs its recorded edge.
+	grantLaunchDelivery(t, memStore, dispatcher, agent)
+	require.NoError(t, dispatcher.DispatchAgentReprovision(ctx, agent, ReprovisionOptions{}))
 
 	req := mockClient.lastCreateReq
 	require.NotNil(t, req)
@@ -1040,7 +1042,7 @@ func TestHTTPAgentDispatcher_DispatchAgentReprovision_MissingEchoFails(t *testin
 	}
 	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
 
-	if err := dispatcher.DispatchAgentReprovision(ctx, agent); err == nil {
+	if err := dispatcher.DispatchAgentReprovision(ctx, agent, ReprovisionOptions{}); err == nil {
 		t.Fatal("expected DispatchAgentReprovision to fail when the broker's response does not echo Reprovisioned=true")
 	}
 }
@@ -1072,7 +1074,7 @@ func TestHTTPAgentDispatcher_DispatchAgentReprovision_StillMissingEnvFails(t *te
 	}
 	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
 
-	err := dispatcher.DispatchAgentReprovision(ctx, agent)
+	err := dispatcher.DispatchAgentReprovision(ctx, agent, ReprovisionOptions{})
 	if err == nil {
 		t.Fatal("expected DispatchAgentReprovision to fail when env is still missing after the retry")
 	}
@@ -1103,7 +1105,7 @@ func TestHTTPAgentDispatcher_DispatchAgentReprovision_NoBroker(t *testing.T) {
 		RuntimeBrokerID: "",
 	}
 
-	if err := dispatcher.DispatchAgentReprovision(ctx, agent); err == nil {
+	if err := dispatcher.DispatchAgentReprovision(ctx, agent, ReprovisionOptions{}); err == nil {
 		t.Fatal("expected error when no runtime broker is assigned")
 	}
 	if mockClient.createCalled {
@@ -1721,14 +1723,12 @@ func TestHTTPAgentDispatcher_DispatchAgentStart_CarriesSkillDispatchMetadata(t *
 
 	mockClient := &mockRuntimeBrokerClient{}
 	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
-	dispatcher.SetSecretBackend(&mockProvisionCredsBackend{
-		projectSecrets: []secret.SecretMeta{
-			{Name: "GH_EXAMPLE", SecretType: "environment", Scope: secret.ScopeProject},
-		},
-		secretValues: map[string]*secret.SecretWithValue{
-			"GH_EXAMPLE": {SecretMeta: secret.SecretMeta{Name: "GH_EXAMPLE", SecretType: "environment"}, Value: "value-1"},
-		},
-	})
+	// The provision credential is a stored project secret whose name is the
+	// owner key of the agent's gh:// skill reference.
+	dispatcher.SetSecretBackend(launchSecretBackend(t, memStore, "test-hub", []secret.SecretWithValue{
+		{SecretMeta: secret.SecretMeta{Name: "GH_EXAMPLE", SecretType: "environment", Scope: secret.ScopeProject, ScopeID: tid("project-1")}, Value: "value-1"},
+	}))
+	dispatcher.SetSkillRefLister(provisionSkillRefs("gh://example/skills/test"))
 
 	wantPreResolved := &ResolveSkillsResponse{
 		Resolved: []ResolvedSkillResponse{{URI: "skill://scion/global/test@1.0.0", Name: "test"}},
@@ -1743,13 +1743,18 @@ func TestHTTPAgentDispatcher_DispatchAgentStart_CarriesSkillDispatchMetadata(t *
 	})
 
 	agent := &store.Agent{
-		ID:              "agent-uuid-123",
+		ID:              tid("agent-uuid-123"),
 		Name:            "test-agent",
 		Slug:            "test-agent-slug",
 		ProjectID:       tid("project-1"),
 		OwnerID:         "owner-uuid-789",
 		RuntimeBrokerID: tid("broker-1"),
 	}
+
+	// The provision credential, and launch selection, deliver the stored
+	// project secret under the delivery credential, which needs the
+	// agent's recorded edge.
+	grantLaunchDelivery(t, memStore, dispatcher, agent)
 
 	if err := dispatcher.DispatchAgentStart(ctx, agent, "", false); err != nil {
 		t.Fatalf("DispatchAgentStart failed: %v", err)
@@ -1808,14 +1813,12 @@ func TestHTTPAgentDispatcher_DispatchAgentRestart_CarriesSkillDispatchMetadata(t
 
 	mockClient := &mockRuntimeBrokerClient{}
 	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
-	dispatcher.SetSecretBackend(&mockProvisionCredsBackend{
-		projectSecrets: []secret.SecretMeta{
-			{Name: "GH_EXAMPLE", SecretType: "environment", Scope: secret.ScopeProject},
-		},
-		secretValues: map[string]*secret.SecretWithValue{
-			"GH_EXAMPLE": {SecretMeta: secret.SecretMeta{Name: "GH_EXAMPLE", SecretType: "environment"}, Value: "value-1"},
-		},
-	})
+	// The provision credential is a stored project secret whose name is the
+	// owner key of the agent's gh:// skill reference.
+	dispatcher.SetSecretBackend(launchSecretBackend(t, memStore, "test-hub", []secret.SecretWithValue{
+		{SecretMeta: secret.SecretMeta{Name: "GH_EXAMPLE", SecretType: "environment", Scope: secret.ScopeProject, ScopeID: tid("project-1")}, Value: "value-1"},
+	}))
+	dispatcher.SetSkillRefLister(provisionSkillRefs("gh://example/skills/test"))
 
 	wantPreResolved := &ResolveSkillsResponse{
 		Resolved: []ResolvedSkillResponse{{URI: "skill://scion/global/test@1.0.0", Name: "test"}},
@@ -1828,13 +1831,18 @@ func TestHTTPAgentDispatcher_DispatchAgentRestart_CarriesSkillDispatchMetadata(t
 	})
 
 	agent := &store.Agent{
-		ID:              "agent-uuid-123",
+		ID:              tid("agent-uuid-123"),
 		Name:            "test-agent",
 		Slug:            "test-agent-slug",
 		ProjectID:       tid("project-1"),
 		OwnerID:         "owner-uuid-789",
 		RuntimeBrokerID: tid("broker-1"),
 	}
+
+	// The provision credential, and launch selection, deliver the stored
+	// project secret under the delivery credential, which needs the
+	// agent's recorded edge.
+	grantLaunchDelivery(t, memStore, dispatcher, agent)
 
 	if err := dispatcher.DispatchAgentRestart(ctx, agent); err != nil {
 		t.Fatalf("DispatchAgentRestart failed: %v", err)
@@ -1886,7 +1894,10 @@ func TestHTTPAgentDispatcher_DispatchAgentStart_CarriesWorkspaceDispatchMetadata
 	mockClient := &mockRuntimeBrokerClient{}
 	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
 
-	gitClone := &api.GitCloneConfig{URL: "https://github.com/example/repo.git"}
+	// A clone URL distinct from the project's recorded remote, so the token
+	// remote is shown to come from the record, not from the URL.
+	depth := 1
+	gitClone := &api.GitCloneConfig{URL: "https://mirror.example.invalid/example/repo.git", Branch: "main", Depth: &depth}
 	agent := &store.Agent{
 		ID:              tid("agent-ws"),
 		Name:            "test-agent",
@@ -1904,8 +1915,16 @@ func TestHTTPAgentDispatcher_DispatchAgentStart_CarriesWorkspaceDispatchMetadata
 	}
 
 	ws := mockClient.lastStartExtras.Workspace
-	if ws.GitClone != gitClone {
-		t.Errorf("expected StartExtras.Workspace.GitClone=%+v, got %+v", gitClone, ws.GitClone)
+	// The dispatched GitClone is the stored one plus the project's recorded
+	// remote as its token remote (withTokenRemote); the stored config is
+	// not modified.
+	want := *gitClone
+	want.TokenRemote = "https://github.com/example/repo.git"
+	if ws.GitClone == nil || !reflect.DeepEqual(*ws.GitClone, want) {
+		t.Errorf("expected StartExtras.Workspace.GitClone=%+v, got %+v", want, ws.GitClone)
+	}
+	if gitClone.TokenRemote != "" {
+		t.Errorf("the stored GitClone was modified: %+v", gitClone)
 	}
 	if ws.Branch != "feature-branch" {
 		t.Errorf("expected StartExtras.Workspace.Branch=%q, got %q", "feature-branch", ws.Branch)
@@ -1954,7 +1973,8 @@ func TestHTTPAgentDispatcher_DispatchAgentStart_RetryAfterHashMismatchCarriesWor
 	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
 	dispatcher.SetHarnessConfigRepairer(func(ctx context.Context, ref HarnessConfigRepairRef) error { return nil })
 
-	gitClone := &api.GitCloneConfig{URL: "https://github.com/example/repo.git"}
+	depth := 1
+	gitClone := &api.GitCloneConfig{URL: "https://mirror.example.invalid/example/repo.git", Branch: "main", Depth: &depth}
 	agent := &store.Agent{
 		ID:              tid("agent-hm"),
 		Name:            "test-agent",
@@ -1976,8 +1996,13 @@ func TestHTTPAgentDispatcher_DispatchAgentStart_RetryAfterHashMismatchCarriesWor
 		t.Fatalf("expected StartAgent to be called twice (fail then retry), got %d calls", mockClient.startCallCount)
 	}
 	ws := mockClient.lastStartExtras.Workspace
-	if ws.GitClone != gitClone {
-		t.Errorf("expected the retry's StartExtras.Workspace.GitClone=%+v, got %+v", gitClone, ws.GitClone)
+	want := *gitClone
+	want.TokenRemote = "https://github.com/example/repo.git"
+	if ws.GitClone == nil || !reflect.DeepEqual(*ws.GitClone, want) {
+		t.Errorf("expected the retry's StartExtras.Workspace.GitClone=%+v, got %+v", want, ws.GitClone)
+	}
+	if gitClone.TokenRemote != "" {
+		t.Errorf("the stored GitClone was modified: %+v", gitClone)
 	}
 	if ws.Branch != "feature-branch" {
 		t.Errorf("expected the retry's StartExtras.Workspace.Branch=%q, got %q", "feature-branch", ws.Branch)
@@ -2160,6 +2185,9 @@ func TestHTTPAgentDispatcher_DispatchAgentStart_ProjectSlugSetForGitRemoteWithou
 func TestHTTPAgentDispatcher_DispatchAgentStart_ResolvesEnvFromStorage(t *testing.T) {
 	ctx := context.Background()
 	memStore := createTestStore(t)
+	// The owner is a user ID, so the agent's recorded chain ends at the
+	// owner and the owner's own rows are delivered.
+	owner := tid("owner-1")
 
 	// Create a project
 	project := &store.Project{
@@ -2213,7 +2241,7 @@ func TestHTTPAgentDispatcher_DispatchAgentStart_ResolvesEnvFromStorage(t *testin
 		Key:           "CUSTOM_VAR",
 		Value:         "user-value",
 		Scope:         "user",
-		ScopeID:       "owner-1",
+		ScopeID:       owner,
 		InjectionMode: store.InjectionModeAlways,
 	}); err != nil {
 		t.Fatalf("failed to set env var: %v", err)
@@ -2223,11 +2251,11 @@ func TestHTTPAgentDispatcher_DispatchAgentStart_ResolvesEnvFromStorage(t *testin
 	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
 
 	agent := &store.Agent{
-		ID:              "agent-env",
+		ID:              tid("agent-env"),
 		Name:            "test-agent",
 		Slug:            "test-agent",
 		ProjectID:       tid("project-env"),
-		OwnerID:         "owner-1",
+		OwnerID:         owner,
 		RuntimeBrokerID: tid("broker-env"),
 		AppliedConfig: &store.AgentAppliedConfig{
 			HarnessConfig: "gemini",
@@ -2235,6 +2263,7 @@ func TestHTTPAgentDispatcher_DispatchAgentStart_ResolvesEnvFromStorage(t *testin
 		},
 	}
 
+	grantLaunchDelivery(t, memStore, dispatcher, agent)
 	err := dispatcher.DispatchAgentStart(ctx, agent, "", false)
 	if err != nil {
 		t.Fatalf("DispatchAgentStart failed: %v", err)
@@ -2306,7 +2335,7 @@ func TestHTTPAgentDispatcher_DispatchAgentStart_ConfigEnvTakesPrecedence(t *test
 	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
 
 	agent := &store.Agent{
-		ID:              "agent-prec",
+		ID:              tid("agent-prec"),
 		Name:            "test-agent",
 		Slug:            "test-agent",
 		ProjectID:       tid("project-prec"),
@@ -2317,6 +2346,7 @@ func TestHTTPAgentDispatcher_DispatchAgentStart_ConfigEnvTakesPrecedence(t *test
 		},
 	}
 
+	grantLaunchDelivery(t, memStore, dispatcher, agent)
 	err := dispatcher.DispatchAgentStart(ctx, agent, "", false)
 	if err != nil {
 		t.Fatalf("DispatchAgentStart failed: %v", err)
@@ -2370,7 +2400,7 @@ func TestHTTPAgentDispatcher_DispatchAgentStart_StorageOverridesEmptyConfigEnv(t
 	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
 
 	agent := &store.Agent{
-		ID:              "agent-empty-env",
+		ID:              tid("agent-empty-env"),
 		Name:            "test-agent",
 		Slug:            "test-agent",
 		ProjectID:       tid("project-empty-env"),
@@ -2385,6 +2415,7 @@ func TestHTTPAgentDispatcher_DispatchAgentStart_StorageOverridesEmptyConfigEnv(t
 		},
 	}
 
+	grantLaunchDelivery(t, memStore, dispatcher, agent)
 	err := dispatcher.DispatchAgentStart(ctx, agent, "", false)
 	if err != nil {
 		t.Fatalf("DispatchAgentStart failed: %v", err)
@@ -2610,7 +2641,8 @@ func TestBuildCreateRequest_GoldenPayload(t *testing.T) {
     "gitClone": {
       "url": "https://github.com/example/repo.git",
       "branch": "main",
-      "depth": 1
+      "depth": 1,
+      "tokenRemote": "https://github.com/example/repo.git"
     }
   },
   "resolvedEnv": {
@@ -3586,7 +3618,7 @@ func TestHTTPAgentDispatcher_DispatchAgentStart_IncludesInlineConfig(t *testing.
 	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
 
 	inlineCfg := &api.ScionConfig{
-		MaxTurns:    3,
+		MaxTurns:    api.IntPtr(3),
 		MaxDuration: "30m",
 	}
 
@@ -3614,8 +3646,8 @@ func TestHTTPAgentDispatcher_DispatchAgentStart_IncludesInlineConfig(t *testing.
 	if mockClient.lastInlineConfig == nil {
 		t.Fatal("expected InlineConfig to be passed to StartAgent")
 	}
-	if mockClient.lastInlineConfig.MaxTurns != 3 {
-		t.Errorf("expected MaxTurns=3, got %d", mockClient.lastInlineConfig.MaxTurns)
+	if !api.IntPtrEqual(mockClient.lastInlineConfig.MaxTurns, api.IntPtr(3)) {
+		t.Errorf("expected MaxTurns=3, got %s", api.FormatCountLimit(mockClient.lastInlineConfig.MaxTurns))
 	}
 	if mockClient.lastInlineConfig.MaxDuration != "30m" {
 		t.Errorf("expected MaxDuration='30m', got '%s'", mockClient.lastInlineConfig.MaxDuration)
@@ -4011,7 +4043,7 @@ func TestHTTPAgentDispatcher_DispatchAgentReprovision_PropagatesSharedWorkspace(
 		},
 	}
 
-	if err := dispatcher.DispatchAgentReprovision(ctx, agent); err != nil {
+	if err := dispatcher.DispatchAgentReprovision(ctx, agent, ReprovisionOptions{}); err != nil {
 		t.Fatalf("DispatchAgentReprovision failed: %v", err)
 	}
 
@@ -4541,6 +4573,10 @@ func (m *mockGitHubAppMinter) MintGitHubAppTokenForProject(_ context.Context, _ 
 	return m.token, m.expiry, m.err
 }
 
+func (m *mockGitHubAppMinter) AuthorizeGitHubTokenSourceProject(context.Context, *store.Agent, *store.Project) error {
+	return nil
+}
+
 func TestBuildCreateRequest_UserGitHubTokenPrecedesApp(t *testing.T) {
 	ctx := context.Background()
 	memStore := createTestStore(t)
@@ -4780,28 +4816,6 @@ func TestBuildCreateRequest_NoAuth_SkipsSecrets(t *testing.T) {
 	})
 }
 
-// mockProvisionCredsBackend extends mockSecretBackend with List and Get support
-// for testing provisionCredentials collection.
-type mockProvisionCredsBackend struct {
-	mockSecretBackend
-	projectSecrets []secret.SecretMeta
-	secretValues   map[string]*secret.SecretWithValue
-}
-
-func (m *mockProvisionCredsBackend) List(_ context.Context, filter secret.Filter) ([]secret.SecretMeta, error) {
-	if filter.Scope == secret.ScopeProject {
-		return m.projectSecrets, nil
-	}
-	return nil, nil
-}
-
-func (m *mockProvisionCredsBackend) Get(_ context.Context, name, scope, scopeID string) (*secret.SecretWithValue, error) {
-	if sv, ok := m.secretValues[name]; ok {
-		return sv, nil
-	}
-	return nil, nil
-}
-
 func TestBuildCreateRequest_NoAuth_ProvisionCredentialsSurvive(t *testing.T) {
 	ctx := context.Background()
 	memStore := createTestStore(t)
@@ -4819,19 +4833,11 @@ func TestBuildCreateRequest_NoAuth_ProvisionCredentialsSurvive(t *testing.T) {
 
 	mockClient := &mockRuntimeBrokerClient{}
 	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
-	dispatcher.SetSecretBackend(&mockProvisionCredsBackend{
-		mockSecretBackend: mockSecretBackend{
-			secrets: []secret.SecretWithValue{
-				{SecretMeta: secret.SecretMeta{Name: "CLAUDE_AUTH", SecretType: "file", Target: "~/.claude/.credentials.json"}, Value: "secret-data"},
-			},
-		},
-		projectSecrets: []secret.SecretMeta{
-			{Name: "GH_EXAMPLE", SecretType: "environment", Scope: secret.ScopeProject},
-		},
-		secretValues: map[string]*secret.SecretWithValue{
-			"GH_EXAMPLE": {SecretMeta: secret.SecretMeta{Name: "GH_EXAMPLE", SecretType: "environment"}, Value: "ghp_token123"},
-		},
-	})
+	dispatcher.SetSecretBackend(launchSecretBackend(t, memStore, "test-hub", []secret.SecretWithValue{
+		{SecretMeta: secret.SecretMeta{Name: "CLAUDE_AUTH", SecretType: "file", Target: "~/.claude/.credentials.json", Scope: secret.ScopeUser, ScopeID: tid("user-1")}, Value: "secret-data"},
+		{SecretMeta: secret.SecretMeta{Name: "GH_EXAMPLE", SecretType: "environment", Scope: secret.ScopeProject, ScopeID: tid("project-1")}, Value: "ghp_token123"},
+	}))
+	dispatcher.SetSkillRefLister(provisionSkillRefs("gh://example/skills/test"))
 
 	agent := &store.Agent{
 		ID:              tid("agent-noauth-prov"),
@@ -4842,6 +4848,8 @@ func TestBuildCreateRequest_NoAuth_ProvisionCredentialsSurvive(t *testing.T) {
 		RuntimeBrokerID: tid("host-1"),
 		AppliedConfig:   &store.AgentAppliedConfig{NoAuth: true},
 	}
+
+	grantLaunchDelivery(t, memStore, dispatcher, agent)
 
 	req, err := dispatcher.buildCreateRequest(ctx, agent, "TestNoAuthProvisionCreds")
 	if err != nil {
@@ -6109,6 +6117,9 @@ func TestHTTPAgentDispatcher_DispatchAgentDelete_ForwardsLinkedProjectPath(t *te
 // environment secret (plus a non-environment secret that must not leak into
 // the env map on either path).
 func TestHTTPAgentDispatcher_BuildStartEnv_StartAndRestartProduceIdenticalEnv(t *testing.T) {
+	// The owner is a user ID, so the agent's recorded chain ends at the
+	// owner and the owner's own rows are delivered.
+	goldenOwner := tid("start-restart-golden-owner")
 	ctx := context.Background()
 	memStore := createTestStore(t)
 
@@ -6150,7 +6161,7 @@ func TestHTTPAgentDispatcher_BuildStartEnv_StartAndRestartProduceIdenticalEnv(t 
 		Key:           "USER_VAR",
 		Value:         "user-value",
 		Scope:         "user",
-		ScopeID:       "golden-owner",
+		ScopeID:       goldenOwner,
 		InjectionMode: store.InjectionModeAlways,
 	}); err != nil {
 		t.Fatalf("failed to set user env var: %v", err)
@@ -6171,25 +6182,27 @@ func TestHTTPAgentDispatcher_BuildStartEnv_StartAndRestartProduceIdenticalEnv(t 
 
 	mockClient := &mockRuntimeBrokerClient{}
 	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
-	dispatcher.SetSecretBackend(&mockSecretBackend{
-		secrets: []secret.SecretWithValue{
-			{SecretMeta: secret.SecretMeta{Name: "CLAUDE_AUTH", SecretType: "file", Target: "~/.claude/.credentials.json"}, Value: "file-secret-data"},
-			{SecretMeta: secret.SecretMeta{Name: "SECRET_API_KEY", SecretType: "environment", Target: "SECRET_API_KEY"}, Value: "secret-value"},
-		},
-	})
+	// Owner-scope stored secrets: start and restart select secrets by
+	// stored metadata (material_delivery.go), not through Resolve.
+	dispatcher.SetSecretBackend(launchSecretBackend(t, memStore, "test-hub", []secret.SecretWithValue{
+		{SecretMeta: secret.SecretMeta{Name: "CLAUDE_AUTH", SecretType: "file", Target: "~/.claude/.credentials.json", Scope: "user", ScopeID: goldenOwner}, Value: "file-secret-data"},
+		{SecretMeta: secret.SecretMeta{Name: "SECRET_API_KEY", SecretType: "environment", Target: "SECRET_API_KEY", Scope: "user", ScopeID: goldenOwner}, Value: "secret-value"},
+	}))
 
 	agent := &store.Agent{
 		ID:              tid("agent-golden"),
 		Name:            "golden-agent",
 		Slug:            "golden-agent",
 		ProjectID:       tid("project-golden"),
-		OwnerID:         "golden-owner",
+		OwnerID:         goldenOwner,
 		RuntimeBrokerID: tid("broker-golden"),
 		AppliedConfig: &store.AgentAppliedConfig{
 			HarnessConfig: "claude",
 			Env:           map[string]string{"CONFIG_VAR": "config-value"},
 		},
 	}
+
+	grantLaunchDelivery(t, memStore, dispatcher, agent)
 
 	if err := dispatcher.DispatchAgentStart(ctx, agent, "", false); err != nil {
 		t.Fatalf("DispatchAgentStart failed: %v", err)

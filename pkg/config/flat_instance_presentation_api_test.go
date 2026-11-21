@@ -109,7 +109,15 @@ var presentationNeverKeys = []string{
 	"context", "kubeconfig",
 	"kubernetes_service_account_mappings", "kubernetesServiceAccountMappings",
 	"kubernetes_block_service_account", "kubernetesBlockServiceAccount",
+	"workload_identity_pool", "workloadIdentityPool",
+	"create_service_accounts", "createServiceAccounts",
 	"home_storage_leaf", "homeStorageLeaf",
+	"project_id", "projectId",
+	"service_account", "serviceAccount",
+	"credentials_file", "credentialsFile",
+	"block_service_account", "blockServiceAccount",
+	"assignable_service_accounts", "assignableServiceAccounts",
+	"network", "subnetwork",
 	"source", "bucket", "prefix", "server", "mode", "volume_name", "volumeName",
 	"alternative_env_keys", "alternativeEnvKeys", "env",
 }
@@ -151,6 +159,9 @@ func TestPresentation_NeverFieldsAbsent(t *testing.T) {
 			PriorityClassName: "agents-high", SharedDirStorageClass: "standard-rwx", SharedDirSize: "40Gi",
 			SafeToEvict: &evict, SharedDirStorageBackend: "nfs", SharedDirStorageBackends: map[string]string{"data": "local"},
 			HomeStorageBackend: "nfs",
+			NodeSelector:       map[string]string{"scion.dev/pool": "agents"},
+			Tolerations:        []api.K8sToleration{{Key: "scion.dev/pool", Operator: "Equal", Value: "agents", Effect: "NoSchedule"}},
+			RuntimeClassName:   "gvisor", PlacementReported: true,
 		},
 		AgentDefaults: &api.PresentedAgentDefaults{
 			DefaultHarnessConfig: "claude", ImageRegistry: "registry.example/team", CloneDepth: "full",
@@ -198,8 +209,8 @@ func TestPresentation_NeverFieldsAbsent(t *testing.T) {
 	}
 	// The source holds every withheld value (TestPresentInstance_RedactsEveryFC4aRow
 	// counts them), so the checks above are not vacuous.
-	if src, _ := json.Marshal(inst); strings.Count(string(src), "NEVER-") != 21 {
-		t.Fatalf("the source does not hold the 21 never-published values: %s", src)
+	if src, _ := json.Marshal(inst); strings.Count(string(src), "NEVER-") != 28 {
+		t.Fatalf("the source does not hold the 28 never-published values: %s", src)
 	}
 }
 

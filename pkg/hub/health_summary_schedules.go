@@ -323,7 +323,9 @@ const healthScheduleReasonOther = "other"
 // carries arbitrary stored text as the reason.
 func healthScheduleReasonCode(reason string) string {
 	switch reason {
-	case store.ScheduleStatusReasonCreatorDeleted, store.ScheduleStatusReasonCronZoneUnsupported:
+	case store.ScheduleStatusReasonCreatorDeleted,
+		store.ScheduleStatusReasonCronZoneUnsupported,
+		store.ScheduleStatusReasonTargetDeleted:
 		return reason
 	default:
 		return healthScheduleReasonOther
@@ -334,9 +336,11 @@ func healthScheduleReasonCode(reason string) string {
 func healthScheduleReasonText(code string) string {
 	switch code {
 	case store.ScheduleStatusReasonCreatorDeleted:
-		return "the agent that created it was deleted"
+		return "the agent or user it runs under was deleted"
 	case store.ScheduleStatusReasonCronZoneUnsupported:
-		return "its cron expression names a time zone, which is not supported"
+		return "its cron expression has a zone prefix, which is not supported: set its time zone field instead"
+	case store.ScheduleStatusReasonTargetDeleted:
+		return "its target agent was deleted"
 	default:
 		return "a reason this hub does not recognize"
 	}

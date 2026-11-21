@@ -23,24 +23,17 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import * as featureFlags from './feature-flags.js';
 import {
+  DECISIONS_FLAG,
+  decisionsEnabled,
   isFeatureEnabled,
   setFeatureFlag,
   setServerFlags,
   resetServerFlagStateForTests,
 } from './feature-flags.js';
 
-// Verify removed exports at the type level — these should not exist.
-// @ts-expect-error ACCESS_BOUNDARIES_READ_FLAG was removed
-import { ACCESS_BOUNDARIES_READ_FLAG } from './feature-flags.js';
-// @ts-expect-error ACCESS_BOUNDARIES_AUTHORING_FLAG was removed
-import { ACCESS_BOUNDARIES_AUTHORING_FLAG } from './feature-flags.js';
-// @ts-expect-error NATIVE_CHAT_PALETTE_FLAG was removed (the palette is always on)
-import { NATIVE_CHAT_PALETTE_FLAG } from './feature-flags.js';
-// @ts-expect-error NATIVE_CHAT_V2_FLAG was removed (v2 is always on)
-import { NATIVE_CHAT_V2_FLAG } from './feature-flags.js';
-// @ts-expect-error TERMINAL_WORKSPACE_FLAG was removed (the terminal workspace is always on)
-import { TERMINAL_WORKSPACE_FLAG } from './feature-flags.js';
+const featureFlagExports: Record<string, unknown> = featureFlags;
 
 // ---------------------------------------------------------------------------
 // Setup
@@ -77,13 +70,24 @@ describe('feature-flags: web.agent_edit', () => {
   });
 });
 
+describe('feature-flags: web.chat_starred_messages', () => {
+  it('defaults ON (in DEFAULT_ON_FLAGS) with no server value or override', () => {
+    expect(isFeatureEnabled('web.chat_starred_messages')).toBe(true);
+  });
+
+  it('the server can still turn it off', () => {
+    setServerFlags({ 'web.chat_starred_messages': false });
+    expect(isFeatureEnabled('web.chat_starred_messages')).toBe(false);
+  });
+});
+
 describe('feature-flags: access boundary flags removed', () => {
   it('does not export ACCESS_BOUNDARIES_READ_FLAG', () => {
-    expect(ACCESS_BOUNDARIES_READ_FLAG).toBeUndefined();
+    expect(featureFlagExports.ACCESS_BOUNDARIES_READ_FLAG).toBeUndefined();
   });
 
   it('does not export ACCESS_BOUNDARIES_AUTHORING_FLAG', () => {
-    expect(ACCESS_BOUNDARIES_AUTHORING_FLAG).toBeUndefined();
+    expect(featureFlagExports.ACCESS_BOUNDARIES_AUTHORING_FLAG).toBeUndefined();
   });
 
   it('access_boundaries_read defaults to OFF (not in DEFAULT_ON_FLAGS)', () => {
@@ -101,7 +105,7 @@ describe('feature-flags: access boundary flags removed', () => {
 
 describe('feature-flags: palette flag removed', () => {
   it('does not export NATIVE_CHAT_PALETTE_FLAG', () => {
-    expect(NATIVE_CHAT_PALETTE_FLAG).toBeUndefined();
+    expect(featureFlagExports.NATIVE_CHAT_PALETTE_FLAG).toBeUndefined();
   });
 });
 
@@ -111,7 +115,7 @@ describe('feature-flags: palette flag removed', () => {
 
 describe('feature-flags: v2 flag removed', () => {
   it('does not export NATIVE_CHAT_V2_FLAG', () => {
-    expect(NATIVE_CHAT_V2_FLAG).toBeUndefined();
+    expect(featureFlagExports.NATIVE_CHAT_V2_FLAG).toBeUndefined();
   });
 });
 
@@ -131,7 +135,7 @@ describe('feature-flags: native_chat flags retained', () => {
 
 describe('feature-flags: terminal workspace flag removed', () => {
   it('does not export TERMINAL_WORKSPACE_FLAG', () => {
-    expect(TERMINAL_WORKSPACE_FLAG).toBeUndefined();
+    expect(featureFlagExports.TERMINAL_WORKSPACE_FLAG).toBeUndefined();
   });
 
   // The one allowed reference to the retired name outside compiledRetired
@@ -155,6 +159,34 @@ describe('feature-flags: project thread groups flag removed', () => {
   // (see the experiment-removal checklist).
   it('the retired name resolves OFF by default (not in DEFAULT_ON_FLAGS)', () => {
     expect(isFeatureEnabled('hub.chat_thread_groups')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Consolidated Decisions flag (ptone/scion#8223)
+// ---------------------------------------------------------------------------
+
+describe('feature-flags: web.decisions consolidation', () => {
+  it('does not export CHAT_CHOICES_FLAG or PROJECT_DECISIONS_FLAG', () => {
+    expect((featureFlags as Record<string, unknown>).CHAT_CHOICES_FLAG).toBeUndefined();
+    expect((featureFlags as Record<string, unknown>).PROJECT_DECISIONS_FLAG).toBeUndefined();
+    expect((featureFlags as Record<string, unknown>).chatChoicesEnabled).toBeUndefined();
+    expect((featureFlags as Record<string, unknown>).projectDecisionsEnabled).toBeUndefined();
+  });
+
+  // The one allowed reference to each retired name outside compiledRetired
+  // (see the experiment-removal checklist).
+  it('retired names resolve OFF by default and do not turn on web.decisions', () => {
+    expect(isFeatureEnabled('web.chat_choices')).toBe(false);
+    expect(isFeatureEnabled('web.project_decisions')).toBe(false);
+    expect(decisionsEnabled()).toBe(false);
+  });
+
+  it('DECISIONS_FLAG is web.decisions, defaults OFF, and toggles decisionsEnabled()', () => {
+    expect(DECISIONS_FLAG).toBe('web.decisions');
+    expect(decisionsEnabled()).toBe(false);
+    setFeatureFlag(DECISIONS_FLAG, true);
+    expect(decisionsEnabled()).toBe(true);
   });
 });
 
@@ -333,5 +365,64 @@ describe('isFeatureEnabled: shadowed-override logging', () => {
 
     expect(infoSpy).toHaveBeenCalledTimes(2);
     infoSpy.mockRestore();
+  });
+});
+
+describe('feature-flags: change event', () => {
+  it('announces server flags and a set flag on the window', async () => {
+    const { FEATURE_FLAGS_CHANGED_EVENT } = await import('./feature-flags.js');
+    const seen = vi.fn();
+    window.addEventListener(FEATURE_FLAGS_CHANGED_EVENT, seen);
+    try {
+      setServerFlags({ 'test.flag': true });
+      setFeatureFlag('test.flag', false);
+      expect(seen).toHaveBeenCalledTimes(2);
+      expect(isFeatureEnabled('test.flag')).toBe(false);
+    } finally {
+      window.removeEventListener(FEATURE_FLAGS_CHANGED_EVENT, seen);
+    }
+  });
+});
+
+describe('execSchedulesEnabled (hub.exec_schedules)', () => {
+  it('defaults to false and follows server/explicit flags', async () => {
+    const { EXEC_SCHEDULES_FLAG, execSchedulesEnabled } = await import('./feature-flags.js');
+    expect(EXEC_SCHEDULES_FLAG).toBe('hub.exec_schedules');
+    expect(execSchedulesEnabled()).toBe(false);
+
+    setServerFlags({ 'hub.exec_schedules': true });
+    expect(execSchedulesEnabled()).toBe(true);
+
+    setFeatureFlag('hub.exec_schedules', false);
+    expect(execSchedulesEnabled()).toBe(false);
+  });
+});
+
+describe('k8sWorkloadIdentitySetupEnabled (hub.k8s_workload_identity_setup)', () => {
+  it('defaults to false and follows server/explicit flags', async () => {
+    const { K8S_WORKLOAD_IDENTITY_SETUP_FLAG, k8sWorkloadIdentitySetupEnabled } =
+      await import('./feature-flags.js');
+    expect(K8S_WORKLOAD_IDENTITY_SETUP_FLAG).toBe('hub.k8s_workload_identity_setup');
+    expect(k8sWorkloadIdentitySetupEnabled()).toBe(false);
+
+    setServerFlags({ 'hub.k8s_workload_identity_setup': true });
+    expect(k8sWorkloadIdentitySetupEnabled()).toBe(true);
+
+    setFeatureFlag('hub.k8s_workload_identity_setup', false);
+    expect(k8sWorkloadIdentitySetupEnabled()).toBe(false);
+  });
+});
+
+describe('idleSuspendEnabled (lifecycle.idle_suspend)', () => {
+  it('defaults to false and follows server/explicit flags', async () => {
+    const { IDLE_SUSPEND_FLAG, idleSuspendEnabled } = await import('./feature-flags.js');
+    expect(IDLE_SUSPEND_FLAG).toBe('lifecycle.idle_suspend');
+    expect(idleSuspendEnabled()).toBe(false);
+
+    setServerFlags({ 'lifecycle.idle_suspend': true });
+    expect(idleSuspendEnabled()).toBe(true);
+
+    setFeatureFlag('lifecycle.idle_suspend', false);
+    expect(idleSuspendEnabled()).toBe(false);
   });
 });

@@ -21,6 +21,8 @@ global-setup.ts          ← Playwright calls this before any spec
   ├─ hub.ts              ← Builds web + Go binary, starts hub on ephemeral port
   ├─ auth.ts             ← Creates authenticated sessions via test-login,
   │                         and redeems test identity web-login codes
+  ├─ agent.ts            ← Provisions containerless test agents and mints
+  │                         X-Scion-Agent-Token credentials (no Docker needed)
   └─ seed.ts             ← Seeds groups, users, role bindings via the real API
 smoke.spec.ts            ← Proves the loop: login → navigate → assert → axe
 global-teardown.ts       ← Kills the hub, cleans up temp files
@@ -34,7 +36,7 @@ global-teardown.ts       ← Kills the hub, cleans up temp files
    - `--foreground` (no daemonization)
    - `--host 127.0.0.1` (loopback only — required for dev-auth)
    - `--web-port <ephemeral>` (random free port)
-   - `--dev-auth` (auto-login as admin on first page load)
+   - `--dev-auth` (the admin session comes from a dev sign-in link, `devSignInURL`)
    - `--enable-test-login` (programmatic session creation endpoint)
    - `--session-secret e2e-test-secret` (deterministic signing key)
    - `--db sqlite://<tmpdir>/e2e.db` (ephemeral database)
@@ -137,11 +139,12 @@ reference use.
 
 ### Hub settings and a co-located broker
 
-Three more `startHub()` options, all off by default:
+Four more `startHub()` options, all off by default:
 
 - `env`: extra environment of the hub process, for supported
-  configuration such as `SCION_SERVER_HUB_ASYNCAGENTLAUNCH: 'true'` or
-  `SCION_IMAGE_REGISTRY`. It is applied over the member-level hub's
+  configuration such as `SCION_IMAGE_REGISTRY` or
+  `SCION_SERVER_HUB_LAUNCHTIMEOUT`. Experiments are not environment
+  settings; use `experiments` or `startupExperiments`. It is applied over the member-level hub's
   `SCION_*`-free environment. Keys the harness sets itself
   (`HARNESS_OWNED_ENV`: `HOME`, `SCION_CLI_MODE`, the hub id and hub class,
   the broker host) and the test mode and test identity settings
@@ -159,6 +162,14 @@ Three more `startHub()` options, all off by default:
   and restarts the hub on the same database, port, HOME and hub id. If
   anything fails before the restarted hub is healthy, the hub process is
   killed and `startHub()` throws.
+- `experiments`: names of experiments the suite needs on. Once the hub is
+  healthy (after any `startupExperiments` restart), `startHub()` turns
+  each one on through the admin experiments API, with no restart, and
+  reads the listing back. If one is not enabled, or a request fails, the
+  hub process is killed and `startHub()` throws, so a suite never runs
+  with an experiment silently off. The override is stored in the hub's
+  database, so it survives `restartHubWithoutDevAuth`. The async create
+  journeys use it for `hub.async_agent_launch`.
 
 `restartHubWithoutDevAuth(stateFile)` restarts a hub that `startHub()`
 started in the same process on the same database, port, HOME and hub id,
@@ -186,7 +197,8 @@ const state = await startHub({
   testLogin: false,
   testIdentities: true,
   runtimeBroker: true,
-  env: { SCION_SERVER_HUB_ASYNCAGENTLAUNCH: 'true', SCION_IMAGE_REGISTRY: registry },
+  env: { SCION_IMAGE_REGISTRY: registry },
+  experiments: ['hub.async_agent_launch'],
   stateFile,
 });
 ```
@@ -316,6 +328,107 @@ Available helpers:
    helper, not the hub, rejects a non-empty value). Any other scope, e.g.
    `'project'`, requires an explicit `scopeId`.
 4. The user's next API call will reflect the new permissions.
+
+## Containerless agent-sender fixture (`agent.ts`)
+
+`agent.ts` provisions a real stored agent on a running `startHub(...)` test hub
+(`provisionOnly: true` against the co-located runtime broker) and mints a valid
+HS256 `X-Scion-Agent-Token` matching `pkg/hub/agenttoken.go` — **no Docker
+daemon or live agent container is required** (ptone/scion#7776).
+
+### Hub prerequisites
+
+Start the throwaway hub with `runtimeBroker: true`, `testIdentities: true`, and
+either `testLogin: true` (the default, which passes `--session-secret`) or
+`env: { SCION_SERVER_SESSION_SECRET: E2E_SESSION_SECRET }` so the hub derives a
+deterministic `agent_signing_key`:
+
+```typescript
+const hub = await startHub({
+  testLogin: true,
+  testIdentities: true,
+  runtimeBroker: true,
+  stateFile,
+  env: {
+    SCION_IMAGE_REGISTRY: 'registry.invalid/scion-e2e',
+  },
+  experiments: ['web.decisions'],
+});
+```
+
+**Credential recording:** `createTestAgent` signs an HS256 JWT with a random
+`jti` and, when `hub.dbDir` is present (all `startHub(...)` runs), records the
+matching `agent_credentials` row in the test hub's SQLite database so
+`pkg/hub/agent_token_verify.go` accepts the token. `server.auth.agent_run_scope`
+must remain off because containerless test agents carry no `run_id`.
+
+### Usage
+
+```typescript
+import { canonicalAgentUserDMKey, createTestAgent } from '../harness/agent.js';
+
+const agent = await createTestAgent(hub, {
+  projectId,
+  name: 'decisions-asker',
+  messageMode: 'project',
+});
+
+// Authenticates on RouteAgentSelf (/api/v1/agents/{id}/*):
+const sendRes = await agent.sendDecisionPrompt({
+  conversationRef: '#decisions-room', // or recipient: 'user:alice@e2e.test' or conversationId
+  msg: 'Select rollout strategy:',
+  decisions: [
+    {
+      id: 'D1',
+      question: 'Which rollout strategy should we use?',
+      choices: [
+        { id: 'canary', label: 'Canary 10%' },
+        { id: 'bluegreen', label: 'Blue/Green' },
+      ],
+      default: 'canary',
+    },
+  ],
+});
+
+// Also authenticates on RouteAgentToken (/api/v1/agent/*):
+const res = await agent.request('/api/v1/agent/gcp-token');
+
+// Inspect or wait for decision-response delivery behavior (assumes a
+// containerless/absent agent; default timeout 20s for ~5–6s broker buffer +
+// retries on hosts without Docker; promptMessageId matches the newest response
+// in ListMessages DESC order):
+//   - 'attempted_delivery' (attemptedAgentDelivery === true): hub dispatched to
+//     the broker (e.g. direct answer or override of an interpreted answer).
+//   - 'logged_without_delivery' (attemptedAgentDelivery === false): row is not
+//     (yet) marked `failed` (`dispatchState: "dispatched"`). In practice, once
+//     a later override settles, an earlier confirmation queued in a prior >2s
+//     broker debounce window has flushed too; if both answers fell in the same
+//     2s window, re-poll after override settles (or space >2s) because
+//     `reportMessageFailure` runs in separate goroutines.
+//   - 'agent_unreachable': asker was stopped/deleted before the answer.
+const delivery = await agent.waitForDecisionResponseDelivery(topicId, {
+  promptMessageId: sendRes.message_id,
+});
+```
+
+### Running the real-hub interactive decisions suite
+
+```bash
+# Prebuild Go hub binary + web client assets, then run the Playwright suite:
+go build -buildvcs=false -o build/scion ./cmd/scion
+cd web
+npm run build
+CHROMIUM_EXECUTABLE=/usr/bin/chromium E2E_PREBUILT=1 npm run test:e2e:chat-decisions
+```
+
+(Omit `CHROMIUM_EXECUTABLE` when using Playwright's downloaded Chromium bundle,
+and omit `E2E_PREBUILT=1` to let `global-setup.ts` run `make build` and
+`npm run build` automatically.)
+
+Note on project roles: built-in `project-admin` and `project-owner` carry the
+`agent.message` permission required to answer a `messageMode: 'project'`
+agent's decision prompts, whereas `project-member` does not (useful when testing
+blocked answerability).
 
 ## Navigation waits
 

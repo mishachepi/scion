@@ -173,3 +173,47 @@ func TestRenderDeliveryText_KeepsVisitorSenderKeys(t *testing.T) {
 		}
 	}
 }
+
+// The sender time zone key is hub-reserved: StripReservedMetadata removes a
+// client-supplied value, so only the hub sets it, after the strip.
+func TestStripReservedMetadata_StripsSenderTimezone(t *testing.T) {
+	out := StripReservedMetadata(map[string]string{"foo": "bar", messages.MetadataSenderTimezone: "Europe/Berlin"})
+	if _, ok := out[messages.MetadataSenderTimezone]; ok {
+		t.Errorf("%s survived the strip: %v", messages.MetadataSenderTimezone, out)
+	}
+	if out["foo"] != "bar" {
+		t.Errorf("unrelated key lost: %v", out)
+	}
+}
+
+// The decision response keys are hub-set only: a client-supplied value is
+// stripped before delivery (design choices v4, 4.4).
+func TestStripReservedMetadata_StripsDecisionKeys(t *testing.T) {
+	md := map[string]string{
+		"foo":                                  "bar",
+		messages.MetadataDecisionKey:           "D1",
+		messages.MetadataDecisionVersion:       "1",
+		messages.MetadataChoiceID:              "yes",
+		messages.MetadataDecisionProvenance:    "direct",
+		messages.MetadataDecisionBatch:         "b1",
+		messages.MetadataDecisionAnswers:       "D1@1=yes",
+		messages.MetadataDecisionDismissReason: "stale",
+	}
+	out := StripReservedMetadata(md)
+	for _, k := range []string{
+		messages.MetadataDecisionKey,
+		messages.MetadataDecisionVersion,
+		messages.MetadataChoiceID,
+		messages.MetadataDecisionProvenance,
+		messages.MetadataDecisionBatch,
+		messages.MetadataDecisionAnswers,
+		messages.MetadataDecisionDismissReason,
+	} {
+		if _, ok := out[k]; ok {
+			t.Errorf("%s survived the strip: %v", k, out)
+		}
+	}
+	if out["foo"] != "bar" {
+		t.Errorf("unrelated key lost: %v", out)
+	}
+}

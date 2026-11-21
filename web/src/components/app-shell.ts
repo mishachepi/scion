@@ -36,8 +36,8 @@ import { performLogout } from '../utils/auth.js';
 import { setDocumentTitle, PAGE_TITLE_EVENT } from '../client/page-title.js';
 import type { PageTitleDetail } from '../client/page-title.js';
 import { enterAppFrame, exitAppFrame } from './shared/app-frame.js';
-import { isFeatureEnabled } from '../utils/feature-flags.js';
-import { ARTIFACTS_FLAG } from '../client/artifacts.js';
+import { decisionsEnabled, isFeatureEnabled } from '../utils/feature-flags.js';
+import { ARTIFACTS_FLAG } from '../client/artifacts-flag.js';
 import {
   TestHubBannerController,
   renderTestHubBanner,
@@ -181,6 +181,8 @@ export class ScionApp extends LitElement {
     /* Content wrapper */
     .content {
       flex: 1;
+      /* The artifact page's sticky review toolbar (.g-sticky) offsets its top
+         by this top padding, and by the 1rem at 640px below: change both. */
       padding: 1.5rem;
       /* The last of the scrolled content clears the home indicator (the
          page uses viewport-fit=cover); the inset is 0 elsewhere. */
@@ -378,6 +380,9 @@ export class ScionApp extends LitElement {
     }
     if (path.match(/^\/projects\/[^/]+\/schedules$/)) {
       return 'Schedules';
+    }
+    if (path.match(/^\/projects\/[^/]+\/decisions$/)) {
+      return decisionsEnabled() ? 'Decisions' : 'Page Not Found';
     }
     if (path.match(/^\/projects\/[^/]+\/metrics$/)) {
       return 'Project Metrics';

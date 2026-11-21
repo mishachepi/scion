@@ -49,6 +49,8 @@ type RuntimeBroker struct {
 	WorkspaceStorage string `json:"workspace_storage,omitempty"`
 	// Health holds the value of the "health" field.
 	Health string `json:"health,omitempty"`
+	// WorkloadIdentityTargets holds the value of the "workload_identity_targets" field.
+	WorkloadIdentityTargets string `json:"workload_identity_targets,omitempty"`
 	// Labels holds the value of the "labels" field.
 	Labels map[string]string `json:"labels,omitempty"`
 	// Annotations holds the value of the "annotations" field.
@@ -95,6 +97,12 @@ type RuntimeBroker struct {
 	PresentationFencedAt *time.Time `json:"presentation_fenced_at,omitempty"`
 	// PresentationObservedAt holds the value of the "presentation_observed_at" field.
 	PresentationObservedAt *time.Time `json:"presentation_observed_at,omitempty"`
+	// ConversionPlanPresentation holds the value of the "conversion_plan_presentation" field.
+	ConversionPlanPresentation string `json:"conversion_plan_presentation,omitempty"`
+	// ConversionPlanPresentationHash holds the value of the "conversion_plan_presentation_hash" field.
+	ConversionPlanPresentationHash string `json:"conversion_plan_presentation_hash,omitempty"`
+	// ConversionPlanObservedAt holds the value of the "conversion_plan_observed_at" field.
+	ConversionPlanObservedAt *time.Time `json:"conversion_plan_observed_at,omitempty"`
 	// Created holds the value of the "created" field.
 	Created time.Time `json:"created,omitempty"`
 	// Updated holds the value of the "updated" field.
@@ -113,9 +121,9 @@ func (*RuntimeBroker) scanValues(columns []string) ([]any, error) {
 			values[i] = new(sql.NullBool)
 		case runtimebroker.FieldLockVersion, runtimebroker.FieldPresentationEpoch, runtimebroker.FieldPresentationSeq:
 			values[i] = new(sql.NullInt64)
-		case runtimebroker.FieldName, runtimebroker.FieldSlug, runtimebroker.FieldMode, runtimebroker.FieldVersion, runtimebroker.FieldStatus, runtimebroker.FieldConnectionState, runtimebroker.FieldCapabilities, runtimebroker.FieldSupportedHarnesses, runtimebroker.FieldResources, runtimebroker.FieldRuntimes, runtimebroker.FieldDefaultProfile, runtimebroker.FieldWorkspaceStorage, runtimebroker.FieldHealth, runtimebroker.FieldEndpoint, runtimebroker.FieldCreatedBy, runtimebroker.FieldGcpHostServiceAccountEmail, runtimebroker.FieldGcpHostProjectID, runtimebroker.FieldGcpHostSource, runtimebroker.FieldHostIdentityObservedEmail, runtimebroker.FieldHostIdentityObservation, runtimebroker.FieldConnectedHubID, runtimebroker.FieldConnectedSessionID, runtimebroker.FieldRuntimeTargetID, runtimebroker.FieldRuntimeTargetType, runtimebroker.FieldRuntimeTargetDisplayName, runtimebroker.FieldRuntimeTargetPresentation, runtimebroker.FieldRuntimeTargetPresentationHash:
+		case runtimebroker.FieldName, runtimebroker.FieldSlug, runtimebroker.FieldMode, runtimebroker.FieldVersion, runtimebroker.FieldStatus, runtimebroker.FieldConnectionState, runtimebroker.FieldCapabilities, runtimebroker.FieldSupportedHarnesses, runtimebroker.FieldResources, runtimebroker.FieldRuntimes, runtimebroker.FieldDefaultProfile, runtimebroker.FieldWorkspaceStorage, runtimebroker.FieldHealth, runtimebroker.FieldWorkloadIdentityTargets, runtimebroker.FieldEndpoint, runtimebroker.FieldCreatedBy, runtimebroker.FieldGcpHostServiceAccountEmail, runtimebroker.FieldGcpHostProjectID, runtimebroker.FieldGcpHostSource, runtimebroker.FieldHostIdentityObservedEmail, runtimebroker.FieldHostIdentityObservation, runtimebroker.FieldConnectedHubID, runtimebroker.FieldConnectedSessionID, runtimebroker.FieldRuntimeTargetID, runtimebroker.FieldRuntimeTargetType, runtimebroker.FieldRuntimeTargetDisplayName, runtimebroker.FieldRuntimeTargetPresentation, runtimebroker.FieldRuntimeTargetPresentationHash, runtimebroker.FieldConversionPlanPresentation, runtimebroker.FieldConversionPlanPresentationHash:
 			values[i] = new(sql.NullString)
-		case runtimebroker.FieldLastHeartbeat, runtimebroker.FieldHostIdentityObservedAt, runtimebroker.FieldConnectedAt, runtimebroker.FieldPresentationFencedAt, runtimebroker.FieldPresentationObservedAt, runtimebroker.FieldCreated, runtimebroker.FieldUpdated:
+		case runtimebroker.FieldLastHeartbeat, runtimebroker.FieldHostIdentityObservedAt, runtimebroker.FieldConnectedAt, runtimebroker.FieldPresentationFencedAt, runtimebroker.FieldPresentationObservedAt, runtimebroker.FieldConversionPlanObservedAt, runtimebroker.FieldCreated, runtimebroker.FieldUpdated:
 			values[i] = new(sql.NullTime)
 		case runtimebroker.FieldID:
 			values[i] = new(uuid.UUID)
@@ -230,6 +238,12 @@ func (_m *RuntimeBroker) assignValues(columns []string, values []any) error {
 				return fmt.Errorf("unexpected type %T for field health", values[i])
 			} else if value.Valid {
 				_m.Health = value.String
+			}
+		case runtimebroker.FieldWorkloadIdentityTargets:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field workload_identity_targets", values[i])
+			} else if value.Valid {
+				_m.WorkloadIdentityTargets = value.String
 			}
 		case runtimebroker.FieldLabels:
 			if value, ok := values[i].(*[]byte); !ok {
@@ -386,6 +400,25 @@ func (_m *RuntimeBroker) assignValues(columns []string, values []any) error {
 				_m.PresentationObservedAt = new(time.Time)
 				*_m.PresentationObservedAt = value.Time
 			}
+		case runtimebroker.FieldConversionPlanPresentation:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field conversion_plan_presentation", values[i])
+			} else if value.Valid {
+				_m.ConversionPlanPresentation = value.String
+			}
+		case runtimebroker.FieldConversionPlanPresentationHash:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field conversion_plan_presentation_hash", values[i])
+			} else if value.Valid {
+				_m.ConversionPlanPresentationHash = value.String
+			}
+		case runtimebroker.FieldConversionPlanObservedAt:
+			if value, ok := values[i].(*sql.NullTime); !ok {
+				return fmt.Errorf("unexpected type %T for field conversion_plan_observed_at", values[i])
+			} else if value.Valid {
+				_m.ConversionPlanObservedAt = new(time.Time)
+				*_m.ConversionPlanObservedAt = value.Time
+			}
 		case runtimebroker.FieldCreated:
 			if value, ok := values[i].(*sql.NullTime); !ok {
 				return fmt.Errorf("unexpected type %T for field created", values[i])
@@ -481,6 +514,9 @@ func (_m *RuntimeBroker) String() string {
 	builder.WriteString("health=")
 	builder.WriteString(_m.Health)
 	builder.WriteString(", ")
+	builder.WriteString("workload_identity_targets=")
+	builder.WriteString(_m.WorkloadIdentityTargets)
+	builder.WriteString(", ")
 	builder.WriteString("labels=")
 	builder.WriteString(fmt.Sprintf("%v", _m.Labels))
 	builder.WriteString(", ")
@@ -573,6 +609,17 @@ func (_m *RuntimeBroker) String() string {
 	builder.WriteString(", ")
 	if v := _m.PresentationObservedAt; v != nil {
 		builder.WriteString("presentation_observed_at=")
+		builder.WriteString(v.Format(time.ANSIC))
+	}
+	builder.WriteString(", ")
+	builder.WriteString("conversion_plan_presentation=")
+	builder.WriteString(_m.ConversionPlanPresentation)
+	builder.WriteString(", ")
+	builder.WriteString("conversion_plan_presentation_hash=")
+	builder.WriteString(_m.ConversionPlanPresentationHash)
+	builder.WriteString(", ")
+	if v := _m.ConversionPlanObservedAt; v != nil {
+		builder.WriteString("conversion_plan_observed_at=")
 		builder.WriteString(v.Format(time.ANSIC))
 	}
 	builder.WriteString(", ")

@@ -295,7 +295,7 @@ func runConversationList(cmd *cobra.Command, args []string) error {
 		outputFormat = "json"
 	}
 
-	settings, client, err := requireHubClient()
+	settings, client, uat, err := requireHubClientUAT()
 	if err != nil {
 		return err
 	}
@@ -320,7 +320,7 @@ func runConversationList(cmd *cobra.Command, args []string) error {
 	// is not an error: it just falls back to today's behavior (nothing
 	// sent, so the caller's participations plus canonical DMs).
 	if convProject != "" {
-		projectID, err := resolveConversationProjectRef(ctx, client, convProject)
+		projectID, err := resolveConversationProjectRef(ctx, client, convProject, uat)
 		if err != nil {
 			return err
 		}
@@ -349,16 +349,17 @@ func runConversationList(cmd *cobra.Command, args []string) error {
 
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	_, _ = fmt.Fprintln(tw, "ID\tKIND\tSURFACE\tNAME\tDEFAULT AGENT\tLAST ACTIVITY")
+	// IDs are printed in full so a listed ID can be passed back as
+	// conv:<id> (ptone/scion#7131).
 	for _, conv := range result.Conversations {
-		shortID := truncateRunes(conv.ID, 12, false)
 		name := truncateRunes(conversationListName(conv), 20, true)
 		defaultAgent := ""
 		if conv.DefaultAgentID != nil {
-			defaultAgent = truncateRunes(*conv.DefaultAgentID, 12, false)
+			defaultAgent = *conv.DefaultAgentID
 		}
 		lastActivity := clitime.Ago(conv.LastActivityAt)
 		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
-			shortID, conv.Kind, conv.Surface, name, defaultAgent, lastActivity)
+			conv.ID, conv.Kind, conv.Surface, name, defaultAgent, lastActivity)
 	}
 	return tw.Flush()
 }
@@ -401,13 +402,18 @@ func runConversationMessages(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	label := newUserLabeler(ctx, client)
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	_, _ = fmt.Fprintln(tw, "TIME\tFROM\tMESSAGE")
-	for _, msg := range result.Items {
+	for i := range result.Items {
+		msg := &result.Items[i]
 		timeStr := clitime.Format(msg.CreatedAt, clitime.Clock)
 		from := truncateRunes(msg.Sender, 20, true)
 		body := truncateRunes(msg.Msg, 60, true)
 		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\n", timeStr, from, body)
+		if authorizedBy := messageAuthorizedBy(msg, label); authorizedBy != "" {
+			_, _ = fmt.Fprintf(tw, "\t\t%s\n", authorizedBy)
+		}
 	}
 	return tw.Flush()
 }
@@ -417,7 +423,7 @@ func runConversationCreate(cmd *cobra.Command, args []string) error {
 		outputFormat = "json"
 	}
 
-	settings, client, err := requireHubClient()
+	settings, client, uat, err := requireHubClientUAT()
 	if err != nil {
 		return err
 	}
@@ -445,7 +451,7 @@ func runConversationCreate(cmd *cobra.Command, args []string) error {
 	defer cancel()
 
 	if projectFromFlag {
-		projectID, err := resolveConversationProjectRef(ctx, client, convProject)
+		projectID, err := resolveConversationProjectRef(ctx, client, convProject, uat)
 		if err != nil {
 			return err
 		}
@@ -594,8 +600,7 @@ func writeConversationGetParticipants(w io.Writer, participants []hubclient.Conv
 	_, _ = fmt.Fprintln(tw, "  KIND\tID\tROLE\tMSG MODE")
 	restricted := false
 	for _, p := range participants {
-		shortID := truncateRunes(p.PrincipalID, 12, false)
-		_, _ = fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\n", p.PrincipalKind, shortID, p.Role, participantModeCell(p))
+		_, _ = fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\n", p.PrincipalKind, p.PrincipalID, p.Role, participantModeCell(p))
 		switch p.MessageMode {
 		case "", "project", "hub":
 		default:
@@ -686,6 +691,13 @@ func runConversationGetMessage(cmd *cobra.Command, args []string) error {
 	_, _ = fmt.Fprintf(tw, "SENDER\t%s\n", msg.Sender)
 	_, _ = fmt.Fprintf(tw, "SENDER ID\t%s\n", msg.SenderID)
 	_, _ = fmt.Fprintf(tw, "SENDER PROJECT ID\t%s\n", senderProjectID)
+	// A message sent with an agent delegated credential also names the
+	// user who authorized it and the grant; other messages print no rows.
+	if msg.AuthorizingUserID != "" {
+		_, _ = fmt.Fprintf(tw, "AUTHORIZED BY\t%s\n", newUserLabeler(ctx, client)(msg.AuthorizingUserID))
+		_, _ = fmt.Fprintf(tw, "AUTHORIZING USER ID\t%s\n", msg.AuthorizingUserID)
+		_, _ = fmt.Fprintf(tw, "DELEGATION GRANT ID\t%s\n", msg.DelegationGrantID)
+	}
 	_, _ = fmt.Fprintf(tw, "RECIPIENT\t%s\n", msg.Recipient)
 	_, _ = fmt.Fprintf(tw, "RECIPIENT ID\t%s\n", msg.RecipientID)
 	_, _ = fmt.Fprintf(tw, "RECIPIENT PROJECT ID\t%s\n", recipientProjectID)
@@ -855,13 +867,18 @@ func runConversationCatchUp(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	label := newUserLabeler(ctx, client)
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	_, _ = fmt.Fprintln(tw, "TIME\tFROM\tMESSAGE")
-	for _, msg := range result.Items {
+	for i := range result.Items {
+		msg := &result.Items[i]
 		timeStr := clitime.Format(msg.CreatedAt, clitime.Clock)
 		from := truncateRunes(msg.Sender, 20, true)
 		body := truncateRunes(msg.Msg, 60, true)
 		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\n", timeStr, from, body)
+		if authorizedBy := messageAuthorizedBy(msg, label); authorizedBy != "" {
+			_, _ = fmt.Fprintf(tw, "\t\t%s\n", authorizedBy)
+		}
 		// A deferred message was never dispatched, so its attachments never
 		// reached this agent's home (ptone/scion#4596). The hub lists them
 		// only to a reader.
@@ -955,12 +972,13 @@ func truncateRunes(s string, max int, ellipsis bool) string {
 // resolveConversationProjectRef turns the --project value of the
 // conversation commands into a hub project ID. The hub filters and files
 // conversations by ID only, so a slug or name sent as-is matches nothing.
-// A UUID-shaped value is used as given.
-func resolveConversationProjectRef(ctx context.Context, client hubclient.Client, ref string) (string, error) {
+// A UUID-shaped value is used as given. uat is as for
+// resolveProjectByNameOrID.
+func resolveConversationProjectRef(ctx context.Context, client hubclient.Client, ref string, uat bool) (string, error) {
 	if isUUIDLike(ref) {
 		return ref, nil
 	}
-	project, err := resolveProjectByNameOrID(ctx, client, ref)
+	project, err := resolveProjectByNameOrID(ctx, client, ref, uat)
 	if err != nil {
 		return "", fmt.Errorf("project %q: %w", ref, err)
 	}

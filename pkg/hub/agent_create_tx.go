@@ -24,6 +24,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/lifecycleevents"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
 )
@@ -154,6 +155,11 @@ func (s *Server) commitAgentCreate(ctx context.Context, w agentCreateWrite) erro
 	}
 	w.Edge.EffectCeiling = w.Ceiling
 	w.Edge.AuthorityProvenance = w.Provenance
+	// The creating principal is not on the agent row; the lifecycle
+	// observer records it on the created event (WP1 design 2.1).
+	ctx = lifecycleevents.WithCreateContext(ctx, lifecycleevents.CreateContext{
+		CreatorType: w.Edge.DelegatorType, CreatorID: w.Edge.DelegatorID,
+	})
 
 	return s.store.WithTx(ctx, func(tx store.Store) error {
 		if err := lockAgentGuardUserTx(ctx, tx, w.Agent); err != nil {
@@ -282,10 +288,10 @@ var errCreateRowDeleteHeld = errors.New("agent row is held by a delete")
 // compensateAgentCreate rolls back a committed create after a later step
 // failed, in one transaction: it deletes the agent row (identity keys
 // cascade), runs the hard-delete work with cause create_compensation
-// (agentHardDeleteWork: delegation edges, service-account assignments and
-// the hard-delete hooks), and writes an agent_create_dispatch_failed audit
-// record naming the create's audit record and the failed stage. A hook
-// error rolls the compensation back.
+// (agentHardDeleteWork: active credential revocation, delegation edges,
+// service-account assignments and the hard-delete hooks), and writes an
+// agent_create_dispatch_failed audit record naming the create's audit record
+// and the failed stage. A hook error rolls the compensation back.
 //
 // The row delete is conditional (ptone/scion#3557, ptone/scion#3958): the
 // row is removed only when no delete holds it (createRowHeldCheck), checked
@@ -298,8 +304,10 @@ var errCreateRowDeleteHeld = errors.New("agent row is held by a delete")
 // errCreateRowDeleteHeld.
 //
 // The caller passes a context detached from the request (see
-// cleanupFailedCreate). Credential revocation, the broker-side delete and
-// the quota release stay with the caller.
+// cleanupFailedCreate). Pre-delete credential revocation (for rollbacks that
+// keep the row), the broker-side delete and the quota release stay with the
+// caller; agentHardDeleteWork also revokes any remaining active credentials in
+// the row-delete transaction.
 func (s *Server) compensateAgentCreate(ctx context.Context, c createCompensation) error {
 	if c.Agent == nil {
 		return fmt.Errorf("%w: no agent to compensate", errAgentCreateWriteInvalid)
@@ -355,7 +363,7 @@ func (s *Server) compensateAgentCreate(ctx context.Context, c createCompensation
 	// check rolls it all back. A delete claim that lands after the read
 	// bumps state_version, so the row delete misses and the attempt is
 	// retried from a fresh read, which then refuses.
-	n, err := s.store.FinalizeAgentDeletion(ctx, agentID, createRowCompensable(), store.DeletionFinalizeHard, store.DeletionFields{},
+	n, err := s.store.FinalizeAgentDeletion(lifecycleCreateRollback(ctx, c.Stage), agentID, createRowCompensable(), store.DeletionFinalizeHard, store.DeletionFields{},
 		createRowHeldCheck(edgesAndAudit))
 	if errors.Is(err, errCreateRowDeleteHeld) {
 		return errCreateRowDeleteHeld

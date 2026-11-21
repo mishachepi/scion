@@ -19,13 +19,17 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent"
+	"github.com/GoogleCloudPlatform/scion/pkg/agentcontrol"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
 )
@@ -40,6 +44,7 @@ type mockRuntimeBrokerService struct {
 	heartbeatResp *hubclient.BrokerHeartbeatResponse
 
 	messageFailureReports []*hubclient.MessageFailuresReport
+	messageFailureResp    *hubclient.MessageFailuresResponse
 
 	// launchReports records every ReportAgentLaunch call, in order.
 	launchReports []*mockLaunchReportCall
@@ -53,6 +58,9 @@ type mockRuntimeBrokerService struct {
 	// launchSender call site built (e.g. its deadline) without needing the
 	// call to fail or time out.
 	ctxHook func(ctx context.Context)
+	// workspaceDownloadFunc, when set, answers WorkspaceDownload; when nil
+	// it answers a 404 (a Hub without the route).
+	workspaceDownloadFunc func(ctx context.Context, brokerID, agentID string, req *api.WorkspaceDownloadRequest) (*api.WorkspaceDownloadResponse, error)
 }
 
 // mockLaunchReportCall records one ReportAgentLaunch invocation.
@@ -110,11 +118,29 @@ func (m *mockRuntimeBrokerService) Heartbeat(ctx context.Context, brokerID strin
 	return m.heartbeatResp, nil
 }
 
-func (m *mockRuntimeBrokerService) ReportMessageFailures(ctx context.Context, brokerID string, req *hubclient.MessageFailuresReport) error {
+func (m *mockRuntimeBrokerService) ReportMessageFailures(ctx context.Context, brokerID string, req *hubclient.MessageFailuresReport) (*hubclient.MessageFailuresResponse, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.messageFailureReports = append(m.messageFailureReports, req)
-	return nil
+	if m.messageFailureResp != nil {
+		cp := *m.messageFailureResp
+		return &cp, nil
+	}
+	return &hubclient.MessageFailuresResponse{Marked: len(req.Failures)}, nil
+}
+
+func (m *mockRuntimeBrokerService) DeliverMessage(ctx context.Context, brokerID, agentID string, req *agentcontrol.DeliverRequest) (int, agentcontrol.DeliverResponse, error) {
+	return http.StatusNotFound, agentcontrol.DeliverResponse{}, nil
+}
+
+func (m *mockRuntimeBrokerService) WorkspaceDownload(ctx context.Context, brokerID, agentID string, req *api.WorkspaceDownloadRequest) (*api.WorkspaceDownloadResponse, error) {
+	m.mu.Lock()
+	fn := m.workspaceDownloadFunc
+	m.mu.Unlock()
+	if fn == nil {
+		return nil, &apiclient.APIError{StatusCode: http.StatusNotFound}
+	}
+	return fn(ctx, brokerID, agentID, req)
 }
 
 func (m *mockRuntimeBrokerService) getHeartbeatCalls() []mockHeartbeatCall {
@@ -201,7 +227,7 @@ func (m *heartbeatMockManager) Delete(ctx context.Context, agentID string, delet
 	return false, nil
 }
 
-func (m *heartbeatMockManager) DeleteTarget(ctx context.Context, agentName string, ref runtime.RunRef, deleteFiles bool, projectPath string, removeBranch bool) (bool, error) {
+func (m *heartbeatMockManager) DeleteTarget(ctx context.Context, agentName, sharerKey string, ref runtime.RunRef, deleteFiles bool, projectPath string, removeBranch bool) (bool, error) {
 	return false, nil
 }
 
@@ -458,6 +484,38 @@ func TestHeartbeatService_ReportsRunIDLabel(t *testing.T) {
 	}
 	if v, ok := got["unlabelled"]; !ok || v != "" {
 		t.Errorf("unlabelled entry RunID = %q (reported %v), want empty", v, ok)
+	}
+}
+
+// TestHeartbeatService_ReportsAgentID: each entry carries its Hub agent ID,
+// from AgentInfo.ID or else the agent_id label, and none when neither is
+// known or the value is not a UUID, such as a legacy container's name label
+// (ptone/scion#7930).
+func TestHeartbeatService_ReportsAgentID(t *testing.T) {
+	id1, id2 := "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
+	client := &mockRuntimeBrokerService{}
+	manager := &heartbeatMockManager{
+		agents: []api.AgentInfo{
+			{Name: "by-id", ProjectID: "project-1", Phase: "running", ID: id1, Labels: map[string]string{api.LabelAgentID: id2}},
+			{Name: "by-label", ProjectID: "project-1", Phase: "running", Labels: map[string]string{api.LabelAgentID: id2}},
+			{Name: "legacy", ProjectID: "project-1", Phase: "running", Labels: map[string]string{api.LabelAgentID: "legacy"}},
+			{Name: "upper", ProjectID: "project-1", Phase: "running", Labels: map[string]string{api.LabelAgentID: "{" + strings.ToUpper(id2) + "}"}},
+			{Name: "unknown", ProjectID: "project-1", Phase: "running"},
+		},
+	}
+	svc := NewHeartbeatService(client, "test-host", time.Hour, manager, nil, slog.Default())
+	if err := svc.ForceHeartbeat(context.Background()); err != nil {
+		t.Fatalf("ForceHeartbeat failed: %v", err)
+	}
+	got := map[string]string{}
+	for _, p := range client.getHeartbeatCalls()[0].Heartbeat.Projects {
+		for _, a := range p.Agents {
+			got[a.Slug] = a.AgentID
+		}
+	}
+	want := map[string]string{"by-id": id1, "by-label": id2, "legacy": "", "upper": id2, "unknown": ""}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("agent IDs = %v, want %v", got, want)
 	}
 }
 

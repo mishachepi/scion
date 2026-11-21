@@ -391,6 +391,38 @@ func TestResolveWorktreeProvision_KubernetesAliases_Rejected(t *testing.T) {
 	}
 }
 
+// TestResolveWorktreeProvision_HostWorkspaceUnmountedRuntimes_Rejected:
+// substrate and cloudrun-sandbox skip host-side provisioning: neither runs
+// the agent in a host worktree, so the dispatch gets the in-container clone
+// (ptone/scion#7913).
+func TestResolveWorktreeProvision_HostWorkspaceUnmountedRuntimes_Rejected(t *testing.T) {
+	for _, name := range []string{"substrate", "cloudrun-sandbox"} {
+		t.Run(name, func(t *testing.T) {
+			result := resolveWorktreeProvision(worktreeProvisionInput{
+				WorkspaceMode: store.WorkspaceModeWorktreePerAgent,
+				GitClone:      &api.GitCloneConfig{URL: "https://github.com/org/repo.git", Branch: "main"},
+				ProjectPath:   t.TempDir(),
+				ProjectID:     "proj-1",
+				AgentID:       "agent-1",
+				AgentName:     "test-agent",
+				RuntimeName:   name,
+				eligibilityOverride: func() (bool, string) {
+					return true, ""
+				},
+			})
+			if result.ShouldProvision {
+				t.Fatalf("expected ShouldProvision=false for runtime %q", name)
+			}
+			if result.MissingIdentity {
+				t.Errorf("expected MissingIdentity=false for runtime %q", name)
+			}
+			if !strings.Contains(result.Reason, name) {
+				t.Errorf("expected reason to name %q, got %q", name, result.Reason)
+			}
+		})
+	}
+}
+
 func TestResolveWorktreeProvision_DockerRuntime_NotRejected(t *testing.T) {
 	eligible, _ := runtime.WorktreeModeEligible()
 	if !eligible {
@@ -1254,19 +1286,18 @@ func TestWorktreeWorkspace_RepoRootDerivesToBase(t *testing.T) {
 }
 
 // worktreeBaseIsProvisioned checks exactly the directories ProvisionShared
-// checks (ProvisionInput.SentinelDirs): the base's parent by default, plus
-// LegacyDir when set. It still requires the base's .git.
+// checks (ProvisionInput.SentinelDirs): the sentinel directory alone, the
+// base's parent by default; never the base (the workspace root) itself
+// (AC-L7). It still requires the base's .git.
 func TestWorktreeBaseIsProvisioned_SentinelLocations(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		dirOf     func(base string) string
-		legacyDir bool
-		want      bool
+		name  string
+		dirOf func(base string) string
+		want  bool
 	}{
 		{name: "parent", dirOf: filepath.Dir, want: true},
 		{name: "state dir not checked by ProvisionShared", dirOf: provision.ProjectStateDir, want: false},
-		{name: "base without LegacyDir", dirOf: func(base string) string { return base }, want: false},
-		{name: "base as LegacyDir", dirOf: func(base string) string { return base }, legacyDir: true, want: true},
+		{name: "workspace root never checked", dirOf: func(base string) string { return base }, want: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			base := filepath.Join(t.TempDir(), "workspace")
@@ -1274,9 +1305,6 @@ func TestWorktreeBaseIsProvisioned_SentinelLocations(t *testing.T) {
 				t.Fatal(err)
 			}
 			in := provision.ProvisionInput{Resolved: provision.ResolvedWorkspace{HostPath: base}}
-			if tc.legacyDir {
-				in.LegacyDir = base
-			}
 			if worktreeBaseIsProvisioned(in) {
 				t.Fatal("provisioned without a sentinel")
 			}

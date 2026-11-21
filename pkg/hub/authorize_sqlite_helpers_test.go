@@ -90,9 +90,12 @@ func newAgentKeysRouteFixture(t *testing.T) *agentKeysRouteFixture {
 	// unless a test opts in via SetDispatcher) still ends in 503
 	// keys_unavailable, since that determination is
 	// s.GetDispatcher() == nil, not anything about the target agent.
+	// The endpoint is stubBrokerEndpoint (loopback): the hub-broker transport
+	// policy accepts it, so a test that dials it through a stub reaches the
+	// dial instead of the plaintext non-loopback refusal.
 	broker := &store.RuntimeBroker{
 		ID: tid("agentkeys-route-broker"), Name: "agentkeys-route-broker", Slug: "agentkeys-route-broker",
-		Endpoint: "http://broker.invalid:9800", Status: store.BrokerStatusOnline,
+		Endpoint: stubBrokerEndpoint, Status: store.BrokerStatusOnline,
 	}
 	require.NoError(t, s.CreateRuntimeBroker(ctx, broker))
 
@@ -361,14 +364,6 @@ func msgAuthzGrantAgentMessage(t *testing.T, s store.Store, userID, projectID st
 	}
 }
 
-// require_NoError is a test helper that fails immediately on error.
-func require_NoError(t *testing.T, err error) {
-	t.Helper()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
 // msgAuthzAgent creates a store.Agent with the specified properties and
 // persists it. Returns the agent.
 func msgAuthzAgent(t *testing.T, s store.Store, id, projectID, mode string, ancestry []string) *store.Agent {
@@ -480,19 +475,14 @@ func authzHelperTargetAgent() *store.Agent {
 	}
 }
 
-// agentToken mints a real, signed agent JWT for a synthetic caller "agent"
-// in callerProjectID with the given scopes. The credential-status gate in
-// the shared auth middleware (auth.go's evaluateAgentCredentialStatus) only
-// consults a credential-ID-keyed store, not store.Agent by ID -- a token
-// with no matching credential row authenticates via the documented legacy
-// compatibility path -- so the caller does not need its own store.Agent row
-// for these routing tests, unlike authorizeAgentKeys' *target*, which must
-// be a real row.
+// agentToken mints a recorded agent JWT for a synthetic caller "agent" in
+// callerProjectID with the given scopes. Because agent_credentials has no
+// foreign-key edge to agents, the caller does not need its own store.Agent row
+// for these routing tests, unlike authorizeAgentKeys' *target*, which must be a
+// real row.
 func (f *agentKeysRouteFixture) agentToken(t *testing.T, callerAgentID, callerProjectID string, scopes ...AgentTokenScope) string {
 	t.Helper()
-	tok, err := f.srv.GetAgentTokenService().GenerateAgentToken(callerAgentID, callerProjectID, scopes, nil)
-	require.NoError(t, err)
-	return tok
+	return f.srv.generateRecordedAgentToken(t, callerAgentID, callerProjectID, scopes, nil)
 }
 
 // keysErrorEnvelope decodes a Hub error envelope response body, including

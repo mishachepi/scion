@@ -22,8 +22,7 @@
 
 import { apiFetch, extractApiError } from './api.js';
 
-/** Feature flag that gates every artifact surface in the web UI. */
-export const ARTIFACTS_FLAG = 'hub.artifacts';
+export { ARTIFACTS_FLAG } from './artifacts-flag.js';
 
 export interface ArtifactFile {
   path: string;
@@ -88,13 +87,6 @@ export interface ArtifactResponse {
    */
   canReview?: boolean;
   /**
-   * On a GET: the caller may not manage the artifact but may give a user
-   * review access (a review grant): the delegating user of the agent that
-   * owns it, the project owners and admins of its home project, and
-   * super-admins. Never set with canManage.
-   */
-  canGrantReview?: boolean;
-  /**
    * On a GET: the caller may share the artifact: canManage, or a steward of
    * an artifact owned by an agent (design D25, ptone/scion#5144), who may
    * change its expiry, revoke its links, remove grants and delete it, but
@@ -117,6 +109,18 @@ export interface ArtifactResponse {
    * the hub cannot tell.
    */
   scopeDeleted?: boolean;
+  /**
+   * On a GET, only while the hub's zip download is on (ptone/scion#7106):
+   * whether the version's files can be downloaded as one zip.
+   */
+  archive?: ArtifactArchive;
+}
+
+/** ArtifactResponse.archive: the hub's answer for the version's zip download. */
+export interface ArtifactArchive {
+  available: boolean;
+  /** Why the zip is not available: "too_large" or "unsupported_name". */
+  reason?: string;
 }
 
 /** GET /api/v1/artifacts/{id}/versions: ready versions, newest first, without files. */
@@ -180,6 +184,8 @@ export interface CreateVersionRequest {
   entry: string;
   note?: string;
   files: ManifestFile[];
+  /** Publish even when reviews of the current version are open. */
+  force?: boolean;
 }
 
 /** Answer to a request that created a pending version. */
@@ -187,6 +193,8 @@ export interface PendingVersionResponse {
   artifact: Artifact;
   version: ArtifactVersion;
   upload: { required: string[] };
+  /** Notes about the create that did not fail it (a forced publish). */
+  warnings?: string[];
 }
 
 /** Remote image rows the hub adds to a version; not part of what was published. */
@@ -267,6 +275,11 @@ export function artifactFileUrl(id: string, seq: number, path: string, stream = 
   const version = seq > 0 ? `/versions/${seq}` : '';
   const query = stream ? '?stream=1' : '';
   return `/api/v1/artifacts/${encodeURIComponent(id)}${version}/files/${encodedPath}${query}`;
+}
+
+/** The zip of every file of version seq (ptone/scion#7106). */
+export function artifactArchiveUrl(id: string, seq: number): string {
+  return `/api/v1/artifacts/${encodeURIComponent(id)}/versions/${seq}/archive`;
 }
 
 /**
@@ -562,6 +575,11 @@ export interface PublishRequest {
    * created.
    */
   resume?: PendingPublish | null | undefined;
+  /**
+   * Publish even when someone is reviewing the current version. Without
+   * it the hub may refuse the publish (ReviewOpenError).
+   */
+  force?: boolean | undefined;
 }
 
 /** A pending version that a failed publish left behind. */
@@ -593,6 +611,64 @@ export class PublishError extends Error {
   }
 }
 
+/** One open review named in a review_open refusal. */
+export interface ReviewOpenEntry {
+  /** Display name, or "a reviewer"; never an id. */
+  reviewer: string;
+  /** Last activity, to the minute. */
+  lastActivityAt: string;
+  unsavedChanges: boolean;
+}
+
+/**
+ * The hub refused a publish because reviews of the current version are
+ * open (409 review_open). Nothing was created: publishing again with
+ * force skips this check.
+ */
+export class ReviewOpenError extends PublishError {
+  constructor(
+    message: string,
+    readonly reviews: ReviewOpenEntry[],
+    readonly truncated: boolean,
+    readonly base: number
+  ) {
+    super(message, null, 'review_open');
+    this.name = 'ReviewOpenError';
+  }
+}
+
+/** Reads a 409 review_open answer, or returns null for any other answer. */
+async function reviewOpenError(res: Response): Promise<ReviewOpenError | null> {
+  if (res.status !== 409) return null;
+  let body: {
+    error?: {
+      code?: string;
+      message?: string;
+      details?: { reviews?: unknown; truncated?: unknown; base?: unknown };
+    };
+  } = {};
+  try {
+    body = (await res.clone().json()) as typeof body;
+  } catch {
+    return null;
+  }
+  if (body.error?.code !== 'review_open') return null;
+  const details = body.error.details ?? {};
+  const reviews = (Array.isArray(details.reviews) ? details.reviews : [])
+    .filter((r): r is Record<string, unknown> => typeof r === 'object' && r !== null)
+    .map((r) => ({
+      reviewer: typeof r.reviewer === 'string' && r.reviewer ? r.reviewer : 'a reviewer',
+      lastActivityAt: typeof r.lastActivityAt === 'string' ? r.lastActivityAt : '',
+      unsavedChanges: r.unsavedChanges === true,
+    }));
+  return new ReviewOpenError(
+    body.error.message || 'Someone is reviewing this version.',
+    reviews,
+    details.truncated === true,
+    typeof details.base === 'number' ? details.base : 0
+  );
+}
+
 /** How long the hub keeps a version that was never finalized. */
 export const PENDING_VERSION_LIFETIME = '24 hours';
 
@@ -618,22 +694,28 @@ export async function publishFiles(req: PublishRequest): Promise<ArtifactRespons
   if (req.note) body.note = req.note;
   if (req.kind === 'review') body.kind = 'review';
   if (!req.artifactId && req.scope) body.scope = req.scope;
+  // force decides only whether the create may go ahead; it is not part of
+  // what is published, so a resumed version matches either way.
   const fingerprint = JSON.stringify([req.artifactId ?? '', body]);
+  if (req.force) body.force = true;
 
   let pending: PendingPublish;
+  let createWarnings: string[] = [];
   if (req.resume && req.resume.fingerprint === fingerprint) {
     pending = req.resume;
   } else {
     const createPath = req.artifactId
       ? `${artifactPath(req.artifactId)}/versions`
       : '/api/v1/artifacts';
-    const created = await okJSON<PendingVersionResponse>(
-      await apiFetch(createPath, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      })
-    );
+    const createRes = await apiFetch(createPath, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const refused = await reviewOpenError(createRes);
+    if (refused) throw refused;
+    const created = await okJSON<PendingVersionResponse>(createRes);
+    createWarnings = created.warnings ?? [];
     const asked = created.upload.required ?? [];
     pending = {
       artifactId: created.artifact.id,
@@ -728,7 +810,80 @@ export async function publishFiles(req: PublishRequest): Promise<ArtifactRespons
     throw new PublishError(err instanceof Error ? err.message : 'finalize failed', left());
   }
   if (!res.ok) await fail(res, '');
-  return (await res.json()) as ArtifactResponse;
+  const finalized = (await res.json()) as ArtifactResponse;
+  // The create's warnings (a publish forced over open reviews) come first.
+  if (createWarnings.length > 0) {
+    finalized.warnings = [...createWarnings, ...(finalized.warnings ?? [])];
+  }
+  return finalized;
+}
+
+/** The answer to a review heartbeat. */
+export interface ReviewBeatResponse {
+  /** The artifact's current version. */
+  currentSeq: number;
+}
+
+/** What a review heartbeat reports. */
+export interface ReviewBeat {
+  /** The version under review. */
+  base: number;
+  /** The review text changed since the last beat. */
+  edited: boolean;
+  /** The review text differs from the text the review started from. */
+  dirty: boolean;
+}
+
+/**
+ * A new review session id: 128 random bits, base64url, 22 characters of
+ * [A-Za-z0-9_-] (the hub accepts 22 to 64 such characters).
+ */
+export function newReviewSessionId(): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function reviewSessionPath(artifactId: string, sessionId: string): string {
+  return `${artifactPath(artifactId)}/review-sessions/${encodeURIComponent(sessionId)}`;
+}
+
+/** Sends one heartbeat of the caller's open review of an artifact. */
+export async function putReviewSession(
+  artifactId: string,
+  sessionId: string,
+  beat: ReviewBeat
+): Promise<ReviewBeatResponse> {
+  return okJSON<ReviewBeatResponse>(
+    await apiFetch(reviewSessionPath(artifactId, sessionId), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(beat),
+    })
+  );
+}
+
+/**
+ * Tells the hub the caller's review ended: the review was closed (Save,
+ * Cancel) or its page left. With keepalive the request outlives the page,
+ * for pagehide. Failures are ignored: the hub stops counting a session at
+ * most five minutes after its last beat anyway.
+ */
+export async function endReviewSession(
+  artifactId: string,
+  sessionId: string,
+  opts: { keepalive?: boolean } = {}
+): Promise<void> {
+  try {
+    await apiFetch(reviewSessionPath(artifactId, sessionId), {
+      method: 'DELETE',
+      keepalive: opts.keepalive === true,
+    });
+  } catch {
+    // Best effort.
+  }
 }
 
 /** A file of a review the hub refused (code unmarked_changes). */
@@ -836,9 +991,37 @@ export function artifactListUrl(filters: ArtifactListFilters, cursor?: string): 
  * Path of an artifact's page in the web UI; seq above 0 names one of its
  * versions, 0 the current one.
  */
-export function artifactPagePath(a: Pick<Artifact, 'id' | 'scopeRef'>, seq = 0): string {
+export function artifactPagePath(
+  a: Pick<Artifact, 'id' | 'scopeRef'>,
+  seq = 0,
+  origin: ArtifactOrigin = 'project'
+): string {
   const base = `/projects/${encodeURIComponent(a.scopeRef)}/artifacts/${encodeURIComponent(a.id)}`;
-  return seq > 0 ? `${base}/v/${seq}` : base;
+  const path = seq > 0 ? `${base}/v/${seq}` : base;
+  return origin === 'artifacts' ? `${path}?${ARTIFACT_ORIGIN_PARAM}=artifacts` : path;
+}
+
+/**
+ * Where an artifact's page was opened from (ptone/scion#6847): the
+ * hub-wide Artifacts list, or (by default) the artifact's project. Its
+ * page goes back there, after a delete too.
+ */
+export type ArtifactOrigin = 'artifacts' | 'project';
+
+/**
+ * The query parameter that records an Artifacts-list origin on the page's
+ * URL, so a reload or a link opened in a new tab keeps it.
+ */
+export const ARTIFACT_ORIGIN_PARAM = 'from';
+
+/** The origin an artifact page path records; a path without one is the project's. */
+export function artifactOriginOf(path: string): ArtifactOrigin {
+  const q = path.indexOf('?');
+  if (q < 0) return 'project';
+  const query = path.slice(q + 1).split('#')[0];
+  return new URLSearchParams(query).get(ARTIFACT_ORIGIN_PARAM) === 'artifacts'
+    ? 'artifacts'
+    : 'project';
 }
 
 // ---------------------------------------------------------------------------
@@ -860,14 +1043,21 @@ export interface CreateLinkResponse {
   link: ShareLink;
   /** Hub-relative path of the link; shown once, never retrievable later. */
   url: string;
+  /**
+   * The absolute link on the hub's content host
+   * (server.hub.content_url), present only when the hub has one; built by the
+   * hub from its configuration, never from the request.
+   */
+  shareUrl?: string;
   /** The link ends earlier than asked because the artifact expires then. */
   clampedToArtifactExpiry?: boolean;
 }
 
 /**
- * Grant permissions. Review (a user only) lets someone who can already read
- * the artifact publish reviews of it, and nothing else; it gives no read
- * access (ptone/scion#4538).
+ * Grant permissions. The levels form a ladder, read, review, write, admin:
+ * each includes the ones before it. Review (a user only) lets someone read
+ * the artifact and publish reviews of it (ptone/scion#4538,
+ * ptone/scion#5145).
  */
 export type GrantPermission = 'read' | 'review' | 'write' | 'admin';
 
@@ -957,7 +1147,7 @@ export const PERMISSION_LABELS: Record<GrantPermission, string> = {
 
 /**
  * The permissions the Share dialog's permission menus offer, weakest first.
- * Review is given through Grant review access, and a review grant is shown
+ * Review is given from a steward's add row, and a review grant is shown
  * with its label only.
  */
 export const SELECTABLE_PERMISSIONS: readonly GrantPermission[] = ['read', 'write', 'admin'];
@@ -1070,6 +1260,18 @@ export async function patchArtifact(
 /** The absolute URL of a share link from the hub-relative path it was created with. */
 export function shareLinkUrl(path: string, origin: string): string {
   return new URL(path, origin).toString();
+}
+
+/**
+ * The link to show and copy for a created share link: the hub's shareUrl on
+ * its content host when it sent one, otherwise the hub-relative url
+ * made absolute on origin.
+ */
+export function createdLinkUrl(
+  created: Pick<CreateLinkResponse, 'url' | 'shareUrl'>,
+  origin: string
+): string {
+  return created.shareUrl || shareLinkUrl(created.url, origin);
 }
 
 /**

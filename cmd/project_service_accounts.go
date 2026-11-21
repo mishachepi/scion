@@ -22,7 +22,9 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/clitime"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
@@ -371,6 +373,7 @@ func runSAShow(cmd *cobra.Command, args []string) error {
 // saMappingStateText renders a mapping state for humans.
 var saMappingStateText = map[string]string{
 	"mapped":       "mapped",
+	"creatable":    "KSA created at start",
 	"not_mapped":   "not mapped",
 	"unknown":      "unknown",
 	"not_reported": "not reported",
@@ -467,11 +470,12 @@ func printSAStatus(w io.Writer, st *hubclient.GCPServiceAccountStatus) {
 	}
 
 	p("\nWorkload Identity binding:\n")
-	binding := strings.ReplaceAll(st.WorkloadIdentityBinding.State, "_", " ")
+	binding := wiOneLine(strings.ReplaceAll(st.WorkloadIdentityBinding.State, "_", " "))
 	if st.WorkloadIdentityBinding.Reason != "" {
-		binding += fmt.Sprintf(" (%s)", st.WorkloadIdentityBinding.Reason)
+		binding += fmt.Sprintf(" (%s)", wiOneLine(st.WorkloadIdentityBinding.Reason))
 	}
 	p("  %s\n", binding)
+	printSAStatusBindingTargets(w, st.WorkloadIdentityBinding.Targets)
 
 	p("\nDefault for:\n")
 	if len(st.DefaultFor) == 0 {
@@ -499,6 +503,69 @@ func printSAStatus(w io.Writer, st *hubclient.GCPServiceAccountStatus) {
 
 	p("\nNext step:\n")
 	p("  %s\n", st.NextStep.Message)
+}
+
+func saTargetStaleReasonText(reason string) string {
+	switch reason {
+	case "broker_no_longer_reports":
+		return "the broker no longer reports Workload Identity targets"
+	case "broker_heartbeat_stale":
+		return "the broker heartbeat is stale"
+	default:
+		return "stored from an earlier broker heartbeat"
+	}
+}
+
+func saBindingTargetReasonText(reason string) string {
+	switch reason {
+	case api.WorkloadIdentityReasonNoPool:
+		return "no Workload Identity pool reported"
+	case "broker_too_old":
+		return "broker too old to report Workload Identity targets"
+	case "flat_broker_pool_unreported":
+		return "flat broker does not report a Workload Identity pool yet"
+	default:
+		return wiOneLine(strings.ReplaceAll(reason, "_", " "))
+	}
+}
+
+func printSAStatusBindingTargets(w io.Writer, targets []hubclient.GCPServiceAccountBindingTarget) {
+	if len(targets) == 0 {
+		return
+	}
+	p := func(format string, a ...interface{}) { _, _ = fmt.Fprintf(w, format, a...) }
+	p("  stored targets (from broker heartbeats):\n")
+	for _, t := range targets {
+		stateText := wiOneLine(strings.ReplaceAll(t.State, "_", " "))
+		where := wiOneLine(strings.Join(t.Profiles, ", "))
+		target := wiOneLine(t.Member)
+		if target == "" {
+			target = where
+		} else if where != "" {
+			target += " (" + where + ")"
+		}
+		var notes []string
+		if t.Reason != "" {
+			notes = append(notes, saBindingTargetReasonText(t.Reason))
+		}
+		if t.Stale {
+			staleMsg := "stored target: " + saTargetStaleReasonText(t.StaleReason)
+			if t.LastHeartbeat != nil && !t.LastHeartbeat.IsZero() {
+				staleMsg += " (last heartbeat " + clitime.Ago(*t.LastHeartbeat) + ")"
+			}
+			notes = append(notes, staleMsg)
+		} else if t.LastHeartbeat != nil && !t.LastHeartbeat.IsZero() {
+			notes = append(notes, "broker heartbeat "+clitime.Ago(*t.LastHeartbeat))
+		}
+		line := fmt.Sprintf("    %-10s %s", stateText, target)
+		if len(notes) > 0 {
+			line += "; " + strings.Join(notes, "; ")
+		}
+		p("%s\n", line)
+		if t.ManualStep != "" {
+			p("               to grant it by hand: %s\n", wiOneLine(t.ManualStep))
+		}
+	}
 }
 
 func runSARemove(cmd *cobra.Command, args []string) error {
@@ -550,8 +617,57 @@ func runSAMint(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Printf("  Verified:  %v\n", sa.Verified)
 	fmt.Printf("  Managed:   %v\n", sa.Managed)
+	printWorkloadIdentityBindings(os.Stdout, sa.WorkloadIdentityBindings)
 
 	return nil
+}
+
+// printWorkloadIdentityBindings prints one line per Workload Identity
+// binding entry of a mint response, with the manual gcloud command for an
+// entry that is not bound. Nothing is printed when there are none.
+func printWorkloadIdentityBindings(w io.Writer, bindings []api.WorkloadIdentityBinding) {
+	if len(bindings) == 0 {
+		return
+	}
+	_, _ = fmt.Fprintln(w, "  Workload Identity bindings:")
+	anyBound := false
+	for _, b := range bindings {
+		where := wiOneLine(strings.Join(b.Profiles, ", "))
+		if b.State == api.WorkloadIdentityBindingBound {
+			anyBound = true
+			_, _ = fmt.Fprintf(w, "    bound    %s (%s)\n", wiOneLine(b.Member), where)
+			continue
+		}
+		target := wiOneLine(b.Member)
+		if target == "" {
+			target = where
+		} else if where != "" {
+			target += " (" + where + ")"
+		}
+		_, _ = fmt.Fprintf(w, "    %-8s %s: %s", wiOneLine(b.State), target, wiOneLine(b.Reason))
+		if b.Detail != "" {
+			_, _ = fmt.Fprintf(w, " - %s", wiOneLine(b.Detail))
+		}
+		_, _ = fmt.Fprintln(w)
+		if b.ManualStep != "" {
+			_, _ = fmt.Fprintf(w, "             to grant it by hand: %s\n", wiOneLine(b.ManualStep))
+		}
+	}
+	if anyBound {
+		_, _ = fmt.Fprintln(w, "  A new Workload Identity binding can take a few minutes to take effect.")
+	}
+}
+
+// wiOneLine replaces control characters (newlines and terminal escapes
+// included) with spaces, so a value from the Hub cannot add or rewrite a
+// line of the output.
+func wiOneLine(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, s)
 }
 
 func runSAVerify(cmd *cobra.Command, args []string) error {

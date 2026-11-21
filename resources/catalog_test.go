@@ -157,7 +157,8 @@ func TestPlatformSkillsFS_ScionAgentManageLifecycleDescribesMove(t *testing.T) {
 // get, so it fails if the skill or its web-apps reference is not embedded,
 // is gated to a subset of agents, or loses its guidance: scion expose
 // and the URL as printed, what the proxy carries, scion tunnel for full apps,
-// and for pages one self-contained file and an honest browser check.
+// and for pages one self-contained file (relative URLs only with the Hub's
+// page view on) and an honest browser check.
 func TestPlatformSkillsFS_ScionWebServing(t *testing.T) {
 	read := func(name string) string {
 		t.Helper()
@@ -232,6 +233,12 @@ func TestPlatformSkillsFS_ScionWebServing(t *testing.T) {
 			"Does not work: client-side routing by path",
 			"`HashRouter`, `createWebHashHistory`",
 			"Search your SOURCE (not the build) for `BrowserRouter`, `createBrowserRouter` and `createWebHistory`",
+			"If you do not know, build **one self-contained HTML file**: it works either way.",
+			"Does not work: URLs that start with `/`",
+			"## With the Hub's page view on",
+			"never `/app.js`",
+			"On the port-forward tunnel it is refused.",
+			"The page link grants access: do not log it, paste it into tickets or chats, or send it anywhere.",
 		}},
 	}
 	for _, p := range pins {
@@ -242,21 +249,39 @@ func TestPlatformSkillsFS_ScionWebServing(t *testing.T) {
 		}
 	}
 
-	// Pages served through the link cannot load separate files today, so
-	// neither file may tell agents that relative URLs or a relative base
-	// make a multi-file app work.
-	for _, p := range pins {
-		lower := strings.ToLower(p.content)
+	// Relative URLs and a relative build base make a multi-file page work
+	// only with the Hub's page view on. So that guidance may appear only in
+	// the web-apps reference's page view section, and nowhere else in
+	// either file.
+	pageView := ""
+	if _, rest, ok := strings.Cut(webRaw, "\n## With the Hub's page view on\n"); ok {
+		pageView, _, _ = strings.Cut(rest, "\n## ")
+	}
+	if pageView == "" {
+		t.Fatalf("embedded scion-web-serving/references/web-apps.md has no page view section")
+	}
+	outside := map[string]string{
+		"SKILL.md":               skillRaw,
+		"references/web-apps.md": strings.Replace(webRaw, pageView, "", 1),
+	}
+	for file, raw := range outside {
+		lower := strings.ToLower(strings.Join(strings.Fields(raw), " "))
 		for _, unwanted := range []string{
 			"relative urls work",
 			"only what the page can reach with relative urls",
+			"base: './'",
 			"base './'",
 			"--base ./",
 			`"homepage": "."`,
 		} {
 			if strings.Contains(lower, unwanted) {
-				t.Errorf("embedded scion-web-serving/%s contains %q, guidance that does not hold for pages opened through the link today", p.file, unwanted)
+				t.Errorf("embedded scion-web-serving/%s contains %q outside the page view section, guidance that holds only with the Hub's page view on", file, unwanted)
 			}
+		}
+	}
+	for _, want := range []string{"Relative URLs work", "base: './'"} {
+		if !strings.Contains(pageView, want) {
+			t.Errorf("the page view section of web-apps.md does not contain %q", want)
 		}
 	}
 }
@@ -290,6 +315,84 @@ func TestMandatoryBoilerplate_PointsToWebServingSkill(t *testing.T) {
 	}
 	if !strings.Contains(hits[0], "scion expose") {
 		t.Errorf("scion-web-serving hint does not mention scion expose: %q", hits[0])
+	}
+}
+
+// TestMandatoryBoilerplate_ClonePerAgentShallowCloneOrientation pins that the
+// embedded workspace orientation preamble keys its shallow-clone guidance on
+// SCION_GIT_DEPTH / is-shallow-repository (covering both clone-per-agent and
+// worktree-per-agent fallback clones), explains why history/range commands
+// fail on shallow clones, and shows how to deepen (ptone/scion#7860).
+func TestMandatoryBoilerplate_ClonePerAgentShallowCloneOrientation(t *testing.T) {
+	data, err := fs.ReadFile(MandatoryBoilerplateFS(), "00-workspace-orientation.md")
+	if err != nil {
+		t.Fatalf("reading embedded 00-workspace-orientation.md: %v", err)
+	}
+	content := strings.Join(strings.Fields(string(data)), " ")
+	for _, want := range []string{
+		"Whenever `SCION_GIT_DEPTH` is set",
+		"fell back to cloning",
+		"git rev-parse --is-shallow-repository",
+		"git merge-base",
+		"git fetch --deepen",
+		"git fetch --unshallow",
+		"git-operations",
+	} {
+		if !strings.Contains(content, want) {
+			t.Errorf("embedded 00-workspace-orientation.md does not contain %q", want)
+		}
+	}
+}
+
+// TestPlatformSkillsFS_GitOperationsCoversShallowClones pins that the embedded
+// git-operations platform skill (injected into every agent, including
+// clone-per-agent where git-sandbox is not injected) covers shallow clone
+// diagnostics and deepening (ptone/scion#7860).
+func TestPlatformSkillsFS_GitOperationsCoversShallowClones(t *testing.T) {
+	data, err := fs.ReadFile(PlatformSkillsFS(), "git-operations/SKILL.md")
+	if err != nil {
+		t.Fatalf("reading embedded git-operations/SKILL.md: %v", err)
+	}
+	raw := strings.ReplaceAll(string(data), "\r\n", "\n")
+	front, _, ok := strings.Cut(strings.TrimPrefix(raw, "---\n"), "\n---\n")
+	if !strings.HasPrefix(raw, "---\n") || !ok {
+		t.Fatalf("embedded git-operations/SKILL.md has no frontmatter block")
+	}
+	if strings.Contains(front, "inject_when") {
+		t.Errorf("git-operations must reach every agent (including clone-per-agent); frontmatter sets inject_when:\n%s", front)
+	}
+	if !strings.Contains(strings.ToLower(front), "shallow") {
+		t.Errorf("git-operations frontmatter description does not mention shallow clones:\n%s", front)
+	}
+
+	content := strings.Join(strings.Fields(raw), " ")
+	for _, want := range []string{
+		"SCION_GIT_DEPTH",
+		"git rev-parse --is-shallow-repository",
+		"no merge base",
+		"`git merge`/`git pull` fail with `refusing to merge unrelated histories`",
+		"git fetch --deepen",
+		"--filter=blob:none",
+		"git fetch --unshallow",
+	} {
+		if !strings.Contains(content, want) {
+			t.Errorf("embedded git-operations/SKILL.md does not contain %q", want)
+		}
+	}
+
+	sandboxData, err := fs.ReadFile(PlatformSkillsFS(), "git-sandbox/SKILL.md")
+	if err != nil {
+		t.Fatalf("reading embedded git-sandbox/SKILL.md: %v", err)
+	}
+	sandboxContent := strings.Join(strings.Fields(string(sandboxData)), " ")
+	for _, want := range []string{
+		"When `SCION_GIT_DEPTH` Is Unset",
+		"If `SCION_GIT_DEPTH` is set",
+		"`git-operations` skill",
+	} {
+		if !strings.Contains(sandboxContent, want) {
+			t.Errorf("embedded git-sandbox/SKILL.md does not contain %q", want)
+		}
 	}
 }
 
@@ -341,6 +444,29 @@ func TestMandatoryBoilerplateFS(t *testing.T) {
 	}
 	if len(data) == 0 {
 		t.Error("agent-instructions-preamble.md is empty")
+	}
+}
+
+func TestPlatformSkillsFS_NoRetiredCoreSkillScopeURIs(t *testing.T) {
+	fsys := PlatformSkillsFS()
+	err := fs.WalkDir(fsys, ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		data, readErr := fs.ReadFile(fsys, path)
+		if readErr != nil {
+			t.Fatalf("reading embedded platform skill file %q: %v", path, readErr)
+		}
+		text := string(data)
+		for _, retired := range []string{"skill://core/", "skill://scion/core/", "skill:///core/"} {
+			if strings.Contains(text, retired) {
+				t.Errorf("embedded platform skill %q still references retired core skill URI prefix %q", path, retired)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking PlatformSkillsFS: %v", err)
 	}
 }
 

@@ -25,10 +25,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -81,11 +83,19 @@ type InstallationToken struct {
 }
 
 // TokenMintError classifies GitHub API errors during token minting.
+//
+// Message is fixed text for the error code: it never carries text received
+// from GitHub, so it is safe to return to API callers and to store as a
+// project status. GitHub's own text (its "message" field, an error body, or
+// a transport error) is kept apart and read through UpstreamDetail, for the
+// hub to log once, capped and sanitised (ptone/scion#7498).
 type TokenMintError struct {
 	ErrorCode  string // One of the error codes below
 	StatusCode int    // HTTP status from GitHub API
-	Message    string // Human-readable error message
+	Message    string // Fixed, human-readable error message (no upstream text)
 	Err        error  // Underlying error
+
+	upstream string // text received from GitHub or the transport; see UpstreamDetail
 }
 
 func (e *TokenMintError) Error() string {
@@ -94,6 +104,48 @@ func (e *TokenMintError) Error() string {
 
 func (e *TokenMintError) Unwrap() error {
 	return e.Err
+}
+
+// UpstreamDetail returns the text GitHub or the transport sent with the
+// failure, unrendered. It is for the server log only: callers render it
+// (the hub's upstreamText) and never return it to a client, store it, or use
+// it as a metrics label.
+func (e *TokenMintError) UpstreamDetail() string {
+	return e.upstream
+}
+
+// upstreamBodyReadLimit bounds how much of a GitHub API error response body
+// this package reads. It equals the hub's upstreamErrorBodyReadLimit
+// (pkg/hub/upstream_text.go); keep the two in step.
+const upstreamBodyReadLimit = 4 << 10
+
+// appMetadataReadLimit bounds how much of a 200 OK GET /app response body
+// GetApp reads. Realistic GitHub App payloads (owner URLs, description,
+// subscribed events, and permissions) routinely exceed 4 KiB.
+const appMetadataReadLimit = 1 << 20
+
+// githubSuccessBodyReadLimit bounds how much of a successful GitHub API
+// response body MintInstallationToken, GetInstallation, ListInstallations,
+// and ListInstallationRepos read. A 100-item repository or installation page
+// can exceed 1 MiB, and this matches commentListResponseBodyLimit.
+const githubSuccessBodyReadLimit = 8 << 20
+
+// errResponseBodyTooLarge is returned when a successful GitHub API response
+// body exceeds its configured read bound.
+var errResponseBodyTooLarge = errors.New("response body exceeds read limit")
+
+// readBoundedBody reads r up to limit bytes. If r yields more than limit
+// bytes, it returns an error wrapping errResponseBodyTooLarge rather than
+// returning a silently truncated body.
+func readBoundedBody(r io.Reader, limit int64) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
+		return nil, fmt.Errorf("%w (%d bytes)", errResponseBodyTooLarge, limit)
+	}
+	return body, nil
 }
 
 // Error codes for token minting failures.
@@ -331,6 +383,16 @@ func (c *Client) MintInstallationToken(ctx context.Context, installationID int64
 		permMap["actions"] = perms.Actions
 	}
 
+	// A request without permissions gets every permission the installation
+	// has. Callers always name the permissions they need; refuse rather
+	// than send an empty set.
+	if len(permMap) == 0 {
+		return nil, &TokenMintError{
+			ErrorCode: ErrCodeTokenMintFailed,
+			Message:   "refusing to request an installation token without explicit permissions",
+		}
+	}
+
 	reqBody := accessTokenRequest{
 		Repositories: repos,
 		Permissions:  permMap,
@@ -356,33 +418,51 @@ func (c *Client) MintInstallationToken(ctx context.Context, installationID int64
 	if err != nil {
 		return nil, &TokenMintError{
 			ErrorCode: ErrCodeTokenMintFailed,
-			Message:   fmt.Sprintf("HTTP request failed: %v", err),
+			Message:   "GitHub API request failed",
 			Err:       err,
+			upstream:  err.Error(),
 		}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, &TokenMintError{
-			ErrorCode: ErrCodeTokenMintFailed,
-			Message:   "failed to read response body",
-			Err:       err,
-		}
-	}
-
 	c.trackRateLimit(resp)
 
 	if resp.StatusCode != http.StatusCreated {
-		return nil, classifyGitHubError(resp.StatusCode, body)
+		errBody, err := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyReadLimit))
+		if err != nil {
+			return nil, &TokenMintError{
+				ErrorCode: ErrCodeTokenMintFailed,
+				Message:   "failed to read response body",
+				Err:       err,
+				upstream:  err.Error(),
+			}
+		}
+		return nil, classifyGitHubError(resp.StatusCode, errBody)
+	}
+
+	body, err := readBoundedBody(resp.Body, githubSuccessBodyReadLimit)
+	if err != nil {
+		msg := "failed to read response body"
+		if errors.Is(err, errResponseBodyTooLarge) {
+			msg = "GitHub API response body exceeded size limit"
+		}
+		return nil, &TokenMintError{
+			ErrorCode:  ErrCodeTokenMintFailed,
+			StatusCode: resp.StatusCode,
+			Message:    msg,
+			Err:        err,
+			upstream:   err.Error(),
+		}
 	}
 
 	var tokenResp accessTokenResponse
 	if err := json.Unmarshal(body, &tokenResp); err != nil {
 		return nil, &TokenMintError{
-			ErrorCode: ErrCodeTokenMintFailed,
-			Message:   "failed to parse token response",
-			Err:       err,
+			ErrorCode:  ErrCodeTokenMintFailed,
+			StatusCode: resp.StatusCode,
+			Message:    "failed to parse token response",
+			Err:        err,
+			upstream:   err.Error(),
 		}
 	}
 
@@ -400,77 +480,54 @@ func (c *Client) MintInstallationToken(ctx context.Context, installationID int64
 }
 
 // classifyGitHubError maps a GitHub API error response to a TokenMintError with
-// an appropriate error code.
+// an appropriate error code. GitHub's "message" field only chooses the code;
+// the returned Message is fixed text for that code, and GitHub's text (the
+// field, or the body when the field is absent) is kept for UpstreamDetail.
 func classifyGitHubError(statusCode int, body []byte) *TokenMintError {
 	var ghErr githubErrorResponse
 	_ = json.Unmarshal(body, &ghErr) // best effort
 
-	msg := ghErr.Message
-	if msg == "" {
-		msg = fmt.Sprintf("GitHub API returned status %d", statusCode)
+	detail := ghErr.Message
+	if detail == "" {
+		detail = string(body)
+	}
+	lower := strings.ToLower(ghErr.Message)
+	mintErr := func(code, message string) *TokenMintError {
+		return &TokenMintError{ErrorCode: code, StatusCode: statusCode, Message: message, upstream: detail}
 	}
 
 	switch statusCode {
 	case http.StatusUnauthorized:
 		// 401: JWT is invalid (bad app ID, expired key, etc.)
-		if strings.Contains(strings.ToLower(msg), "app not found") ||
-			strings.Contains(strings.ToLower(msg), "integration not found") {
-			return &TokenMintError{
-				ErrorCode:  ErrCodeAppNotFound,
-				StatusCode: statusCode,
-				Message:    fmt.Sprintf("GitHub App not found — verify the App ID in Admin > Server Config > GitHub App. GitHub says: %s", msg),
-			}
+		if strings.Contains(lower, "app not found") || strings.Contains(lower, "integration not found") {
+			return mintErr(ErrCodeAppNotFound,
+				"GitHub App not found — verify the App ID in Admin > Server Config > GitHub App.")
 		}
-		return &TokenMintError{
-			ErrorCode:  ErrCodePrivateKeyInvalid,
-			StatusCode: statusCode,
-			Message:    fmt.Sprintf("GitHub rejected the JWT — the private key likely doesn't match the App. Regenerate the key in GitHub App settings and re-upload it in Admin > Server Config. GitHub says: %s", msg),
-		}
+		return mintErr(ErrCodePrivateKeyInvalid,
+			"GitHub rejected the JWT — the private key likely doesn't match the App. Regenerate the key in GitHub App settings and re-upload it in Admin > Server Config.")
 
 	case http.StatusForbidden:
 		// 403: Installation suspended or permission issue
-		if strings.Contains(strings.ToLower(msg), "suspended") {
-			return &TokenMintError{
-				ErrorCode:  ErrCodeInstallationSuspended,
-				StatusCode: statusCode,
-				Message:    fmt.Sprintf("Installation is suspended: %s", msg),
-			}
+		if strings.Contains(lower, "suspended") {
+			return mintErr(ErrCodeInstallationSuspended, "The GitHub App installation is suspended.")
 		}
-		return &TokenMintError{
-			ErrorCode:  ErrCodePermissionDenied,
-			StatusCode: statusCode,
-			Message:    fmt.Sprintf("Permission denied: %s", msg),
-		}
+		return mintErr(ErrCodePermissionDenied, "GitHub denied the GitHub App permission for this request.")
 
 	case http.StatusNotFound:
 		// 404: Installation doesn't exist (revoked/deleted)
-		return &TokenMintError{
-			ErrorCode:  ErrCodeInstallationRevoked,
-			StatusCode: statusCode,
-			Message:    fmt.Sprintf("Installation not found (may have been revoked): %s", msg),
-		}
+		return mintErr(ErrCodeInstallationRevoked,
+			"The GitHub App installation was not found; it may have been revoked.")
 
 	case http.StatusUnprocessableEntity:
 		// 422: Typically repo not accessible or invalid permissions
-		if strings.Contains(strings.ToLower(msg), "repository") {
-			return &TokenMintError{
-				ErrorCode:  ErrCodeRepoNotAccessible,
-				StatusCode: statusCode,
-				Message:    fmt.Sprintf("Repository not accessible: %s", msg),
-			}
+		if strings.Contains(lower, "repository") {
+			return mintErr(ErrCodeRepoNotAccessible,
+				"The repository is not accessible to the GitHub App installation.")
 		}
-		return &TokenMintError{
-			ErrorCode:  ErrCodePermissionDenied,
-			StatusCode: statusCode,
-			Message:    fmt.Sprintf("Invalid request: %s", msg),
-		}
+		return mintErr(ErrCodePermissionDenied, "GitHub rejected the token request as invalid.")
 
 	default:
-		return &TokenMintError{
-			ErrorCode:  ErrCodeTokenMintFailed,
-			StatusCode: statusCode,
-			Message:    fmt.Sprintf("GitHub API error (status %d): %s", statusCode, msg),
-		}
+		return mintErr(ErrCodeTokenMintFailed, fmt.Sprintf("GitHub API error (status %d).", statusCode))
 	}
 }
 
@@ -518,15 +575,19 @@ func (c *Client) GetInstallation(ctx context.Context, installationID int64) (*In
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
-	}
-
 	c.trackRateLimit(resp)
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, classifyGitHubError(resp.StatusCode, body)
+		errBody, err := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyReadLimit))
+		if err != nil {
+			return nil, fmt.Errorf("failed to read response: %w", err)
+		}
+		return nil, classifyGitHubError(resp.StatusCode, errBody)
+	}
+
+	body, err := readBoundedBody(resp.Body, githubSuccessBodyReadLimit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
 	var installation Installation
@@ -563,16 +624,21 @@ func (c *Client) ListInstallations(ctx context.Context) ([]Installation, error) 
 			return nil, fmt.Errorf("HTTP request failed: %w", err)
 		}
 
-		body, err := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read response: %w", err)
-		}
-
 		c.trackRateLimit(resp)
 
 		if resp.StatusCode != http.StatusOK {
-			return nil, classifyGitHubError(resp.StatusCode, body)
+			errBody, err := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyReadLimit))
+			_ = resp.Body.Close()
+			if err != nil {
+				return nil, fmt.Errorf("failed to read response: %w", err)
+			}
+			return nil, classifyGitHubError(resp.StatusCode, errBody)
+		}
+
+		body, err := readBoundedBody(resp.Body, githubSuccessBodyReadLimit)
+		_ = resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read response: %w", err)
 		}
 
 		var installations []Installation
@@ -619,16 +685,19 @@ func (c *Client) ListInstallationRepos(ctx context.Context, installationID int64
 			return nil, fmt.Errorf("HTTP request failed: %w", err)
 		}
 
-		body, err := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read response: %w", err)
-		}
-
 		c.trackRateLimit(resp)
 
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("failed to list repos (status %d): %s", resp.StatusCode, string(body))
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, upstreamBodyReadLimit))
+			_ = resp.Body.Close()
+			// GitHub's body is not part of the error (ptone/scion#7498).
+			return nil, fmt.Errorf("failed to list repos (status %d)", resp.StatusCode)
+		}
+
+		body, err := readBoundedBody(resp.Body, githubSuccessBodyReadLimit)
+		_ = resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read response: %w", err)
 		}
 
 		var result struct {
@@ -694,15 +763,19 @@ func (c *Client) GetApp(ctx context.Context) (map[string]interface{}, error) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
-	}
-
 	c.trackRateLimit(resp)
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, classifyGitHubError(resp.StatusCode, body)
+		errBody, err := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyReadLimit))
+		if err != nil {
+			return nil, fmt.Errorf("failed to read response: %w", err)
+		}
+		return nil, classifyGitHubError(resp.StatusCode, errBody)
+	}
+
+	body, err := readBoundedBody(resp.Body, appMetadataReadLimit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
 	var result map[string]interface{}
@@ -711,4 +784,107 @@ func (c *Client) GetApp(ctx context.Context) (map[string]interface{}, error) {
 	}
 
 	return result, nil
+}
+
+// AppIdentity holds the GitHub App's metadata, subscribed webhook events, and
+// permissions returned by GET /app.
+type AppIdentity struct {
+	AppID       int64             `json:"app_id"`
+	Slug        string            `json:"slug"`
+	BotLogin    string            `json:"bot_login"`
+	Events      []string          `json:"events"`
+	Permissions map[string]string `json:"permissions"`
+	FetchedAt   time.Time         `json:"fetched_at"`
+}
+
+// Clone returns a deep copy of id so callers cannot mutate cached slices or maps.
+func (id AppIdentity) Clone() AppIdentity {
+	events := make([]string, len(id.Events))
+	copy(events, id.Events)
+	perms := make(map[string]string, len(id.Permissions))
+	for k, v := range id.Permissions {
+		perms[k] = v
+	}
+	return AppIdentity{
+		AppID:       id.AppID,
+		Slug:        id.Slug,
+		BotLogin:    id.BotLogin,
+		Events:      events,
+		Permissions: perms,
+		FetchedAt:   id.FetchedAt,
+	}
+}
+
+// ParseAppIdentity extracts an AppIdentity from a decoded GET /app response.
+func ParseAppIdentity(raw map[string]interface{}, fetchedAt time.Time) AppIdentity {
+	out := AppIdentity{
+		Events:      []string{},
+		Permissions: map[string]string{},
+		FetchedAt:   fetchedAt.UTC(),
+	}
+	if raw == nil {
+		return out
+	}
+
+	switch v := raw["id"].(type) {
+	case float64:
+		out.AppID = int64(v)
+	case json.Number:
+		if n, err := v.Int64(); err == nil {
+			out.AppID = n
+		}
+	case int64:
+		out.AppID = v
+	case int:
+		out.AppID = int64(v)
+	}
+
+	if slug, ok := raw["slug"].(string); ok {
+		slug = strings.TrimSpace(slug)
+		out.Slug = slug
+		if slug != "" {
+			out.BotLogin = slug + "[bot]"
+		}
+	}
+
+	seenEvents := make(map[string]struct{})
+	addEvent := func(ev string) {
+		ev = strings.TrimSpace(ev)
+		if ev == "" {
+			return
+		}
+		if _, dup := seenEvents[ev]; dup {
+			return
+		}
+		seenEvents[ev] = struct{}{}
+		out.Events = append(out.Events, ev)
+	}
+	switch evs := raw["events"].(type) {
+	case []interface{}:
+		for _, item := range evs {
+			if s, ok := item.(string); ok {
+				addEvent(s)
+			}
+		}
+	case []string:
+		for _, s := range evs {
+			addEvent(s)
+		}
+	}
+	sort.Strings(out.Events)
+
+	switch perms := raw["permissions"].(type) {
+	case map[string]interface{}:
+		for k, v := range perms {
+			if vs, ok := v.(string); ok {
+				out.Permissions[k] = vs
+			}
+		}
+	case map[string]string:
+		for k, v := range perms {
+			out.Permissions[k] = v
+		}
+	}
+
+	return out
 }

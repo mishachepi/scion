@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -115,8 +116,9 @@ func lookViaHub(hubCtx *HubContext, agentName string, execCmd []string) error {
 	headerCtx, cancelHeader := context.WithTimeout(context.Background(), lookIdentityTimeout)
 	defer cancelHeader()
 	headerCh := make(chan string, 1)
+	showAuthority := cliShowsAgentAuthority(resolveMode())
 	go func() {
-		headerCh <- fetchLookIdentityHeader(headerCtx, hubCtx.Client, agentSvc, projectID, agentName)
+		headerCh <- fetchLookIdentityHeader(headerCtx, hubCtx.Client, agentSvc, projectID, agentName, showAuthority)
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -125,6 +127,12 @@ func lookViaHub(hubCtx *HubContext, agentName string, execCmd []string) error {
 	resp, err := agentSvc.Exec(ctx, agentName, execCmd, 10)
 	if err != nil {
 		return wrapHubError(fmt.Errorf("failed to capture terminal output for agent '%s': %w", agentName, err))
+	}
+	if resp.ExitCode != 0 {
+		// The capture failed inside the agent (no tmux session, ssh exit 255,
+		// ...). The output is the error text, not pane content, so keep it
+		// off stdout.
+		return lookCaptureError(agentName, resp.ExitCode, resp.Output)
 	}
 
 	// The header goes to stderr, so stdout keeps only the captured terminal
@@ -141,22 +149,39 @@ func lookViaHub(hubCtx *HubContext, agentName string, execCmd []string) error {
 	return nil
 }
 
+// lookCaptureError reports a capture that exited non-zero, quoting the first
+// non-empty line of its output.
+func lookCaptureError(agentName string, exitCode int, output string) error {
+	msg := fmt.Sprintf("capturing terminal for agent '%s' failed (exit %d)", agentName, exitCode)
+	for _, line := range strings.Split(output, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			return fmt.Errorf("%s: %s", msg, line)
+		}
+	}
+	return errors.New(msg)
+}
+
 // lookIdentityTimeout bounds the identity header fetch. It runs alongside
 // Exec, so it delays the terminal output only when it outlasts Exec. A var
 // so tests can shorten it.
 var lookIdentityTimeout = 3 * time.Second
 
-// fetchLookIdentityHeader returns the agent's GCP identity header line for
-// scion look. It is best effort: when the agent cannot be read, or no
-// identity is recorded, it returns "".
-func fetchLookIdentityHeader(ctx context.Context, client hubclient.Client, agentSvc hubclient.AgentService, projectID, agentName string) string {
+// fetchLookIdentityHeader returns the header lines for scion look: the
+// agent's GCP identity and, with showAuthority, the cause line of an
+// orphaned or revoked agent (authorityCauseLine). It is best effort: when
+// the agent cannot be read, or there is nothing to show, it returns "".
+func fetchLookIdentityHeader(ctx context.Context, client hubclient.Client, agentSvc hubclient.AgentService, projectID, agentName string, showAuthority bool) string {
 	agent, err := agentSvc.Get(ctx, agentName)
 	if err != nil || agent == nil {
 		return ""
 	}
+	var authorityLine string
+	if showAuthority {
+		authorityLine = authorityCauseLine(agent.Authority)
+	}
 	id := agentGCPIdentity(*agent)
 	if id == nil {
-		return ""
+		return authorityLine
 	}
 	if id.ServiceAccountID != "" {
 		pid := agent.ProjectID
@@ -169,7 +194,14 @@ func fetchLookIdentityHeader(ctx context.Context, client hubclient.Client, agent
 	if agent.AppliedConfig != nil {
 		profile = agent.AppliedConfig.Profile
 	}
-	return lookIdentityHeader(id, profile)
+	header := lookIdentityHeader(id, profile)
+	switch {
+	case authorityLine == "":
+		return header
+	case header == "":
+		return authorityLine
+	}
+	return header + "\n" + authorityLine
 }
 
 func init() {

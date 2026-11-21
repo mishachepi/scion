@@ -300,7 +300,7 @@ func TestAgentCompactView_KeySetIsAllowlist(t *testing.T) {
 	full := &store.Agent{
 		ID: tid("cv-allkeys"), Slug: "cv-allkeys", Name: "All Keys", Template: "claude",
 		ProjectID: f.project.ID, Labels: map[string]string{"k": "v"},
-		Phase: "running", Activity: "executing", ContainerStatus: "Up 5 minutes",
+		Phase: "suspended", Activity: "completed", SuspendReason: "idle", ContainerStatus: "Up 5 minutes",
 		Message: "Waiting for review", MessageMode: "project", Ancestry: []string{f.agentIDAt(0)},
 		CreatedBy: f.owner.ID, OwnerID: f.owner.ID,
 		AppliedConfig: &store.AgentAppliedConfig{CreatorName: "All Keys Creator", Env: map[string]string{"A": "b"}, Harness: "claude", ModelSize: "large"},
@@ -689,9 +689,9 @@ func TestAgentCompactView_NilAgentsMarshalsLikeFullView(t *testing.T) {
 	for _, agents := range [][]AgentWithCapabilities{nil, {}} {
 		resp := ListAgentsResponse{Agents: agents, TotalCount: 0}
 		full := httptest.NewRecorder()
-		(&Server{}).writeAgentList(context.Background(), full, agentListViewFull, resp)
+		(&Server{}).writeAgentList(context.Background(), full, agentListViewFull, agentListIncludes{}, resp)
 		compact := httptest.NewRecorder()
-		(&Server{}).writeAgentList(context.Background(), compact, agentListViewCompact, resp)
+		(&Server{}).writeAgentList(context.Background(), compact, agentListViewCompact, agentListIncludes{}, resp)
 		require.Equal(t, http.StatusOK, full.Code)
 		require.Equal(t, http.StatusOK, compact.Code)
 		fullAgents := decodeObject(t, full.Body.Bytes())["agents"]

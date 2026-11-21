@@ -169,11 +169,105 @@ describe('scion-page-brokers-area', () => {
     expect(row(root, LEGACY.id)?.querySelector('.health-ok')).toBeNull();
   });
 
+  it('an offline broker whose last reported health was healthy never renders ok (ptone/scion#7820)', async () => {
+    vi.mocked(loadAdminStatus).mockResolvedValue(adminStatus(true));
+    fetchMock.mockImplementation((url: string) => {
+      if (url.startsWith('/api/v1/runtime-brokers')) {
+        return jsonResponse({
+          brokers: [
+            {
+              ...FLAT_K8S,
+              status: 'offline',
+              connectionState: 'disconnected',
+              hostedByThisServer: false,
+            },
+          ],
+        });
+      }
+      if (url.startsWith('/api/v1/admin/health/summary')) {
+        return jsonResponse(healthSummary([{ id: FLAT_K8S.id }]));
+      }
+      return jsonResponse({}, 404);
+    });
+    const root = await mount();
+    expect(row(root, FLAT_K8S.id)?.querySelector('.health-ok')).toBeNull();
+    expect(row(root, FLAT_K8S.id)?.textContent).not.toContain('ok');
+  });
+
   it('a 403 from the summary hides the Health column', async () => {
     vi.mocked(loadAdminStatus).mockResolvedValue(adminStatus(true));
     summaryStatus = 403;
     const root = await mount();
     expect(requested('/api/v1/admin/health/summary')).toBe(true);
     expect(root.querySelector('th.health-col')).toBeNull();
+  });
+
+  describe('version against the hub (ptone/scion#5972)', () => {
+    beforeEach(() => {
+      fetchMock.mockImplementation((url: string) => {
+        if (url.startsWith('/api/v1/runtime-brokers')) {
+          return jsonResponse({
+            brokers: [
+              { ...FLAT_K8S, version: 'v1.3.0', versionStatus: 'match' },
+              { ...FLAT_DOCKER, version: 'v1.2.0', versionStatus: 'mismatch' },
+              { ...LEGACY, status: 'online', version: '', versionStatus: 'unknown' },
+            ],
+            hubVersion: 'v1.3.0',
+          });
+        }
+        return jsonResponse({}, 404);
+      });
+    });
+
+    it('shows each version next to the hub version, marking a mismatch and an unknown', async () => {
+      const root = await mount();
+      expect(
+        root.querySelector('.hub-version-note')?.textContent?.replace(/\s+/g, ' ').trim()
+      ).toBe('Hub: v1.3.0');
+      const status = (id: string): string | null | undefined =>
+        row(root, id)
+          ?.querySelector('.version-col [data-version-status]')
+          ?.getAttribute('data-version-status');
+      expect(status(FLAT_K8S.id)).toBe('match');
+      expect(status(FLAT_DOCKER.id)).toBe('mismatch');
+      expect(status(LEGACY.id)).toBe('unknown');
+      expect(cellText(root, FLAT_DOCKER.id, 'version-col')).toBe('v1.2.0');
+      expect(
+        row(root, FLAT_DOCKER.id)?.querySelector('.version-col sl-icon')?.getAttribute('name')
+      ).toBe('exclamation-triangle');
+    });
+
+    it('the Needs attention chip includes online mismatched and unknown-version brokers when the hub has a single known version (ptone/scion#7430)', async () => {
+      const root = await mount();
+      const group = root.querySelector('sl-radio-group') as HTMLElement & { value: string };
+      group.value = 'attention';
+      group.dispatchEvent(new Event('sl-change'));
+      await (mounted[0] as Page).updateComplete;
+      expect(row(root, FLAT_DOCKER.id)).not.toBeNull();
+      expect(row(root, LEGACY.id)).not.toBeNull();
+      expect(row(root, FLAT_K8S.id)).toBeNull();
+    });
+
+    it('the Needs attention chip excludes unknown-version brokers when the hub version is mixed (ptone/scion#7430)', async () => {
+      fetchMock.mockImplementation((url: string) => {
+        if (url.startsWith('/api/v1/runtime-brokers')) {
+          return jsonResponse({
+            brokers: [
+              { ...FLAT_K8S, version: 'v1.3.0', versionStatus: 'unknown' },
+              { ...LEGACY, status: 'online', version: '', versionStatus: 'unknown' },
+            ],
+            hubVersion: 'mixed',
+          });
+        }
+        return jsonResponse({}, 404);
+      });
+      const root = await mount();
+      const group = root.querySelector('sl-radio-group') as HTMLElement & { value: string };
+      group.value = 'attention';
+      group.dispatchEvent(new Event('sl-change'));
+      await (mounted[0] as Page).updateComplete;
+      expect(row(root, LEGACY.id)).toBeNull();
+      expect(row(root, FLAT_K8S.id)).toBeNull();
+    });
   });
 });

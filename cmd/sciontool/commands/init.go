@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -35,10 +36,12 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/provision"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/autoexpose"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/conduit/sshd"
+	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/delegation"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/dirfd"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/hooks"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/hooks/handlers"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/hub"
+	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/liveness"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/log"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/metadata"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/procreap"
@@ -174,10 +177,16 @@ type InitRunOptions struct {
 	// ResolveWorkingDir, when non-nil, is called once by RunInit — directly
 	// after gitCloneWorkspace and the post-pre-start-hook ownership fixup
 	// have both run, and before anything else that starts a long-running
-	// component on the harness's behalf (sidecar services, the metadata
-	// server, the hub secret fetch) or before harnessSupervisorConfig builds
-	// the supervisor.Config — to compute the harness child's working
-	// directory in place of the static WorkingDir field above.
+	// component on the harness's behalf (sidecar services, the hub secret
+	// fetch) or before harnessSupervisorConfig builds the supervisor.Config
+	// — to compute the harness child's working directory in place of the
+	// static WorkingDir field above.
+	//
+	// The metadata server is not one of those components: it is network
+	// setup, started before the clone so that CAP_NET_ADMIN can be dropped
+	// before any workload-controlled step (see init_netadmin.go). It is
+	// therefore already running when the resolver is called, and RunInit
+	// stops it on every early return, including a resolver error.
 	//
 	// That placement is not incidental: a resolver that needs to know
 	// whether a directory is actually usable (searchable by the scion
@@ -193,7 +202,8 @@ type InitRunOptions struct {
 	//
 	// An error from ResolveWorkingDir fails RunInit closed with
 	// exitCodeNoUsableHarnessCwd: the harness is never started, sidecar
-	// services/the metadata server/the hub secret fetch never start either,
+	// services and the hub secret fetch never start either, the
+	// already-running metadata server is stopped before RunInit returns,
 	// and RunInit never falls back to WorkingDir's own zero-value "inherit
 	// this process's cwd" behaviour or to "/".
 	//
@@ -320,13 +330,24 @@ func resolveAgentHome(targetUID int, rootless bool) string {
 // independent of setupHostUser's real-environment-dependent agentHome
 // resolution.
 func reportInitFailure(agentHome string, cause error) {
+	reportInitFailureWithExitCode(agentHome, cause, nil)
+}
+
+// reportInitFailureWithExitCode is reportInitFailure that also sends the
+// harness exit code to the Hub when exitCode is non-nil, as the crash
+// report after the wait loop does (finalStatusUpdate). The immediate-exit
+// path uses it, so a harness that dies inside childStartupCheckWindow is
+// reported with its code like one that dies later.
+func reportInitFailureWithExitCode(agentHome string, cause error, exitCode *int) {
 	statusHandler := handlers.NewStatusHandler()
 	statusHandler.StatusPath = filepath.Join(agentHome, "agent-info.json")
 	errMsg := cause.Error()
 	_ = statusHandler.UpdatePhaseAndMessage(state.PhaseError, "", errMsg)
 	if hubClient := hub.NewClient(); hubClient != nil && hubClient.IsConfigured() {
 		hubCtx, hubCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		if hubErr := hubClient.ReportState(hubCtx, state.PhaseError, "", errMsg); hubErr != nil {
+		s := state.AgentState{Phase: state.PhaseError}
+		update := hub.StatusUpdate{Phase: state.PhaseError, Status: s.DisplayStatus(), Message: errMsg, ExitCode: exitCode}
+		if hubErr := hubClient.UpdateStatus(hubCtx, update); hubErr != nil {
 			log.Error("Failed to report init failure to Hub: %v", hubErr)
 		}
 		hubCancel()
@@ -432,6 +453,10 @@ func newLifecycleManager(agentHome string, targetUID, targetGID int, requirePriv
 // process. Production code always leaves both at their default; only a test
 // replaces them.
 var runNewLifecycleManager = newLifecycleManager
+
+// harnessSecretsRoot is the in-memory volume RunInit writes staged harness
+// secrets below (hooks.DefaultHarnessDirsRoot). Only a test changes it.
+var harnessSecretsRoot = hooks.DefaultHarnessDirsRoot
 var runEnforceTokenFileOwnerChecks = hub.EnforceTokenFileOwnerChecks
 
 // RunInit runs the sciontool init logic: it sets up the container user,
@@ -469,16 +494,9 @@ func RunInit(args []string, opts InitRunOptions) int {
 		log.Info("tmux runtime mode: container-only steps suppressed")
 	}
 
-	// Log operating mode for diagnostics
-	mode := hub.OperatingMode()
-	switch mode {
-	case hub.ModeLocal:
-		log.Info("Operating mode: local (no hub configured)")
-	case hub.ModeHubConnected:
-		log.Info("Operating mode: hub-connected (endpoint: %s)", os.Getenv(hub.EnvHubEndpoint))
-	case hub.ModeHosted:
-		log.Info("Operating mode: hosted (endpoint: %s)", os.Getenv(hub.EnvHubEndpoint))
-	}
+	// The operating mode is logged once the hub client is built (see
+	// logHubOperatingMode), so a hub endpoint without a usable client is
+	// reported as such rather than as hub-connected.
 
 	// nfs shared-dir writers: clear the umask's group bits (022 -> 002) when
 	// the runtime granted shared-dir groups (SCION_SUPPLEMENTAL_GIDS checked
@@ -542,6 +560,22 @@ func RunInit(args []string, opts InitRunOptions) int {
 		}
 	}
 
+	// Refuse, before any credential below is written or staged, a start
+	// whose required metadata protection cannot be set up in this
+	// container (see metadataProtectionPreflight). The config is read once
+	// here and reused for the metadata server start below; nothing in
+	// between changes the variables it reads.
+	metaCfg := metadata.ConfigFromEnv()
+	if tmuxRuntimeMode {
+		// The GCP metadata server binds 169.254.169.254; not feasible on the
+		// host (tmux runtime).
+		metaCfg = nil
+	}
+	if err := metadataProtectionPreflight(metaCfg); err != nil {
+		reportInitFailure(agentHome, err)
+		return 1
+	}
+
 	// Move the bootstrap transport credential out of the environment and
 	// into the transport token file before anything else can inherit it.
 	// Child processes read the file (via SCION_TRANSPORT_TOKEN_FILE), which
@@ -557,7 +591,25 @@ func RunInit(args []string, opts InitRunOptions) int {
 	// the harness. This must happen before telemetry pipeline initialization
 	// because the GCP credentials file (pointed to by SCION_OTEL_GCP_CREDENTIALS)
 	// must exist on disk when the telemetry pipeline starts.
+	//
+	// The in-memory harness directories, when the runtime names them, are
+	// created for the workload user first (a no-op unless init runs as
+	// root), so staged harness secrets and the harness outputs never fall
+	// back to the home.
+	if err := prepareHarnessMemDirs(); err != nil {
+		log.Error("Failed to prepare the in-memory harness directories: %v", err)
+		reportInitFailure(agentHome, err)
+		return 1
+	}
+	// resolvedAuthNonceThisPass is the nonce of the resolved-auth carry
+	// file this pass wrote, for the path without a re-exec.
+	resolvedAuthNonceThisPass := ""
 	if encoded := os.Getenv(stagedsecrets.EnvVar); encoded != "" {
+		// Only this pass may set the staged-token and resolved-auth
+		// markers; ones inherited from the environment are dropped before
+		// anything is staged.
+		_ = os.Unsetenv(envHubTokenStaged)
+		_ = os.Unsetenv(envResolvedAuthStaged)
 		staged, err := stagedsecrets.Decode(encoded)
 		if err != nil {
 			log.Error("Failed to decode staged secrets: %v", err)
@@ -567,13 +619,87 @@ func RunInit(args []string, opts InitRunOptions) int {
 			return 1
 		}
 		if err := stagedsecrets.Write(agentHome, staged); err != nil {
+			// On runtimes whose hub credential travels in the staged blob
+			// (Cloud Run), stage it best-effort before reporting the failure so
+			// reportInitFailure can reach the Hub instead of exiting with an
+			// unconfigured client. Running stageHubToken only on failure here
+			// keeps normal staging below so a FileSecret can never overwrite
+			// the hub credential file.
+			if staged.HubToken != "" {
+				if _, tokErr := stageHubToken(staged.HubToken, targetUID, targetGID); tokErr != nil {
+					log.Warn("Could not stage hub credential before reporting secret-staging failure: %v", tokErr)
+				}
+				staged.HubToken = ""
+			}
 			log.Error("Failed to write staged secrets: %v", err)
 			reportInitFailure(agentHome, fmt.Errorf("failed to write staged secrets: %w", err))
 			return 1
 		}
+		// A runtime whose instance cannot see the broker-written token file
+		// (Cloud Run) stages the hub-issued credential instead. It is
+		// written to the canonical token file, and a marker (not the
+		// credential) survives the re-exec below so this init removes the
+		// file again at exit. The errors name the step and path only.
+		if staged.HubToken != "" {
+			kept, err := stageHubToken(staged.HubToken, targetUID, targetGID)
+			staged.HubToken = ""
+			if err != nil {
+				log.Error("Failed to write the staged hub credential: %v", err)
+				reportInitFailure(agentHome, fmt.Errorf("failed to write the staged hub credential: %w", err))
+				return 1
+			}
+			if kept {
+				log.Info("Kept the existing hub credential file: it was issued after the staged one")
+			} else {
+				log.Info("Wrote the staged hub credential to the agent token file")
+			}
+			if err := os.Setenv(envHubTokenStaged, "1"); err != nil {
+				log.Warn("Could not mark the hub credential file as staged; it will not be removed at exit: %v", err)
+			}
+		}
+		// A runtime whose instance home is on shared storage (Cloud Run)
+		// stages the harness bundle's secrets in the blob. They are written
+		// only into the in-memory directory SCION_HARNESS_SECRETS_DIR names,
+		// never into the home; with no such directory the start fails.
+		// Errors name the step and file names only.
+		harnessSecretCount := len(staged.HarnessSecrets)
+		if err := stagedsecrets.WriteHarnessSecrets(harnessSecretsRoot, os.Getenv(hooks.HarnessSecretsDirEnv), staged.HarnessSecrets); err != nil {
+			staged.HarnessSecrets = nil
+			log.Error("Failed to write the staged harness secrets: %v", err)
+			reportInitFailure(agentHome, fmt.Errorf("failed to write the staged harness secrets: %w", err))
+			return 1
+		}
+		staged.HarnessSecrets = nil
+		// A runtime that delivers the instance environment in plain form
+		// (Cloud Run) stages its resolved-auth entries that are not
+		// discovery settings. They reach the harness launch below only
+		// through a file on the in-memory volume (never this process's
+		// environment, the home or shared storage); with no in-memory
+		// harness directory the start fails. Counts only are logged.
+		// The marker carries this pass's nonce (never a credential), which
+		// the carry file also holds; it survives the re-exec below, so the
+		// next pass reads this carry file and no other.
+		resolvedAuthCount := len(staged.ResolvedAuthEnv)
+		if resolvedAuthCount > 0 {
+			nonce, err := stagedsecrets.NewResolvedAuthNonce()
+			if err == nil {
+				err = stagedsecrets.WriteResolvedAuthEnv(resolvedAuthEnvRoot, os.Getenv(hooks.HarnessSecretsDirEnv), nonce, staged.ResolvedAuthEnv)
+			}
+			if err == nil {
+				err = os.Setenv(envResolvedAuthStaged, nonce)
+			}
+			if err != nil {
+				staged.ResolvedAuthEnv = nil
+				log.Error("Failed to stage the resolved-auth environment entries: %v", err)
+				reportInitFailure(agentHome, fmt.Errorf("failed to stage the resolved-auth environment entries: %w", err))
+				return 1
+			}
+			resolvedAuthNonceThisPass = nonce
+		}
+		staged.ResolvedAuthEnv = nil
 		_ = os.Unsetenv(stagedsecrets.EnvVar)
-		log.Info("Staged %d file secret(s) and %d variable secret(s)",
-			len(staged.FileSecrets), len(staged.VariableSecrets))
+		log.Info("Staged %d file secret(s), %d variable secret(s), %d harness secret(s) and %d resolved-auth env entr(ies)",
+			len(staged.FileSecrets), len(staged.VariableSecrets), harnessSecretCount, resolvedAuthCount)
 
 		// Re-exec to purge SCION_STAGED_SECRETS from /proc/1/environ.
 		//
@@ -605,6 +731,10 @@ func RunInit(args []string, opts InitRunOptions) int {
 			log.Info("RunInit embedded: skipping environ-purge re-exec")
 		}
 	} else if transportCleared {
+		// Only the staging pass above arms the staged-token and
+		// resolved-auth markers; this re-exec carries neither.
+		_ = os.Unsetenv(envHubTokenStaged)
+		_ = os.Unsetenv(envResolvedAuthStaged)
 		// Restart init with the cleaned environment, as above. On the
 		// second pass the env var is absent and the file already exists,
 		// so this branch is not taken again. Skipped for an embedded
@@ -616,6 +746,39 @@ func RunInit(args []string, opts InitRunOptions) int {
 		} else {
 			log.Info("RunInit embedded: skipping environ-purge re-exec")
 		}
+	}
+
+	// The resolved-auth entries the staging pass carried across the re-exec
+	// are read and their file removed now, before anything else runs; they
+	// go to the harness child's environment only (supervisor AuthEnv). A
+	// carry file without the marker was not written by this init and is
+	// removed unread.
+	resolvedAuthNonce := resolvedAuthNonceThisPass
+	if resolvedAuthNonce == "" {
+		resolvedAuthNonce = os.Getenv(envResolvedAuthStaged)
+	}
+	_ = os.Unsetenv(envResolvedAuthStaged)
+	resolvedAuthEnv, err := takeResolvedAuthEnv(resolvedAuthEnvRoot, resolvedAuthNonce)
+	if err != nil {
+		log.Error("Failed to read the staged resolved-auth environment entries: %v", err)
+		reportInitFailure(agentHome, fmt.Errorf("failed to read the staged resolved-auth environment entries: %w", err))
+		return 1
+	}
+
+	// The token file this init staged from the runtime's payload is removed
+	// as init returns, after the final hub reports (deferred calls run after
+	// every return path below), but only when the agent's final outcome is
+	// clean (stagedTokenCleanExit, set once the exit is classified, or when
+	// the child exits 0 within the immediate-exit check). After a
+	// crash, a limits stop or an init failure the platform restarts the
+	// container with the same payload, so the file, which the refresh loop
+	// keeps current, is kept for stageHubToken's iat rule. A file the broker
+	// bind-mounted or copied in (docker, Kubernetes) is never staged and
+	// stays as before.
+	stagedTokenCleanExit := false
+	if os.Getenv(envHubTokenStaged) == "1" {
+		_ = os.Unsetenv(envHubTokenStaged)
+		defer func() { finishStagedHubToken(stagedTokenCleanExit) }()
 	}
 
 	// Open the startup listener when the runtime asked for one (only the
@@ -752,6 +915,109 @@ func RunInit(args []string, opts InitRunOptions) int {
 	_, projectHookStatErr := os.Stat(projectHookPath)
 	projectHookStaged := projectHookStatErr == nil
 
+	// Opt-in egress firewall. It runs before the metadata server start
+	// because the script resets the nat and filter tables, which would
+	// remove the interception rules installed below.
+	firewallInstalled, err := setupInitFirewall()
+	if err != nil {
+		reportInitFailure(agentHome, err)
+		return 1
+	}
+
+	// Record this launch before anything reports to the hub or the harness
+	// starts: the harness and its hooks inherit the variable, so every status
+	// report of this generation carries it, and the hub can tell a late report
+	// from a previous generation (e.g. this init's own predecessor exiting
+	// after a resume) apart from the current one. See hub.EnvLaunchStartedAt.
+	launchStartedAt := time.Now().UTC().Format(time.RFC3339)
+	if err := os.Setenv(hub.EnvLaunchStartedAt, launchStartedAt); err != nil {
+		log.Error("Failed to export %s: %v", hub.EnvLaunchStartedAt, err)
+	}
+
+	// Initialize hubClient early so the metadata server's fetch callbacks
+	// can use it without data races or startup race conditions.
+	hubClient := hub.NewClient()
+	logHubOperatingMode(hubClient)
+
+	// Start GCP metadata server if configured. This runs before the git
+	// clone, pre-start hooks, sidecar services and the harness, so that
+	// the CAP_NET_ADMIN drop below happens before any of them start (see
+	// init_netadmin.go for the full ordering).
+	var metadataServer *metadata.Server
+	if metaCfg != nil {
+		// Wire up dynamic token retrieval so the metadata server always
+		// uses the latest agent token after refresh, not the startup value.
+		metaCfg.TokenFunc = func() string {
+			return hub.ReadTokenFile()
+		}
+		// Delegate GCP token fetching to the hub client so the metadata
+		// server uses the correct auth headers (X-Scion-Agent-Token) and
+		// OIDC transport layer. hubClient is created just above, before
+		// the server starts, so the closures always see it.
+		metaCfg.FetchGCPToken = func(ctx context.Context, scopes []string) (*metadata.GCPAccessTokenResponse, error) {
+			hc := hubClient
+			if hc == nil || !hc.IsConfigured() {
+				return nil, fmt.Errorf("hub client not initialized")
+			}
+			hubResp, err := hc.FetchGCPToken(ctx, scopes)
+			if err != nil {
+				return nil, err
+			}
+			return &metadata.GCPAccessTokenResponse{
+				AccessToken: hubResp.AccessToken,
+				ExpiresIn:   hubResp.ExpiresIn,
+				TokenType:   hubResp.TokenType,
+			}, nil
+		}
+		metaCfg.FetchGCPIdentityToken = func(ctx context.Context, audience string) (string, error) {
+			hc := hubClient
+			if hc == nil || !hc.IsConfigured() {
+				return "", fmt.Errorf("hub client not initialized")
+			}
+			return hc.FetchGCPIdentityToken(ctx, audience)
+		}
+		metadataServer = metadata.New(*metaCfg)
+		// Nothing long-running may outlive an early return (a failed
+		// start or drop, a clone, pre-start, overlay or working-directory
+		// failure): stop the server on every return path. Stop is
+		// idempotent, so the normal-shutdown stop below is unaffected.
+		defer runMetadataServerStop(metadataServer)
+		metaCtx := context.Background()
+		if err := runMetadataServerStart(metaCtx, metadataServer); err != nil {
+			if metaCfg.StartFailureIsFatal(err) {
+				// Fail closed: the harness must not run in block or assign
+				// mode without the metadata server and, where the runtime
+				// granted it, the interception. This is the late backstop
+				// behind metadataProtectionPreflight: it runs after staging,
+				// so the transport token file goes too, and the staged hub
+				// credential (if this init staged it) through the deferred
+				// finishStagedHubToken. File-secret targets and the
+				// harness-secrets dir stay; see removeTransportTokenOnRefusal.
+				log.Error("Failed to start metadata server (mode=%s); not starting the harness: %v", metaCfg.Mode, err)
+				reportInitFailure(agentHome, fmt.Errorf("GCP metadata server could not start in %s mode: %w", metaCfg.Mode, err))
+				removeTransportTokenOnRefusal()
+				stagedTokenCleanExit = true
+				return 1
+			}
+			log.Warn("Metadata server not started (mode=%s, host networking); continuing: %v", metaCfg.Mode, err)
+		} else {
+			log.Info("GCP metadata server started (mode=%s, port=%d)", metaCfg.Mode, metaCfg.Port)
+		}
+	}
+
+	// Network setup is complete: drop CAP_NET_ADMIN before anything else
+	// starts (clone, pre-start hooks, services, the harness). Passthrough
+	// runs no metadata server, so it drops only when the firewall was
+	// installed. The drop is required (fatal on failure) whenever init
+	// installed network controls.
+	required := firewallInstalled || (metadataServer != nil && metadataInterceptionInstalled(metadataServer))
+	if metadataServer != nil || firewallInstalled {
+		if err := dropNetAdmin(required); err != nil {
+			reportInitFailure(agentHome, err)
+			return 1
+		}
+	}
+
 	// Clone git workspace BEFORE pre-start hooks so that provisioners
 	// (e.g. antigravity) see the populated workspace rather than an empty
 	// one.  The clone depends only on environment variables and agent
@@ -809,13 +1075,18 @@ func RunInit(args []string, opts InitRunOptions) int {
 				if pathErr != nil {
 					log.Error("Cannot locate previous env overlay: %v", pathErr)
 				} else if _, statErr := os.Stat(existingOverlay); statErr == nil {
-					log.Info("WARNING: Pre-start provisioning failed but previous env overlay exists at %s, using fallback", existingOverlay)
+					log.Warn("Pre-start provisioning failed but previous env overlay exists at %s, using fallback", existingOverlay)
 					fallbackExists = true
 				}
 			}
 			if !fallbackExists {
 				log.Error("Pre-start provisioning is required; aborting startup")
-				_ = statusHandler.UpdatePhaseAndMessage(state.PhaseError, "", fmt.Sprintf("pre-start hook failed: %v", err))
+				// Local state and the Hub, like the clone failure: a
+				// runtime whose broker cannot read agent-info.json
+				// would otherwise never see the reason. The error is
+				// bounded and its provisioner detail sanitized
+				// (hooks.HarnessProvisionFailureDetail).
+				reportInitFailure(agentHome, fmt.Errorf("pre-start hook failed: %w", err))
 				return 1
 			}
 		}
@@ -832,8 +1103,9 @@ func RunInit(args []string, opts InitRunOptions) int {
 	// Resolve the harness working directory now — after runGitCloneWorkspace
 	// and the post-pre-start-hook ownership fixup above have both run, and
 	// before anything that starts a long-running component on the harness's
-	// behalf (sidecar services, the metadata server, the hub secret fetch)
-	// or builds the supervisor.Config — so a resolver that depends on the
+	// behalf (sidecar services, the hub secret fetch; the metadata server is
+	// network setup and already running, see init_netadmin.go) or builds
+	// the supervisor.Config — so a resolver that depends on the
 	// workspace being present and searchable by the scion uid
 	// (substrate-serve's, in particular) sees it in its final state rather
 	// than whatever the broker's bind mount left it in, and a resolver
@@ -896,6 +1168,11 @@ func RunInit(args []string, opts InitRunOptions) int {
 		writeEnvFile(agentHome, targetUID, targetGID)
 	}
 
+	// Seed system ffmpeg symlinks from the base image into Playwright's default
+	// persistent home registry (~/.cache/ms-playwright) when the seed directory
+	// is present, keeping runtime browser downloads persistent across restarts.
+	runSeedPlaywrightFfmpegCache(agentHome, playwrightFfmpegSeedDir, targetUID, targetGID)
+
 	// Read and start sidecar services
 	var svcManager *services.Manager
 	// Workaround: Claude Code creates a dangling symlink at
@@ -946,20 +1223,6 @@ func RunInit(args []string, opts InitRunOptions) int {
 		}
 	}
 
-	// Record this launch before anything reports to the hub or the harness
-	// starts: the harness and its hooks inherit the variable, so every status
-	// report of this generation carries it, and the hub can tell a late report
-	// from a previous generation (e.g. this init's own predecessor exiting
-	// after a resume) apart from the current one. See hub.EnvLaunchStartedAt.
-	launchStartedAt := time.Now().UTC().Format(time.RFC3339)
-	if err := os.Setenv(hub.EnvLaunchStartedAt, launchStartedAt); err != nil {
-		log.Error("Failed to export %s: %v", hub.EnvLaunchStartedAt, err)
-	}
-
-	// Initialize hubClient early so the metadata server's fetch callbacks
-	// can use it without data races or startup race conditions.
-	hubClient := hub.NewClient()
-
 	// Publish what this process knows about its own agent credential for
 	// sciontool doctor. The first write happens here, before the child
 	// starts, so doctor never reads a state left by an earlier run as
@@ -968,10 +1231,7 @@ func RunInit(args []string, opts InitRunOptions) int {
 	defer credStateCancel()
 	hub.PublishCredentialState(credStateCtx, hubClient)
 
-	// Start GCP metadata server if configured
-	var metadataServer *metadata.Server
-	// The GCP metadata server binds 169.254.169.254; not feasible on the host (tmux runtime).
-	if metaCfg := metadata.ConfigFromEnv(); metaCfg != nil && !tmuxRuntimeMode {
+	if metadataServer != nil {
 		// Remove pre-existing gcloud configuration state so that gcloud
 		// re-initializes and discovers the emulated metadata server via
 		// GCE_METADATA_ROOT. gcloud only checks for the metadata server
@@ -979,59 +1239,6 @@ func RunInit(args []string, opts InitRunOptions) int {
 		// We preserve application_default_credentials.json which may be
 		// bind-mounted as a secret (gcloud-adc).
 		runCleanGcloudConfigForMetadata(filepath.Join(agentHome, ".config", "gcloud"), opts.RequirePrivilegeDrop)
-		// Wire up dynamic token retrieval so the metadata server always
-		// uses the latest agent token after refresh, not the startup value.
-		metaCfg.TokenFunc = func() string {
-			return hub.ReadTokenFile()
-		}
-		// Delegate GCP token fetching to the hub client so the metadata
-		// server uses the correct auth headers (X-Scion-Agent-Token) and
-		// OIDC transport layer. The hub client is created after the metadata
-		// server starts, so the closures capture the hubClient variable
-		// which is set later. Token requests only arrive after the child
-		// process has started, so the hub client is always available by then.
-		metaCfg.FetchGCPToken = func(ctx context.Context, scopes []string) (*metadata.GCPAccessTokenResponse, error) {
-			hc := hubClient
-			if hc == nil || !hc.IsConfigured() {
-				return nil, fmt.Errorf("hub client not initialized")
-			}
-			hubResp, err := hc.FetchGCPToken(ctx, scopes)
-			if err != nil {
-				return nil, err
-			}
-			return &metadata.GCPAccessTokenResponse{
-				AccessToken: hubResp.AccessToken,
-				ExpiresIn:   hubResp.ExpiresIn,
-				TokenType:   hubResp.TokenType,
-			}, nil
-		}
-		metaCfg.FetchGCPIdentityToken = func(ctx context.Context, audience string) (string, error) {
-			hc := hubClient
-			if hc == nil || !hc.IsConfigured() {
-				return "", fmt.Errorf("hub client not initialized")
-			}
-			return hc.FetchGCPIdentityToken(ctx, audience)
-		}
-		metadataServer = metadata.New(*metaCfg)
-		metaCtx := context.Background()
-		if err := runMetadataServerStart(metaCtx, metadataServer); err != nil {
-			if metaCfg.StartFailureIsFatal(err) {
-				// Fail closed: the harness must not run in block or assign
-				// mode without the metadata server and, where the runtime
-				// granted it, the interception.
-				log.Error("Failed to start metadata server (mode=%s); not starting the harness: %v", metaCfg.Mode, err)
-				if svcManager != nil {
-					svcShutdownCtx, svcShutdownCancel := context.WithTimeout(context.Background(), gracePeriod)
-					_ = runServicesShutdown(svcShutdownCtx, svcManager)
-					svcShutdownCancel()
-				}
-				reportInitFailure(agentHome, fmt.Errorf("GCP metadata server could not start in %s mode: %w", metaCfg.Mode, err))
-				return 1
-			}
-			log.Warn("Metadata server not started (mode=%s, host networking); continuing: %v", metaCfg.Mode, err)
-		} else {
-			log.Info("GCP metadata server started (mode=%s, port=%d)", metaCfg.Mode, metaCfg.Port)
-		}
 	}
 
 	// Pre-flight checks: verify key paths are accessible before launching child
@@ -1088,6 +1295,7 @@ func RunInit(args []string, opts InitRunOptions) int {
 		// TUIs exit immediately (background pgrp cannot read the tty).
 		config.ForegroundTTY = true
 	}
+	config.AuthEnv = resolvedAuthEnv
 	sup := supervisor.New(config)
 
 	// Create a cancellable context for graceful shutdown
@@ -1142,6 +1350,9 @@ func RunInit(args []string, opts InitRunOptions) int {
 		}
 	}
 	readyMode := state.ReadyModeForStrategy(readySpec.Strategy)
+	if !tmuxRuntimeMode {
+		removeStaleHarnessExitFiles()
+	}
 	harnessLaunchedAt := time.Now()
 
 	// The conduit SSH server and its host key are prepared, and the first
@@ -1174,14 +1385,16 @@ func RunInit(args []string, opts InitRunOptions) int {
 	var tokenRefreshDone <-chan struct{}
 	var ghTokenRefreshCancel context.CancelFunc
 	var ghTokenRefreshDone <-chan struct{}
+	var delegationHelper *delegation.Helper
 	var readyWatchCancel context.CancelFunc
 	var readyWatchDone chan struct{}
 
 	// Wait a moment for process to start, then run post-start hooks
 	// Use a short timeout to detect immediate startup failures
-	log.Debug("Waiting for child process startup (100ms check)...")
+	log.Debug("Waiting for child process startup (%v check)...", childStartupCheckWindow)
 	select {
 	case result := <-exitChan:
+		observeChildStartupPath(true)
 		// Child exited immediately - likely a startup error
 		if result.err != nil {
 			log.Error("Child exited immediately with error: %v (uid=%d, gid=%d)", result.err, os.Geteuid(), os.Getegid())
@@ -1189,8 +1402,23 @@ func RunInit(args []string, opts InitRunOptions) int {
 			return 1
 		}
 		log.Info("Child exited immediately with code %d (uid=%d, gid=%d)", result.code, os.Geteuid(), os.Getegid())
+		// tmux exits 0 once the agent window's session ends, so the child's
+		// code says nothing about the harness: take the harness's own code
+		// from the wrapper's file, and treat a missing file from the
+		// wrapper as the harness never starting.
+		harnessCode := readHarnessExitCode()
+		if outcome, crashed := classifyImmediateExit(result.code, harnessCode,
+			childRecordsHarnessExitCode(childArgs, os.Getenv), readHarnessTail(), requestedShutdown.Load()); crashed {
+			log.Error("Harness exited immediately: %s", outcome.message)
+			reportInitFailureWithExitCode(agentHome, errors.New(outcome.message), &outcome.exitCode)
+			return outcome.exitCode
+		}
+		// An immediate exit 0 is as clean as one after the wait loop, so a
+		// token file this init staged is removed on both paths alike.
+		stagedTokenCleanExit = result.code == 0
 		return result.code
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(childStartupCheckWindow):
+		observeChildStartupPath(false)
 		// Process appears to be running, execute post-start hooks
 		log.Info("Running post-start hooks...")
 		if err := lifecycleManager.RunPostStart(); err != nil {
@@ -1258,12 +1486,33 @@ func RunInit(args []string, opts InitRunOptions) int {
 				})
 			}
 		}
+		// The harness_error watchdogs (init_harness_watchdog.go) start
+		// once the harness is ready, in the watcher's goroutine, so the
+		// shutdown path below stops them with it.
+		// The heartbeat's live-work samples, shared with the API-error
+		// watchdog (ptone/scion#7855): live work means the turn is not
+		// over, so a swallowed API error is not yet a harness error.
+		liveWork := newLiveWorkRecorder()
+		watchdogCfg := newHarnessWatchdogConfig(harnessWatchdogDeps{
+			LaunchedAt:       harnessLaunchedAt,
+			AgentHome:        agentHome,
+			StatusHandler:    statusHandler,
+			HubClient:        hubClient,
+			Pipeline:         telemetryPipeline,
+			TargetUID:        targetUID,
+			TargetGID:        targetGID,
+			CapturePane:      captureHarnessPane,
+			TurnEventsPath:   turnEventsFilePath,
+			PendingErrorPath: pendingHarnessErrorFilePath,
+			LiveWork:         liveWork.Live,
+		})
 		var readyWatchCtx context.Context
 		readyWatchCtx, readyWatchCancel = context.WithCancel(context.Background())
 		readyWatchDone = make(chan struct{})
 		go func() {
 			defer close(readyWatchDone)
-			watchHarnessReady(readyWatchCtx, readyCfg)
+			readiness := watchHarnessReady(readyWatchCtx, readyCfg)
+			runHarnessErrorWatchdogs(readyWatchCtx, watchdogCfg, readiness, time.Now())
 		}()
 
 		if hubClient != nil && hubClient.IsConfigured() {
@@ -1279,6 +1528,13 @@ func RunInit(args []string, opts InitRunOptions) int {
 				OnSuccess: func() {
 					log.Debug("Heartbeat sent successfully")
 				},
+				// Live work (ptone/scion#7855): the Hub keeps an agent
+				// with a tool call in flight, or whose container is doing
+				// CPU work, from being marked stalled or auto-suspended.
+				LiveWork: liveWork.record(livenessProvider(liveness.NewSampler(liveness.Config{
+					AgentUID:         livenessAgentUID(targetUID),
+					HarnessRootDepth: livenessHarnessRootDepth(os.Getenv),
+				}), statusHandler.CurrentActivitySince)),
 			})
 			log.Info("Started Hub heartbeat loop (interval: %s)", hub.DefaultHeartbeatInterval)
 
@@ -1289,9 +1545,11 @@ func RunInit(args []string, opts InitRunOptions) int {
 			if opts.DisablePortForwarding {
 				log.Info("port forwarding disabled: skipping port-forward tunnel manager and auto-expose")
 			} else {
-				go newPortForwarding(hubClient, opts.DisableConduit,
-					conduitPTYUser(targetUID, targetGID, rootless, opts.RequirePrivilegeDrop),
-					conduitSSH, os.Getenv).run(ctx)
+				ptyUser := conduitPTYUser(targetUID, targetGID, rootless, opts.RequirePrivilegeDrop)
+				go newPortForwarding(hubClient, opts.DisableConduit, ptyUser, conduitSSH,
+					conduitDeliverOptions(os.Getenv, exec.LookPath, childArgs, ptyUser),
+					conduitExecOptions(os.Getenv, ptyUser, harnessShellEnv(config)),
+					os.Getenv).run(ctx)
 
 				// Auto-expose: detect and register listening ports
 				if autoExposeCfg := autoexpose.ConfigFromEnv(); autoExposeCfg.Enabled && hubClient != nil {
@@ -1359,6 +1617,10 @@ func RunInit(args []string, opts InitRunOptions) int {
 					},
 				})
 			}
+
+			// Serve the delegation socket, through which processes in the
+			// agent make hub requests with a delegation grant.
+			delegationHelper = startDelegationHelper(hubClient, targetUID, targetGID)
 		} else {
 			log.Debug("Hub client not configured - skipping status report")
 		}
@@ -1565,8 +1827,9 @@ waitLoop:
 		}
 	}
 
-	// Stop the readiness watcher first so it cannot report working after
-	// the harness has exited.
+	// Stop the readiness watcher and the harness_error watchdogs first so
+	// they cannot report working or harness_error after the harness has
+	// exited.
 	if readyWatchCancel != nil {
 		readyWatchCancel()
 		<-readyWatchDone
@@ -1583,6 +1846,12 @@ waitLoop:
 		tokenRefreshCancel()
 		<-tokenRefreshDone
 		log.Debug("Token refresh loop stopped")
+	}
+	if delegationHelper != nil {
+		if err := delegationHelper.Close(); err != nil {
+			log.Debug("Delegation helper stop: %v", err)
+		}
+		log.Debug("Delegation helper stopped")
 	}
 	if heartbeatCancel != nil {
 		heartbeatCancel()
@@ -1612,8 +1881,15 @@ waitLoop:
 		log.Info("Recovered harness exit code %d from %s", *harnessCode, harnessExitCodePath)
 	}
 
-	outcome := classifyExit(result.code, result.err, harnessCode, limitsExceeded, requestedShutdown.Load())
+	outcome := classifyExit(result.code, result.err, harnessCode, limitsExceeded, requestedShutdown.Load(), readHarnessTail())
 	finalCode := outcome.exitCode
+	// Clean for the staged token file also requires that the child exited 0
+	// or that a stop was requested (RunInit then exits 0, see initExitCode):
+	// when the harness exit-code file says 0 but the child exits non-zero,
+	// the container exits non-zero and is restarted with the same payload,
+	// so the file is kept.
+	stagedTokenCleanExit = finalCode == 0 && !outcome.isCrash && !outcome.limitsExceeded && result.err == nil &&
+		(result.code == 0 || outcome.signaled)
 	limitsExceeded = outcome.limitsExceeded
 
 	// Report a session whose session-end hook has not run (the agent is
@@ -1646,7 +1922,7 @@ waitLoop:
 
 	// Stop metadata server
 	if metadataServer != nil {
-		metadataServer.Stop()
+		runMetadataServerStop(metadataServer)
 		log.Info("GCP metadata server stopped")
 	}
 
@@ -1726,7 +2002,21 @@ waitLoop:
 	}
 
 	log.Info("Child exited with code %d", result.code)
-	return result.code
+	return initExitCode(outcome, result.code)
+}
+
+// initExitCode is the process exit code RunInit returns once classifyExit has
+// ruled out a crash, limits and a supervisor error. A requested stop exits 0:
+// a child killed by the stop signal reports -1, which os.Exit would turn into
+// 255 and leave the container at Exited (255) after a clean stop. Otherwise
+// the child's own code is kept, so a child that exits non-zero while the
+// harness exit-code file says 0 still exits non-zero (and keeps its staged
+// token file, see stagedTokenCleanExit).
+func initExitCode(outcome exitOutcome, childCode int) int {
+	if outcome.signaled {
+		return 0
+	}
+	return childCode
 }
 
 // loadHarnessEnvOverlay loads the env overlay produced by the pre-start
@@ -1844,6 +2134,44 @@ var (
 	runServicesShutdown    = func(ctx context.Context, m *services.Manager) error { return m.Shutdown(ctx) }
 )
 
+// livenessProvider returns the heartbeat's live-work callback: it samples
+// with the activity agent-info.json records and when that activity began,
+// which the tool-call tier needs. The sampler only reads agent-info.json.
+func livenessProvider(s *liveness.Sampler, activity func() (state.Activity, time.Time)) func() *liveness.LiveWork {
+	return func() *liveness.LiveWork {
+		act, since := activity()
+		return s.Sample(time.Now(), act, since)
+	}
+}
+
+// livenessAgentUID is the UID the agent's processes run as, for the
+// liveness sampler: targetUID when init drops privileges to it, otherwise
+// init's own UID, which the harness then inherits (rootless or no host
+// user; see setupHostUser).
+func livenessAgentUID(targetUID int) int {
+	if targetUID > 0 {
+		return targetUID
+	}
+	return os.Getuid()
+}
+
+// livenessHarnessRootDepth reads the harness config's
+// state.LivenessHarnessRootDepthEnv for the liveness sampler: unset means
+// 1, and an unparsable value is logged and treated as 1 (the sampler also
+// clamps the range).
+func livenessHarnessRootDepth(getenv func(string) string) int {
+	raw := getenv(state.LivenessHarnessRootDepthEnv)
+	if raw == "" {
+		return 1
+	}
+	depth, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		log.Warn("Liveness: ignoring %s=%q (not an integer); using 1", state.LivenessHarnessRootDepthEnv, raw)
+		return 1
+	}
+	return depth
+}
+
 // harnessExitCodePath is the harness exit-code file readHarnessExitCode
 // reads. It is a variable only so a RunInit test can point it at a temp
 // file instead of the host's fixed path; production never changes it.
@@ -1892,6 +2220,90 @@ func readHarnessExitCode() *int {
 		return nil
 	}
 	return &code
+}
+
+// harnessTailPath is the pane-tail file the tmux agent-window wrapper writes
+// before the exit-code file (state.HarnessTailFile). Like
+// harnessExitCodePath it is a variable only so tests can use a temp file.
+var harnessTailPath = state.HarnessTailFile
+
+// harnessTailMaxBytes bounds the read in readHarnessTail. The wrapper
+// captures 40 joined pane lines; a larger file is not read at all.
+const harnessTailMaxBytes = 1 << 20
+
+// harnessTailLines is how many of the last non-empty pane lines a crash
+// reason carries.
+const harnessTailLines = 5
+
+// readHarnessTail returns the last harnessTailLines non-empty lines of the
+// pane-tail file, joined with " | ", or "" if the file is missing, too
+// large or not a single-link regular file. The read refuses symlinks at
+// every path component and never blocks on a FIFO, for the same reasons
+// as readHarnessExitCode. The text is raw harness output: callers redact
+// it (handlers.FormatHarnessTailReason) before it leaves the process.
+func readHarnessTail() string {
+	data, err := dirfd.ReadFileNoFollow(harnessTailPath, harnessTailMaxBytes)
+	if err != nil {
+		return ""
+	}
+	return lastNonEmptyLines(string(data), harnessTailLines)
+}
+
+// removeStaleHarnessExitFiles removes the exit-code and pane-tail files a
+// previous harness run in this container left behind (a restarted
+// container keeps /tmp), so a reader after this run never takes the old
+// run's code or output for its own, and a missing exit-code file reliably
+// means this run's harness never recorded one. os.Remove does not follow a
+// symlink at the leaf.
+func removeStaleHarnessExitFiles() {
+	for _, p := range []string{harnessExitCodePath, harnessTailPath} {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			log.Warn("Could not remove stale harness file %s: %v", p, err)
+		}
+	}
+}
+
+// errHarnessNotStarted is the supervisor error classifyExit receives when the
+// child exited within childStartupCheckWindow without the harness recording
+// an exit code: the tmux agent window never ran the harness wrapper (tmux
+// failed, or the session ended before the harness started).
+var errHarnessNotStarted = errors.New("the harness did not start: no harness exit code was recorded")
+
+// childRecordsHarnessExitCode reports whether the supervised child is the
+// tmux agent-window wrapper that writes harnessExitCodePath, so a missing
+// file means the harness never ran. The runtimes pass the wrapper in the
+// child's arguments, or in SCION_START_CMD when a FUSE mount step runs
+// first; any other child (a plain command) never writes the file.
+func childRecordsHarnessExitCode(childArgs []string, getenv func(string) string) bool {
+	for _, a := range childArgs {
+		if strings.Contains(a, harnessExitCodePath) {
+			return true
+		}
+	}
+	return strings.Contains(getenv("SCION_START_CMD"), harnessExitCodePath)
+}
+
+// classifyImmediateExit classifies a child that exited within
+// childStartupCheckWindow with no supervisor error. It reports a crash when
+// the harness recorded a non-zero exit code, when the child exited non-zero
+// with no harness code, or when the child is the harness wrapper and no
+// harness code was recorded at all; the outcome then carries the harness's
+// code rather than tmux's. Otherwise ok is false and the caller keeps the
+// child's own code.
+func classifyImmediateExit(childCode int, harnessCode *int, wrapped bool, harnessTail string, requestedShutdown bool) (exitOutcome, bool) {
+	switch {
+	case harnessCode != nil && *harnessCode != 0:
+		outcome := classifyExit(childCode, nil, harnessCode, false, requestedShutdown, harnessTail)
+		return outcome, outcome.isCrash
+	case harnessCode == nil && (childCode != 0 || wrapped):
+		var supErr error
+		if wrapped {
+			supErr = errHarnessNotStarted
+		}
+		outcome := classifyExit(childCode, supErr, nil, false, requestedShutdown, "")
+		return outcome, outcome.isCrash
+	}
+	return exitOutcome{}, false
 }
 
 // exitOutcome captures the classified result of a supervised agent exit.
@@ -1957,7 +2369,14 @@ func finalStatusUpdate(outcome exitOutcome) hub.StatusUpdate {
 // failure not reflected in supervisedCode). requestedShutdown is true when
 // init received SIGTERM/SIGINT, indicating the container was intentionally
 // stopped — a signal-killed child (exit code -1) is expected, not a crash.
-func classifyExit(supervisedCode int, supervisorErr error, harnessCode *int, limitsExceeded bool, requestedShutdown bool) exitOutcome {
+//
+// harnessTail is the harness's last output (readHarnessTail); a crash with
+// a harness exit code appends it, redacted, as
+// "Agent crashed with exit code N: <tail>", with the oldest output cut
+// first so the whole reason fits the 300-rune cap. supervisorErr
+// errHarnessNotStarted (no harness code recorded) is reported as the
+// harness not starting, with the child's code or 1.
+func classifyExit(supervisedCode int, supervisorErr error, harnessCode *int, limitsExceeded bool, requestedShutdown bool, harnessTail string) exitOutcome {
 	if !limitsExceeded && supervisedCode == handlers.ExitCodeLimitsExceeded {
 		limitsExceeded = true
 	}
@@ -1984,6 +2403,14 @@ func classifyExit(supervisedCode int, supervisorErr error, harnessCode *int, lim
 		}
 	}
 
+	if harnessCode == nil && errors.Is(supervisorErr, errHarnessNotStarted) {
+		if finalCode == 0 {
+			finalCode = 1
+		}
+		msg := fmt.Sprintf("Agent failed to start (exit code %d): %v", finalCode, supervisorErr)
+		return exitOutcome{exitCode: finalCode, isCrash: true, message: msg}
+	}
+
 	// A supervisor error with a zero exit code is itself a failure.
 	supervisorFailed := supervisorErr != nil && finalCode == 0
 	if supervisorFailed {
@@ -2000,6 +2427,9 @@ func classifyExit(supervisedCode int, supervisorErr error, harnessCode *int, lim
 		msg = fmt.Sprintf("Agent crashed (supervisor error: %v)", supervisorErr)
 	} else {
 		msg = fmt.Sprintf("Agent crashed with exit code %d", finalCode)
+		if harnessCode != nil && strings.TrimSpace(harnessTail) != "" {
+			msg = handlers.FormatHarnessTailReason(msg, harnessTail)
+		}
 	}
 	return exitOutcome{exitCode: finalCode, isCrash: true, message: msg}
 }
@@ -2625,6 +3055,24 @@ var runMetadataServerStart = func(ctx context.Context, s *metadata.Server) error
 	return s.Start(ctx)
 }
 
+// childStartupCheckWindow is how long RunInit waits after starting the
+// child before treating it as running. A child that exits inside the
+// window takes the immediate-exit path, which returns before the normal
+// shutdown sequence. A package-level variable only so tests can choose
+// the path deterministically.
+var childStartupCheckWindow = 100 * time.Millisecond
+
+// observeChildStartupPath is called with true on the immediate-exit path
+// and false once the child is treated as running. A no-op seam so tests
+// can assert which path RunInit took.
+var observeChildStartupPath = func(immediate bool) {}
+
+// runMetadataServerStop is (*metadata.Server).Stop's call site as a seam,
+// so tests can observe that RunInit stops the server on every return path.
+var runMetadataServerStop = func(s *metadata.Server) {
+	s.Stop()
+}
+
 // runFetchSecretOverrides is fetchSecretOverrides's call site as a package
 // var, the same reason as runServicesStart above: a test must be able to
 // observe that the resolver runs before the hub secret fetch without a test
@@ -3145,6 +3593,21 @@ func isUIDMapped(uid int) bool {
 var errGitCloneWorkspacePrivilegeDropRequired = errors.New(
 	"gitCloneWorkspace: privilege drop required but uid/gid were not both set; refusing to run git as root")
 
+// resolveGitCheckoutWorkers returns the parallel checkout worker count
+// passed via `git -c checkout.workers=<N>` when gitCloneWorkspace populates
+// or switches branches (provision.DefaultGitCheckoutWorkers, overridden by
+// provision.EnvGitCheckoutWorkers). Passing it via `-c` rather than
+// `git config` keeps .git/config clean under pkg/util/git_config_policy.go.
+func resolveGitCheckoutWorkers() int {
+	raw := os.Getenv(provision.EnvGitCheckoutWorkers)
+	n, ok := provision.ParseGitCheckoutWorkers(raw)
+	if !ok {
+		log.Warn("%s is not a valid integer in 0..%d (%q), defaulting to %d",
+			provision.EnvGitCheckoutWorkers, provision.MaxGitCheckoutWorkers, raw, n)
+	}
+	return n
+}
+
 // gitCloneWorkspace clones a git repository into /workspace when SCION_GIT_CLONE_URL
 // is set. This supports hub-first git projects where the repository must be cloned
 // before the harness starts. When uid > 0, all git commands run as the specified
@@ -3181,7 +3644,14 @@ func gitCloneWorkspace(uid, gid int, agentHome string, requirePrivilegeDrop bool
 	// written during provisioning — they don't indicate a real clone.
 	if !isWorkspaceEmpty(workspacePath) {
 		log.Info("Workspace already populated, skipping git clone")
-		return nil
+		// The agent's .gitconfig outlives the clone: bring its credential
+		// helper to the current binding on every start, so a helper an
+		// earlier version wrote (unscoped, or scoped to a remote the hub no
+		// longer offers the token to) does not survive a restart.
+		uid, gid = cloneUserIDs(uid, gid)
+		offerToken := provision.CloneTokenAllowed(os.Getenv(api.EnvGitTokenRemote), normalizeCloneURL(cloneURL))
+		setupGitCmd := func(cmd *exec.Cmd) { configureGitCommand(cmd, uid, gid) }
+		return reconcileCloneCredentialHelper(filepath.Join(agentHome, ".gitconfig"), setupGitCmd, offerToken)
 	}
 
 	// Snapshot the workspace's pre-existing top-level entries (e.g.
@@ -3195,13 +3665,7 @@ func gitCloneWorkspace(uid, gid int, agentHome string, requirePrivilegeDrop bool
 	// When uid is 0 (broker running as root or no host UID configured), fall
 	// back to the scion user so that cloned files are owned by the container
 	// user rather than root.
-	if uid == 0 {
-		if scionUser, err := scionUserLookup("scion"); err == nil {
-			uid, _ = strconv.Atoi(scionUser.Uid)
-			gid, _ = strconv.Atoi(scionUser.Gid)
-			log.Info("Falling back to scion user UID=%d GID=%d for git clone", uid, gid)
-		}
-	}
+	uid, gid = cloneUserIDs(uid, gid)
 
 	currentEUID := os.Geteuid()
 	ensureWorkspaceOwnership(workspacePath, uid, gid, currentEUID, os.Chown)
@@ -3217,10 +3681,11 @@ func gitCloneWorkspace(uid, gid int, agentHome string, requirePrivilegeDrop bool
 	}
 	depth, err := strconv.Atoi(depthStr)
 	if err != nil {
-		log.Info("WARNING: SCION_GIT_DEPTH is not a valid integer (%q), defaulting to 1", depthStr)
+		log.Warn("SCION_GIT_DEPTH is not a valid integer (%q), defaulting to 1", depthStr)
 		depth = 1
 		depthStr = "1"
 	}
+	checkoutWorkersArg := fmt.Sprintf("checkout.workers=%d", resolveGitCheckoutWorkers())
 	agentName := os.Getenv("SCION_AGENT_NAME")
 
 	// Helper to configure a git command: run as the scion user and disable
@@ -3250,6 +3715,17 @@ func gitCloneWorkspace(uid, gid int, agentHome string, requirePrivilegeDrop bool
 	// through a run-time credential helper (initTokenCredentialHelper) that reads
 	// GITHUB_TOKEN from the environment, so it is never in a git argv or .git/config.
 	cloneURLNoCredential := normalizeCloneURL(cloneURL)
+
+	// The git token is offered to this clone only when its URL names the
+	// project's recorded remote (api.EnvGitTokenRemote, which the broker relays
+	// from the hub's project record): https, the same host and owner/repo
+	// (provision.CloneTokenAllowed). A clone URL from a label naming any other
+	// host or repository, or no recorded remote at all, gets no credential
+	// helper, on the fetch or in the agent's .gitconfig.
+	offerToken := provision.CloneTokenAllowed(os.Getenv(api.EnvGitTokenRemote), cloneURLNoCredential)
+	if !offerToken {
+		log.Warn("the clone URL does not name the project's recorded git remote; cloning without a git credential")
+	}
 
 	// Determine the agent feature branch name early so we can try cloning it.
 	agentBranch := os.Getenv("SCION_AGENT_BRANCH")
@@ -3294,8 +3770,13 @@ func gitCloneWorkspace(uid, gid int, agentHome string, requirePrivilegeDrop bool
 	fetchBranch := func(branchToFetch string) (string, bool) {
 		// -c credential.<scheme>://<host>.helper=<run-time env-expansion helper>:
 		// the helper is scoped to the clone URL's host, and the token is read from
-		// GITHUB_TOKEN by the helper, never passed on the fetch argv.
-		fetchArgs := []string{"-c", scopedCredentialConfigArg(cloneURL), "-C", workspacePath, "fetch"}
+		// GITHUB_TOKEN by the helper, never passed on the fetch argv. Installed
+		// only when offerToken.
+		var fetchArgs []string
+		if offerToken {
+			fetchArgs = append(fetchArgs, "-c", scopedCredentialConfigArg(cloneURL))
+		}
+		fetchArgs = append(fetchArgs, "-C", workspacePath, "fetch")
 		if depth > 0 {
 			fetchArgs = append(fetchArgs, "--depth", depthStr)
 		}
@@ -3355,7 +3836,7 @@ func gitCloneWorkspace(uid, gid int, agentHome string, requirePrivilegeDrop bool
 	}
 
 	// Check out the fetched branch to populate the working tree.
-	checkoutArgs := []string{"-C", workspacePath, "checkout", "-b", clonedBranch, "origin/" + clonedBranch}
+	checkoutArgs := []string{"-c", checkoutWorkersArg, "-C", workspacePath, "checkout", "-b", clonedBranch, "origin/" + clonedBranch}
 	coCmd := exec.Command("git", checkoutArgs...)
 	setupGitCmd(coCmd)
 	if out, err := procreap.CombinedOutputManaged(coCmd); err != nil {
@@ -3392,16 +3873,11 @@ func gitCloneWorkspace(uid, gid int, agentHome string, requirePrivilegeDrop bool
 	// root (HOME=/root) but the harness runs as the scion user.
 	gitconfigPath := filepath.Join(agentHome, ".gitconfig")
 
-	var credentialHelper string
-	if hub.IsGitHubAppEnabled() {
-		credentialHelper = "!sciontool credential-helper"
-	} else {
-		credentialHelper = provision.GitTokenCredentialHelper
-	}
-	credCmd := exec.Command("git", "config", "--file", gitconfigPath, "credential.helper", credentialHelper)
-	setupGitCmd(credCmd)
-	if err := procreap.RunManaged(credCmd); err != nil {
-		return fmt.Errorf("failed to configure git credential helper: %w", err)
+	// The helper is scoped to the recorded remote's host and written only
+	// when offerToken; see reconcileCloneCredentialHelper, which also runs on
+	// every later start of this workspace.
+	if err := reconcileCloneCredentialHelper(gitconfigPath, setupGitCmd, offerToken); err != nil {
+		return err
 	}
 
 	// Resolve the agent feature branch name.
@@ -3417,7 +3893,7 @@ func gitCloneWorkspace(uid, gid int, agentHome string, requirePrivilegeDrop bool
 		checked := false
 
 		// 1. Try local checkout (works if branch matches the cloned branch)
-		checkoutCmd := exec.Command("git", "-C", workspacePath, "checkout", branchName)
+		checkoutCmd := exec.Command("git", "-c", checkoutWorkersArg, "-C", workspacePath, "checkout", branchName)
 		setupGitCmd(checkoutCmd)
 		if err := procreap.RunManaged(checkoutCmd); err == nil {
 			checked = true
@@ -3429,7 +3905,7 @@ func gitCloneWorkspace(uid, gid int, agentHome string, requirePrivilegeDrop bool
 			setupGitCmd(fetchCmd)
 			if err := procreap.RunManaged(fetchCmd); err == nil {
 				// Branch exists on remote — check it out tracking origin
-				trackCmd := exec.Command("git", "-C", workspacePath, "checkout", "-b", branchName, "origin/"+branchName)
+				trackCmd := exec.Command("git", "-c", checkoutWorkersArg, "-C", workspacePath, "checkout", "-b", branchName, "origin/"+branchName)
 				setupGitCmd(trackCmd)
 				if err := procreap.RunManaged(trackCmd); err == nil {
 					checked = true
@@ -3439,7 +3915,7 @@ func gitCloneWorkspace(uid, gid int, agentHome string, requirePrivilegeDrop bool
 
 		// 3. Branch doesn't exist anywhere — create it
 		if !checked {
-			createCmd := exec.Command("git", "-C", workspacePath, "checkout", "-b", branchName)
+			createCmd := exec.Command("git", "-c", checkoutWorkersArg, "-C", workspacePath, "checkout", "-b", branchName)
 			setupGitCmd(createCmd)
 			if err := procreap.RunManaged(createCmd); err != nil {
 				return fmt.Errorf("failed to create branch %s: %w", branchName, err)
@@ -3692,7 +4168,10 @@ func configureSharedWorkspaceGit(agentHome string, uid, gid int, requirePrivileg
 		configureCmd = func(cmd *exec.Cmd) {}
 	}
 
-	runGitConfig := func(args ...string) {
+	// gitConfig runs `git config --file gitconfigPath args...` and returns its
+	// failure, after logging it. With absentOK, a run that exits 5
+	// (`--unset-all` of a key that is not set) is not a failure.
+	gitConfig := func(absentOK bool, args ...string) error {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		gitPath, rerr := rootexec.Resolve("git")
@@ -3701,17 +4180,24 @@ func configureSharedWorkspaceGit(agentHome string, uid, gid int, requirePrivileg
 			if gitConfigFailureHook != nil {
 				gitConfigFailureHook(args, rerr)
 			}
-			return
+			return rerr
 		}
 		cmd := exec.CommandContext(ctx, gitPath, append([]string{"config", "--file", gitconfigPath}, args...)...)
 		configureCmd(cmd)
 		if out, cerr := procreap.CombinedOutputManaged(cmd); cerr != nil {
+			var exitErr *exec.ExitError
+			if absentOK && errors.As(cerr, &exitErr) && exitErr.ExitCode() == 5 {
+				return nil
+			}
 			log.Error("Failed to run git config %v: %s %v", args, string(out), cerr)
 			if gitConfigFailureHook != nil {
 				gitConfigFailureHook(args, cerr)
 			}
+			return cerr
 		}
+		return nil
 	}
+	runGitConfig := func(args ...string) { _ = gitConfig(false, args...) }
 
 	// Configure credential helper using sciontool's credential-helper command,
 	// which handles both GITHUB_TOKEN env var and GitHub App token refresh.
@@ -3723,8 +4209,24 @@ func configureSharedWorkspaceGit(agentHome string, uid, gid int, requirePrivileg
 		// Simple credential helper using GITHUB_TOKEN env var
 		credentialHelper = provision.GitTokenCredentialHelper
 	}
-	// This is idempotent and works even if provisioning already set it.
-	runGitConfig("credential.helper", credentialHelper)
+	// The helper is scoped to the host of the project's recorded git remote
+	// (api.EnvGitTokenRemote, which the broker relays from the hub's project
+	// record): credential.https://<host>.helper. It is never scoped to the
+	// clone-url label or the shared workspace's own origin, which agents can
+	// write. An unscoped credential.helper (written by an earlier version) is
+	// removed first; without a recorded remote no helper is configured.
+	// Replacing all values keeps this idempotent when provisioning already
+	// wrote the same key. A failed removal fails closed, as gitCloneWorkspace
+	// does: no helper is written and the error is returned, because the
+	// unscoped helper would still offer the token to every host.
+	if err := gitConfig(true, "--unset-all", "credential.helper"); err != nil {
+		return fmt.Errorf("failed to remove an unscoped git credential helper: %w", err)
+	}
+	if scope, ok := provision.TokenRemoteCredentialScope(os.Getenv(api.EnvGitTokenRemote)); ok {
+		runGitConfig("--replace-all", "credential."+scope+".helper", credentialHelper)
+	} else {
+		log.Warn("No recorded git remote for the shared workspace; no git credential helper configured")
+	}
 
 	// Configure git identity for the agent
 	agentName := os.Getenv("SCION_AGENT_NAME")
@@ -4078,6 +4580,106 @@ func writeEnvFile(agentHome string, uid, gid int) {
 	log.Debug("Wrote %d env vars to %s", len(lines)-1, envPath)
 }
 
+// cloneUserIDs returns the identity gitCloneWorkspace runs git as: uid/gid,
+// or the scion user when uid is 0 (broker running as root or no host UID
+// configured), so that cloned files are owned by the container user rather
+// than root.
+func cloneUserIDs(uid, gid int) (int, int) {
+	if uid != 0 {
+		return uid, gid
+	}
+	if scionUser, err := scionUserLookup("scion"); err == nil {
+		uid, _ = strconv.Atoi(scionUser.Uid)
+		gid, _ = strconv.Atoi(scionUser.Gid)
+		log.Info("Falling back to scion user UID=%d GID=%d for git clone", uid, gid)
+	}
+	return uid, gid
+}
+
+// reconcileCloneCredentialHelper brings the git credential helper in a
+// clone-per-agent agent's .gitconfig (gitconfigPath) to the current token
+// binding. It runs on the first clone and on every later start of a
+// populated workspace, because the .gitconfig outlives the clone:
+//
+//   - an unscoped credential.helper (an earlier version wrote one) is removed;
+//   - a scoped credential.<url>.helper whose value is one of the helpers this
+//     file writes is removed, so a helper written for a remote the hub no
+//     longer offers the token to does not survive a restart;
+//   - when offerToken, the helper is written again, scoped to the host of the
+//     project's recorded git remote (credential.https://<host>.helper,
+//     provision.TokenRemoteCredentialScope).
+//
+// A clone URL that does not name the recorded remote, or no recorded remote,
+// ends with no helper, so fetches and pushes to that origin are never offered
+// the token. Every git call runs a trusted git binary from rootexec's fixed
+// search path (never $PATH), as configureSharedWorkspaceGit does, through
+// setupGitCmd. Any failure is returned, so the caller fails closed.
+func reconcileCloneCredentialHelper(gitconfigPath string, setupGitCmd func(*exec.Cmd), offerToken bool) error {
+	gitPath, err := rootexec.Resolve("git")
+	if err != nil {
+		return fmt.Errorf("failed to resolve a trusted git binary for the credential helper: %w", err)
+	}
+	// unset runs `git config --unset-all key [value-pattern]`; exit status 5
+	// means the key is not set (or the file does not exist). It resolves git
+	// itself so the exec site is provably routed through rootexec.Resolve
+	// (the exec-site guard checks the smallest enclosing function).
+	unset := func(args ...string) error {
+		unsetGit, err := rootexec.Resolve("git")
+		if err != nil {
+			return err
+		}
+		cmd := exec.Command(unsetGit, append([]string{"config", "--file", gitconfigPath, "--unset-all"}, args...)...)
+		setupGitCmd(cmd)
+		if err := procreap.RunManaged(cmd); err != nil {
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 5 {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := unset("credential.helper"); err != nil {
+		return fmt.Errorf("failed to remove an unscoped git credential helper: %w", err)
+	}
+
+	ours := []string{"!sciontool credential-helper", provision.GitTokenCredentialHelper}
+	listCmd := exec.Command(gitPath, "config", "--file", gitconfigPath, "--null", "--get-regexp", `^credential\..+\.helper$`)
+	setupGitCmd(listCmd)
+	out, err := procreap.OutputManaged(listCmd)
+	if err != nil {
+		var exitErr *exec.ExitError
+		// Exit status 1: no key matches (or the file does not exist).
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+			return fmt.Errorf("failed to list git credential helpers: %w", err)
+		}
+		out = nil
+	}
+	for _, entry := range strings.Split(string(out), "\x00") {
+		key, value, ok := strings.Cut(entry, "\n")
+		if !ok || !slices.Contains(ours, value) {
+			continue
+		}
+		if err := unset("--fixed-value", key, value); err != nil {
+			return fmt.Errorf("failed to remove a scoped git credential helper: %w", err)
+		}
+	}
+
+	scope, scoped := provision.TokenRemoteCredentialScope(os.Getenv(api.EnvGitTokenRemote))
+	if !offerToken || !scoped {
+		return nil
+	}
+	credentialHelper := provision.GitTokenCredentialHelper
+	if hub.IsGitHubAppEnabled() {
+		credentialHelper = "!sciontool credential-helper"
+	}
+	credCmd := exec.Command(gitPath, "config", "--file", gitconfigPath, "--replace-all", "credential."+scope+".helper", credentialHelper)
+	setupGitCmd(credCmd)
+	if err := procreap.RunManaged(credCmd); err != nil {
+		return fmt.Errorf("failed to configure git credential helper: %w", err)
+	}
+	return nil
+}
+
 // isWorkspaceEmpty returns true if the directory doesn't exist or contains
 // only provisioning marker entries (e.g. .scion/, .scion-volumes/). A workspace
 // with only marker directories is considered empty for git-clone purposes so
@@ -4089,9 +4691,9 @@ func isWorkspaceEmpty(path string) bool {
 	}
 	// Filter out known marker entries that don't indicate a real workspace
 	// (provisioning markers and shared-dir mount points; see
-	// api.IsWorkspaceMarker).
+	// api.IsWorkspaceMarkerEntry).
 	for _, e := range entries {
-		if api.IsWorkspaceMarker(e.Name()) {
+		if api.IsWorkspaceMarkerEntry(path, e.Name()) {
 			continue
 		}
 		log.Debug("Workspace not empty: found %q in %s", e.Name(), path)

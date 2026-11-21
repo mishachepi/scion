@@ -119,6 +119,16 @@ server:
     #                                   # networks. Security: an http:// value sends agent
     #                                   # bearer tokens and fetched secrets unencrypted; use
     #                                   # https:// unless the network is trusted and isolated.
+    # internal_url: ""                 # Layer 0 (file/env only, restart required; never
+    #                                   # writable through the admin API). The hub_url that
+    #                                   # broker plugins call the hub API on, e.g.
+    #                                   # http://127.0.0.1:8080 when public_url is behind an
+    #                                   # auth proxy. When unset, hub_url is public_url.
+    #                                   # Same form as agent_endpoint. WARNING: plugins also
+    #                                   # get public_url, but none reads it yet: Slack, Teams,
+    #                                   # Telegram and Discord build registration links from
+    #                                   # hub_url, so those links will use this address
+    #                                   # (Discord's register_url overrides it).
 
     # Layer 0 — CORS (restart required, middleware-init bound)
     # cors:
@@ -128,6 +138,8 @@ server:
     # Layer 1 — Access (section: access)
     admin_emails: []                   # Super-admin email addresses
     # auto_suspend_stalled: true       # Layer 1 (section: lifecycle)
+    # auto_suspend_idle: false         # Layer 1 (section: lifecycle)
+    # idle_suspend_after: "15m"        # Layer 1 (section: lifecycle; minimum 5m)
     # soft_delete_retention: "72h"     # Layer 1 (section: lifecycle)
     # soft_delete_retain_files: false  # Layer 1 (section: lifecycle)
     # public_url: ""                   # Layer 1 (section: endpoints)
@@ -145,6 +157,10 @@ server:
     #                                   # perf_trace line per request (phase times,
     #                                   # authz store calls, decision audits, DB
     #                                   # pool waits). Observe only. Off by default.
+    # csp_report_raw_samples: false    # Layer 0 (restart required). Adds the
+    #                                   # sample of each browser policy report to
+    #                                   # its csp_violation log record. Samples can
+    #                                   # hold page content. Off by default.
     # membership_sweep_report_only: false # Layer 0 (restart required). The
     #                                   # membership-standing sweep logs and audits
     #                                   # the agents it would hold and stop, and

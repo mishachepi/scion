@@ -26,6 +26,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent"
 	entschema "github.com/GoogleCloudPlatform/scion/pkg/ent/schema"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/user"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/userdeletion"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
@@ -63,10 +64,11 @@ func storePrefsToEnt(p *store.UserPreferences) *entschema.UserPreferences {
 		return nil
 	}
 	return &entschema.UserPreferences{
-		DefaultTemplate: p.DefaultTemplate,
-		DefaultProfile:  p.DefaultProfile,
-		Theme:           p.Theme,
-		Timezone:        p.Timezone,
+		DefaultTemplate:             p.DefaultTemplate,
+		DefaultProfile:              p.DefaultProfile,
+		Theme:                       p.Theme,
+		Timezone:                    p.Timezone,
+		PreselectRecommendedChoices: p.PreselectRecommendedChoices,
 	}
 }
 
@@ -76,10 +78,11 @@ func entPrefsToStore(p *entschema.UserPreferences) *store.UserPreferences {
 		return nil
 	}
 	return &store.UserPreferences{
-		DefaultTemplate: p.DefaultTemplate,
-		DefaultProfile:  p.DefaultProfile,
-		Theme:           p.Theme,
-		Timezone:        p.Timezone,
+		DefaultTemplate:             p.DefaultTemplate,
+		DefaultProfile:              p.DefaultProfile,
+		Theme:                       p.Theme,
+		Timezone:                    p.Timezone,
+		PreselectRecommendedChoices: p.PreselectRecommendedChoices,
 	}
 }
 
@@ -330,6 +333,19 @@ func (s *UserStore) createUser(ctx context.Context, u *store.User, extra func(*e
 	}
 	u.Email = normalizeEmail(u.Email)
 
+	// deleting is written only by MarkUserDeleting, and the ID of a user
+	// with a deletion tombstone is never reused (ptone/scion#2143).
+	if u.Status == store.UserStatusDeleting {
+		return store.ErrUserDeleting
+	}
+	tombstoned, err := s.client.UserDeletion.Query().Where(userdeletion.UserIDEQ(uid)).Exist(ctx)
+	if err != nil {
+		return mapError(err)
+	}
+	if tombstoned {
+		return store.ErrAlreadyExists
+	}
+
 	create := s.client.User.Create().
 		SetID(uid).
 		SetEmail(u.Email).
@@ -418,9 +434,20 @@ func (s *UserStore) UpdateUser(ctx context.Context, u *store.User) error {
 	// leave its own. A federated row keeps its synthetic email and the
 	// viewer role, and is never invited; no other row takes a federated
 	// synthetic address or the pending status.
-	current, err := s.client.User.Query().Where(user.IDEQ(uid)).Select(user.FieldKind, user.FieldEmail).Only(ctx)
+	current, err := s.client.User.Query().Where(user.IDEQ(uid)).Select(user.FieldKind, user.FieldEmail, user.FieldStatus).Only(ctx)
 	if err != nil {
 		return mapError(err)
+	}
+	// A user being deleted keeps its status until the deletion completes
+	// and removes the row (ptone/scion#2143): UpdateUser never writes
+	// deleting (MarkUserDeleting does) and never changes a deleting row.
+	// The update below repeats the status test in its WHERE clause, so a
+	// caller that read the row before MarkUserDeleting committed cannot
+	// write another status over it. That window lies between two
+	// statements of this call, so no conformance case reaches it; the
+	// conformance suite covers the refusal of a row already deleting.
+	if current.Status == user.StatusDeleting || u.Status == store.UserStatusDeleting {
+		return store.ErrUserDeleting
 	}
 	if current.Kind == user.KindFederated {
 		if u.Email != current.Email || u.Status == store.UserStatusInvited ||
@@ -442,6 +469,7 @@ func (s *UserStore) UpdateUser(ctx context.Context, u *store.User) error {
 	}
 
 	update := s.client.User.UpdateOneID(uid).
+		Where(user.StatusNEQ(user.StatusDeleting)).
 		SetEmail(u.Email).
 		SetDisplayName(u.DisplayName)
 
@@ -483,6 +511,30 @@ func (s *UserStore) UpdateUser(ctx context.Context, u *store.User) error {
 	}
 
 	if err := update.Exec(ctx); err != nil {
+		if ent.IsNotFound(err) {
+			// The row read above does not match any more: it was
+			// deleted, or marked deleting in between.
+			exists, qerr := s.client.User.Query().Where(user.IDEQ(uid)).Exist(ctx)
+			if qerr != nil {
+				return mapError(qerr)
+			}
+			if exists {
+				return store.ErrUserDeleting
+			}
+		}
+		return mapError(err)
+	}
+	return nil
+}
+
+// MarkUserDeleting sets the user's status to deleting (ptone/scion#2143).
+// It is the only write of that status.
+func (s *UserStore) MarkUserDeleting(ctx context.Context, id string) error {
+	uid, err := parseUUID(id)
+	if err != nil {
+		return err
+	}
+	if err := s.client.User.UpdateOneID(uid).SetStatus(user.StatusDeleting).Exec(ctx); err != nil {
 		return mapError(err)
 	}
 	return nil
@@ -561,6 +613,11 @@ func lockKeyShare(o *sql.LockOptions) {
 func (s *UserStore) DeleteUser(ctx context.Context, id string) error {
 	uid, err := parseUUID(id)
 	if err != nil {
+		return err
+	}
+	// The user's decision answers keep their name and email snapshots but
+	// lose the user id (design choices v4, O2).
+	if err := clearDecisionAnswerUser(ctx, s.client, uid.String()); err != nil {
 		return err
 	}
 	if err := s.client.User.DeleteOneID(uid).Exec(ctx); err != nil {

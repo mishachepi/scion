@@ -384,7 +384,7 @@ func TestRequireHubClient_AgentHubContext_HubNotEnabledInSettings(t *testing.T) 
 	defer orig.restore()
 	clearHubContextEnv(t)
 
-	t.Setenv("SCION_HUB_ENDPOINT", "http://hub.internal.example")
+	t.Setenv("SCION_HUB_ENDPOINT", "https://hub.internal.example")
 	t.Setenv("SCION_PROJECT_ID", "agent-project-id")
 	t.Setenv("SCION_AUTH_TOKEN", "test-agent-token")
 
@@ -464,7 +464,7 @@ func TestRunNotificationsList_AgentHubContext_HubNotEnabledInSettings(t *testing
 }
 
 func TestDefaultTriggers(t *testing.T) {
-	expected := []string{"COMPLETED", "WAITING_FOR_INPUT", "LIMITS_EXCEEDED"}
+	expected := []string{"COMPLETED", "IDLE", "WAITING_FOR_INPUT", "LIMITS_EXCEEDED"}
 	if len(defaultTriggers) != len(expected) {
 		t.Fatalf("defaultTriggers length = %d, want %d", len(defaultTriggers), len(expected))
 	}

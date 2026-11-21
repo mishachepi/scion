@@ -38,7 +38,7 @@
  * the test harness) are ported from miller79/scion PR #127 by Anthony Lofton.
  */
 
-import { LitElement, html, css, nothing } from 'lit';
+import { LitElement, html, css, nothing, type TemplateResult } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 
 import { apiFetch, extractApiError, parseApiError } from '../../client/api.js';
@@ -53,8 +53,14 @@ import type {
 import type { PrincipalChangeDetail } from './principal-picker.js';
 import { showConfirm } from './confirm-dialog.js';
 import './principal-picker.js';
+import { invitedStatusTagStyles } from './styles.js';
+import { leaveVisibility, type LeaveVisibility } from '../../client/project-leave.js';
+import './project-leave-dialog.js';
+import type { ProjectLeftDetail, ScionProjectLeaveDialog } from './project-leave-dialog.js';
 import {
   BUILT_IN_PROJECT_MEMBERSHIP_ROLES,
+  builtInRoleLabel,
+  PROJECT_VIEWER_ROLE_NAME,
   getPrincipalIcon,
   getRoleTier,
   type RoleTier,
@@ -282,14 +288,17 @@ export function customRoleState(
   return { disabled: false, reason: '' };
 }
 
-/** Built-in roles from the catalog, in tier order (owner, admin, member). */
+/** Built-in roles from the catalog, in tier order (owner, admin, member),
+ *  with the viewer role last. */
 export function builtInCatalog(
   assignable: readonly AssignableProjectRole[]
 ): AssignableProjectRole[] {
   const rank: Record<RoleTier, number> = { owner: 0, admin: 1, member: 2 };
+  const order = (name: string): number =>
+    rank[getRoleTier(name)] + (name === PROJECT_VIEWER_ROLE_NAME ? 1 : 0);
   return assignable
     .filter((r) => (r.roleKind ? r.roleKind === 'builtin' : !isCustomProjectRole(r.name)))
-    .sort((a, b) => rank[getRoleTier(a.name)] - rank[getRoleTier(b.name)]);
+    .sort((a, b) => order(a.name) - order(b.name));
 }
 
 /** Whether a catalog role is custom: its roleKind when the hub sent one,
@@ -321,7 +330,9 @@ export function defaultBuiltInForAdd(
   };
   const builtIns = builtInCatalog(assignable);
   for (const tier of ['admin', 'member'] as const) {
-    const role = builtIns.find((r) => getRoleTier(r.name) === tier);
+    const role = builtIns.find(
+      (r) => getRoleTier(r.name) === tier && r.name !== PROJECT_VIEWER_ROLE_NAME
+    );
     if (role && !builtInOptionState(role, ctx).disabled) return role.id;
   }
   return NO_PROJECT_ROLE;
@@ -379,12 +390,25 @@ export function rowTier(group: ProjectMemberGroup): RoleTier {
   return b ? getRoleTier(b.roleName) : 'member';
 }
 
-function isDirectOwnerRow(group: ProjectMemberGroup): boolean {
+const INVITED_MEMBER_TOOLTIP = 'Has not signed in yet. Access starts at first sign-in.';
+const INVITED_OWNER_TOOLTIP = 'Invited owner. Does not count as an owner until they sign in.';
+const INVITED_DIALOG_NOTICE =
+  'This user has not signed in yet. The roles you assign here take effect at their first sign-in.';
+const INVITED_DIALOG_OWNER_WARNING =
+  'Invited owners do not count towards the last-owner rule until they sign in. Keep at least one signed-in owner.';
+
+function hasDirectOwnerBinding(group: ProjectMemberGroup): boolean {
+  return group.bindings.some(
+    (b) => b.source === 'direct' && !isCustomBinding(b) && getRoleTier(b.roleName) === 'owner'
+  );
+}
+
+/** Matches server usable-owner check: existing user with status 'active'. */
+function isUsableOwnerRow(group: ProjectMemberGroup): boolean {
   return (
     group.principalType === 'user' &&
-    group.bindings.some(
-      (b) => b.source === 'direct' && !isCustomBinding(b) && getRoleTier(b.roleName) === 'owner'
-    )
+    group.principalStatus === 'active' &&
+    hasDirectOwnerBinding(group)
   );
 }
 
@@ -392,8 +416,13 @@ export function isLastDirectOwner(
   group: ProjectMemberGroup,
   groups: readonly ProjectMemberGroup[]
 ): boolean {
-  if (!isDirectOwnerRow(group)) return false;
-  return groups.filter(isDirectOwnerRow).length <= 1;
+  if (!hasDirectOwnerBinding(group)) return false;
+  if (isUsableOwnerRow(group)) {
+    return groups.filter(isUsableOwnerRow).length <= 1;
+  }
+  // Unusable owner binding (invited, suspended, or missing user): stays locked
+  // only when it is the sole owner binding on the project.
+  return groups.filter(hasDirectOwnerBinding).length <= 1;
 }
 
 /**
@@ -414,14 +443,17 @@ export function tierFromRoleIds(
 }
 
 /** Last-owner status for a principal known only by its tier: a direct user
- *  owner is the last one when the loaded rows hold at most one direct owner. */
+ *  owner is the last one when the loaded rows hold at most one usable owner
+ *  (or at most one owner binding of any kind). */
 export function isLastOwnerByTier(
   principalType: string,
   tier: RoleTier,
   groups: readonly ProjectMemberGroup[]
 ): boolean {
   if (principalType !== 'user' || tier !== 'owner') return false;
-  return groups.filter(isDirectOwnerRow).length <= 1;
+  return (
+    groups.filter(isUsableOwnerRow).length <= 1 || groups.filter(hasDirectOwnerBinding).length <= 1
+  );
 }
 
 /**
@@ -526,6 +558,9 @@ function principalLabel(group: Pick<ProjectMemberGroup, 'principalDisplayName' |
   return group.principalDisplayName || group.principalId;
 }
 
+/** Event the editor dispatches after it opened the transfer dialog for `openTransferOnLoad`. */
+export const TRANSFER_OPENED_ON_LOAD_EVENT = 'scion-transfer-opened-on-load';
+
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
@@ -547,6 +582,20 @@ export class ScionProjectMembersEditor extends LitElement {
   /** Section description override. */
   @property() sectionDescription = '';
 
+  /**
+   * The signed-in user's ID. Their own row offers Leave (ptone/scion#7494)
+   * instead of Remove while the capabilities offer a leave.
+   */
+  @property() currentUserId = '';
+
+  /** The project's name, for the leave dialog. */
+  @property() projectName = '';
+
+  /** Open the transfer ownership dialog once loaded, when the user may transfer. */
+  @property({ type: Boolean }) openTransferOnLoad = false;
+
+  private transferOpenedOnLoad = false;
+
   @state() private loading = true;
   @state() private groups: ProjectMemberGroup[] = [];
   @state() private assignableRoles: AssignableProjectRole[] = [];
@@ -563,6 +612,7 @@ export class ScionProjectMembersEditor extends LitElement {
   @state() private dlgPrincipalType: MemberPrincipalType = 'user';
   @state() private dlgPrincipalId = '';
   @state() private dlgDisplayName = '';
+  @state() private dlgPrincipalStatus = '';
   @state() private dlgBuiltIn = NO_PROJECT_ROLE;
   @state() private dlgCurrentBuiltIn = NO_PROJECT_ROLE;
   /** Set once the user picks a built-in radio; until then Add mode keeps
@@ -597,378 +647,392 @@ export class ScionProjectMembersEditor extends LitElement {
   // Action feedback
   @state() private actionFeedback: { message: string; variant: 'success' | 'danger' } | null = null;
 
-  static override styles = css`
-    :host {
-      display: block;
-    }
-
-    .section {
-      background: var(--scion-surface, #ffffff);
-      border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: var(--scion-radius-lg, 0.75rem);
-      padding: 1.5rem;
-      margin-bottom: 1.5rem;
-    }
-
-    .section-header {
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      margin-bottom: 1rem;
-      gap: 1rem;
-    }
-
-    .section-header-info h2 {
-      font-size: 1.125rem;
-      font-weight: 600;
-      color: var(--scion-text, #1e293b);
-      margin: 0 0 0.25rem 0;
-    }
-
-    .section-header-info p {
-      color: var(--scion-text-muted, #64748b);
-      font-size: 0.875rem;
-      margin: 0;
-    }
-
-    .section-header-actions {
-      display: flex;
-      gap: 0.5rem;
-      align-items: center;
-      flex-shrink: 0;
-    }
-
-    .member-count {
-      font-size: 0.875rem;
-      color: var(--scion-text-muted, #64748b);
-      font-weight: 400;
-      margin-left: 0.5rem;
-    }
-
-    /* Table */
-    .table-container {
-      background: var(--scion-surface, #ffffff);
-      border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: var(--scion-radius-lg, 0.75rem);
-      overflow: hidden;
-    }
-
-    .compact .table-container {
-      border: none;
-      border-radius: 0;
-    }
-
-    table {
-      width: 100%;
-      border-collapse: collapse;
-    }
-
-    th {
-      text-align: left;
-      padding: 0.75rem 1rem;
-      font-size: 0.75rem;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--scion-text-muted, #64748b);
-      background: var(--scion-bg-subtle, #f1f5f9);
-      border-bottom: 1px solid var(--scion-border, #e2e8f0);
-    }
-
-    td {
-      padding: 0.75rem 1rem;
-      font-size: 0.875rem;
-      color: var(--scion-text, #1e293b);
-      border-bottom: 1px solid var(--scion-border, #e2e8f0);
-      vertical-align: middle;
-    }
-
-    tr:last-child td {
-      border-bottom: none;
-    }
-
-    tr:hover td {
-      background: var(--scion-bg-subtle, #f1f5f9);
-    }
-
-    /* Member identity */
-    .member-identity {
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
-    }
-
-    .member-icon {
-      width: 2rem;
-      height: 2rem;
-      border-radius: 50%;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      flex-shrink: 0;
-    }
-
-    .member-icon.user {
-      background: var(--sl-color-primary-100, #dbeafe);
-      color: var(--sl-color-primary-600, #2563eb);
-    }
-
-    .member-icon.group {
-      background: var(--sl-color-warning-100, #fef3c7);
-      color: var(--sl-color-warning-600, #d97706);
-    }
-
-    .member-icon.agent {
-      background: var(--sl-color-success-100, #dcfce7);
-      color: var(--sl-color-success-600, #16a34a);
-    }
-
-    .member-icon sl-icon {
-      font-size: 0.875rem;
-    }
-
-    .member-info {
-      display: flex;
-      flex-direction: column;
-      min-width: 0;
-    }
-
-    .member-name {
-      font-weight: 500;
-      font-size: 0.875rem;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
-    .member-detail {
-      font-size: 0.6875rem;
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    /* Role badge */
-    .role-badge {
-      display: inline-flex;
-      align-items: center;
-      padding: 0.125rem 0.5rem;
-      border-radius: 9999px;
-      font-size: 0.75rem;
-      font-weight: 500;
-      background: var(--scion-bg-subtle, #f1f5f9);
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    /* Provenance badge */
-    .provenance-badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.25rem;
-      font-size: 0.6875rem;
-    }
-
-    .provenance-badge.direct {
-      color: var(--sl-color-primary-600, #2563eb);
-    }
-
-    .provenance-badge.group-derived {
-      color: var(--sl-color-warning-600, #d97706);
-    }
-
-    .provenance-badge sl-icon {
-      font-size: 0.6875rem;
-    }
-
-    .actions-cell {
-      text-align: right;
-      white-space: nowrap;
-    }
-
-    .meta-text {
-      font-size: 0.8125rem;
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    /* Empty state */
-    .empty-state {
-      text-align: center;
-      padding: 3rem 2rem;
-    }
-
-    .compact .empty-state {
-      padding: 2rem 1.5rem;
-    }
-
-    .empty-state > sl-icon {
-      font-size: 3rem;
-      color: var(--scion-text-muted, #64748b);
-      opacity: 0.5;
-      margin-bottom: 0.75rem;
-    }
-
-    .empty-state h3 {
-      font-size: 1.125rem;
-      font-weight: 600;
-      color: var(--scion-text, #1e293b);
-      margin: 0 0 0.5rem 0;
-    }
-
-    .empty-state p {
-      color: var(--scion-text-muted, #64748b);
-      margin: 0 0 1.25rem 0;
-      font-size: 0.875rem;
-    }
-
-    /* Loading / Error */
-    .loading-state {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 2rem;
-      color: var(--scion-text-muted, #64748b);
-      gap: 0.75rem;
-    }
-
-    .error-state {
-      color: var(--sl-color-danger-600, #dc2626);
-      font-size: 0.875rem;
-      padding: 0.75rem 1rem;
-      background: var(--sl-color-danger-50, #fef2f2);
-      border-radius: var(--scion-radius, 0.5rem);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 0.5rem;
-    }
-
-    .feedback-alert {
-      margin-bottom: 1rem;
-    }
-
-    /* Dialog */
-    .form-group {
-      margin-bottom: 1rem;
-    }
-
-    .form-group:last-child {
-      margin-bottom: 0;
-    }
-
-    .dialog-error {
-      color: var(--sl-color-danger-600, #dc2626);
-      font-size: 0.875rem;
-      padding: 0.5rem 0.75rem;
-      background: var(--sl-color-danger-50, #fef2f2);
-      border-radius: var(--scion-radius, 0.5rem);
-    }
-
-    .validation-warning {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      padding: 0.5rem 0.75rem;
-      background: var(--sl-color-warning-50, #fffbeb);
-      border: 1px solid var(--sl-color-warning-200, #fde68a);
-      border-radius: var(--scion-radius, 0.5rem);
-      color: var(--sl-color-warning-700, #b45309);
-      font-size: 0.8125rem;
-    }
-
-    .validation-warning sl-icon {
-      flex-shrink: 0;
-    }
-
-    .role-badges {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 0.25rem;
-    }
-
-    .role-badge.custom {
-      background: var(--sl-color-primary-50, #eff6ff);
-      color: var(--sl-color-primary-700, #1d4ed8);
-    }
-
-    .no-role {
-      font-style: italic;
-    }
-
-    .form-label {
-      display: block;
-      font-size: 0.875rem;
-      font-weight: 500;
-      margin-bottom: 0.375rem;
-    }
-
-    .form-help {
-      font-size: 0.75rem;
-      color: var(--scion-text-muted, #64748b);
-      margin: 0.25rem 0 0.5rem;
-    }
-
-    .dialog-member {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      margin-bottom: 1rem;
-    }
-
-    .role-option {
-      display: block;
-      margin-bottom: 0.25rem;
-    }
-
-    .option-reason {
-      display: block;
-      font-size: 0.75rem;
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    .option-error {
-      outline: 2px solid var(--sl-color-danger-500, #ef4444);
-      outline-offset: 2px;
-      border-radius: 0.25rem;
-    }
-
-    .custom-role-list {
-      display: flex;
-      flex-direction: column;
-      gap: 0.375rem;
-    }
-
-    .dialog-info {
-      color: var(--sl-color-primary-700, #1d4ed8);
-      font-size: 0.875rem;
-      padding: 0.5rem 0.75rem;
-      margin-bottom: 1rem;
-      background: var(--sl-color-primary-50, #eff6ff);
-      border-radius: var(--scion-radius, 0.5rem);
-    }
-
-    .dialog-info .locked-reason {
-      display: block;
-      margin-top: 0.25rem;
-      font-weight: 600;
-    }
-
-    .dialog-actions-inline {
-      margin-top: 0.5rem;
-    }
-
-    @media (max-width: 768px) {
-      .hide-mobile {
-        display: none;
+  static override styles = [
+    invitedStatusTagStyles,
+    css`
+      :host {
+        display: block;
       }
 
       .section {
-        padding: 1rem;
+        background: var(--scion-surface, #ffffff);
+        border: 1px solid var(--scion-border, #e2e8f0);
+        border-radius: var(--scion-radius-lg, 0.75rem);
+        padding: 1.5rem;
+        margin-bottom: 1.5rem;
       }
 
-      th,
-      td {
-        padding: 0.5rem 0.75rem;
+      .section-header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        margin-bottom: 1rem;
+        gap: 1rem;
       }
-    }
-  `;
+
+      .section-header-info h2 {
+        font-size: 1.125rem;
+        font-weight: 600;
+        color: var(--scion-text, #1e293b);
+        margin: 0 0 0.25rem 0;
+      }
+
+      .section-header-info p {
+        color: var(--scion-text-muted, #64748b);
+        font-size: 0.875rem;
+        margin: 0;
+      }
+
+      .section-header-actions {
+        display: flex;
+        gap: 0.5rem;
+        align-items: center;
+        flex-shrink: 0;
+      }
+
+      .member-count {
+        font-size: 0.875rem;
+        color: var(--scion-text-muted, #64748b);
+        font-weight: 400;
+        margin-left: 0.5rem;
+      }
+
+      /* Table */
+      .table-container {
+        background: var(--scion-surface, #ffffff);
+        border: 1px solid var(--scion-border, #e2e8f0);
+        border-radius: var(--scion-radius-lg, 0.75rem);
+        overflow: hidden;
+      }
+
+      .compact .table-container {
+        border: none;
+        border-radius: 0;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+
+      th {
+        text-align: left;
+        padding: 0.75rem 1rem;
+        font-size: 0.75rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--scion-text-muted, #64748b);
+        background: var(--scion-bg-subtle, #f1f5f9);
+        border-bottom: 1px solid var(--scion-border, #e2e8f0);
+      }
+
+      td {
+        padding: 0.75rem 1rem;
+        font-size: 0.875rem;
+        color: var(--scion-text, #1e293b);
+        border-bottom: 1px solid var(--scion-border, #e2e8f0);
+        vertical-align: middle;
+      }
+
+      tr:last-child td {
+        border-bottom: none;
+      }
+
+      tr:hover td {
+        background: var(--scion-bg-subtle, #f1f5f9);
+      }
+
+      /* Member identity */
+      .member-identity {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+      }
+
+      .member-icon {
+        width: 2rem;
+        height: 2rem;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+      }
+
+      .member-icon.user {
+        background: var(--sl-color-primary-100, #dbeafe);
+        color: var(--sl-color-primary-600, #2563eb);
+      }
+
+      .member-icon.group {
+        background: var(--sl-color-warning-100, #fef3c7);
+        color: var(--sl-color-warning-600, #d97706);
+      }
+
+      .member-icon.agent {
+        background: var(--sl-color-success-100, #dcfce7);
+        color: var(--sl-color-success-600, #16a34a);
+      }
+
+      .member-icon sl-icon {
+        font-size: 0.875rem;
+      }
+
+      .member-info {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+      }
+
+      .member-name-row {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        min-width: 0;
+      }
+
+      .member-name {
+        font-weight: 500;
+        font-size: 0.875rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .member-detail {
+        font-size: 0.6875rem;
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      /* Role badge */
+      .role-badge {
+        display: inline-flex;
+        align-items: center;
+        padding: 0.125rem 0.5rem;
+        border-radius: 9999px;
+        font-size: 0.75rem;
+        font-weight: 500;
+        background: var(--scion-bg-subtle, #f1f5f9);
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      /* Provenance badge */
+      .provenance-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.25rem;
+        font-size: 0.6875rem;
+      }
+
+      .provenance-badge.direct {
+        color: var(--sl-color-primary-600, #2563eb);
+      }
+
+      .provenance-badge.group-derived {
+        color: var(--sl-color-warning-600, #d97706);
+      }
+
+      .provenance-badge sl-icon {
+        font-size: 0.6875rem;
+      }
+
+      .actions-cell {
+        text-align: right;
+        white-space: nowrap;
+      }
+
+      .meta-text {
+        font-size: 0.8125rem;
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      /* Empty state */
+      .empty-state {
+        text-align: center;
+        padding: 3rem 2rem;
+      }
+
+      .compact .empty-state {
+        padding: 2rem 1.5rem;
+      }
+
+      .empty-state > sl-icon {
+        font-size: 3rem;
+        color: var(--scion-text-muted, #64748b);
+        opacity: 0.5;
+        margin-bottom: 0.75rem;
+      }
+
+      .empty-state h3 {
+        font-size: 1.125rem;
+        font-weight: 600;
+        color: var(--scion-text, #1e293b);
+        margin: 0 0 0.5rem 0;
+      }
+
+      .empty-state p {
+        color: var(--scion-text-muted, #64748b);
+        margin: 0 0 1.25rem 0;
+        font-size: 0.875rem;
+      }
+
+      /* Loading / Error */
+      .loading-state {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 2rem;
+        color: var(--scion-text-muted, #64748b);
+        gap: 0.75rem;
+      }
+
+      .error-state {
+        color: var(--sl-color-danger-600, #dc2626);
+        font-size: 0.875rem;
+        padding: 0.75rem 1rem;
+        background: var(--sl-color-danger-50, #fef2f2);
+        border-radius: var(--scion-radius, 0.5rem);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.5rem;
+      }
+
+      .feedback-alert {
+        margin-bottom: 1rem;
+      }
+
+      /* Dialog */
+      .form-group {
+        margin-bottom: 1rem;
+      }
+
+      .form-group:last-child {
+        margin-bottom: 0;
+      }
+
+      .dialog-error {
+        color: var(--sl-color-danger-600, #dc2626);
+        font-size: 0.875rem;
+        padding: 0.5rem 0.75rem;
+        background: var(--sl-color-danger-50, #fef2f2);
+        border-radius: var(--scion-radius, 0.5rem);
+      }
+
+      .validation-warning {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.5rem 0.75rem;
+        background: var(--sl-color-warning-50, #fffbeb);
+        border: 1px solid var(--sl-color-warning-200, #fde68a);
+        border-radius: var(--scion-radius, 0.5rem);
+        color: var(--sl-color-warning-700, #b45309);
+        font-size: 0.8125rem;
+      }
+
+      .validation-warning sl-icon {
+        flex-shrink: 0;
+      }
+
+      .role-badges {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.25rem;
+      }
+
+      .role-badge.custom {
+        background: var(--sl-color-primary-50, #eff6ff);
+        color: var(--sl-color-primary-700, #1d4ed8);
+      }
+
+      .no-role {
+        font-style: italic;
+      }
+
+      .form-label {
+        display: block;
+        font-size: 0.875rem;
+        font-weight: 500;
+        margin-bottom: 0.375rem;
+      }
+
+      .form-help {
+        font-size: 0.75rem;
+        color: var(--scion-text-muted, #64748b);
+        margin: 0.25rem 0 0.5rem;
+      }
+
+      .dialog-member {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        margin-bottom: 1rem;
+      }
+
+      .role-option {
+        display: block;
+        margin-bottom: 0.25rem;
+      }
+
+      .option-reason {
+        display: block;
+        font-size: 0.75rem;
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .option-error {
+        outline: 2px solid var(--sl-color-danger-500, #ef4444);
+        outline-offset: 2px;
+        border-radius: 0.25rem;
+      }
+
+      .custom-role-list {
+        display: flex;
+        flex-direction: column;
+        gap: 0.375rem;
+      }
+
+      .dialog-info {
+        color: var(--sl-color-primary-700, #1d4ed8);
+        font-size: 0.875rem;
+        padding: 0.5rem 0.75rem;
+        margin-bottom: 1rem;
+        background: var(--sl-color-primary-50, #eff6ff);
+        border-radius: var(--scion-radius, 0.5rem);
+      }
+
+      .dialog-info .locked-reason {
+        display: block;
+        margin-top: 0.25rem;
+        font-weight: 600;
+      }
+
+      .dialog-actions-inline {
+        margin-top: 0.5rem;
+      }
+
+      .invited-member-alert div + div {
+        margin-top: 0.375rem;
+      }
+
+      @media (max-width: 768px) {
+        .hide-mobile {
+          display: none;
+        }
+
+        .section {
+          padding: 1rem;
+        }
+
+        th,
+        td {
+          padding: 0.5rem 0.75rem;
+        }
+      }
+    `,
+  ];
 
   /** Guard to prevent double-fetch when connectedCallback and updated both fire. */
   private _initialLoadDone = false;
@@ -1052,6 +1116,9 @@ export class ScionProjectMembersEditor extends LitElement {
             canTransfer: rawCaps.canTransfer ?? false,
             canManageCustomRoles: rawCaps.canManageCustomRoles ?? false,
             actions: rawCaps.actions ?? [],
+            ...(typeof rawCaps.canLeave === 'boolean'
+              ? { canLeave: rawCaps.canLeave, leaveBlockedReason: rawCaps.leaveBlockedReason ?? '' }
+              : {}),
           }
         : null;
     } catch (err) {
@@ -1070,6 +1137,14 @@ export class ScionProjectMembersEditor extends LitElement {
       this.catalogError = null;
     }
     this.loading = false;
+    if (this.openTransferOnLoad && !this.transferOpenedOnLoad && this.capabilities?.canTransfer) {
+      this.transferOpenedOnLoad = true;
+      this.openTransferDialog();
+      // Tell the host the one-time open happened, so it clears its flag.
+      this.dispatchEvent(
+        new CustomEvent(TRANSFER_OPENED_ON_LOAD_EVENT, { bubbles: true, composed: true })
+      );
+    }
   }
 
   private async loadAssignableRoles(): Promise<void> {
@@ -1199,6 +1274,7 @@ export class ScionProjectMembersEditor extends LitElement {
     this.dlgPrincipalType = 'user';
     this.dlgPrincipalId = '';
     this.dlgDisplayName = '';
+    this.dlgPrincipalStatus = '';
     this.dlgCurrentBuiltIn = NO_PROJECT_ROLE;
     this.dlgCurrentBuiltInName = '';
     this.dlgBuiltIn = defaultBuiltInForAdd(this.capabilities, 'user', this.assignableRoles);
@@ -1246,6 +1322,7 @@ export class ScionProjectMembersEditor extends LitElement {
     this.dlgPrincipalType = group.principalType as MemberPrincipalType;
     this.dlgPrincipalId = group.principalId;
     this.dlgDisplayName = principalLabel(group);
+    this.dlgPrincipalStatus = group.principalStatus ?? '';
     this.dlgCurrentBuiltIn = builtIn?.roleDefinitionId ?? NO_PROJECT_ROLE;
     this.dlgCurrentBuiltInName = builtIn?.roleName ?? '';
     this.dlgBuiltIn = this.dlgCurrentBuiltIn;
@@ -1280,6 +1357,7 @@ export class ScionProjectMembersEditor extends LitElement {
     this.dlgPrincipalType = principalType;
     this.dlgPrincipalId = principalId;
     this.dlgDisplayName = displayName || principalId;
+    this.dlgPrincipalStatus = '';
     this.dlgCurrentBuiltIn = builtIn ?? NO_PROJECT_ROLE;
     this.dlgCurrentBuiltInName = this.assignableRoles.find((r) => r.id === builtIn)?.name ?? '';
     this.dlgBuiltIn = this.dlgCurrentBuiltIn;
@@ -1316,6 +1394,7 @@ export class ScionProjectMembersEditor extends LitElement {
     this.dlgPrincipalType = type;
     this.dlgPrincipalId = '';
     this.dlgDisplayName = '';
+    this.dlgPrincipalStatus = '';
     this.dlgBuiltIn = defaultBuiltInForAdd(this.capabilities, type, this.assignableRoles);
     this.dlgBuiltInTouched = false;
     this.dlgCustomIds = [];
@@ -1329,6 +1408,7 @@ export class ScionProjectMembersEditor extends LitElement {
     if (this.dialogMode !== 'add') return;
     this.dlgPrincipalId = detail.principalId;
     this.dlgDisplayName = detail.displayLabel;
+    this.dlgPrincipalStatus = detail.principalStatus ?? '';
     const existing = findMemberGroup(this.groups, this.dlgPrincipalType, detail.principalId);
     if (existing) {
       const label = principalLabel(existing);
@@ -1602,6 +1682,76 @@ export class ScionProjectMembersEditor extends LitElement {
   // Transfer ownership
   // ---------------------------------------------------------------------------
 
+  /** Open the transfer ownership dialog, when the user may transfer. */
+  openTransferOwnership(): void {
+    if (this.capabilities?.canTransfer) this.openTransferDialog();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Leave (ptone/scion#7494)
+  // ---------------------------------------------------------------------------
+
+  /** Whether `group` is the signed-in user's own row. */
+  private isSelfRow(group: ProjectMemberGroup): boolean {
+    return (
+      !!this.currentUserId &&
+      group.principalType === 'user' &&
+      group.principalId === this.currentUserId
+    );
+  }
+
+  /** How the signed-in user's own row offers Leave. */
+  private get selfLeave(): LeaveVisibility {
+    return leaveVisibility(this.capabilities);
+  }
+
+  /** Whether the actions column is shown: editable, or a self row with Leave. */
+  private get showActions(): boolean {
+    if (!this.effectiveReadOnly) return true;
+    return this.selfLeave.kind !== 'hidden' && this.groups.some((g) => this.isSelfRow(g));
+  }
+
+  private openLeaveDialog(): void {
+    if (this.selfLeave.kind !== 'enabled') return;
+    const dialog = this.shadowRoot?.querySelector<ScionProjectLeaveDialog>(
+      'scion-project-leave-dialog'
+    );
+    void dialog?.show();
+  }
+
+  private renderLeaveDialog(): TemplateResult | typeof nothing {
+    if (this.selfLeave.kind === 'hidden') return nothing;
+    return html`<scion-project-leave-dialog
+      projectId=${this.projectId}
+      projectName=${this.projectName}
+      ?transferAvailable=${!!this.capabilities?.canTransfer}
+      @scion-leave-transfer-ownership=${(e: Event) => {
+        e.stopPropagation();
+        this.openTransferDialog();
+      }}
+      @scion-project-left=${(e: CustomEvent<ProjectLeftDetail>) => {
+        if (e.detail.result.remainingAccess !== 'none') void this.loadData();
+      }}
+    ></scion-project-leave-dialog>`;
+  }
+
+  private renderSelfLeave(): TemplateResult {
+    const leave = this.selfLeave;
+    const button = html`<sl-button
+      size="small"
+      variant="default"
+      data-self-leave
+      ?disabled=${leave.kind === 'blocked'}
+      @click=${() => this.openLeaveDialog()}
+    >
+      <sl-icon slot="prefix" name="box-arrow-right"></sl-icon>
+      Leave
+    </sl-button>`;
+    return leave.kind === 'blocked'
+      ? html`<sl-tooltip content=${leave.reason}><span>${button}</span></sl-tooltip>`
+      : button;
+  }
+
   private openTransferDialog(): void {
     this.transferNewOwnerId = '';
     this.transferError = null;
@@ -1696,6 +1846,7 @@ export class ScionProjectMembersEditor extends LitElement {
         </div>
       </div>
       ${this.renderBody()} ${this.renderMemberDialog()} ${this.renderTransferDialog()}
+      ${this.renderLeaveDialog()}
     `;
   }
 
@@ -1736,6 +1887,7 @@ export class ScionProjectMembersEditor extends LitElement {
           </div>
         </div>
         ${this.renderBody()} ${this.renderMemberDialog()} ${this.renderTransferDialog()}
+        ${this.renderLeaveDialog()}
       </div>
     `;
   }
@@ -1809,7 +1961,7 @@ export class ScionProjectMembersEditor extends LitElement {
               <th>Member</th>
               <th>Roles</th>
               ${showSource ? html`<th class="hide-mobile">Source</th>` : nothing}
-              ${!this.effectiveReadOnly ? html`<th class="actions-cell">Actions</th>` : nothing}
+              ${this.showActions ? html`<th class="actions-cell">Actions</th>` : nothing}
             </tr>
           </thead>
           <tbody>
@@ -1842,6 +1994,10 @@ export class ScionProjectMembersEditor extends LitElement {
     const remove = canRemoveRow(group, this.capabilities, this.groups);
     // The shield-lock icon already explains the last-owner case.
     const removeTip = lastOwner ? '' : remove.reason;
+    // The user's own row offers Leave in place of Remove (ptone/scion#7494).
+    const selfLeave = this.isSelfRow(group) && this.selfLeave.kind !== 'hidden';
+    const isInvited = group.principalType === 'user' && group.principalStatus === 'invited';
+    const invitedTip = rowTier(group) === 'owner' ? INVITED_OWNER_TOOLTIP : INVITED_MEMBER_TOOLTIP;
 
     return html`
       <tr data-principal=${key}>
@@ -1851,7 +2007,14 @@ export class ScionProjectMembersEditor extends LitElement {
               <sl-icon name="${getPrincipalIcon(group.principalType)}"></sl-icon>
             </div>
             <div class="member-info">
-              <span class="member-name">${principalLabel(group)}</span>
+              <div class="member-name-row">
+                <span class="member-name">${principalLabel(group)}</span>
+                ${isInvited
+                  ? html`<sl-tooltip content=${invitedTip}>
+                      <span class="status-badge invited">Invited</span>
+                    </sl-tooltip>`
+                  : nothing}
+              </div>
               <span class="member-detail">${group.principalType}</span>
             </div>
           </div>
@@ -1867,10 +2030,10 @@ export class ScionProjectMembersEditor extends LitElement {
               </span>
             </td>`
           : nothing}
-        ${!this.effectiveReadOnly
+        ${this.showActions
           ? html`
               <td class="actions-cell">
-                ${editable
+                ${editable && !this.effectiveReadOnly
                   ? html`
                       <sl-icon-button
                         name="pencil"
@@ -1880,7 +2043,8 @@ export class ScionProjectMembersEditor extends LitElement {
                       ></sl-icon-button>
                     `
                   : nothing}
-                ${editable
+                ${selfLeave ? this.renderSelfLeave() : nothing}
+                ${editable && !this.effectiveReadOnly && !selfLeave
                   ? html`
                       <sl-tooltip content=${removeTip} ?disabled=${!removeTip}>
                         <sl-icon-button
@@ -1892,7 +2056,7 @@ export class ScionProjectMembersEditor extends LitElement {
                       </sl-tooltip>
                     `
                   : nothing}
-                ${lastOwner
+                ${lastOwner && !this.effectiveReadOnly && !selfLeave
                   ? html`<sl-tooltip content=${LAST_OWNER_REMOVE_REASON}>
                       <sl-icon
                         name="shield-lock"
@@ -1935,7 +2099,6 @@ export class ScionProjectMembersEditor extends LitElement {
     const locked = !!this.dlgLockedReason;
     const optionState = (role: AssignableProjectRole | null): OptionState =>
       locked ? { disabled: true, reason: '' } : builtInOptionState(role, ctx);
-    const labels: Record<RoleTier, string> = { owner: 'Owner', admin: 'Admin', member: 'Member' };
     const option = (value: string, label: string, state: OptionState, description = '') => html`
       <sl-radio
         class="role-option ${this.dlgErrorRoleId === value ? 'option-error' : ''}"
@@ -1961,7 +2124,7 @@ export class ScionProjectMembersEditor extends LitElement {
           }}
         >
           ${builtIns.map((role) =>
-            option(role.id, labels[getRoleTier(role.name)], optionState(role), role.description)
+            option(role.id, builtInRoleLabel(role.name), optionState(role), role.description)
           )}
           ${this.noProjectRoleShown
             ? option(
@@ -2085,6 +2248,25 @@ export class ScionProjectMembersEditor extends LitElement {
     `;
   }
 
+  private renderInvitedDialogNotice(): TemplateResult | typeof nothing {
+    if (this.dlgPrincipalType !== 'user' || this.dlgPrincipalStatus !== 'invited') return nothing;
+    const selectedBuiltInName =
+      this.dlgBuiltIn === NO_PROJECT_ROLE
+        ? ''
+        : (this.assignableRoles.find((r) => r.id === this.dlgBuiltIn)?.name ??
+          (this.dlgBuiltIn === this.dlgCurrentBuiltIn ? this.dlgCurrentBuiltInName : ''));
+    const selectedOwner = !!selectedBuiltInName && getRoleTier(selectedBuiltInName) === 'owner';
+    return html`
+      <div class="form-group">
+        <sl-alert class="invited-member-alert" variant="primary" open>
+          <sl-icon slot="icon" name="info-circle"></sl-icon>
+          <div>${INVITED_DIALOG_NOTICE}</div>
+          ${selectedOwner ? html`<div>${INVITED_DIALOG_OWNER_WARNING}</div>` : nothing}
+        </sl-alert>
+      </div>
+    `;
+  }
+
   private renderMemberDialog() {
     if (!this.dialogOpen) return nothing;
 
@@ -2158,7 +2340,12 @@ export class ScionProjectMembersEditor extends LitElement {
                   <sl-icon name="${getPrincipalIcon(this.dlgPrincipalType)}"></sl-icon>
                 </div>
                 <div class="member-info">
-                  <span class="member-name">${this.dlgDisplayName || this.dlgPrincipalId}</span>
+                  <div class="member-name-row">
+                    <span class="member-name">${this.dlgDisplayName || this.dlgPrincipalId}</span>
+                    ${this.dlgPrincipalType === 'user' && this.dlgPrincipalStatus === 'invited'
+                      ? html`<span class="status-badge invited">Invited</span>`
+                      : nothing}
+                  </div>
                   <span class="member-detail">${this.dlgPrincipalType}</span>
                 </div>
                 ${this.dlgIsLastOwner
@@ -2171,6 +2358,7 @@ export class ScionProjectMembersEditor extends LitElement {
                   : nothing}
               </div>
             `}
+        ${this.renderInvitedDialogNotice()}
         ${this.catalogError
           ? html`<div class="form-group dialog-error">
               Couldn't load the list of roles: ${this.catalogError}

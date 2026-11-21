@@ -63,16 +63,27 @@ type idFixtures struct {
 	groupDel                string
 	user                    string
 	userDel                 string
+	userDeletion            string
 	member                  string
 	skill                   string
 	skillDel                string
+	projectSkill            string
+	projectSkillDel         string
 	skillRegistry           string
 	template                string
 	templateDel             string
+	projectTemplate         string
+	projectTemplateDel      string
 	harnessConfig           string
 	harnessConfigDel        string
 	schedule                string
 	scheduledEvent          string
+	webhookEndpoint         string
+	webhookEndpointDel      string
+	trigger                 string
+	triggerPaused           string
+	triggerDel              string
+	triggerEvent            string
 	limit                   string
 	limitUD                 string
 	entitlement             string
@@ -109,6 +120,7 @@ type idFixtures struct {
 	integrationName         string
 	lifecycleHook           string
 	hubPreStartHook         string
+	hubPreStartHookDel      string
 	chatTopic               string
 	agentLifecycle          string
 	agentRestore            string
@@ -143,10 +155,13 @@ type idFixtures struct {
 	// (skillVersion, 1.0.0) holding one stored file, SKILL.md;
 	// templateFiles and harnessConfigFiles are global records holding one
 	// stored file each, README.md (seedLiveInventoryCatalogFiles).
-	skillFiles         string
-	skillVersion       string
-	templateFiles      string
-	harnessConfigFiles string
+	skillFiles           string
+	skillVersion         string
+	projectSkillFiles    string
+	projectSkillVersion  string
+	templateFiles        string
+	projectTemplateFiles string
+	harnessConfigFiles   string
 	// delegation holds an agent delegation grant bound to agent, a
 	// disposable twin grant for the revoke entry, and an active delegated
 	// credential of the first grant (seedLiveInventoryDelegation).
@@ -329,16 +344,27 @@ func seedLiveInventoryFixtures(t *testing.T, ctx context.Context, srv *Server, s
 		groupDel:             tid("li-group-del"),
 		user:                 tid("li-user"),
 		userDel:              tid("li-user-del"),
+		userDeletion:         tid("li-user-deletion"),
 		member:               tid("li-member"),
 		skill:                tid("li-skill"),
 		skillDel:             tid("li-skill-del"),
+		projectSkill:         tid("li-project-skill"),
+		projectSkillDel:      tid("li-project-skill-del"),
 		skillRegistry:        tid("li-skill-registry"),
 		template:             tid("li-template"),
 		templateDel:          tid("li-template-del"),
+		projectTemplate:      tid("li-project-template"),
+		projectTemplateDel:   tid("li-project-template-del"),
 		harnessConfig:        tid("li-hc"),
 		harnessConfigDel:     tid("li-hc-del"),
 		schedule:             tid("li-schedule"),
 		scheduledEvent:       tid("li-sched-event"),
+		webhookEndpoint:      tid("li-webhook-ep"),
+		webhookEndpointDel:   tid("li-webhook-ep-del"),
+		trigger:              tid("li-trigger"),
+		triggerPaused:        tid("li-trigger-paused"),
+		triggerDel:           tid("li-trigger-del"),
+		triggerEvent:         tid("li-trigger-event"),
 		limit:                tid("li-limit"),
 		limitUD:              tid("li-limit-ud"),
 		entitlement:          tid("li-entitlement"),
@@ -424,11 +450,17 @@ func seedLiveInventoryFixtures(t *testing.T, ctx context.Context, srv *Server, s
 
 	require.NoError(t, s.CreateUser(ctx, &store.User{ID: f.user, Email: "li-user@test.com", DisplayName: "LI User", Role: "member", Status: "active"}))
 	require.NoError(t, s.CreateUser(ctx, &store.User{ID: f.userDel, Email: "li-user-del@test.com", DisplayName: "LI User Del", Role: "member", Status: "active"}))
+	// A user with a recorded forced deletion, for GET
+	// /api/v1/users/{id}/deletion (ptone/scion#2143).
+	require.NoError(t, s.CreateUser(ctx, &store.User{ID: f.userDeletion, Email: "li-user-deletion@test.com", DisplayName: "LI User Deletion", Role: "member", Status: "active"}))
+	require.NoError(t, s.CreateUserDeletion(ctx, &store.UserDeletion{UserID: f.userDeletion, RequestedByKind: "user", RequestedByID: DevUserID, CredentialKind: "session", RequestedAt: time.Now()}))
 	require.NoError(t, s.CreateUser(ctx, &store.User{ID: f.member, Email: "li-member@test.com", DisplayName: "LI Member", Role: "member", Status: "active"}))
 	require.NoError(t, s.AddGroupMember(ctx, &store.GroupMember{GroupID: f.group, MemberID: f.member, MemberType: store.GroupMemberTypeUser, Role: store.GroupMemberRoleMember}))
 
 	require.NoError(t, s.CreateSkill(ctx, &store.Skill{ID: f.skill, Name: "li-skill", Slug: "li-skill", Scope: store.SkillScopeGlobal, Status: "active", Created: now, Updated: now}))
 	require.NoError(t, s.CreateSkill(ctx, &store.Skill{ID: f.skillDel, Name: "li-skill-del", Slug: "li-skill-del", Scope: store.SkillScopeGlobal, Status: "active", Created: now, Updated: now}))
+	require.NoError(t, s.CreateSkill(ctx, &store.Skill{ID: f.projectSkill, Name: "li-project-skill-rec", Slug: "li-project-skill-rec", Scope: store.SkillScopeProject, ScopeID: f.project, Status: "active", Created: now, Updated: now}))
+	require.NoError(t, s.CreateSkill(ctx, &store.Skill{ID: f.projectSkillDel, Name: "li-project-skill-del", Slug: "li-project-skill-del", Scope: store.SkillScopeProject, ScopeID: f.project, Status: "active", Created: now, Updated: now}))
 	// CreateSkillRegistry (skill_registry_store.go) ignores a caller-supplied
 	// ID and mints its own, writing it back into the passed struct.
 	skillRegistry := &store.SkillRegistry{Name: "li-skill-registry", Endpoint: "https://example.invalid/registry", Type: store.SkillRegistryTypeHub, TrustLevel: store.SkillRegistryTrustTrusted, Status: store.SkillRegistryStatusActive, Created: now, Updated: now}
@@ -440,12 +472,93 @@ func seedLiveInventoryFixtures(t *testing.T, ctx context.Context, srv *Server, s
 
 	require.NoError(t, s.CreateTemplate(ctx, &store.Template{ID: f.template, Name: "li-template", Slug: "li-template", Harness: "claude", Scope: store.TemplateScopeGlobal, Created: now, Updated: now}))
 	require.NoError(t, s.CreateTemplate(ctx, &store.Template{ID: f.templateDel, Name: "li-template-del", Slug: "li-template-del", Harness: "claude", Scope: store.TemplateScopeGlobal, Created: now, Updated: now}))
+	require.NoError(t, s.CreateTemplate(ctx, &store.Template{ID: f.projectTemplate, Name: "li-project-template-rec", Slug: "li-project-template-rec", Harness: "claude", Scope: store.TemplateScopeProject, ScopeID: f.project, ProjectID: f.project, Created: now, Updated: now}))
+	require.NoError(t, s.CreateTemplate(ctx, &store.Template{ID: f.projectTemplateDel, Name: "li-project-template-del", Slug: "li-project-template-del", Harness: "claude", Scope: store.TemplateScopeProject, ScopeID: f.project, ProjectID: f.project, Created: now, Updated: now}))
 
 	require.NoError(t, s.CreateHarnessConfig(ctx, &store.HarnessConfig{ID: f.harnessConfig, Name: "li-hc", Slug: "li-hc", Harness: "claude", Scope: store.HarnessConfigScopeGlobal, Status: store.HarnessConfigStatusActive, Created: now, Updated: now}))
 	require.NoError(t, s.CreateHarnessConfig(ctx, &store.HarnessConfig{ID: f.harnessConfigDel, Name: "li-hc-del", Slug: "li-hc-del", Harness: "claude", Scope: store.HarnessConfigScopeGlobal, Status: store.HarnessConfigStatusActive, Created: now, Updated: now}))
 
 	require.NoError(t, s.CreateSchedule(ctx, &store.Schedule{ID: f.schedule, ProjectID: f.project, Name: "li-schedule", CronExpr: "0 0 * * *", EventType: "message", Payload: "{}", Status: store.ScheduleStatusActive, CreatedAt: now, UpdatedAt: now}))
 	require.NoError(t, s.CreateScheduledEvent(ctx, &store.ScheduledEvent{ID: f.scheduledEvent, ProjectID: f.project, EventType: "message", FireAt: now.Add(time.Hour), Payload: "{}", Status: store.ScheduledEventPending, CreatedAt: now}))
+
+	for _, epSeed := range []struct {
+		id   string
+		name string
+	}{
+		{f.webhookEndpoint, "li-webhook-ep"},
+		{f.webhookEndpointDel, "li-webhook-ep-del"},
+	} {
+		require.NoError(t, s.CreateWebhookEndpoint(ctx, &store.WebhookEndpoint{
+			ID:                  epSeed.id,
+			ProjectID:           f.project,
+			Name:                epSeed.name,
+			Status:              store.WebhookEndpointStatusActive,
+			SignatureMode:       store.WebhookSignatureModeScionV1,
+			SecretVersion:       1,
+			OwnerPrincipalKind:  "user",
+			OwnerPrincipalID:    DevUserID,
+			OwnerCredentialKind: store.InitiatorCredentialKindSession,
+			CreatedBy:           DevUserID,
+			CreatedAt:           now,
+			UpdatedAt:           now,
+		}))
+		secretRow, sErr := srv.newWebhookEndpointSecretRow(f.project, epSeed.id, 1, "li-webhook-secret-"+epSeed.name, DevUserID)
+		require.NoError(t, sErr)
+		require.NoError(t, s.CreateSecret(ctx, secretRow))
+	}
+	liTriggerPayload := `{"agentId":"` + f.agent + `","agentName":"li-agent","message":"li-trigger-msg","wake":true}`
+	for _, trSeed := range []struct {
+		id     string
+		name   string
+		status string
+	}{
+		{f.trigger, "li-trigger", store.TriggerStatusActive},
+		{f.triggerPaused, "li-trigger-paused", store.TriggerStatusPaused},
+		{f.triggerDel, "li-trigger-del", store.TriggerStatusActive},
+	} {
+		require.NoError(t, s.CreateTrigger(ctx, &store.Trigger{
+			ID:             trSeed.id,
+			ProjectID:      f.project,
+			Name:           trSeed.name,
+			Status:         trSeed.status,
+			StatusReason:   store.TriggerStatusReasonNone,
+			SourceKind:     store.TriggerSourceKindWebhook,
+			SourceID:       f.webhookEndpoint,
+			MatchTypes:     []string{"webhook.received"},
+			MatchDialect:   "cel",
+			ActionType:     "message",
+			ActionPayload:  liTriggerPayload,
+			SubjectDialect: "cel",
+			SubjectMode:    store.TriggerSubjectModeNew,
+			CreatedBy:      DevUserID,
+			InitiatorAttribution: store.InitiatorAttribution{
+				InitiatorPrincipalKind:  "user",
+				InitiatorPrincipalID:    DevUserID,
+				InitiatorCredentialKind: store.InitiatorCredentialKindSession,
+				AttributionVersion:      1,
+				AuthorizationRevision:   1,
+			},
+			CreatedAt: now,
+			UpdatedAt: now,
+		}))
+	}
+	require.NoError(t, s.CreateTriggerEvent(ctx, &store.TriggerEvent{
+		ID:           f.triggerEvent,
+		ProjectID:    f.project,
+		SourceKind:   store.TriggerSourceKindWebhook,
+		SourceID:     f.webhookEndpoint,
+		Type:         "webhook.received",
+		Subject:      "webhook:" + f.webhookEndpoint,
+		DedupKey:     "li-trigger-event-dedup",
+		OccurredAt:   now,
+		ReceivedAt:   now,
+		Attributes:   map[string]string{"endpoint_name": "li-webhook-ep"},
+		Headers:      map[string]string{"Content-Type": "application/json"},
+		Payload:      `{"ok":true}`,
+		PayloadBytes: 11,
+		Status:       store.TriggerEventStatusProcessed,
+		CreatedAt:    now,
+	}))
 
 	limitDef, err := s.CreateLimitDefinition(ctx, &store.LimitDefinition{ID: f.limit, Name: "li-limit", ResourceType: "agent", Unit: "count", DefaultValue: 10, CreatedAt: now, UpdatedAt: now})
 	require.NoError(t, err)
@@ -679,6 +792,18 @@ func seedLiveInventoryFixtures(t *testing.T, ctx context.Context, srv *Server, s
 	})
 	require.NoError(t, err)
 	f.hubPreStartHook = hubHook.ID
+	// A disposable second hub hook for the update and delete routes, so the
+	// fixture hook above is never deleted and stays readable by GET
+	// /api/v1/pre-start-hooks/{id}. Creating it archives the fixture hook
+	// (a new hub hook archives the active one in the same scope); the walk's
+	// POST /api/v1/pre-start-hooks/{id}/activate entry re-activates the
+	// fixture hook before the DELETE, and the GET reads either state.
+	hubHookDel, err := s.CreateHubPreStartHook(ctx, &store.ProjectPreStartHook{
+		Scope: store.PreStartHookScopeHub, Name: "li-hub-pre-start-hook-del", Slug: "li-hub-pre-start-hook-del",
+		Script: "#!/bin/sh\necho li-del\n", CreatedBy: "li@test.com", UpdatedBy: "li@test.com",
+	})
+	require.NoError(t, err)
+	f.hubPreStartHookDel = hubHookDel.ID
 
 	// Artifact service: on (experiment, store, blob storage) with one
 	// single-file artifact owned by the dev user, homed in f.project.
@@ -686,14 +811,22 @@ func seedLiveInventoryFixtures(t *testing.T, ctx context.Context, srv *Server, s
 	f.artifact = seedLiveInventoryArtifact(t, ctx, artStore, artBlobs, f.project)
 	seedLiveInventoryCatalogFiles(t, ctx, s, artBlobs, &f)
 
-	// hub.conduit, hub.agent_delegation, federation.project_visitors and
-	// hub.agent_edit_held on too, so their experiment-gated routes are
-	// live: the registry above with all four also defaulting on (no
+	// hub.conduit, hub.agent_delegation, federation.project_visitors,
+	// web.chat_starred_messages, hub.agent_edit_held,
+	// hub.user_delete_force_cascade, hub.artifact_archive,
+	// hub.artifacts_open_review_check, hub.project_self_leave and
+	// hub.runtime_orphan_reconcile on too, so
+	// their experiment-gated
+	// routes are live: the registry above with them also defaulting on (no
 	// operational settings, which the other entries rely on, are replaced).
 	var active []experiments.Experiment
 	for _, e := range srv.experimentRegistry().All() {
 		if e.Name == conduitExperiment || e.Name == experiments.AgentDelegation || e.Name == experiments.FederationProjectVisitors ||
-			e.Name == experiments.AgentEditHeld {
+			e.Name == experiments.ChatStarredMessages || e.Name == experiments.AgentEditHeld ||
+			e.Name == experiments.UserDeleteForceCascade || e.Name == experiments.ArtifactArchive ||
+			e.Name == experiments.ArtifactsOpenReviewCheck ||
+			e.Name == experiments.ProjectSelfLeave || e.Name == experiments.RuntimeOrphanReconcile ||
+			e.Name == experiments.Triggers {
 			e.Default = true
 		}
 		active = append(active, e)
@@ -705,7 +838,14 @@ func seedLiveInventoryFixtures(t *testing.T, ctx context.Context, srv *Server, s
 	require.True(t, srv.experimentEnabled(experiments.Artifacts))
 	require.True(t, srv.experimentEnabled(experiments.AgentDelegation))
 	require.True(t, srv.experimentEnabled(experiments.FederationProjectVisitors))
+	require.True(t, srv.experimentEnabled(experiments.ChatStarredMessages))
 	require.True(t, srv.experimentEnabled(experiments.AgentEditHeld))
+	require.True(t, srv.experimentEnabled(experiments.UserDeleteForceCascade))
+	require.True(t, srv.experimentEnabled(experiments.ArtifactArchive))
+	require.True(t, srv.experimentEnabled(experiments.ArtifactsOpenReviewCheck))
+	require.True(t, srv.experimentEnabled(experiments.ProjectSelfLeave))
+	require.True(t, srv.experimentEnabled(experiments.RuntimeOrphanReconcile))
+	require.True(t, srv.experimentEnabled(experiments.Triggers))
 	// POST /api/v1/auth/federation-token also answers 404 while the OIDC
 	// provider is off: install a test key manager and allow the audience
 	// that bodyOverrides sends, so the route reaches its caller checks.
@@ -775,11 +915,26 @@ func seedLiveInventoryCatalogFiles(t *testing.T, ctx context.Context, s store.St
 		Status: store.SkillVersionStatusPublished, Files: file("SKILL.md"), Created: now}))
 	put(skillPath + "/1.0.0/SKILL.md")
 
+	f.projectSkillFiles = tid("li-project-skill-files")
+	projectSkillPath := "li-catalog/skills/li-project-skill-files"
+	require.NoError(t, s.CreateSkill(ctx, &store.Skill{ID: f.projectSkillFiles, Name: "li-project-skill-files", Slug: "li-project-skill-files", Scope: store.SkillScopeProject, ScopeID: f.project,
+		Status: "active", StoragePath: projectSkillPath, Created: now, Updated: now}))
+	f.projectSkillVersion = tid("li-project-skill-version")
+	require.NoError(t, s.CreateSkillVersion(ctx, &store.SkillVersion{ID: f.projectSkillVersion, SkillID: f.projectSkillFiles, Version: "1.0.0",
+		Status: store.SkillVersionStatusPublished, Files: file("SKILL.md"), Created: now}))
+	put(projectSkillPath + "/1.0.0/SKILL.md")
+
 	f.templateFiles = tid("li-template-files")
 	templatePath := "li-catalog/templates/li-template-files"
 	require.NoError(t, s.CreateTemplate(ctx, &store.Template{ID: f.templateFiles, Name: "li-template-files", Slug: "li-template-files", Harness: "claude",
 		Scope: store.TemplateScopeGlobal, Status: store.TemplateStatusActive, StoragePath: templatePath, Files: file("README.md"), Created: now, Updated: now}))
 	put(templatePath + "/README.md")
+
+	f.projectTemplateFiles = tid("li-project-template-files")
+	projectTemplatePath := "li-catalog/templates/li-project-template-files"
+	require.NoError(t, s.CreateTemplate(ctx, &store.Template{ID: f.projectTemplateFiles, Name: "li-project-template-files", Slug: "li-project-template-files", Harness: "claude",
+		Scope: store.TemplateScopeProject, ScopeID: f.project, ProjectID: f.project, Status: store.TemplateStatusActive, StoragePath: projectTemplatePath, Files: file("README.md"), Created: now, Updated: now}))
+	put(projectTemplatePath + "/README.md")
 
 	f.harnessConfigFiles = tid("li-hc-files")
 	hcPath := "li-catalog/harness-configs/li-hc-files"
@@ -849,12 +1004,27 @@ func opPatternOverrides(f idFixtures) map[overrideKey]map[string]string {
 		{"agent.lifecycle.delete", "/api/v1/projects/{projectId}/agents/{id}"}:          {"projectId": f.project, "id": f.agentDelProject},
 		{"agent.port.register", "/api/v1/agents/{id}/ports"}:                            {"id": f.agentPorts},
 		{"project.lifecycle.delete", "/api/v1/projects/{id}"}:                           {"id": f.projectDel},
+		{"hub.lifecyclehooks.update", "/api/v1/pre-start-hooks/{id}"}:                   {"id": f.hubPreStartHookDel},
 		{"group.delete", "/api/v1/groups/{id}"}:                                         {"id": f.groupDel},
 		{"user.admin.delete", "/api/v1/users/{id}"}:                                     {"id": f.userDel},
 		{"testidentity.delete", "/api/v1/test-identities/{id}"}:                         {"id": f.testIdentityDel},
-		{"skill.delete", "/api/v1/skills/{id}"}:                                         {"id": f.skillDel},
+		{"skill.update", "/api/v1/skills/{id}"}:                                         {"id": f.projectSkill},
+		{"skill.update", "/api/v1/skills/{id}/versions"}:                                {"id": f.projectSkillFiles},
+		{"skill.update", "/api/v1/skills/{id}/versions/{vid}/deprecate"}:                {"id": f.projectSkillFiles, "vid": f.projectSkillVersion},
+		{"skill.update", "/api/v1/skills/{id}/upload"}:                                  {"id": f.projectSkillFiles},
+		{"skill.update", "/api/v1/skills/{id}/finalize"}:                                {"id": f.projectSkillFiles},
+		{"skill.update", "/api/v1/skills/{id}/files/{path}"}:                            {"id": f.projectSkillFiles, "path": "SKILL.md"},
+		{"skill.delete", "/api/v1/skills/{id}"}:                                         {"id": f.projectSkillDel},
+		{"skill.global.delete", "/api/v1/skills/{id}"}:                                  {"id": f.skillDel},
 		{"skill.register", "/api/v1/skill-registries/{id}"}:                             {"id": f.skillRegistryDel},
-		{"template.delete", "/api/v1/templates/{id}"}:                                   {"id": f.templateDel},
+		{"template.update", "/api/v1/templates/{id}"}:                                   {"id": f.projectTemplate},
+		{"template.update", "/api/v1/templates/{id}/upload"}:                            {"id": f.projectTemplateFiles},
+		{"template.update", "/api/v1/templates/{id}/finalize"}:                          {"id": f.projectTemplateFiles},
+		{"template.update", "/api/v1/templates/{id}/files"}:                             {"id": f.projectTemplateFiles},
+		{"template.update", "/api/v1/templates/{id}/files/{path}"}:                      {"id": f.projectTemplateFiles, "path": "README.md"},
+		{"template.delete", "/api/v1/templates/{id}"}:                                   {"id": f.projectTemplateDel},
+		{"template.global.delete", "/api/v1/templates/{id}"}:                            {"id": f.templateDel},
+		{"template.reimport", "/api/v1/templates/{id}/reimport"}:                        {"id": f.projectTemplate},
 		{"harnessconfig.delete", "/api/v1/harness-configs/{id}"}:                        {"id": f.harnessConfigDel},
 		// User-scope branches address the caller's user-scope records; a
 		// clone copies the global fixture into the caller's user scope.
@@ -881,6 +1051,8 @@ func opPatternOverrides(f idFixtures) map[overrideKey]map[string]string {
 		// Grant revoke and grant read share their pattern; revoke takes
 		// the disposable twin grant.
 		{"agent.delegation.revoke", "/api/v1/agents/{id}/delegations/{grantId}"}: {"id": f.agent, "grantId": f.delegation.grantRevoke},
+		// Per-agent revoke-all takes the disposable agent and its grant.
+		{"agent.delegation.revokeall", "/api/v1/agents/{id}/delegations/revoke-all"}: {"id": f.delegation.revokeAllAgent},
 
 		// Group and direct conversation reads share their patterns.
 		{"project.conversation.read", "/api/v1/conversations/{id}"}:                           {"id": f.inbox.groupConversation},
@@ -896,6 +1068,10 @@ func opPatternOverrides(f idFixtures) map[overrideKey]map[string]string {
 		// The project-scoped role-binding DELETE removes its own project
 		// binding; the hub-path DELETE keeps the system-scoped fixture.
 		{"project.membership.rolebinding.delete", "/api/v1/admin/role-bindings/{id}"}: {"id": f.roleBindingProjectDel},
+
+		// Webhook endpoint and trigger deletes use disposable twins.
+		{"webhookendpoint.delete", "/api/v1/projects/{projectId}/webhook-endpoints/{id}"}: {"projectId": f.project, "id": f.webhookEndpointDel},
+		{"trigger.delete", "/api/v1/projects/{projectId}/triggers/{id}"}:                  {"projectId": f.project, "id": f.triggerDel},
 	}
 }
 
@@ -920,6 +1096,8 @@ func patternOverrides(f idFixtures) map[string]map[string]string {
 		"/api/v1/artifacts/{id}/versions/{seq}":              {"id": f.artifact, "seq": "1"},
 		"/api/v1/artifacts/{id}/versions/{seq}/finalize":     {"id": f.artifact, "seq": "1"},
 		"/api/v1/artifacts/{id}/versions/{seq}/view":         {"id": f.artifact, "seq": "1"},
+		"/api/v1/artifacts/{id}/versions/{seq}/archive":      {"id": f.artifact, "seq": "1"},
+		"/api/v1/artifacts/{id}/review-sessions/{sid}":       {"id": f.artifact, "sid": "AAAAAAAAAAAAAAAAAAAAAA"},
 
 		// --- test identity family ---
 		"/api/v1/test-identities/{id}/token":          {"id": f.testIdentity},
@@ -994,6 +1172,7 @@ func patternOverrides(f idFixtures) map[string]map[string]string {
 		"/api/v1/projects/{id}/members":              {"id": f.project},
 		"/api/v1/projects/{id}/members/{memberId}":   {"id": f.project, "memberId": f.projectMembership},
 		"/api/v1/projects/{id}/transfer-ownership":   {"id": f.project},
+		"/api/v1/projects/{id}/leave":                {"id": f.project},
 		"/api/v1/projects/{id}/visitors":             {"id": f.project},
 		"/api/v1/projects/{id}/visitors/{visitorId}": {"id": f.project, "visitorId": f.projectVisitor},
 		// Visitor rules (the item pattern addresses the rule remove takes).
@@ -1048,6 +1227,7 @@ func patternOverrides(f idFixtures) map[string]map[string]string {
 		"/api/v1/projects/{id}/github-status":                     {"id": f.project},
 		"/api/v1/projects/{id}/github-permissions":                {"id": f.project},
 		"/api/v1/projects/{id}/git-identity":                      {"id": f.project},
+		"/api/v1/projects/{id}/trigger-sources/github":            {"id": f.project},
 		"/api/v1/projects/{id}/members/assignable-roles":          {"id": f.project},
 
 		// --- group family ---
@@ -1058,6 +1238,8 @@ func patternOverrides(f idFixtures) map[string]map[string]string {
 		// --- user family ---
 		"/api/v1/users/{id}":                 {"id": f.user},
 		"/api/v1/users/{id}/revoke-sessions": {"id": f.user},
+		"/api/v1/users/{id}/delete-blockers": {"id": f.user},
+		"/api/v1/users/{id}/deletion":        {"id": f.userDeletion},
 
 		// --- skill family ---
 		"/api/v1/skills/{id}":                          {"id": f.skill},
@@ -1111,6 +1293,17 @@ func patternOverrides(f idFixtures) map[string]map[string]string {
 		"/api/v1/projects/{projectId}/schedules/{id}/pause":   {"projectId": f.project, "id": f.schedule},
 		"/api/v1/projects/{projectId}/schedules/{id}/resume":  {"projectId": f.project, "id": f.schedule},
 
+		// --- webhook endpoint & trigger families ---
+		"/api/v1/projects/{projectId}/webhook-endpoints":      {"projectId": f.project},
+		"/api/v1/projects/{projectId}/webhook-endpoints/{id}": {"projectId": f.project, "id": f.webhookEndpoint},
+		"/api/v1/projects/{projectId}/triggers":               {"projectId": f.project},
+		"/api/v1/projects/{projectId}/triggers/{id}":          {"projectId": f.project, "id": f.trigger},
+		"/api/v1/projects/{projectId}/triggers/{id}/history":  {"projectId": f.project, "id": f.trigger},
+		"/api/v1/projects/{projectId}/triggers/{id}/pause":    {"projectId": f.project, "id": f.trigger},
+		"/api/v1/projects/{projectId}/triggers/{id}/resume":   {"projectId": f.project, "id": f.triggerPaused},
+		"/api/v1/projects/{projectId}/trigger-events":         {"projectId": f.project},
+		"/api/v1/projects/{projectId}/trigger-events/{id}":    {"projectId": f.project, "id": f.triggerEvent},
+
 		// --- quota family (read defaults; quota.update/.delete are
 		// re-pointed at the disposable UD instances by opPatternOverrides) ---
 		"/api/v1/admin/limits/{id}":              {"id": f.limit},
@@ -1144,19 +1337,23 @@ func patternOverrides(f idFixtures) map[string]map[string]string {
 		"/api/v1/env/{key}": {"key": f.envVarKey},
 
 		// --- runtime broker family ---
-		"/api/v1/runtime-brokers/{id}":                         {"id": f.runtimeBroker},
-		"/api/v1/runtime-brokers/{id}/settings":                {"id": f.runtimeBroker},
-		"/api/v1/runtime-brokers/{id}/heartbeat":               {"id": f.runtimeBroker},
-		"/api/v1/runtime-brokers/{id}/projects":                {"id": f.runtimeBroker},
-		"/api/v1/runtime-brokers/{id}/env":                     {"id": f.runtimeBroker},
-		"/api/v1/runtime-brokers/{id}/env/{key}":               {"id": f.runtimeBroker, "key": f.brokerEnvKey},
-		"/api/v1/runtime-brokers/{id}/secrets":                 {"id": f.runtimeBroker},
-		"/api/v1/runtime-brokers/{id}/secrets/{key}":           {"id": f.runtimeBroker, "key": f.brokerSecretKey},
-		"/api/v1/runtime-brokers/{id}/message-failures":        {"id": f.runtimeBroker},
-		"/api/v1/runtime-brokers/{id}/agents/{agentId}/launch": {"id": f.runtimeBroker, "agentId": f.agent},
+		"/api/v1/runtime-brokers/{id}":                                     {"id": f.runtimeBroker},
+		"/api/v1/runtime-brokers/{id}/settings":                            {"id": f.runtimeBroker},
+		"/api/v1/runtime-brokers/{id}/heartbeat":                           {"id": f.runtimeBroker},
+		"/api/v1/runtime-brokers/{id}/projects":                            {"id": f.runtimeBroker},
+		"/api/v1/runtime-brokers/{id}/conversion-plan":                     {"id": f.runtimeBroker},
+		"/api/v1/runtime-brokers/{id}/env":                                 {"id": f.runtimeBroker},
+		"/api/v1/runtime-brokers/{id}/env/{key}":                           {"id": f.runtimeBroker, "key": f.brokerEnvKey},
+		"/api/v1/runtime-brokers/{id}/secrets":                             {"id": f.runtimeBroker},
+		"/api/v1/runtime-brokers/{id}/secrets/{key}":                       {"id": f.runtimeBroker, "key": f.brokerSecretKey},
+		"/api/v1/runtime-brokers/{id}/message-failures":                    {"id": f.runtimeBroker},
+		"/api/v1/runtime-brokers/{id}/agents/{agentId}/launch":             {"id": f.runtimeBroker, "agentId": f.agent},
+		"/api/v1/runtime-brokers/{id}/agents/{agentId}/workspace-download": {"id": f.runtimeBroker, "agentId": f.agent},
+		"/api/v1/runtime-brokers/{id}/agents/{agentId}/deliver":            {"id": f.runtimeBroker, "agentId": f.agent},
 
 		// --- github app family ---
-		"/api/v1/github-app/installations/{id}": {"id": f.githubInstallationID},
+		"/api/v1/github-app/installations/{id}":          {"id": f.githubInstallationID},
+		"/api/v1/github-app/repo-routing/{owner}/{repo}": {"owner": "li-account", "repo": "li-repo"},
 
 		// --- role family (role.definition.delete is re-pointed at the
 		// disposable instance by opPatternOverrides) ---
@@ -1190,6 +1387,9 @@ func patternOverrides(f idFixtures) map[string]map[string]string {
 		"/api/v1/chat/conversations/{id}/typing":               {"id": f.chatTopic},
 		"/api/v1/chat/conversations/{id}/interagent":           {"id": f.chat.dmAgent},
 		"/api/v1/chat/conversations/{id}/promote":              {"id": f.chat.dmAgent},
+		// Starred messages: the fixture thread's message (the PUT entry
+		// stars it before the read entries, the DELETE entry removes it).
+		"/api/v1/chat/stars/{messageId}": {"messageId": f.chat.topicMessage},
 
 		// --- integrations family ---
 		"/api/v1/admin/integrations/{name}":         {"name": f.integrationName},
@@ -1230,12 +1430,17 @@ func patternOverrides(f idFixtures) map[string]map[string]string {
 func queryOverrides(f idFixtures) map[string]string {
 	return map[string]string{
 		"/api/v1/chat/prefs": "agentId=" + f.agent,
+		// The star list needs its conversation, the state its messages.
+		"/api/v1/chat/stars":       "conversationKey=" + f.chatTopic,
+		"/api/v1/chat/stars/state": "messageId=" + f.chat.topicMessage,
 		// The single-file publish is selected by ?name= (pkg/artifacts).
 		"/api/v1/artifacts": "name=live-inventory.txt&scope=" + f.project,
 		// handleConversationResolve 400s without a reference.
 		"/api/v1/conversations/resolve": "reference=conv:" + f.inbox.groupConversation,
 		// handleAdminEffectiveAccess 400s without a principal.
 		"/api/v1/admin/effective-access": "principalType=user&principalId=" + f.user,
+		// handleAdminEffectivePermissions 400s without a principal.
+		"/api/v1/admin/effective-permissions": "principalType=user&principalId=" + f.user,
 		// handleListThreadGroups 400s without a project for a user.
 		"/api/v1/thread-groups": "projectId=" + f.project,
 		// Skill file reads and writes name the version.
@@ -1261,6 +1466,8 @@ func bodyOverrides(f idFixtures) map[overrideKey]map[string]interface{} {
 		// an admitted caller gets 200 instead of a body 400
 		// (seedLiveInventoryFixtures allows it).
 		{"federation.token.mint", "/api/v1/auth/federation-token"}: {"audience": liveInventoryFederationAudience},
+		// A star names the conversation of the message it stars.
+		{"chat.star.add", "/api/v1/chat/stars/{messageId}"}: {"conversationKey": f.chatTopic},
 		// updateProjectMemberRole (handlers_project_members.go) 400s
 		// "roleDefinitionId is required" on an empty body before the
 		// binding ID is used for anything; with a real role ID, the
@@ -1328,7 +1535,10 @@ func bodyOverrides(f idFixtures) map[overrideKey]map[string]interface{} {
 		{"skill.global.create", "/api/v1/skills"}:                       {"name": "li-global-skill", "scope": "global"},
 		{"skill.discover.project", "/api/v1/skills/discover-directory"}: {"projectId": f.project, "sourceUrl": "https://example.invalid/li-skills"},
 		{"skill.discover.global", "/api/v1/skills/discover-directory"}:  {"sourceUrl": "https://example.invalid/li-skills"},
-		{"template.create", "/api/v1/templates"}:                        {"name": "li-created-template", "harness": "claude", "scope": "global"},
+		{"template.create", "/api/v1/templates"}:                        {"name": "li-project-template", "harness": "claude", "scope": "project", "scopeId": f.project},
+		{"template.global.create", "/api/v1/templates"}:                 {"name": "li-global-template", "harness": "claude", "scope": "global"},
+		{"template.clone", "/api/v1/templates/{id}/clone"}:              {"name": "li-project-template-clone", "scope": "project", "scopeId": f.project},
+		{"template.global.clone", "/api/v1/templates/{id}/clone"}:       {"name": "li-global-template-clone", "scope": "global"},
 		{"harnessconfig.create", "/api/v1/harness-configs"}:             {"name": "li-created-hc", "harness": "claude", "scope": "global"},
 		{"template.import.global", "/api/v1/resources/import"}:          {"kind": "template", "scope": "global", "sourceUrl": "https://example.invalid/li-global"},
 		{"template.import.global", "/api/v1/resources/discover"}:        {"kind": "template", "scope": "global", "sourceUrl": "https://example.invalid/li-global"},
@@ -1341,6 +1551,15 @@ func bodyOverrides(f idFixtures) map[overrideKey]map[string]interface{} {
 		{"skill.resolve.local", "/api/v1/skills/resolve"}:               {"skills": []map[string]string{{"uri": "skill://li-skill-files"}}},
 		{"skill.resolve.github.project", "/api/v1/skills/resolve"}:      {"projectId": f.project, "skills": []map[string]string{{"uri": "gh://li-invalid"}}},
 		{"skill.resolve.github.public", "/api/v1/skills/resolve"}:       {"skills": []map[string]string{{"uri": "gh://li-invalid"}}},
+		// Webhook endpoint and trigger authoring writes: valid bodies so the
+		// positive probes exercise real creates and updates (201 / 200).
+		{"webhookendpoint.create", "/api/v1/projects/{projectId}/webhook-endpoints"}: {"name": "li-webhook-created"},
+		{"trigger.create", "/api/v1/projects/{projectId}/triggers"}: {
+			"name":   "li-trigger-created",
+			"source": map[string]interface{}{"kind": "webhook", "id": f.webhookEndpoint},
+			"action": map[string]interface{}{"type": "message", "agentId": f.agent, "message": "li-msg"},
+		},
+		{"trigger.update", "/api/v1/projects/{projectId}/triggers/{id}"}: {"description": "li-trigger-updated"},
 	}
 }
 
@@ -1423,11 +1642,15 @@ func seedLiveInventoryArtifact(t *testing.T, ctx context.Context, st artifacts.S
 
 // liveInventoryDelegation is the agent delegation fixture of the live
 // method inventory: a grant bound to the fixture agent, a disposable twin
-// grant for the revoke entry, and an active credential of the first grant.
+// grant for the revoke entry, an active credential of the first grant, and
+// for the per-agent revoke-all entry a disposable agent ID (no agent row:
+// grants outlive their agent) with one grant of its own, so revoke-all
+// leaves the fixture agent's grants alone.
 type liveInventoryDelegation struct {
-	grant       string
-	grantRevoke string
-	credential  string
+	grant          string
+	grantRevoke    string
+	credential     string
+	revokeAllAgent string
 }
 
 // seedLiveInventoryDelegation writes the live inventory's grants and
@@ -1435,9 +1658,9 @@ type liveInventoryDelegation struct {
 // token reaches them as hub authority.
 func seedLiveInventoryDelegation(t *testing.T, ctx context.Context, s store.Store, agentID, projectID string) liveInventoryDelegation {
 	t.Helper()
-	grant := func(name string) string {
+	grantOn := func(boundAgentID, name string) string {
 		g := &store.AgentDelegationGrant{
-			AgentID: agentID, AgentProjectID: projectID, IssuerUserID: DevUserID,
+			AgentID: boundAgentID, AgentProjectID: projectID, IssuerUserID: DevUserID,
 			BoundaryKind: "hub", CeilingVersion: 1, CeilingPermissionIDs: []string{"agent.read"},
 			Name: name, MaxCredentialTTLSeconds: agentDelegationCredentialDefaultTTL,
 			ExpiresAt: time.Now().Add(time.Hour), IssuanceAuditID: uuid.New().String(),
@@ -1445,7 +1668,9 @@ func seedLiveInventoryDelegation(t *testing.T, ctx context.Context, s store.Stor
 		require.NoError(t, s.CreateAgentDelegationGrant(ctx, g))
 		return g.ID
 	}
-	out := liveInventoryDelegation{grant: grant("li-grant"), grantRevoke: grant("li-grant-revoke")}
+	grant := func(name string) string { return grantOn(agentID, name) }
+	out := liveInventoryDelegation{grant: grant("li-grant"), grantRevoke: grant("li-grant-revoke"), revokeAllAgent: uuid.New().String()}
+	grantOn(out.revokeAllAgent, "li-grant-revoke-all")
 	_, hash, err := newDelegatedCredentialToken()
 	require.NoError(t, err)
 	cred := &store.AgentDelegatedCredential{

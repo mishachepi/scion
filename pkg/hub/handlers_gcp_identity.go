@@ -27,6 +27,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/google/uuid"
 	"google.golang.org/api/googleapi"
@@ -362,6 +363,11 @@ type createGCPServiceAccountResponse struct {
 type gcpServiceAccountWithWarnings struct {
 	store.GCPServiceAccount
 	Warnings []string `json:"warnings,omitempty"`
+	// WorkloadIdentityBindings reports the Workload Identity grants a mint
+	// made or skipped (hub.k8s_workload_identity_setup; ptone/scion#3329
+	// phase 5). Absent on other responses, when the experiment is off, and
+	// when the project has no Kubernetes runtime target.
+	WorkloadIdentityBindings []api.WorkloadIdentityBinding `json:"workloadIdentityBindings,omitempty"`
 }
 
 func (s *Server) createGCPServiceAccount(w http.ResponseWriter, r *http.Request, projectID string) {
@@ -644,14 +650,14 @@ func (s *Server) listGCPServiceAccounts(w http.ResponseWriter, r *http.Request, 
 	if len(items) > 0 {
 		profiles = s.projectKubernetesProfileMappings(ctx, projectID)
 	}
-	annotateGCPSAMappings(items, profiles)
+	s.annotateGCPSAMappings(items, profiles)
 	s.annotateGCPSAAssignStatus(ctx, items, projectID, assignReq)
 
 	writeJSON(w, http.StatusOK, ListGCPServiceAccountsResponse{
 		Items:        items,
 		Capabilities: scopeCap,
 		MintQuota:    mintQuota,
-		Warnings: projectSAMappingWarningsFrom(projectID,
+		Warnings: s.projectSAMappingWarningsFrom(projectID,
 			func() projectSAMappingView { return projectSAMappingViewFrom(profiles) }, saPtrs...),
 	})
 }
@@ -1110,6 +1116,11 @@ func (s *Server) mintGCPServiceAccount(w http.ResponseWriter, r *http.Request, p
 		"project_id", projectID, "sa_email", saEmail, "hub_email", hubEmail,
 		"self_act_as", allowSelfActAs)
 
+	// Workload Identity bindings (hub.k8s_workload_identity_setup): best
+	// effort, after the required grants. A failed grant never fails the
+	// mint; it is reported in the response.
+	wiBindings, warningView := s.projectWorkloadIdentityBindings(r.Context(), projectID, saEmail)
+
 	// Store the SA record — only reached when ALL required IAM mutations succeeded.
 	sa := &store.GCPServiceAccount{
 		ID:                 uuid.New().String(),
@@ -1142,6 +1153,7 @@ func (s *Server) mintGCPServiceAccount(w http.ResponseWriter, r *http.Request, p
 	LogGCPTokenGeneration(r.Context(), s.auditLogger, GCPTokenEventMintSA,
 		"", projectID, saEmail, sa.ID, true, "")
 	s.logGCPServiceAccountRegisterAudit(r.Context(), sa)
+	s.logWorkloadIdentityBindingsAudit(r.Context(), projectID, sa, wiBindings)
 
 	slog.Info("GCP SA minted",
 		"project_id", projectID, "sa_id", sa.ID, "email", saEmail,
@@ -1149,8 +1161,9 @@ func (s *Server) mintGCPServiceAccount(w http.ResponseWriter, r *http.Request, p
 		"self_act_as", allowSelfActAs)
 
 	writeJSON(w, http.StatusCreated, gcpServiceAccountWithWarnings{
-		GCPServiceAccount: *sa,
-		Warnings:          s.projectSAMappingWarnings(r.Context(), projectID, sa),
+		GCPServiceAccount:        *sa,
+		Warnings:                 s.projectSAMappingWarningsFrom(projectID, warningView, sa),
+		WorkloadIdentityBindings: wiBindings,
 	})
 }
 
@@ -1457,6 +1470,11 @@ func (s *Server) handleAgentGCPToken(w http.ResponseWriter, r *http.Request) {
 	if s.agentStandingForbidden(r.Context(), w, agentRecord.ID) {
 		return
 	}
+	// A natively assigned Cloud Run agent is refused from its stored
+	// record, whatever scopes its token carries.
+	if s.refuseCloudRunNativeMint(r.Context(), w, agentRecord) {
+		return
+	}
 
 	// Recheck the agent record and assignment mode from the store, then the
 	// JWT scope, before paying for the service-account row lookup below -- a
@@ -1479,6 +1497,13 @@ func (s *Server) handleAgentGCPToken(w http.ResponseWriter, r *http.Request) {
 	// facts from the store on every mint request.
 	if !s.resolveAgentGCPMintFacts(r.Context(), gcpID, agentRecord.ProjectID, agentRecord.RuntimeBrokerID) {
 		writeError(w, http.StatusForbidden, ErrCodeForbidden, "no GCP identity assigned", nil)
+		return
+	}
+
+	// The use decision with the account's parent ceiling, then actAs on
+	// the recorded source in enforce mode (authorizeAgentGCPMint).
+	if !s.authorizeAgentGCPMint(r.Context(), agentRecord, gcpID) {
+		writeError(w, http.StatusForbidden, ErrCodeForbidden, msgGCPMintNotAuthorized, nil)
 		return
 	}
 
@@ -1553,6 +1578,11 @@ func (s *Server) handleAgentGCPIdentityToken(w http.ResponseWriter, r *http.Requ
 	if s.agentStandingForbidden(r.Context(), w, agentRecord.ID) {
 		return
 	}
+	// A natively assigned Cloud Run agent is refused from its stored
+	// record, whatever scopes its token carries.
+	if s.refuseCloudRunNativeMint(r.Context(), w, agentRecord) {
+		return
+	}
 
 	// Recheck the agent record and assignment mode from the store, then the
 	// JWT scope, before paying for the service-account row lookup below -- a
@@ -1573,6 +1603,13 @@ func (s *Server) handleAgentGCPIdentityToken(w http.ResponseWriter, r *http.Requ
 	// facts from the store on every mint request.
 	if !s.resolveAgentGCPMintFacts(r.Context(), gcpID, agentRecord.ProjectID, agentRecord.RuntimeBrokerID) {
 		writeError(w, http.StatusForbidden, ErrCodeForbidden, "no GCP identity assigned", nil)
+		return
+	}
+
+	// The use decision with the account's parent ceiling, then actAs on
+	// the recorded source in enforce mode (authorizeAgentGCPMint).
+	if !s.authorizeAgentGCPMint(r.Context(), agentRecord, gcpID) {
+		writeError(w, http.StatusForbidden, ErrCodeForbidden, msgGCPMintNotAuthorized, nil)
 		return
 	}
 

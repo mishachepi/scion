@@ -112,6 +112,12 @@ func requiredBodyCases() []requiredBodyCase {
 		}},
 		{"ScheduledEvents.Get", func(ctx context.Context, c Client) error { return expectNoResult(c.ScheduledEvents("p").Get(ctx, "e")) }},
 		{"Schedules.Get", func(ctx context.Context, c Client) error { return expectNoResult(c.Schedules("p").Get(ctx, "s")) }},
+		{"WebhookEndpoints.Get", func(ctx context.Context, c Client) error {
+			return expectNoResult(c.WebhookEndpoints("p").Get(ctx, "ep"))
+		}},
+		{"Triggers.Get", func(ctx context.Context, c Client) error { return expectNoResult(c.Triggers("p").Get(ctx, "tr")) }},
+		{"TriggerEvents.Get", func(ctx context.Context, c Client) error { return expectNoResult(c.TriggerEvents("p").Get(ctx, "ev")) }},
+		{"TriggerEvents.List", func(ctx context.Context, c Client) error { return expectNoResult(c.TriggerEvents("p").List(ctx, nil)) }},
 		{"GCPServiceAccounts.Get", func(ctx context.Context, c Client) error {
 			return expectNoResult(c.GCPServiceAccounts().Get(ctx, HubScopedRef("sa")))
 		}},

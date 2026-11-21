@@ -16,6 +16,7 @@ package hub
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -34,6 +35,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/store/entadapter"
 	conduitv1 "github.com/GoogleCloudPlatform/scion/proto/conduit/v1"
+	"github.com/gorilla/websocket"
 )
 
 // The hub's in-process conduit relay (design v2.4 §3.9: every hub process
@@ -69,6 +71,10 @@ type ConduitRelayOptions struct {
 	// testHookAdmission, when set, runs during admission (before the
 	// session is registered). Tests only.
 	testHookAdmission func()
+	// testHookRevalidated, when set, runs each time a newly registered
+	// session's revalidation (conduitRevalidatePrincipal) has returned,
+	// whatever its result. Tests only.
+	testHookRevalidated func()
 	// sessionWriteWait, when positive, is the per-write deadline of every
 	// relay session (conduit.Config.WriteWait; 0 = conduit.DefaultWriteWait).
 	// It runs on Clock, so tests that advance a fake Clock set it above
@@ -84,6 +90,10 @@ type ConduitRelayOptions struct {
 	PeerAuth relay.PeerAuth
 	// HTTPClient performs the self-check probe (nil: relay default).
 	HTTPClient *http.Client
+	// HopTLS is the TLS client configuration of every internal hop call
+	// to other relays (relay.NewHopClientTLS: the operator CA and server
+	// name; nil: the system roots). Verification is never skipped.
+	HopTLS *tls.Config
 	// ReconnectWindow is GoAway.reconnect_after_ms, the jitter window
 	// targets draw their redial delay from (0 = the relay default, 5s).
 	ReconnectWindow time.Duration
@@ -92,6 +102,9 @@ type ConduitRelayOptions struct {
 	// deadline ends by it (server.hub.conduit.lifetime_cap; 0 = the
 	// default, 3500s).
 	LifetimeCap time.Duration
+	// JitterLifetimeCap is relay.Config.JitterLifetimeCap: the
+	// per-session jitter of LifetimeCap (nil: none; ptone/scion#5245).
+	JitterLifetimeCap func(time.Duration) time.Duration
 	// AuthzRecheckInterval overrides ServerConfig.ConduitAuthzRecheckInterval
 	// (0 = use it; negative disables the sweep, for tests).
 	AuthzRecheckInterval time.Duration
@@ -140,7 +153,7 @@ func (s *Server) conduitServingIn(snap ExperimentsSnapshot) bool {
 // verifies with the same ring. Without it each node holds its own
 // in-memory ring, which hosted HA refuses (C8).
 func (s *Server) ConduitGrantRingShared() bool {
-	return len(s.encryptionKey) > 0
+	return s.cipher.Enabled()
 }
 
 // SetConduitRelayStartFailure records that the in-process relay failed to
@@ -214,9 +227,29 @@ func (s *Server) StartConduitRelay(ctx context.Context, opts ConduitRelayOptions
 			return s.conduitWelcomeGrantKeys(ctx)
 		}
 	}
+	revalidate := s.conduitRevalidatePrincipal
+	if h := opts.testHookRevalidated; h != nil {
+		revalidate = func(ctx context.Context, p relay.Principal) error {
+			err := s.conduitRevalidatePrincipal(ctx, p)
+			h()
+			return err
+		}
+	}
 	lifetimeCap := opts.LifetimeCap
 	if lifetimeCap == 0 {
 		lifetimeCap = config.ConduitDefaultLifetimeCap
+	}
+	// With HopTLS every hop client verifies peers with it; the clients
+	// keep the defaults they have without it (the relay's 10s client, the
+	// router's untimed one).
+	relayHTTPClient, peerHTTP := opts.HTTPClient, opts.HTTPClient
+	var hopWS *websocket.Dialer
+	if opts.HopTLS != nil {
+		hopWS = relay.NewHopWSDialer(opts.HopTLS)
+		if opts.HTTPClient == nil {
+			relayHTTPClient = relay.NewHopHTTPClientWithTimeout(opts.HopTLS, 10*time.Second)
+			peerHTTP = relay.NewHopHTTPClient(opts.HopTLS)
+		}
 	}
 	r, err := relay.New(relay.Config{
 		InstanceID:       id,
@@ -225,18 +258,22 @@ func (s *Server) StartConduitRelay(ctx context.Context, opts ConduitRelayOptions
 		Registry:         reg,
 		Store:            st,
 		GrantKeys:        grantKeys,
-		Revalidate:       s.conduitRevalidatePrincipal,
+		Revalidate:       revalidate,
 		Refresh:          s.conduitAgentRefresh,
 		PeerAuth:         opts.PeerAuth,
-		HTTPClient:       opts.HTTPClient,
+		HTTPClient:       relayHTTPClient,
+		WSDialer:         hopWS,
 		Clock:            opts.Clock,
 		Session:          conduit.Config{WriteWait: opts.sessionWriteWait},
 		ReconnectWindow:  opts.ReconnectWindow,
 		LifetimeCap:      lifetimeCap,
+		// Per-session jitter of the cap (ptone/scion#5245).
+		JitterLifetimeCap: opts.JitterLifetimeCap,
 		OnBrokerSessionsSuperseded: func(brokerID string, closed int) {
 			s.recordBrokerSessionsSuperseded(brokerID, brokerSupersededAtAdmission, closed)
 		},
 		OnBrokerIncarnationFlap: s.recordBrokerIncarnationFlap,
+		OnAgentSessionAdmitted:  s.onAgentConduitSessionAdmitted,
 		Logger:                  slog.Default().With("subsystem", "hub.conduit"),
 	})
 	if err != nil {
@@ -246,7 +283,7 @@ func (s *Server) StartConduitRelay(ctx context.Context, opts ConduitRelayOptions
 		Relay:    r,
 		Registry: reg,
 		Store:    st,
-		Peers:    &relay.PeerClient{HTTP: opts.HTTPClient, Auth: opts.PeerAuth},
+		Peers:    &relay.PeerClient{HTTP: peerHTTP, WS: hopWS, Auth: opts.PeerAuth},
 		Now:      now,
 		Brokers:  newLegacyBrokerResolver(s.controlChannel, id),
 	})
@@ -553,7 +590,7 @@ func (s *Server) handleConduit(w http.ResponseWriter, r *http.Request) {
 			NotFound(w, "route")
 		case r.Method != http.MethodGet:
 			MethodNotAllowed(w, http.MethodGet)
-		case rt.ingress == config.ConduitIngressProxy && rt.ingressOffCause == "" && !rt.terminating.Load():
+		case rt.ingressServing():
 			s.serveConduitIngress(w, r, rt)
 		default:
 			s.refuseConduitExternal(w, r, rt)
@@ -590,7 +627,13 @@ func (s *Server) decideConduitFor(w http.ResponseWriter, r *http.Request, forRel
 	// upgrade. A broker authenticates with HMAC headers in its own handler,
 	// so it is recognized by its broker-id header rather than by a context
 	// identity.
-	identity := GetIdentityFromContext(r.Context())
+	// A hub user token request without a session generation is refused,
+	// never defaulted (conduitCaptureSessionGeneration).
+	identity, ok := conduitCaptureSessionGeneration(r.Context(), GetIdentityFromContext(r.Context()))
+	if !ok {
+		refuseConduitUncapturedSessionGeneration(w)
+		return conduitAdmission{}, false
+	}
 	agentIdent, isAgent := identity.(AgentIdentity)
 	userIdent, isUser := identity.(UserIdentity)
 	switch {

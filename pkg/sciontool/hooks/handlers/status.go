@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"time"
 
 	state "github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/agentinfolock"
@@ -75,11 +76,66 @@ func (h *StatusHandler) update(mutate func(info map[string]interface{}) bool) er
 	}
 	return agentinfolock.Update(h.StatusPath, opts, func() error {
 		info := h.readAgentInfoMap()
+		prevActivity, _ := info["activity"].(string)
+		prevMessage := detailMessage(info)
 		if !mutate(info) {
 			return nil
 		}
+		dropStaleHarnessErrorReason(info, prevActivity, prevMessage)
+		stampActivitySince(info, prevActivity, time.Now())
 		return h.writeAgentInfoLocked(info)
 	})
+}
+
+// detailMessage returns info's detail.message, or "".
+func detailMessage(info map[string]interface{}) string {
+	detail, _ := info["detail"].(map[string]interface{})
+	message, _ := detail["message"].(string)
+	return message
+}
+
+// dropStaleHarnessErrorReason removes the harness_error reason from
+// detail.message when a write replaced the harness_error activity and left
+// the reason in place, so no later reader (the broker heartbeat relays
+// detail.message) shows the cleared error. A write that set its own
+// message keeps it.
+func dropStaleHarnessErrorReason(info map[string]interface{}, prevActivity, prevMessage string) {
+	if prevActivity != string(state.ActivityHarnessError) || prevMessage == "" {
+		return
+	}
+	if current, _ := info["activity"].(string); current == string(state.ActivityHarnessError) {
+		return
+	}
+	if detailMessage(info) == prevMessage {
+		applyMessage(info, "")
+	}
+}
+
+// activitySinceKey is the agent-info.json field that records when the
+// current activity began (RFC 3339, UTC). The liveness sampler reads it
+// (ptone/scion#7855): a process the harness started after a tool call
+// began is that tool call's process, and the tool-call stall suppression
+// is capped by the time since then.
+const activitySinceKey = "activitySince"
+
+// stampActivitySince sets activitySinceKey to now when the write changed the
+// activity from before, or set an activity on a record that has no stamp
+// yet; it removes the stamp when the write removed the activity. A write
+// that keeps the activity (a second tool-start while executing, a message
+// or phase-only write) keeps the stamp. Every write goes through update, so
+// this is the one place the stamp is kept.
+func stampActivitySince(info map[string]interface{}, before string, now time.Time) {
+	after, _ := info["activity"].(string)
+	switch {
+	case after == "":
+		delete(info, activitySinceKey)
+	case after != before:
+		info[activitySinceKey] = now.UTC().Format(time.RFC3339Nano)
+	default:
+		if _, ok := info[activitySinceKey].(string); !ok {
+			info[activitySinceKey] = now.UTC().Format(time.RFC3339Nano)
+		}
+	}
 }
 
 // NewStatusHandler creates a new status handler.
@@ -197,6 +253,10 @@ const maxNotificationWaitAgents = 64
 
 // isStickyActivity returns true if the given activity is a "sticky" value that
 // should resist being overwritten by normal event-driven updates.
+// idle (agent-reported, `sciontool status idle`) is handled exactly like
+// blocked: wherever the comments in this file and hub.go list blocked as
+// kept or held, idle is too, and the same new-work events (isNewWorkEvent)
+// clear it.
 func isStickyActivity(activity string) bool {
 	return state.Activity(activity).IsSticky()
 }
@@ -229,6 +289,12 @@ func (h *StatusHandler) Handle(event *hooks.Event) error {
 	}
 	if err := h.captureHarnessSessionID(event); err != nil {
 		return err
+	}
+
+	// The parent's turn ended on an error the harness reported: the harness
+	// is alive at its prompt but the turn failed (see setHarnessError).
+	if isTurnEndError(event) {
+		return h.setHarnessError(harnessErrorReason(event))
 	}
 
 	result := eventToPhaseActivity(event)
@@ -316,9 +382,64 @@ func (h *StatusHandler) Handle(event *hooks.Event) error {
 		return h.updateActivityIfNotSticky(result.activity, "", clearNotificationWaiting, subagentID(event))
 	}
 
-	// All other events (model-end, etc.): update activity only if current
-	// activity is not sticky.
+	// model-start and an error-free model-end are turn progress: the
+	// harness reached the model, so a harness_error is cleared (see
+	// clearHarnessError). Every other sticky activity is kept. A model-end
+	// that carries an error is not progress (the harness may still retry
+	// or end the turn on it) and keeps harness_error.
+	if isHarnessProgressEvent(event) {
+		return h.updateActivityIfNotSticky(result.activity, "", clearHarnessError, "")
+	}
+
+	// All other events: update activity only if current activity is not
+	// sticky.
 	return h.updateActivityIfNotSticky(result.activity, "", clearNone, "")
+}
+
+// isHarnessProgressEvent reports whether event is the parent's model-start,
+// or its model-end with no error that is not uncounted
+// (isProgressModelEnd). OpenCode emits no prompt-submit,
+// agent-start or model-start on a later turn, so its model-end (one per
+// completed model step) is what shows a follow-up turn reached the model.
+func isHarnessProgressEvent(event *hooks.Event) bool {
+	if isSubagentEvent(event) {
+		return false
+	}
+	switch event.Name {
+	case hooks.EventModelStart:
+		return true
+	case hooks.EventModelEnd:
+		return isProgressModelEnd(event)
+	}
+	return false
+}
+
+// setHarnessError records that the harness reported a turn-ending error:
+// activity harness_error with reason in detail.message. It replaces every
+// activity except completed (the agent finished its task before the turn
+// failed) and the terminal limits_exceeded and crashed. Like
+// SetHarnessErrorIf, it writes only while the phase is running (or not
+// recorded): a turn error reported while the agent stops or after it
+// stopped is not a live harness at its prompt. It is one locked update.
+func (h *StatusHandler) setHarnessError(reason string) error {
+	return h.update(func(info map[string]interface{}) bool {
+		if phase := stringField(info, "phase"); phase != "" && phase != string(state.PhaseRunning) {
+			return false
+		}
+		current := state.Activity(stringField(info, "activity"))
+		if current == state.ActivityCompleted || current.IsTerminal() {
+			return false
+		}
+		applyActivity(info, state.ActivityHarnessError, "")
+		applyMessage(info, reason)
+		return true
+	})
+}
+
+// stringField returns info[key] when it is a string, or "".
+func stringField(info map[string]interface{}, key string) string {
+	v, _ := info[key].(string)
+	return v
 }
 
 // setWaitingFromNotificationFor sets waiting_for_input, marks it as set by a
@@ -729,6 +850,24 @@ func (h *StatusHandler) CurrentActivity() state.Activity {
 	return state.Activity(current)
 }
 
+// CurrentActivitySince returns the activity recorded in agent-info.json and
+// when it began (activitySinceKey). The time is zero when the file is
+// missing or unreadable, or when the record has no valid stamp (a record
+// written by an older sciontool).
+func (h *StatusHandler) CurrentActivitySince() (state.Activity, time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	info := h.readAgentInfoMap()
+	current, _ := info["activity"].(string)
+	var since time.Time
+	if raw, ok := info[activitySinceKey].(string); ok {
+		if t, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+			since = t
+		}
+	}
+	return state.Activity(current), since
+}
+
 // SetMessage writes a message to the agent-info.json detail section.
 // This is used to persist error messages so the broker heartbeat can
 // relay them to the hub even after the container exits.
@@ -753,14 +892,30 @@ const (
 	clearNotificationWaiting
 	// clearAnyWaiting clears any waiting_for_input (the parent's tool-start:
 	// the user has responded and the agent is running a tool), except a
-	// wait that sub-agents hold.
+	// wait that sub-agents hold. It also clears harness_error, like
+	// clearHarnessError.
 	clearAnyWaiting
+	// clearHarnessError clears harness_error and keeps every other sticky
+	// activity, as clearNone does (the parent's model-start and error-free
+	// model-end). harness_error is a harness observation, not an agent
+	// intent, so any turn-progress event clears it: prompt-submit,
+	// agent-start and a new session-start (which clear every sticky
+	// activity, see isNewWorkEvent), the parent's tool-start
+	// (clearAnyWaiting) and these. It is deliberately separate from
+	// isNewWorkEvent, which decides what clears blocked.
+	clearHarnessError
 )
+
+// clearsHarnessError reports whether an event with clear rule c replaces a
+// harness_error activity.
+func (c waitingClear) clearsHarnessError() bool {
+	return c == clearAnyWaiting || c == clearHarnessError
+}
 
 // stickyBlocksUpdate reports whether the activity recorded in info is sticky
 // and must not be overwritten by an event with the given clear rule. Only
-// waiting_for_input can be cleared; completed, blocked, limits_exceeded and
-// crashed always block. subagent is the event's sub-agent agent_id, or ""
+// waiting_for_input and harness_error (see clearsHarnessError) can be
+// cleared; completed, blocked, limits_exceeded and crashed always block. subagent is the event's sub-agent agent_id, or ""
 // for the parent's own event. When the event is blocked but changed info,
 // released is true, so the caller writes info. That happens when a
 // sub-agent's event removes its own entry while other owners remain, when
@@ -771,6 +926,9 @@ func stickyBlocksUpdate(info map[string]interface{}, clear waitingClear, subagen
 	currentActivity, _ := info["activity"].(string)
 	if !isStickyActivity(currentActivity) {
 		return false, false
+	}
+	if currentActivity == string(state.ActivityHarnessError) {
+		return !clear.clearsHarnessError(), false
 	}
 	if currentActivity != string(state.ActivityWaitingForInput) {
 		return true, false

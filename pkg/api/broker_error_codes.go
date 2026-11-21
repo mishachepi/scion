@@ -30,10 +30,39 @@ const (
 	// it from (ptone/scion#3422).
 	BrokerErrCodeWorkspaceStorageUnconfigured = "workspace_storage_unconfigured"
 
+	// BrokerErrCodeWorkspaceDownloadModeUnsupported marks a create whose
+	// workspaceDownloadMode this broker does not know (422). The broker
+	// never falls back to another download for it.
+	BrokerErrCodeWorkspaceDownloadModeUnsupported = "workspace_download_mode_unsupported"
+
 	// BrokerErrCodeHarnessConfigUnusable marks a dispatch whose
 	// harness-config provisioner cannot run (422). It is a configuration
 	// error the caller must fix (ptone/scion#3132).
 	BrokerErrCodeHarnessConfigUnusable = "harness_config_unusable"
+	// BrokerErrCodeProjectPathNotInitialized marks a create, start or
+	// restart of a plain project whose explicit project path (a provider's
+	// LocalPath) holds no .scion directory or marker (409). The operator must
+	// initialize the path as a project (ptone/scion#6647).
+	BrokerErrCodeProjectPathNotInitialized = "project_path_not_initialized"
+	// BrokerErrCodeGitConfigRefused marks an agent create, start or restart
+	// the broker refuses (422) because the repository's git config sets keys
+	// agents may not be given. The message names every refused key and how
+	// to remove it, never a value or a host path (ptone/scion#6835).
+	BrokerErrCodeGitConfigRefused = LaunchCodeGitConfigRefused
+
+	// BrokerErrCodeStorageMigrationRequired marks an agent start the broker
+	// refuses (422) because its storage would be placed differently than
+	// configured before server.project_storage: its profile or runtime
+	// entry sets a removed storage override, or its per-agent shared-dir
+	// record pins nfs while the layout is not shared. The message names
+	// the keys and the migration (ptone/scion#6371).
+	BrokerErrCodeStorageMigrationRequired = "storage_migration_required"
+
+	// BrokerErrCodeProjectStorageUnavailable marks an agent create, start
+	// or restart the broker refuses (503) because it does not see the
+	// project storage share. The message names configuration fields, never
+	// the path, and gives the remedy (ptone/scion#5823).
+	BrokerErrCodeProjectStorageUnavailable = "project_storage_unavailable"
 
 	// BrokerErrCodeIdentityNotMapped marks a dispatch in GCP identity mode
 	// "assign" on the Kubernetes runtime whose GCP service account has no
@@ -48,6 +77,15 @@ const (
 	// one mapped to its GCP service account (400). The details also name
 	// the requested and mapped Kubernetes ServiceAccounts.
 	BrokerErrCodeIdentityKSAMismatch = "identity_ksa_mismatch"
+
+	// BrokerErrCodeIdentityKSAConflict marks a dispatch in GCP identity mode
+	// "assign" on the Kubernetes runtime where opt-in broker KSA creation
+	// found an existing Kubernetes ServiceAccount at the conventional
+	// <gsa-account-id> name whose iam.gke.io/gcp-service-account annotation
+	// does not match the target GCP service account (400). The existing KSA
+	// is never modified; the details name it and the namespace so the Hub can
+	// tell the operator how to resolve the collision (ptone/scion#7966).
+	BrokerErrCodeIdentityKSAConflict = "identity_ksa_conflict"
 
 	// BrokerErrCodePriorStartInProgress marks a create refused because an
 	// earlier start of the same agent name on the broker was still
@@ -73,12 +111,26 @@ const (
 	// (ptone/scion#4668).
 	BrokerErrCodeBrokerDraining = "broker_draining"
 
+	// BrokerErrCodeStorageInvalid marks an agent create, start or restart
+	// refused because the broker's project storage settings are invalid
+	// (422). The broker started without storage; the operator must fix
+	// server.project_storage on the broker host and restart it. Stop and
+	// delete keep working.
+	BrokerErrCodeStorageInvalid = "storage_invalid"
+
 	// BrokerErrCodeLocalWorktreeRefused marks a worktree-per-agent dispatch
 	// for a linked checkout that the co-located broker refused because the
 	// checkout failed verification (409). Nothing was created. The hub
 	// relays it like any other broker failure; the CLI reads
 	// BrokerErrDetailReason from its details to show the cause and the fix.
 	BrokerErrCodeLocalWorktreeRefused = "local_worktree_refused"
+
+	// BrokerErrCodeUnsupportedCapability marks a create, start or restart
+	// refused (412) because the resolved runtime does not support a required
+	// capability such as the project's workspace sharing mode (for example
+	// worktree-per-agent on Cloud Run). Nothing was provisioned or started;
+	// the hub relays the 412 refusal unchanged.
+	BrokerErrCodeUnsupportedCapability = "unsupported_capability"
 
 	// BrokerErrCodeRetainedFilesRefused marks a PurgeRetainedQueryParam
 	// delete that removed nothing because the files are not, or may not
@@ -110,6 +162,15 @@ const (
 	// directory on the broker exists without that move's marker: the files
 	// were not created by the move (409). The message names no host path.
 	BrokerErrCodeMoveMarkerMismatch = "move_marker_mismatch"
+
+	// BrokerErrDetailHomeReset is the error detail key every error answer
+	// to a create request with resetHome carries, whatever its status
+	// (ptone/scion#7757): BrokerHomeResetIntact when the broker did not
+	// move the agent's home aside, BrokerHomeResetApplied when it did. The
+	// hub treats an answer without it (a proxy page, a timeout) as a reset.
+	BrokerErrDetailHomeReset = "homeReset"
+	BrokerHomeResetIntact    = "intact"
+	BrokerHomeResetApplied   = "applied"
 
 	// BrokerErrCodeReloadUnconfirmed marks a reset-auth that wrote the new
 	// credential into the agent container but could not deliver the reload
@@ -167,9 +228,9 @@ func IsBrokerRuntimeCause(code string) bool {
 	return false
 }
 
-// Detail keys of a broker identity_not_mapped or identity_ksa_mismatch
-// error. The broker writes them and the hub reads them to build its own
-// message.
+// Detail keys of a broker identity_not_mapped, identity_ksa_mismatch, or
+// identity_ksa_conflict error. The broker writes them and the hub reads them
+// to build its own message.
 const (
 	BrokerErrDetailServiceAccount = "serviceAccount"
 	BrokerErrDetailProfile        = "profile"
@@ -177,11 +238,14 @@ const (
 	BrokerErrDetailBroker         = "broker"
 	BrokerErrDetailRequestedKSA   = "requestedKubernetesServiceAccount"
 	BrokerErrDetailMappedKSA      = "mappedKubernetesServiceAccount"
+	BrokerErrDetailConflictingKSA = "conflictingKubernetesServiceAccount"
 
 	// BrokerErrDetailKSASource says where the Kubernetes ServiceAccount
 	// named by BrokerErrDetailMappedKSA came from: BrokerKSASourceMapped
-	// (kubernetes_service_account_mappings) or BrokerKSASourceDiscovered
-	// (the iam.gke.io/gcp-service-account annotation). Absent means mapped.
+	// (kubernetes_service_account_mappings), BrokerKSASourceDiscovered
+	// (the iam.gke.io/gcp-service-account annotation), or
+	// BrokerKSASourceCreated (created or reused by opt-in broker KSA
+	// creation). Absent means mapped.
 	BrokerErrDetailKSASource = "kubernetesServiceAccountSource"
 
 	// BrokerErrDetailDiscovery is the result of looking for a Kubernetes
@@ -191,13 +255,32 @@ const (
 	// namespace that was searched.
 	BrokerErrDetailDiscovery = "kubernetesServiceAccountDiscovery"
 	BrokerErrDetailNamespace = "namespace"
+
+	// BrokerErrDetailMissingPermission names the Kubernetes RBAC permission
+	// that failed with 403 Forbidden during opt-in KSA creation on an
+	// identity_not_mapped refusal (ptone/scion#7966): one of the
+	// BrokerKSAPermission values.
+	BrokerErrDetailMissingPermission = "missingPermission"
 )
 
 // Values of BrokerErrDetailKSASource.
 const (
 	BrokerKSASourceMapped     = "mapped"
 	BrokerKSASourceDiscovered = "discovered"
+	BrokerKSASourceCreated    = "created"
 )
+
+// Values of BrokerErrDetailMissingPermission.
+const (
+	BrokerKSAPermissionCreate = "create serviceaccounts"
+	BrokerKSAPermissionGet    = "get serviceaccounts"
+)
+
+// BrokerSASourceCloudRunAllowlist is the Source of a service account report
+// entry for a Cloud Run profile: the account is listed in the selected
+// runtime entry's cloudrun.assignable_service_accounts in the broker's
+// global settings. Such an entry carries only the GSA.
+const BrokerSASourceCloudRunAllowlist = "cloudrun_allowlist"
 
 // Values of BrokerErrDetailDiscovery.
 const (
@@ -224,6 +307,14 @@ const (
 // account report (hubclient.ProfileSAMappingsState.ReportVersion). Version
 // 2 means the broker reports a profile incomplete whenever dispatch would
 // not use the profile's entries (BrokerSAReportForceRuntime). The Hub
-// refuses a dispatch from a report only at this version or later; a report
-// without it (an older broker) is unknown.
-const BrokerSAReportVersion = 2
+// refuses a Kubernetes dispatch from a report only at version 2 or later;
+// a report without a version is unknown.
+//
+// Version 3 adds a report for each Cloud Run profile: its
+// cloudrun.assignable_service_accounts as entries with Source
+// BrokerSASourceCloudRunAllowlist, whether the profile can run an instance
+// as a per-dispatch identity, and whether a block account is configured
+// (as a boolean only). With the hub.cloudrun_native_identity experiment
+// on, the Hub refuses a Cloud Run dispatch from a profile whose report is
+// missing or below version 3.
+const BrokerSAReportVersion = 3

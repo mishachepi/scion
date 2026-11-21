@@ -688,9 +688,8 @@ func TestSAAssign2147_MemberAgentCreatesAgent_Enforce_EvaluatesCreatingSA(t *tes
 			checker := scriptedChecker(targetSA, tc.allow)
 			enforceSAAssign(m.srv, checker)
 
-			tok, err := m.srv.GetAgentTokenService().GenerateAgentToken(creator.ID, m.proj.ID,
+			tok := m.srv.generateRecordedAgentToken(t, creator.ID, m.proj.ID,
 				append([]AgentTokenScope{ScopeProjectRead}, ScopesForRole(AgentRoleFull)...), nil)
-			require.NoError(t, err)
 
 			childName := "2147-path-child-" + tc.name
 			rec := doRequestWithAgentToken(t, m.srv, http.MethodPost, "/api/v1/projects/"+m.proj.ID+"/agents",
@@ -729,7 +728,7 @@ func TestSAAssign2147_MemberScheduledDispatch_Enforce_EvaluatesScheduleCreator(t
 			enforceSAAssign(m.srv, checker)
 
 			agentName := "2147-path-sched-" + tc.name
-			err := m.srv.dispatchAgentEventHandler()(context.Background(), withSessionRevision(store.ScheduledEvent{
+			err := fireScheduledActionForTest(context.Background(), m.srv, "dispatch_agent", withSessionRevision(store.ScheduledEvent{
 				ID:        "evt-" + agentName,
 				ProjectID: m.proj.ID,
 				EventType: "dispatch_agent",

@@ -23,7 +23,33 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/clitime"
+	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 )
+
+// formatBrokerTargetCell renders the TARGET column of `scion hub brokers`:
+// for a flat Runtime Broker, its runtime target type, optional display name
+// and optional reported namespace ("kubernetes / Cluster A / ns agents");
+// for a legacy Runtime Broker, "legacy" with its profile count when non-zero.
+func formatBrokerTargetCell(b hubclient.RuntimeBroker) string {
+	if b.RuntimeTarget != nil {
+		parts := []string{b.RuntimeTarget.Type}
+		if b.RuntimeTarget.DisplayName != "" {
+			parts = append(parts, b.RuntimeTarget.DisplayName)
+		}
+		if b.RuntimeTargetPresentation != nil && b.RuntimeTargetPresentation.Target != nil && b.RuntimeTargetPresentation.Target.Namespace != "" {
+			parts = append(parts, "ns "+b.RuntimeTargetPresentation.Target.Namespace)
+		}
+		return strings.Join(parts, " / ")
+	}
+	switch n := len(b.Profiles); n {
+	case 0:
+		return "legacy"
+	case 1:
+		return "legacy (1 profile)"
+	default:
+		return fmt.Sprintf("legacy (%d profiles)", n)
+	}
+}
 
 // presentationCaption heads the reported defaults of a flat Runtime Broker:
 // they are what the instance reported, defaults for new agents only, and
@@ -52,6 +78,7 @@ func writeRuntimeTargetSections(w io.Writer, target *api.RuntimeTargetDescriptor
 	line("Display name", target.DisplayName)
 	if p != nil && p.Target != nil {
 		line("Namespace", p.Target.Namespace)
+		line("Region", p.Target.Region)
 	}
 
 	_, _ = fmt.Fprintln(w)
@@ -74,9 +101,7 @@ func writeRuntimeTargetSections(w io.Writer, target *api.RuntimeTargetDescriptor
 		line("Priority class", t.PriorityClassName)
 		line("Shared dir storage class", t.SharedDirStorageClass)
 		line("Shared dir size", t.SharedDirSize)
-		line("Shared dir storage backend", t.SharedDirStorageBackend)
-		line("Shared dir backends", sortedPairs(t.SharedDirStorageBackends))
-		line("Home storage backend", t.HomeStorageBackend)
+		writePresentedPlacement(line, t)
 	}
 	d := p.AgentDefaults
 	if d == nil {
@@ -135,6 +160,52 @@ func writeRuntimeTargetSections(w io.Writer, target *api.RuntimeTargetDescriptor
 	}
 }
 
+// writePresentedPlacement writes the reported pod placement for new agents:
+// "not reported" when the instance does not report placement (an older
+// instance), "none" when it reports none, else each set field.
+func writePresentedPlacement(line func(label, value string), t *api.PresentedTarget) {
+	if !t.PlacementReported {
+		line("Placement", "not reported")
+		return
+	}
+	if len(t.NodeSelector) == 0 && len(t.Tolerations) == 0 && t.RuntimeClassName == "" {
+		line("Placement", "none")
+		return
+	}
+	keys := make([]string, 0, len(t.NodeSelector))
+	for k := range t.NodeSelector {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	pairs := make([]string, len(keys))
+	for i, k := range keys {
+		pairs[i] = k + "=" + t.NodeSelector[k]
+	}
+	line("Node selector", strings.Join(pairs, ", "))
+	tols := make([]string, len(t.Tolerations))
+	for i, tol := range t.Tolerations {
+		tols[i] = formatToleration(tol)
+	}
+	line("Tolerations", strings.Join(tols, "; "))
+	line("Runtime class", t.RuntimeClassName)
+}
+
+// formatToleration renders a toleration as key, operator (empty is
+// Equal), value and effect, for example "pool=agents:NoSchedule" or
+// "dedicated Exists" or "Exists" for a match-all entry.
+func formatToleration(t api.K8sToleration) string {
+	var s string
+	if t.Operator == "Exists" {
+		s = strings.TrimSpace(t.Key + " Exists")
+	} else {
+		s = t.Key + "=" + t.Value
+	}
+	if t.Effect != "" {
+		s += ":" + t.Effect
+	}
+	return s
+}
+
 // triState renders an optional bool as unset, true or false.
 func triState(b *bool) string {
 	switch {
@@ -145,22 +216,6 @@ func triState(b *bool) string {
 	default:
 		return "false"
 	}
-}
-
-func sortedPairs(m map[string]string) string {
-	if len(m) == 0 {
-		return ""
-	}
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	parts := make([]string, len(keys))
-	for i, k := range keys {
-		parts[i] = k + "=" + m[k]
-	}
-	return strings.Join(parts, ", ")
 }
 
 func formatPresentedVolume(v api.PresentedVolume) string {

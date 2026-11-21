@@ -57,8 +57,9 @@ func createOwnedAgent(t *testing.T, s store.Store, slug, projectID, ownerID stri
 	return a
 }
 
-// requireOwnsAgentsDenial asserts a 409 conflict whose details.agents lists
-// exactly the given agents.
+// requireOwnsAgentsDenial asserts a 409 user_delete_blocked whose
+// details.agents lists exactly the given agents and whose details.edges is
+// empty.
 func requireOwnsAgentsDenial(t *testing.T, rec *httptest.ResponseRecorder, agents ...*store.Agent) {
 	t.Helper()
 	require.Equal(t, http.StatusConflict, rec.Code, rec.Body.String())
@@ -67,16 +68,20 @@ func requireOwnsAgentsDenial(t *testing.T, rec *httptest.ResponseRecorder, agent
 			Code    string `json:"code"`
 			Message string `json:"message"`
 			Details struct {
-				Agents []ownedAgentRef `json:"agents"`
+				Agents    []ownedAgentRef    `json:"agents"`
+				Edges     []delegatorEdgeRef `json:"edges"`
+				Truncated bool               `json:"truncated"`
 			} `json:"details"`
 		} `json:"error"`
 	}
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp), rec.Body.String())
-	assert.Equal(t, ErrCodeConflict, resp.Error.Code)
+	assert.Equal(t, ErrCodeUserDeleteBlocked, resp.Error.Code)
+	assert.Empty(t, resp.Error.Details.Edges)
+	assert.False(t, resp.Error.Details.Truncated)
 	assert.Equal(t, userOwnsAgentsDeleteMessage, resp.Error.Message)
 	want := make([]ownedAgentRef, 0, len(agents))
 	for _, a := range agents {
-		want = append(want, ownedAgentRef{ID: a.ID, Slug: a.Slug, ProjectID: a.ProjectID})
+		want = append(want, ownedAgentRef{ID: a.ID, Slug: a.Slug, ProjectID: a.ProjectID, DeletionState: a.DeletionState})
 	}
 	assert.ElementsMatch(t, want, resp.Error.Details.Agents)
 }
@@ -590,6 +595,10 @@ func (s *ctxFreeUserScopeListStore) ListSecrets(ctx context.Context, filter stor
 	return s.Store.ListSecrets(context.WithoutCancel(ctx), filter)
 }
 
+func (s *ctxFreeUserScopeListStore) ListPendingSecretScopeIDs(ctx context.Context, scope string) ([]string, error) {
+	return s.Store.ListPendingSecretScopeIDs(context.WithoutCancel(ctx), scope)
+}
+
 // TestSweepOrphanedUserScopedData_ExpiredContextKeepsValues: when the sweep's
 // ctx has ended by the time of the user lookups, the sweep returns the ctx
 // error and removes nothing.
@@ -801,20 +810,51 @@ func TestDeleteUser_DescendantAgentDenied(t *testing.T) {
 	require.NoError(t, err, "denied delete must keep the user")
 }
 
-// scheduledAgent returns an agent shaped like the scheduler's dispatch
-// (dispatchAgentEventHandler): no owner, no ancestry, and the schedule's
-// creator recorded only as CreatedBy.
+// scheduledAgent returns a legacy pre-2b scheduler-dispatched agent row:
+// no owner, no ancestry, and the schedule's creator recorded only as
+// CreatedBy. Headless creates since PR 2b set OwnerID and Ancestry from the
+// principal (headless-identity-note.md §2–§3), covered in the subtest below.
 func scheduledAgent(slug, projectID, createdBy, phase string) *store.Agent {
 	return &store.Agent{ID: tid("agent-" + slug), Slug: slug, Name: slug, ProjectID: projectID,
 		Phase: phase, Detached: true, CreatedBy: createdBy}
 }
 
-// TestDeleteUser_ScheduledAgentDenied: an agent the scheduler dispatched for
-// the user's schedule (OwnerID empty, CreatedBy the user) blocks the delete
-// on both delete paths, stopped or not; a soft-deleted one does not, and
-// neither does an agent with another owner that names the user as creator.
+// TestDeleteUser_ScheduledAgentDenied: both a post-2b headless agent (which
+// sets OwnerID == user and Ancestry == [user], counted as a direct owned
+// agent) and a legacy pre-2b owner-less scheduled row (OwnerID empty,
+// CreatedBy the user) block user deletion on both delete paths, stopped or
+// not; a soft-deleted one does not, and neither does an agent with another
+// owner that names the user as creator.
 func TestDeleteUser_ScheduledAgentDenied(t *testing.T) {
-	t.Run("users delete", func(t *testing.T) {
+	t.Run("headless owned agent via dispatch_agent fire", func(t *testing.T) {
+		srv, s, _, _, project := setupDemoPolicyTest(t)
+		linkScheduledDispatchBroker(t, s, project.ID)
+		ctx := context.Background()
+		dave := newActiveMember(t, s, "user-dave-headless", "dave-headless@test.com")
+		grantProjectRole(t, s, dave.ID, project.ID, store.ProjectRoleMember)
+
+		require.NoError(t, fireScheduledActionForTest(ctx, srv, "dispatch_agent", withSessionRevision(store.ScheduledEvent{
+			ID:        tid("dave-headless-evt"),
+			ProjectID: project.ID,
+			EventType: "dispatch_agent",
+			Payload:   `{"agentName":"dave-headless-running"}`,
+			CreatedBy: dave.ID,
+		}, dave.ID)))
+		headlessChild, err := s.GetAgentBySlug(ctx, project.ID, "dave-headless-running")
+		require.NoError(t, err)
+		require.Equal(t, dave.ID, headlessChild.OwnerID)
+		require.Equal(t, []string{dave.ID}, headlessChild.Ancestry)
+
+		rec := doRequest(t, srv, http.MethodDelete, "/api/v1/users/"+dave.ID, nil)
+		requireOwnsAgentsDenial(t, rec, headlessChild)
+		_, err = s.GetUser(ctx, dave.ID)
+		require.NoError(t, err, "denied delete must keep the user")
+
+		require.NoError(t, s.DeleteAgent(ctx, headlessChild.ID))
+		rec = doRequest(t, srv, http.MethodDelete, "/api/v1/users/"+dave.ID, nil)
+		require.Equal(t, http.StatusNoContent, rec.Code, rec.Body.String())
+	})
+	t.Run("users delete (legacy owner-less CreatedBy fallback)", func(t *testing.T) {
 		srv, s, _, _, project := setupDemoPolicyTest(t)
 		ctx := context.Background()
 		dave := newActiveMember(t, s, "user-dave", "dave@test.com")
@@ -959,6 +999,16 @@ func (r *userLockRecordingStore) ListAgents(ctx context.Context, f store.AgentFi
 	return r.Store.ListAgents(ctx, f, opts)
 }
 
+func (r *userLockRecordingStore) GetDelegationEdgesForDelegator(ctx context.Context, delegatorType, delegatorID string) ([]*store.DelegationEdge, error) {
+	r.record("edges:" + delegatorType + ":" + delegatorID)
+	return r.Store.GetDelegationEdgesForDelegator(ctx, delegatorType, delegatorID)
+}
+
+func (r *userLockRecordingStore) DeactivateDelegationEdgesForDelegator(ctx context.Context, delegatorType, delegatorID string, d store.Deactivation) (int, error) {
+	r.record("sweep:" + delegatorType + ":" + delegatorID)
+	return r.Store.DeactivateDelegationEdgesForDelegator(ctx, delegatorType, delegatorID, d)
+}
+
 func (r *userLockRecordingStore) CreateAgent(ctx context.Context, a *store.Agent) error {
 	r.record("create:" + a.Slug)
 	return r.Store.CreateAgent(ctx, a)
@@ -980,7 +1030,8 @@ func requireBefore(t *testing.T, r *userLockRecordingStore, first, second string
 
 // TestUserRowLocks_DeleteExclusiveCreateRestoreShared pins where the hub
 // takes the user-row lock (ptone/scion#2769): both delete paths lock the
-// user's row exclusively before listing the user's agents, and agent create
+// user's row exclusively before listing the user's agents and delegator
+// edges, and sweep those edges after the check, and agent create
 // and restore lock the guard user's row (owner, ancestry root, or schedule
 // creator; lockAgentGuardUserTx) shared before writing the agent. On
 // SQLite the lock is a plain read, so only the call order is checked here;
@@ -996,6 +1047,8 @@ func TestUserRowLocks_DeleteExclusiveCreateRestoreShared(t *testing.T) {
 		requireBefore(t, r, "lock:"+dave.ID+":true", "list:owner:"+dave.ID)
 		requireBefore(t, r, "lock:"+dave.ID+":true", "list:ancestor:"+dave.ID)
 		requireBefore(t, r, "lock:"+dave.ID+":true", "list:createdby:"+dave.ID)
+		requireBefore(t, r, "lock:"+dave.ID+":true", "edges:user:"+dave.ID)
+		requireBefore(t, r, "edges:user:"+dave.ID, "sweep:user:"+dave.ID)
 	})
 	t.Run("allow-list delete", func(t *testing.T) {
 		srv, s, _, _, _ := setupDemoPolicyTest(t)
@@ -1007,6 +1060,8 @@ func TestUserRowLocks_DeleteExclusiveCreateRestoreShared(t *testing.T) {
 		requireBefore(t, r, "lock:"+carol.ID+":true", "list:owner:"+carol.ID)
 		requireBefore(t, r, "lock:"+carol.ID+":true", "list:ancestor:"+carol.ID)
 		requireBefore(t, r, "lock:"+carol.ID+":true", "list:createdby:"+carol.ID)
+		requireBefore(t, r, "lock:"+carol.ID+":true", "edges:user:"+carol.ID)
+		requireBefore(t, r, "edges:user:"+carol.ID, "sweep:user:"+carol.ID)
 	})
 	t.Run("create", func(t *testing.T) {
 		f := newUATCreateFixture(t, "lock-create")

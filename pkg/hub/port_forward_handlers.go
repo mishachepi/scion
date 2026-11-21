@@ -30,8 +30,10 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/conduit/router"
+	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/portforward"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
+	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
@@ -397,12 +399,11 @@ func (s *Server) proxyAgentPort(w http.ResponseWriter, r *http.Request, agentID 
 	}
 	exposed := findExposedPort(agent.ExposedPorts, port)
 	if exposed == nil {
-		if isBrowserRequest(r) {
-			writeProxyErrorHTML(w, http.StatusNotFound, "Port Not Available",
-				"The requested port is not exposed on this agent.")
-		} else {
-			NotFound(w, "Port")
-		}
+		s.writePortNotExposed(w, r)
+		return
+	}
+	if s.config.ConduitPolicy.PortDenied(exposed.Port) {
+		s.writePortDenied(w, r)
 		return
 	}
 	// The bare proxy URL (.../proxy, no trailing slash) is answered with a
@@ -418,6 +419,82 @@ func (s *Server) proxyAgentPort(w http.ResponseWriter, r *http.Request, agentID 
 		redirectToProxyRoot(w, r)
 		return
 	}
+	// With hub.port_view on, a page navigation by a signed-in user is sent
+	// to a page link instead (port_view.go); access was decided above.
+	if s.redirectToPortView(w, r, agent, exposed) {
+		return
+	}
+	s.proxyToAgentPort(w, r, GetIdentityFromContext(r.Context()), agent, exposed, proxyPath, portProxyPolicy{
+		surface: portProxySurfacePath,
+		caller:  identityStringFromContext(r.Context()),
+	}, start)
+}
+
+// Surfaces of the agent port proxy, as logged.
+const (
+	portProxySurfacePath = "path"     // /api/v1/agents/{id}/ports/{port}/proxy
+	portProxySurfaceView = "portview" // /api/v1/portview/<capability> (port_view.go)
+)
+
+// portProxyPolicy is what differs between the surfaces that proxy to an
+// agent port (proxyToAgentPort).
+type portProxyPolicy struct {
+	// surface is logged with each proxied request.
+	surface string
+	// caller is the identity string logged with each proxied request.
+	caller string
+	// portView applies the page view headers (setPortViewResponseHeaders)
+	// and response rules (portViewModifyResponse).
+	portView bool
+}
+
+// writePortNotExposed answers a request for a port the agent has not
+// exposed: the proxy error page for a browser, else a JSON 404.
+func (s *Server) writePortNotExposed(w http.ResponseWriter, r *http.Request) {
+	writePortNotExposedWithBranding(w, r, s.ResolvedBranding())
+}
+
+func writePortNotExposedWithBranding(w http.ResponseWriter, r *http.Request, b *config.ResolvedBranding) {
+	if isBrowserRequest(r) {
+		writeProxyErrorHTMLWithBranding(w, b, http.StatusNotFound, "Port Not Available",
+			"The requested port is not exposed on this agent.")
+		return
+	}
+	NotFound(w, "Port")
+}
+
+// writePortDenied answers a request for a port denied by operator policy:
+// the proxy error page for a browser, else a JSON 403.
+func (s *Server) writePortDenied(w http.ResponseWriter, r *http.Request) {
+	writePortDeniedWithBranding(w, r, s.ResolvedBranding())
+}
+
+func writePortDeniedWithBranding(w http.ResponseWriter, r *http.Request, b *config.ResolvedBranding) {
+	if isBrowserRequest(r) {
+		writeProxyErrorHTMLWithBranding(w, b, http.StatusForbidden, "Port Not Available",
+			"The operator does not allow access to this port.")
+		return
+	}
+	Forbidden(w)
+}
+
+// portTunnelFailedMessage is the client-facing text for a failed legacy
+// port-forward tunnel request.
+const portTunnelFailedMessage = "Port-forward tunnel failed"
+
+// proxyToAgentPort proxies r to the agent's exposed port as identity, the
+// caller's access already decided: over the agent's conduit session when
+// this node can route it and the port is loopback, else over the
+// port-forward tunnel, subject to the refuseLegacyProxy rule.
+func (s *Server) proxyToAgentPort(w http.ResponseWriter, r *http.Request, identity Identity, agent *store.Agent, exposed *store.ExposedPort, proxyPath string, policy portProxyPolicy, start time.Time) {
+	port := exposed.Port
+	// transport and outcome name the answer for the page view request
+	// counter (recordPortViewRequest); other surfaces are not counted.
+	var transport, outcome string
+	if policy.portView {
+		setPortViewResponseHeaders(w)
+		defer func() { s.recordPortViewRequest(transport, outcome) }()
+	}
 	// Conduit first (hub.conduit on and this node runs the relay): an agent
 	// with a conduit session is proxied over it. An agent without one may
 	// be an older sciontool on the port-forward tunnel below. Every loopback
@@ -425,17 +502,57 @@ func (s *Server) proxyAgentPort(w http.ResponseWriter, r *http.Request, agentID 
 	// retargeted: the stream always goes to conduitProxyHost (127.0.0.1)
 	// inside the agent.
 	conduitOn := s.conduitRoutable()
-	identity := GetIdentityFromContext(r.Context())
+	// Every caller of proxyToAgentPort (the agent port route and the port
+	// page view) captures the session generation here, so a stream opened
+	// below is closed by the later re-check once the user's sessions are
+	// revoked. A hub user token request without a session generation is
+	// refused, never defaulted (conduitCaptureSessionGeneration).
+	// The generation stamped is the one the request's own hub user token
+	// carries, so it may only go onto that same user: the page view's
+	// identity comes from its link, and only page navigations check that the
+	// signed-in user is the link's. A hub user token request for any other
+	// identity is refused.
+	// A verified page view link (portViewLinkFor) runs as the link: its
+	// request's own credential is not captured.
+	if !portViewLinkFor(r.Context(), identity) {
+		if conduitAuthTypeCapturesSessionGeneration(requestAuthType(r.Context())) {
+			if u := GetUserIdentityFromContext(r.Context()); u == nil || isNilIdentity(identity) || u.ID() != identity.ID() {
+				refuseConduitUncapturedSessionGeneration(w)
+				return
+			}
+		}
+		var ok bool
+		identity, ok = conduitCaptureSessionGeneration(r.Context(), identity)
+		if !ok {
+			refuseConduitUncapturedSessionGeneration(w)
+			return
+		}
+	}
 	if conduitOn && isLoopbackHost(exposed.Host) {
 		conn, err := s.openConduitPort(r.Context(), identity, agent, exposed.Port)
 		switch {
 		case err == nil:
-			s.serveConduitProxy(w, r, agent, exposed.Port, proxyPath, conn)
+			// served, unless the round trip fails (offline); a response
+			// cut while its body streams was answered by the app.
+			transport, outcome = portViewTransportConduit, portViewRequestServed
+			if !s.serveConduitProxy(w, r, agent, exposed.Port, proxyPath, conn, policy) {
+				outcome = portViewRequestOffline
+			}
 			return
 		case !errors.Is(err, router.ErrNoSession):
+			transport, outcome = portViewTransportConduit, portViewConduitOpenOutcome(err)
 			writeConduitProxyError(w, r, agent.ID, err)
 			return
 		}
+	}
+	// Every answer below is the tunnel's: refused (the route refused for
+	// user requests, the evaluation or a re-check denied it, a WebSocket,
+	// a body over the limit; portViewRequestRefused), unless the app
+	// answered (served) or the tunnel could not reach it (offline).
+	transport, outcome = portViewTransportLegacy, portViewRequestRefused
+	if s.config.ConduitPolicy.PortDenied(port) {
+		s.writePortDenied(w, r)
+		return
 	}
 	// No path without a target-side deadline (design §3.5 Q14, v2.21.46):
 	// in external relay mode with enforce, a user request that only the
@@ -446,7 +563,8 @@ func (s *Server) proxyAgentPort(w http.ResponseWriter, r *http.Request, agentID 
 	}
 	if isWebSocketUpgrade(r) {
 		if conduitOn && !s.portTunnels.has(agent.ID) {
-			writeAgentOffline(w, r)
+			outcome = portViewRequestOffline
+			s.writeAgentOffline(w, r)
 			return
 		}
 		writeError(w, http.StatusNotImplemented, ErrCodeInvalidRequest, "WebSocket port forwarding is not supported in this revision", nil)
@@ -471,6 +589,9 @@ func (s *Server) proxyAgentPort(w http.ResponseWriter, r *http.Request, agentID 
 	ctx, cancel := context.WithTimeout(legacy.context(r), portForwardTimeout)
 	defer cancel()
 	reqPath := "/" + strings.TrimPrefix(proxyPath, "/")
+	fwdHeader := cloneForwardHeaders(r.Header)
+	// The front proxy's identity headers are not passed to the agent's app.
+	s.stripFrontProxyIdentityHeaders(fwdHeader)
 	resp, err := s.portTunnels.Do(ctx, agent.ID, portforward.Request{
 		StreamID: uuid.NewString(),
 		Port:     exposed.Port,
@@ -478,7 +599,7 @@ func (s *Server) proxyAgentPort(w http.ResponseWriter, r *http.Request, agentID 
 		Method:   r.Method,
 		Path:     reqPath,
 		Query:    r.URL.RawQuery,
-		Header:   cloneForwardHeaders(r.Header),
+		Header:   fwdHeader,
 		Body:     body,
 	})
 	if hook := s.legacyPortTunnelReturnedTestHook; hook != nil {
@@ -490,13 +611,14 @@ func (s *Server) proxyAgentPort(w http.ResponseWriter, r *http.Request, agentID 
 		return
 	}
 	if err != nil {
+		outcome = portViewRequestOffline
 		if errors.Is(err, errNoPortTunnel) {
 			if conduitOn {
-				writeAgentOffline(w, r)
+				s.writeAgentOffline(w, r)
 				return
 			}
 			if isBrowserRequest(r) {
-				writeProxyErrorHTML(w, http.StatusServiceUnavailable, "Service Unavailable",
+				writeProxyErrorHTMLWithBranding(w, s.ResolvedBranding(), http.StatusServiceUnavailable, "Service Unavailable",
 					"No active port-forward tunnel for this agent. The agent may not be running or the tunnel has not been established yet.")
 			} else {
 				writeError(w, http.StatusServiceUnavailable, ErrCodeRuntimeError, "No active port-forward tunnel for this agent", nil)
@@ -507,54 +629,75 @@ func (s *Server) proxyAgentPort(w http.ResponseWriter, r *http.Request, agentID 
 			writeError(w, http.StatusServiceUnavailable, ErrCodeRuntimeError, err.Error(), nil)
 			return
 		}
-		writeError(w, http.StatusBadGateway, ErrCodeRuntimeError, "Port-forward tunnel failed: "+err.Error(), nil)
+		// The tunnel's error text stays in the hub log; the client gets
+		// the fixed message.
+		errText := err.Error()
+		slog.Warn("port-forward tunnel request failed", "agent_id", agent.ID,
+			"error_len", len(errText), "error", brokerBodyForLog(errText))
+		writeError(w, http.StatusBadGateway, ErrCodeRuntimeError, portTunnelFailedMessage, nil)
 		return
 	}
 	if resp.Error != "" {
-		writeError(w, http.StatusBadGateway, ErrCodeRuntimeError, resp.Error, nil)
+		outcome = portViewRequestOffline
+		// resp.Error is the far end's free text: hub log only, capped and
+		// rendered.
+		slog.Warn("port-forward tunnel returned an error", "agent_id", agent.ID,
+			"error_len", len(resp.Error), "error", brokerBodyForLog(resp.Error))
+		writeError(w, http.StatusBadGateway, ErrCodeRuntimeError, portTunnelFailedMessage, nil)
 		return
 	}
+	// The app's headers, minus hop-by-hop and the ones the hub controls,
+	// get the hub's response policy (applyPortProxyResponsePolicy), as on
+	// the conduit path. They are then added to w after the policy headers
+	// already set further up the handler chain are removed, which is the
+	// merge the conduit path's reverse proxy performs, so each policy
+	// header is sent once.
+	app := make(http.Header, len(resp.Header))
 	for k, vals := range resp.Header {
 		if hopByHopHeader(k) || stripFromProxyResponse(k) {
 			continue
 		}
+		app[http.CanonicalHeaderKey(k)] = append(app[http.CanonicalHeaderKey(k)], vals...)
+	}
+	applyPortProxyResponsePolicy(app, policy)
+	for _, k := range portProxyPolicyHeaders {
+		w.Header().Del(k)
+	}
+	for k, vals := range app {
 		for _, v := range vals {
 			w.Header().Add(k, v)
 		}
 	}
-	// Hub-controlled response headers: the proxied content cannot override
-	// these, so it is sandboxed to an opaque origin and cannot set cookies
-	// on the hub origin.
-	w.Header().Set("Content-Security-Policy", untrustedContentSandboxCSP)
-	w.Header().Set("X-Content-Type-Options", "nosniff")
 	if resp.Status == 0 {
 		resp.Status = http.StatusOK
 	}
+	outcome = portViewRequestServed
 	w.WriteHeader(resp.Status)
 	_, _ = w.Write(resp.Body)
 	slog.Debug("Proxy request",
 		"agent_id", agent.ID,
 		"port", port,
-		"caller", identityStringFromContext(r.Context()),
+		"caller", policy.caller,
+		"surface", policy.surface,
 		"method", r.Method,
-		"path", reqPath,
+		"path", logging.SubPath(reqPath),
 		"status", resp.Status,
 		"duration", time.Since(start),
 	)
 }
 
-// writeProxyErrorHTML writes a self-contained HTML error page for browser requests
-// to proxy endpoints. It delegates to the shared renderErrorPage template.
-func writeProxyErrorHTML(w http.ResponseWriter, status int, title, message string) {
+// writeProxyErrorHTMLWithBranding writes a self-contained HTML error page for
+// browser requests to proxy endpoints with Hub branding applied.
+func writeProxyErrorHTMLWithBranding(w http.ResponseWriter, b *config.ResolvedBranding, status int, title, message string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
-	_, _ = fmt.Fprint(w, proxyErrorPageHTML(title, message))
+	_, _ = fmt.Fprint(w, proxyErrorPageHTMLWithBranding(b, title, message))
 }
 
-// proxyErrorPageHTML returns a self-contained HTML error page with the given
-// title and message, using the shared renderErrorPage template.
-func proxyErrorPageHTML(title, message string) string {
-	return renderErrorPage("Scion - "+title, "&#9888;&#65039;", "error", title, message)
+// proxyErrorPageHTMLWithBranding returns a self-contained HTML error page with
+// the given title, message, and Hub branding, using the shared renderErrorPage template.
+func proxyErrorPageHTMLWithBranding(b *config.ResolvedBranding, title, message string) string {
+	return renderErrorPageWithBranding(b, brandPageTitle(b, title), "&#9888;&#65039;", "error", title, message)
 }
 
 func (s *Server) handleAgentPortTunnel(w http.ResponseWriter, r *http.Request, agentID string) {
@@ -589,8 +732,7 @@ func (s *Server) authorizePortAccess(w http.ResponseWriter, r *http.Request, age
 		return agent, true
 	}
 	if userIdent := GetUserIdentityFromContext(ctx); userIdent != nil {
-		decision := s.authzService.CheckAccess(ctx, userIdent, agentResource(agent), action)
-		if !decision.Allowed {
+		if !s.userPortAccessAllowed(ctx, userIdent, agent, action) {
 			writeError(w, http.StatusForbidden, ErrCodeForbidden, "Access denied", nil)
 			return nil, false
 		}
@@ -598,6 +740,13 @@ func (s *Server) authorizePortAccess(w http.ResponseWriter, r *http.Request, age
 	}
 	writeError(w, http.StatusForbidden, ErrCodeForbidden, "This action requires user or agent authentication", nil)
 	return nil, false
+}
+
+// userPortAccessAllowed is the user decision of authorizePortAccess: may
+// user take action on agent's ports. The page view route
+// (portViewIdentity) makes the same decision.
+func (s *Server) userPortAccessAllowed(ctx context.Context, user UserIdentity, agent *store.Agent, action Action) bool {
+	return s.authzService.CheckAccess(ctx, user, agentResource(agent), action).Allowed
 }
 
 // authorizePortRegistration authorizes registering, deleting and clearing an
@@ -719,10 +868,16 @@ func hopByHopHeader(k string) bool {
 // hub itself (or intentionally omitted) so the response is sandboxed and
 // cannot set or clear cookies, storage, or cache on the hub origin. CORS
 // response headers are owned by the hub's corsMiddleware; relaying the
-// agent's copies would duplicate them, which browsers reject.
+// agent's copies would duplicate them, which browsers reject. The page
+// headers the web server sets on every response (X-Frame-Options,
+// X-XSS-Protection, Referrer-Policy, Permissions-Policy; see
+// securityHeadersMiddleware) are the hub's too, so the hub's own page
+// headers are not combined with the proxied app's.
 func stripFromProxyResponse(k string) bool {
 	switch strings.ToLower(k) {
 	case "set-cookie", "set-cookie2", "content-security-policy", "x-content-type-options", "clear-site-data":
+		return true
+	case "x-frame-options", "x-xss-protection", "referrer-policy", "permissions-policy":
 		return true
 	case "access-control-allow-origin", "access-control-allow-credentials", "access-control-allow-methods",
 		"access-control-allow-headers", "access-control-allow-private-network", "access-control-expose-headers",
@@ -733,9 +888,39 @@ func stripFromProxyResponse(k string) bool {
 	}
 }
 
+// portProxyPolicyHeaders are the response headers applyPortProxyResponsePolicy
+// always sets. A transport that merges the app's headers into a response
+// writer removes them from the writer first, so each is sent once.
+// TestPortProxyPolicyHeadersMatchPolicy keeps the list equal to what the
+// policy sets.
+var portProxyPolicyHeaders = [...]string{"Content-Security-Policy", "Permissions-Policy", "X-Content-Type-Options"}
+
+// applyPortProxyResponsePolicy sets the hub's response policy on h, the
+// headers of a proxied app response after stripFromProxyResponse, for both
+// port proxy transports: the page view rules (portViewModifyResponse) when
+// policy.portView, then the sandbox policy with its Permissions-Policy, and
+// nosniff. The last two are set unconditionally and last: nothing sets them
+// on a proxied answer after this, so the app cannot replace them.
+func applyPortProxyResponsePolicy(h http.Header, policy portProxyPolicy) {
+	if policy.portView {
+		portViewModifyResponse(h)
+	}
+	setUntrustedContentHeaders(h, agentServedPageSandboxCSP)
+	h.Set("X-Content-Type-Options", "nosniff")
+}
+
+// sensitiveHeader reports whether a request header is removed before a
+// request proxied to an agent's port reaches the app, on both port proxy
+// transports: the hub's credential headers, the federation token
+// (FederationTokenHeader) and the trusted-proxy identity headers
+// (extractProxyUser). The hub reads them for its own authentication; the
+// agent's app never receives them.
 func sensitiveHeader(k string) bool {
 	switch strings.ToLower(k) {
 	case "authorization", "cookie", "x-scion-agent-token", "x-scion-broker-id", "x-scion-broker-hmac":
+		return true
+	case strings.ToLower(FederationTokenHeader),
+		"x-forwarded-user-id", "x-forwarded-user-email", "x-forwarded-user-name", "x-forwarded-user-role":
 		return true
 	default:
 		return false
@@ -896,11 +1081,13 @@ func encodeLocationQuery(q string) string {
 // no-credentials answer points to.
 const portProxyMultiFileDocsURL = "https://googlecloudplatform.github.io/scion/hosted/user/port-forwarding/#multi-file-apps"
 
-// portProxyNoCredentialsBody is the static body of the no-credentials
-// answer on proxy routes (writePortProxyNoCredentials).
-const portProxyNoCredentialsBody = "Scion port proxy: pages opened through this URL can only use what is " +
+const portProxyNoCredentialsBodySuffix = " port proxy: pages opened through this URL can only use what is " +
 	"inside the page itself; separate scripts, stylesheets and requests back to the app are not served. " +
 	"Serve a single self-contained page. See " + portProxyMultiFileDocsURL + ".\n"
+
+// portProxyNoCredentialsBody is the default static body of the no-credentials
+// answer on proxy routes (writePortProxyNoCredentials).
+const portProxyNoCredentialsBody = config.DefaultBrandName + portProxyNoCredentialsBodySuffix
 
 // Headers of the no-credentials answer on proxy routes.
 const (
@@ -910,14 +1097,15 @@ const (
 	portProxyHintSandboxedSub  = "sandboxed-subresource"
 )
 
-// writePortProxyNoCredentials answers a request to a port proxy route that
-// carries no credential and is not a page navigation (a script,
-// stylesheet, image or fetch requested by a proxied page) with a
-// plain-text 401 the browser can show and the page can read, instead of
-// the hub's JSON 401, which browsers report only as a MIME type error.
-// The body is static. It reports whether the request looked like a
-// sub-request from a proxied page (Origin "null" or a cross-site fetch).
-func writePortProxyNoCredentials(w http.ResponseWriter, r *http.Request) (hinted bool) {
+// writePortProxyNoCredentialsWithBranding answers a request to a port proxy
+// route that carries no credential and is not a page navigation (a script,
+// stylesheet, image or fetch requested by a proxied page) with a plain-text
+// 401 the browser can show and the page can read, instead of the hub's JSON
+// 401, which browsers report only as a MIME type error. It reports whether the
+// request looked like a sub-request from a proxied page (Origin "null" or a
+// cross-site fetch).
+func writePortProxyNoCredentialsWithBranding(w http.ResponseWriter, r *http.Request, b *config.ResolvedBranding) (hinted bool) {
+	b = brandOrDefault(b)
 	h := w.Header()
 	h.Set("Content-Type", "text/plain; charset=utf-8")
 	h.Set("X-Content-Type-Options", "nosniff")
@@ -930,7 +1118,11 @@ func writePortProxyNoCredentials(w http.ResponseWriter, r *http.Request) (hinted
 	if hinted {
 		h.Set(portProxyHintHeader, portProxyHintSandboxedSub)
 	}
+	body := portProxyNoCredentialsBody
+	if b.Name != config.DefaultBrandName {
+		body = b.Name + portProxyNoCredentialsBodySuffix
+	}
 	w.WriteHeader(http.StatusUnauthorized)
-	_, _ = io.WriteString(w, portProxyNoCredentialsBody)
+	_, _ = io.WriteString(w, body)
 	return hinted
 }

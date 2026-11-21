@@ -15,6 +15,7 @@
 package config
 
 import (
+	"slices"
 	"sort"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
@@ -41,12 +42,14 @@ type FlatInstancePresentation struct {
 
 // FlatRuntimeTargetPresentation is the publishable part of an instance's
 // runtime_target. context, kubeconfig, kubernetes_service_account_mappings,
-// kubernetes_block_service_account and home_storage_leaf are never
-// published.
+// kubernetes_block_service_account, workload_identity_pool,
+// create_service_accounts, home_storage_leaf, project_id, service_account,
+// network, subnetwork and credentials_file are never published.
 type FlatRuntimeTargetPresentation struct {
 	Type                     string            `json:"type"`
 	DisplayName              string            `json:"display_name,omitempty"`
 	Namespace                string            `json:"namespace,omitempty"`
+	Region                   string            `json:"region,omitempty"`
 	GKE                      bool              `json:"gke,omitempty"`
 	PriorityClassName        string            `json:"priority_class_name,omitempty"`
 	SharedDirStorageClass    string            `json:"shared_dir_storage_class,omitempty"`
@@ -55,6 +58,14 @@ type FlatRuntimeTargetPresentation struct {
 	SharedDirStorageBackend  string            `json:"shared_dir_storage_backend,omitempty"`
 	SharedDirStorageBackends map[string]string `json:"shared_dir_storage_backends,omitempty"`
 	HomeStorageBackend       string            `json:"home_storage_backend,omitempty"`
+	// NodeSelector, Tolerations and RuntimeClassName are the instance's
+	// pod placement. PlacementReported is true when this build reports
+	// placement (a Kubernetes target), so a reader can tell "reported, none
+	// configured" from an older instance that does not report it.
+	NodeSelector      map[string]string   `json:"node_selector,omitempty"`
+	Tolerations       []api.K8sToleration `json:"tolerations,omitempty"`
+	RuntimeClassName  string              `json:"runtime_class_name,omitempty"`
+	PlacementReported bool                `json:"placement_reported,omitempty"`
 }
 
 // FlatAgentDefaultsPresentation is the publishable part of an instance's
@@ -108,10 +119,15 @@ type FlatHarnessOverridePresentation struct {
 func PresentInstance(inst V1RuntimeBrokerInstanceConfig) FlatInstancePresentation {
 	out := FlatInstancePresentation{Key: inst.Key, Name: inst.Name}
 	if t := inst.RuntimeTarget; t != nil {
+		var region string
+		if t.Type == RuntimeTargetTypeCloudRun {
+			region = t.Region
+		}
 		out.RuntimeTarget = &FlatRuntimeTargetPresentation{
 			Type:                     t.Type,
 			DisplayName:              t.DisplayName,
 			Namespace:                t.Namespace,
+			Region:                   region,
 			GKE:                      t.GKE,
 			PriorityClassName:        t.PriorityClassName,
 			SharedDirStorageClass:    t.SharedDirStorageClass,
@@ -120,6 +136,10 @@ func PresentInstance(inst V1RuntimeBrokerInstanceConfig) FlatInstancePresentatio
 			SharedDirStorageBackend:  t.SharedDirStorageBackend,
 			SharedDirStorageBackends: copyStringMap(t.SharedDirStorageBackends),
 			HomeStorageBackend:       t.HomeStorageBackend,
+			NodeSelector:             copyStringMap(t.NodeSelector),
+			Tolerations:              slices.Clone(t.Tolerations),
+			RuntimeClassName:         t.RuntimeClassName,
+			PlacementReported:        t.Type == RuntimeTargetTypeKubernetes,
 		}
 	}
 	if d := inst.AgentDefaults; d != nil {
@@ -187,10 +207,15 @@ func (p FlatInstancePresentation) API() api.RuntimeTargetPresentation {
 		Name:          p.Name,
 	}
 	if t := p.RuntimeTarget; t != nil {
+		var region string
+		if t.Type == RuntimeTargetTypeCloudRun {
+			region = t.Region
+		}
 		out.Target = &api.PresentedTarget{
 			Type:                     t.Type,
 			DisplayName:              t.DisplayName,
 			Namespace:                t.Namespace,
+			Region:                   region,
 			GKE:                      t.GKE,
 			PriorityClassName:        t.PriorityClassName,
 			SharedDirStorageClass:    t.SharedDirStorageClass,
@@ -199,6 +224,10 @@ func (p FlatInstancePresentation) API() api.RuntimeTargetPresentation {
 			SharedDirStorageBackend:  t.SharedDirStorageBackend,
 			SharedDirStorageBackends: copyStringMap(t.SharedDirStorageBackends),
 			HomeStorageBackend:       t.HomeStorageBackend,
+			NodeSelector:             copyStringMap(t.NodeSelector),
+			Tolerations:              slices.Clone(t.Tolerations),
+			RuntimeClassName:         t.RuntimeClassName,
+			PlacementReported:        t.PlacementReported,
 		}
 	}
 	if d := p.AgentDefaults; d != nil {

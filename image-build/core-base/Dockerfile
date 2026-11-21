@@ -106,6 +106,10 @@ RUN /opt/scion-image-build/lib/install-core-toolchain.sh free-uid-1000
 
 RUN /opt/scion-image-build/lib/install-core-toolchain.sh apt-common
 RUN /opt/scion-image-build/lib/install-core-toolchain.sh chromium
+# System libraries for Playwright's WebKit and Firefox builds; agents run as
+# non-root and cannot install them later. The list and its provenance live in
+# the script (step_playwright_deps).
+RUN /opt/scion-image-build/lib/install-core-toolchain.sh playwright-deps
 RUN /opt/scion-image-build/lib/install-core-toolchain.sh gcsfuse
 RUN /opt/scion-image-build/lib/install-core-toolchain.sh gcloud
 
@@ -182,9 +186,11 @@ ENV LC_ALL=C.UTF-8
 ENV EDITOR=nano
 ENV VISUAL=nano
 
-# Chrome DevTools MCP server and the playwright CLI, installed globally.
+# Chrome DevTools MCP server and the playwright CLI, installed globally, plus
+# Playwright's ffmpeg registry symlinks to system /usr/bin/ffmpeg.
 RUN --mount=type=secret,id=npmrc,target=/root/.npmrc,required=false \
-    /opt/scion-image-build/lib/install-core-toolchain.sh npm-tools
+    /opt/scion-image-build/lib/install-core-toolchain.sh npm-tools \
+    && /opt/scion-image-build/lib/install-core-toolchain.sh playwright-ffmpeg
 
 # Fail the build, not the agent, when this image does not satisfy what
 # scion-base needs from the layer beneath it. thick-prep ends with the exact
@@ -199,6 +205,7 @@ RUN --mount=type=secret,id=npmrc,target=/root/.npmrc,required=false \
 ARG TARGETARCH
 ARG BUILDARCH
 RUN GO_MIN_VERSION="${GO_MIN_VERSION}" \
+    HELM_VERSION="${HELM_VERSION}" \
     TARGETARCH="${TARGETARCH}" \
     BUILDARCH="${BUILDARCH}" \
     /opt/scion-image-build/lib/verify-base-contract.sh

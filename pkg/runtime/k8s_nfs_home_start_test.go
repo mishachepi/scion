@@ -85,6 +85,9 @@ func TestNFSHomeSubPaths(t *testing.T) {
 // The token the init containers require is the one sciontool advertises
 // for this contract.
 func TestHomeFeatureToken_MatchesSciontool(t *testing.T) {
+	if homeResetFeatureToken != homeprep.ResetFeatureToken {
+		t.Fatalf("reset feature mismatch: %q vs %q", homeResetFeatureToken, homeprep.ResetFeatureToken)
+	}
 	if homeFeatureToken != homeprep.FeatureToken {
 		t.Errorf("runtime requires %q, sciontool advertises %q", homeFeatureToken, homeprep.FeatureToken)
 	}
@@ -194,6 +197,7 @@ func TestBuildPod_NFSHomeBrokerLeafAndSharedClaim(t *testing.T) {
 	cfg.WorkspaceBackendName = "nfs"
 	cfg.NFSPVClaimName = "home-pvc"
 	cfg.NFSSubPath = "projects/" + testHomeProjectID + "/workspace"
+	cfg.ProjectID = testHomeProjectID
 	cfg.HomeStorage.StopGraceSeconds = 45
 	pod, err := rt.buildPod("default", cfg)
 	if err != nil {
@@ -1113,6 +1117,7 @@ func TestBuildPod_NFSHomeClonePerAgentSharedClaim(t *testing.T) {
 	cfg.WorkspaceBackendName = "nfs"
 	cfg.NFSPVClaimName = "home-pvc"
 	cfg.NFSSubPath = "projects/" + testHomeProjectID + "/workspace"
+	cfg.ProjectID = testHomeProjectID
 	cfg.NFSAgentDirName = "a"
 	pod, err := rt.buildPod("default", cfg)
 	if err != nil {
@@ -1161,6 +1166,7 @@ func TestRun_NFSHomeSecretDeleteBetweenConfirmAndCreate(t *testing.T) {
 	cs.PrependReactor("create", "pods", func(k8stesting.Action) (bool, k8sruntime.Object, error) {
 		return true, nil, errors.New("stop here")
 	})
+	seedConfigClaims(t, cs, "default", cfg)
 	if _, err := rt.Run(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "stop here") {
 		t.Fatalf("Run: %v", err)
 	}
@@ -1366,5 +1372,75 @@ func TestRun_NFSHomeStartUnreadablePodRefusedWithoutRealization(t *testing.T) {
 	}
 	if len(*deletes) != 0 {
 		t.Errorf("deletes = %+v, want none", *deletes)
+	}
+}
+
+func TestBuildPodNFSHomeReset(t *testing.T) {
+	rt, _, _ := newTestK8sRuntime()
+	cfg := nfsHomeTestConfig(true)
+	cfg.HomeResetID = "reset-1"
+	for range 2 {
+		pod, err := rt.buildPod("default", cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, c := range pod.Spec.InitContainers {
+			if c.Name != k8sHomePrepareContainer {
+				continue
+			}
+			found = true
+			script := strings.Join(c.Command, " ")
+			if !strings.Contains(script, shellQuote("--reset-id")+" "+shellQuote("reset-1")) || !strings.Contains(script, "home-reset-v1") {
+				t.Fatalf("prepare command lacks reset contract: %s", script)
+			}
+		}
+		if !found {
+			t.Fatal("no prepare container")
+		}
+	}
+}
+
+func TestHomeResetInitCommandFeatureGuard(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no sh")
+	}
+	for _, features := range []string{"home-v1\n", "home-v1\nhome-reset-v1\n", "home-reset-v10\n"} {
+		t.Run(strings.ReplaceAll(features, "\n", "-"), func(t *testing.T) {
+			bin := t.TempDir()
+			script := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = version ]; then printf '%s'; exit 0; fi\necho ran \"$@\"\n", strings.ReplaceAll(features, "\n", "\\n"))
+			if err := os.WriteFile(filepath.Join(bin, "sciontool"), []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			cmd := homeResetInitCommand("sciontool", "home", "prepare", "--reset-id", "reset-1")
+			c := exec.Command(cmd[0], cmd[1:]...)
+			c.Env = []string{"PATH=" + bin + ":/usr/bin:/bin"}
+			out, err := c.CombinedOutput()
+			if strings.Contains(features, "home-reset-v1\n") {
+				if err != nil || !strings.Contains(string(out), "ran home prepare --reset-id reset-1") {
+					t.Fatalf("out=%s err=%v", out, err)
+				}
+			} else {
+				var ee *exec.ExitError
+				if !errors.As(err, &ee) || ee.ExitCode() != 3 || !strings.Contains(string(out), "cannot reset an NFS home") || strings.Contains(string(out), "ran home") {
+					t.Fatalf("out=%s err=%v", out, err)
+				}
+			}
+		})
+	}
+}
+
+func TestBuildPodLocalHomeReset(t *testing.T) {
+	rt, _, _ := newTestK8sRuntime()
+	cfg := nfsHomeTestConfig(false)
+	cfg.HomeResetID = "reset-1"
+	pod, err := rt.buildPod("default", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range pod.Spec.InitContainers {
+		if c.Name == k8sHomePrepareContainer || c.Name == k8sHomeLeafContainer {
+			t.Fatalf("local home unexpectedly uses NFS init container %s", c.Name)
+		}
 	}
 }

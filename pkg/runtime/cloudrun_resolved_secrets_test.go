@@ -131,13 +131,7 @@ func newSandboxSecretsHarness(t *testing.T) *sandboxSecretsHarness {
 		rootDir:      filepath.Join(tmpDir, "scion"),
 		watchCancels: make(map[string]context.CancelFunc),
 	}
-	t.Cleanup(func() {
-		h.rt.watchMu.Lock()
-		for _, cancel := range h.rt.watchCancels {
-			cancel()
-		}
-		h.rt.watchMu.Unlock()
-	})
+	stopWatchersOnCleanup(t, h.rt.state.path, h.rt)
 	h.cfg = RunConfig{
 		Name:         "secrets-agent",
 		HomeDir:      homeDir,
@@ -424,7 +418,9 @@ func TestCloudRunRun_OversizedSecretFailsWithName(t *testing.T) {
 		wantErr string
 	}{
 		{"environment", api.ResolvedSecret{Name: "big-env", Type: "environment", Target: "BIG_ENV", Value: big}, `"big-env"`},
-		{"file", api.ResolvedSecret{Name: "big-file", Type: "file", Target: "/home/scion/big.bin", Value: big}, `"big-file"`},
+		// The staged blob's error names only the largest field class, never
+		// a secret name, key or path.
+		{"file", api.ResolvedSecret{Name: "big-file", Type: "file", Target: "/home/scion/big.bin", Value: big}, "the largest part is the " + stagedClassFileSecrets},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -438,6 +434,9 @@ func TestCloudRunRun_OversizedSecretFailsWithName(t *testing.T) {
 			}
 			_, err := rt.Run(context.Background(), cfg)
 			checkSizeError(t, err, tc.wantErr, "xxxxxxxx")
+			if tc.name == "file" && err != nil && (strings.Contains(err.Error(), "big-file") || strings.Contains(err.Error(), "big.bin")) {
+				t.Error("the staged-blob error names a secret or its target")
+			}
 			if len(fake.createReqs) != 0 {
 				t.Errorf("CreateInstance called %d times, want 0", len(fake.createReqs))
 			}
@@ -520,5 +519,77 @@ func TestCloudRunSandboxRun_ErrorRedactsResolvedSecretValue(t *testing.T) {
 				t.Error("error output contains the staged secrets blob")
 			}
 		})
+	}
+}
+
+// TestCloudRunRun_FileSecretsUnderScionSecretsNotBlockedByReadOnlyMount
+// reproduces ptone/scion#7866: Cloud Run must not mount a read-only NFS
+// directory over /home/<user>/.scion/secrets, so file-type secrets targeting
+// ~/.scion/secrets/<file> (including nested subdirectories) are projected by
+// stagedsecrets.Write into the agent home without failing with EROFS.
+func TestCloudRunRun_FileSecretsUnderScionSecretsNotBlockedByReadOnlyMount(t *testing.T) {
+	fake := &fakeInstancesClient{getErr: notFoundErr()}
+	rt, cfg, agentDir := rollbackTestRun(t, fake, true)
+	cfg.UnixUsername = "scion"
+	cfg.ResolvedSecrets = []api.ResolvedSecret{
+		{Name: "API_TOKEN", Type: "file", Target: "~/.scion/secrets/api-token", Value: "token-body-7866"},
+		{Name: "SA_KEY", Type: "file", Target: "/home/scion/.scion/secrets/nested/sa.json", Value: `{"type":"service_account"}`},
+	}
+
+	if _, err := rt.Run(context.Background(), cfg); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	inst := fake.createReqs[0].Instance
+	for _, vm := range inst.Containers[0].VolumeMounts {
+		if vm.MountPath == "/home/scion/.scion/secrets" || strings.HasPrefix(vm.MountPath, "/home/scion/.scion/secrets/") {
+			t.Errorf("instance mounts %q at %q; /home/scion/.scion/secrets must stay writable in the agent home", vm.Name, vm.MountPath)
+		}
+	}
+	for _, v := range inst.Volumes {
+		if v.Name == "secrets" {
+			t.Errorf("instance defines unused volume %q (%v)", v.Name, v.GetNfs())
+		}
+	}
+	if _, err := os.Stat(filepath.Join(agentDir, "secrets-"+crTestAgentID)); !os.IsNotExist(err) {
+		t.Errorf("provisionCloudRunNFS created unused secrets directory (stat err=%v)", err)
+	}
+
+	env := crInstanceEnv(t, fake)
+	staged, err := stagedsecrets.Decode(env[stagedsecrets.EnvVar])
+	if err != nil {
+		t.Fatalf("decode %s: %v", stagedsecrets.EnvVar, err)
+	}
+
+	// Simulate sciontool init running stagedsecrets.Write against the agent's
+	// provisioned NFS home directory mounted at /home/scion.
+	homeOnShare := filepath.Join(agentDir, "home-"+crTestAgentID)
+	containerView := stagedsecrets.Staged{VariableSecrets: staged.VariableSecrets}
+	for _, fs := range staged.FileSecrets {
+		rel := strings.TrimPrefix(fs.Target, "/home/scion/")
+		if rel == fs.Target {
+			t.Fatalf("expected target %q under /home/scion/", fs.Target)
+		}
+		containerView.FileSecrets = append(containerView.FileSecrets, stagedsecrets.FileSecret{
+			Name:   fs.Name,
+			Target: filepath.Join(homeOnShare, filepath.FromSlash(rel)),
+			Value:  fs.Value,
+		})
+	}
+	if err := stagedsecrets.Write(homeOnShare, &containerView); err != nil {
+		t.Fatalf("stagedsecrets.Write on Cloud Run home failed: %v", err)
+	}
+
+	for rel, want := range map[string]string{
+		".scion/secrets/api-token":      "token-body-7866",
+		".scion/secrets/nested/sa.json": `{"type":"service_account"}`,
+	} {
+		got, err := os.ReadFile(filepath.Join(homeOnShare, filepath.FromSlash(rel)))
+		if err != nil {
+			t.Fatalf("read %s: %v", rel, err)
+		}
+		if string(got) != want {
+			t.Errorf("%s = %q, want %q", rel, got, want)
+		}
 	}
 }

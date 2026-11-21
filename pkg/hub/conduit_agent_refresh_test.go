@@ -171,9 +171,7 @@ func TestConduitAgentRefresh_RefusalsClose4401(t *testing.T) {
 		{name: "expired", token: func(t *testing.T, f *relayFixture) string {
 			svc, err := NewAgentTokenService(AgentTokenConfig{SigningKey: f.srv.agentTokenService.config.SigningKey, TokenDuration: -time.Hour})
 			require.NoError(t, err)
-			tok, err := svc.GenerateAgentToken(f.launched.ID, f.launched.ProjectID, ScopesForRole(AgentRoleFull), nil)
-			require.NoError(t, err)
-			return tok
+			return generateRecordedAgentToken(t, svc, f.store, f.launched.ID, f.launched.ProjectID, ScopesForRole(AgentRoleFull), nil)
 		}},
 		{name: "another agent", token: func(t *testing.T, f *relayFixture) string { return f.agentToken(t, f.agent) }},
 		{name: "another project", token: func(t *testing.T, f *relayFixture) string {
@@ -182,9 +180,7 @@ func TestConduitAgentRefresh_RefusalsClose4401(t *testing.T) {
 			return tok
 		}},
 		{name: "without agent:port:forward", token: func(t *testing.T, f *relayFixture) string {
-			tok, err := f.srv.agentTokenService.GenerateAgentToken(f.launched.ID, f.launched.ProjectID, []AgentTokenScope{ScopeAgentStatusUpdate}, nil)
-			require.NoError(t, err)
-			return tok
+			return f.srv.generateRecordedAgentToken(t, f.launched.ID, f.launched.ProjectID, []AgentTokenScope{ScopeAgentStatusUpdate}, nil)
 		}},
 		{name: "revoked", token: func(t *testing.T, f *relayFixture) string {
 			tok := f.agentToken(t, f.launched)
@@ -213,7 +209,19 @@ func TestConduitAgentRefresh_RefusalsClose4401(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := newRelayFixture(t, nil)
+			// The relay re-reads the agent row once the session is
+			// registered, after the dialer has its Welcome, and closes
+			// it with 4401 if the agent is gone. The test changes state
+			// only after that read, so only the refresh can close it.
+			revalidated := make(chan struct{}, 1)
+			f := newRelayFixture(t, func(o *ConduitRelayOptions) {
+				o.testHookRevalidated = func() {
+					select {
+					case revalidated <- struct{}{}:
+					default:
+					}
+				}
+			})
 			refreshes := agentRefreshCounter(t, f.srv)
 			admit := f.agentToken(t, f.launched)
 			if tc.enforce {
@@ -225,6 +233,11 @@ func TestConduitAgentRefresh_RefusalsClose4401(t *testing.T) {
 			}
 			ls, _, err := f.dial(t, admit, f.launched.RunID)
 			require.NoError(t, err)
+			select {
+			case <-revalidated:
+			case <-time.After(refreshWait):
+				t.Fatal("the relay did not revalidate the session")
+			}
 
 			require.NoError(t, ls.RefreshAuth([]byte(tc.token(t, f)), 0))
 			requireClosedWith(t, ls, conduit.CloseUnauthenticated)

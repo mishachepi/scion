@@ -181,6 +181,7 @@ func attachmentDeliveries(messageID string, refs []AttachmentRef) []messages.Att
 		out = append(out, messages.AttachmentDelivery{
 			ArtifactID: ref.ID, MessageID: messageID, Name: ref.Name,
 			MimeType: ref.MimeType, Size: ref.Size, SHA256: ref.sha256,
+			ProjectedPath: ref.projectedPath, ProjectedMount: ref.projectedMount,
 		})
 	}
 	return out
@@ -323,6 +324,9 @@ func (s *Server) storeOutboundBeforeBroker(ctx context.Context, w http.ResponseW
 	}
 	structuredMsg.ConversationID = storeMsg.ConversationID
 	if err := storeRow(ctx); err != nil {
+		if writeDecisionStoreError(w, err) {
+			return false, false
+		}
 		s.messageLog.Error("Failed to persist outbound message", "agent_id", agent.ID, "error", err)
 		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to persist message", nil)
 		return false, false
@@ -367,6 +371,20 @@ func (s *Server) validateMessageAttachments(ctx context.Context, target *store.A
 			return nil, "", false
 		}
 	}
+	refs, msg := s.validateUserAttachmentIDs(ctx, user, ids, paths, route)
+	if msg != "" {
+		return nil, msg, true
+	}
+	return refs, "", true
+}
+
+// validateUserAttachmentIDs runs the attachment_ids checks of a send by
+// user to an agent recipient, once the caller is admitted to name ids: the
+// ids must be the user's own unsent uploads (validateAttachmentIDs), no two
+// attachments of the send (ids and the hub-local paths) may share a name,
+// and the send must fit the delivery budget. It returns the references, or
+// the 400 validation message. route labels the refusal log line.
+func (s *Server) validateUserAttachmentIDs(ctx context.Context, user Identity, ids, paths []string, route string) ([]AttachmentRef, string) {
 	refs, msg := s.validateAttachmentIDs(ctx, artifacts.PrincipalKindUser, user.ID(), ids, len(paths), route, user)
 	if msg == "" {
 		msg = duplicateAttachmentNameWithPaths(refs, paths)
@@ -375,9 +393,9 @@ func (s *Server) validateMessageAttachments(ctx context.Context, target *store.A
 		msg = s.checkAttachmentDeliveryBudget(refs)
 	}
 	if msg != "" {
-		return nil, msg, true
+		return nil, msg
 	}
-	return refs, "", true
+	return refs, ""
 }
 
 // agentSendReachesAgents reports whether an agent send can deliver its

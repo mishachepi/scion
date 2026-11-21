@@ -71,6 +71,13 @@ func (s *rsWebChatStore) GetTopic(_ context.Context, topicID string) (*WebChatTo
 	return nil, fmt.Errorf("topic not found: %s", topicID)
 }
 
+func (s *rsWebChatStore) GetTopicIncludingDeleted(_ context.Context, topicID string) (*WebChatTopic, error) {
+	if t, ok := s.topics[topicID]; ok {
+		return t, nil
+	}
+	return nil, nil
+}
+
 // Stubs for the remaining WebChatStore interface methods — none are called
 // by the read-switch code path under test.
 func (s *rsWebChatStore) Init() error { return nil }
@@ -122,6 +129,9 @@ func (s *rsWebChatStore) GetTopicConversationIDIncludingDeletedInProject(_ conte
 }
 func (s *rsWebChatStore) CreateTopic(context.Context, WebChatTopic) error { return nil }
 func (s *rsWebChatStore) ListTopics(context.Context, string) ([]WebChatTopic, error) {
+	return nil, nil
+}
+func (s *rsWebChatStore) ListTopicsIncludingDeleted(context.Context, string) ([]WebChatTopic, error) {
 	return nil, nil
 }
 func (s *rsWebChatStore) ListTopicsByProjects(context.Context, []string) ([]WebChatTopic, error) {
@@ -203,7 +213,6 @@ func (s *rsWebChatStore) RecordMentions(context.Context, string, string, []strin
 func (s *rsWebChatStore) UnreadMentionKeys(context.Context, string, []string) (map[string]bool, error) {
 	return nil, nil
 }
-func (s *rsWebChatStore) PurgeOrphanMentions(context.Context) (int, error) { return 0, nil }
 
 // ==========================================================================
 // S1 — handleConversationHistory

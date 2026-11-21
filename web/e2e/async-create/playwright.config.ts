@@ -14,14 +14,15 @@
 
 import { defineConfig } from '@playwright/test';
 
+import { chromiumLaunchOptions } from '../../playwright-chromium.js';
 import { parseTimeoutMs } from './journey-lib.js';
 
 const CI = !!process.env.CI;
 
 // Async agent create from the web form, end to end against the real Go hub
 // binary. By default the global setup starts a throwaway member-level test
-// hub with the co-located runtime broker and server.hub.async_agent_launch
-// on (../harness/hub.ts); E2E_TARGET_URL points the journey at an existing
+// hub with the co-located runtime broker and the hub.async_agent_launch
+// experiment on (../harness/hub.ts); E2E_TARGET_URL points the journey at an existing
 // non-IAP hub instead (see state.ts). The spec acts as a member test
 // identity. Checks that need a real launch skip, with the reason, where no
 // container runtime is usable.
@@ -61,11 +62,6 @@ export default defineConfig({
     viewport: { width: 1280, height: 800 },
     navigationTimeout: 30_000,
     actionTimeout: 15_000,
-    launchOptions: {
-      ...(process.env.CHROMIUM_EXECUTABLE
-        ? { executablePath: process.env.CHROMIUM_EXECUTABLE }
-        : {}),
-      args: ['--no-sandbox', '--disable-setuid-sandbox'],
-    },
+    launchOptions: chromiumLaunchOptions(),
   },
 });

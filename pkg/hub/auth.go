@@ -26,6 +26,9 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
+	"github.com/GoogleCloudPlatform/scion/pkg/config"
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/authctx"
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/trigger"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
 )
@@ -40,6 +43,10 @@ type AuthConfig struct {
 	DevAuthToken string
 	// DevUserCfg holds identity overrides for the development user
 	DevUserCfg DevUserConfig
+	// DevUser, when set, is the live development identity (see
+	// devUserSource); it takes precedence over DevUserCfg so an identity
+	// change is picked up by the next request. Nil uses DevUserCfg as is.
+	DevUser *devUserSource
 	// AgentTokenSvc handles agent JWT validation
 	AgentTokenSvc *AgentTokenService
 	// UserTokenSvc handles user JWT validation
@@ -186,6 +193,9 @@ type AuthConfig struct {
 	// 401 on a port proxy route (Server.recordPortProxyNoCredentials).
 	// Nil counts nothing.
 	RecordPortProxyNoCredentials func()
+	// ResolvedBranding returns the current Hub branding snapshot for
+	// unauthenticated plain-text port proxy errors. Nil falls back to defaults.
+	ResolvedBranding func() *config.ResolvedBranding
 }
 
 // tokenType represents the type of authentication token.
@@ -272,7 +282,14 @@ func normalizeConstraintAuditAuthFailures(w http.ResponseWriter, r *http.Request
 
 // serveAfterAuth unwraps the response normalizer before entering downstream
 // middleware or a handler, so only authentication failures are rewritten.
+// It also carries the request's note of authorization checks stopped by
+// the request context ending, and writes its one summary line (if any)
+// when the handler returns, including on panic.
 func serveAfterAuth(w http.ResponseWriter, next http.Handler, r *http.Request) {
+	if ctx, note := withAuthzStoppedNote(r.Context()); note != nil {
+		r = r.WithContext(ctx)
+		defer note.emit(r)
+	}
 	if normalizer, ok := w.(*constraintAuditAuthFailureWriter); ok {
 		next.ServeHTTP(normalizer.ResponseWriter, r)
 		return
@@ -298,7 +315,10 @@ func handlerAfterAuth(next http.Handler) http.Handler {
 func UnifiedAuthMiddleware(cfg AuthConfig) func(http.Handler) http.Handler {
 	// Parse trusted proxy CIDRs
 	trustedNets := parseTrustedProxies(cfg.TrustedProxies)
-	devUser := NewDevUser(cfg.DevUserCfg)
+	devUsers := cfg.DevUser
+	if devUsers == nil {
+		devUsers = newDevUserSource(cfg.DevUserCfg)
+	}
 	log := cfg.Logger
 	if log == nil {
 		log = slog.Default()
@@ -571,6 +591,18 @@ func UnifiedAuthMiddleware(cfg AuthConfig) func(http.Handler) http.Handler {
 					return
 				}
 
+				// Step 3f: Port page view (hub.port_view). A credential-less
+				// request of any method under /api/v1/portview/ in the
+				// route's one shape (isPortViewRequest) is passed through
+				// WITHOUT an identity: the route serves on the capability
+				// in its path alone, checked on every request, and never
+				// authorizes by an identity. It must stay above 3g.
+				if isPortViewRequest(r) {
+					ctx = contextWithAuthType(ctx, AuthTypeSignedURL)
+					serveAfterAuth(w, next, r.WithContext(ctx))
+					return
+				}
+
 				// Step 3g: no credential of any kind reached a port proxy
 				// route on a request that is not a page navigation
 				// (a navigation without a web session is sent to login by
@@ -579,11 +611,15 @@ func UnifiedAuthMiddleware(cfg AuthConfig) func(http.Handler) http.Handler {
 				//
 				// ORDER: this step must stay the last one before the final
 				// 401. Any new step that lets a request without a
-				// credential through (as 3c to 3e do) goes ABOVE this
+				// credential through (as 3c to 3f do) goes ABOVE this
 				// one; placed below it, its port proxy requests would get
-				// this 401 instead. (3f is left free for such a step.)
+				// this 401 instead.
 				if isProxyRoute(r.URL.Path) && !isBrowserRequest(r) {
-					hinted := writePortProxyNoCredentials(w, r)
+					var b *config.ResolvedBranding
+					if cfg.ResolvedBranding != nil {
+						b = cfg.ResolvedBranding()
+					}
+					hinted := writePortProxyNoCredentialsWithBranding(w, r, b)
 					if cfg.RecordPortProxyNoCredentials != nil {
 						cfg.RecordPortProxyNoCredentials()
 					}
@@ -619,6 +655,7 @@ func UnifiedAuthMiddleware(cfg AuthConfig) func(http.Handler) http.Handler {
 				if !admitDevUserAccount(ctx, cfg, log, w) {
 					return
 				}
+				devUser := devUsers.Load()
 				ctx = context.WithValue(ctx, userContextKey{}, devUser)
 				ctx = contextWithIdentity(ctx, devUser)
 				ctx = contextWithCredentialContext(ctx, credentialContextForIdentity(devUser))
@@ -714,6 +751,7 @@ func UnifiedAuthMiddleware(cfg AuthConfig) func(http.Handler) http.Handler {
 						if !admitDevUserAccount(ctx, cfg, log, w) {
 							return
 						}
+						devUser := devUsers.Load()
 						ctx = context.WithValue(ctx, userContextKey{}, devUser)
 						ctx = contextWithIdentity(ctx, devUser)
 						ctx = contextWithCredentialContext(ctx, credentialContextForIdentity(devUser))
@@ -762,6 +800,15 @@ func UnifiedAuthMiddleware(cfg AuthConfig) func(http.Handler) http.Handler {
 				}
 				// JWT tokens are self-contained; check current user status
 				// from the store to enforce suspension between token refreshes.
+				//
+				// With no UserStore the row block, and with it the session
+				// generation check below, is skipped and no generation is
+				// recorded in the request context. No store means no
+				// revocation can have been recorded. Serving hubs always have
+				// a store: enforced by TestInitHubServer_RefusesNilStore
+				// (cmd) and TestNew_WiresAuthUserStoreFromStore (pkg/hub).
+				var rowGen int64
+				haveRowGen := false
 				if cfg.UserStore != nil {
 					// The account must be active (checkUserAccount, the rule
 					// decide applies): a suspended account, an account with no
@@ -792,6 +839,18 @@ func UnifiedAuthMiddleware(cfg AuthConfig) func(http.Handler) http.Handler {
 						writeAccountRefusal(w, refusal)
 						return
 					}
+					// The token's session generation must equal the users
+					// row's: any difference refuses (a missing claim reads
+					// as 0). This read of the row must stay authoritative;
+					// see sessionGenerationRefusal before adding a replica
+					// or cache on the user read path.
+					if reason := sessionGenerationRefusal(claims.SessionGeneration, u.SessionGeneration); reason != "" {
+						logSessionGenerationRefusal(ctx, log, "jwt_auth", claims.UserID, claims.SessionGeneration, u.SessionGeneration, reason)
+						writeError(w, http.StatusUnauthorized, ErrCodeUnauthorized,
+							"invalid access token: session revoked", nil)
+						return
+					}
+					rowGen, haveRowGen = u.SessionGeneration, true
 					// A federated account authenticates only with its
 					// issuer's token (the federated branch above), never
 					// with a hub-issued session or user token.
@@ -855,6 +914,11 @@ func UnifiedAuthMiddleware(cfg AuthConfig) func(http.Handler) http.Handler {
 				ctx = contextWithIdentity(ctx, user)
 				ctx = contextWithCredentialContext(ctx, credentialContextForIdentity(user))
 				ctx = contextWithAuthType(ctx, AuthTypeJWT)
+				if haveRowGen {
+					// The users-row generation compared above (equal to the
+					// claim), for consumers that re-check later.
+					ctx = authctx.WithSessionGeneration(ctx, rowGen)
+				}
 				if cfg.Debug {
 					log.Debug("User authenticated", "email", user.Email())
 				}
@@ -1043,6 +1107,13 @@ func isUnauthenticatedEndpoint(path string) bool {
 		return true
 	case "/api/v1/test-infra/status": // Test-identity gate status for the web banner (four bools and the issuer audience)
 		return true
+	case "/api/v1/csp-reports": // Browser policy reports for the web pages (no sign-in; browsers send reports on their own)
+		return true
+	}
+	// Generic signed webhook ingress: exact ^/api/v1/hooks/[0-9a-f-]{36}$ match
+	// only (never prefix), so subpaths like /api/v1/hooks/x/y still require auth.
+	if trigger.IsHooksRequestPath(path) {
+		return true
 	}
 	return false
 }
@@ -1166,21 +1237,11 @@ func extractProxyUser(r *http.Request) UserIdentity {
 // agentCredentialIDContextKey stores the credential ID for a validated agent token.
 type agentCredentialIDContextKey struct{}
 
-// legacyTokenContextKey marks that the agent token is a legacy (pre-table) token.
-type legacyTokenContextKey struct{}
-
-// GetAgentCredentialIDFromContext returns the credential ID if the agent token
-// was found in the credential store, or "" if it's a legacy token.
+// GetAgentCredentialIDFromContext returns the credential ID for a validated
+// agent token, or "" if not set.
 func GetAgentCredentialIDFromContext(ctx context.Context) string {
 	id, _ := ctx.Value(agentCredentialIDContextKey{}).(string)
 	return id
-}
-
-// IsLegacyTokenFromContext returns true if the agent token was not found in the
-// credential store (compatibility window for pre-table tokens).
-func IsLegacyTokenFromContext(ctx context.Context) bool {
-	v, _ := ctx.Value(legacyTokenContextKey{}).(bool)
-	return v
 }
 
 // RequireAuth is middleware that ensures a request is authenticated.

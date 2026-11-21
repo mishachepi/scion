@@ -114,26 +114,37 @@ var expectedSelectorRegistry = map[string][]string{
 	"skill:create":                    {"skill.create"},
 	"skill:create_global":             {"skill.create_global"},
 	"skill:delete":                    {"skill.delete"},
+	"skill:delete_global":             {"skill.delete_global"},
 	"skill:list":                      {"skill.list"},
 	"skill:manage":                    {"skill.create", "skill.delete", "skill.list", "skill.read", "skill.register", "skill.update"},
 	"skill:read":                      {"skill.read"},
 	"skill:register":                  {"skill.register"},
 	"skill:update":                    {"skill.update"},
+	"skill:update_global":             {"skill.update_global"},
 	"template:create":                 {"template.create"},
+	"template:create_global":          {"template.create_global"},
 	"template:delete":                 {"template.delete"},
+	"template:delete_global":          {"template.delete_global"},
 	"template:list":                   {"template.list"},
 	"template:manage":                 {"template.create", "template.delete", "template.list", "template.read", "template.update"},
 	"template:read":                   {"template.read"},
 	"template:update":                 {"template.update"},
+	"template:update_global":          {"template.update_global"},
 	"user:invite":                     {"user.invite"},
 	"user:list":                       {"user.list"},
 	"user:read":                       {"user.read"},
 	"user:update":                     {"user.update"},
 	"user:suspend":                    {"user.suspend"},
+	"user:promote":                    {"user.promote"},
+	"user:delete":                     {"user.delete"},
 	"user_skill_injection:update":     {"user_skill_injection.update"},
 
 	// Project messaging policy (owner rule applies on top of the selector).
 	"project:set_messaging_policy": {"project.set_messaging_policy"},
+
+	// Project message policies (owner/admin rule applies on top of manage selector).
+	"project:manage_message_policies": {"project.manage_message_policies"},
+	"project:read_message_policies":   {"project.read_message_policies"},
 
 	// scheduled_event selectors (reads, cancellation, pause and authoring).
 	"scheduled_event:delete": {"scheduled_event.delete"},
@@ -141,6 +152,21 @@ var expectedSelectorRegistry = map[string][]string{
 	"scheduled_event:read":   {"scheduled_event.read"},
 	"scheduled_event:update": {"scheduled_event.update"},
 	"scheduled_event:create": {"scheduled_event.create"},
+
+	// github_trigger selectors (App comment action and project source settings).
+	"github_trigger:comment":   {"github_trigger.comment"},
+	"github_trigger:configure": {"github_trigger.configure"},
+
+	// trigger and webhook_endpoint selectors (ptone/scion#7961).
+	"trigger:delete":          {"trigger.delete"},
+	"trigger:list":            {"trigger.list"},
+	"trigger:read":            {"trigger.read"},
+	"trigger:update":          {"trigger.update"},
+	"trigger:create":          {"trigger.create"},
+	"webhook_endpoint:delete": {"webhook_endpoint.delete"},
+	"webhook_endpoint:list":   {"webhook_endpoint.list"},
+	"webhook_endpoint:read":   {"webhook_endpoint.read"},
+	"webhook_endpoint:create": {"webhook_endpoint.create"},
 
 	// Identity governance reads and hub audit (hub boundary only).
 	"role:read":              {"role.read"},

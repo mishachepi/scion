@@ -230,11 +230,11 @@ func TestAgentDelegationManagement_BoundAgentToken(t *testing.T) {
 		tokenGrant, err := f.srv.AuthorizeAgentToken(ctx, stored)
 		require.NoError(t, err)
 
-		// No credential row (a legacy token): refused in the handler.
+		// No credential row: refused by the agent token middleware.
 		noRow, _, err := f.srv.SignAgentToken(tokenGrant, stored.RunID)
 		require.NoError(t, err)
-		adtAssertAPIError(t, f.readGrant(t, noRow, f.agentA.ID, grant.ID), http.StatusUnauthorized, errCodeAgentCredentialInvalid)
-		adtAssertAPIError(t, f.revokeGrant(t, noRow, f.agentA.ID, grant.ID), http.StatusUnauthorized, errCodeAgentCredentialInvalid)
+		adtAssertAPIError(t, f.readGrant(t, noRow, f.agentA.ID, grant.ID), http.StatusUnauthorized, agentTokenRefusedCode)
+		adtAssertAPIError(t, f.revokeGrant(t, noRow, f.agentA.ID, grant.ID), http.StatusUnauthorized, agentTokenRefusedCode)
 
 		// An expired row: refused in the handler.
 		expired, ac, err := f.srv.SignAgentToken(tokenGrant, stored.RunID)
@@ -783,21 +783,26 @@ func TestAgentDelegatedCredentialPurge_InjectedClock(t *testing.T) {
 // Seeded roles
 // =============================================================================
 
-// TestAgentDelegationManagementRoles_Seeded: hub-admin, project-owner and
-// project-admin hold exactly the four management permissions; no other
-// built-in role except super-admin holds any agent.delegation permission,
-// and none but super-admin holds issuance or exchange.
+// TestAgentDelegationManagementRoles_Seeded (§17.2 flow 40): project-owner
+// and project-admin hold exactly the four per-grant management
+// permissions; hub-admin holds those and agent.delegation.revoke_all; no
+// other built-in role except super-admin holds any agent.delegation
+// permission (so none but super-admin and hub-admin holds revoke_all), and
+// none but super-admin holds issuance or exchange.
 func TestAgentDelegationManagementRoles_Seeded(t *testing.T) {
 	management := []string{
 		agentDelegationRevokePermission, agentDelegationCredentialRevokePermission,
 		agentDelegationListPermission, agentDelegationReadPermission,
 	}
-	holders := map[string]bool{
-		store.SystemRoleHubAdmin: true, store.ProjectRoleOwner: true, store.ProjectRoleAdmin: true,
+	withRevokeAll := append(append([]string(nil), management...), agentDelegationRevokeAllPermission)
+	holders := map[string][]string{
+		store.SystemRoleHubAdmin: withRevokeAll,
+		store.ProjectRoleOwner:   management,
+		store.ProjectRoleAdmin:   management,
 	}
 	for _, role := range BuiltInRoles() {
 		if role.Name == store.SystemRoleSuperAdmin {
-			for _, id := range append(management, agentDelegationCreatePermission, agentDelegationExchangePermission) {
+			for _, id := range append(withRevokeAll, agentDelegationCreatePermission, agentDelegationExchangePermission) {
 				assert.Contains(t, role.Permissions, id)
 			}
 			continue
@@ -808,13 +813,13 @@ func TestAgentDelegationManagementRoles_Seeded(t *testing.T) {
 				held = append(held, p)
 			}
 		}
-		if holders[role.Name] {
-			assert.ElementsMatch(t, management, held, role.Name)
+		if want, ok := holders[role.Name]; ok {
+			assert.ElementsMatch(t, want, held, role.Name)
 		} else {
 			assert.Empty(t, held, role.Name)
 		}
 	}
-	for _, id := range management {
+	for _, id := range withRevokeAll {
 		p, ok := registryPermission(id)
 		require.True(t, ok, id)
 		assert.Empty(t, p.UATScope, id)

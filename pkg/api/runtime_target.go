@@ -148,6 +148,7 @@ type PresentedTarget struct {
 	Type                     string            `json:"type"`
 	DisplayName              string            `json:"displayName,omitempty"`
 	Namespace                string            `json:"namespace,omitempty"`
+	Region                   string            `json:"region,omitempty"`
 	GKE                      bool              `json:"gke,omitempty"`
 	PriorityClassName        string            `json:"priorityClassName,omitempty"`
 	SharedDirStorageClass    string            `json:"sharedDirStorageClass,omitempty"`
@@ -156,6 +157,15 @@ type PresentedTarget struct {
 	SharedDirStorageBackend  string            `json:"sharedDirStorageBackend,omitempty"`
 	SharedDirStorageBackends map[string]string `json:"sharedDirStorageBackends,omitempty"`
 	HomeStorageBackend       string            `json:"homeStorageBackend,omitempty"`
+	// NodeSelector, Tolerations and RuntimeClassName are the instance's
+	// reported pod placement for new agents. PlacementReported is set only
+	// by an instance that reports placement; absent or false means "not
+	// reported", not "no placement". The Hub stores it as received and
+	// never sets it.
+	NodeSelector      map[string]string `json:"nodeSelector,omitempty"`
+	Tolerations       []K8sToleration   `json:"tolerations,omitempty"`
+	RuntimeClassName  string            `json:"runtimeClassName,omitempty"`
+	PlacementReported bool              `json:"placementReported,omitempty"`
 }
 
 // PresentedAgentDefaults is the publishable part of an instance's

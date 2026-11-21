@@ -18,6 +18,7 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
@@ -29,6 +30,40 @@ const (
 	agentListViewFull    = "full"
 	agentListViewCompact = "compact"
 )
+
+// agentListIncludeCapabilities is the include= value that adds each item's
+// resolvedHarness and harnessCapabilities to a full-view agent list
+// (ptone/scion#8227).
+const agentListIncludeCapabilities = "capabilities"
+
+// agentListIncludes selects optional per-item enrichments on full-view agent
+// list responses.
+type agentListIncludes struct {
+	authority    bool
+	capabilities bool
+}
+
+func agentListQueryIncludes(query url.Values, token string) bool {
+	for _, v := range query["include"] {
+		for _, part := range strings.Split(v, ",") {
+			if strings.TrimSpace(part) == token {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func agentListIncludesCapabilities(query url.Values) bool {
+	return agentListQueryIncludes(query, agentListIncludeCapabilities)
+}
+
+func parseAgentListIncludes(query url.Values) agentListIncludes {
+	return agentListIncludes{
+		authority:    agentListIncludesAuthority(query),
+		capabilities: agentListIncludesCapabilities(query),
+	}
+}
 
 // AgentCompactItem is one agent in a view=compact agent list: the fields a
 // graph or tree consumer needs (identity, project, status, detail message,
@@ -54,6 +89,7 @@ type AgentCompactItem struct {
 	Labels          map[string]string `json:"labels,omitempty"`
 	Phase           string            `json:"phase,omitempty"`
 	Activity        string            `json:"activity,omitempty"`
+	SuspendReason   string            `json:"suspendReason,omitempty"`
 	ContainerStatus string            `json:"containerStatus,omitempty"`
 	Message         string            `json:"message,omitempty"`
 	MessageMode     string            `json:"messageMode"`
@@ -113,6 +149,7 @@ func toCompact(a AgentWithCapabilities) AgentCompactItem {
 		Labels:            a.Labels,
 		Phase:             a.Phase,
 		Activity:          a.Activity,
+		SuspendReason:     a.SuspendReason,
 		ContainerStatus:   a.ContainerStatus,
 		Message:           a.Message,
 		MessageMode:       a.MessageMode,
@@ -165,10 +202,19 @@ func legacyAgentListView(query url.Values) string {
 // stats and capabilities has already run, identically for both views, and
 // only the per-item shape differs. It first sets every item's harness
 // vendor and model size (setAgentListBadges), the same for both views, so
-// every list path carries them.
-func (s *Server) writeAgentList(ctx context.Context, w http.ResponseWriter, view string, resp ListAgentsResponse) {
-	s.setAgentListBadges(ctx, resp.Agents)
+// every list path carries the badges. On the full view, inc.capabilities
+// adds resolvedHarness and harnessCapabilities (populateAgentListCapabilities)
+// and inc.authority adds each item's authority state (setAgentListAuthority);
+// the compact view never does either.
+func (s *Server) writeAgentList(ctx context.Context, w http.ResponseWriter, view string, inc agentListIncludes, resp ListAgentsResponse) {
+	memo := s.setAgentListBadges(ctx, resp.Agents)
 	if view != agentListViewCompact {
+		if inc.capabilities {
+			s.populateAgentListCapabilities(ctx, resp.Agents, memo)
+		}
+		if inc.authority {
+			s.setAgentListAuthority(ctx, resp.Agents)
+		}
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}

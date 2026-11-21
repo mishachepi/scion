@@ -40,6 +40,16 @@ func TestExtractMentions(t *testing.T) {
 		{name: "email not mention", text: "send to user@example.com", want: nil},
 		{name: "mention followed by colon", text: "hey @alice: check this", want: []string{"alice"}},
 		{name: "mention in parentheses", text: "(cc @bob)", want: []string{"bob"}},
+		{name: "wrapped mentions stay ignored for agent routing", text: "ping (@alice) and **@bob**", want: nil},
+		{name: "possessive ascii", text: "check @instance-investigator's proposal", want: []string{"instance-investigator"}},
+		{name: "possessive typographic", text: "check @instance-investigator\u2019s proposal", want: []string{"instance-investigator"}},
+		{name: "possessive uppercase", text: "check @ALICE'S and @BOB\u2019S notes", want: []string{"ALICE", "BOB"}},
+		{name: "possessive on slug ending in s", text: "check @hub-ops's and @devops' and @secops\u2019 logs", want: []string{"hub-ops", "devops", "secops"}},
+		{name: "possessive with trailing prose punctuation", text: "per @alice's, @bob\u2019s. (see @carol's) and 'check @dave's'!", want: []string{"alice", "bob", "carol", "dave"}},
+		{name: "possessive deduplicates with plain mention", text: "see @instance-investigator's note; cc @instance-investigator", want: []string{"instance-investigator"}},
+		{name: "bare possessive not a mention", text: "hey @'s and @\u2019s and @!'s here", want: nil},
+		{name: "wrapped possessive stays ignored for agent routing", text: "ping (@alice's) and **@bob\u2019s** and '@carol's", want: nil},
+		{name: "email possessive not mention", text: "send to user@example.com's inbox", want: nil},
 	}
 
 	for _, tc := range tests {
@@ -48,6 +58,49 @@ func TestExtractMentions(t *testing.T) {
 			assert.Equal(t, tc.want, got)
 		})
 	}
+}
+
+func TestExtractWrappedMentions(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want []string
+	}{
+		{name: "no mentions", text: "hello world", want: nil},
+		{name: "plain mention", text: "hey @alice check this", want: []string{"alice"}},
+		{name: "parentheses tight", text: "ping (@alice) please", want: []string{"alice"}},
+		{name: "bold markdown", text: "thanks **@alice**!", want: []string{"alice"}},
+		{name: "italic asterisk", text: "cc *@alice*", want: []string{"alice"}},
+		{name: "italic underscore", text: "cc _@alice_", want: []string{"alice"}},
+		{name: "bold underscore", text: "cc __@alice__", want: []string{"alice"}},
+		{name: "italic underscore around snake_case slug", text: "cc _@my_agent_", want: []string{"my_agent"}},
+		{name: "intraword underscore before at is ignored", text: "foo_@alice", want: nil},
+		{name: "strikethrough", text: "not ~~@alice~~", want: []string{"alice"}},
+		{name: "double quotes", text: `ask "@alice" about it`, want: []string{"alice"}},
+		{name: "single quotes", text: "ask '@alice' about it", want: []string{"alice"}},
+		{name: "square brackets", text: "owner [@alice]", want: []string{"alice"}},
+		{name: "angle brackets", text: "ping <@alice>", want: []string{"alice"}},
+		{name: "after colon without space", text: "FYI:@alice", want: []string{"alice"}},
+		{name: "nested markdown and parens", text: "(**@alice-smith**)", want: []string{"alice-smith"}},
+		{name: "wrapped email mention", text: "cc **@alice.smith@test.com**", want: []string{"alice.smith@test.com"}},
+		{name: "email without leading at is still ignored", text: "(alice.smith@test.com) and **bob@test.com** and mailto:carol@test.com", want: nil},
+		{name: "inline backtick before at is ignored", text: "run `@alice`", want: nil},
+		{name: "multiple mentions in one token", text: "@alice/@bob", want: []string{"alice", "bob"}},
+		{name: "case insensitive dedup", text: "(@Alice) and **@alice**", want: []string{"Alice"}},
+		{name: "bare at in parens", text: "(@) and @!!!", want: nil},
+		{name: "possessive ascii and typographic", text: "check @alice's and (@bob\u2019s)", want: []string{"alice", "bob"}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, ExtractWrappedMentions(tc.text))
+		})
+	}
+
+	t.Run("ExtractProseWrappedMentions keeps code and quote protections", func(t *testing.T) {
+		text := "inline `(**@ignored1**)` and `(cc @ignored2)`\n> **@ignored3**\n```\n(@ignored4)\n```\nreal (**@alice**) and (@bob)"
+		assert.Equal(t, []string{"alice", "bob"}, ExtractProseWrappedMentions(text))
+	})
 }
 
 func TestExtractProseMentions(t *testing.T) {
@@ -170,6 +223,11 @@ func TestExtractProseMentions(t *testing.T) {
 			text: "\t```\n@alice please look",
 			want: []string{"alice"},
 		},
+		{
+			name: "possessive in prose extracted while code and quote possessives ignored",
+			text: "see `@ignored-a's` log\n> @ignored-b\u2019s quote\n```\n@ignored-c's block\n```\ntake @instance-investigator's and @hub-ops\u2019s.",
+			want: []string{"instance-investigator", "hub-ops"},
+		},
 	}
 
 	for _, tc := range tests {
@@ -193,6 +251,9 @@ func TestIsLeadingMention(t *testing.T) {
 		{name: "name mismatch", text: "@typo hello", firstMentionName: "agent-a", want: false},
 		{name: "empty name after trim", text: "@ hello", firstMentionName: "agent-a", want: false},
 		{name: "trailing punct stripped", text: "@agent-a, hello", firstMentionName: "agent-a", want: true},
+		{name: "leading ascii possessive", text: "@agent-a's proposal looks good", firstMentionName: "agent-a", want: true},
+		{name: "leading typographic possessive with comma", text: "@agent-a\u2019s, please check", firstMentionName: "agent-a", want: true},
+		{name: "bare possessive", text: "@'s hello", firstMentionName: "agent-a", want: false},
 		{name: "empty text", text: "", firstMentionName: "agent-a", want: false},
 		{name: "leading whitespace", text: "  @agent-a hello", firstMentionName: "agent-a", want: true},
 		{name: "all-punct name", text: "@!!! hello", firstMentionName: "agent-a", want: false},
@@ -313,4 +374,49 @@ func TestDeliveredSlugs(t *testing.T) {
 	}
 	slugs := DeliveredSlugs(results)
 	assert.Equal(t, []string{"alice", "bob"}, slugs)
+}
+
+func TestReplaceProseMention(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		old     string
+		new     string
+		want    string
+	}{
+		{
+			name:    "known email in prose and markdown wrappers",
+			content: "Ask @john@example.com, **@JOHN@EXAMPLE.COM**, _@john@example.com_, or (@john@example.com).",
+			old:     "john@example.com",
+			new:     "john-smith",
+			want:    "Ask @john-smith, **@john-smith**, _@john-smith_, or (@john-smith).",
+		},
+		{
+			name:    "leaves plain email in prose untouched",
+			content: "Email john@example.com or user@example.com directly.",
+			old:     "john@example.com",
+			new:     "john-smith",
+			want:    "Email john@example.com or user@example.com directly.",
+		},
+		{
+			name:    "does not partially match longer domain or local suffix",
+			content: "Skip @john@example.com.au and @@john@example.com and foo_@john@example.com.",
+			old:     "john@example.com",
+			new:     "john-smith",
+			want:    "Skip @john@example.com.au and @@john@example.com and foo_@john@example.com.",
+		},
+		{
+			name:    "skips inline code spans, fenced code blocks, and blockquotes",
+			content: "Use `@john@example.com` and ping @john@example.com:\n```\n@john@example.com\n```\n> @john@example.com",
+			old:     "john@example.com",
+			new:     "john-smith",
+			want:    "Use `@john@example.com` and ping @john-smith:\n```\n@john@example.com\n```\n> @john@example.com",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, ReplaceProseMention(tc.content, tc.old, tc.new))
+		})
+	}
 }

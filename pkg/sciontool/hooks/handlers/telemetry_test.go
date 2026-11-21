@@ -201,6 +201,7 @@ func TestSpanMapping(t *testing.T) {
 		hooks.EventModelEnd:         "gen_ai.api.response",
 		hooks.EventAgentStart:       "agent.turn.start",
 		hooks.EventAgentEnd:         "agent.turn.end",
+		hooks.EventAgentError:       "agent.turn.end",
 		hooks.EventNotification:     "agent.notification",
 		hooks.EventResponseComplete: "agent.response.complete",
 	}
@@ -754,10 +755,10 @@ func TestTelemetryHandler_TokenMetricsOnModelEnd(t *testing.T) {
 // would catch a regression where the handler goes back to including
 // agent_id/project_id, since the admission test would keep passing.
 //
-// gen_ai.api.calls is asserted to still carry agent_id and project_id in the
-// same run, documenting the intended asymmetry: it keeps them for Cloud
-// descriptor compatibility (design §3.2); scion.usage.tokens does not,
-// because its GCP allowlist doesn't permit them.
+// gen_ai.api.calls is asserted in the same run to carry exactly harness,
+// model and status: like scion.usage.tokens it has no unprefixed agent_id or
+// project_id (ptone/scion#3668), so both metrics share the canonical scion_*
+// identity labels the pipeline stamps.
 func TestTelemetryHandler_UsageTokenLabelsMatchContract(t *testing.T) {
 	scrubTelemetryEnv(t)
 	t.Setenv("SCION_USAGE_SOURCE", "hooks")
@@ -841,13 +842,29 @@ func TestTelemetryHandler_UsageTokenLabelsMatchContract(t *testing.T) {
 				if !ok {
 					t.Fatalf("%s: unexpected data type %T", m.Name, m.Data)
 				}
+				// Exactly harness, model and status: no unprefixed
+				// agent_id/project_id, so calls and tokens share one
+				// identity label set once the pipeline stamps the
+				// canonical scion_* labels (ptone/scion#3668).
+				wantCallKeys := map[string]bool{
+					telemetrycontract.HarnessLabel: true,
+					telemetrycontract.ModelLabel:   true,
+					telemetrycontract.StatusLabel:  true,
+				}
 				for _, point := range sum.DataPoints {
 					sawAPICallPoint = true
-					if _, ok := point.Attributes.Value(attribute.Key("agent_id")); !ok {
-						t.Errorf("%s point missing agent_id (intended asymmetry vs. %s)", m.Name, telemetrycontract.MetricUsageTokens)
+					gotKeys := map[string]bool{}
+					for _, kv := range point.Attributes.ToSlice() {
+						gotKeys[string(kv.Key)] = true
 					}
-					if _, ok := point.Attributes.Value(attribute.Key("project_id")); !ok {
-						t.Errorf("%s point missing project_id (intended asymmetry vs. %s)", m.Name, telemetrycontract.MetricUsageTokens)
+					if len(gotKeys) != len(wantCallKeys) {
+						t.Errorf("%s point attribute keys = %v, want exactly %v", m.Name, gotKeys, wantCallKeys)
+						continue
+					}
+					for key := range wantCallKeys {
+						if !gotKeys[key] {
+							t.Errorf("%s point attribute keys = %v, missing %q", m.Name, gotKeys, key)
+						}
 					}
 				}
 			}
@@ -1304,4 +1321,95 @@ func TestTelemetryHandler_ModelAttributeOnSpansAndLogs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTelemetryHandler_SingleSpanUnpairedModelEndEmitsTokenAttributes(t *testing.T) {
+	scrubTelemetryEnv(t)
+	t.Setenv("SCION_USAGE_SOURCE", "hooks")
+	t.Setenv("SCION_HARNESS", "antigravity")
+
+	sr := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+	defer func() { _ = tp.Shutdown(context.Background()) }()
+
+	h := NewTelemetryHandler(tp, nil, nil)
+
+	// Unpaired model-end (hook-per-process singleSpan path) with all 5 token types > 0.
+	if err := h.Handle(&hooks.Event{
+		Name:    hooks.EventModelEnd,
+		RawName: "PostInvocation",
+		Dialect: "antigravity",
+		Data: hooks.EventData{
+			SessionID:        "conv-single-span",
+			Model:            "gemini-3.8-flash-medium",
+			InputTokens:      4889,
+			OutputTokens:     123,
+			CachedTokens:     3705,
+			CacheWriteTokens: 42,
+			ReasoningTokens:  19,
+		},
+	}); err != nil {
+		t.Fatalf("Handle unpaired model-end: %v", err)
+	}
+
+	// Second unpaired model-end with zero cache_write and reasoning tokens (must omit zero keys).
+	if err := h.Handle(&hooks.Event{
+		Name:    hooks.EventModelEnd,
+		RawName: "PostInvocation",
+		Dialect: "antigravity",
+		Data: hooks.EventData{
+			SessionID:    "conv-single-span",
+			Model:        "gemini-3.8-flash-medium",
+			InputTokens:  1000,
+			OutputTokens: 50,
+			CachedTokens: 200,
+		},
+	}); err != nil {
+		t.Fatalf("Handle second unpaired model-end: %v", err)
+	}
+
+	spans := sr.Ended()
+	if len(spans) != 2 {
+		t.Fatalf("ended spans = %d, want 2", len(spans))
+	}
+
+	assertIntAttrs := func(idx int, want map[string]int64, absent []string) {
+		t.Helper()
+		if spans[idx].Name() != "gen_ai.api.response" {
+			t.Errorf("spans[%d].Name = %q, want gen_ai.api.response", idx, spans[idx].Name())
+		}
+		got := map[string]int64{}
+		for _, kv := range spans[idx].Attributes() {
+			if kv.Value.Type() == attribute.INT64 {
+				got[string(kv.Key)] = kv.Value.AsInt64()
+			}
+		}
+		for k, w := range want {
+			if v, ok := got[k]; !ok || v != w {
+				t.Errorf("spans[%d] attr %s = (%d, %t), want %d", idx, k, v, ok, w)
+			}
+		}
+		for _, k := range absent {
+			if v, ok := got[k]; ok {
+				t.Errorf("spans[%d] unexpectedly has attr %s = %d", idx, k, v)
+			}
+		}
+	}
+
+	assertIntAttrs(0, map[string]int64{
+		"gen_ai.usage.input_tokens":       4889,
+		"gen_ai.usage.output_tokens":      123,
+		"gen_ai.usage.cached_tokens":      3705,
+		"gen_ai.usage.cache_write_tokens": 42,
+		"gen_ai.usage.reasoning_tokens":   19,
+	}, nil)
+
+	assertIntAttrs(1, map[string]int64{
+		"gen_ai.usage.input_tokens":  1000,
+		"gen_ai.usage.output_tokens": 50,
+		"gen_ai.usage.cached_tokens": 200,
+	}, []string{
+		"gen_ai.usage.cache_write_tokens",
+		"gen_ai.usage.reasoning_tokens",
+	})
 }

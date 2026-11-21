@@ -177,6 +177,8 @@ func (s *Server) haltDispatchProducers() {
 	if scheduler != nil {
 		scheduler.halt()
 	}
+	s.scheduledDetachedFires.closeAdmission()
+	s.execRuns.work.closeAdmission()
 	s.haltScheduledSendSweeper()
 	s.haltAutoSuspendWorker()
 }

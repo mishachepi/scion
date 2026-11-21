@@ -21,12 +21,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
@@ -483,6 +485,70 @@ type OnboardingStatus struct {
 	ImageRegistrySaveable string `json:"imageRegistrySaveable,omitempty"`
 }
 
+// harnessesSeeded reports whether at least one active global harness config
+// exists: the rows the setup wizard's harness step lists, the same query as
+// its request (GET /api/v1/harness-configs?scope=global&status=active). A
+// directory under globalDir/harness-configs with no row does not count when
+// bootstrap could have created one.
+//
+// Where no row can be created for the directory, the directory counts (a
+// subdirectory holding config.yaml), so the onboarding status is never held
+// incomplete on a hub that cannot seed: without a store, without a storage
+// backend (bootstrap skips) and after a bootstrap, workstation or hosted,
+// that could not load the built-in seed ledger. A store error also falls
+// back to the directory rather than reading as not seeded.
+func (s *Server) harnessesSeeded(ctx context.Context, globalDir string) bool {
+	hcDir := filepath.Join(globalDir, "harness-configs")
+	if s.store == nil {
+		return countHarnessConfigDirs(hcDir) > 0
+	}
+	result, err := s.store.ListHarnessConfigs(ctx, store.HarnessConfigFilter{
+		Scope:  store.HarnessConfigScopeGlobal,
+		Status: store.HarnessConfigStatusActive,
+	}, store.ListOptions{Limit: 1, SkipTotalCount: true})
+	if err != nil {
+		// The UI polls this status: WARN once per failure streak.
+		logf := s.resourceLog.Debug
+		if !s.harnessListWarned.Swap(true) {
+			logf = s.resourceLog.Warn
+		}
+		logf("onboarding status: listing harness configs failed; counting the harness-configs directory",
+			"dir", hcDir, "error", err)
+		return countHarnessConfigDirs(hcDir) > 0
+	}
+	s.harnessListWarned.Store(false)
+	if result != nil && len(result.Items) > 0 {
+		return true
+	}
+	if s.GetStorage() == nil || s.harnessSeedLedgerFailed.Load() {
+		return countHarnessConfigDirs(hcDir) > 0
+	}
+	return false
+}
+
+// hasUserWorkspace reports whether at least one user project exists in the
+// store, excluding the Hub's built-in global project (isGlobalHubProject).
+// Because project slugs are unique, at most one row can hold the global slug,
+// so a Limit of 2 always sees a non-global project when one exists.
+func (s *Server) hasUserWorkspace(ctx context.Context) bool {
+	if s.store == nil {
+		return false
+	}
+	page, err := s.store.ListProjectSummaries(ctx, store.ProjectFilter{}, store.ListOptions{
+		Limit:          2,
+		SkipTotalCount: true,
+	})
+	if err != nil || page == nil {
+		return false
+	}
+	for i := range page.Items {
+		if !isGlobalHubProject(page.Items[i].Slug) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) computeOnboardingStatus(ctx context.Context) OnboardingStatus {
 	var status OnboardingStatus
 
@@ -509,27 +575,14 @@ func (s *Server) computeOnboardingStatus(ctx context.Context) OnboardingStatus {
 	_, detectErr := config.DetectLocalRuntime()
 	status.RuntimeOK = detectErr == nil
 
-	// HarnessesSeeded: at least one harness-config exists
-	harnessConfigsDir := filepath.Join(globalDir, "harness-configs")
-	if entries, err := os.ReadDir(harnessConfigsDir); err == nil {
-		for _, e := range entries {
-			if e.IsDir() {
-				status.HarnessesSeeded = true
-				break
-			}
-		}
-	}
+	status.HarnessesSeeded = s.harnessesSeeded(ctx, globalDir)
 
-	// HasWorkspace: at least one project in the store
-	if s.store != nil {
-		result, err := s.store.ListProjects(ctx, store.ProjectFilter{}, store.ListOptions{Limit: 1})
-		if err == nil && result != nil && len(result.Items) > 0 {
-			status.HasWorkspace = true
-		}
-	}
+	// HasWorkspace: at least one non-global project in the store
+	status.HasWorkspace = s.hasUserWorkspace(ctx)
 
-	// Complete: all required steps done
-	status.Complete = status.Initialized && status.IdentitySet && status.RuntimeOK && status.HarnessesSeeded
+	// Complete: core workstation setup is ready and either web identity is
+	// configured or a user project already exists (e.g. CLI-initialized).
+	status.Complete = status.Initialized && status.RuntimeOK && status.HarnessesSeeded && (status.IdentitySet || status.HasWorkspace)
 
 	status.EmbeddedBrokerID = s.GetEmbeddedBrokerID()
 
@@ -746,6 +799,9 @@ type imagePullResponse struct {
 	JobID string `json:"jobId"`
 }
 
+// systemImagePuller is the signature of runtime.PullImages.
+type systemImagePuller func(ctx context.Context, rt runtime.Runtime, harnesses []string, registry, tag string, onEvent func(runtime.PullResult)) error
+
 func (s *Server) handleSystemImagesPull(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		MethodNotAllowed(w, http.MethodPost)
@@ -776,6 +832,9 @@ func (s *Server) handleSystemImagesPull(w http.ResponseWriter, r *http.Request) 
 	}
 
 	registry := s.resolveImageRegistry()
+	// The harness images take the hub-scope image_tag (ptone/scion#6625);
+	// "" when none applies (imageTagStateOf).
+	imageTag := s.hubScopeImageTag()
 	if registry == "" {
 		s.imagePullActive.Store(false)
 		writeError(w, http.StatusUnprocessableEntity, ErrCodeUnprocessable, "image_registry is not configured — run 'scion config set --global image_registry <registry>' or reinstall via Homebrew", nil)
@@ -787,10 +846,14 @@ func (s *Server) handleSystemImagesPull(w http.ResponseWriter, r *http.Request) 
 	rt := runtime.GetRuntime(systemRuntimeProjectPath, "")
 
 	requestedHarnesses := req.Harnesses
+	pull := s.systemImagePull
+	if pull == nil {
+		pull = runtime.PullImages
+	}
 
 	go func() {
 		defer s.imagePullActive.Store(false)
-		if err := runtime.PullImages(s.ctx, rt, requestedHarnesses, registry, func(pr runtime.PullResult) {
+		if err := pull(s.ctx, rt, requestedHarnesses, registry, imageTag, func(pr runtime.PullResult) {
 			s.events.PublishRaw("system.images."+jobID, pr)
 		}); err != nil {
 			s.events.PublishRaw("system.images."+jobID, map[string]string{
@@ -920,6 +983,41 @@ func resolveBuildScript() string {
 	return path
 }
 
+// bundledHarnessBuildImagesFromFS maps each bundled harness directory in hfs
+// that ships a Dockerfile to the image configured in its config.yaml.
+func bundledHarnessBuildImagesFromFS(hfs fs.FS) map[string]string {
+	entries, err := fs.ReadDir(hfs, ".")
+	if err != nil {
+		return nil
+	}
+	images := make(map[string]string, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if _, err := fs.Stat(hfs, name+"/Dockerfile"); err != nil {
+			continue
+		}
+		data, err := fs.ReadFile(hfs, name+"/config.yaml")
+		if err != nil {
+			continue
+		}
+		cfg, err := config.ParseHarnessConfigYAML(data)
+		if err != nil {
+			continue
+		}
+		if img := strings.TrimSpace(cfg.Image); img != "" {
+			images[name] = img
+		}
+	}
+	return images
+}
+
+var bundledHarnessBuildImages = sync.OnceValue(func() map[string]string {
+	return bundledHarnessBuildImagesFromFS(harness.HarnessesFS())
+})
+
 func (s *Server) handleSystemImagesBuild(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		MethodNotAllowed(w, http.MethodPost)
@@ -967,9 +1065,9 @@ func (s *Server) handleSystemImagesBuild(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	allowed := map[string]bool{"claude": true, "gemini": true, "codex": true, "opencode": true}
+	allowed := bundledHarnessBuildImages()
 	for _, h := range req.Harnesses {
-		if !allowed[h] {
+		if _, ok := allowed[h]; !ok {
 			ValidationError(w, fmt.Sprintf("unknown harness %q", h), nil)
 			return
 		}
@@ -1025,14 +1123,22 @@ func (s *Server) runImageBuild(ctx context.Context, subject, buildScript string,
 	if err := cmd.Wait(); err != nil {
 		s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: "build failed: " + err.Error()})
 	} else {
-		for _, h := range harnesses {
-			s.events.PublishRaw(subject, map[string]string{
-				"image":  "scion-" + h + ":latest",
-				"status": "done",
-			})
-		}
-		s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: "build complete"})
+		s.publishImageBuildCompletion(subject, harnesses, bundledHarnessBuildImages())
 	}
+}
+
+func (s *Server) publishImageBuildCompletion(subject string, harnesses []string, images map[string]string) {
+	for _, h := range harnesses {
+		image := images[h]
+		if image == "" {
+			image = "scion-" + h + ":latest"
+		}
+		s.events.PublishRaw(subject, map[string]string{
+			"image":  image,
+			"status": "done",
+		})
+	}
+	s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: "build complete"})
 }
 
 // --- 5.2: Filesystem Endpoints ---

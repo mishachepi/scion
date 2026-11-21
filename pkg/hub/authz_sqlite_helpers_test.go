@@ -159,13 +159,6 @@ func bearerUser(id string) *AuthenticatedUser {
 	return NewAuthenticatedUser(id, id+"@test.com", "User", "member", "api")
 }
 
-func bearerCeiling(t *testing.T, selectors ...string) permissions.FrozenPermissionCeiling {
-	t.Helper()
-	ceiling, ok := permissions.BuildCeilingFromSelectors(selectors)
-	require.True(t, ok, "selectors must resolve: %v", selectors)
-	return ceiling
-}
-
 func hubBoundary() TokenBoundary { return TokenBoundary{Kind: BoundaryKindHub} }
 
 func projectBoundary(projectID string) TokenBoundary {
@@ -174,28 +167,6 @@ func projectBoundary(projectID string) TokenBoundary {
 
 func activeUserPrincipal(id string) PrincipalContext {
 	return PrincipalContext{Kind: PrincipalKindUser, ID: id}
-}
-
-// systemRoleUserWithPermissions creates a user with a custom system-scoped
-// role definition carrying exactly permissionIDs, and returns the user ID.
-func systemRoleUserWithPermissions(t *testing.T, s store.Store, userID string, permissionIDs []string) {
-	t.Helper()
-	ctx := context.Background()
-	require.NoError(t, s.CreateUser(ctx, &store.User{ID: userID, Email: userID + "@test.com", DisplayName: "u", Role: "member", Status: store.UserStatusActive}))
-	rd, err := s.CreateRoleDefinition(ctx, &store.RoleDefinition{
-		Name:        "apa-custom-" + userID,
-		ScopeType:   store.RoleScopeSystem,
-		Permissions: permissionIDs,
-	})
-	require.NoError(t, err)
-	_, err = s.CreateRoleBinding(ctx, &store.RoleBinding{
-		RoleDefinitionID: rd.ID,
-		PrincipalType:    store.RoleBindingPrincipalUser,
-		PrincipalID:      userID,
-		ScopeType:        store.RoleScopeSystem,
-		CreatedBy:        "test",
-	})
-	require.NoError(t, err)
 }
 
 // bypassAgentsFixture is the world these tests reason about, mirroring the
@@ -384,78 +355,6 @@ func setupCanDelegateTest(t *testing.T) (*AuthzService, store.Store) {
 	return authz, s
 }
 
-// createTestUserWithRole creates a user and assigns them a system-scoped role binding.
-// For super-admin bindings, CreatedBy is set to the system reconciler sentinel
-// because the D10 store-level guard rejects non-reconciler callers.
-func createTestUserWithRole(t *testing.T, s store.Store, userID, email, role, roleName string) {
-	t.Helper()
-	ctx := context.Background()
-
-	require.NoError(t, s.CreateUser(ctx, &store.User{
-		ID: userID, Email: email, DisplayName: email, Role: role, Status: "active",
-	}))
-
-	rd, err := s.GetRoleDefinitionByName(ctx, roleName, store.RoleScopeSystem)
-	require.NoError(t, err, "role definition %q not found", roleName)
-
-	createdBy := "test"
-	if roleName == store.SystemRoleSuperAdmin {
-		createdBy = store.SystemReconcileCreatedBy
-	}
-
-	_, err = s.CreateRoleBinding(ctx, &store.RoleBinding{
-		RoleDefinitionID: rd.ID,
-		PrincipalType:    store.RoleBindingPrincipalUser,
-		PrincipalID:      userID,
-		ScopeType:        store.RoleScopeSystem,
-		ScopeID:          "",
-		CreatedBy:        createdBy,
-	})
-	if err != nil && err != store.ErrAlreadyExists {
-		t.Fatalf("failed to create role binding: %v", err)
-	}
-}
-
-// createTestUserWithProjectRole creates a user and assigns them a project-scoped role binding.
-func createTestUserWithProjectRole(t *testing.T, s store.Store, userID, email, projectID, roleName string) {
-	t.Helper()
-	ctx := context.Background()
-
-	// Create user if not exists
-	if _, err := s.GetUser(ctx, userID); err != nil {
-		require.NoError(t, s.CreateUser(ctx, &store.User{
-			ID: userID, Email: email, DisplayName: email, Role: "member", Status: "active",
-		}))
-	}
-
-	rd, err := s.GetRoleDefinitionByName(ctx, roleName, store.RoleScopeProject)
-	require.NoError(t, err, "role definition %q not found", roleName)
-
-	_, err = s.CreateRoleBinding(ctx, &store.RoleBinding{
-		RoleDefinitionID: rd.ID,
-		PrincipalType:    store.RoleBindingPrincipalUser,
-		PrincipalID:      userID,
-		ScopeType:        store.RoleScopeProject,
-		ScopeID:          projectID,
-		CreatedBy:        "test",
-	})
-	if err != nil && err != store.ErrAlreadyExists {
-		t.Fatalf("failed to create project role binding: %v", err)
-	}
-}
-
-// createDelegateTestProject creates a project in the store.
-func createDelegateTestProject(t *testing.T, s store.Store, projectID, slug, createdBy string) {
-	t.Helper()
-	ctx := context.Background()
-	require.NoError(t, s.CreateProject(ctx, &store.Project{
-		ID:        projectID,
-		Name:      slug,
-		Slug:      slug,
-		CreatedBy: createdBy,
-	}))
-}
-
 // edgeLookupErrStore fails GetDelegationEdgesForDelegate for one delegate
 // with an error other than store.ErrNotFound.
 type edgeLookupErrStore struct {
@@ -567,21 +466,6 @@ func assertRequestNotAdmitted(t *testing.T, d Decision, msg string) {
 	t.Helper()
 	assert.False(t, d.Allowed, "%s: reason %q", msg, d.Reason)
 	assert.Contains(t, notAdmittedReasons, d.Reason, "%s: unexpected deny reason %q", msg, d.Reason)
-}
-
-func boundedCeiling(ids ...string) store.EffectCeiling {
-	if ids == nil {
-		ids = []string{}
-	}
-	return store.EffectCeiling{Kind: store.EffectCeilingBounded, Version: permissions.CeilingVersionV1, PermissionIDs: ids}
-}
-
-func allRegistryIDs() []string {
-	ids := make([]string, 0, len(permissions.Registry))
-	for _, p := range permissions.Registry {
-		ids = append(ids, p.ID)
-	}
-	return ids
 }
 
 // uatCeilingFromSelectors returns the bounded ceiling a V1 UAT with the given
@@ -989,56 +873,10 @@ func userRoleHolds(t *testing.T, a *AuthzService, userID, perm, projectID string
 	return ok
 }
 
-func softDeleteStoredAgent(t *testing.T, s store.Store, id string) {
-	t.Helper()
-	a, err := s.GetAgent(context.Background(), id)
-	require.NoError(t, err)
-	a.DeletedAt = time.Now()
-	require.NoError(t, s.UpdateAgent(context.Background(), a))
-}
-
 func assertCeilingDeny(t *testing.T, d Decision, msg string) {
 	t.Helper()
 	assert.False(t, d.Allowed, "%s: reason %q", msg, d.Reason)
 	assert.Equal(t, DeniedByDelegationCeiling, d.DeniedBy, "%s: reason %q", msg, d.Reason)
-}
-
-// addProjectMemberWithRole is a small helper that adds the given user to the
-// project's members group with the requested role.
-func addProjectMemberWithRole(t *testing.T, s store.Store, project *store.Project, userID, role string) {
-	t.Helper()
-	ctx := context.Background()
-	membersGroup, err := s.GetGroupBySlug(ctx, "project:"+project.Slug+":members")
-	require.NoError(t, err)
-	require.NoError(t, s.AddGroupMember(ctx, &store.GroupMember{
-		GroupID:    membersGroup.ID,
-		MemberType: store.GroupMemberTypeUser,
-		MemberID:   userID,
-		Role:       role,
-	}))
-
-	// Phase 1F: also create the corresponding project role binding, since
-	// isProjectOwnerOrAdmin now uses role bindings as the sole source of truth.
-	groupRoleMap := map[string]string{
-		store.GroupMemberRoleOwner:  store.ProjectRoleOwner,
-		store.GroupMemberRoleAdmin:  store.ProjectRoleAdmin,
-		store.GroupMemberRoleMember: store.ProjectRoleMember,
-	}
-	if roleName, ok := groupRoleMap[role]; ok {
-		rd, err := s.GetRoleDefinitionByName(ctx, roleName, store.RoleScopeProject)
-		require.NoError(t, err, "project role definition %q not found", roleName)
-		_, err = s.CreateRoleBinding(ctx, &store.RoleBinding{
-			RoleDefinitionID: rd.ID,
-			PrincipalType:    store.RoleBindingPrincipalUser,
-			PrincipalID:      userID,
-			ScopeType:        store.RoleScopeProject,
-			ScopeID:          project.ID,
-			CreatedBy:        "test",
-		})
-		if err != nil && err != store.ErrAlreadyExists {
-			t.Fatalf("failed to create project role binding: %v", err)
-		}
-	}
 }
 
 // makeProjectMemberUser creates a user, adds them to hub-members, and adds them
@@ -1058,17 +896,6 @@ func makeProjectMemberUser(t *testing.T, s store.Store, project *store.Project, 
 	ensureHubMembership(ctx, s, u.ID)
 	addProjectMemberWithRole(t, s, project, u.ID, role)
 	return u
-}
-
-// recordedProv returns version-1 provenance whose source is the edge's
-// delegator, as every recording write produces.
-func recordedProv(kind string, id string, cred store.SourceCredentialKind) store.AuthorityProvenance {
-	return store.AuthorityProvenance{
-		ProvenanceVersion:    store.ProvenanceVersionV1,
-		SourcePrincipalKind:  kind,
-		SourcePrincipalID:    id,
-		SourceCredentialKind: cred,
-	}
 }
 
 // schedulerProv returns consistent scheduler provenance for a delegator.
@@ -1137,21 +964,6 @@ func parseHubProduction(t *testing.T) (*token.FileSet, []*ast.File) {
 		files = append(files, f)
 	}
 	return fset, files
-}
-
-// declReceiverName returns "Recv.Name" or "Name" for decl.
-func declReceiverName(decl *ast.FuncDecl) string {
-	if decl.Recv == nil || len(decl.Recv.List) == 0 {
-		return decl.Name.Name
-	}
-	typ := decl.Recv.List[0].Type
-	if star, ok := typ.(*ast.StarExpr); ok {
-		typ = star.X
-	}
-	if id, ok := typ.(*ast.Ident); ok {
-		return id.Name + "." + decl.Name.Name
-	}
-	return decl.Name.Name
 }
 
 // callsIn returns, per enclosing function, the calls to a function or
@@ -1247,7 +1059,7 @@ var relationshipCharacterizedAllowlist = map[relationshipAllowKey][]string{
 		"gcp_service_account.assign",
 	},
 	{"owner", "user", "skill"}: {
-		"skill.create", "skill.create_global", "skill.read", "skill.update", "skill.delete",
+		"skill.create", "skill.read", "skill.update", "skill.delete",
 		"skill.list", "skill.register",
 	},
 
@@ -1283,22 +1095,22 @@ var relationshipCharacterizedAllowlist = map[relationshipAllowKey][]string{
 	// Current hub members may assign hub-scoped service accounts.
 	{"hub_member_sa_assign", "user", "gcp_service_account"}: {"gcp_service_account.assign"},
 
+	// Launch delivery of a project-, hub- or broker-scope secret or env var
+	// to the delivery credential's agent (ptone/scion#2129). The candidate
+	// is built only for a hub_delivery principal on a named delivery item
+	// (TestMaterialAssociation_* in material_delivery_test.go), so no
+	// characterization principal in this file reaches these cells.
+	{"project_association", "agent", "secret"}:  {"secret.deliver"},
+	{"project_association", "agent", "env_var"}: {"env_var.deliver"},
+	{"hub_association", "agent", "secret"}:      {"secret.deliver"},
+	{"hub_association", "agent", "env_var"}:     {"env_var.deliver"},
+	{"broker_association", "agent", "secret"}:   {"secret.deliver"},
+	{"broker_association", "agent", "env_var"}:  {"env_var.deliver"},
+
 	// An agent may read its origin user's personal (user-scoped) skills,
 	// through the same progeny relationship as opted-in secrets, keyed on
 	// the skill's owning bucket rather than a per-record creator field.
 	{"progeny", "agent", "skill"}: {"skill.read"},
-}
-
-// sameTypeRegistryPermissions returns every registry permission ID whose
-// Resource is resourceType, in registry order.
-func sameTypeRegistryPermissions(resourceType string) []permissions.Permission {
-	var out []permissions.Permission
-	for _, p := range permissions.Registry {
-		if p.Resource == resourceType {
-			out = append(out, p)
-		}
-	}
-	return out
 }
 
 func characterizedSet(key relationshipAllowKey) map[string]bool {
@@ -1345,34 +1157,9 @@ func createCharacterizationUser(t *testing.T, s store.Store, id string) UserIden
 	return NewAuthenticatedUser(id, id+"@relchar.test", id, "member", "api")
 }
 
-// grantProjectAccessOnly binds userID in projectID to a project-scoped role
-// with no permissions. The binding is project membership (active project
-// access, which owner and ancestor relationships on project targets
-// require; ptone/scion#2141) without granting any permission through the
-// role, so the relationship stays the only grant source under test.
-func grantProjectAccessOnly(t *testing.T, s store.Store, userID, projectID string) {
-	t.Helper()
-	ctx := context.Background()
-	name := "relchar-access-only"
-	rd, err := s.GetRoleDefinitionByName(ctx, name, store.RoleScopeProject)
-	if err != nil {
-		require.ErrorIs(t, err, store.ErrNotFound)
-		rd, err = s.CreateRoleDefinition(ctx, &store.RoleDefinition{
-			ID: api.NewUUID(), Name: name, Description: "project access, no permissions",
-			ScopeType: store.RoleScopeProject, Permissions: []string{},
-		})
-		require.NoError(t, err)
-	}
-	_, err = s.CreateRoleBinding(ctx, &store.RoleBinding{
-		RoleDefinitionID: rd.ID, PrincipalType: store.RoleBindingPrincipalUser, PrincipalID: userID,
-		ScopeType: store.RoleScopeProject, ScopeID: projectID, CreatedBy: "test",
-	})
-	require.NoError(t, err)
-}
-
 // knownRelationshipNames lists every relationship name a row may use.
-// Association relationships are typed but have no rows until their
-// permissions are registered (TestRelationshipPolicy_AssociationRowsRequireRegistryIDs).
+// Association rows name only registered deliver permissions on their own
+// resource type (TestRelationshipPolicy_AssociationRowsRequireRegistryIDs).
 var knownRelationshipNames = map[string]bool{
 	"owner":                true,
 	"ancestor":             true,
@@ -1479,14 +1266,6 @@ func relationshipResult(t *testing.T, d Decision, rule RelationshipRuleID) Relat
 	}
 	t.Fatalf("no %s candidate in provenance: %+v", rule, d.Provenance.Relationships)
 	return RelationshipCandidateResult{}
-}
-
-func setUserStatus(t *testing.T, s store.Store, id, status string) {
-	t.Helper()
-	u, err := s.GetUser(context.Background(), id)
-	require.NoError(t, err)
-	u.Status = status
-	require.NoError(t, s.UpdateUser(context.Background(), u))
 }
 
 type fakeProgenyAdapter struct {
@@ -1829,19 +1608,6 @@ func authzTestSetup(t *testing.T) (*AuthzService, store.Store) {
 	return srv.authzService, s
 }
 
-// createTestRoleDefinition creates a custom role definition for tests.
-func createTestRoleDefinition(t *testing.T, s store.Store, name, scopeType string, permissions []string) *store.RoleDefinition {
-	t.Helper()
-	ctx := context.Background()
-	rd, err := s.CreateRoleDefinition(ctx, &store.RoleDefinition{
-		Name:        name,
-		ScopeType:   scopeType,
-		Permissions: permissions,
-	})
-	require.NoError(t, err)
-	return rd
-}
-
 // errorInjectingStore wraps a real store and allows injecting errors into
 // specific methods. All other methods delegate to the embedded store.
 type errorInjectingStore struct {
@@ -1897,12 +1663,8 @@ type bearerFixture struct {
 // the handler-level authorization these tests are designed to exercise.
 func (f *bypassAgentsFixture) token(t *testing.T, scopes ...AgentTokenScope) string {
 	t.Helper()
-	svc := f.srv.GetAgentTokenService()
-	require.NotNil(t, svc)
 	allScopes := append([]AgentTokenScope{ScopeProjectRead}, scopes...)
-	tok, err := svc.GenerateAgentToken(f.caller.ID, f.caller.ProjectID, allScopes, nil)
-	require.NoError(t, err)
-	return tok
+	return f.srv.generateRecordedAgentToken(t, f.caller.ID, f.caller.ProjectID, allScopes, nil)
 }
 
 // asAgent issues a request carrying the calling agent's token.

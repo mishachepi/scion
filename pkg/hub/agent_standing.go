@@ -102,8 +102,9 @@ const standingPermission = "agent.read"
 // still holds it).
 const standingMaxChainDepth = maxDelegationDepth
 
-// standingMemo is a per-request memo of agentStanding results. Only policy
-// results (nil or a standingDenial) are remembered; faults are recomputed.
+// standingMemo is a per-request memo of agentStanding results. Policy
+// results (nil or a standingDenial) and refusals caused by the request
+// context ending are remembered; other faults are recomputed.
 // It lives in the request context and dies with it.
 type standingMemo struct {
 	mu      sync.Mutex
@@ -146,21 +147,37 @@ func (s *Server) agentStanding(ctx context.Context, agentID string) error {
 		memo.mu.Lock()
 		res, ok := memo.results[agentID]
 		memo.mu.Unlock()
-		if ok {
+		// A remembered request-end refusal serves only a ctx that the
+		// request's end stopped too (authzStoppedByRequestEnd). Any other
+		// ctx sharing the memo, live or ended on its own bound (a detached
+		// check), evaluates again, so its own fault keeps its WARN.
+		requestEnd := errors.Is(res, context.Canceled) || errors.Is(res, context.DeadlineExceeded)
+		if ok && (!requestEnd || authzStoppedByRequestEnd(ctx, res)) {
 			return res
 		}
 	}
-	err := s.evaluateAgentStanding(ctx, agentID)
-	if memo != nil && (err == nil || errors.Is(err, errAgentNotInStanding)) {
+	var err error
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		// ctx has ended: refuse without a lookup.
+		err = fmt.Errorf("agent standing: %w", ctxErr)
+	} else {
+		err = s.evaluateAgentStanding(ctx, agentID)
+	}
+	stopped := authzStoppedByRequestEnd(ctx, err)
+	// Policy results are remembered for the request, and so is a refusal
+	// caused by the request context ending (ptone/scion#6012); any other
+	// fault is recomputed.
+	if memo != nil && (err == nil || errors.Is(err, errAgentNotInStanding) || stopped) {
 		memo.mu.Lock()
 		memo.results[agentID] = err
 		memo.mu.Unlock()
 	}
 	if err != nil {
-		if errors.Is(err, errAgentNotInStanding) {
+		switch {
+		case errors.Is(err, errAgentNotInStanding):
 			slog.Debug("agent standing refused", "agent_id", agentID, "reason", standingReason(err))
-		} else {
-			slog.Warn("agent standing lookup failed", "agent_id", agentID, "error", err)
+		default:
+			logAuthzCheckFault(ctx, nil, "agent_standing", "agent standing lookup failed", err, "agent_id", agentID)
 		}
 	}
 	return err
@@ -321,27 +338,33 @@ func (s *Server) userAdmittedToProjectOn(ctx context.Context, st store.Store, us
 
 // userAdmittedToProjectAs is userAdmittedToProjectOn for admission adm.
 func (s *Server) userAdmittedToProjectAs(ctx context.Context, st store.Store, user *store.User, projectID string, adm standingAdmission, memo *ProjectAdmissionCache) (bool, error) {
+	res, err := s.userAdmissionAs(ctx, st, user, projectID, adm, memo)
+	if err != nil {
+		return false, err
+	}
+	return res.Admitted, nil
+}
+
+// userAdmissionAs is userAdmittedToProjectAs returning the whole result,
+// with the Source of the evidence that admitted the user.
+func (s *Server) userAdmissionAs(ctx context.Context, st store.Store, user *store.User, projectID string, adm standingAdmission, memo *ProjectAdmissionCache) (ProjectAdmissionResult, error) {
 	// A hub test identity that can no longer authenticate (expired, no
 	// expiry, or the feature off: testFixtureRejection, the auth path's own
 	// rule) is admitted nowhere, so the agents it roots are held
 	// (ptone/scion#4240, Phase 3b).
 	if testFixtureRejection(user, s.testIdentities.enabled, s.testIdentities.clock()) != "" {
-		return false, nil
+		return ProjectAdmissionResult{}, nil
 	}
 	authz := s.authzFor(st)
 	if authz == nil {
-		return false, errors.New("project admission: authz service not available")
+		return ProjectAdmissionResult{}, errors.New("project admission: authz service not available")
 	}
 	pc := PrincipalContext{
 		Kind:     PrincipalKindUser,
 		ID:       user.ID,
 		Identity: NewAuthenticatedUser(user.ID, user.Email, user.DisplayName, user.Role, ""),
 	}
-	res, err := authz.ProjectAdmissionForClass(maskAuthzInputs(ctx), pc, projectID, adm.permissionID, adm.class, memo)
-	if err != nil {
-		return false, err
-	}
-	return res.Admitted, nil
+	return authz.ProjectAdmissionForClass(maskAuthzInputs(ctx), pc, projectID, adm.permissionID, adm.class, memo)
 }
 
 // resolveChainRoot returns the ID of the user at the root of the agent's
@@ -543,10 +566,11 @@ const agentSuspendedConflictMessage = "This agent is suspended. A hub admin can 
 // or not in good standing.
 func agentSuspendedRefusal(agentID string) *startRefusal {
 	return &startRefusal{
-		HTTPStatus: http.StatusConflict,
-		Code:       ErrCodeConflict,
-		Message:    agentSuspendedConflictMessage,
-		Details:    map[string]interface{}{"agentId": agentID},
+		HTTPStatus:      http.StatusConflict,
+		Code:            ErrCodeConflict,
+		Message:         agentSuspendedConflictMessage,
+		Details:         map[string]interface{}{"agentId": agentID},
+		StandingRefused: true,
 	}
 }
 
@@ -565,60 +589,6 @@ func standingStartRefusal(agentID string, err error) *startRefusal {
 		Code:       ErrCodeInternalError,
 		Message:    "could not verify the agent's standing",
 	}
-}
-
-// scheduledFireStanding refuses a scheduled event whose target agent is held
-// or whose authoring agent is not in good standing (ptone/scion#3433).
-// target is the message event's target agent, nil for an event with no
-// target (dispatch_agent). A user author is checked live by the event's own
-// authorization. A message event is refused with the one public scheduled
-// message refusal; the specific cause is logged.
-func (s *Server) scheduledFireStanding(ctx context.Context, evt store.ScheduledEvent, target *store.Agent) error {
-	refuse := func(cause string, err error) error {
-		slog.Warn("Scheduler: scheduled event refused at fire time",
-			"eventID", evt.ID, "eventType", evt.EventType, "projectID", evt.ProjectID,
-			"creator", evt.CreatedBy, "cause", cause, "error", err)
-		if target != nil {
-			return errScheduledMessageRefused
-		}
-		return fmt.Errorf("scheduled dispatch refused: %s", cause)
-	}
-	if target != nil {
-		held, err := s.agentHeld(ctx, target.ID)
-		if err != nil {
-			return refuse("target hold lookup failed", err)
-		}
-		if held {
-			return refuse("target agent is suspended", nil)
-		}
-	}
-	// The authoring principal is the event's recorded revision principal;
-	// CreatedBy (history) is checked too, so an agent named by either must
-	// be in good standing.
-	var authors []string
-	if init := s.scheduledInitiator(evt.InitiatorAttribution); !init.LegacyUnknown &&
-		init.PrincipalKind == store.DelegationPrincipalAgent && init.PrincipalID != "" {
-		authors = append(authors, init.PrincipalID)
-	}
-	if evt.CreatedBy != "" {
-		authors = append(authors, evt.CreatedBy)
-	}
-	for _, id := range authors {
-		creator, err := s.store.GetAgent(ctx, id)
-		if err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				continue
-			}
-			return refuse("author lookup failed", err)
-		}
-		if creator == nil {
-			continue
-		}
-		if err := s.agentStanding(ctx, creator.ID); err != nil {
-			return refuse("authoring agent is not in good standing", err)
-		}
-	}
-	return nil
 }
 
 // ErrAgentNotInStanding is returned by the dispatcher when the standing
@@ -652,6 +622,20 @@ func heldTargetDMError(agent *store.Agent) *AgentDMError {
 		Message:    fmt.Sprintf("agent %q is suspended. A hub admin can lift the hold.", agent.Slug),
 		HTTPStatus: http.StatusConflict,
 	}
+}
+
+// heldTargetRefusal is the refusal of a send to target when it is held:
+// heldTargetDMError for a held target, heldLookupFaultDMError when the hold
+// could not be read, and nil otherwise.
+func (s *Server) heldTargetRefusal(ctx context.Context, target *store.Agent) *AgentDMError {
+	held, err := s.agentHeld(ctx, target.ID)
+	if err != nil {
+		return heldLookupFaultDMError()
+	}
+	if held {
+		return heldTargetDMError(target)
+	}
+	return nil
 }
 
 // agentStandingForbidden runs agentStanding for an agent caller and writes
@@ -707,7 +691,8 @@ func (s *Server) agentSuspensionViews(ctx context.Context, agents []store.Agent)
 		for {
 			res, err := s.store.ListActiveAgentHoldsByProject(ctx, p, store.ListOptions{Limit: 500, Cursor: cursor})
 			if err != nil {
-				slog.Warn("agent suspension view: hold listing failed", "project_id", p, "error", err)
+				logAuthzCheckFault(ctx, nil, "agent_suspension_holds",
+					"agent suspension view: hold listing failed", err, "project_id", p)
 				break
 			}
 			for _, h := range res.Items {

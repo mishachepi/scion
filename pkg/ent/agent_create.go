@@ -298,6 +298,20 @@ func (_c *AgentCreate) SetNillableStalledFromActivity(v *string) *AgentCreate {
 	return _c
 }
 
+// SetSuspendReason sets the "suspend_reason" field.
+func (_c *AgentCreate) SetSuspendReason(v string) *AgentCreate {
+	_c.mutation.SetSuspendReason(v)
+	return _c
+}
+
+// SetNillableSuspendReason sets the "suspend_reason" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableSuspendReason(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetSuspendReason(*v)
+	}
+	return _c
+}
+
 // SetCurrentTurns sets the "current_turns" field.
 func (_c *AgentCreate) SetCurrentTurns(v int) *AgentCreate {
 	_c.mutation.SetCurrentTurns(v)
@@ -500,6 +514,20 @@ func (_c *AgentCreate) SetNillableAppliedConfig(v *string) *AgentCreate {
 	return _c
 }
 
+// SetEffectiveConfig sets the "effective_config" field.
+func (_c *AgentCreate) SetEffectiveConfig(v string) *AgentCreate {
+	_c.mutation.SetEffectiveConfig(v)
+	return _c
+}
+
+// SetNillableEffectiveConfig sets the "effective_config" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableEffectiveConfig(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetEffectiveConfig(*v)
+	}
+	return _c
+}
+
 // SetPendingConfig sets the "pending_config" field.
 func (_c *AgentCreate) SetPendingConfig(v string) *AgentCreate {
 	_c.mutation.SetPendingConfig(v)
@@ -586,6 +614,34 @@ func (_c *AgentCreate) SetLastActivityEvent(v time.Time) *AgentCreate {
 func (_c *AgentCreate) SetNillableLastActivityEvent(v *time.Time) *AgentCreate {
 	if v != nil {
 		_c.SetLastActivityEvent(*v)
+	}
+	return _c
+}
+
+// SetLastLiveProcessAt sets the "last_live_process_at" field.
+func (_c *AgentCreate) SetLastLiveProcessAt(v time.Time) *AgentCreate {
+	_c.mutation.SetLastLiveProcessAt(v)
+	return _c
+}
+
+// SetNillableLastLiveProcessAt sets the "last_live_process_at" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableLastLiveProcessAt(v *time.Time) *AgentCreate {
+	if v != nil {
+		_c.SetLastLiveProcessAt(*v)
+	}
+	return _c
+}
+
+// SetLastLiveWorkAt sets the "last_live_work_at" field.
+func (_c *AgentCreate) SetLastLiveWorkAt(v time.Time) *AgentCreate {
+	_c.mutation.SetLastLiveWorkAt(v)
+	return _c
+}
+
+// SetNillableLastLiveWorkAt sets the "last_live_work_at" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableLastLiveWorkAt(v *time.Time) *AgentCreate {
+	if v != nil {
+		_c.SetLastLiveWorkAt(*v)
 	}
 	return _c
 }
@@ -698,6 +754,20 @@ func (_c *AgentCreate) SetLaunchID(v string) *AgentCreate {
 func (_c *AgentCreate) SetNillableLaunchID(v *string) *AgentCreate {
 	if v != nil {
 		_c.SetLaunchID(*v)
+	}
+	return _c
+}
+
+// SetLaunchRunID sets the "launch_run_id" field.
+func (_c *AgentCreate) SetLaunchRunID(v string) *AgentCreate {
+	_c.mutation.SetLaunchRunID(v)
+	return _c
+}
+
+// SetNillableLaunchRunID sets the "launch_run_id" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableLaunchRunID(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetLaunchRunID(*v)
 	}
 	return _c
 }
@@ -1268,6 +1338,48 @@ func (_c *AgentCreate) SetNillableSoftDeleteOpID(v *string) *AgentCreate {
 	return _c
 }
 
+// SetActivitySince sets the "activity_since" field.
+func (_c *AgentCreate) SetActivitySince(v time.Time) *AgentCreate {
+	_c.mutation.SetActivitySince(v)
+	return _c
+}
+
+// SetNillableActivitySince sets the "activity_since" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableActivitySince(v *time.Time) *AgentCreate {
+	if v != nil {
+		_c.SetActivitySince(*v)
+	}
+	return _c
+}
+
+// SetLastDeliveryAt sets the "last_delivery_at" field.
+func (_c *AgentCreate) SetLastDeliveryAt(v time.Time) *AgentCreate {
+	_c.mutation.SetLastDeliveryAt(v)
+	return _c
+}
+
+// SetNillableLastDeliveryAt sets the "last_delivery_at" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableLastDeliveryAt(v *time.Time) *AgentCreate {
+	if v != nil {
+		_c.SetLastDeliveryAt(*v)
+	}
+	return _c
+}
+
+// SetIdleSuspendClaimUntil sets the "idle_suspend_claim_until" field.
+func (_c *AgentCreate) SetIdleSuspendClaimUntil(v time.Time) *AgentCreate {
+	_c.mutation.SetIdleSuspendClaimUntil(v)
+	return _c
+}
+
+// SetNillableIdleSuspendClaimUntil sets the "idle_suspend_claim_until" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableIdleSuspendClaimUntil(v *time.Time) *AgentCreate {
+	if v != nil {
+		_c.SetIdleSuspendClaimUntil(*v)
+	}
+	return _c
+}
+
 // SetID sets the "id" field.
 func (_c *AgentCreate) SetID(v uuid.UUID) *AgentCreate {
 	_c.mutation.SetID(v)
@@ -1445,6 +1557,10 @@ func (_c *AgentCreate) defaults() {
 	if _, ok := _c.mutation.LaunchID(); !ok {
 		v := agent.DefaultLaunchID
 		_c.mutation.SetLaunchID(v)
+	}
+	if _, ok := _c.mutation.LaunchRunID(); !ok {
+		v := agent.DefaultLaunchRunID
+		_c.mutation.SetLaunchRunID(v)
 	}
 	if _, ok := _c.mutation.RunID(); !ok {
 		v := agent.DefaultRunID
@@ -1743,6 +1859,10 @@ func (_c *AgentCreate) createSpec() (*Agent, *sqlgraph.CreateSpec) {
 		_spec.SetField(agent.FieldStalledFromActivity, field.TypeString, value)
 		_node.StalledFromActivity = value
 	}
+	if value, ok := _c.mutation.SuspendReason(); ok {
+		_spec.SetField(agent.FieldSuspendReason, field.TypeString, value)
+		_node.SuspendReason = &value
+	}
 	if value, ok := _c.mutation.CurrentTurns(); ok {
 		_spec.SetField(agent.FieldCurrentTurns, field.TypeInt, value)
 		_node.CurrentTurns = value
@@ -1803,6 +1923,10 @@ func (_c *AgentCreate) createSpec() (*Agent, *sqlgraph.CreateSpec) {
 		_spec.SetField(agent.FieldAppliedConfig, field.TypeString, value)
 		_node.AppliedConfig = value
 	}
+	if value, ok := _c.mutation.EffectiveConfig(); ok {
+		_spec.SetField(agent.FieldEffectiveConfig, field.TypeString, value)
+		_node.EffectiveConfig = &value
+	}
 	if value, ok := _c.mutation.PendingConfig(); ok {
 		_spec.SetField(agent.FieldPendingConfig, field.TypeString, value)
 		_node.PendingConfig = &value
@@ -1830,6 +1954,14 @@ func (_c *AgentCreate) createSpec() (*Agent, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.LastActivityEvent(); ok {
 		_spec.SetField(agent.FieldLastActivityEvent, field.TypeTime, value)
 		_node.LastActivityEvent = &value
+	}
+	if value, ok := _c.mutation.LastLiveProcessAt(); ok {
+		_spec.SetField(agent.FieldLastLiveProcessAt, field.TypeTime, value)
+		_node.LastLiveProcessAt = &value
+	}
+	if value, ok := _c.mutation.LastLiveWorkAt(); ok {
+		_spec.SetField(agent.FieldLastLiveWorkAt, field.TypeTime, value)
+		_node.LastLiveWorkAt = &value
 	}
 	if value, ok := _c.mutation.StartedAt(); ok {
 		_spec.SetField(agent.FieldStartedAt, field.TypeTime, value)
@@ -1862,6 +1994,10 @@ func (_c *AgentCreate) createSpec() (*Agent, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.LaunchID(); ok {
 		_spec.SetField(agent.FieldLaunchID, field.TypeString, value)
 		_node.LaunchID = value
+	}
+	if value, ok := _c.mutation.LaunchRunID(); ok {
+		_spec.SetField(agent.FieldLaunchRunID, field.TypeString, value)
+		_node.LaunchRunID = value
 	}
 	if value, ok := _c.mutation.RunID(); ok {
 		_spec.SetField(agent.FieldRunID, field.TypeString, value)
@@ -2026,6 +2162,18 @@ func (_c *AgentCreate) createSpec() (*Agent, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.SoftDeleteOpID(); ok {
 		_spec.SetField(agent.FieldSoftDeleteOpID, field.TypeString, value)
 		_node.SoftDeleteOpID = &value
+	}
+	if value, ok := _c.mutation.ActivitySince(); ok {
+		_spec.SetField(agent.FieldActivitySince, field.TypeTime, value)
+		_node.ActivitySince = &value
+	}
+	if value, ok := _c.mutation.LastDeliveryAt(); ok {
+		_spec.SetField(agent.FieldLastDeliveryAt, field.TypeTime, value)
+		_node.LastDeliveryAt = &value
+	}
+	if value, ok := _c.mutation.IdleSuspendClaimUntil(); ok {
+		_spec.SetField(agent.FieldIdleSuspendClaimUntil, field.TypeTime, value)
+		_node.IdleSuspendClaimUntil = &value
 	}
 	if nodes := _c.mutation.ProjectIDs(); len(nodes) > 0 {
 		edge := &sqlgraph.EdgeSpec{
@@ -2472,6 +2620,24 @@ func (u *AgentUpsert) ClearStalledFromActivity() *AgentUpsert {
 	return u
 }
 
+// SetSuspendReason sets the "suspend_reason" field.
+func (u *AgentUpsert) SetSuspendReason(v string) *AgentUpsert {
+	u.Set(agent.FieldSuspendReason, v)
+	return u
+}
+
+// UpdateSuspendReason sets the "suspend_reason" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateSuspendReason() *AgentUpsert {
+	u.SetExcluded(agent.FieldSuspendReason)
+	return u
+}
+
+// ClearSuspendReason clears the value of the "suspend_reason" field.
+func (u *AgentUpsert) ClearSuspendReason() *AgentUpsert {
+	u.SetNull(agent.FieldSuspendReason)
+	return u
+}
+
 // SetCurrentTurns sets the "current_turns" field.
 func (u *AgentUpsert) SetCurrentTurns(v int) *AgentUpsert {
 	u.Set(agent.FieldCurrentTurns, v)
@@ -2730,6 +2896,24 @@ func (u *AgentUpsert) ClearAppliedConfig() *AgentUpsert {
 	return u
 }
 
+// SetEffectiveConfig sets the "effective_config" field.
+func (u *AgentUpsert) SetEffectiveConfig(v string) *AgentUpsert {
+	u.Set(agent.FieldEffectiveConfig, v)
+	return u
+}
+
+// UpdateEffectiveConfig sets the "effective_config" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateEffectiveConfig() *AgentUpsert {
+	u.SetExcluded(agent.FieldEffectiveConfig)
+	return u
+}
+
+// ClearEffectiveConfig clears the value of the "effective_config" field.
+func (u *AgentUpsert) ClearEffectiveConfig() *AgentUpsert {
+	u.SetNull(agent.FieldEffectiveConfig)
+	return u
+}
+
 // SetPendingConfig sets the "pending_config" field.
 func (u *AgentUpsert) SetPendingConfig(v string) *AgentUpsert {
 	u.Set(agent.FieldPendingConfig, v)
@@ -2811,6 +2995,42 @@ func (u *AgentUpsert) UpdateLastActivityEvent() *AgentUpsert {
 // ClearLastActivityEvent clears the value of the "last_activity_event" field.
 func (u *AgentUpsert) ClearLastActivityEvent() *AgentUpsert {
 	u.SetNull(agent.FieldLastActivityEvent)
+	return u
+}
+
+// SetLastLiveProcessAt sets the "last_live_process_at" field.
+func (u *AgentUpsert) SetLastLiveProcessAt(v time.Time) *AgentUpsert {
+	u.Set(agent.FieldLastLiveProcessAt, v)
+	return u
+}
+
+// UpdateLastLiveProcessAt sets the "last_live_process_at" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateLastLiveProcessAt() *AgentUpsert {
+	u.SetExcluded(agent.FieldLastLiveProcessAt)
+	return u
+}
+
+// ClearLastLiveProcessAt clears the value of the "last_live_process_at" field.
+func (u *AgentUpsert) ClearLastLiveProcessAt() *AgentUpsert {
+	u.SetNull(agent.FieldLastLiveProcessAt)
+	return u
+}
+
+// SetLastLiveWorkAt sets the "last_live_work_at" field.
+func (u *AgentUpsert) SetLastLiveWorkAt(v time.Time) *AgentUpsert {
+	u.Set(agent.FieldLastLiveWorkAt, v)
+	return u
+}
+
+// UpdateLastLiveWorkAt sets the "last_live_work_at" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateLastLiveWorkAt() *AgentUpsert {
+	u.SetExcluded(agent.FieldLastLiveWorkAt)
+	return u
+}
+
+// ClearLastLiveWorkAt clears the value of the "last_live_work_at" field.
+func (u *AgentUpsert) ClearLastLiveWorkAt() *AgentUpsert {
+	u.SetNull(agent.FieldLastLiveWorkAt)
 	return u
 }
 
@@ -2949,6 +3169,24 @@ func (u *AgentUpsert) UpdateLaunchID() *AgentUpsert {
 // ClearLaunchID clears the value of the "launch_id" field.
 func (u *AgentUpsert) ClearLaunchID() *AgentUpsert {
 	u.SetNull(agent.FieldLaunchID)
+	return u
+}
+
+// SetLaunchRunID sets the "launch_run_id" field.
+func (u *AgentUpsert) SetLaunchRunID(v string) *AgentUpsert {
+	u.Set(agent.FieldLaunchRunID, v)
+	return u
+}
+
+// UpdateLaunchRunID sets the "launch_run_id" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateLaunchRunID() *AgentUpsert {
+	u.SetExcluded(agent.FieldLaunchRunID)
+	return u
+}
+
+// ClearLaunchRunID clears the value of the "launch_run_id" field.
+func (u *AgentUpsert) ClearLaunchRunID() *AgentUpsert {
+	u.SetNull(agent.FieldLaunchRunID)
 	return u
 }
 
@@ -3684,6 +3922,60 @@ func (u *AgentUpsert) ClearSoftDeleteOpID() *AgentUpsert {
 	return u
 }
 
+// SetActivitySince sets the "activity_since" field.
+func (u *AgentUpsert) SetActivitySince(v time.Time) *AgentUpsert {
+	u.Set(agent.FieldActivitySince, v)
+	return u
+}
+
+// UpdateActivitySince sets the "activity_since" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateActivitySince() *AgentUpsert {
+	u.SetExcluded(agent.FieldActivitySince)
+	return u
+}
+
+// ClearActivitySince clears the value of the "activity_since" field.
+func (u *AgentUpsert) ClearActivitySince() *AgentUpsert {
+	u.SetNull(agent.FieldActivitySince)
+	return u
+}
+
+// SetLastDeliveryAt sets the "last_delivery_at" field.
+func (u *AgentUpsert) SetLastDeliveryAt(v time.Time) *AgentUpsert {
+	u.Set(agent.FieldLastDeliveryAt, v)
+	return u
+}
+
+// UpdateLastDeliveryAt sets the "last_delivery_at" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateLastDeliveryAt() *AgentUpsert {
+	u.SetExcluded(agent.FieldLastDeliveryAt)
+	return u
+}
+
+// ClearLastDeliveryAt clears the value of the "last_delivery_at" field.
+func (u *AgentUpsert) ClearLastDeliveryAt() *AgentUpsert {
+	u.SetNull(agent.FieldLastDeliveryAt)
+	return u
+}
+
+// SetIdleSuspendClaimUntil sets the "idle_suspend_claim_until" field.
+func (u *AgentUpsert) SetIdleSuspendClaimUntil(v time.Time) *AgentUpsert {
+	u.Set(agent.FieldIdleSuspendClaimUntil, v)
+	return u
+}
+
+// UpdateIdleSuspendClaimUntil sets the "idle_suspend_claim_until" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateIdleSuspendClaimUntil() *AgentUpsert {
+	u.SetExcluded(agent.FieldIdleSuspendClaimUntil)
+	return u
+}
+
+// ClearIdleSuspendClaimUntil clears the value of the "idle_suspend_claim_until" field.
+func (u *AgentUpsert) ClearIdleSuspendClaimUntil() *AgentUpsert {
+	u.SetNull(agent.FieldIdleSuspendClaimUntil)
+	return u
+}
+
 // UpdateNewValues updates the mutable fields using the new values that were set on create except the ID field.
 // Using this option is equivalent to using:
 //
@@ -4111,6 +4403,27 @@ func (u *AgentUpsertOne) ClearStalledFromActivity() *AgentUpsertOne {
 	})
 }
 
+// SetSuspendReason sets the "suspend_reason" field.
+func (u *AgentUpsertOne) SetSuspendReason(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetSuspendReason(v)
+	})
+}
+
+// UpdateSuspendReason sets the "suspend_reason" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateSuspendReason() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateSuspendReason()
+	})
+}
+
+// ClearSuspendReason clears the value of the "suspend_reason" field.
+func (u *AgentUpsertOne) ClearSuspendReason() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearSuspendReason()
+	})
+}
+
 // SetCurrentTurns sets the "current_turns" field.
 func (u *AgentUpsertOne) SetCurrentTurns(v int) *AgentUpsertOne {
 	return u.Update(func(s *AgentUpsert) {
@@ -4412,6 +4725,27 @@ func (u *AgentUpsertOne) ClearAppliedConfig() *AgentUpsertOne {
 	})
 }
 
+// SetEffectiveConfig sets the "effective_config" field.
+func (u *AgentUpsertOne) SetEffectiveConfig(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetEffectiveConfig(v)
+	})
+}
+
+// UpdateEffectiveConfig sets the "effective_config" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateEffectiveConfig() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateEffectiveConfig()
+	})
+}
+
+// ClearEffectiveConfig clears the value of the "effective_config" field.
+func (u *AgentUpsertOne) ClearEffectiveConfig() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearEffectiveConfig()
+	})
+}
+
 // SetPendingConfig sets the "pending_config" field.
 func (u *AgentUpsertOne) SetPendingConfig(v string) *AgentUpsertOne {
 	return u.Update(func(s *AgentUpsert) {
@@ -4507,6 +4841,48 @@ func (u *AgentUpsertOne) UpdateLastActivityEvent() *AgentUpsertOne {
 func (u *AgentUpsertOne) ClearLastActivityEvent() *AgentUpsertOne {
 	return u.Update(func(s *AgentUpsert) {
 		s.ClearLastActivityEvent()
+	})
+}
+
+// SetLastLiveProcessAt sets the "last_live_process_at" field.
+func (u *AgentUpsertOne) SetLastLiveProcessAt(v time.Time) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLastLiveProcessAt(v)
+	})
+}
+
+// UpdateLastLiveProcessAt sets the "last_live_process_at" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateLastLiveProcessAt() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLastLiveProcessAt()
+	})
+}
+
+// ClearLastLiveProcessAt clears the value of the "last_live_process_at" field.
+func (u *AgentUpsertOne) ClearLastLiveProcessAt() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLastLiveProcessAt()
+	})
+}
+
+// SetLastLiveWorkAt sets the "last_live_work_at" field.
+func (u *AgentUpsertOne) SetLastLiveWorkAt(v time.Time) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLastLiveWorkAt(v)
+	})
+}
+
+// UpdateLastLiveWorkAt sets the "last_live_work_at" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateLastLiveWorkAt() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLastLiveWorkAt()
+	})
+}
+
+// ClearLastLiveWorkAt clears the value of the "last_live_work_at" field.
+func (u *AgentUpsertOne) ClearLastLiveWorkAt() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLastLiveWorkAt()
 	})
 }
 
@@ -4668,6 +5044,27 @@ func (u *AgentUpsertOne) UpdateLaunchID() *AgentUpsertOne {
 func (u *AgentUpsertOne) ClearLaunchID() *AgentUpsertOne {
 	return u.Update(func(s *AgentUpsert) {
 		s.ClearLaunchID()
+	})
+}
+
+// SetLaunchRunID sets the "launch_run_id" field.
+func (u *AgentUpsertOne) SetLaunchRunID(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLaunchRunID(v)
+	})
+}
+
+// UpdateLaunchRunID sets the "launch_run_id" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateLaunchRunID() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLaunchRunID()
+	})
+}
+
+// ClearLaunchRunID clears the value of the "launch_run_id" field.
+func (u *AgentUpsertOne) ClearLaunchRunID() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLaunchRunID()
 	})
 }
 
@@ -5525,6 +5922,69 @@ func (u *AgentUpsertOne) ClearSoftDeleteOpID() *AgentUpsertOne {
 	})
 }
 
+// SetActivitySince sets the "activity_since" field.
+func (u *AgentUpsertOne) SetActivitySince(v time.Time) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetActivitySince(v)
+	})
+}
+
+// UpdateActivitySince sets the "activity_since" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateActivitySince() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateActivitySince()
+	})
+}
+
+// ClearActivitySince clears the value of the "activity_since" field.
+func (u *AgentUpsertOne) ClearActivitySince() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearActivitySince()
+	})
+}
+
+// SetLastDeliveryAt sets the "last_delivery_at" field.
+func (u *AgentUpsertOne) SetLastDeliveryAt(v time.Time) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLastDeliveryAt(v)
+	})
+}
+
+// UpdateLastDeliveryAt sets the "last_delivery_at" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateLastDeliveryAt() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLastDeliveryAt()
+	})
+}
+
+// ClearLastDeliveryAt clears the value of the "last_delivery_at" field.
+func (u *AgentUpsertOne) ClearLastDeliveryAt() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLastDeliveryAt()
+	})
+}
+
+// SetIdleSuspendClaimUntil sets the "idle_suspend_claim_until" field.
+func (u *AgentUpsertOne) SetIdleSuspendClaimUntil(v time.Time) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetIdleSuspendClaimUntil(v)
+	})
+}
+
+// UpdateIdleSuspendClaimUntil sets the "idle_suspend_claim_until" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateIdleSuspendClaimUntil() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateIdleSuspendClaimUntil()
+	})
+}
+
+// ClearIdleSuspendClaimUntil clears the value of the "idle_suspend_claim_until" field.
+func (u *AgentUpsertOne) ClearIdleSuspendClaimUntil() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearIdleSuspendClaimUntil()
+	})
+}
+
 // Exec executes the query.
 func (u *AgentUpsertOne) Exec(ctx context.Context) error {
 	if len(u.create.conflict) == 0 {
@@ -6119,6 +6579,27 @@ func (u *AgentUpsertBulk) ClearStalledFromActivity() *AgentUpsertBulk {
 	})
 }
 
+// SetSuspendReason sets the "suspend_reason" field.
+func (u *AgentUpsertBulk) SetSuspendReason(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetSuspendReason(v)
+	})
+}
+
+// UpdateSuspendReason sets the "suspend_reason" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateSuspendReason() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateSuspendReason()
+	})
+}
+
+// ClearSuspendReason clears the value of the "suspend_reason" field.
+func (u *AgentUpsertBulk) ClearSuspendReason() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearSuspendReason()
+	})
+}
+
 // SetCurrentTurns sets the "current_turns" field.
 func (u *AgentUpsertBulk) SetCurrentTurns(v int) *AgentUpsertBulk {
 	return u.Update(func(s *AgentUpsert) {
@@ -6420,6 +6901,27 @@ func (u *AgentUpsertBulk) ClearAppliedConfig() *AgentUpsertBulk {
 	})
 }
 
+// SetEffectiveConfig sets the "effective_config" field.
+func (u *AgentUpsertBulk) SetEffectiveConfig(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetEffectiveConfig(v)
+	})
+}
+
+// UpdateEffectiveConfig sets the "effective_config" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateEffectiveConfig() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateEffectiveConfig()
+	})
+}
+
+// ClearEffectiveConfig clears the value of the "effective_config" field.
+func (u *AgentUpsertBulk) ClearEffectiveConfig() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearEffectiveConfig()
+	})
+}
+
 // SetPendingConfig sets the "pending_config" field.
 func (u *AgentUpsertBulk) SetPendingConfig(v string) *AgentUpsertBulk {
 	return u.Update(func(s *AgentUpsert) {
@@ -6515,6 +7017,48 @@ func (u *AgentUpsertBulk) UpdateLastActivityEvent() *AgentUpsertBulk {
 func (u *AgentUpsertBulk) ClearLastActivityEvent() *AgentUpsertBulk {
 	return u.Update(func(s *AgentUpsert) {
 		s.ClearLastActivityEvent()
+	})
+}
+
+// SetLastLiveProcessAt sets the "last_live_process_at" field.
+func (u *AgentUpsertBulk) SetLastLiveProcessAt(v time.Time) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLastLiveProcessAt(v)
+	})
+}
+
+// UpdateLastLiveProcessAt sets the "last_live_process_at" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateLastLiveProcessAt() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLastLiveProcessAt()
+	})
+}
+
+// ClearLastLiveProcessAt clears the value of the "last_live_process_at" field.
+func (u *AgentUpsertBulk) ClearLastLiveProcessAt() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLastLiveProcessAt()
+	})
+}
+
+// SetLastLiveWorkAt sets the "last_live_work_at" field.
+func (u *AgentUpsertBulk) SetLastLiveWorkAt(v time.Time) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLastLiveWorkAt(v)
+	})
+}
+
+// UpdateLastLiveWorkAt sets the "last_live_work_at" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateLastLiveWorkAt() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLastLiveWorkAt()
+	})
+}
+
+// ClearLastLiveWorkAt clears the value of the "last_live_work_at" field.
+func (u *AgentUpsertBulk) ClearLastLiveWorkAt() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLastLiveWorkAt()
 	})
 }
 
@@ -6676,6 +7220,27 @@ func (u *AgentUpsertBulk) UpdateLaunchID() *AgentUpsertBulk {
 func (u *AgentUpsertBulk) ClearLaunchID() *AgentUpsertBulk {
 	return u.Update(func(s *AgentUpsert) {
 		s.ClearLaunchID()
+	})
+}
+
+// SetLaunchRunID sets the "launch_run_id" field.
+func (u *AgentUpsertBulk) SetLaunchRunID(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLaunchRunID(v)
+	})
+}
+
+// UpdateLaunchRunID sets the "launch_run_id" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateLaunchRunID() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLaunchRunID()
+	})
+}
+
+// ClearLaunchRunID clears the value of the "launch_run_id" field.
+func (u *AgentUpsertBulk) ClearLaunchRunID() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLaunchRunID()
 	})
 }
 
@@ -7530,6 +8095,69 @@ func (u *AgentUpsertBulk) UpdateSoftDeleteOpID() *AgentUpsertBulk {
 func (u *AgentUpsertBulk) ClearSoftDeleteOpID() *AgentUpsertBulk {
 	return u.Update(func(s *AgentUpsert) {
 		s.ClearSoftDeleteOpID()
+	})
+}
+
+// SetActivitySince sets the "activity_since" field.
+func (u *AgentUpsertBulk) SetActivitySince(v time.Time) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetActivitySince(v)
+	})
+}
+
+// UpdateActivitySince sets the "activity_since" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateActivitySince() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateActivitySince()
+	})
+}
+
+// ClearActivitySince clears the value of the "activity_since" field.
+func (u *AgentUpsertBulk) ClearActivitySince() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearActivitySince()
+	})
+}
+
+// SetLastDeliveryAt sets the "last_delivery_at" field.
+func (u *AgentUpsertBulk) SetLastDeliveryAt(v time.Time) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLastDeliveryAt(v)
+	})
+}
+
+// UpdateLastDeliveryAt sets the "last_delivery_at" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateLastDeliveryAt() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLastDeliveryAt()
+	})
+}
+
+// ClearLastDeliveryAt clears the value of the "last_delivery_at" field.
+func (u *AgentUpsertBulk) ClearLastDeliveryAt() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLastDeliveryAt()
+	})
+}
+
+// SetIdleSuspendClaimUntil sets the "idle_suspend_claim_until" field.
+func (u *AgentUpsertBulk) SetIdleSuspendClaimUntil(v time.Time) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetIdleSuspendClaimUntil(v)
+	})
+}
+
+// UpdateIdleSuspendClaimUntil sets the "idle_suspend_claim_until" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateIdleSuspendClaimUntil() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateIdleSuspendClaimUntil()
+	})
+}
+
+// ClearIdleSuspendClaimUntil clears the value of the "idle_suspend_claim_until" field.
+func (u *AgentUpsertBulk) ClearIdleSuspendClaimUntil() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearIdleSuspendClaimUntil()
 	})
 }
 

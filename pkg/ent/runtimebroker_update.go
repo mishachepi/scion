@@ -299,6 +299,26 @@ func (_u *RuntimeBrokerUpdate) ClearHealth() *RuntimeBrokerUpdate {
 	return _u
 }
 
+// SetWorkloadIdentityTargets sets the "workload_identity_targets" field.
+func (_u *RuntimeBrokerUpdate) SetWorkloadIdentityTargets(v string) *RuntimeBrokerUpdate {
+	_u.mutation.SetWorkloadIdentityTargets(v)
+	return _u
+}
+
+// SetNillableWorkloadIdentityTargets sets the "workload_identity_targets" field if the given value is not nil.
+func (_u *RuntimeBrokerUpdate) SetNillableWorkloadIdentityTargets(v *string) *RuntimeBrokerUpdate {
+	if v != nil {
+		_u.SetWorkloadIdentityTargets(*v)
+	}
+	return _u
+}
+
+// ClearWorkloadIdentityTargets clears the value of the "workload_identity_targets" field.
+func (_u *RuntimeBrokerUpdate) ClearWorkloadIdentityTargets() *RuntimeBrokerUpdate {
+	_u.mutation.ClearWorkloadIdentityTargets()
+	return _u
+}
+
 // SetLabels sets the "labels" field.
 func (_u *RuntimeBrokerUpdate) SetLabels(v map[string]string) *RuntimeBrokerUpdate {
 	_u.mutation.SetLabels(v)
@@ -751,6 +771,66 @@ func (_u *RuntimeBrokerUpdate) ClearPresentationObservedAt() *RuntimeBrokerUpdat
 	return _u
 }
 
+// SetConversionPlanPresentation sets the "conversion_plan_presentation" field.
+func (_u *RuntimeBrokerUpdate) SetConversionPlanPresentation(v string) *RuntimeBrokerUpdate {
+	_u.mutation.SetConversionPlanPresentation(v)
+	return _u
+}
+
+// SetNillableConversionPlanPresentation sets the "conversion_plan_presentation" field if the given value is not nil.
+func (_u *RuntimeBrokerUpdate) SetNillableConversionPlanPresentation(v *string) *RuntimeBrokerUpdate {
+	if v != nil {
+		_u.SetConversionPlanPresentation(*v)
+	}
+	return _u
+}
+
+// ClearConversionPlanPresentation clears the value of the "conversion_plan_presentation" field.
+func (_u *RuntimeBrokerUpdate) ClearConversionPlanPresentation() *RuntimeBrokerUpdate {
+	_u.mutation.ClearConversionPlanPresentation()
+	return _u
+}
+
+// SetConversionPlanPresentationHash sets the "conversion_plan_presentation_hash" field.
+func (_u *RuntimeBrokerUpdate) SetConversionPlanPresentationHash(v string) *RuntimeBrokerUpdate {
+	_u.mutation.SetConversionPlanPresentationHash(v)
+	return _u
+}
+
+// SetNillableConversionPlanPresentationHash sets the "conversion_plan_presentation_hash" field if the given value is not nil.
+func (_u *RuntimeBrokerUpdate) SetNillableConversionPlanPresentationHash(v *string) *RuntimeBrokerUpdate {
+	if v != nil {
+		_u.SetConversionPlanPresentationHash(*v)
+	}
+	return _u
+}
+
+// ClearConversionPlanPresentationHash clears the value of the "conversion_plan_presentation_hash" field.
+func (_u *RuntimeBrokerUpdate) ClearConversionPlanPresentationHash() *RuntimeBrokerUpdate {
+	_u.mutation.ClearConversionPlanPresentationHash()
+	return _u
+}
+
+// SetConversionPlanObservedAt sets the "conversion_plan_observed_at" field.
+func (_u *RuntimeBrokerUpdate) SetConversionPlanObservedAt(v time.Time) *RuntimeBrokerUpdate {
+	_u.mutation.SetConversionPlanObservedAt(v)
+	return _u
+}
+
+// SetNillableConversionPlanObservedAt sets the "conversion_plan_observed_at" field if the given value is not nil.
+func (_u *RuntimeBrokerUpdate) SetNillableConversionPlanObservedAt(v *time.Time) *RuntimeBrokerUpdate {
+	if v != nil {
+		_u.SetConversionPlanObservedAt(*v)
+	}
+	return _u
+}
+
+// ClearConversionPlanObservedAt clears the value of the "conversion_plan_observed_at" field.
+func (_u *RuntimeBrokerUpdate) ClearConversionPlanObservedAt() *RuntimeBrokerUpdate {
+	_u.mutation.ClearConversionPlanObservedAt()
+	return _u
+}
+
 // SetUpdated sets the "updated" field.
 func (_u *RuntimeBrokerUpdate) SetUpdated(v time.Time) *RuntimeBrokerUpdate {
 	_u.mutation.SetUpdated(v)
@@ -900,6 +980,12 @@ func (_u *RuntimeBrokerUpdate) sqlSave(ctx context.Context) (_node int, err erro
 	if _u.mutation.HealthCleared() {
 		_spec.ClearField(runtimebroker.FieldHealth, field.TypeString)
 	}
+	if value, ok := _u.mutation.WorkloadIdentityTargets(); ok {
+		_spec.SetField(runtimebroker.FieldWorkloadIdentityTargets, field.TypeString, value)
+	}
+	if _u.mutation.WorkloadIdentityTargetsCleared() {
+		_spec.ClearField(runtimebroker.FieldWorkloadIdentityTargets, field.TypeString)
+	}
 	if value, ok := _u.mutation.Labels(); ok {
 		_spec.SetField(runtimebroker.FieldLabels, field.TypeJSON, value)
 	}
@@ -1040,6 +1126,24 @@ func (_u *RuntimeBrokerUpdate) sqlSave(ctx context.Context) (_node int, err erro
 	}
 	if _u.mutation.PresentationObservedAtCleared() {
 		_spec.ClearField(runtimebroker.FieldPresentationObservedAt, field.TypeTime)
+	}
+	if value, ok := _u.mutation.ConversionPlanPresentation(); ok {
+		_spec.SetField(runtimebroker.FieldConversionPlanPresentation, field.TypeString, value)
+	}
+	if _u.mutation.ConversionPlanPresentationCleared() {
+		_spec.ClearField(runtimebroker.FieldConversionPlanPresentation, field.TypeString)
+	}
+	if value, ok := _u.mutation.ConversionPlanPresentationHash(); ok {
+		_spec.SetField(runtimebroker.FieldConversionPlanPresentationHash, field.TypeString, value)
+	}
+	if _u.mutation.ConversionPlanPresentationHashCleared() {
+		_spec.ClearField(runtimebroker.FieldConversionPlanPresentationHash, field.TypeString)
+	}
+	if value, ok := _u.mutation.ConversionPlanObservedAt(); ok {
+		_spec.SetField(runtimebroker.FieldConversionPlanObservedAt, field.TypeTime, value)
+	}
+	if _u.mutation.ConversionPlanObservedAtCleared() {
+		_spec.ClearField(runtimebroker.FieldConversionPlanObservedAt, field.TypeTime)
 	}
 	if value, ok := _u.mutation.Updated(); ok {
 		_spec.SetField(runtimebroker.FieldUpdated, field.TypeTime, value)
@@ -1332,6 +1436,26 @@ func (_u *RuntimeBrokerUpdateOne) SetNillableHealth(v *string) *RuntimeBrokerUpd
 // ClearHealth clears the value of the "health" field.
 func (_u *RuntimeBrokerUpdateOne) ClearHealth() *RuntimeBrokerUpdateOne {
 	_u.mutation.ClearHealth()
+	return _u
+}
+
+// SetWorkloadIdentityTargets sets the "workload_identity_targets" field.
+func (_u *RuntimeBrokerUpdateOne) SetWorkloadIdentityTargets(v string) *RuntimeBrokerUpdateOne {
+	_u.mutation.SetWorkloadIdentityTargets(v)
+	return _u
+}
+
+// SetNillableWorkloadIdentityTargets sets the "workload_identity_targets" field if the given value is not nil.
+func (_u *RuntimeBrokerUpdateOne) SetNillableWorkloadIdentityTargets(v *string) *RuntimeBrokerUpdateOne {
+	if v != nil {
+		_u.SetWorkloadIdentityTargets(*v)
+	}
+	return _u
+}
+
+// ClearWorkloadIdentityTargets clears the value of the "workload_identity_targets" field.
+func (_u *RuntimeBrokerUpdateOne) ClearWorkloadIdentityTargets() *RuntimeBrokerUpdateOne {
+	_u.mutation.ClearWorkloadIdentityTargets()
 	return _u
 }
 
@@ -1787,6 +1911,66 @@ func (_u *RuntimeBrokerUpdateOne) ClearPresentationObservedAt() *RuntimeBrokerUp
 	return _u
 }
 
+// SetConversionPlanPresentation sets the "conversion_plan_presentation" field.
+func (_u *RuntimeBrokerUpdateOne) SetConversionPlanPresentation(v string) *RuntimeBrokerUpdateOne {
+	_u.mutation.SetConversionPlanPresentation(v)
+	return _u
+}
+
+// SetNillableConversionPlanPresentation sets the "conversion_plan_presentation" field if the given value is not nil.
+func (_u *RuntimeBrokerUpdateOne) SetNillableConversionPlanPresentation(v *string) *RuntimeBrokerUpdateOne {
+	if v != nil {
+		_u.SetConversionPlanPresentation(*v)
+	}
+	return _u
+}
+
+// ClearConversionPlanPresentation clears the value of the "conversion_plan_presentation" field.
+func (_u *RuntimeBrokerUpdateOne) ClearConversionPlanPresentation() *RuntimeBrokerUpdateOne {
+	_u.mutation.ClearConversionPlanPresentation()
+	return _u
+}
+
+// SetConversionPlanPresentationHash sets the "conversion_plan_presentation_hash" field.
+func (_u *RuntimeBrokerUpdateOne) SetConversionPlanPresentationHash(v string) *RuntimeBrokerUpdateOne {
+	_u.mutation.SetConversionPlanPresentationHash(v)
+	return _u
+}
+
+// SetNillableConversionPlanPresentationHash sets the "conversion_plan_presentation_hash" field if the given value is not nil.
+func (_u *RuntimeBrokerUpdateOne) SetNillableConversionPlanPresentationHash(v *string) *RuntimeBrokerUpdateOne {
+	if v != nil {
+		_u.SetConversionPlanPresentationHash(*v)
+	}
+	return _u
+}
+
+// ClearConversionPlanPresentationHash clears the value of the "conversion_plan_presentation_hash" field.
+func (_u *RuntimeBrokerUpdateOne) ClearConversionPlanPresentationHash() *RuntimeBrokerUpdateOne {
+	_u.mutation.ClearConversionPlanPresentationHash()
+	return _u
+}
+
+// SetConversionPlanObservedAt sets the "conversion_plan_observed_at" field.
+func (_u *RuntimeBrokerUpdateOne) SetConversionPlanObservedAt(v time.Time) *RuntimeBrokerUpdateOne {
+	_u.mutation.SetConversionPlanObservedAt(v)
+	return _u
+}
+
+// SetNillableConversionPlanObservedAt sets the "conversion_plan_observed_at" field if the given value is not nil.
+func (_u *RuntimeBrokerUpdateOne) SetNillableConversionPlanObservedAt(v *time.Time) *RuntimeBrokerUpdateOne {
+	if v != nil {
+		_u.SetConversionPlanObservedAt(*v)
+	}
+	return _u
+}
+
+// ClearConversionPlanObservedAt clears the value of the "conversion_plan_observed_at" field.
+func (_u *RuntimeBrokerUpdateOne) ClearConversionPlanObservedAt() *RuntimeBrokerUpdateOne {
+	_u.mutation.ClearConversionPlanObservedAt()
+	return _u
+}
+
 // SetUpdated sets the "updated" field.
 func (_u *RuntimeBrokerUpdateOne) SetUpdated(v time.Time) *RuntimeBrokerUpdateOne {
 	_u.mutation.SetUpdated(v)
@@ -1966,6 +2150,12 @@ func (_u *RuntimeBrokerUpdateOne) sqlSave(ctx context.Context) (_node *RuntimeBr
 	if _u.mutation.HealthCleared() {
 		_spec.ClearField(runtimebroker.FieldHealth, field.TypeString)
 	}
+	if value, ok := _u.mutation.WorkloadIdentityTargets(); ok {
+		_spec.SetField(runtimebroker.FieldWorkloadIdentityTargets, field.TypeString, value)
+	}
+	if _u.mutation.WorkloadIdentityTargetsCleared() {
+		_spec.ClearField(runtimebroker.FieldWorkloadIdentityTargets, field.TypeString)
+	}
 	if value, ok := _u.mutation.Labels(); ok {
 		_spec.SetField(runtimebroker.FieldLabels, field.TypeJSON, value)
 	}
@@ -2106,6 +2296,24 @@ func (_u *RuntimeBrokerUpdateOne) sqlSave(ctx context.Context) (_node *RuntimeBr
 	}
 	if _u.mutation.PresentationObservedAtCleared() {
 		_spec.ClearField(runtimebroker.FieldPresentationObservedAt, field.TypeTime)
+	}
+	if value, ok := _u.mutation.ConversionPlanPresentation(); ok {
+		_spec.SetField(runtimebroker.FieldConversionPlanPresentation, field.TypeString, value)
+	}
+	if _u.mutation.ConversionPlanPresentationCleared() {
+		_spec.ClearField(runtimebroker.FieldConversionPlanPresentation, field.TypeString)
+	}
+	if value, ok := _u.mutation.ConversionPlanPresentationHash(); ok {
+		_spec.SetField(runtimebroker.FieldConversionPlanPresentationHash, field.TypeString, value)
+	}
+	if _u.mutation.ConversionPlanPresentationHashCleared() {
+		_spec.ClearField(runtimebroker.FieldConversionPlanPresentationHash, field.TypeString)
+	}
+	if value, ok := _u.mutation.ConversionPlanObservedAt(); ok {
+		_spec.SetField(runtimebroker.FieldConversionPlanObservedAt, field.TypeTime, value)
+	}
+	if _u.mutation.ConversionPlanObservedAtCleared() {
+		_spec.ClearField(runtimebroker.FieldConversionPlanObservedAt, field.TypeTime)
 	}
 	if value, ok := _u.mutation.Updated(); ok {
 		_spec.SetField(runtimebroker.FieldUpdated, field.TypeTime, value)

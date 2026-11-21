@@ -16,6 +16,7 @@ package hub
 
 import (
 	"reflect"
+	"slices"
 	"sync"
 	"time"
 
@@ -41,32 +42,52 @@ type startupLayer1Values struct {
 	// GitHubApp holds the non-secret GitHub App fields only. The private
 	// key and webhook secret are never part of a snapshot.
 	GitHubApp githubAppPublicConfig
+	// AuthorizedDomains is the sign-in domain list from settings.yaml and
+	// SCION_SERVER_* (ptone/scion#6000).
+	AuthorizedDomains []string
+	// Branding is the Hub-wide UI branding from startup config.
+	Branding *config.BrandingConfig
 }
 
 // githubAppPublicConfig is the part of GitHubAppServerConfig that the
 // github_app settings section owns.
 type githubAppPublicConfig struct {
-	AppID           int64
-	APIBaseURL      string
-	WebhooksEnabled bool
-	InstallationURL string
-	PrivateKeyPath  string
+	AppID                 int64
+	APIBaseURL            string
+	WebhooksEnabled       bool
+	InstallationURL       string
+	PrivateKeyPath        string
+	AppSlug               string
+	CommandMentionAliases []string
+}
+
+func (a githubAppPublicConfig) equal(b githubAppPublicConfig) bool {
+	return a.AppID == b.AppID &&
+		a.APIBaseURL == b.APIBaseURL &&
+		a.WebhooksEnabled == b.WebhooksEnabled &&
+		a.InstallationURL == b.InstallationURL &&
+		a.PrivateKeyPath == b.PrivateKeyPath &&
+		a.AppSlug == b.AppSlug &&
+		slices.Equal(a.CommandMentionAliases, b.CommandMentionAliases)
 }
 
 func githubAppPublicFrom(c GitHubAppServerConfig) githubAppPublicConfig {
 	return githubAppPublicConfig{
-		AppID:           c.AppID,
-		APIBaseURL:      c.APIBaseURL,
-		WebhooksEnabled: c.WebhooksEnabled,
-		InstallationURL: c.InstallationURL,
-		PrivateKeyPath:  c.PrivateKeyPath,
+		AppID:                 c.AppID,
+		APIBaseURL:            c.APIBaseURL,
+		WebhooksEnabled:       c.WebhooksEnabled,
+		InstallationURL:       c.InstallationURL,
+		PrivateKeyPath:        c.PrivateKeyPath,
+		AppSlug:               c.AppSlug,
+		CommandMentionAliases: slices.Clone(c.CommandMentionAliases),
 	}
 }
 
 // setGitHubAppPublicLocked writes the non-secret GitHub App fields into
 // s.config. It reports whether anything changed. Callers hold s.mu.
 func (s *Server) setGitHubAppPublicLocked(g githubAppPublicConfig) bool {
-	if githubAppPublicFrom(s.config.GitHubAppConfig) == g {
+	prev := githubAppPublicFrom(s.config.GitHubAppConfig)
+	if prev.equal(g) {
 		return false
 	}
 	s.config.GitHubAppConfig.AppID = g.AppID
@@ -74,6 +95,11 @@ func (s *Server) setGitHubAppPublicLocked(g githubAppPublicConfig) bool {
 	s.config.GitHubAppConfig.WebhooksEnabled = g.WebhooksEnabled
 	s.config.GitHubAppConfig.InstallationURL = g.InstallationURL
 	s.config.GitHubAppConfig.PrivateKeyPath = g.PrivateKeyPath
+	s.config.GitHubAppConfig.AppSlug = g.AppSlug
+	s.config.GitHubAppConfig.CommandMentionAliases = slices.Clone(g.CommandMentionAliases)
+	if prev.AppID != g.AppID || prev.APIBaseURL != g.APIBaseURL || prev.PrivateKeyPath != g.PrivateKeyPath {
+		s.githubAppIdentity.reset()
+	}
 	return true
 }
 
@@ -87,7 +113,37 @@ func (s *Server) recordStartupLayer1Values() {
 		AutoExposePortsDefault: copyBoolPtr(s.config.AutoExposePortsDefault),
 		TelemetryConfig:        s.config.TelemetryConfig,
 		GitHubApp:              githubAppPublicFrom(s.config.GitHubAppConfig),
+		AuthorizedDomains:      slices.Clone(s.config.AuthorizedDomains),
+		Branding:               s.config.Branding.Clone(),
 	}
+}
+
+// ResolvedBranding returns the running Hub's validated UI branding snapshot.
+// Never returns nil; an uninitialized Server returns DefaultResolvedBranding().
+func (s *Server) ResolvedBranding() *config.ResolvedBranding {
+	if s != nil {
+		if r := s.resolvedBranding.Load(); r != nil {
+			return r
+		}
+	}
+	return config.DefaultResolvedBranding()
+}
+
+// applyBrandingLocked resolves next and updates s.config.Branding and
+// s.resolvedBranding, returning true when the effective branding config
+// changed. Malformed configs log a warning and fall back to stock Scion
+// defaults. Callers hold s.mu (or run during single-goroutine Server init).
+func (s *Server) applyBrandingLocked(next *config.BrandingConfig) bool {
+	cloned := next.Clone()
+	changed := !reflect.DeepEqual(s.config.Branding, cloned)
+	s.config.Branding = cloned
+	resolved, errs := config.ResolveBranding(cloned)
+	if len(errs) > 0 {
+		logging.Subsystem("hub.settings").Warn("invalid server.hub.branding configuration; falling back to default Scion branding",
+			"errors", errs)
+	}
+	s.resolvedBranding.Store(resolved)
+	return changed
 }
 
 // softDeleteSettings returns the running soft-delete retention and the
@@ -206,6 +262,10 @@ type layer1ApplySkips struct {
 	// FederationReason is set when the federation configuration was not
 	// installed.
 	FederationReason string
+	// AuthorizedDomainsPinned is set when a SCION_SERVER_* variable pins
+	// authorized_domains on this node, so a saved list is not applied
+	// (ptone/scion#6000).
+	AuthorizedDomainsPinned bool
 }
 
 // layer1ApplySkips returns the items the last ApplySnapshot skipped.
@@ -221,5 +281,8 @@ func (s *Server) layer1ApplySkips() layer1ApplySkips {
 	s.federationApply.mu.Lock()
 	out.FederationReason = s.federationApply.skipReason
 	s.federationApply.mu.Unlock()
+	if ops := s.GetOperationalSettings(); ops != nil {
+		out.AuthorizedDomainsPinned = slices.Contains(ops.EnvOverriddenKeys(), authorizedDomainsKey)
+	}
 	return out
 }

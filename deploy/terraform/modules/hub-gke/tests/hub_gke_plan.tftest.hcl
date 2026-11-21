@@ -7,6 +7,7 @@ mock_provider "google" {}
 mock_provider "kubernetes" {}
 mock_provider "helm" {}
 mock_provider "random" {}
+mock_provider "tls" {}
 
 variables {
   project_id          = "tfha-test-project"
@@ -145,20 +146,25 @@ run "client_id_set_installs_the_hub" {
   }
 
   assert {
+    condition     = try(output.chart_values.config.extra.server.project_storage, null) == null
+    error_message = "config.extra must not carry server.project_storage; the chart renders it from workspaceStorage.nfs."
+  }
+
+  assert {
     condition     = !contains(keys(output.chart_values.hub), "podAnnotations")
     error_message = "no rotation marker means no rotation annotation."
   }
 
-  # Default: the value is left out, so the chart's own default (false)
-  # applies and existing hubs' values do not change.
+  # Default: both values are left out, so the chart's own defaults ("" and
+  # false) apply and existing hubs' values do not change.
   assert {
-    condition     = !contains(keys(output.chart_values.hub), "testIdentities")
-    error_message = "test_identities_enabled defaults to false and must leave hub.testIdentities out of the chart values."
+    condition     = !contains(keys(output.chart_values.hub), "testIdentities") && !contains(keys(output.chart_values.hub), "hubClass")
+    error_message = "test_identities_enabled defaults to false and must leave hub.testIdentities and hub.hubClass out of the chart values."
   }
 
   assert {
-    condition     = output.chart_values.runtime.gke == true
-    error_message = "agent_runtime_gke_mode defaults to true, so chart_values.runtime.gke must be true (the chart's previous hardcoded runtimes.kubernetes.gke)."
+    condition     = output.chart_values.runtime.gke == false
+    error_message = "agent_runtime_gke_mode defaults to false, so chart_values.runtime.gke must be false (matching hub-identity and chart RBAC)."
   }
 
   assert {
@@ -247,12 +253,12 @@ run "agent_runtime_gke_mode_passes_through" {
   command = plan
 
   variables {
-    agent_runtime_gke_mode = false
+    agent_runtime_gke_mode = true
   }
 
   assert {
-    condition     = output.chart_values.runtime.gke == false
-    error_message = "agent_runtime_gke_mode = false must reach the chart as runtime.gke = false."
+    condition     = output.chart_values.runtime.gke == true
+    error_message = "agent_runtime_gke_mode = true must reach the chart as runtime.gke = true."
   }
 }
 
@@ -264,8 +270,8 @@ run "test_identities_enabled_reaches_the_chart" {
   }
 
   assert {
-    condition     = output.chart_values.hub.testIdentities.enabled == true
-    error_message = "test_identities_enabled = true must set the chart's hub.testIdentities.enabled to true."
+    condition     = output.chart_values.hub.hubClass == "test" && output.chart_values.hub.testIdentities.enabled == true
+    error_message = "test_identities_enabled = true must set the chart's hub.hubClass to \"test\" and hub.testIdentities.enabled to true."
   }
 
   assert {
@@ -282,8 +288,8 @@ run "test_identities_explicit_false_adds_nothing" {
   }
 
   assert {
-    condition     = !contains(keys(output.chart_values.hub), "testIdentities")
-    error_message = "test_identities_enabled = false must leave hub.testIdentities out (the chart default is false)."
+    condition     = !contains(keys(output.chart_values.hub), "testIdentities") && !contains(keys(output.chart_values.hub), "hubClass")
+    error_message = "test_identities_enabled = false must leave hub.testIdentities and hub.hubClass out (the chart defaults are false and \"\")."
   }
 }
 
@@ -346,7 +352,7 @@ run "relative_nfs_export_rejected" {
   expect_failures = [var.nfs]
 }
 
-run "empty_nfs_pv_name_rejected" {
+run "empty_nfs_pv_name_accepted" {
   command = plan
 
   variables {
@@ -354,6 +360,23 @@ run "empty_nfs_pv_name_rejected" {
       server  = "192.0.2.10"
       export  = "/scion/tfha-gke-h3"
       pv_name = ""
+    }
+  }
+
+  assert {
+    condition     = output.chart_values.workspaceStorage.nfs.pvName == ""
+    error_message = "An empty nfs.pv_name must be accepted and render an empty workspaceStorage.nfs.pvName (agent pods mount the share inline)."
+  }
+}
+
+run "invalid_nfs_pv_name_rejected" {
+  command = plan
+
+  variables {
+    nfs = {
+      server  = "192.0.2.10"
+      export  = "/scion/tfha-gke-h3"
+      pv_name = "Bad_Name"
     }
   }
 
@@ -460,4 +483,164 @@ run "chart_ci_fixture_matches_chart_values" {
     ))
     error_message = "deploy/helm/scion-hub/ci/values-terraform-hub-gke.yaml no longer matches chart_values; update the fixture with the module."
   }
+}
+
+run "multi_replica_in_process_provisions_conduit_tls_only" {
+  command = plan
+
+  variables {
+    project_id           = "example-project"
+    public_url           = "https://tfha-gke-h3.example.com"
+    image_repository     = "us-central1-docker.pkg.dev/example-project/example-repo/scion-hub-gke"
+    image_digest         = "sha256:feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface"
+    hub_sa_email         = "tfha-gke-h3-hub@example-project.iam.gserviceaccount.com"
+    transport_sa_email   = "tfha-gke-h3-transport@example-project.iam.gserviceaccount.com"
+    image_registry       = "us-central1-docker.pkg.dev/example-project/example-repo"
+    sql_connection_name  = "example-project:us-central1:tfha-pg"
+    iap_oauth_client_id  = "123456789-placeholder.apps.googleusercontent.com"
+    admin_emails         = ["admin@example.com"]
+    db_password_rotation = "2026-10-06"
+    nfs = {
+      server  = "nfs.example.com"
+      export  = "/example-export/tfha-gke-h3"
+      pv_name = "tfha-gke-h3-nfs"
+    }
+    hub_replica_count = 2
+    enable_hub_pdb    = true
+  }
+
+  assert {
+    condition = (
+      output.chart_values.replicaCount == 2 &&
+      output.chart_values.hub.pdb.enabled == true &&
+      length(kubernetes_secret_v1.conduit_tls) == 1 &&
+      length(kubernetes_secret_v1.conduit_peer) == 0 &&
+      output.chart_values.conduit.internalTls.enabled == true &&
+      output.chart_values.conduit.internalTls.existingSecret == "tfha-gke-h3-conduit-tls" &&
+      output.chart_values.conduit.internalTls.serverName == "tfha-gke-h3-scion-hub-relay.tfha-gke-h3-system.svc" &&
+      !contains(keys(output.chart_values), "relay")
+    )
+    error_message = "multi-replica in_process mode must provision conduit_tls, set replicaCount=2 and hub.pdb.enabled=true, and create no external relay resources."
+  }
+
+  assert {
+    condition = jsonencode(output.chart_values) == jsonencode(merge(
+      yamldecode(file("${path.module}/../../../helm/scion-hub/ci/values-terraform-hub-gke-multi.yaml")),
+      {
+        database = {
+          for k, v in yamldecode(file("${path.module}/../../../helm/scion-hub/ci/values-terraform-hub-gke-multi.yaml")).database :
+          k => v if k != "password"
+        }
+      },
+    ))
+    error_message = "deploy/helm/scion-hub/ci/values-terraform-hub-gke-multi.yaml no longer matches chart_values; update the fixture with the module."
+  }
+}
+
+run "external_relay_ha_provisions_tls_peer_secret_and_relay_values" {
+  command = plan
+
+  variables {
+    project_id           = "example-project"
+    public_url           = "https://tfha-gke-h3.example.com"
+    image_repository     = "us-central1-docker.pkg.dev/example-project/example-repo/scion-hub-gke"
+    image_digest         = "sha256:feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface"
+    hub_sa_email         = "tfha-gke-h3-hub@example-project.iam.gserviceaccount.com"
+    transport_sa_email   = "tfha-gke-h3-transport@example-project.iam.gserviceaccount.com"
+    image_registry       = "us-central1-docker.pkg.dev/example-project/example-repo"
+    sql_connection_name  = "example-project:us-central1:tfha-pg"
+    iap_oauth_client_id  = "123456789-placeholder.apps.googleusercontent.com"
+    admin_emails         = ["admin@example.com"]
+    db_password_rotation = "2026-10-06"
+    nfs = {
+      server  = "nfs.example.com"
+      export  = "/example-export/tfha-gke-h3"
+      pv_name = "tfha-gke-h3-nfs"
+    }
+    hub_replica_count   = 2
+    conduit_relay_mode  = "external"
+    relay_replica_count = 3
+    enable_hub_pdb      = true
+    enable_relay_pdb    = true
+    relay_sa_email      = "tfha-gke-h3-relay@example-project.iam.gserviceaccount.com"
+    relay_db_user       = "tfha-gke-h3-relay"
+    relay_db_password   = "placeholder-not-a-real-relay-password"
+  }
+
+  assert {
+    condition = (
+      length(kubernetes_secret_v1.conduit_tls) == 1 &&
+      length(kubernetes_secret_v1.conduit_peer) == 1 &&
+      random_password.conduit_peer[0].length == 48 &&
+      random_password.session[0].length == 64 &&
+      output.chart_values.conduit.relayMode == "external" &&
+      output.chart_values.conduit.peerAuth == "hmac" &&
+      output.chart_values.conduit.existingPeerSecret == "tfha-gke-h3-conduit-peer" &&
+      output.chart_values.relay.enabled == true &&
+      output.chart_values.relay.replicaCount == 3 &&
+      output.chart_values.relay.pdb.enabled == true &&
+      output.chart_values.relay.serviceAccount.name == "scion-relay" &&
+      output.chart_values.relay.serviceAccount.gcpServiceAccount == "tfha-gke-h3-relay@example-project.iam.gserviceaccount.com" &&
+      output.chart_values.relay.database.user == "tfha-gke-h3-relay" &&
+      !contains(keys(output.chart_values.relay.database), "password") &&
+      output.chart_values.relay.podAnnotations["scion.dev/db-password-rotation"] == "2026-10-06"
+    )
+    error_message = "external relay mode must provision TLS + peer secrets and wire conduit/relay chart_values without leaking relay_db_password in plain values."
+  }
+
+  assert {
+    condition = jsonencode(output.chart_values) == jsonencode(merge(
+      yamldecode(file("${path.module}/../../../helm/scion-hub/ci/values-terraform-hub-gke-external.yaml")),
+      {
+        database = {
+          for k, v in yamldecode(file("${path.module}/../../../helm/scion-hub/ci/values-terraform-hub-gke-external.yaml")).database :
+          k => v if k != "password"
+        }
+        relay = merge(
+          yamldecode(file("${path.module}/../../../helm/scion-hub/ci/values-terraform-hub-gke-external.yaml")).relay,
+          {
+            database = {
+              for k, v in yamldecode(file("${path.module}/../../../helm/scion-hub/ci/values-terraform-hub-gke-external.yaml")).relay.database :
+              k => v if k != "password"
+            }
+          },
+        )
+      },
+    ))
+    error_message = "deploy/helm/scion-hub/ci/values-terraform-hub-gke-external.yaml no longer matches chart_values; update the fixture with the module."
+  }
+}
+
+run "hub_pdb_with_single_replica_is_rejected" {
+  command = plan
+
+  variables {
+    hub_replica_count = 1
+    enable_hub_pdb    = true
+  }
+
+  expect_failures = [var.enable_hub_pdb]
+}
+
+run "relay_pdb_without_external_mode_is_rejected" {
+  command = plan
+
+  variables {
+    conduit_relay_mode = "in_process"
+    enable_relay_pdb   = true
+  }
+
+  expect_failures = [var.enable_relay_pdb]
+}
+
+run "relay_pdb_with_single_relay_replica_is_rejected" {
+  command = plan
+
+  variables {
+    conduit_relay_mode  = "external"
+    relay_replica_count = 1
+    enable_relay_pdb    = true
+  }
+
+  expect_failures = [var.enable_relay_pdb]
 }

@@ -56,6 +56,14 @@ type BuiltInRole struct {
 	// a project member (RoleDefinition.ConfersMembership false). It is
 	// set only on project-visitor.
 	NoMembership bool
+	// SystemRowOnly marks a built-in role added after operators could
+	// create custom roles: an existing row of its name that is not a
+	// system role is a custom role an operator created first. At startup
+	// renameCustomRolesHoldingBuiltInNames renames that row
+	// (customRoleRenameFor), with an audit record, before the built-in role
+	// is seeded; it keeps its permissions and bindings and stays a custom
+	// role. It is set on project-viewer (ptone/scion#5519).
+	SystemRowOnly bool
 }
 
 // builtInRoleRevisionKey returns the hub-setting key used to track the last
@@ -97,26 +105,26 @@ func BuiltInRoles() []BuiltInRole {
 			Name:        store.SystemRoleSuperAdmin,
 			Description: "Full platform administrator with all permissions",
 			ScopeType:   store.RoleScopeSystem,
-			Revision:    9, // R9: project.chat_post (ptone/scion#5518); R8: drop Reserved project.register (ptone/scion#2124); R7: add user.list, which the user list checks (ptone/scion#2124); R6: artifact.steward (ptone/scion#5144); R5: drop Reserved agent.log_append (ptone/scion#4230); R4: drop Reserved hub.federation.read, hub.federation.update, hub.teams_manifest.update, user.list (ptone/scion#4229); R3: drop Reserved permissions (ptone/scion#3652); R2: add broker.auto_provide (ptone/scion#2104)
+			Revision:    16, // R16: project.manage_message_policies, project.read_message_policies (ptone/scion#8047); R15: trigger.*, webhook_endpoint.* (ptone/scion#8028); R14: github_trigger.{comment,configure} (ptone/scion#8090); R13: system_one_instance.{read,create,delete,execute} (ptone/scion#8044); R12: template.create_global, template.update_global, template.delete_global (ptone/scion#1713); R11: skill.update_global, skill.delete_global (ptone/scion#1713); R10: agent.delegation.revoke_all (ptone/scion#2132); R9: project.chat_post (ptone/scion#5518); R8: drop Reserved project.register (ptone/scion#2124); R7: add user.list, which the user list checks (ptone/scion#2124); R6: artifact.steward (ptone/scion#5144); R5: drop Reserved agent.log_append (ptone/scion#4230); R4: drop Reserved hub.federation.read, hub.federation.update, hub.teams_manifest.update, user.list (ptone/scion#4229); R3: drop Reserved permissions (ptone/scion#3652); R2: add broker.auto_provide (ptone/scion#2104)
 			Permissions: allPermissionIDs(),
 		},
 		{
 			Name:        store.SystemRoleHubAdmin,
 			Description: "Hub administrator with scopeable admin permissions",
 			ScopeType:   store.RoleScopeSystem,
-			Revision:    9, // R9: project.chat_post (ptone/scion#5518); R8: project.manage_visitors (ptone/scion#4603); R7: agent delegation grant management (agent.delegation.revoke, .credential.revoke, .list, .read); R6: drop Reserved hub.federation.read, hub.federation.update, hub.teams_manifest.update, user.list (ptone/scion#4229); R5: hub.env_vars.read
+			Revision:    15, // R15: project.manage_message_policies, project.read_message_policies (ptone/scion#8047); R14: trigger.*, webhook_endpoint.* (ptone/scion#8028); R13: system_one_instance.{read,create,delete,execute} (ptone/scion#8044); R12: template.create_global, template.update_global, template.delete_global (ptone/scion#1713); R11: skill.update_global, skill.delete_global (ptone/scion#1713); R10: agent.delegation.revoke_all (ptone/scion#2132); R9: project.chat_post (ptone/scion#5518); R8: project.manage_visitors (ptone/scion#4603); R7: agent delegation grant management (agent.delegation.revoke, .credential.revoke, .list, .read); R6: drop Reserved hub.federation.read, hub.federation.update, hub.teams_manifest.update, user.list (ptone/scion#4229); R5: hub.env_vars.read
 			Permissions: hubAdminPermissionIDs(),
 		},
 		{
-			// global-catalog-author: Phase 1 (ptone/scion#1713) grants only
-			// skill.create_global. Phase 2 extends this to update/delete for
-			// skills and templates. Seeded as a role *definition only* — no
-			// binding is created. An operator grants it deliberately.
-			// See design doc §3.1 (roles).
+			// global-catalog-author: grants global-catalog skill and template CRUD
+			// twins (skill.create_global, skill.update_global, skill.delete_global,
+			// template.create_global, template.update_global, template.delete_global;
+			// ptone/scion#1713). Seeded as a role *definition only* — no binding is
+			// created. An operator grants it deliberately.
 			Name:        store.SystemRoleGlobalCatalogAuthor,
-			Description: "Creates global (hub-scoped) skills",
+			Description: "Creates and maintains global catalog skills and templates",
 			ScopeType:   store.RoleScopeSystem,
-			Revision:    1,
+			Revision:    3, // R3: template.create_global, template.update_global, template.delete_global (ptone/scion#1713); R2: skill.update_global, skill.delete_global (ptone/scion#1713); R1: skill.create_global
 			Permissions: globalCatalogAuthorPermissionIDs(),
 		},
 		{
@@ -147,22 +155,36 @@ func BuiltInRoles() []BuiltInRole {
 			Name:        store.ProjectRoleOwner,
 			Description: "Project owner with full project permissions",
 			ScopeType:   store.RoleScopeProject,
-			Revision:    11, // R11: project.chat_post (ptone/scion#5518); R10: artifact.steward (ptone/scion#5144); R9: project.manage_visitors; R8: agent delegation grant management for project-bounded grants; R7: project.set_messaging_policy; R6: artifact.read, artifact.create; R5: agent.port_access for owners and admins; R4: add gcp_service_account.assign (ptone/scion#2147)
+			Revision:    14, // R14: project.manage_message_policies, project.read_message_policies (ptone/scion#8047); R13: trigger.*, webhook_endpoint.* (ptone/scion#8028); R12: github_trigger.{comment,configure} (ptone/scion#8090); R11: project.chat_post (ptone/scion#5518); R10: artifact.steward (ptone/scion#5144); R9: project.manage_visitors; R8: agent delegation grant management for project-bounded grants; R7: project.set_messaging_policy; R6: artifact.read, artifact.create; R5: agent.port_access for owners and admins; R4: add gcp_service_account.assign (ptone/scion#2147)
 			Permissions: projectOwnerPermissionIDs(),
 		},
 		{
 			Name:        store.ProjectRoleAdmin,
 			Description: "Project admin with most project permissions (no delete, no set_message_mode)",
 			ScopeType:   store.RoleScopeProject,
-			Revision:    9, // R9: project.chat_post (ptone/scion#5518); R8: project.manage_visitors; R7: agent delegation grant management for project-bounded grants; R6: artifact.read, artifact.create; R5: agent.port_access for owners and admins; R4: add gcp_service_account.assign (ptone/scion#2147)
+			Revision:    12, // R12: project.manage_message_policies, project.read_message_policies (ptone/scion#8047); R11: trigger.{create,list,read,update}, webhook_endpoint.{create,list,read} (ptone/scion#8028); R10: github_trigger.{comment,configure} (ptone/scion#8090); R9: project.chat_post (ptone/scion#5518); R8: project.manage_visitors; R7: agent delegation grant management for project-bounded grants; R6: artifact.read, artifact.create; R5: agent.port_access for owners and admins; R4: add gcp_service_account.assign (ptone/scion#2147)
 			Permissions: projectAdminPermissionIDs(),
 		},
 		{
 			Name:        store.ProjectRoleMember,
 			Description: "Project member with basic project permissions",
 			ScopeType:   store.RoleScopeProject,
-			Revision:    6, // R6: project.chat_post (ptone/scion#5518); R5: artifact.read, artifact.create; R4: add gcp_service_account.assign (ptone/scion#2147)
+			Revision:    9, // R9: project.read_message_policies (ptone/scion#8047); R8: trigger.{create,list,read}, webhook_endpoint.{create,list,read} (ptone/scion#8028); R7: github_trigger.comment (ptone/scion#8090); R6: project.chat_post (ptone/scion#5518); R5: artifact.read, artifact.create; R4: add gcp_service_account.assign (ptone/scion#2147)
 			Permissions: projectMemberCuratedPermissionIDs(),
+		},
+		{
+			// project-viewer: a membership role that reads the project and its
+			// chat and cannot post messages
+			// (ptone/scion#5519). It confers membership, so the
+			// one-membership-role-per-principal rule applies, and it is
+			// assignable wherever project-member is. Nobody is moved into
+			// it automatically.
+			Name:          store.ProjectRoleViewer,
+			Description:   "Can read the project and its chat; cannot post messages or create agents",
+			ScopeType:     store.RoleScopeProject,
+			Revision:      2, // R2: project.read_message_policies (ptone/scion#8047)
+			Permissions:   projectViewerPermissionIDs(),
+			SystemRowOnly: true,
 		},
 		{
 			// project-visitor: the grant given to a federated account
@@ -190,7 +212,7 @@ func BuiltInRoles() []BuiltInRole {
 			Name:        store.AgentRoleDefReadonly,
 			Description: "Read-only agent permissions",
 			ScopeType:   store.RoleScopeSystem,
-			Revision:    1,
+			Revision:    2, // R2: agent.status_update, self-only (ptone/scion#7926)
 			Permissions: agentRolePermissionIDs(AgentRoleReadOnly),
 		},
 		{
@@ -354,6 +376,9 @@ func projectOwnerPermissionIDs() []string {
 		// checked; in the default off mode this permission alone authorizes
 		// assignment of project-scoped service accounts.
 		"gcp_service_account.assign",
+		// GitHub App triggers (comment action and project source settings; ptone/scion#8090)
+		"github_trigger.comment",
+		"github_trigger.configure",
 		// Harness config management
 		"harness_config.create",
 		"harness_config.delete",
@@ -369,10 +394,12 @@ func projectOwnerPermissionIDs() []string {
 		"project.delete",
 		"project.list",
 		"project.manage",
+		"project.manage_message_policies",
 		// project.manage_visitors: grant and revoke visitor access for
 		// federated accounts (owners and admins, not members).
 		"project.manage_visitors",
 		"project.read",
+		"project.read_message_policies",
 		"project.secret_read",
 		// Project owners hold project.set_messaging_policy; the messaging
 		// policy handler also applies the direct-owner rule.
@@ -397,6 +424,16 @@ func projectOwnerPermissionIDs() []string {
 		"template.list",
 		"template.read",
 		"template.update",
+		// Trigger and webhook endpoint management
+		"trigger.create",
+		"trigger.delete",
+		"trigger.list",
+		"trigger.read",
+		"trigger.update",
+		"webhook_endpoint.create",
+		"webhook_endpoint.delete",
+		"webhook_endpoint.list",
+		"webhook_endpoint.read",
 	}
 }
 
@@ -449,6 +486,9 @@ func projectAdminPermissionIDs() []string {
 		// checked; in the default off mode this permission alone authorizes
 		// assignment of project-scoped service accounts.
 		"gcp_service_account.assign",
+		// GitHub App triggers (comment action and project source settings; ptone/scion#8090)
+		"github_trigger.comment",
+		"github_trigger.configure",
 		// Harness config management (no delete)
 		"harness_config.create",
 		"harness_config.list",
@@ -458,8 +498,10 @@ func projectAdminPermissionIDs() []string {
 		"project.chat_post",
 		"project.list",
 		"project.manage",
+		"project.manage_message_policies",
 		"project.manage_visitors",
 		"project.read",
+		"project.read_message_policies",
 		"project.secret_read",
 		"project.update",
 		// Scheduled event management (no delete)
@@ -478,6 +520,14 @@ func projectAdminPermissionIDs() []string {
 		"template.list",
 		"template.read",
 		"template.update",
+		// Trigger and webhook endpoint management (no delete)
+		"trigger.create",
+		"trigger.list",
+		"trigger.read",
+		"trigger.update",
+		"webhook_endpoint.create",
+		"webhook_endpoint.list",
+		"webhook_endpoint.read",
 	}
 }
 
@@ -513,6 +563,8 @@ func projectMemberCuratedPermissionIDs() []string {
 		// checked; in the default off mode this permission alone authorizes
 		// assignment of project-scoped service accounts.
 		"gcp_service_account.assign",
+		// GitHub App triggers (comment action only; configure is owner/admin; ptone/scion#8090)
+		"github_trigger.comment",
 		// Harness config (create, read, list)
 		"harness_config.create",
 		"harness_config.list",
@@ -523,6 +575,7 @@ func projectMemberCuratedPermissionIDs() []string {
 		"project.chat_post",
 		"project.list",
 		"project.read",
+		"project.read_message_policies",
 		// Scheduled events (create, read, list)
 		"scheduled_event.create",
 		"scheduled_event.list",
@@ -534,6 +587,26 @@ func projectMemberCuratedPermissionIDs() []string {
 		"template.create",
 		"template.list",
 		"template.read",
+		// Triggers and webhook endpoints (create, read, list)
+		"trigger.create",
+		"trigger.list",
+		"trigger.read",
+		"webhook_endpoint.create",
+		"webhook_endpoint.list",
+		"webhook_endpoint.read",
+	}
+}
+
+// projectViewerPermissionIDs returns the curated permission set for the
+// project-viewer role: read the project (and so its chat) and its agents.
+// It holds no project.chat_post, agent.create or agent.message.
+func projectViewerPermissionIDs() []string {
+	return []string{
+		"agent.list",
+		"agent.read",
+		"project.list",
+		"project.read",
+		"project.read_message_policies",
 	}
 }
 
@@ -739,6 +812,14 @@ func reconcileBuiltInRole(ctx context.Context, s store.Store, role BuiltInRole) 
 	}
 
 	existing, err := s.GetRoleDefinitionByName(ctx, role.Name, role.ScopeType)
+	if err == nil && role.SystemRowOnly && !existing.System {
+		// renameCustomRolesHoldingBuiltInNames runs first at startup and
+		// fails the start if it cannot rename such a row, so this is not
+		// reached there. A custom row is never taken over.
+		slog.Warn("a custom role holds a built-in role's name; the built-in role is not seeded",
+			"name", role.Name, "role_id", existing.ID)
+		return 0, false
+	}
 	if err != nil {
 		if !errors.Is(err, store.ErrNotFound) {
 			slog.Warn("failed to check for existing role definition",
@@ -806,6 +887,105 @@ func reconcileBuiltInRole(ctx context.Context, s store.Store, role BuiltInRole) 
 		"perm_hash", codeMarker.PermHash,
 		"permissions_count", len(role.Permissions))
 	return 0, false
+}
+
+// customRoleRenamedOp is the mutation type of the audit record written when
+// a custom role that holds a SystemRowOnly built-in role's name is renamed.
+const customRoleRenamedOp = "builtin_role_name_custom_role_renamed"
+
+// renameCustomRolesHoldingBuiltInNames renames, before the built-in roles are
+// reconciled, every custom (non-system) role definition that holds the name
+// of a SystemRowOnly built-in role in its scope (customRoleRenameFor). Each
+// rename and its mutation audit record (before: the name; after: the new
+// name and the role ID) are written in one transaction. The role keeps its
+// permissions, and its bindings keep naming it by ID, so it stays a custom
+// role and nothing it grants changes. Any failure is returned: the caller
+// fails the start rather than seeding a built-in role beside a custom row
+// of the same name. Running it again renames nothing.
+func renameCustomRolesHoldingBuiltInNames(ctx context.Context, s store.Store) error {
+	for _, role := range BuiltInRoles() {
+		if !role.SystemRowOnly {
+			continue
+		}
+		existing, err := s.GetRoleDefinitionByName(ctx, role.Name, role.ScopeType)
+		if errors.Is(err, store.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("look up role %q: %w", role.Name, err)
+		}
+		if existing.System {
+			continue
+		}
+		renamed := *existing
+		renamed.Name = customRoleRenameFor(existing)
+		after, _ := json.Marshal(map[string]string{"name": renamed.Name, "roleId": existing.ID})
+		before, _ := json.Marshal(map[string]string{"name": existing.Name})
+		err = s.WithTx(ctx, func(tx store.Store) error {
+			if _, err := tx.UpdateRoleDefinition(ctx, &renamed); err != nil {
+				return err
+			}
+			return tx.CreateMutationAudit(ctx, &store.MutationAuditRecord{
+				Timestamp:          time.Now().UTC(),
+				MutationType:       customRoleRenamedOp,
+				ActorPrincipalKind: "system",
+				ActorPrincipalID:   store.SystemReconcileCreatedBy,
+				TargetType:         "role_definition",
+				TargetID:           existing.ID,
+				BeforeSummary:      string(before),
+				AfterSummary:       string(after),
+			})
+		})
+		if err != nil {
+			return fmt.Errorf("rename custom role %q (%s) that holds a built-in role's name: %w", existing.Name, existing.ID, err)
+		}
+		slog.Warn("renamed a custom role that held a built-in role's name",
+			"name", role.Name, "role_id", existing.ID, "new_name", renamed.Name)
+	}
+	return nil
+}
+
+// builtInMembershipRoleRowsNotSystem returns the built-in project membership
+// role names (store.BuiltInProjectMembershipRoles) whose stored row is not a
+// system row, and logs an error naming each one. Every check recognises a
+// built-in membership role only as a system row, so such a row is treated
+// as a custom role: its bindings stop conferring the built-in tier. The seed
+// has always created these rows as system rows (role_definitions has had the
+// column since the table was introduced, and nothing else writes it), so
+// this is expected to find nothing; it reports and never changes the rows.
+func builtInMembershipRoleRowsNotSystem(ctx context.Context, s store.Store) []string {
+	names := make([]string, 0, len(store.BuiltInProjectMembershipRoles))
+	for name := range store.BuiltInProjectMembershipRoles {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var bad []string
+	for _, name := range names {
+		rd, err := s.GetRoleDefinitionByName(ctx, name, store.RoleScopeProject)
+		if err != nil {
+			if !errors.Is(err, store.ErrNotFound) {
+				slog.Warn("could not check a built-in role row", "name", name, "error", err)
+			}
+			continue
+		}
+		if !rd.System {
+			bad = append(bad, name)
+			slog.Error("a built-in project membership role row is not a system row; it is treated as a custom role and its bindings do not confer the built-in tier",
+				"name", name, "role_id", rd.ID)
+		}
+	}
+	return bad
+}
+
+// customRoleRenameFor is the new name of a custom role that held a
+// SystemRowOnly built-in role's name: the name, "-custom-" and the first
+// eight characters of its ID, so the rename is stable and unique.
+func customRoleRenameFor(rd *store.RoleDefinition) string {
+	id := rd.ID
+	if len(id) > 8 {
+		id = id[:8]
+	}
+	return rd.Name + "-custom-" + id
 }
 
 // getAppliedBuiltInRoleMarker reads the last-applied revision marker for a
@@ -909,6 +1089,16 @@ func hubAdminPermissionIDs() []string {
 		"scheduled_event.create": true,
 		"scheduled_event.delete": true,
 		"scheduled_event.update": true,
+		// Trigger and webhook endpoint management (hub-wide visibility and control)
+		"trigger.read":            true,
+		"trigger.list":            true,
+		"trigger.create":          true,
+		"trigger.delete":          true,
+		"trigger.update":          true,
+		"webhook_endpoint.read":   true,
+		"webhook_endpoint.list":   true,
+		"webhook_endpoint.create": true,
+		"webhook_endpoint.delete": true,
 		// hub.federation.read, hub.federation.update and
 		// hub.teams_manifest.update are Reserved: no route checks them
 		// (ptone/scion#4229).
@@ -934,10 +1124,12 @@ func hubAdminPermissionIDs() []string {
 		"role_binding.create": true,
 		"role_binding.delete": true,
 		// Project oversight
-		"project.read":      true,
-		"project.list":      true,
-		"project.update":    true,
-		"project.chat_post": true,
+		"project.read":                    true,
+		"project.list":                    true,
+		"project.update":                  true,
+		"project.chat_post":               true,
+		"project.manage_message_policies": true,
+		"project.read_message_policies":   true,
 		// Project visitor grants (ptone/scion#4603). Granting and changing
 		// a grant's window also need every permission of the
 		// project-visitor role on the project (non-amplification).
@@ -950,18 +1142,32 @@ func hubAdminPermissionIDs() []string {
 		"skill.delete":        true,
 		"skill.register":      true,
 		"skill.create_global": true,
+		"skill.update_global": true,
+		"skill.delete_global": true,
+		// Global template catalog (global twins only — plain template.* stay
+		// out of hub-admin so it does not gain non-member project template
+		// write authority; ptone/scion#1713)
+		"template.create_global": true,
+		"template.update_global": true,
+		"template.delete_global": true,
 		// Access constraints — full operator control.
 		// hub-admin can read and administer access constraints so that
 		// operators who are not super-admins can manage them via the web UI.
 		"access_constraint.read":  true,
 		"access_constraint.admin": true,
 		// Agent delegation grant management, for any grant
-		// (.design/agent-delegation.md §7, §18.5). Not issuance, not
-		// exchange.
+		// (.design/agent-delegation.md §7, §18.5), including revoke-all.
+		// Not issuance, not exchange.
 		"agent.delegation.revoke":            true,
 		"agent.delegation.credential.revoke": true,
 		"agent.delegation.list":              true,
 		"agent.delegation.read":              true,
+		"agent.delegation.revoke_all":        true,
+		// System One provider instance administration (ptone/scion#8044).
+		"system_one_instance.read":    true,
+		"system_one_instance.create":  true,
+		"system_one_instance.delete":  true,
+		"system_one_instance.execute": true,
 	}
 
 	var ids []string
@@ -980,6 +1186,11 @@ func hubAdminPermissionIDs() []string {
 func globalCatalogAuthorPermissionIDs() []string {
 	return []string{
 		"skill.create_global",
+		"skill.delete_global",
+		"skill.update_global",
+		"template.create_global",
+		"template.delete_global",
+		"template.update_global",
 	}
 }
 
@@ -1786,6 +1997,15 @@ func ReconcileSuperAdminBindings(ctx context.Context, s store.Store, adminEmails
 			if reconcileSkipsUser(u) {
 				if inAdminList {
 					slog.Warn("skipping admin promotion of a test identity listed in admin_emails", "user_id", u.ID)
+				}
+				continue
+			}
+			// A user being deleted (ptone/scion#2143) has had its role
+			// bindings removed and keeps none until the row is gone: it is
+			// neither promoted nor demoted.
+			if u.Status == store.UserStatusDeleting {
+				if inAdminList {
+					slog.Warn("skipping admin promotion of a user being deleted listed in admin_emails", "user_id", u.ID)
 				}
 				continue
 			}

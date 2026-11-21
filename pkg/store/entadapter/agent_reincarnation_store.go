@@ -57,6 +57,7 @@ func entAgentReincarnationToStore(r *ent.AgentReincarnation) *store.AgentReincar
 		TargetBrokerID: r.TargetBrokerID,
 		SourceCleanup:  r.SourceCleanup,
 		TransferMode:   r.TransferMode,
+		HomeReset:      r.HomeReset,
 	}
 	if r.PreviousAppliedConfig != "" {
 		cfg, err := unmarshalAppliedConfigSnapshot(r.PreviousAppliedConfig)
@@ -86,6 +87,8 @@ func unmarshalAppliedConfigSnapshot(raw string) (*store.AgentAppliedConfig, erro
 	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
 		return nil, err
 	}
+	// As parseAppliedConfig: only the exact-key reader reads the decision.
+	cfg.NativeCloudRun = rowNativeCloudRun(raw)
 	return &cfg, nil
 }
 
@@ -117,7 +120,8 @@ func (s *AgentReincarnationStore) CreateAgentReincarnation(ctx context.Context, 
 		SetSourceBrokerID(r.SourceBrokerID).
 		SetTargetBrokerID(r.TargetBrokerID).
 		SetSourceCleanup(r.SourceCleanup).
-		SetTransferMode(r.TransferMode)
+		SetTransferMode(r.TransferMode).
+		SetHomeReset(r.HomeReset)
 
 	if !r.RequestedAt.IsZero() {
 		builder.SetRequestedAt(r.RequestedAt)

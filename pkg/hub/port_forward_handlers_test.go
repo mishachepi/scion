@@ -172,6 +172,21 @@ func TestAgentPortProxyNoTunnelReturns503(t *testing.T) {
 	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
 }
 
+// TestAgentPortProxyDeniedPortReturns403: covers the port-forward tunnel path.
+func TestAgentPortProxyDeniedPortReturns403(t *testing.T) {
+	srv, s := testServer(t)
+	srv.config.ConduitPolicy.DenyPorts = []int{3000}
+	agent, token := createPortForwardAgent(t, srv, s)
+
+	rec := doAgentTokenRequest(t, srv, http.MethodPost, "/api/v1/agents/"+agent.ID+"/ports", map[string]any{
+		"port": 3000,
+	}, token)
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	rec = doAgentTokenRequest(t, srv, http.MethodGet, "/api/v1/agents/"+agent.ID+"/ports/3000/proxy/", nil, token)
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+}
+
 func TestProxyErrorContentNegotiation(t *testing.T) {
 	srv, s := testServer(t)
 	agent, token := createPortForwardAgent(t, srv, s)
@@ -329,6 +344,10 @@ func TestAgentPortProxyResponseIsSandboxed(t *testing.T) {
 	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Set-Cookie", "session=agent-set; Path=/")
 		w.Header().Set("Content-Security-Policy", "default-src *")
+		for name, v := range agentPageHeaders {
+			w.Header().Set(name, v)
+		}
+		w.Header().Set("X-Agent-Kept", "kept")
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("<html>agent content</html>"))
@@ -365,10 +384,34 @@ func TestAgentPortProxyResponseIsSandboxed(t *testing.T) {
 	rec = doAgentTokenRequest(t, srv, http.MethodGet, "/api/v1/agents/"+agent.ID+"/ports/"+portText+"/proxy/", nil, token)
 	require.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, "<html>agent content</html>", rec.Body.String())
-	assert.Equal(t, untrustedContentSandboxCSP, rec.Header().Get("Content-Security-Policy"),
+	assert.Equal(t, agentServedPageSandboxCSP, rec.Header().Get("Content-Security-Policy"),
 		"the hub's sandbox CSP must be authoritative; the agent's own CSP must not pass through")
+	// Without the web frontend in front (this recorder is the hub alone),
+	// the response still refuses to be embedded.
+	assert.Equal(t, []string{"'none'"}, cspDirective(rec.Header().Get("Content-Security-Policy"), "frame-ancestors"), "hub-only frame-ancestors")
+	assert.Equal(t, untrustedContentPermissionsPolicy, rec.Header().Get("Permissions-Policy"),
+		"the hub's Permissions-Policy must replace the agent's own (camera=*)")
 	assert.Equal(t, "nosniff", rec.Header().Get("X-Content-Type-Options"))
 	assert.Empty(t, rec.Header().Values("Set-Cookie"), "the agent must not be able to set cookies on the hub origin")
+
+	// Behind the web server's security headers, which set the web pages'
+	// policy first, the sandbox policy is still the only one.
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agents/"+agent.ID+"/ports/"+portText+"/proxy/", nil)
+	req.Header.Set("X-Scion-Agent-Token", token)
+	webRec := httptest.NewRecorder()
+	(&WebServer{}).securityHeadersMiddleware(srv.Handler()).ServeHTTP(webRec, req)
+	require.Equal(t, http.StatusOK, webRec.Code)
+	assert.Equal(t, []string{agentServedPageSandboxCSP}, webRec.Header().Values("Content-Security-Policy"), "tunnel response policies")
+	assert.Equal(t, []string{"nosniff"}, webRec.Header().Values("X-Content-Type-Options"), "tunnel response nosniff headers")
+
+	// The hub's own page headers are not combined with the app's: each
+	// has exactly the hub's single value. Positive control: a header the
+	// hub does not set still passes through from the app.
+	hub := proxiedPageHeaderValues(t)
+	for _, name := range hubPageHeaderNames {
+		assert.Equal(t, []string{hub[name]}, webRec.Header().Values(name), "tunnel page header "+name)
+	}
+	assert.Equal(t, "kept", webRec.Header().Get("X-Agent-Kept"))
 }
 
 // TestAgentPortProxyResponseDoesNotRelayHubOriginStateHeaders verifies the
@@ -615,10 +658,7 @@ func createPortForwardAgent(t *testing.T, srv *Server, s store.Store) (*store.Ag
 	}
 	require.NoError(t, s.CreateAgent(ctx, agent))
 
-	tokenSvc := srv.GetAgentTokenService()
-	require.NotNil(t, tokenSvc)
-	token, err := tokenSvc.GenerateAgentToken(agent.ID, project.ID, []AgentTokenScope{ScopeAgentPortForward}, nil)
-	require.NoError(t, err)
+	token := srv.generateRecordedAgentToken(t, agent.ID, project.ID, []AgentTokenScope{ScopeAgentPortForward}, nil)
 	return agent, token
 }
 
@@ -689,9 +729,8 @@ func TestAgentPortProxyBareURLRedirect(t *testing.T) {
 			Phase:     string(state.PhaseRunning),
 		}
 		require.NoError(t, s.CreateAgent(ctx, other))
-		otherToken, err := srv.GetAgentTokenService().GenerateAgentToken(other.ID, agent.ProjectID,
+		otherToken := srv.generateRecordedAgentToken(t, other.ID, agent.ProjectID,
 			[]AgentTokenScope{ScopeAgentPortForward}, nil)
-		require.NoError(t, err)
 
 		for _, method := range []string{http.MethodGet, http.MethodHead} {
 			bare := doAgentTokenRequest(t, srv, method, base+"?x=1", nil, otherToken)
@@ -891,7 +930,8 @@ func (a portProxyStubAuthenticator) Authenticate(*http.Request) (*ProxyUserInfo,
 	return a.user, a.err
 }
 
-func (portProxyStubAuthenticator) Name() string { return "stub" }
+func (portProxyStubAuthenticator) Name() string               { return "stub" }
+func (portProxyStubAuthenticator) AssertionHeaders() []string { return nil }
 
 // TestRedirectToProxyRootLocationIsOneLine (ptone/scion#5566): whatever
 // bytes the raw query holds, the bare-URL redirect writes exactly one
@@ -1042,9 +1082,8 @@ func TestAgentPortProxyBareURLWebSocketUnchanged(t *testing.T) {
 			Phase:     string(state.PhaseRunning),
 		}
 		require.NoError(t, s.CreateAgent(ctx, other))
-		otherToken, err := srv.GetAgentTokenService().GenerateAgentToken(other.ID, agent.ProjectID,
+		otherToken := srv.generateRecordedAgentToken(t, other.ID, agent.ProjectID,
 			[]AgentTokenScope{ScopeAgentPortForward}, nil)
-		require.NoError(t, err)
 
 		up, plain := send(base, otherToken, true), send(base, otherToken, false)
 		assert.Equal(t, http.StatusForbidden, up.Code, up.Body.String())
@@ -1057,4 +1096,66 @@ func TestAgentPortProxyBareURLWebSocketUnchanged(t *testing.T) {
 		assert.Equal(t, plainHeader, upHeader)
 		assert.Empty(t, up.Header().Get("Location"))
 	})
+}
+
+// The sandbox token sets are pinned exactly, so widening either policy is a
+// deliberate change to this test. Stored files and attachments get print and
+// dialogs; agent-served apps also get forms, pointer lock, orientation lock
+// and presentation. Neither policy may ever grant the hub's origin or launch
+// desktop protocol handlers.
+func TestSandboxCSPTokens(t *testing.T) {
+	// tokens parses only the sandbox directive; the policy has others.
+	tokens := func(csp string) []string {
+		require.True(t, strings.HasPrefix(csp, "sandbox "), "CSP must start with the sandbox directive: %q", csp)
+		return cspDirective(csp, "sandbox")
+	}
+	assert.ElementsMatch(t, []string{
+		"allow-scripts", "allow-popups", "allow-popups-to-escape-sandbox", "allow-downloads", "allow-modals",
+	}, tokens(untrustedContentSandboxCSP))
+	assert.ElementsMatch(t, []string{
+		"allow-scripts", "allow-popups", "allow-popups-to-escape-sandbox", "allow-downloads", "allow-modals",
+		"allow-forms", "allow-pointer-lock", "allow-orientation-lock", "allow-presentation",
+	}, tokens(agentServedPageSandboxCSP))
+	for _, csp := range []string{untrustedContentSandboxCSP, agentServedPageSandboxCSP} {
+		for _, forbidden := range []string{
+			"allow-same-origin", "allow-top-navigation", "allow-top-navigation-by-user-activation",
+			"allow-top-navigation-to-custom-protocols", "allow-storage-access-by-user-activation",
+		} {
+			assert.NotContains(t, tokens(csp), forbidden)
+		}
+	}
+	assert.NotContains(t, tokens(untrustedContentSandboxCSP), "allow-forms", "stored files keep the stricter sandbox")
+	for _, csp := range []string{untrustedContentSandboxCSP, agentServedPageSandboxCSP} {
+		assert.Equal(t, []string{"'none'"}, cspDirective(csp, "frame-ancestors"), "frame-ancestors in %q", csp)
+		assert.Len(t, strings.Split(csp, ";"), 2, "only the sandbox and frame-ancestors directives: %q", csp)
+	}
+}
+
+// The Permissions-Policy denies every powerful feature it names and leaves
+// clipboard writes allowed.
+func TestUntrustedContentPermissionsPolicy(t *testing.T) {
+	// directives splits a policy into its exact directives, so a check never
+	// matches part of a longer directive.
+	directives := func(policy string) map[string]bool {
+		out := map[string]bool{}
+		for _, d := range strings.Split(policy, ",") {
+			out[strings.TrimSpace(d)] = true
+		}
+		return out
+	}
+	content := directives(untrustedContentPermissionsPolicy)
+	for d := range content {
+		assert.True(t, strings.HasSuffix(d, "=()"), "directive %q must deny the feature", d)
+		assert.False(t, strings.HasPrefix(d, "clipboard-write="), "clipboard writes stay allowed: %q", d)
+	}
+	for _, f := range []string{"camera", "microphone", "geolocation", "display-capture", "clipboard-read"} {
+		assert.True(t, content[f+"=()"], "%s must be denied", f)
+	}
+	for d := range directives(webPermissionsPolicy) {
+		assert.True(t, content[d], "untrusted content must deny everything the hub-wide policy denies: %q", d)
+	}
+	h := http.Header{}
+	setUntrustedContentHeaders(h, agentServedPageSandboxCSP)
+	assert.Equal(t, agentServedPageSandboxCSP, h.Get("Content-Security-Policy"))
+	assert.Equal(t, untrustedContentPermissionsPolicy, h.Get("Permissions-Policy"))
 }

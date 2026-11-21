@@ -95,6 +95,8 @@ type hubEndpointInputs struct {
 	ResolvedEnv          map[string]string
 	ProjectPath          string
 	ContainerHubEndpoint string
+	// ContainerHubEndpointConfigured is ServerConfig.ContainerHubEndpointConfigured.
+	ContainerHubEndpointConfigured bool
 	// ColocatedPublicHubEndpoint is the hub's public URL when colocated
 	// containers cannot reach it (see ServerConfig.ColocatedPublicHubEndpoint).
 	// A resolved endpoint equal to it is replaced by the dispatch runtime's
@@ -104,6 +106,10 @@ type hubEndpointInputs struct {
 	ColocatedRuntimeHubEndpoints map[string]string
 	RuntimeName                  string
 	HubListenPort                int
+	// FlatCloudRun is set for a flat cloudrun Runtime Broker instance
+	// (amendment P5-CR): its agents get ContainerHubEndpoint, the URL the
+	// flat host validated at activation, and nothing else.
+	FlatCloudRun bool
 }
 
 // resolveEffectiveHubEndpoint resolves the hub endpoint to stamp into a
@@ -119,6 +125,21 @@ type hubEndpointInputs struct {
 // this function returns and delivers into the agent's own SCION_HUB_ENDPOINT
 // env is identical whether or not it is trusted.
 func resolveEffectiveHubEndpoint(ctx context.Context, in hubEndpointInputs) (endpoint string, trusted bool, err error) {
+	// A flat cloudrun instance's agents get only the endpoint its host
+	// resolved from its own configuration and validated at activation
+	// (ContainerHubEndpoint): no request-level, connection, resolved-env or
+	// project-settings tier applies, and the K_SERVICE derivation below
+	// never runs. An endpoint that fails the activation rules here refuses
+	// the start; it is never replaced by a derived one.
+	if in.FlatCloudRun {
+		if !in.Op.valid() {
+			return "", false, fmt.Errorf("resolveEffectiveHubEndpoint: unknown start operation %q", in.Op)
+		}
+		if err := ValidateFlatCloudRunHubEndpoint(in.ContainerHubEndpoint); err != nil {
+			return "", false, fmt.Errorf("cannot resolve hub endpoint for a flat Cloud Run instance: %w", err)
+		}
+		return in.ContainerHubEndpoint, true, nil
+	}
 	switch in.Op {
 	case opCreate, opHTTPStart, opHTTPRestart:
 		endpoint, trusted = resolveHubEndpointForCreate(
@@ -127,7 +148,10 @@ func resolveEffectiveHubEndpoint(ctx context.Context, in hubEndpointInputs) (end
 			in.BrokerHubEndpoint,
 			in.ResolvedEnv,
 			in.ProjectPath,
-			in.ContainerHubEndpoint,
+			containerHubOverride{
+				Endpoint:   in.ContainerHubEndpoint,
+				Configured: in.ContainerHubEndpointConfigured,
+			},
 			colocatedRewrite{
 				PublicHubEndpoint:   in.ColocatedPublicHubEndpoint,
 				RuntimeHubEndpoints: in.ColocatedRuntimeHubEndpoints,
@@ -188,9 +212,10 @@ func resolveEffectiveHubEndpoint(ctx context.Context, in hubEndpointInputs) (end
 // The final localhost/connection-endpoint substitution and the
 // container-bridge override below only ever replace the endpoint with
 // another operator-derived value (the connection endpoint or a rewrite of
-// the broker's own bridge address), so neither one can turn a trusted
-// result into an untrusted one or vice versa.
-func resolveHubEndpointForCreate(reqHubEndpoint, connectionHubEndpoint, brokerHubEndpoint string, resolvedEnv map[string]string, projectPath, containerHubEndpoint string, colocated colocatedRewrite, runtimeName string) (endpoint string, trusted bool) {
+// the broker's own bridge address, or the operator's explicitly configured
+// container_hub_endpoint), so neither one can turn a trusted result into an
+// untrusted one or vice versa.
+func resolveHubEndpointForCreate(reqHubEndpoint, connectionHubEndpoint, brokerHubEndpoint string, resolvedEnv map[string]string, projectPath string, container containerHubOverride, colocated colocatedRewrite, runtimeName string) (endpoint string, trusted bool) {
 	hubEndpoint := reqHubEndpoint
 	trusted = hubEndpoint != ""
 	if hubEndpoint == "" {
@@ -227,7 +252,7 @@ func resolveHubEndpointForCreate(reqHubEndpoint, connectionHubEndpoint, brokerHu
 		hubEndpoint = connectionHubEndpoint
 		trusted = true
 	}
-	return applyContainerBridgeOverride(hubEndpoint, containerHubEndpoint, colocated, runtimeName), trusted
+	return applyContainerBridgeOverride(hubEndpoint, container, colocated, runtimeName), trusted
 }
 
 func hubEndpointFromResolvedEnv(resolvedEnv map[string]string) string {
@@ -255,7 +280,7 @@ func hubEndpointFromProjectSettings(projectPath string) string {
 				"path", ignored, "settings_dir", settingsDir)
 		}
 	}
-	projectSettings, err := config.LoadSettingsFromDir(settingsDir)
+	projectSettings, err := config.LoadProjectSettingsFromDir(settingsDir)
 	if err != nil {
 		return ""
 	}
@@ -274,6 +299,16 @@ var bridgeHostnames = map[string]struct{}{
 // container's /etc/hosts.
 const podmanHostAlias = "host.containers.internal"
 
+// containerHubOverride is the broker's container Hub endpoint and whether the
+// operator set it explicitly (server.broker.container_hub_endpoint) rather
+// than the server computing it at start-up.
+type containerHubOverride struct {
+	// Endpoint is ServerConfig.ContainerHubEndpoint.
+	Endpoint string
+	// Configured is ServerConfig.ContainerHubEndpointConfigured.
+	Configured bool
+}
+
 // colocatedRewrite is the colocated hub's public URL that this host does not
 // serve (e.g. an IAP-fronted Cloud Run URL), with the URL each local
 // container runtime reaches the hub at instead.
@@ -291,14 +326,20 @@ type colocatedRewrite struct {
 //     runtime's colocated.RuntimeHubEndpoints entry (kept when there is
 //     none). This does not depend on containerHubEndpoint, which follows
 //     the broker's default runtime.
-//   - when endpoint is a loopback URL, it is replaced by
-//     containerHubEndpoint.
+//   - on the docker and podman runtimes only, when the operator configured
+//     container.Endpoint explicitly, any other non-loopback endpoint is
+//     replaced by it wholesale: a colocated or private-network broker can
+//     give its agents an internal Hub URL while remote brokers keep the
+//     public one. A computed container.Endpoint never replaces a
+//     non-loopback endpoint.
+//   - when endpoint is a loopback URL, it is replaced by container.Endpoint.
 //
 // Other runtimes (cloudrun, Apple container) keep the public URL: they do
 // not run on this host's Docker bridge. The tmux runtime runs agents on the
 // broker host itself, so its endpoint is never rewritten: a loopback hub URL
 // is the right one there, and a container bridge hostname may not resolve.
-func applyContainerBridgeOverride(endpoint, containerHubEndpoint string, colocated colocatedRewrite, runtimeName string) string {
+func applyContainerBridgeOverride(endpoint string, container containerHubOverride, colocated colocatedRewrite, runtimeName string) string {
+	containerHubEndpoint := container.Endpoint
 	if isKubernetesRuntimeName(runtimeName) || runtimeName == "tmux" {
 		return endpoint
 	}
@@ -308,7 +349,13 @@ func applyContainerBridgeOverride(endpoint, containerHubEndpoint string, colocat
 		}
 		return endpoint
 	}
-	if containerHubEndpoint == "" || !isLocalhostEndpoint(endpoint) {
+	if containerHubEndpoint == "" || endpoint == "" {
+		return endpoint
+	}
+	if !isLocalhostEndpoint(endpoint) {
+		if container.Configured && isBridgeContainerRuntimeName(runtimeName) {
+			return containerHubEndpoint
+		}
 		return endpoint
 	}
 	bridgeURL, err := url.Parse(containerHubEndpoint)

@@ -150,11 +150,8 @@ func fpAgentCreateRequest(t *testing.T, srv *Server, parentID, projectID, name s
 // route, or on /api/v1/agents when topLevel is set.
 func fpAgentCreateRequestOn(t *testing.T, srv *Server, topLevel bool, parentID, projectID, name string) *httptest.ResponseRecorder {
 	t.Helper()
-	svc := srv.GetAgentTokenService()
-	require.NotNil(t, svc)
 	scopes := append([]AgentTokenScope{ScopeProjectRead, ScopeAgentCreate}, ScopesForRole(AgentRoleFull)...)
-	tok, err := svc.GenerateAgentToken(parentID, projectID, scopes, nil)
-	require.NoError(t, err)
+	tok := srv.generateRecordedAgentToken(t, parentID, projectID, scopes, nil)
 	if topLevel {
 		return doRequestWithAgentToken(t, srv, http.MethodPost, "/api/v1/agents",
 			CreateAgentRequest{Name: name, ProjectID: projectID, AgentRole: string(AgentRoleFull)}, tok)
@@ -263,7 +260,7 @@ func TestFixtureProvenance_ScheduledDispatchStamped(t *testing.T) {
 	want := e.stamp()
 	fxID := e.fx.Identity.ID
 
-	require.NoError(t, e.srv.dispatchAgentEventHandler()(ctx, withSessionRevision(store.ScheduledEvent{
+	require.NoError(t, fireScheduledActionForTest(ctx, e.srv, "dispatch_agent", withSessionRevision(store.ScheduledEvent{
 		ID: "evt-fp-user", ProjectID: e.project, EventType: "dispatch_agent",
 		Payload: `{"agentName":"fp-sched-user","task":"t"}`, CreatedBy: fxID,
 	}, fxID)))
@@ -271,11 +268,12 @@ func TestFixtureProvenance_ScheduledDispatchStamped(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, want, byUser.Fixture)
 	assert.Equal(t, fxID, byUser.CreatedBy)
-	assert.Empty(t, byUser.Ancestry, "a scheduled child keeps no ancestry")
+	assert.Equal(t, fxID, byUser.OwnerID)
+	assert.Equal(t, []string{fxID}, byUser.Ancestry)
 	fpAssertEdgeDelegator(t, e.store, byUser.ID, store.DelegationPrincipalUser, fxID)
 
 	parent := fpCreateAgent(t, e.srv, e.fx.AccessToken, e.project, "fp-sched-parent")
-	require.NoError(t, e.srv.dispatchAgentEventHandler()(ctx, withAgentRevision(t, e.srv, store.ScheduledEvent{
+	require.NoError(t, fireScheduledActionForTest(ctx, e.srv, "dispatch_agent", withAgentRevision(t, e.srv, store.ScheduledEvent{
 		ID: "evt-fp-agent", ProjectID: e.project, EventType: "dispatch_agent",
 		Payload: `{"agentName":"fp-sched-agent","task":"t"}`, CreatedBy: parent,
 	}, parent)))
@@ -283,7 +281,8 @@ func TestFixtureProvenance_ScheduledDispatchStamped(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, want, byAgent.Fixture)
 	assert.Equal(t, parent, byAgent.CreatedBy)
-	assert.Empty(t, byAgent.Ancestry, "a scheduled child keeps no ancestry")
+	assert.Equal(t, parent, byAgent.OwnerID)
+	assert.Equal(t, []string{fxID, parent}, byAgent.Ancestry)
 	fpAssertEdgeDelegator(t, e.store, byAgent.ID, store.DelegationPrincipalAgent, parent)
 }
 

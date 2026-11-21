@@ -388,7 +388,7 @@ func TestRelationshipProjectAccess_StagePlacement(t *testing.T) {
 		decision: Decision{Allowed: true},
 	}
 	var rejectedBy string
-	_, ok := f.srv.authzService.runRelationshipStages(ctx, principal, "user", res, "agent.attach", nil, c, access,
+	_, ok := f.srv.authzService.runRelationshipStages(ctx, principal, "user", res, ActionAttach, "agent.attach", nil, c, access,
 		func(kind, _ string) { rejectedBy = kind })
 	assert.False(t, ok)
 	assert.Equal(t, RelationshipRejectProjectAccess, rejectedBy)
@@ -397,7 +397,7 @@ func TestRelationshipProjectAccess_StagePlacement(t *testing.T) {
 	// A permission outside the relationship policy is rejected at stage 1,
 	// before the project-access stage reads anything.
 	before := f.counting.calls(userID)
-	_, ok = f.srv.authzService.runRelationshipStages(ctx, principal, "user", res, "project.delete", nil, c, access,
+	_, ok = f.srv.authzService.runRelationshipStages(ctx, principal, "user", res, ActionDelete, "project.delete", nil, c, access,
 		func(kind, _ string) { rejectedBy = kind })
 	assert.False(t, ok)
 	assert.Equal(t, RelationshipRejectPolicy, rejectedBy)
@@ -805,7 +805,9 @@ func TestRelationshipProjectAccess_RefusalSurfaces(t *testing.T) {
 			f.counting.setFault(userFaultID)
 			f.counting.setBindingFault(bindingFaultID)
 
-			handler := f.srv.messageEventHandler()
+			handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+				return fireScheduledActionForTest(ctx, f.srv, "message", evt)
+			}
 			fire := func(creatorID, agentID string) string {
 				t.Helper()
 				payload := `{"agentId":"` + agentID + `","message":"hello"}`
@@ -869,7 +871,7 @@ func TestRelationshipProjectAccess_ScheduledTargetLookupFault(t *testing.T) {
 	t.Cleanup(func() { f.srv.store = orig })
 	logs := installSentinelLogCapture(t)
 
-	err := f.srv.messageEventHandler()(ctx, withSessionRevision(store.ScheduledEvent{
+	err := fireScheduledActionForTest(ctx, f.srv, "message", withSessionRevision(store.ScheduledEvent{
 		ID: tid("rpa-schedfault-evt"), ProjectID: f.projectID, EventType: "message",
 		Payload: `{"agentId":"` + agent.ID + `","message":"hello"}`, CreatedBy: f.ownerID,
 	}, f.ownerID))

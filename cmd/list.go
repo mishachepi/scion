@@ -125,9 +125,11 @@ func listAgentsViaHub(hubCtx *HubContext) error {
 	}
 
 	opts := &hubclient.ListAgentsOptions{
-		IncludeDeleted: listDeleted,
-		Phase:          filterPhase,
-		Labels:         parsedLabels,
+		IncludeDeleted:      listDeleted,
+		Phase:               filterPhase,
+		Labels:              parsedLabels,
+		IncludeAuthority:    cliShowsAgentAuthority(resolveMode()),
+		IncludeCapabilities: isJSONOutput(),
 	}
 	if listCount > 0 {
 		opts.Page.Limit = listCount
@@ -658,40 +660,50 @@ func hubAgentToAgentInfo(a hubclient.Agent) api.AgentInfo {
 		displayName = a.Name
 	}
 	info := api.AgentInfo{
-		ID:                a.ID,
-		Slug:              a.Slug,
-		ContainerID:       a.ContainerID,
-		Name:              displayName,
-		Template:          a.Template,
-		HarnessConfig:     a.HarnessConfig,
-		HarnessAuth:       a.HarnessAuth,
-		Project:           a.Project,
-		ProjectID:         a.ProjectID,
-		Labels:            a.Labels,
-		Annotations:       a.Annotations,
-		Phase:             phase,
-		Activity:          activity,
-		ContainerStatus:   a.ContainerStatus,
-		Image:             a.Image,
-		Detached:          a.Detached,
-		Runtime:           a.Runtime,
-		RuntimeBrokerID:   a.RuntimeBrokerID,
-		RuntimeBrokerName: a.RuntimeBrokerName,
-		RuntimeBrokerType: a.RuntimeBrokerType,
-		RuntimeState:      a.RuntimeState,
-		WebPTYEnabled:     a.WebPTYEnabled,
-		TaskSummary:       a.TaskSummary,
-		Created:           a.Created,
-		Updated:           a.Updated,
-		LastSeen:          a.LastSeen,
-		LastActivityEvent: a.LastActivityEvent,
-		DeletedAt:         a.DeletedAt,
-		CreatedBy:         a.CreatedBy,
-		OwnerID:           a.OwnerID,
-		StateVersion:      a.StateVersion,
-		ProvisionedOnly:   a.ProvisionedOnly,
-		ExitCode:          a.ExitCode,
-		ExitReason:        a.ExitReason,
+		ID:                  a.ID,
+		Slug:                a.Slug,
+		ContainerID:         a.ContainerID,
+		Name:                displayName,
+		Template:            a.Template,
+		HarnessConfig:       a.HarnessConfig,
+		HarnessAuth:         a.HarnessAuth,
+		Project:             a.Project,
+		ProjectID:           a.ProjectID,
+		Labels:              a.Labels,
+		Annotations:         a.Annotations,
+		Phase:               phase,
+		Activity:            activity,
+		ContainerStatus:     a.ContainerStatus,
+		Image:               a.Image,
+		Detached:            a.Detached,
+		Runtime:             a.Runtime,
+		RuntimeBrokerID:     a.RuntimeBrokerID,
+		RuntimeBrokerName:   a.RuntimeBrokerName,
+		RuntimeBrokerType:   a.RuntimeBrokerType,
+		RuntimeState:        a.RuntimeState,
+		WebPTYEnabled:       a.WebPTYEnabled,
+		TaskSummary:         a.TaskSummary,
+		Created:             a.Created,
+		Updated:             a.Updated,
+		LastSeen:            a.LastSeen,
+		LastActivityEvent:   a.LastActivityEvent,
+		DeletedAt:           a.DeletedAt,
+		CreatedBy:           a.CreatedBy,
+		OwnerID:             a.OwnerID,
+		StateVersion:        a.StateVersion,
+		ProvisionedOnly:     a.ProvisionedOnly,
+		ExitCode:            a.ExitCode,
+		ExitReason:          a.ExitReason,
+		SuspendReason:       a.SuspendReason,
+		Authority:           a.Authority,
+		ResolvedHarness:     a.ResolvedHarness,
+		HarnessCapabilities: a.HarnessCapabilities,
+		Launch:              a.Launch,
+
+		StalledFromActivity: a.StalledFromActivity,
+	}
+	if a.Message != "" {
+		info.Detail = &api.AgentDetail{Message: a.Message}
 	}
 
 	// Fall back to AppliedConfig fields if top-level fields are empty
@@ -732,12 +744,33 @@ func filterRunningAgents(agents []api.AgentInfo) []api.AgentInfo {
 	return filtered
 }
 
-// haltedPhaseLabel shows why a halted agent was halted next to its phase,
-// e.g. "halted (preempted)", using the reason's fixed display label
-// ("unknown" when none is recorded); any other phase is returned unchanged.
-func haltedPhaseLabel(phase, exitReason string) string {
-	if phase == string(state.PhaseHalted) {
+// exitReasonPhaseLabel shows a halted or errored agent's exit reason next
+// to its phase, using the reason's fixed display label. A halted agent
+// always shows one, e.g. "halted (preempted)" ("unknown" when none is
+// recorded). An agent in phase error shows it, e.g. "error (crashed)",
+// only when one is recorded: an init failure (failed clone or pre-start)
+// has none, and its reason is in the message. Any other phase is returned
+// unchanged.
+func exitReasonPhaseLabel(phase, exitReason string) string {
+	switch {
+	case phase == string(state.PhaseHalted):
 		return phase + " (" + state.ExitReason(exitReason).Label() + ")"
+	case phase == string(state.PhaseError) && exitReason != "":
+		return phase + " (" + state.ExitReason(exitReason).Label() + ")"
+	}
+	return phase
+}
+
+// suspendedPhaseLabel shows why a suspended agent was suspended next to its
+// phase, e.g. "suspended (idle)" or "suspended · completed (idle)", when a
+// known reason is recorded; any other phase, or no or an unknown reason, is
+// returned unchanged.
+func suspendedPhaseLabel(phase, reason string) string {
+	r := state.SuspendReason(reason)
+	isSuspended := phase == string(state.PhaseSuspended) ||
+		strings.HasPrefix(phase, string(state.PhaseSuspended)+" · ")
+	if isSuspended && r != "" && r.IsValid() {
+		return phase + " (" + reason + ")"
 	}
 	return phase
 }
@@ -791,8 +824,15 @@ func filterAgentsByFlags(agents []api.AgentInfo) []api.AgentInfo {
 		if filterPhase != "" && !strings.EqualFold(a.Phase, filterPhase) {
 			continue
 		}
-		if filterActivity != "" && !strings.EqualFold(a.Activity, filterActivity) {
-			continue
+		if filterActivity != "" {
+			if !strings.EqualFold(a.Activity, filterActivity) {
+				continue
+			}
+			// Without an explicit --phase, --activity selects active/terminal
+			// agents rather than suspended rows carrying a retained activity.
+			if filterPhase == "" && strings.EqualFold(a.Phase, string(state.PhaseSuspended)) {
+				continue
+			}
 		}
 		if filterTemplate != "" && !strings.EqualFold(a.Template, filterTemplate) {
 			continue
@@ -899,9 +939,13 @@ func displayAgents(agents []api.AgentInfo, all bool) error {
 		}
 		if phase == string(state.PhaseStopped) && state.Activity(a.Activity).IsTerminal() {
 			phase = a.Activity
+		} else if phase == string(state.PhaseSuspended) && state.Activity(a.Activity).IsRetainedOnSuspend() {
+			phase = phase + " · " + state.Activity(a.Activity).DisplayLabel()
 		}
-		phase = haltedPhaseLabel(phase, a.ExitReason)
+		phase = exitReasonPhaseLabel(phase, a.ExitReason)
+		phase = suspendedPhaseLabel(phase, a.SuspendReason)
 		phase = provisionedPhaseLabel(phase, a.ProvisionedOnly)
+		phase = authorityPhaseLabel(phase, a.Authority)
 		containerStatus := a.ContainerStatus
 		if containerStatus == "created" && a.ID == "" {
 			containerStatus = "none"
@@ -914,7 +958,11 @@ func displayAgents(agents []api.AgentInfo, all bool) error {
 		if activityTime.IsZero() {
 			activityTime = a.LastSeen
 		}
-		lastActivity := formatLastActivity(a.Activity, activityTime)
+		displayAgent := a
+		if a.Phase == string(state.PhaseSuspended) && !state.Activity(a.Activity).IsRetainedOnSuspend() {
+			displayAgent.Activity = ""
+		}
+		lastActivity := formatAgentLastActivity(displayAgent, activityTime)
 		// Use broker name if available, otherwise fall back to ID
 		broker := a.RuntimeBrokerName
 		if broker == "" {
@@ -977,6 +1025,38 @@ func provisionedOnlyListHint(agents []api.AgentInfo, all bool) string {
 	}
 }
 
+// lastActivityReasonMaxRunes caps the harness_error reason shown in the
+// LAST ACTIVITY column.
+const lastActivityReasonMaxRunes = 40
+
+// formatAgentLastActivity is formatLastActivity with the context a few
+// activities carry (the agent-controlled reason goes through safeText): harness_error shows its reason ("harness error:
+// model API: APIError (status 400), 2m ago") and stalled the activity it
+// was stalled from ("stalled (was executing), 6m ago").
+func formatAgentLastActivity(a api.AgentInfo, t time.Time) string {
+	label := a.Activity
+	switch state.Activity(a.Activity) {
+	case state.ActivityHarnessError:
+		label = state.ActivityHarnessError.DisplayLabel()
+		if a.Detail != nil && a.Detail.Message != "" {
+			label += ": " + truncateRunes(safeText(a.Detail.Message), lastActivityReasonMaxRunes, true)
+		}
+	case state.ActivityStalled:
+		if a.StalledFromActivity != "" {
+			label = fmt.Sprintf("%s (was %s)", a.Activity, state.Activity(a.StalledFromActivity).DisplayLabel())
+		}
+		if a.Detail != nil && a.Detail.Message == state.StalledNoHookActivityHint {
+			label += ": " + a.Detail.Message
+		}
+	default:
+		return formatLastActivity(a.Activity, t)
+	}
+	if t.IsZero() {
+		return label
+	}
+	return fmt.Sprintf("%s, %s", label, clitime.Ago(t))
+}
+
 // formatLastActivity formats a status and timestamp as a combined "activity, time ago" string.
 func formatLastActivity(status string, t time.Time) string {
 	timePart := "-"
@@ -1023,7 +1103,9 @@ func hubStatusToPhaseActivity(status string) (string, string) {
 	if a.IsTerminal() {
 		return string(state.PhaseStopped), status
 	}
-	// Check if the status is a known activity (only valid during running phase)
+	// Check if the status is a known activity. DisplayStatus() emits "suspended"
+	// for suspended agents even when they retain an activity, so a bare activity
+	// string on the legacy Status field always belongs to the running phase.
 	if a.IsValid() && a != "" {
 		return string(state.PhaseRunning), status
 	}

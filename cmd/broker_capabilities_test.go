@@ -44,10 +44,19 @@ var heartbeatOnlyCapabilities = map[string]bool{}
 // in flight) are registered false and become true at the first heartbeat.
 // Heartbeat-only capabilities are absent from the static set, the
 // registration names and the stored capabilities.
+// ephemeralCapableRuntime is a runtime that implements
+// runtime.EphemeralPersistenceRuntime.
+type ephemeralCapableRuntime struct{ *runtime.DockerRuntime }
+
+func (ephemeralCapableRuntime) SupportsEphemeralPersistence() bool { return true }
+
 func TestCapabilities_RegistrationMatchesHeartbeat(t *testing.T) {
 	for name, rt := range map[string]runtime.Runtime{
 		"docker": runtime.NewDockerRuntime(),
 		"nil":    nil,
+		// A runtime with ephemeral persistence, so the field is checked
+		// with a true value (ptone/scion#7780).
+		"ephemeral-capable": ephemeralCapableRuntime{runtime.NewDockerRuntime()},
 	} {
 		t.Run(name, func(t *testing.T) {
 			// The node image registry is registered as the heartbeat
@@ -70,6 +79,15 @@ func TestCapabilities_RegistrationMatchesHeartbeat(t *testing.T) {
 					continue
 				}
 				require.True(t, stored.IsValid(), "store.BrokerCapabilities has no %s", f.Name)
+				if f.Type.Kind() == reflect.Slice {
+					// A runtime list, registered as one name per runtime
+					// (reprovisionResetHome:<runtime>).
+					assert.Equal(t, hv.Field(i).Interface(), stored.Interface(), "embedded registration and heartbeat disagree on %s", f.Name)
+					for _, rt := range hv.Field(i).Interface().([]string) {
+						assert.Contains(t, names, runtimebroker.ReprovisionResetHomeCapabilityPrefix+rt, "registration names lack %s", rt)
+					}
+					continue
+				}
 				if f.Type.Kind() == reflect.String {
 					// A node configuration value, not a capability name.
 					assert.Equal(t, hv.Field(i).String(), stored.String(), "embedded registration and heartbeat disagree on %s", f.Name)
@@ -82,6 +100,7 @@ func TestCapabilities_RegistrationMatchesHeartbeat(t *testing.T) {
 				tag := strings.Split(f.Tag.Get("json"), ",")[0]
 				assert.Equal(t, hv.Field(i).Bool(), slices.Contains(names, tag), "registration names and heartbeat disagree on %s", tag)
 			}
+			assert.Equal(t, name == "ephemeral-capable", registered.EphemeralPersistence, "ephemeralPersistence registered")
 			assert.Equal(t, reflect.TypeOf(hubclient.BrokerCapabilities{}).NumField()-len(heartbeatOnlyCapabilities), rv.NumField(), "every capability but the heartbeat-only ones has a stored counterpart")
 		})
 	}

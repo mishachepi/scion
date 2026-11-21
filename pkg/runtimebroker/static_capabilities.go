@@ -42,6 +42,7 @@ func StaticCapabilities(rt scionrt.Runtime, nodeImageRegistry string) *hubclient
 		AsyncLaunch:            true,
 		AsyncStart:             true, // async start of existing agents (ptone/scion#4669)
 		EmptyPerAgentWorkspace: scionrt.HasEmptyPerAgentSupport(rt),
+		EphemeralPersistence:   scionrt.HasEphemeralPersistenceSupport(rt),
 		// This broker honours localOnly deletes and confirms a moved
 		// agent's NFS workspace before provisioning it (agent move).
 		AgentMove: true,
@@ -52,14 +53,27 @@ func StaticCapabilities(rt scionrt.Runtime, nodeImageRegistry string) *hubclient
 		// This broker's reprovision reuses an empty-per-agent workspace in
 		// place (miller79/scion#167).
 		ReprovisionEmptyPerAgent: true,
+		// This broker's reprovision resets an agent home on the advertised
+		// runtimes (ptone/scion#7757).
+		ReprovisionResetHomeRuntimes: ReprovisionResetHomeRuntimes(),
+		RestartingRuntimes:           RestartingRuntimes(),
 		// This broker re-renders the provision-rendered keys the hub lists
 		// in changed_fields at start (ptone/scion#3982).
 		ChangedFields: true,
 		// This broker applies cleared_fields at start (ptone/scion#4890).
 		ClearedFields: true,
+		// This broker honours an explicit count limit of 0 as "no limit"
+		// (ptone/scion#5605).
+		UnlimitedCountLimits: true,
+		// This broker applies the resources sub-field entries of
+		// cleared_fields at start (ptone/scion#5676).
+		ClearedResourceSubfields: true,
 		// This broker redeems attachment delivery capabilities and writes
 		// the files into the agent's home (ptone/scion#4596).
 		AttachmentDelivery: true,
+		// This broker writes create-time HomeFiles entries into the newly
+		// provisioned agent's home directory (ptone/scion#8058).
+		HomeFiles: true,
 	}
 }
 
@@ -118,11 +132,46 @@ func StaticCapabilityNames(rt scionrt.Runtime) []string {
 	add(c.AsyncLaunch, "asyncLaunch")
 	add(c.AsyncStart, "asyncStart")
 	add(c.EmptyPerAgentWorkspace, "emptyPerAgentWorkspace")
+	add(c.EphemeralPersistence, "ephemeralPersistence")
 	add(c.AgentMove, "agentMove")
 	add(c.AgentMoveRecreate, "agentMoveRecreate")
 	add(c.ReprovisionEmptyPerAgent, "reprovisionEmptyPerAgent")
+	for _, rt := range c.ReprovisionResetHomeRuntimes {
+		names = append(names, ReprovisionResetHomeCapabilityPrefix+rt)
+	}
+	for _, rt := range c.RestartingRuntimes {
+		names = append(names, RestartingRuntimeCapabilityPrefix+rt)
+	}
 	add(c.ChangedFields, "changedFields")
 	add(c.ClearedFields, "clearedFields")
+	add(c.UnlimitedCountLimits, "unlimitedCountLimits")
+	add(c.ClearedResourceSubfields, "clearedResourceSubfields")
 	add(c.AttachmentDelivery, "attachmentDelivery")
+	add(c.HomeFiles, "homeFiles")
 	return names
+}
+
+// ReprovisionResetHomeCapabilityPrefix starts the registration capability
+// name of each runtime in ReprovisionResetHomeRuntimes
+// ("reprovisionResetHome:docker").
+const ReprovisionResetHomeCapabilityPrefix = "reprovisionResetHome:"
+
+// ReprovisionResetHomeRuntimes returns the runtimes on which this broker's
+// reprovision resets an agent home completely: both the broker directory
+// and any runtime home leaf (ptone/scion#7757). Runtimes that keep a
+// copy of the home elsewhere (an NFS leaf) are added once they clear it.
+func ReprovisionResetHomeRuntimes() []string {
+	return []string{"docker", "podman", "container", "cloudrun", "cloudrun-instances", "kubernetes"}
+}
+
+// RestartingRuntimeCapabilityPrefix starts the registration capability name
+// of each runtime in RestartingRuntimes ("restartingRuntime:cloudrun").
+const RestartingRuntimeCapabilityPrefix = "restartingRuntime:"
+
+// RestartingRuntimes returns the runtimes on which the platform may restart
+// an agent container that exited: Cloud Run Instances run under the
+// platform-default restart policy (ptone/scion#5141). Docker, Podman and
+// Kubernetes agents are never restarted (no restart policy, or Never).
+func RestartingRuntimes() []string {
+	return []string{"cloudrun", "cloudrun-instances"}
 }

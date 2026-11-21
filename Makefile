@@ -20,7 +20,7 @@ GOLANGCI_LINT         ?= $(GOLANGCI_LINT_PATCHED)
 
 .DEFAULT_GOAL := help
 
-.PHONY: all build build-a2a-bridge test-a2a-integration install test test-fast test-hub-sqlite test-sqlite-nonhub test-cmd-sqlite test-fast-ci test-launch-store-postgres test-store-postgres test-store-postgres-others test-store-postgres-env-check test-store-postgres-integrationtest test-store-postgres-entadapter test-store-postgres-tail testpart-selftest test-hub-postgres test-hub-postgres-env-check test-hub-postgres-default test-hub-postgres-integration hub-postgres-integration-shards test-webchat-postgres test-conduit-authz-postgres test-artifacts-postgres test-fixture-coverage hubshard-parity build-hub-shard test-hub-shard test-hub-shards vet-hub-shard vet lint lint-ci vet-integration vet-integration-ci vet-integration-extras compat-literals check-annotation-prefix check-authz-guards check-conversation-upsert-guard check-hub-store-reassign check-store-delete-callers check-scan-coverage check-security-marker-gates cli-time-zones time-literals check-setenv-guard check-harness-coverage check-image-go-dirs check-authorization-catalog check-route-authz-manifest check-method-not-allowed check-debug-defaults check-sqlite-coverage sqlite-ci-pkgs check-extras-go-images check-custom golangci-lint golangci-lint-build golangci-lint-split-selftest web web-budget web-typecheck web-lint web-test fmt fmt-check tidy-extras ci ci-full clean help container-sciontool container-scion container-binaries proto proto-check ent-check tidy-check
+.PHONY: all build build-a2a-bridge test-a2a-integration install test test-fast test-hub-sqlite test-sqlite-nonhub test-cmd-sqlite test-fast-ci test-launch-store-postgres test-store-postgres test-store-postgres-others test-store-postgres-env-check test-store-postgres-integrationtest test-store-postgres-entadapter test-store-postgres-tail testpart-selftest hubshard-skip-summary-selftest test-hub-postgres test-hub-postgres-env-check test-hub-postgres-default test-hub-postgres-integration hub-postgres-integration-shards test-webchat-postgres test-conduit-authz-postgres test-artifacts-postgres test-fixture-coverage hubshard-parity hub-dupcheck build-hub-shard test-hub-shard test-hub-shards vet-hub-shard vet lint lint-ci vet-integration vet-integration-ci vet-integration-extras compat-literals check-annotation-prefix check-authz-guards check-conversation-upsert-guard check-hub-store-reassign check-store-delete-callers check-scan-coverage check-security-marker-gates check-agent-mutators cli-time-zones time-literals check-setenv-guard check-harness-coverage test-image-scripts check-image-go-dirs check-authorization-catalog check-route-authz-manifest check-method-not-allowed check-debug-defaults check-sqlite-coverage sqlite-ci-pkgs check-extras-go-images check-custom golangci-lint golangci-lint-build golangci-lint-split-selftest web web-budget web-typecheck web-lint web-test fmt fmt-check tidy-extras ci ci-full clean help container-sciontool container-scion container-binaries proto proto-check ent-check tidy-check check-entsql-driver-assert
 
 ## all: Build the web frontend and compile the Go binary (run 'make install' separately to install)
 all: web build
@@ -146,7 +146,8 @@ test-hub-sqlite: test-sqlite-nonhub test-hub-shards
 SQLITE_NONHUB_PKGS := ./pkg/hub/... ./perf/bench/seed/... ./pkg/conduit/... \
 	./pkg/store/entadapter/... ./pkg/artifacts/... ./pkg/brokerownership/... \
 	./pkg/brokerregistration/... ./pkg/ent/entc/... ./pkg/secret/... \
-	./pkg/store/storetest/... ./pkg/store/relaydb ./pkg/testinfra/...
+	./pkg/store/storetest/... ./pkg/store/relaydb ./pkg/testinfra/... \
+	./pkg/observability/txdiag ./pkg/agent/tmuxdeliver ./pkg/durablequeue/...
 SQLITE_NONHUB_PKGS_CMD = go list $(SQLITE_NONHUB_PKGS) | grep -vx '$(HUB_PKG)'
 
 # SQLITE_CI_PKGS are the package patterns that blocking CI jobs test with
@@ -193,9 +194,23 @@ test-cmd-sqlite:
 hubshard-parity:
 	@./hack/hubshard/hubshard.sh -parity
 
+## hub-dupcheck: Fail on a duplicate top-level declaration in pkg/hub plus its test files under any CI tag set (parse only)
+# The shards compile apart, so two test files in different shards can each
+# declare the same helper: every shard builds, and every whole-package build
+# (go vet ./pkg/hub/) fails. HUB_DUPCHECK_TAGS are the tag sets CI compiles
+# pkg/hub with: shard tests (default, no_sqlite; race-detection adds race),
+# shard vets and the integration Postgres jobs. See hack/dupdecl/main.go.
+HUB_DUPCHECK_TAGS := "" no_sqlite no_sqlite,race integration integration,tzcontract
+hub-dupcheck:
+	@go run ./hack/dupdecl $(foreach t,$(HUB_DUPCHECK_TAGS),-tags $(t)) ./pkg/hub
+
 ## testpart-selftest: Test hack/testpart.sh, which splits the T1 entadapter Postgres tests over CI jobs (bash only)
 testpart-selftest:
 	@./hack/test-testpart.sh
+
+## hubshard-skip-summary-selftest: Test the skipped-tests summary of make test-hub-shard (bash only, a fake test binary; no go)
+hubshard-skip-summary-selftest:
+	@./hack/hubshard/test-skip-summary.sh
 
 ## test-hub-shard: Run pkg/hub test shard SHARD=K (NOSQLITE=1: with -tags no_sqlite; RACE=1: with -race)
 # Generates the shard overlay in a temp dir (the tree is not modified),
@@ -359,12 +374,13 @@ MEMBERSHIP_LOSS_POSTGRES_TESTS := TestMembershipLossProcessor_vs_ProjectDelete_P
 # new skip in that package still fails the target.
 #
 # The pkg/ent/entc run covers the SQLite-to-Postgres `scion server migrate`
-# path (TestMigrateBeta_SQLiteToPostgres, ptone/scion#4366) and skill creation
+# path (TestMigrateBeta_SQLiteToPostgres, ptone/scion#4366), skill creation
 # against a pre-existing `visibility` column
 # (TestSkillStore_CreateAgainstOldSchemaWithVisibilityColumn_Postgres,
-# ptone/scion#4370). Each works in its own throwaway schema, so neither
-# disturbs the shared database. Any skip fails the target first, then each
-# test must print its own PASS line.
+# ptone/scion#4370), and the core-to-global skill scope startup migration
+# (TestMigrateSkillCoreScope_Postgres, ptone/scion#1713). Each works in its
+# own throwaway schema, so none disturbs the shared database. Any skip fails
+# the target first, then each test must print its own PASS line.
 #
 # The cmd run covers the PostgreSQL search_path shadow guard in every
 # standalone command that migrates the hub database (server migrate,
@@ -492,12 +508,38 @@ test-store-postgres-entadapter: test-store-postgres-env-check
 		fi; \
 	fi
 
-# test-store-postgres-tail: the storetest, pkg/store/enttest, pkg/ent/entc,
-# pkg/testinfra and cmd runs of test-store-postgres (after entadapter). The enttest run
-# includes TestSchemaSnapshot_MatchesAutoMigrate, which checks that the
-# schema snapshot the harness provisions test schemas from matches
-# entc.AutoMigrate.
+# test-store-postgres-tail: the storetest, pkg/store/enttest, pkg/durablequeue,
+# pkg/ent/entc, pkg/testinfra and cmd runs of test-store-postgres (after
+# entadapter). The enttest run includes TestSchemaSnapshot_MatchesAutoMigrate,
+# which checks that the schema snapshot the harness provisions test schemas
+# from matches entc.AutoMigrate.
 test-store-postgres-tail: test-store-postgres-env-check
+	@go test -tags integration -count=1 -timeout 10m -v \
+		./pkg/durablequeue/... > /tmp/test-launch-store-postgres-durablequeue.log 2>&1; \
+	status=$$?; \
+	cat /tmp/test-launch-store-postgres-durablequeue.log; \
+	if [ $$status -ne 0 ]; then exit $$status; fi; \
+	if grep -qE '^[[:space:]]*--- SKIP' /tmp/test-launch-store-postgres-durablequeue.log; then \
+		echo "ERROR: one or more pkg/durablequeue Postgres tests were skipped -- see '--- SKIP' lines above." >&2; \
+		exit 1; \
+	fi; \
+	if ! grep -qE '^--- PASS: TestEchoConsumer_TwoConcurrentDrainers ' /tmp/test-launch-store-postgres-durablequeue.log; then \
+		echo "ERROR: the pkg/durablequeue two-drainer Postgres test did not run." >&2; \
+		exit 1; \
+	fi
+	@go test -tags integration -count=1 -timeout 10m -v \
+		./pkg/hub/trigger/... > /tmp/test-launch-store-postgres-trigger.log 2>&1; \
+	status=$$?; \
+	cat /tmp/test-launch-store-postgres-trigger.log; \
+	if [ $$status -ne 0 ]; then exit $$status; fi; \
+	if grep -qE '^[[:space:]]*--- SKIP' /tmp/test-launch-store-postgres-trigger.log; then \
+		echo "ERROR: one or more pkg/hub/trigger Postgres tests were skipped -- see '--- SKIP' lines above." >&2; \
+		exit 1; \
+	fi; \
+	if ! grep -qE '^--- PASS: TestDispatcher_TwoConcurrentDrainers_UniqueTriggerFire ' /tmp/test-launch-store-postgres-trigger.log; then \
+		echo "ERROR: the pkg/hub/trigger two-drainer uniqueness Postgres test did not run." >&2; \
+		exit 1; \
+	fi
 	@go test -tags integration -count=1 -timeout 10m -v \
 		-run '^TestCompositeStore_CRUDParity$$/^group$$/^MembershipCleanup$$' \
 		./pkg/store/storetest/... > /tmp/test-launch-store-postgres-storetest.log 2>&1; \
@@ -526,7 +568,7 @@ test-store-postgres-tail: test-store-postgres-env-check
 		exit 1; \
 	fi
 	@go test -tags integration -count=1 -timeout 10m -v \
-		-run '^(TestMigrateBeta_SQLiteToPostgres|TestSkillStore_CreateAgainstOldSchemaWithVisibilityColumn_Postgres)$$' \
+		-run '^(TestMigrateBeta_SQLiteToPostgres|TestSkillStore_CreateAgainstOldSchemaWithVisibilityColumn_Postgres|TestMigrateSkillCoreScope_Postgres)$$' \
 		./pkg/ent/entc/ > /tmp/test-launch-store-postgres-entc.log 2>&1; \
 	status=$$?; \
 	cat /tmp/test-launch-store-postgres-entc.log; \
@@ -541,6 +583,10 @@ test-store-postgres-tail: test-store-postgres-env-check
 	fi; \
 	if ! grep -qE '^--- PASS: TestSkillStore_CreateAgainstOldSchemaWithVisibilityColumn_Postgres ' /tmp/test-launch-store-postgres-entc.log; then \
 		echo "ERROR: the skill-visibility old-schema Postgres test did not run." >&2; \
+		exit 1; \
+	fi; \
+	if ! grep -qE '^--- PASS: TestMigrateSkillCoreScope_Postgres ' /tmp/test-launch-store-postgres-entc.log; then \
+		echo "ERROR: the core-to-global skill scope Postgres migration test did not run." >&2; \
 		exit 1; \
 	fi
 	@go test -tags integration -count=1 -timeout 10m -v \
@@ -587,19 +633,59 @@ test-store-postgres-tail: test-store-postgres-env-check
 test-launch-store-postgres: test-store-postgres
 	@./hack/hubshard/shard.sh postgres all integration $(HUB_INTEGRATION_POSTGRES_TESTS)
 
+# BROKER_RESERVATION_TRANSFER_POSTGRES_TESTS are the Postgres variants of
+# the atomic broker reservation transfer (ptone/scion#5951): the forward
+# move at the source cap, the cap on the target, the target lock held across
+# the transaction (two replicas) and the concurrent soak.
+BROKER_RESERVATION_TRANSFER_POSTGRES_TESTS := TestMoveBrokerQuota_SourceAtCapTargetFull_Postgres \
+	TestTransferBroker_TargetAtCapRefused_Postgres \
+	TestTransferBroker_TargetLockHeldAcrossTransaction_Postgres \
+	TestTransferBroker_ConcurrentReserveSoak_Postgres
+
+# USER_DELETION_POSTGRES_TESTS are the forced user delete concurrency tests
+# (ptone/scion#2143): a restore racing the delete request, a restore racing
+# the completion, two hub processes completing one deletion, and a finalize
+# racing the completion's reopen of a blocking agent; and a token's user
+# delete refused in its transaction for a system-scope binding the
+# pre-check did not see.
+USER_DELETION_POSTGRES_TESTS := TestForceDeleteUser_RestoreRacesRequest_Postgres \
+	TestForceDeleteUser_RestoreRacesCompletion_Postgres \
+	TestForceDeleteUser_TwoReconcilersOneCompletion_Postgres \
+	TestForceDeleteUser_FinalizeRacesCompletionReopen_Postgres \
+	TestUserDeleteToken_InTransactionBindingRefused_Postgres
+
 # HUB_INTEGRATION_POSTGRES_TESTS are the pkg/hub Postgres tests that need
 # -tags integration (the integration TestMain sets up the ent test
 # database): the project-delete lock-order test, the two-replica scheduled
 # send test, the membership loss and test identity concurrency tests, and
 # the broker presence registry test (its conduit registry runs on the ent
-# test database).
+# test database), the agent delegation issuance vs reincarnation claim
+# race, the broker reservation transfer tests
+# (BROKER_RESERVATION_TRANSFER_POSTGRES_TESTS) and the forced user delete
+# tests (USER_DELETION_POSTGRES_TESTS), the chat retention cascade and
+# replica race and deleted-conversation tests, and the two-replica project
+# quota admission test.
 # Each must print a PASS line, and any skip fails (shard.sh postgres).
 HUB_INTEGRATION_POSTGRES_TESTS := TestProjectDeletionService_LockOrderNoDeadlock \
 	TestScheduledSend_TwoHubReplicasPostgres_OneDelivery \
 	TestBrokerPresence_LiveRegistrySession \
+	TestAgentDelegationIssuanceVsReincarnateClaim_Postgres \
 	$(MEMBERSHIP_LOSS_POSTGRES_TESTS) \
 	$(TEST_IDENTITY_POSTGRES_TESTS) \
-	TestHubInternal_ReplayAcrossHubReplicas
+	$(BROKER_RESERVATION_TRANSFER_POSTGRES_TESTS) \
+	$(USER_DELETION_POSTGRES_TESTS) \
+	TestHubInternal_ReplayAcrossHubReplicas \
+	TestChatRetention_Postgres_CascadeAndReplicaRace \
+	TestChatRetention_Postgres_DeletedConversationsAndAttachments \
+	TestProjectQuota_TwoHubReplicasPostgres_OneAdmission \
+	TestEncryptionScan_ClassifiesByAuthenticatingKey \
+	TestEncryptionScan_PagesCoverEveryRow \
+	TestEncryptionAudit_CountsAuthenticatedKeysOnly \
+	TestVerifyEncryption_PolicyAllowedSet \
+	TestVerifyEncryption_AllV2Passes \
+	TestInvitedUser_HubRoleGuard_ConcurrentGroupBindAndAdd_Postgres \
+	TestTriggers_ConcurrentCaps_Postgres \
+	TestWebhookIngress_ConcurrentPendingCap_Postgres
 
 ## test-hub-postgres: Run the pkg/hub Postgres tests of shard SHARD=K (SHARD=all: every shard holding one)
 # Requires SCION_TEST_POSTGRES_URL (integration tests) and
@@ -657,11 +743,18 @@ WEBCHAT_POSTGRES_TESTS := TestListTopicsByProjects_Postgres \
 	TestC4Fix_Postgres_PreExistingDB_Idempotent \
 	TestUnreadMentionKeys_Postgres \
 	TestScheduledStore_Postgres \
+	TestMessageStarStore_Postgres \
 	TestWebChatStore_Postgres_MessagesInOtherSchema \
 	TestWebChatStore_Postgres_ThreadMigrationsWaitForMessagesTable \
 	TestWebChatStore_Postgres_ThreadMigrationsRunOnce \
 	TestUserPrefsThreadGroupsMarker_Postgres \
-	TestUserPrefsThreadGroupsMigratedAt_Postgres_PreExistingDB
+	TestUserPrefsThreadGroupsMigratedAt_Postgres_PreExistingDB \
+	TestChatSearchLiteralWildcards_Postgres \
+	TestChatSearchDeletedAndEdited_Postgres \
+	TestChatSearchDifferential_Postgres \
+	TestChatSearchStatementTimeout_Postgres \
+	TestChatSearchVisibility_Postgres \
+	TestChatSearchStoreTimeoutStopsStatement_Postgres
 
 test-webchat-postgres:
 	@if [ -z "$$SCION_TEST_POSTGRES_DSN" ]; then \
@@ -797,13 +890,15 @@ vet-integration-extras:
 compat-literals:
 	@./hack/check-project-compat-literals.sh
 
-## check-authz-guards: Verify no authorization-bypass patterns exist in handler code
+## check-authz-guards: Verify no authorization-bypass patterns exist in handler code, and that the scan reaches every hack/area-dirs.txt directory
 # NOTE: make reports its own failure code (2) rather than the recipe's, so the
-# script's exit 1 (violations found) and exit 2 (nothing was analysed — skipped,
-# not clean) are indistinguishable to anything reading this target's exit status.
-# The messages still differ on stderr. Any caller that needs to tell those two
-# apart must invoke ./hack/check-authz-guards.sh directly, as CI does.
+# script's exit 1 (violations found, or the --self-test-dirs self-test failed)
+# and exit 3, 4 or 5 (nothing was analysed —
+# skipped, not clean) are indistinguishable to anything reading this target's
+# exit status. The messages still differ on stderr. Any caller that needs to
+# tell them apart must invoke ./hack/check-authz-guards.sh directly, as CI does.
 check-authz-guards:
+	@./hack/check-authz-guards.sh --self-test-dirs
 	@./hack/check-authz-guards.sh
 
 ## check-annotation-prefix: Flag new scion.io/ annotation keys (migration to scion.dev/)
@@ -825,6 +920,10 @@ check-hub-store-reassign:
 ## check-store-delete-callers: Flag direct store DeleteAgent/DeleteProject calls outside hack/store-delete-callers-allowlist.txt
 check-store-delete-callers:
 	@./hack/check-store-delete-callers.sh
+
+## check-agent-mutators: Verify no package outside pkg/store mutates agent rows directly (WP1 lifecycle observer; type-checks pkg/hub, so ci-full and the CI workflow, not make ci)
+check-agent-mutators:
+	@./hack/check-agent-mutators.sh
 
 ## check-scan-coverage: Every enumeration call in a pkg/hub source-scanning test needs a pkg/hub-wide scan-covers claim (self-test first)
 check-scan-coverage:
@@ -856,6 +955,15 @@ time-literals:
 check-harness-coverage:
 	@./image-build/scripts/check-harness-coverage.sh
 
+## test-image-scripts: Test the release image driver (build-release-images.sh), the build-images.sh guards, verify-registry.sh error classification, the assert-no-cgo.sh exit contract, the Cloud Build digest recorder, and the GKE CD pipeline scripts with stubs; no docker, no network
+test-image-scripts:
+	@bash ./image-build/scripts/test-build-release-images.sh
+	@bash ./image-build/scripts/test-build-images.sh
+	@bash ./image-build/scripts/test-verify-registry.sh
+	@bash ./image-build/scripts/test-assert-no-cgo.sh
+	@bash ./image-build/scripts/test-buildx-record-digest.sh
+	@bash ./deploy/cd/scripts/test-cd-scripts.sh
+
 ## check-image-go-dirs: Verify every Dockerfile that builds the root Go module copies all of its top-level Go dirs (ptone/scion#5453)
 # NOTE: same caveat as check-authz-guards above -- make collapses the
 # script's exit 1 (violations) and exit 2 (could not run) into one code.
@@ -879,6 +987,11 @@ check-route-authz-manifest:
 check-method-not-allowed:
 	@./hack/check-method-not-allowed.sh
 
+## check-entsql-driver-assert: Flag type assertions of an ent driver to *entsql.Driver (use entc.SQLDriver / entc.SQLDB, which unwrap the transaction diagnostics wrapper)
+check-entsql-driver-assert:
+	@./hack/check-entsql-driver-assert.sh --self-test >/dev/null
+	@./hack/check-entsql-driver-assert.sh
+
 ## check-debug-defaults: Verify setup scripts, deploy templates and hosted setup docs keep debug off by default
 check-debug-defaults:
 	@./hack/check-debug-defaults.sh --self-test
@@ -897,7 +1010,7 @@ check-extras-go-images:
 	@./hack/check-extras-go-images.sh
 
 ## check-custom: Run all custom CI lint checks (see hack/LINT-CONVENTIONS.md)
-check-custom: hubshard-parity testpart-selftest compat-literals check-annotation-prefix check-authz-guards check-setenv-guard check-conversation-upsert-guard check-hub-store-reassign check-store-delete-callers check-scan-coverage check-security-marker-gates check-image-go-dirs check-authorization-catalog check-route-authz-manifest cli-time-zones time-literals check-method-not-allowed check-debug-defaults check-sqlite-coverage check-extras-go-images
+check-custom: hubshard-parity hub-dupcheck hubshard-skip-summary-selftest testpart-selftest compat-literals check-annotation-prefix check-authz-guards check-setenv-guard check-conversation-upsert-guard check-hub-store-reassign check-store-delete-callers check-scan-coverage check-security-marker-gates check-image-go-dirs check-authorization-catalog check-route-authz-manifest cli-time-zones time-literals check-method-not-allowed check-entsql-driver-assert check-debug-defaults check-sqlite-coverage check-extras-go-images test-image-scripts
 	@echo "All custom checks passed."
 
 ## golangci-lint-build: Build the patched golangci-lint CI uses into ./build/tools/ (skipped when up to date)
@@ -933,6 +1046,7 @@ container-sciontool:
 	@GOOS=$(CONTAINER_OS) GOARCH=$(CONTAINER_ARCH) CGO_ENABLED=0 \
 		go build -buildvcs=false -ldflags "$(SCIONTOOL_LDFLAGS)" \
 		-o $(CONTAINER_DIR)/sciontool ./cmd/sciontool
+	@bash image-build/lib/assert-no-cgo.sh $(CONTAINER_DIR)/sciontool
 	@echo "Built: $(CONTAINER_DIR)/sciontool"
 
 ## container-scion: Cross-compile scion CLI for Linux containers
@@ -1013,7 +1127,7 @@ ci: fmt-check lint check-custom test-fast build
 	@echo "CI passed."
 
 ## ci-full: Run the full CI pipeline locally (mirrors GitHub Actions, includes web + golangci-lint)
-ci-full: fmt-check web web-budget web-typecheck web-lint web-test lint vet-integration vet-integration-extras check-custom golangci-lint-split-selftest golangci-lint test-fast test-fixture-coverage build
+ci-full: fmt-check web web-budget web-typecheck web-lint web-test lint vet-integration vet-integration-extras check-custom check-agent-mutators golangci-lint-split-selftest golangci-lint test-fast test-fixture-coverage build
 	@echo ""
 	@echo "CI (full) passed."
 

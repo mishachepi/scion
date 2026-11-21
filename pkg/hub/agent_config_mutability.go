@@ -118,6 +118,7 @@ type agentEditField struct {
 // Locked reasons shared by several rows or phases.
 const (
 	editReasonImmutable      = "Fixed when the agent was created; no transition applies a change."
+	editReasonHarnessSwitch  = "Change with scion reincarnate --harness (resets the home)."
 	editReasonWorkspace      = "The workspace is provisioned when the agent is created; no transition applies a change."
 	editReasonInternal       = "Managed by Scion; not user-editable."
 	editReasonTemplatePlugin = "Declared by the template; change the template's agent_plugins and reincarnate the agent."
@@ -177,7 +178,7 @@ var agentEditFields = []agentEditField{
 	// TX: immutable.
 	{Key: "projectId", Tier: EditTierImmutable, LockedReason: editReasonImmutable},
 	{Key: "template", Tier: EditTierImmutable, LockedReason: editReasonImmutable},
-	{Key: "harnessConfig", Tier: EditTierImmutable, LockedReason: editReasonImmutable},
+	{Key: "harnessConfig", Tier: EditTierImmutable, LockedReason: editReasonHarnessSwitch},
 	{Key: "runtimeBrokerId", Tier: EditTierImmutable, LockedReason: "Moving an agent to another broker is done by reincarnating it with a target broker."},
 	{Key: "profile", Tier: EditTierImmutable, LockedReason: editReasonImmutable},
 	{Key: "branch", Tier: EditTierImmutable, LockedReason: editReasonWorkspace},
@@ -189,6 +190,8 @@ var agentEditFields = []agentEditField{
 	// copy would do nothing. T2 once inline or hub-sourced plugins exist.
 	{Key: "config.agent_plugins", Tier: EditTierImmutable, LockedReason: editReasonTemplatePlugin},
 	{Key: "config.empty_per_agent_workspace", Tier: EditTierImmutable, LockedReason: editReasonWorkspace},
+	// Persistence is resolved and stamped once, at create (ptone/scion#7780).
+	{Key: "config.persistence", Tier: EditTierImmutable, LockedReason: editReasonImmutable},
 	{Key: "config.harness", Tier: EditTierImmutable, LockedReason: editReasonImmutable},
 	{Key: "config.harness_config", Tier: EditTierImmutable, LockedReason: editReasonImmutable},
 	{Key: "config.default_harness_config", Tier: EditTierImmutable, LockedReason: editReasonImmutable},
@@ -308,11 +311,23 @@ type FieldEditState struct {
 	// agent's broker re-renders at start: clearing or zeroing it takes
 	// effect only at the next reincarnation. It is not set on a field
 	// whose clear the agent's broker applies at the next start
-	// (brokerStartSupport.clearAppliesAtStart). The count limits keep it
-	// with every broker: their 0 (Unlimited) is never applied at a start
-	// (ptone/scion#5605), although a null clear is; the flag cannot tell
-	// the two apart, so it errs toward the note.
+	// (brokerStartSupport.clearAppliesAtStart). A count limit's clear is
+	// its null; its 0 (Unlimited) is a value, see UnlimitedUnsupported.
 	ClearNeedsReincarnate bool `json:"clearNeedsReincarnate,omitempty"`
+	// UnlimitedUnsupported is set on max_turns and max_model_calls when
+	// the agent's broker does not advertise unlimitedCountLimits (or the
+	// agent has none): no start would apply Unlimited (0) over an
+	// inherited limit, so a PATCH that changes the field to 0 is refused
+	// (ptone/scion#5605). The Edit page disables its Unlimited control.
+	UnlimitedUnsupported bool `json:"unlimitedUnsupported,omitempty"`
+	// SubfieldClearUnsupported is set on resources when the agent's broker
+	// does not advertise clearedResourceSubfields (or the agent has none):
+	// no start would apply a resources edit that leaves out a sub-field the
+	// agent stores (requests or limits cpu or memory, or disk), so such a
+	// clear takes effect only at the next reincarnation and the PATCH
+	// reports it in heldForReincarnate (ptone/scion#5676). The Edit page
+	// says so before a save.
+	SubfieldClearUnsupported bool `json:"subfieldClearUnsupported,omitempty"`
 	// Reason explains a locked field.
 	Reason string `json:"reason,omitempty"`
 }
@@ -399,6 +414,12 @@ func buildAgentEditability(agent *store.Agent, access agentEditAccess) *AgentEdi
 		}
 		if d == EditLocked {
 			st.Reason = reason
+		}
+		if unlimitedCountFieldKeys[f.Key] && !access.Broker.UnlimitedCountLimits {
+			st.UnlimitedUnsupported = true
+		}
+		if f.Key == agentConfigKeyPrefix+"resources" && !access.Broker.resourceSubfieldClearAppliesAtStart() {
+			st.SubfieldClearUnsupported = true
 		}
 		// A resume continues the harness's conversation: whether a changed
 		// model, or a re-rendered prompt, instructions file, skill or

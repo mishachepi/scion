@@ -70,6 +70,11 @@ func resetMessageFlags() func() {
 	msgCC = nil
 	msgArtifacts = nil
 	msgArtifactRefs = nil
+	resetDecisionFlags()
+	for _, name := range []string{"decisions", "decisions-file", "choices", "choices-file", "update"} {
+		_ = messageCmd.Flags().Lookup(name).Value.Set(messageCmd.Flags().Lookup(name).DefValue)
+		messageCmd.Flags().Lookup(name).Changed = false
+	}
 	messageCmd.Flags().Lookup("broadcast").Changed = false
 	messageCmd.Flags().Lookup("all").Changed = false
 	_ = rawFlag.Value.Set("false")
@@ -88,6 +93,11 @@ func resetMessageFlags() func() {
 		msgCC = orig.cc
 		msgArtifacts = orig.artifacts
 		msgArtifactRefs = nil
+		resetDecisionFlags()
+		for _, name := range []string{"decisions", "decisions-file", "choices", "choices-file", "update"} {
+			_ = messageCmd.Flags().Lookup(name).Value.Set(messageCmd.Flags().Lookup(name).DefValue)
+			messageCmd.Flags().Lookup(name).Changed = false
+		}
 		messageCmd.Flags().Lookup("broadcast").Changed = bcastChanged
 		messageCmd.Flags().Lookup("all").Changed = allChanged
 		_ = rawFlag.Value.Set(rawValue)
@@ -146,9 +156,22 @@ func newDeprecationTestServer(t *testing.T, projectID string) (*httptest.Server,
 			})
 
 		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/scheduled-events"):
+			var req hubclient.CreateScheduledEventRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req.AgentID == "" && req.AgentName == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"error": map[string]interface{}{
+						"code":    "validation_error",
+						"message": "agentId or agentName is required for message events",
+					},
+				})
+				return
+			}
+			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"id":      "evt-123",
-				"fire_at": "2030-01-01T00:00:00Z",
+				"id":     "evt-123",
+				"fireAt": "2030-01-01T00:00:00Z",
 			})
 
 		case r.Method == http.MethodPost:
@@ -663,6 +686,7 @@ func TestDeprecatedFlags_Hidden(t *testing.T) {
 		"broadcast", "all", // removed, still registered to avoid "unknown flag" errors
 		"in", "at", "plain", "raw",
 		"notify", "channel", "thread-id", "cc",
+		"choices", "choices-file",
 	}
 	for _, name := range deprecatedFlags {
 		f := messageCmd.Flags().Lookup(name)
@@ -675,6 +699,7 @@ func TestDeprecatedFlags_Hidden(t *testing.T) {
 func TestRetainedFlags_NotHidden(t *testing.T) {
 	retainedFlags := []string{
 		"interrupt", "wake", "attach",
+		"decisions", "decisions-file", "update",
 	}
 	for _, name := range retainedFlags {
 		f := messageCmd.Flags().Lookup(name)

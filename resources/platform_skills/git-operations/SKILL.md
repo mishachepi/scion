@@ -2,17 +2,31 @@
 name: git-operations
 description: >-
   Git safety and operational guidance for Scion agents. Covers working tree
-  resets, rebase pitfalls, and general git behavior that agents should know
-  regardless of workspace mode. For workspace-mode-specific git rules, see
-  the git-sandbox skill.
+  resets, shallow clones, rebase pitfalls, and general git behavior that agents
+  should know regardless of workspace mode. For workspace-mode-specific git
+  rules, see the git-sandbox skill.
 ---
 
 # Git Operations
 
 General git safety rules for Scion agents. These apply regardless of
-workspace sharing mode — for mode-specific guidance (worktree isolation,
-shared-plain index hazards, clone-per-agent remotes), see the `git-sandbox`
-skill.
+workspace sharing mode — for local worktree sandbox rules, see the
+`git-sandbox` skill.
+
+## Shallow Clones
+
+In-container per-agent clones (`SCION_GIT_DEPTH` set — `clone-per-agent`, or a `worktree-per-agent` start that fell back to cloning) default to a shallow clone of depth 1 (`SCION_GIT_DEPTH=1`; `N` means depth `N`, and `0` means a full clone). `SCION_GIT_DEPTH` reflects the initial clone setting; run `git rev-parse --is-shallow-repository` to check whether the live checkout is still shallow.
+
+**Symptoms of a shallow clone:**
+- `git diff main...HEAD` and `git merge-base` fail with `no merge base` (or return empty output) when the branch point is older than the clone depth.
+- Two-dot ranges (`git log a..b`) walk to the shallow graft and list hundreds of unrelated commits.
+- `git log -S`, `git blame`, and tag comparisons cannot see commits past the shallow boundary; `git merge`/`git pull` fail with `refusing to merge unrelated histories`, and `git rebase` replays the grafted root commit and conflicts.
+
+**How to handle history and range operations (when remote access permits):**
+- **Reach a merge base quickly:** `git fetch --deepen=50 origin main` (increase `<N>` until `git merge-base` succeeds). Use `--deepen=<N>` while shallow and plain `git fetch` once unshallowed — running `git fetch --depth=<N>` on an unshallowed checkout writes a new `.git/shallow` graft and re-shallows it.
+- **Inspect deeper commit/tree history without downloading all blobs:** `git fetch --filter=blob:none --deepen=200 <remote> <branch>` (trees are fetched, blobs are not: `--name-only`/`--name-status` and `git log -1 --no-patch <sha>` stay local, while `git show --stat`, `-p`, and other content diffs fetch missing blobs on demand).
+- **Fetch complete history (for full `git log -S`, `blame`, or `rebase`):** `git fetch --unshallow`.
+- **Diff against an explicit base commit:** when your brief names the base SHA and only a diff is needed, fetch that commit if missing and run `git diff <base-sha> HEAD`.
 
 ## Working Tree Reset Safety
 
@@ -32,3 +46,8 @@ The `-x` flag is not a stronger clean — it is a different operation. Default t
 A concurrent edit to the deleted file raises a modify/delete conflict and halts the rebase — that case is handled, because it demands a decision. A concurrent edit that adds a *reference* to the deleted file **from a different file** produces no conflict at all: git sees two disjoint changes, reports "Successfully rebased," and leaves a dangling reference.
 
 After rebasing a deletion, **grep for the deleted name**. Any inbound-reference count taken before the rebase is stale by construction.
+
+## Non-Interactive Editor & Repository Config
+
+- **Bypass interactive editors with `GIT_EDITOR=true`:** Use `GIT_EDITOR=true git rebase --continue` (or `--no-edit` on `commit`/`merge`). Do **not** rely on `git -c core.editor=true <subcommand>` — agent harnesses often export `GIT_EDITOR=false` in command subshells, which overrides `-c core.editor` and aborts the command.
+- **Keep disallowed keys out of `.git/config`:** Never write `core.editor`, `core.hooksPath`, or other command-running/credential keys into repository git config; Runtime Brokers refuse to start or resume an agent whose checkout sets unallowed repository config keys. Pass non-editor options per command (`git -c <key>=<val> <subcommand>`).

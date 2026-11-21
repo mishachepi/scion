@@ -19,8 +19,49 @@ limitations under the License.
 {{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
-{{/* Fully qualified release name. */}}
+{{/*
+Fully qualified release name.
+
+When fullnameOverride is set, it is used directly (capped at 63 characters).
+Otherwise $name defaults to .Chart.Name ("scion-hub"), overridable with
+nameOverride.
+
+When .Release.Name already contains $name AND does not end in "-<name>",
+.Release.Name is returned unchanged: this preserves the documented
+"helm upgrade --install scion-hub" name as well as "scion-hub-*" names, while
+never ending in "-<name>". Every other release renders "<release>-<name>",
+which always ends in "-<name>" (or a 10-hex SHA-256 digest over
+"<release>/<name>" when a long nameOverride pushes "<release>-<name>" past 63
+characters). Because the two branches have disjoint output ranges and each
+branch is injective in .Release.Name, distinct releases in one namespace
+cannot share a default fullname (fixes C4).
+*/}}
 {{- define "scion-hub.fullname" -}}
+{{- if .Values.fullnameOverride }}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- $name := default .Chart.Name .Values.nameOverride }}
+{{- $suffix := printf "-%s" $name }}
+{{- if and (contains $name .Release.Name) (not (hasSuffix $suffix .Release.Name)) }}
+{{- .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- $candidate := printf "%s-%s" .Release.Name $name }}
+{{- if le (len $candidate) 63 }}
+{{- $candidate | trimSuffix "-" }}
+{{- else }}
+{{- $digest := sha256sum (printf "%s/%s" .Release.Name $name) | trunc 10 }}
+{{- printf "%s-%s" ($candidate | trunc 52 | trimSuffix "-") $digest }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Pre-C4 fullname (chart <= 0.1.0). Called ONLY by NOTES.txt and
+scion-hub.clusterRoleNameLegacy so upgrade disclosures can name pre-fix
+objects for releases whose fullname moved. DO NOT USE IT TO NAME AN OBJECT.
+*/}}
+{{- define "scion-hub.fullnameLegacy" -}}
 {{- if .Values.fullnameOverride }}
 {{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
 {{- else }}
@@ -333,25 +374,24 @@ and it was still the wrong shape of claim, so it is replaced by the true one:
     NOT ELIMINATE IT. THE (fullname, namespace) PAIR IS NOT A SECURITY
     BOUNDARY AND MUST NOT BE RELIED ON AS ONE.
 
-Two collision classes are DECLARED RESIDUALS of this change - known, measured,
-graded Critical by gke-deploy-lead, and open after this commit lands:
+Two collision classes were DECLARED RESIDUALS when the C1 truncation digest
+landed; C4 is now closed in scion-hub.fullname and C5 remains open:
 
-  C4  fullname is many-to-one in the release name, above. Release "prod" beside
-      release "prod-scion-hub" in ONE namespace share every generated name.
-      Measured 20 colliding release pairs over len(R) 1..43.
-  C5  the "-" this helper joins with is LEGAL INSIDE BOTH OPERANDS, so the
-      readable branch is an ambiguous concatenation: fullname "a-b" in namespace
-      "c" and fullname "a" in namespace "b-c" both render "a-b-c-agents".
-      Measured 3875 colliding pairs.
+  C4  (FIXED in scion-hub.fullname) fullname used to skip "-<name>" whenever
+      .Release.Name contained $name, collapsing (R, R-scion-hub) in one
+      namespace onto one fullname. scion-hub.fullname now appends "-<name>"
+      whenever .Release.Name ends in "-<name>".
+  C5  (OPEN) the "-" this helper joins with is LEGAL INSIDE BOTH OPERANDS, so
+      the readable branch is an ambiguous concatenation: fullname "a-b" in
+      namespace "c" and fullname "a" in namespace "b-c" both render
+      "a-b-c-agents".
 
-🔴 AND HERE IS THE PART A READER OF THIS FIX WILL GET WRONG IF NOBODY WRITES IT
-DOWN: NEITHER RESIDUAL TRUNCATES, AND THIS FIX IS GATED ON TRUNCATION. The gate
-is len($readable) > 63. C4 and C5 render at ordinary lengths - C5's example is
-33 bytes against a bound of 63 - so the digest branch never executes on their
-inputs and the identical names are emitted unchanged. THE GATE IS KEYED ON THE
-ONE PROPERTY BOTH REMAINING CRITICALS LACK. Do not read a green
-tests/rbac-collision.sh as "collisions are handled"; several of its assertions
-PIN THESE RESIDUALS AS PRESENT and go red when they are fixed.
+🔴 C5 DOES NOT TRUNCATE, AND THIS HELPER'S DIGEST IS GATED ON TRUNCATION. The
+gate is len($readable) > 63. C5 renders at ordinary lengths - C5's example is
+33 bytes against a bound of 63 - so the digest branch never executes on its
+inputs and the identical names are emitted unchanged. Do not read a green
+tests/rbac-collision.sh as "all cluster-scoped collisions are handled"; arm (q)
+PINS C5 AS PRESENT and goes red when it is fixed.
 
 What this commit does close is the class needing a LONG name: a silent collision
 arising FROM TRUNCATION, which is what C1 was. That is one class of three.
@@ -420,7 +460,7 @@ WHEN THIS CAN BE DELETED: when no supported upgrade path starts from a chart
 version at or before 0.1.0. Delete the NOTES block with it, not before.
 */}}
 {{- define "scion-hub.clusterRoleNameLegacy" -}}
-{{- printf "%s-%s-agents" (include "scion-hub.fullname" .) .Release.Namespace | trunc 63 | trimSuffix "-" -}}
+{{- printf "%s-%s-agents" (include "scion-hub.fullnameLegacy" .) .Release.Namespace | trunc 63 | trimSuffix "-" -}}
 {{- end }}
 
 {{/*
@@ -676,7 +716,7 @@ the mechanism was sound and only the justification was invented:
     a thing this chart produces BY DEFAULT: with workspaceStorage.nfs disabled
     there is no shared volume and no workspace_storage section, nothing two
     pods can both write. With it enabled, every replica mounts the same NFS
-    export and the hub renders server.workspace_storage, so two pods - the two
+    export and the hub renders server.project_storage, so two pods - the two
     replicas of a RollingUpdate included - CAN write the same share. That is the
     case the next bullet anticipated, and the answer there still holds:
     concurrency on the share is the hub's to coordinate (Postgres advisory
@@ -2406,6 +2446,9 @@ hack/verify.sh pins both cases.
 */}}
 {{- $envDoc := fromYaml (include (print .Template.BasePath "/configmap-env.yaml") .) }}
 {{- $shadowable := concat (keys (default dict $envDoc.data)) (list "POD_NAMESPACE") }}
+{{- if trim (toString ((.Values.conduit | default (dict)).existingPeerSecret | default "")) }}
+{{- $shadowable = append $shadowable "SCION_SERVER_HUB_CONDUIT_PEERSECRET" }}
+{{- end }}
 {{- if lt (len $shadowable) 5 }}
 {{- fail (printf "the environment ConfigMap rendered %d keys, which is fewer than the chart is known to emit unconditionally - hub.extraEnv's shadow guard derives its list from those keys and would be checking almost nothing." (len (default dict $envDoc.data))) }}
 {{- end }}
@@ -2442,6 +2485,18 @@ environment is still the chart's.
 */}}
 {{- if eq $name "SCION_ACTIVE_PROFILE" }}
 {{- fail "hub.extraEnv may not set SCION_ACTIVE_PROFILE: the hub loads SCION_* environment variables over settings.yaml (LoadVersionedSettings, pkg/config/settings_v1.go), so it would replace active_profile and change which profile's image_registry the hub resolves, without the chart's registry check seeing it. Set active_profile through config.extra instead; the chart renders active_profile: default, so changing it there is refused as a collision until the chart supports it." }}
+{{- end }}
+{{- /*
+SCION_SERVER_HUB_CONDUIT_INTERNAL* (internal_listen, internal_advertise and the
+internal_tls_* files and server name) binds over the rendered settings.yaml, so
+it would set the relay listener or its TLS past this chart's relay checks.
+Refused in every form, matched case-insensitively.
+*/}}
+{{- if hasPrefix "SCION_SERVER_HUB_CONDUIT_INTERNAL" (upper $name) }}
+{{- fail (printf "hub.extraEnv may not set %s: it would override the relay listener or its TLS settings (server.hub.conduit.internal_*) over the rendered settings.yaml, bypassing the chart's relay checks. Use conduit.internalTls (or config.extra, or your own settings file under config.existingSecret)." $name) }}
+{{- end }}
+{{- if has (upper $name) (list "SCION_SERVER_HUB_CONDUIT_RELAYMODE" "SCION_SERVER_HUB_CONDUIT_RELAY_MODE" "SCION_SERVER_HUB_CONDUIT_PEERAUTH" "SCION_SERVER_HUB_CONDUIT_PEER_AUTH" "SCION_SERVER_HUB_CONDUIT_PEERSECRET" "SCION_SERVER_HUB_CONDUIT_PEER_SECRET") }}
+{{- fail (printf "hub.extraEnv may not set %s: it would override server.hub.conduit relay mode or peer authentication past the chart's conduit checks. Use conduit.relayMode, conduit.peerAuth, conduit.existingPeerSecret or conduit.peerSecret instead." $name) }}
 {{- end }}
 {{- /*
 SCION_SERVER_HUB_CLASS binds to server.hub.class through the same env layer, over
@@ -2555,7 +2610,7 @@ as R4. Order is the order the guard appends them in, so the refusal message and
 this list read the same way.
 */}}
 {{- define "scion-hub.existingSecretRefusals" -}}
-config.extra, storage.bucket, agents.imageRegistry, hub.adminEmails, hub.hubClass, secrets.backend, secrets.gcpsm.projectId, secrets.gcpsm.replicationLocations, database.name, database.user, database.password, auth.oauth.web.github.clientId, auth.oauth.web.github.clientSecret, auth.oauth.web.google.clientId, auth.oauth.web.google.clientSecret, auth.proxy.iap.audience, auth.transport.mode, auth.transport.oidcAudience, auth.transport.platformAuthSa, runtime.gke, workspaceStorage.nfs.enabled, workspaceStorage.nfs.server, workspaceStorage.nfs.export, workspaceStorage.nfs.mountRoot, workspaceStorage.nfs.shareId, workspaceStorage.nfs.pvName, workspaceStorage.nfs.subpathRoot
+config.extra, storage.bucket, agents.imageRegistry, hub.adminEmails, hub.hubClass, secrets.backend, secrets.gcpsm.projectId, secrets.gcpsm.replicationLocations, database.name, database.user, database.password, auth.oauth.web.github.clientId, auth.oauth.web.github.clientSecret, auth.oauth.web.google.clientId, auth.oauth.web.google.clientSecret, auth.proxy.iap.audience, auth.transport.mode, auth.transport.oidcAudience, auth.transport.platformAuthSa, runtime.gke, workspaceStorage.nfs.enabled, workspaceStorage.nfs.server, workspaceStorage.nfs.export, workspaceStorage.nfs.mountRoot, workspaceStorage.nfs.shareId, workspaceStorage.nfs.pvName, workspaceStorage.nfs.subpathRoot, conduit.relayMode, conduit.peerAuth, conduit.peerSecret, conduit.internalTls.enabled, conduit.internalTls.port, conduit.internalTls.existingSecret, conduit.internalTls.caSecret, conduit.internalTls.caKey, conduit.internalTls.serverName, relay.enabled, relay.replicaCount, relay.port, relay.publicUrl, relay.hubInternalUrl, relay.trustedProxies, relay.args, relay.extraEnv, relay.resources.requests.cpu, relay.resources.requests.memory, relay.resources.limits.memory, relay.podAnnotations, relay.podLabels, relay.nodeSelector, relay.tolerations, relay.affinity, relay.topologySpreadConstraints, relay.terminationGracePeriodSeconds, relay.probes.startup.enabled, relay.probes.startup.periodSeconds, relay.probes.startup.failureThreshold, relay.probes.startup.timeoutSeconds, relay.probes.readiness.periodSeconds, relay.probes.readiness.timeoutSeconds, relay.probes.readiness.failureThreshold, relay.probes.liveness.enabled, relay.probes.liveness.periodSeconds, relay.probes.liveness.failureThreshold, relay.probes.liveness.timeoutSeconds, relay.serviceAccount.create, relay.serviceAccount.name, relay.serviceAccount.gcpServiceAccount, relay.serviceAccount.annotations, relay.pdb.enabled, relay.pdb.minAvailable, relay.pdb.maxUnavailable, relay.database.auth, relay.database.user, relay.database.password, relay.database.maxOpenConns, relay.database.maxIdleConns, relay.database.connMaxLifetime, relay.database.connMaxIdleTime
 {{- end }}
 
 {{/*
@@ -2701,6 +2756,70 @@ subpathRoot; change both together.
 {{- if trim (toString (index $nfsInline $f | default "")) }}{{- $inline = append $inline (printf "workspaceStorage.nfs.%s" $f) }}{{- end }}
 {{- end }}
 {{- if ne (trim (toString ($nfsInline.subpathRoot | default "projects"))) "projects" }}{{- $inline = append $inline "workspaceStorage.nfs.subpathRoot" }}{{- end }}
+{{- $conduitInline := .Values.conduit | default (dict) }}
+{{- if ne (trim (toString ($conduitInline.relayMode | default "in_process"))) "in_process" }}{{- $inline = append $inline "conduit.relayMode" }}{{- end }}
+{{- if ne (trim (toString ($conduitInline.peerAuth | default "auto"))) "auto" }}{{- $inline = append $inline "conduit.peerAuth" }}{{- end }}
+{{- if toString ($conduitInline.peerSecret | default "") }}{{- $inline = append $inline "conduit.peerSecret" }}{{- end }}
+{{- $relayInline := $conduitInline.internalTls | default (dict) }}
+{{- if eq (toString $relayInline.enabled) "true" }}{{- $inline = append $inline "conduit.internalTls.enabled" }}{{- end }}
+{{- if ne (int ($relayInline.port | default 9443)) 9443 }}{{- $inline = append $inline "conduit.internalTls.port" }}{{- end }}
+{{- range $f := list "existingSecret" "caSecret" }}
+{{- if trim (toString (index $relayInline $f | default "")) }}{{- $inline = append $inline (printf "conduit.internalTls.%s" $f) }}{{- end }}
+{{- end }}
+{{- if ne (trim (toString ($relayInline.caKey | default "ca.crt"))) "ca.crt" }}{{- $inline = append $inline "conduit.internalTls.caKey" }}{{- end }}
+{{- if trim (toString ($relayInline.serverName | default "")) }}{{- $inline = append $inline "conduit.internalTls.serverName" }}{{- end }}
+{{- $rInline := .Values.relay | default (dict) }}
+{{- $rEnabledStr := toString (ternary "auto" $rInline.enabled (eq (toString $rInline.enabled) "<nil>")) }}
+{{- if ne $rEnabledStr "auto" }}{{- $inline = append $inline "relay.enabled" }}{{- end }}
+{{- if ne (int ($rInline.replicaCount | default 2)) 2 }}{{- $inline = append $inline "relay.replicaCount" }}{{- end }}
+{{- if ne (int ($rInline.port | default 8080)) 8080 }}{{- $inline = append $inline "relay.port" }}{{- end }}
+{{- if trim (toString ($rInline.publicUrl | default "")) }}{{- $inline = append $inline "relay.publicUrl" }}{{- end }}
+{{- if trim (toString ($rInline.hubInternalUrl | default "")) }}{{- $inline = append $inline "relay.hubInternalUrl" }}{{- end }}
+{{- if $rInline.trustedProxies }}{{- $inline = append $inline "relay.trustedProxies" }}{{- end }}
+{{- if $rInline.args }}{{- $inline = append $inline "relay.args" }}{{- end }}
+{{- if $rInline.extraEnv }}{{- $inline = append $inline "relay.extraEnv" }}{{- end }}
+{{- if ne (toString (dig "resources" "requests" "cpu" "250m" $rInline)) "250m" }}{{- $inline = append $inline "relay.resources.requests.cpu" }}{{- end }}
+{{- if ne (toString (dig "resources" "requests" "memory" "512Mi" $rInline)) "512Mi" }}{{- $inline = append $inline "relay.resources.requests.memory" }}{{- end }}
+{{- if ne (toString (dig "resources" "limits" "memory" "1Gi" $rInline)) "1Gi" }}{{- $inline = append $inline "relay.resources.limits.memory" }}{{- end }}
+{{- if $rInline.podAnnotations }}{{- $inline = append $inline "relay.podAnnotations" }}{{- end }}
+{{- if $rInline.podLabels }}{{- $inline = append $inline "relay.podLabels" }}{{- end }}
+{{- if $rInline.nodeSelector }}{{- $inline = append $inline "relay.nodeSelector" }}{{- end }}
+{{- if $rInline.tolerations }}{{- $inline = append $inline "relay.tolerations" }}{{- end }}
+{{- if $rInline.affinity }}{{- $inline = append $inline "relay.affinity" }}{{- end }}
+{{- if $rInline.topologySpreadConstraints }}{{- $inline = append $inline "relay.topologySpreadConstraints" }}{{- end }}
+{{- if ne (int ($rInline.terminationGracePeriodSeconds | default 45)) 45 }}{{- $inline = append $inline "relay.terminationGracePeriodSeconds" }}{{- end }}
+{{- $rProbes := $rInline.probes | default (dict) }}
+{{- $rStartup := $rProbes.startup | default (dict) }}
+{{- if and (hasKey $rStartup "enabled") (not (and (kindIs "bool" $rStartup.enabled) $rStartup.enabled)) }}{{- $inline = append $inline "relay.probes.startup.enabled" }}{{- end }}
+{{- if ne (int ($rStartup.periodSeconds | default 5)) 5 }}{{- $inline = append $inline "relay.probes.startup.periodSeconds" }}{{- end }}
+{{- if ne (int ($rStartup.failureThreshold | default 60)) 60 }}{{- $inline = append $inline "relay.probes.startup.failureThreshold" }}{{- end }}
+{{- if ne (int ($rStartup.timeoutSeconds | default 3)) 3 }}{{- $inline = append $inline "relay.probes.startup.timeoutSeconds" }}{{- end }}
+{{- $rReadiness := $rProbes.readiness | default (dict) }}
+{{- if ne (int ($rReadiness.periodSeconds | default 10)) 10 }}{{- $inline = append $inline "relay.probes.readiness.periodSeconds" }}{{- end }}
+{{- if ne (int ($rReadiness.timeoutSeconds | default 3)) 3 }}{{- $inline = append $inline "relay.probes.readiness.timeoutSeconds" }}{{- end }}
+{{- if ne (int ($rReadiness.failureThreshold | default 3)) 3 }}{{- $inline = append $inline "relay.probes.readiness.failureThreshold" }}{{- end }}
+{{- $rLiveness := $rProbes.liveness | default (dict) }}
+{{- if $rLiveness.enabled }}{{- $inline = append $inline "relay.probes.liveness.enabled" }}{{- end }}
+{{- if ne (int ($rLiveness.periodSeconds | default 15)) 15 }}{{- $inline = append $inline "relay.probes.liveness.periodSeconds" }}{{- end }}
+{{- if ne (int ($rLiveness.failureThreshold | default 3)) 3 }}{{- $inline = append $inline "relay.probes.liveness.failureThreshold" }}{{- end }}
+{{- if ne (int ($rLiveness.timeoutSeconds | default 3)) 3 }}{{- $inline = append $inline "relay.probes.liveness.timeoutSeconds" }}{{- end }}
+{{- $rSa := $rInline.serviceAccount | default (dict) }}
+{{- if and (hasKey $rSa "create") (not (and (kindIs "bool" $rSa.create) $rSa.create)) }}{{- $inline = append $inline "relay.serviceAccount.create" }}{{- end }}
+{{- if trim (toString ($rSa.name | default "")) }}{{- $inline = append $inline "relay.serviceAccount.name" }}{{- end }}
+{{- if trim (toString ($rSa.gcpServiceAccount | default "")) }}{{- $inline = append $inline "relay.serviceAccount.gcpServiceAccount" }}{{- end }}
+{{- if $rSa.annotations }}{{- $inline = append $inline "relay.serviceAccount.annotations" }}{{- end }}
+{{- $rPdb := $rInline.pdb | default (dict) }}
+{{- if $rPdb.enabled }}{{- $inline = append $inline "relay.pdb.enabled" }}{{- end }}
+{{- if ne (trim (toString ($rPdb.minAvailable | default ""))) "" }}{{- $inline = append $inline "relay.pdb.minAvailable" }}{{- end }}
+{{- if ne (trim (toString ($rPdb.maxUnavailable | default ""))) "" }}{{- $inline = append $inline "relay.pdb.maxUnavailable" }}{{- end }}
+{{- $rDb := $rInline.database | default (dict) }}
+{{- if trim (toString ($rDb.auth | default "")) }}{{- $inline = append $inline "relay.database.auth" }}{{- end }}
+{{- if trim (toString ($rDb.user | default "")) }}{{- $inline = append $inline "relay.database.user" }}{{- end }}
+{{- if toString ($rDb.password | default "") }}{{- $inline = append $inline "relay.database.password" }}{{- end }}
+{{- if ne (int ($rDb.maxOpenConns | default 10)) 10 }}{{- $inline = append $inline "relay.database.maxOpenConns" }}{{- end }}
+{{- if ne (int ($rDb.maxIdleConns | default 5)) 5 }}{{- $inline = append $inline "relay.database.maxIdleConns" }}{{- end }}
+{{- if ne (trim (toString ($rDb.connMaxLifetime | default "30m"))) "30m" }}{{- $inline = append $inline "relay.database.connMaxLifetime" }}{{- end }}
+{{- if ne (trim (toString ($rDb.connMaxIdleTime | default "5m"))) "5m" }}{{- $inline = append $inline "relay.database.connMaxIdleTime" }}{{- end }}
 {{- if $inline }}
 {{- fail (printf "config.existingSecret is set together with inline settings values (%s). With config.existingSecret the chart renders no settings.yaml, so those values would be silently discarded. Set one or the other: either supply the whole file yourself, or let the chart render it. Note that these are only the settings values the chart can PROVE you set, because their default is empty. Others - auth.mode, hub.name, the database pool sizes, the hub ID and the agent namespace - are just as inert here and cannot be refused, because a default-valued setting is indistinguishable from an unset one; they are listed with the settings keys your own file must carry in NOTES.txt and in values.yaml at config.existingSecret." (join ", " $inline)) }}
 {{- end }}
@@ -2948,7 +3067,7 @@ source for it is the divergence this check exists to prevent. */}}
 
 {{- /* HA preflight block 1, part 3: hub blob storage. GCS, and not the
 Filestore share - workspace storage is a different subsystem under
-server.workspace_storage and does not satisfy this. */}}
+server.project_storage and does not satisfy this. */}}
 {{- if eq (lower (toString $emittedDriver)) "postgres" }}
 {{- if ne (lower (toString (dig "server" "storage" "provider" "" $doc))) "gcs" }}
 {{- fail (printf "rendered settings.yaml must set server.storage.provider: gcs under Postgres, got %s. Local blob storage is not HA-safe and the hub refuses to start. This is the hub's own blob store; the Filestore workspace share does not satisfy it." (include "scion-hub.diagValue" (dig "server" "storage" "provider" "" $doc))) }}
@@ -3269,6 +3388,15 @@ HA preflight as configured.
 */}}
 {{- if eq $driver "postgres" }}
 {{- $database = set $database "url" (include "scion-hub.databaseUrl" .) }}
+{{- $conduitForDb := include "scion-hub.conduitConfig" . | fromYaml }}
+{{- $relayOnForDb := eq (include "scion-hub.relayEnabled" .) "true" }}
+{{- if or (eq (toString $conduitForDb.relayMode) "external") $relayOnForDb }}
+{{- $hubDbUser := include "scion-hub.databaseUser" . }}
+{{- $relayDbUser := include "scion-hub.relayDatabaseUser" . }}
+{{- if and $relayDbUser (ne $relayDbUser $hubDbUser) }}
+{{- $database = set $database "relay_role" $relayDbUser }}
+{{- end }}
+{{- end }}
 {{- end }}
 
 {{- /* server.storage: the HUB'S BLOB STORE. Not the Filestore workspace share. */}}
@@ -3410,6 +3538,38 @@ nothing, so it is refused rather than discarded.
 {{- if $platformAuthSa }}{{- $transportOut = set $transportOut "platform_auth_sa" $platformAuthSa }}{{- end }}
 {{- $authOut = set $authOut "transport" $transportOut }}
 {{- end }}
+{{- /*
+server.hub.conduit from conduit.* and conduit.internalTls: the relay mode,
+peer authentication, inline peer secret (redacted in settingsChecksum) and
+internal TLS listener. Absent when all are at their defaults, leaving every
+other render byte-identical.
+*/}}
+{{- $conduitCfg := include "scion-hub.conduitConfig" . | fromYaml }}
+{{- $relayTls := include "scion-hub.relayTls" . | fromYaml }}
+{{- $conduitOut := dict }}
+{{- if eq (toString $conduitCfg.relayMode) "external" }}
+{{- $extraListen := trim (toString (dig "server" "hub" "conduit" "internal_listen" "" (.Values.config.extra | default (dict)))) }}
+{{- if and (not $relayTls) (not $extraListen) }}
+{{- fail "conduit.relayMode is external, which requires server.hub.conduit.internal_listen so relay pods can call the hub internal API. Enable conduit.internalTls with conduit.internalTls.existingSecret." }}
+{{- end }}
+{{- $conduitOut = set $conduitOut "relay_mode" "external" }}
+{{- end }}
+{{- if ne (toString $conduitCfg.peerAuth) "auto" }}
+{{- $conduitOut = set $conduitOut "peer_auth" $conduitCfg.peerAuth }}
+{{- end }}
+{{- if $conduitCfg.peerSecret }}
+{{- $conduitOut = set $conduitOut "peer_secret" $conduitCfg.peerSecret }}
+{{- end }}
+{{- if $relayTls }}
+{{- $conduitOut = set $conduitOut "internal_listen" (printf "0.0.0.0:%d" (int $relayTls.port)) }}
+{{- $conduitOut = set $conduitOut "internal_tls_cert_file" (printf "%s/tls.crt" $relayTls.certDir) }}
+{{- $conduitOut = set $conduitOut "internal_tls_key_file" (printf "%s/tls.key" $relayTls.certDir) }}
+{{- $conduitOut = set $conduitOut "internal_tls_ca_file" (printf "%s/ca.crt" $relayTls.caDir) }}
+{{- $conduitOut = set $conduitOut "internal_tls_server_name" $relayTls.serverName }}
+{{- end }}
+{{- if gt (len $conduitOut) 0 }}
+{{- $hub = set $hub "conduit" $conduitOut }}
+{{- end }}
 {{- $server := dict
     "mode" "hosted"
     "hub" $hub
@@ -3481,7 +3641,8 @@ hack/verify.sh enforces it under the name migration-rename-hazard, across every
 values permutation rather than only the default one.
 */}}
 {{- /*
-server.workspace_storage, from scion-hub.nfsWorkspace - the same define the
+server.project_storage (the one storage block: workspace, shared dirs and homes;
+homes stay local), from scion-hub.nfsWorkspace - the same define the
 Deployment's volume and mount come from, so the two cannot disagree about the
 mount path. Absent when workspaceStorage.nfs is disabled, which leaves every
 other render byte-identical. Snake_case and field names as the Cloud Run
@@ -3489,14 +3650,14 @@ module's settings template writes them.
 */}}
 {{- $nfsWs := include "scion-hub.nfsWorkspace" . | fromYaml }}
 {{- if $nfsWs }}
-{{- $server = set $server "workspace_storage" (dict
+{{- $server = set $server "project_storage" (dict
     "backend" "nfs"
     "nfs" (dict
       "mount_root" $nfsWs.mountRoot
       "uid" (int $nfsWs.uid)
       "gid" (int $nfsWs.gid)
       "subpath_root" $nfsWs.subpathRoot
-      "shares" (list (dict "id" $nfsWs.shareId "server" $nfsWs.server "export" $nfsWs.export "pv_name" $nfsWs.pvName)))) }}
+      "shares" (list (ternary (dict "id" $nfsWs.shareId "server" $nfsWs.server "export" $nfsWs.export "pv_name" $nfsWs.pvName) (dict "id" $nfsWs.shareId "server" $nfsWs.server "export" $nfsWs.export) (ne (toString $nfsWs.pvName) ""))))) }}
 {{- end }}
 {{- $doc := dict "schema_version" "1" "active_profile" "default" "server" $server }}
 {{- if .Values.agents.imageRegistry }}
@@ -3533,6 +3694,7 @@ forces a chart fork. Merged before the assertions run, not after. */}}
 {{- $rendered := toYaml $doc }}
 {{- include "scion-hub.assertSettings" (dict "root" . "rendered" $rendered "hubId" $hubId) }}
 {{- include "scion-hub.assertNoExtraCollision" (dict "preMerge" $preMerge "extra" .Values.config.extra) }}
+{{- include "scion-hub.assertRelayListenerTls" (dict "doc" $doc) }}
 {{- /* config.extra is an arbitrary subtree the operator controls, so it can put
 a credential at a path no redaction list names - a DSN at server.database.url
 was measured doing exactly that, landing in the Secret AND moving the
@@ -4076,7 +4238,13 @@ for as long as that stays true. The known deltas are the floor constant and the
 paragraph that justifies it, both marked PHASE 2 DELTA below.
 */}}
 {{- define "scion-hub.settingsChecksum" -}}
-{{- $obj := fromYaml (include (print .Template.BasePath "/secret-settings.yaml") .) }}
+{{- $root := . }}
+{{- $tpl := "/secret-settings.yaml" }}
+{{- if and (kindIs "map" .) (hasKey . "_settingsTemplate") }}
+{{- $root = .root }}
+{{- $tpl = ._settingsTemplate }}
+{{- end }}
+{{- $obj := fromYaml (include (print $root.Template.BasePath $tpl) $root) }}
 {{- if hasKey $obj "Error" }}
 {{- fail (printf "scion-hub.settingsChecksum could not parse the rendered settings Secret as YAML: %s. This annotation is a digest of a redacted projection of that document, so a parse failure would digest an error string instead - a value that never changes, which is worse than no annotation because it looks like coverage." (get $obj "Error")) }}
 {{- end }}
@@ -4093,6 +4261,12 @@ paragraph that justifies it, both marked PHASE 2 DELTA below.
 {{- $_ := set $entry "client_secret" $redacted }}
 {{- $marks = add1 $marks }}
 {{- end }}
+{{- end }}
+{{- $conduitDoc := dig "server" "hub" "conduit" (dict) $doc }}
+{{- if and (kindIs "map" $conduitDoc) (hasKey $conduitDoc "peer_secret") }}
+{{- $rendered = append $rendered (toString (get $conduitDoc "peer_secret")) }}
+{{- $_ := set $conduitDoc "peer_secret" $redacted }}
+{{- $marks = add1 $marks }}
 {{- end }}
 {{- $db := dig "server" "database" (dict) $doc }}
 {{- if hasKey $db "url" }}
@@ -4278,7 +4452,7 @@ WORKSPACE STORAGE - NFS. Appended at end of file, like the phases above.
 workspaceStorage.nfs, validated and normalised, as YAML - or the empty string
 when it is disabled. THE ONE SOURCE for both of its consumers:
 
-  - scion-hub.settings renders server.workspace_storage from it, and
+  - scion-hub.settings renders server.project_storage from it, and
   - deployment.yaml renders the hub pod's inline nfs volume and the hub
     container's mount from it.
 
@@ -4298,7 +4472,7 @@ V1NFSConfig and V1SharedDirStorageConfig).
 
 Field names match the Cloud Run module's settings template
 (deploy/terraform/modules/hub-cloudrun/templates/settings.yaml.tftpl,
-workspace_storage:), so the two deployments describe the share the same way.
+project_storage:), so the two deployments describe the share the same way.
 
 uid and gid are not values. They are rendered from the hub's effective
 hub.securityContext.runAsUser and runAsGroup - the same values
@@ -4313,8 +4487,13 @@ THE GUARDS, and why each one is here rather than left to the hub:
     cannot mount, and the pod sits in ContainerCreating with nothing in the
     chart's output saying why. A missing shareId makes the mount path the mount
     root itself, which still passes readiness while the hub and agents disagree
-    about the tree. A missing pvName leaves agent pods with no claim to mount.
-  - config.extra.server.workspace_storage is refused while this is enabled.
+    about the tree. pvName is optional: without it, agent pods mount the share
+    inline, one NFS volume per directory by server path, with no NFS mount
+    options, and the agent runtime (here the hub pod, which mounts the export at
+    <mountRoot>/<shareId>) creates each directory first, so the export must be
+    writable by hub.securityContext.runAsUser and runAsGroup.
+  - config.extra.server.project_storage (and the deprecated workspace_storage,
+    shared_dir_storage and home_storage) is refused while this is enabled.
     It would replace or change the settings half without touching the mount -
     exactly the drift this define exists to prevent. (The generic config.extra
     collision rule would catch an overlapping leaf too; this one names the
@@ -4342,16 +4521,15 @@ it, so the guards run even when the settings Secret is not rendered.
 {{- if $shareId }}{{- $inert = append $inert "workspaceStorage.nfs.shareId" }}{{- end }}
 {{- if $pvName }}{{- $inert = append $inert "workspaceStorage.nfs.pvName" }}{{- end }}
 {{- if $inert }}
-{{- fail (printf "%s set while workspaceStorage.nfs.enabled is false. The chart renders neither server.workspace_storage nor the hub's NFS mount in that case, so the value would reach nothing. Set workspaceStorage.nfs.enabled: true, or remove it." (join " and " $inert)) }}
+{{- fail (printf "%s set while workspaceStorage.nfs.enabled is false. The chart renders neither server.project_storage nor the hub's NFS mount in that case, so the value would reach nothing. Set workspaceStorage.nfs.enabled: true, or remove it." (join " and " $inert)) }}
 {{- end }}
 {{- else }}
 {{- $missing := list }}
 {{- if not $server }}{{- $missing = append $missing "workspaceStorage.nfs.server" }}{{- end }}
 {{- if not $export }}{{- $missing = append $missing "workspaceStorage.nfs.export" }}{{- end }}
 {{- if not $shareId }}{{- $missing = append $missing "workspaceStorage.nfs.shareId" }}{{- end }}
-{{- if not $pvName }}{{- $missing = append $missing "workspaceStorage.nfs.pvName" }}{{- end }}
 {{- if $missing }}
-{{- fail (printf "workspaceStorage.nfs.enabled is true, which requires %s. The chart renders the hub's NFS volume and server.workspace_storage from these, and the hub's /readyz fails unless the share is mounted at <mountRoot>/<shareId>." (join ", " $missing)) }}
+{{- fail (printf "workspaceStorage.nfs.enabled is true, which requires %s. The chart renders the hub's NFS volume and server.project_storage from these, and the hub's /readyz fails unless the share is mounted at <mountRoot>/<shareId>." (join ", " $missing)) }}
 {{- end }}
 {{- $mountRoot := trim (toString ($nfs.mountRoot | default "")) }}
 {{- $subpathRoot := trim (toString ($nfs.subpathRoot | default "")) }}
@@ -4370,13 +4548,17 @@ it, so the guards run even when the settings Secret is not rendered.
 {{- if not (hasPrefix "/" $export) }}
 {{- fail (printf "workspaceStorage.nfs.export is %s; it must be an absolute export path on the server, such as /scion_workspaces." (include "scion-hub.diagValue" $nfs.export)) }}
 {{- end }}
-{{- if not (regexMatch "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" $pvName) }}
+{{- if and $pvName (not (regexMatch "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" $pvName)) }}
 {{- fail (printf "workspaceStorage.nfs.pvName is %s; it must be a Kubernetes object name (lower-case letters, digits, '-' and '.'). It names the PersistentVolumeClaim agent pods mount." (include "scion-hub.diagValue" $nfs.pvName)) }}
 {{- end }}
 {{- $extra := .Values.config.extra | default (dict) }}
 {{- $extraServer := $extra.server }}
-{{- if and (kindIs "map" $extraServer) (hasKey $extraServer "workspace_storage") }}
-{{- fail "workspaceStorage.nfs is enabled and config.extra also sets server.workspace_storage. The chart renders server.workspace_storage and the hub's NFS mount from workspaceStorage.nfs together, because the hub's /readyz fails unless the share is mounted at mount_root/shares[0].id; a settings block from config.extra could change one without the other. Use workspaceStorage.nfs alone." }}
+{{- if kindIs "map" $extraServer }}
+{{- range $key := list "project_storage" "workspace_storage" "shared_dir_storage" "home_storage" }}
+{{- if hasKey $extraServer $key }}
+{{- fail (printf "workspaceStorage.nfs is enabled and config.extra also sets server.%s. The chart renders server.project_storage and the hub's NFS mount from workspaceStorage.nfs together, because the hub's /readyz fails unless the share is mounted at mount_root/shares[0].id, and the hub accepts exactly one storage block; a settings block from config.extra could change one without the other. Use workspaceStorage.nfs alone." $key) }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- $out := dict
     "server" $server
@@ -4390,4 +4572,842 @@ it, so the guards run even when the settings Secret is not rendered.
     "mountPath" (printf "%s/%s" $mountRoot $shareId) }}
 {{- toYaml $out }}
 {{- end }}
+{{- end }}
+
+{{/*
+conduit.internalTls, validated, or empty when disabled: the conduit relay's
+internal hop between hub nodes over native TLS. Read by the Deployment (the
+Secret volumes, their mounts, the relay port and POD_IP) and by
+scion-hub.settings (server.hub.conduit), one define so the file paths in the
+settings and the mount paths cannot disagree. Called from the always-rendered
+Deployment so its guards also run under config.existingSecret.
+
+The hub derives the advertised endpoint as https://POD_IP:<port> when the
+listener serves TLS, and every hop client verifies the peer certificate against
+the CA file and serverName. One certificate whose SAN is serverName therefore
+serves every replica. The directories are mounted whole, not by subPath, so a
+rotated Secret (for example by cert-manager) reaches the files. The hub re-reads
+the certificate and key when they change, without a restart. It reads the CA
+bundle and serverName once at startup, so changing either needs a rolling
+restart.
+*/}}
+{{- define "scion-hub.relayTls" -}}
+{{- $c := (.Values.conduit | default (dict)).internalTls | default (dict) }}
+{{- $secret := trim (toString ($c.existingSecret | default "")) }}
+{{- $caSecret := trim (toString ($c.caSecret | default "")) }}
+{{- $caKey := trim (toString ($c.caKey | default "ca.crt")) }}
+{{- $serverName := trim (toString ($c.serverName | default "")) }}
+{{- $port := int ($c.port | default 9443) }}
+{{- /*
+enabled is true, false or "auto" (the default). "auto" turns the relay hop on
+when replicaCount is above one: those replicas reach each other's relays, and
+the hop must be TLS. It stays off under config.existingSecret, where the
+operator's own file decides.
+*/}}
+{{- $mode := toString (ternary "auto" $c.enabled (eq (toString $c.enabled) "<nil>")) }}
+{{- if not (has $mode (list "true" "false" "auto")) }}
+{{- fail (printf "conduit.internalTls.enabled is %s; it must be true, false or \"auto\"." (include "scion-hub.diagValue" $mode)) }}
+{{- end }}
+{{- $conduitVals := .Values.conduit | default (dict) }}
+{{- $relayMode := trim (toString ($conduitVals.relayMode | default "in_process")) }}
+{{- $relayVals := .Values.relay | default (dict) }}
+{{- $relayEnStr := toString (ternary "auto" $relayVals.enabled (eq (toString $relayVals.enabled) "<nil>")) }}
+{{- $relayActive := or (eq $relayEnStr "true") (and (eq $relayEnStr "auto") (eq $relayMode "external")) }}
+{{- $on := or (eq $mode "true") (and (eq $mode "auto") (or (gt (int .Values.replicaCount) 1) (eq $relayMode "external") $relayActive) (not .Values.config.existingSecret)) }}
+{{- if not $on }}
+{{- $inert := list }}
+{{- if $secret }}{{- $inert = append $inert "conduit.internalTls.existingSecret" }}{{- end }}
+{{- if $caSecret }}{{- $inert = append $inert "conduit.internalTls.caSecret" }}{{- end }}
+{{- if ne $caKey "ca.crt" }}{{- $inert = append $inert "conduit.internalTls.caKey" }}{{- end }}
+{{- if $serverName }}{{- $inert = append $inert "conduit.internalTls.serverName" }}{{- end }}
+{{- if ne $port 9443 }}{{- $inert = append $inert "conduit.internalTls.port" }}{{- end }}
+{{- /* Under "auto" the values may be set ahead of a scale-up, so only an explicit false refuses them. */}}
+{{- if and $inert (eq $mode "false") }}
+{{- fail (printf "%s set while the relay hop is off (conduit.internalTls.enabled is %s, replicaCount is %d). The chart renders no relay listener in that case, so the value would reach nothing. Set conduit.internalTls.enabled: true, or remove it." (join " and " $inert) $mode (int .Values.replicaCount)) }}
+{{- end }}
+{{- else }}
+{{- if and (not $secret) (eq $mode "auto") }}
+{{- if gt (int .Values.replicaCount) 1 }}
+{{- fail (printf "replicaCount is %d, and conduit.internalTls.enabled \"auto\" (the default) turns on TLS for the relay hop between hub nodes above one replica. Set conduit.internalTls.existingSecret to a kubernetes.io/tls Secret (tls.crt, tls.key) in the release namespace, for example one issued by cert-manager, or set conduit.internalTls.enabled: false." (int .Values.replicaCount)) }}
+{{- else }}
+{{- fail "conduit.relayMode is external (or relay is enabled), and conduit.internalTls.enabled \"auto\" (the default) turns on TLS for the internal hop between hub and relay pods. Set conduit.internalTls.existingSecret to a kubernetes.io/tls Secret (tls.crt, tls.key) in the release namespace." }}
+{{- end }}
+{{- end }}
+{{- if not $secret }}
+{{- fail "conduit.internalTls.enabled is true, which requires conduit.internalTls.existingSecret: a kubernetes.io/tls Secret (tls.crt, tls.key) in the release namespace, for example one issued by cert-manager. The relay listener serves native TLS from it; the chart never creates certificates." }}
+{{- end }}
+{{- range $pair := list (list "existingSecret" $secret) (list "caSecret" $caSecret) }}
+{{- $v := index $pair 1 }}
+{{- if and $v (not (regexMatch "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" $v)) }}
+{{- fail (printf "conduit.internalTls.%s is %s; it must be a Kubernetes Secret name (lower-case letters, digits, '-' and '.')." (index $pair 0) (include "scion-hub.diagValue" $v)) }}
+{{- end }}
+{{- end }}
+{{- if not (regexMatch "^[-._a-zA-Z0-9]+$" $caKey) }}
+{{- fail (printf "conduit.internalTls.caKey is %s; it must be a Secret data key such as ca.crt." (include "scion-hub.diagValue" $caKey)) }}
+{{- end }}
+{{- if not $serverName }}
+{{- $serverName = printf "%s-relay.%s.svc" (include "scion-hub.fullname" .) .Release.Namespace }}
+{{- end }}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $serverName) }}
+{{- fail (printf "conduit.internalTls.serverName is %s; it must be a DNS name, the SAN every hub node's certificate carries." (include "scion-hub.diagValue" $serverName)) }}
+{{- end }}
+{{- if or (lt $port 1) (gt $port 65535) }}
+{{- fail (printf "conduit.internalTls.port is %d; it must be between 1 and 65535." $port) }}
+{{- end }}
+{{- $taken := list (dict "n" (int .Values.hub.webPort) "name" "hub.webPort") (dict "n" (int (include "scion-hub.brokerPort" .)) "name" "the hub's in-process runtime broker") }}
+{{- if .Values.cloudsql.enabled }}
+{{- $taken = append $taken (dict "n" (int .Values.cloudsql.port) "name" "cloudsql.port") }}
+{{- $taken = append $taken (dict "n" (int .Values.cloudsql.healthCheckPort) "name" "cloudsql.healthCheckPort") }}
+{{- end }}
+{{- range $t := $taken }}
+{{- if eq $port (int $t.n) }}
+{{- fail (printf "conduit.internalTls.port %d is also %s. Every container in a pod shares one network namespace, so the second listener fails at startup." $port $t.name) }}
+{{- end }}
+{{- end }}
+{{- $extraHub := dig "server" "hub" (dict) (.Values.config.extra | default (dict)) }}
+{{- if and (kindIs "map" $extraHub) (hasKey $extraHub "conduit") }}
+{{- $extraConduit := index $extraHub "conduit" }}
+{{- if kindIs "map" $extraConduit }}
+{{- range $k := list "internal_listen" "internal_advertise" "internal_tls_cert_file" "internal_tls_key_file" "internal_tls_ca_file" "internal_tls_server_name" }}
+{{- if hasKey $extraConduit $k }}
+{{- fail (printf "conduit.internalTls is enabled and config.extra also sets server.hub.conduit.%s. The chart renders the relay listener, its TLS files and the mounts they name together from conduit.internalTls; use that alone." $k) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- $imageCheck := include "scion-hub.relayTlsImageCheck" (dict "root" . "via" "wiring") }}
+{{- $out := dict
+    "imageCheck" $imageCheck
+    "port" $port
+    "secret" $secret
+    "caSecret" (default $secret $caSecret)
+    "caKey" $caKey
+    "serverName" $serverName
+    "certDir" "/etc/scion/relay-tls"
+    "caDir" "/etc/scion/relay-tls-ca" }}
+{{- toYaml $out }}
+{{- end }}
+{{- end }}
+
+{{/*
+The relay hop's TLS check, on the merged settings document. A
+server.hub.conduit.internal_listen that is not a literal loopback address must
+come with BOTH server.hub.conduit.internal_tls_cert_file and
+internal_tls_key_file, whichever path wrote it (conduit.internalTls or
+config.extra). Either file alone is refused as well, as the hub refuses it.
+
+What this check can and cannot do: it guarantees the rendered settings ask for
+TLS. Serving TLS is the hub's job, and only hub releases that understand the
+internal_tls_* settings do it. An earlier hub ignores those keys and serves the
+listener in plaintext, so this chart's relay wiring is meant to ship with those
+hub releases, not before them.
+*/}}
+{{- define "scion-hub.assertRelayListenerTls" -}}
+{{- $conduit := dig "server" "hub" "conduit" (dict) .doc }}
+{{- if kindIs "map" $conduit }}
+{{- /*
+The TLS files and server name are checked as written, as the hub reads them
+(validateInternalTLS): the cert and key are set together or not at all, and a
+server name may not contain "/", ":", a space or a tab, or be padded with
+whitespace. A blank or whitespace-padded file path is refused too; the hub
+would count it as set and then fail to open it.
+*/}}
+{{- $certRaw := toString (dig "internal_tls_cert_file" "" $conduit) }}
+{{- $keyRaw := toString (dig "internal_tls_key_file" "" $conduit) }}
+{{- $caRaw := toString (dig "internal_tls_ca_file" "" $conduit) }}
+{{- range $pair := list (list "internal_tls_cert_file" $certRaw) (list "internal_tls_key_file" $keyRaw) (list "internal_tls_ca_file" $caRaw) }}
+{{- $v := index $pair 1 }}
+{{- if and $v (ne (trim $v) $v) }}
+{{- fail (printf "server.hub.conduit.%s is %s, which is blank or padded with whitespace. The hub would try to open that exact path; write the file path without surrounding whitespace." (index $pair 0) (include "scion-hub.diagValue" $v)) }}
+{{- end }}
+{{- end }}
+{{- $nameRaw := toString (dig "internal_tls_server_name" "" $conduit) }}
+{{- if and $nameRaw (or (regexMatch "[/: \t]" $nameRaw) (ne (trim $nameRaw) $nameRaw)) }}
+{{- fail (printf "server.hub.conduit.internal_tls_server_name is %s; it must be a host name with no \"/\", \":\", spaces, tabs or surrounding whitespace. The hub refuses anything else at startup." (include "scion-hub.diagValue" $nameRaw)) }}
+{{- end }}
+{{- $cert := $certRaw }}
+{{- $key := $keyRaw }}
+{{- $listenRaw := toString (dig "internal_listen" "" $conduit) }}
+{{- $listen := trim $listenRaw }}
+{{- /* Gated on the raw value, so a whitespace-only listen hits the whitespace refusal. */}}
+{{- if $listenRaw }}
+{{- /*
+The hub validates internal_listen untrimmed (SplitHostPort, then Atoi on the
+port), and a leading space would not bind, so surrounding whitespace is refused.
+The value must be host:port with a port of 1-65535 in any mode; the host is
+empty, a bracketed IPv6 literal, or a name or IPv4 address without colons.
+
+Without TLS the listener must also be loopback, as the hub's
+CheckRelayInternalListen reads it: a loopback IP literal: [::1] or a valid
+127.x.y.z (octets 0-255, no leading zeros). A name is never loopback, not even
+localhost, because the hub would resolve it when it binds.
+
+The chart is deliberately stricter than the hub in these cases:
+- other loopback IP spellings (an expanded ::1, ::ffff:127.0.0.1), which it
+  treats as not loopback;
+- port 0;
+- a port written with a sign or a leading zero (for example :+9443, :09443).
+- an empty bracketed host ([]:port).
+*/}}
+{{- if ne $listenRaw $listen }}
+{{- fail (printf "server.hub.conduit.internal_listen is %s, with leading or trailing whitespace, which the hub cannot use as written (it fails validation or the bind at startup); remove the whitespace." (include "scion-hub.diagValue" $listenRaw)) }}
+{{- end }}
+{{- $hostPort := "^(|\\[[^\\[\\]]+\\]|[^:\\[\\]]+):([1-9][0-9]{0,4})$" }}
+{{- $portStr := regexReplaceAll $hostPort $listen "${2}" }}
+{{- if or (not (regexMatch $hostPort $listen)) (gt (int $portStr) 65535) }}
+{{- fail (printf "server.hub.conduit.internal_listen is %s; it must be host:port with a port of 1-65535 (for example 0.0.0.0:9443 or [::1]:9443). The hub refuses anything else at startup." (include "scion-hub.diagValue" $listen)) }}
+{{- end }}
+{{- /* One loopback definition, shared with the image check's exemption. */}}
+{{- $loopback := eq (include "scion-hub.isLoopbackListen" $listen) "true" }}
+{{- if and (not $loopback) (not (and $cert $key)) }}
+{{- fail (printf "server.hub.conduit.internal_listen is %s, which is not a loopback address (a loopback IP literal: [::1] or a valid 127.x.y.z, never a name such as localhost; with a port of 1-65535), and internal_tls_cert_file and internal_tls_key_file are not both set. The relay hop between hub nodes must serve TLS: set conduit.internalTls (enabled, existingSecret), or bind internal_listen to loopback." (include "scion-hub.diagValue" $listen)) }}
+{{- end }}
+{{- end }}
+{{- if and (or $cert $key) (not (and $cert $key)) }}
+{{- fail "server.hub.conduit.internal_tls_cert_file and internal_tls_key_file must be set together; the hub refuses one without the other at startup." }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+The first hub release whose relay listener honours the internal_tls_*
+settings. An older hub ignores them and serves the relay hop in plaintext, so
+the chart refuses its relay wiring for an image older than this.
+
+The floor is v0.3.0-preview.5, the first versioned release that carries the
+change, and nightly-20261029, the first nightly that carries it. A semver tag
+is compared with the version floor by semver precedence, so an earlier
+pre-release such as v0.3.0-preview.4 is refused and v0.3.0 or any later
+release passes; a nightly tag is compared with the nightly floor by date.
+
+Chart.yaml appVersion, the default image tag, stays below the floor and is not
+bumped, because versioned hub images are not yet published for each release.
+So with the relay wiring on, an operator sets image.tag or image.digest.
+
+An empty version floor is still handled (every semver tag is refused, failing
+closed, with a message that names only the nightly), but the chart no longer
+ships one.
+*/}}
+{{- define "scion-hub.relayTlsMinHub" -}}
+version: "v0.3.0-preview.5"
+nightly: "20261029"
+{{- end }}
+
+{{/*
+The off-remedy for the relay TLS image check, by the path that triggered it.
+Takes "wiring" (conduit.internalTls is on) or "extra" (a non-loopback
+config.extra internal_listen with the wiring off). Used by the render-time
+messages and by NOTES.txt, so the two say the same thing.
+*/}}
+{{- define "scion-hub.relayOffRemedy" -}}
+{{- if eq (toString .) "extra" -}}
+remove the config.extra internal_listen (or bind it to loopback)
+{{- else if eq (toString .) "wiring" -}}
+set conduit.internalTls.enabled: false
+{{- else -}}
+{{- fail (printf "scion-hub.relayOffRemedy: unknown path %q" (toString .)) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Checks the hub image against scion-hub.relayTlsMinHub when the relay wiring is
+on, and returns "ok" or "unverified". It fails the render for a tag that is
+older. The tag is image.tag, else .Chart.AppVersion.
+- A semver tag (v1.2.3, 1.2.3-preview.4) is compared by semver precedence.
+- A nightly tag (nightly-YYYYMMDD) is compared by date.
+- Anything else, or an image.digest (which a tag cannot describe), cannot be
+  checked: it is allowed, returns "unverified", and the chart warns in
+  NOTES.txt and annotates the Deployment.
+*/}}
+{{- define "scion-hub.relayTlsImageCheck" -}}
+{{- /* dict: root (the chart context), via ("wiring": conduit.internalTls is on;
+"extra": a non-loopback config.extra internal_listen with the wiring off). The
+via value picks the off-remedy the operator can act on. */}}
+{{- $root := .root }}
+{{- $off := include "scion-hub.relayOffRemedy" (toString .via) }}
+{{- $min := include "scion-hub.relayTlsMinHub" $root | fromYaml }}
+{{- $tag := trim (toString ($root.Values.image.tag | default $root.Chart.AppVersion)) }}
+{{- /* What to do about an older tag. With image.tag unset, the tag is the
+chart's appVersion, so the operator has to set one. */}}
+{{- $minVersion := trim (toString ($min.version | default "")) }}
+{{- /* $orRelease reads inside a remedy ("nightly-X or later or a release at or
+after Y"); $orReleaseParen inside a parenthesis ("(nightly-X or later, or a
+release at or after Y)"). Both are empty when the version floor is empty.
+*/}}
+{{- $orRelease := "" }}
+{{- $orReleaseParen := "" }}
+{{- if $minVersion }}{{- $orRelease = printf " or a release at or after %s" $minVersion }}{{- $orReleaseParen = printf ", or a release at or after %s" $minVersion }}{{- end }}
+{{- $defaultTag := not (trim (toString ($root.Values.image.tag | default ""))) }}
+{{- $remedy := printf "Use nightly-%s or later%s, set image.digest, or %s." $min.nightly $orRelease $off }}
+{{- if $defaultTag }}
+{{- $remedy = printf "image.tag is not set, so the tag is the chart's appVersion (%s), which is older than the floor: set image.tag to nightly-%s or later%s, or set image.digest, or %s." $root.Chart.AppVersion $min.nightly $orRelease $off }}
+{{- end }}
+{{- /*
+Semantic Versioning 2.0.0, with an optional leading v: numeric identifiers
+without leading zeros, no empty identifiers, and optional build metadata (which
+does not affect precedence). A tag that starts like a version but is not one
+is refused with the chart's own message rather than passed to semver.
+*/}}
+{{- /*
+Numbers are bounded at 19 digits, inside uint64: major, minor and patch, and
+numeric pre-release identifiers too. An overflowing number gets the
+malformed-version refusal below rather than a parse error. This is deliberately
+stricter than Semantic Versioning 2.0.0, which sets no size limit (some valid
+20-digit numbers that fit in uint64 are refused too). It fails closed, and no
+real image tag is affected.
+*/}}
+{{- $num := "(0|[1-9][0-9]{0,18})" }}
+{{- $preId := "(0|[1-9][0-9]{0,18}|[0-9]*[A-Za-z-][0-9A-Za-z-]*)" }}
+{{- $semverRe := printf "^v?%s\\.%s\\.%s(-%s(\\.%s)*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$" $num $num $num $preId $preId }}
+{{- if $root.Values.image.digest }}
+{{- print "unverified" }}
+{{- else if and (regexMatch $semverRe $tag) (not $minVersion) }}
+{{- /* With an empty version floor, every version tag fails, and the message names the nightly, never a version floor. */}}
+{{- if $defaultTag }}
+{{- fail (printf "image.tag is not set, so the tag is the chart's appVersion (%s), a version tag, and no versioned hub release serves the relay hop with the internal_tls_* settings yet, so a version tag cannot pass: set image.tag to nightly-%s or later, or set image.digest, or %s." $root.Chart.AppVersion $min.nightly $off) }}
+{{- end }}
+{{- fail (printf "the hub image tag %s is a version tag, and no versioned hub release serves the relay hop with the internal_tls_* settings yet, so a version tag cannot pass: use nightly-%s or later, set image.digest, or %s." (include "scion-hub.diagValue" $tag) $min.nightly $off) }}
+{{- else if regexMatch $semverRe $tag }}
+{{- if lt ((semver $tag).Compare (semver $minVersion)) 0 }}
+{{- fail (printf "the hub image tag %s is older than %s, the first hub release that serves the relay hop with the internal_tls_* settings. An older hub ignores them and would serve the hop in plaintext. %s" (include "scion-hub.diagValue" $tag) $minVersion $remedy) }}
+{{- end }}
+{{- print "ok" }}
+{{- else if regexMatch "^v?[0-9]+\\.[0-9]+\\.[0-9]+" $tag }}
+{{- if $minVersion }}
+{{- fail (printf "the hub image tag %s starts like a version but is not a valid semantic version, so the chart cannot compare it with the minimum hub release that serves the relay hop with the internal_tls_* settings (nightly-%s or later%s). Use a valid version tag or an image digest, or %s." (include "scion-hub.diagValue" $tag) $min.nightly $orReleaseParen $off) }}
+{{- end }}
+{{- fail (printf "the hub image tag %s starts like a version but is not a valid semantic version, and no versioned hub release serves the relay hop with the internal_tls_* settings yet. Use nightly-%s or later or an image digest, or %s." (include "scion-hub.diagValue" $tag) $min.nightly $off) }}
+{{- else if regexMatch "^nightly-[0-9]{8}$" $tag }}
+{{- if lt (trimPrefix "nightly-" $tag) (toString $min.nightly) }}
+{{- fail (printf "the hub image tag %s is older than nightly-%s, the first nightly that serves the relay hop with the internal_tls_* settings. An older hub ignores them and would serve the hop in plaintext. %s" (include "scion-hub.diagValue" $tag) $min.nightly $remedy) }}
+{{- end }}
+{{- print "ok" }}
+{{- else }}
+{{- print "unverified" }}
+{{- end }}
+{{- end }}
+
+{{/*
+Whether the hub image check applies, and its result: "ok", "unverified" or ""
+(it does not apply). It applies when the chart's relay wiring is on, and also
+when config.extra sets a non-loopback server.hub.conduit.internal_listen with
+the wiring off: in both cases an older hub would ignore the internal_tls_*
+settings and serve that listener in plaintext. A loopback listener needs no
+TLS, so it needs no check. An older image fails the render (in
+scion-hub.relayTlsImageCheck).
+*/}}
+{{- define "scion-hub.relayImageCheck" -}}
+{{- $relayTls := include "scion-hub.relayTls" . | fromYaml }}
+{{- if $relayTls }}
+{{- print $relayTls.imageCheck }}
+{{- else }}
+{{- $listen := toString (dig "server" "hub" "conduit" "internal_listen" "" (.Values.config.extra | default (dict))) }}
+{{- if and $listen (not (include "scion-hub.isLoopbackListen" $listen)) }}
+{{- include "scion-hub.relayTlsImageCheck" (dict "root" . "via" "extra") }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+"true" when a listen value is a loopback host:port as the hub reads it (see
+scion-hub.assertRelayListenerTls), else empty.
+*/}}
+{{- define "scion-hub.isLoopbackListen" -}}
+{{- $hostPort := "^(|\\[[^\\[\\]]+\\]|[^:\\[\\]]+):([1-9][0-9]{0,4})$" }}
+{{- if regexMatch $hostPort . }}
+{{- $host := regexReplaceAll $hostPort . "${1}" }}
+{{- $oct := "(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])" }}
+{{- if or (eq $host "[::1]") (regexMatch (printf "^127\\.%s\\.%s\\.%s$" $oct $oct $oct) $host) }}true{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+================================================================================
+POD DISRUPTION BUDGET AND SEPARATE CONDUIT RELAY ROLE.
+================================================================================
+*/}}
+
+{{/*
+Validates and renders the budget field (minAvailable or maxUnavailable) for a
+PodDisruptionBudget. Expects dict: pdb (map), prefix ("hub.pdb" or "relay.pdb").
+When enabled is false, checks that neither minAvailable nor maxUnavailable was
+set inertly? No: under enabled=false, minAvailable/maxUnavailable are allowed to
+stay unset; we validate both-set and format whenever enabled is true (and
+refuse malformed values even when disabled).
+*/}}
+{{- define "scion-hub.pdbBudget" -}}
+{{- $pdb := .pdb | default (dict) }}
+{{- $prefix := .prefix }}
+{{- $minRaw := trim (toString (ternary "" $pdb.minAvailable (eq (toString $pdb.minAvailable) "<nil>"))) }}
+{{- $maxRaw := trim (toString (ternary "" $pdb.maxUnavailable (eq (toString $pdb.maxUnavailable) "<nil>"))) }}
+{{- $validBudget := "^(0|[1-9][0-9]*|(100|[1-9]?[0-9])%)$" }}
+{{- if and $minRaw (not (regexMatch $validBudget $minRaw)) }}
+{{- fail (printf "%s.minAvailable is %s; it must be a non-negative integer or a percentage such as \"50%%\"." $prefix (include "scion-hub.diagValue" $minRaw)) }}
+{{- end }}
+{{- if and $maxRaw (not (regexMatch $validBudget $maxRaw)) }}
+{{- fail (printf "%s.maxUnavailable is %s; it must be a non-negative integer or a percentage such as \"50%%\"." $prefix (include "scion-hub.diagValue" $maxRaw)) }}
+{{- end }}
+{{- if and $minRaw $maxRaw }}
+{{- fail (printf "%s.minAvailable and %s.maxUnavailable are both set; Kubernetes PodDisruptionBudget accepts one or the other, never both." $prefix $prefix) }}
+{{- end }}
+{{- if $pdb.enabled }}
+{{- if $maxRaw }}
+{{- if regexMatch "^[0-9]+$" $maxRaw }}
+maxUnavailable: {{ int $maxRaw }}
+{{- else }}
+maxUnavailable: {{ $maxRaw | quote }}
+{{- end }}
+{{- else if $minRaw }}
+{{- if regexMatch "^[0-9]+$" $minRaw }}
+minAvailable: {{ int $minRaw }}
+{{- else }}
+minAvailable: {{ $minRaw | quote }}
+{{- end }}
+{{- else }}
+maxUnavailable: 1
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Returns "true" when separate Conduit Relay manifests should render, else "".
+relay.enabled accepts true, false or "auto" (on when conduit.relayMode is
+"external" and config.existingSecret is empty).
+*/}}
+{{- define "scion-hub.relayEnabled" -}}
+{{- $conduit := .Values.conduit | default (dict) }}
+{{- $relayMode := trim (toString ($conduit.relayMode | default "in_process")) }}
+{{- $r := .Values.relay | default (dict) }}
+{{- $mode := toString (ternary "auto" $r.enabled (eq (toString $r.enabled) "<nil>")) }}
+{{- if not (has $mode (list "true" "false" "auto")) }}
+{{- fail (printf "relay.enabled is %s; it must be true, false or \"auto\"." (include "scion-hub.diagValue" $mode)) }}
+{{- end }}
+{{- if and (not .Values.config.existingSecret) (or (eq $mode "true") (and (eq $mode "auto") (eq $relayMode "external"))) -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+Validates conduit.relayMode, conduit.peerAuth, conduit.peerSecret, and
+conduit.existingPeerSecret / existingPeerSecretKey. Emits normalized YAML map.
+Called unconditionally from templates/deployment.yaml as well as settings.
+*/}}
+{{- define "scion-hub.conduitConfig" -}}
+{{- $c := .Values.conduit | default (dict) }}
+{{- $relayMode := trim (toString ($c.relayMode | default "in_process")) }}
+{{- if not (has $relayMode (list "in_process" "external")) }}
+{{- fail (printf "conduit.relayMode is %s; it must be \"in_process\" or \"external\"." (include "scion-hub.diagValue" $relayMode)) }}
+{{- end }}
+{{- $peerAuth := trim (toString ($c.peerAuth | default "auto")) }}
+{{- if not (has $peerAuth (list "auto" "hmac" "oidc")) }}
+{{- fail (printf "conduit.peerAuth is %s; it must be \"auto\", \"hmac\" or \"oidc\"." (include "scion-hub.diagValue" $peerAuth)) }}
+{{- end }}
+{{- if and (eq $relayMode "external") (not .Values.config.existingSecret) }}
+{{- if eq $peerAuth "auto" }}
+{{- $peerAuth = "hmac" }}
+{{- else if eq $peerAuth "oidc" }}
+{{- $extraIngress := trim (toString (dig "server" "hub" "conduit" "ingress" "proxy" (.Values.config.extra | default (dict)))) }}
+{{- if eq $extraIngress "proxy" }}
+{{- fail "conduit.relayMode is external and conduit.peerAuth is \"oidc\", which leaves the hub's proxy ingress disabled at startup (cause ingress_requires_hmac). Set conduit.peerAuth: \"hmac\" (or leave it at \"auto\", which resolves to \"hmac\" in external mode)." }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- $rawPeerSecret := toString ($c.peerSecret | default "") }}
+{{- $normPeerSecret := trimSuffix "\n" $rawPeerSecret }}
+{{- $existingPeer := trim (toString ($c.existingPeerSecret | default "")) }}
+{{- $existingPeerKey := trim (toString ($c.existingPeerSecretKey | default "")) }}
+{{- if and (ne $rawPeerSecret "") $existingPeer }}
+{{- fail "conduit.peerSecret and conduit.existingPeerSecret are both set. Set one or the other: conduit.existingPeerSecret to reference a Secret you manage, or conduit.peerSecret to render it into the settings Secret." }}
+{{- end }}
+{{- if and $existingPeerKey (not $existingPeer) }}
+{{- fail "conduit.existingPeerSecretKey is set but conduit.existingPeerSecret is not. Set conduit.existingPeerSecret too, or remove conduit.existingPeerSecretKey." }}
+{{- end }}
+{{- if and $existingPeer (not (regexMatch "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" $existingPeer)) }}
+{{- fail (printf "conduit.existingPeerSecret is %s; it must be a Kubernetes Secret name (lower-case letters, digits, '-' and '.')." (include "scion-hub.diagValue" $existingPeer)) }}
+{{- end }}
+{{- if and $existingPeerKey (not (regexMatch "^[-._a-zA-Z0-9]+$" $existingPeerKey)) }}
+{{- fail (printf "conduit.existingPeerSecretKey is %s; it must be a Secret data key such as SCION_SERVER_HUB_CONDUIT_PEERSECRET." (include "scion-hub.diagValue" $existingPeerKey)) }}
+{{- end }}
+{{- if and (ne $rawPeerSecret "") (eq $normPeerSecret "") }}
+{{- fail "conduit.peerSecret contains only a newline, which normalizes to unset; provide a secret of at least 32 octets." }}
+{{- end }}
+{{- if ne $normPeerSecret "" }}
+{{- if lt (len $normPeerSecret) 32 }}
+{{- fail "conduit.peerSecret is shorter than 32 octets; server.hub.conduit.peer_secret requires at least 32 octets with at least 16 distinct octets." }}
+{{- end }}
+{{- $seenChars := dict }}
+{{- range $ch := splitList "" $normPeerSecret }}
+{{- if ne $ch "" }}{{- $_ := set $seenChars $ch true }}{{- end }}
+{{- end }}
+{{- if lt (len $seenChars) 16 }}
+{{- fail "conduit.peerSecret has fewer than 16 distinct characters; server.hub.conduit.peer_secret requires at least 16 distinct octets." }}
+{{- end }}
+{{- $inlineSession := trimSuffix "\n" (toString ((.Values.auth | default (dict)).sessionSecret | default "")) }}
+{{- if and $inlineSession (eq $normPeerSecret $inlineSession) }}
+{{- fail "conduit.peerSecret must differ from auth.sessionSecret: the hub refuses a relay-peer secret equal to its session secret." }}
+{{- end }}
+{{- end }}
+{{- $relayOn := eq (include "scion-hub.relayEnabled" .) "true" }}
+{{- if and (or (and (eq $relayMode "external") (not .Values.config.existingSecret)) $relayOn) (eq $normPeerSecret "") (not $existingPeer) }}
+{{- fail "conduit.relayMode is external (or relay is enabled), which requires a shared relay-peer secret: set conduit.existingPeerSecret (preferred) or conduit.peerSecret." }}
+{{- end }}
+{{- $out := dict
+    "relayMode" $relayMode
+    "peerAuth" $peerAuth
+    "peerSecret" $normPeerSecret
+    "existingPeerSecret" $existingPeer
+    "existingPeerSecretKey" (default "SCION_SERVER_HUB_CONDUIT_PEERSECRET" $existingPeerKey) }}
+{{- toYaml $out }}
+{{- end }}
+
+{{/*
+Name of the internal ClusterIP Service exposing the Hub pods' relay-tls port
+(9443) so separate relay pods can reach server.relay.hub_internal_url.
+NOTE: Service/<fullname>-relay selects HUB pods (scion-hub.selectorLabels), NOT
+relay pods — that name is fixed by the pre-existing default
+conduit.internalTls.serverName (<fullname>-relay.<namespace>.svc) for every
+release whose fullname <= 57 chars. Separate relay workload objects
+(Deployment/<fullname>-relay, PodDisruptionBudget/<fullname>-relay) share the
+base name in their own API groups/kinds, carry distinct selector labels
+(scion-hub.relaySelectorLabels: app.kubernetes.io/name = scion-hub-relay), and
+have no Service in front of them (Hubs dial relay pods directly by pod IP from
+relay_instances).
+*/}}
+{{- define "scion-hub.relayServiceName" -}}
+{{- $base := include "scion-hub.fullname" . }}
+{{- $cand := printf "%s-relay" $base }}
+{{- if le (len $cand) 63 -}}
+{{- $cand -}}
+{{- else -}}
+{{- $digest := sha256sum $cand | trunc 10 -}}
+{{- printf "%s-%s-relay" ($base | trunc 46 | trimSuffix "-") $digest -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Base resource name for separate Conduit Relay workload objects (Deployment,
+PodDisruptionBudget, ServiceAccount, and the -settings Secret suffix). Shares
+the <fullname>-relay stem with Service/<fullname>-relay across distinct resource
+kinds; relay workloads always select scion-hub.relaySelectorLabels, never Hub
+pods.
+*/}}
+{{- define "scion-hub.relayFullname" -}}
+{{- include "scion-hub.relayServiceName" . -}}
+{{- end }}
+
+{{/* Selector labels for separate Conduit Relay pods (distinct from Hub pods!). */}}
+{{- define "scion-hub.relaySelectorLabels" -}}
+app.kubernetes.io/name: {{ include "scion-hub.name" . }}-relay
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{/* Standard labels for separate Conduit Relay objects. */}}
+{{- define "scion-hub.relayLabels" -}}
+helm.sh/chart: {{ include "scion-hub.chart" . }}
+{{ include "scion-hub.relaySelectorLabels" . }}
+{{- if .Chart.AppVersion }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end }}
+app.kubernetes.io/component: relay
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end }}
+
+{{/* ServiceAccount name for separate Conduit Relay pods. */}}
+{{- define "scion-hub.relayServiceAccountName" -}}
+{{- $sa := (.Values.relay | default (dict)).serviceAccount | default (dict) }}
+{{- if $sa.create -}}
+{{- default (include "scion-hub.relayFullname" .) $sa.name -}}
+{{- else -}}
+{{- default "default" $sa.name -}}
+{{- end -}}
+{{- end }}
+
+{{/* Secret name holding the rendered settings.yaml for --role relay pods. */}}
+{{- define "scion-hub.relaySettingsSecretName" -}}
+{{- printf "%s-settings" (include "scion-hub.relayFullname" .) -}}
+{{- end }}
+
+{{/*
+CLI arguments for `scion server start --role relay`.
+--role relay rejects --enable-hub, --enable-runtime-broker, --enable-web, and
+--keyring-file*; it listens on --host / --port (server.hub.host / port).
+*/}}
+{{- define "scion-hub.relayArgs" -}}
+{{- $r := .Values.relay | default (dict) }}
+{{- $port := int ($r.port | default 8080) }}
+{{- $args := list
+    "server" "start"
+    "--foreground"
+    "--hosted"
+    "--role" "relay"
+    "--host" "0.0.0.0"
+    "--port" (printf "%d" $port)
+    "--global" }}
+{{- $reserved := list
+    "foreground" "hosted" "production" "role" "host" "port" "global"
+    "config" "c" "project" "g" "profile"
+    "enable-hub" "enable-runtime-broker" "enable-web" "web-port" "auto-provide"
+    "session-secret" "dev-auth" "auth-token" "test-mode"
+    "keyring-file" "keyring-file-allow-world-readable"
+    "internal-listen" "internal-advertise"
+    "internal-tls-cert-file" "internal-tls-key-file" "internal-tls-ca-file" "internal-tls-server-name" }}
+{{- range $raw := ($r.args | default (list)) }}
+{{- $s := toString $raw }}
+{{- if ne (trim $s) $s }}
+{{- fail (printf "relay.args entry %s has leading or trailing whitespace." (include "scion-hub.diagValue" $s)) }}
+{{- end }}
+{{- if hasPrefix "-" $s }}
+{{- $trimmed := regexReplaceAll "^--?" $s "" }}
+{{- $flag := lower (index (splitList "=" $trimmed) 0) }}
+{{- if has $flag $reserved }}
+{{- fail (printf "relay.args may not set --%s: that flag is owned by the chart or invalid on --role relay." $flag) }}
+{{- end }}
+{{- include "scion-hub.assertNoCredentialName" (dict "name" $flag "source" (printf "relay.args flag --%s: the name" $flag)) }}
+{{- end }}
+{{- include "scion-hub.assertNoCredential" (dict "value" $s "source" "relay.args entry") }}
+{{- $args = append $args $s }}
+{{- end }}
+{{- range $a := $args }}
+- {{ $a | quote }}
+{{- end }}
+{{- end }}
+
+{{/* Environment-variable guard for relay.extraEnv. */}}
+{{- define "scion-hub.assertRelayExtraEnv" -}}
+{{- $r := .Values.relay | default (dict) }}
+{{- $shadowable := list "HOME" "SCION_SERVER_HUB_CONDUIT_PEERSECRET" }}
+{{- range $entry := ($r.extraEnv | default (list)) }}
+{{- $name := toString (dig "name" "" $entry) }}
+{{- if or (regexMatch "^SCION_SERVER_(DATABASE|OIDC|SECRETS|RELAY)_" (upper $name)) (hasPrefix "SCION_SERVER_HUB_CONDUIT_" (upper $name)) }}
+{{- fail (printf "relay.extraEnv may not set %s: configure relay database, conduit and server.relay settings through the chart values instead." $name) }}
+{{- end }}
+{{- if has (upper $name) (list "SCION_SERVER_SESSION_SECRET" "SESSION_SECRET" "K_SERVICE") }}
+{{- fail (printf "relay.extraEnv may not set %s: --role relay must never carry the hub session secret or K_SERVICE on Kubernetes." $name) }}
+{{- end }}
+{{- if has $name $shadowable }}
+{{- fail (printf "relay.extraEnv may not set %s: the chart manages that environment variable on the relay container." $name) }}
+{{- end }}
+{{- if hasKey $entry "value" }}
+{{- include "scion-hub.assertNoCredentialName" (dict "name" (replace "_" "-" $name) "source" (printf "relay.extraEnv entry %s: the name" $name)) }}
+{{- include "scion-hub.assertNoCredential" (dict "value" (dig "value" "" $entry) "source" (printf "relay.extraEnv value of %s" $name)) }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/* Effective database auth mode ("iam" or "password") for relay pods under postgres. */}}
+{{- define "scion-hub.relayDatabaseAuth" -}}
+{{- $rDb := ((.Values.relay | default (dict)).database | default (dict)) }}
+{{- $auth := trim (toString ($rDb.auth | default "")) }}
+{{- if $auth -}}
+{{- $auth -}}
+{{- else -}}
+{{- trim (toString (.Values.database.auth | default "")) -}}
+{{- end -}}
+{{- end }}
+
+{{/* Effective Postgres database user for relay pods. */}}
+{{- define "scion-hub.relayDatabaseUser" -}}
+{{- $r := .Values.relay | default (dict) }}
+{{- $rDb := $r.database | default (dict) }}
+{{- $rUser := trim (toString ($rDb.user | default "")) }}
+{{- $auth := include "scion-hub.relayDatabaseAuth" . }}
+{{- if $rUser -}}
+{{- $rUser -}}
+{{- else if eq $auth "iam" -}}
+{{- $rGsa := trim (toString (($r.serviceAccount | default (dict)).gcpServiceAccount | default "")) }}
+{{- if $rGsa -}}
+{{- trimSuffix ".gserviceaccount.com" $rGsa -}}
+{{- else -}}
+{{- include "scion-hub.databaseUser" . -}}
+{{- end -}}
+{{- else -}}
+{{- include "scion-hub.databaseUser" . -}}
+{{- end -}}
+{{- end }}
+
+{{/* Derived server.database.url for --role relay pods under postgres. */}}
+{{- define "scion-hub.relayDatabaseUrl" -}}
+{{- if not .Values.cloudsql.enabled -}}
+{{- fail "database.driver is postgres on relay pods, which requires cloudsql.enabled: true." -}}
+{{- end -}}
+{{- $auth := include "scion-hub.relayDatabaseAuth" . -}}
+{{- if not (has $auth (list "iam" "password")) -}}
+{{- fail (printf "relay database authentication mode is %s; set relay.database.auth or database.auth to \"iam\" or \"password\"." (include "scion-hub.diagValue" $auth)) -}}
+{{- end -}}
+{{- $rDb := ((.Values.relay | default (dict)).database | default (dict)) -}}
+{{- $rPw := toString ($rDb.password | default "") -}}
+{{- if and (eq $auth "iam") $rPw -}}
+{{- fail "relay.database.password is set while effective relay database auth is iam; remove relay.database.password or set relay.database.auth: password." -}}
+{{- end -}}
+{{- $user := include "scion-hub.relayDatabaseUser" . | include "scion-hub.pctEncodeUserinfo" -}}
+{{- $cred := $user -}}
+{{- if eq $auth "password" -}}
+{{- $pw := ternary $rPw (toString (.Values.database.password | default "")) (ne $rPw "") -}}
+{{- if not $pw -}}
+{{- fail "relay database authentication is password, which requires relay.database.password or database.password." -}}
+{{- end -}}
+{{- $cred = printf "%s:%s" $user (include "scion-hub.pctEncodeUserinfo" $pw) -}}
+{{- end -}}
+{{- printf "postgres://%s@127.0.0.1:%d/%s?sslmode=disable" $cred (int .Values.cloudsql.port) .Values.database.name -}}
+{{- end }}
+
+{{/* Cloud SQL Auth Proxy sidecar container for --role relay pods. */}}
+{{- define "scion-hub.relayCloudsqlProxyContainer" -}}
+{{- $cs := .Values.cloudsql -}}
+{{- $auth := include "scion-hub.relayDatabaseAuth" . -}}
+{{- $args := list
+    "--structured-logs"
+    (printf "--port=%d" (int $cs.port))
+    "--health-check"
+    "--http-address=0.0.0.0"
+    (printf "--http-port=%d" (int $cs.healthCheckPort)) -}}
+{{- if eq $auth "iam" -}}
+{{- $args = append $args "--auto-iam-authn" -}}
+{{- end -}}
+{{- if $cs.privateIp -}}
+{{- $args = append $args "--private-ip" -}}
+{{- end -}}
+{{- $args = append $args $cs.instanceConnectionName -}}
+{{- range $a := $args -}}
+{{- include "scion-hub.assertNoCredential" (dict "value" $a "source" "relay cloud-sql-proxy argument") -}}
+{{- end -}}
+- name: cloud-sql-proxy
+  image: {{ include "scion-hub.cloudsqlProxyImage" . | quote }}
+  imagePullPolicy: {{ $cs.image.pullPolicy }}
+  args:
+    {{- range $a := $args }}
+    - {{ $a | quote }}
+    {{- end }}
+  startupProbe:
+    httpGet:
+      path: /startup
+      port: {{ int $cs.healthCheckPort }}
+    periodSeconds: 1
+    failureThreshold: 60
+    timeoutSeconds: 5
+  readinessProbe:
+    httpGet:
+      path: /readiness
+      port: {{ int $cs.healthCheckPort }}
+    periodSeconds: 10
+    failureThreshold: 3
+    timeoutSeconds: 5
+  securityContext:
+    {{- include "scion-hub.nonRootSecurityContext" . | nindent 4 }}
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+  {{- with $cs.resources }}
+  resources:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+
+{{/* Port-collision check inside the relay pod's network namespace. */}}
+{{- define "scion-hub.assertRelayPorts" -}}
+{{- $r := .Values.relay | default (dict) }}
+{{- $relayPort := int ($r.port | default 8080) }}
+{{- $relayTls := include "scion-hub.relayTls" . | fromYaml }}
+{{- $seen := dict (printf "p%d" $relayPort) "relay.port" }}
+{{- if $relayTls }}
+{{- $tk := printf "p%d" (int $relayTls.port) }}
+{{- if hasKey $seen $tk }}
+{{- fail (printf "port %d is claimed by both %s and conduit.internalTls.port inside the relay pod." (int $relayTls.port) (get $seen $tk)) }}
+{{- end }}
+{{- $_ := set $seen $tk "conduit.internalTls.port" }}
+{{- end }}
+{{- if .Values.cloudsql.enabled }}
+{{- range $p := list
+    (dict "n" (int .Values.cloudsql.port) "name" "cloudsql.port")
+    (dict "n" (int .Values.cloudsql.healthCheckPort) "name" "cloudsql.healthCheckPort") }}
+{{- $k := printf "p%d" $p.n }}
+{{- if hasKey $seen $k }}
+{{- fail (printf "port %d is claimed by both %s and %s inside the relay pod." $p.n (get $seen $k) $p.name) }}
+{{- end }}
+{{- $_ := set $seen $k $p.name }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Rendered settings.yaml for --role relay pods (templates/relay-secret-settings.yaml).
+Deliberately carries ONLY relay, conduit, trusted_proxies and database settings:
+zero hub session secrets, OAuth credentials, GCS storage buckets, Secret Manager
+settings, or Runtime Broker settings.
+*/}}
+{{- define "scion-hub.relaySettings" -}}
+{{- $r := .Values.relay | default (dict) }}
+{{- $rDb := $r.database | default (dict) }}
+{{- $driver := .Values.database.driver }}
+{{- $conduitCfg := include "scion-hub.conduitConfig" . | fromYaml }}
+{{- $relayTls := include "scion-hub.relayTls" . | fromYaml }}
+{{- if not $relayTls }}
+{{- fail "separate Conduit Relay pods require conduit.internalTls (enabled with conduit.internalTls.existingSecret) so hub and relay pods authenticate and encrypt the internal hop." }}
+{{- end }}
+{{- $defaultHubInternal := printf "https://%s.%s.svc:%d" (include "scion-hub.relayServiceName" .) .Release.Namespace (int $relayTls.port) }}
+{{- $hubInternalUrl := trim (toString ($r.hubInternalUrl | default "")) }}
+{{- if not $hubInternalUrl }}{{- $hubInternalUrl = $defaultHubInternal }}{{- end }}
+{{- if not (hasPrefix "https://" $hubInternalUrl) }}
+{{- fail (printf "relay.hubInternalUrl is %s; the internal hop to the hub must use https://." (include "scion-hub.diagValue" $hubInternalUrl)) }}
+{{- end }}
+{{- include "scion-hub.assertNoCredential" (dict "value" $hubInternalUrl "source" "relay.hubInternalUrl") }}
+{{- $publicUrl := trim (toString ($r.publicUrl | default "")) }}
+{{- if not $publicUrl }}{{- $publicUrl = include "scion-hub.baseUrl" . }}{{- end }}
+{{- if not (hasPrefix "https://" $publicUrl) }}
+{{- fail (printf "relay.publicUrl is %s; server.relay.public_url must use https://." (include "scion-hub.diagValue" $publicUrl)) }}
+{{- end }}
+{{- include "scion-hub.assertNoCredential" (dict "value" $publicUrl "source" "relay.publicUrl") }}
+{{- $conduitOut := dict
+    "internal_listen" (printf "0.0.0.0:%d" (int $relayTls.port))
+    "internal_tls_cert_file" (printf "%s/tls.crt" $relayTls.certDir)
+    "internal_tls_key_file" (printf "%s/tls.key" $relayTls.certDir)
+    "internal_tls_ca_file" (printf "%s/ca.crt" $relayTls.caDir)
+    "internal_tls_server_name" $relayTls.serverName }}
+{{- if ne (toString $conduitCfg.peerAuth) "auto" }}
+{{- $conduitOut = set $conduitOut "peer_auth" $conduitCfg.peerAuth }}
+{{- end }}
+{{- if $conduitCfg.peerSecret }}
+{{- $conduitOut = set $conduitOut "peer_secret" $conduitCfg.peerSecret }}
+{{- end }}
+{{- $hubOut := dict
+    "host" "0.0.0.0"
+    "port" (int ($r.port | default 8080))
+    "conduit" $conduitOut }}
+{{- $gcpProjectId := trim (toString (((.Values.secrets | default (dict)).gcpsm | default (dict)).projectId | default "")) }}
+{{- if $gcpProjectId }}
+{{- $hubOut = set $hubOut "gcp_project_id" $gcpProjectId }}
+{{- end }}
+{{- $database := dict
+    "driver" $driver
+    "max_open_conns" (int ($rDb.maxOpenConns | default 10))
+    "max_idle_conns" (int ($rDb.maxIdleConns | default 5))
+    "conn_max_lifetime" ($rDb.connMaxLifetime | default "30m")
+    "conn_max_idle_time" ($rDb.connMaxIdleTime | default "5m") }}
+{{- if eq $driver "postgres" }}
+{{- $database = set $database "url" (include "scion-hub.relayDatabaseUrl" .) }}
+{{- end }}
+{{- $trusted := list }}
+{{- range $cidr := ($r.trustedProxies | default (list)) }}
+{{- $cs := trim (toString $cidr) }}
+{{- include "scion-hub.assertNoCredential" (dict "value" $cs "source" "relay.trustedProxies") }}
+{{- $trusted = append $trusted $cs }}
+{{- end }}
+{{- $server := dict
+    "mode" "hosted"
+    "hub" $hubOut
+    "relay" (dict "hub_internal_url" $hubInternalUrl "public_url" $publicUrl)
+    "trusted_proxies" $trusted
+    "database" $database }}
+{{- $doc := dict "schema_version" "1" "server" $server }}
+{{- toYaml $doc -}}
+{{- end }}
+
+{{/*
+Credential-redacted SHA-256 checksum for relay-secret-settings.yaml, delegating
+to scion-hub.settingsChecksum so both secrets share one redaction and backstop.
+*/}}
+{{- define "scion-hub.relaySettingsChecksum" -}}
+{{- include "scion-hub.settingsChecksum" (dict "root" . "_settingsTemplate" "/relay-secret-settings.yaml") -}}
 {{- end }}

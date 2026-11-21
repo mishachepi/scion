@@ -1,0 +1,915 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package hub
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/experiments"
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/authzop"
+	"github.com/GoogleCloudPlatform/scion/pkg/messages"
+	"github.com/GoogleCloudPlatform/scion/pkg/messaging"
+	"github.com/GoogleCloudPlatform/scion/pkg/store"
+)
+
+// Error codes of the decision endpoints (design choices v4, 4.10).
+const (
+	ErrCodeDecisionReplaced    = "replaced"
+	ErrCodeDecisionWithdrawn   = "withdrawn"
+	ErrCodeDecisionDismissed   = "dismissed"
+	ErrCodeDecisionAnswered    = "already_answered"
+	ErrCodeNotRecordedAnswerer = "not_recorded_answerer"
+)
+
+// decisionsRoutePrefix is the subtree of the decision endpoints.
+const decisionsRoutePrefix = "/api/v1/decisions/"
+
+// decisionResponseQuestionMax caps the question quoted in the line delivered
+// to the asking agent.
+const decisionResponseQuestionMax = 200
+
+// DecisionAnswerRequest is the body of POST /api/v1/decisions/{rowId}/answer.
+// The client names the choice by id only; the label is always copied from
+// the stored decision.
+type DecisionAnswerRequest struct {
+	ChoiceID       string `json:"choice_id"`
+	OtherText      string `json:"other_text,omitempty"`
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
+	Surface        string `json:"surface,omitempty"`
+}
+
+// normalizeAnswerSurface validates the optional surface field on web answer
+// requests: empty or "native" records "native", and "decisions_page" records
+// "decisions_page". External channel surfaces ("slack", "google_chat", ...)
+// are set only by channel bridges or agent-interpreted recording.
+func normalizeAnswerSurface(raw string) (string, bool) {
+	switch strings.TrimSpace(raw) {
+	case "", store.DecisionSurfaceNative:
+		return store.DecisionSurfaceNative, true
+	case store.DecisionSurfaceDecisionsPage:
+		return store.DecisionSurfaceDecisionsPage, true
+	default:
+		return "", false
+	}
+}
+
+// DecisionAnswerResponse is the 200 answer of the answer endpoint.
+type DecisionAnswerResponse struct {
+	Decision          DecisionView `json:"decision"`
+	ResponseMessageID string       `json:"responseMessageId"`
+	Replayed          bool         `json:"replayed,omitempty"`
+}
+
+// handleDecisionRoutes serves the decision endpoints, 404 while
+// web.decisions is off:
+//
+//	GET  /api/v1/decisions/{rowId}         the decision's view
+//	POST /api/v1/decisions/{rowId}/answer  answer it (a user, never an agent)
+func (s *Server) handleDecisionRoutes(w http.ResponseWriter, r *http.Request) {
+	s.requireExperiment(experiments.Decisions, func(w http.ResponseWriter, r *http.Request) {
+		rest := strings.TrimPrefix(r.URL.Path, decisionsRoutePrefix)
+		rowID, sub, _ := strings.Cut(rest, "/")
+		switch {
+		case rowID == "":
+			NotFound(w, "Decision")
+		case sub == "":
+			if r.Method != http.MethodGet {
+				MethodNotAllowed(w, http.MethodGet)
+				return
+			}
+			s.handleDecisionGet(w, r, rowID)
+		case sub == "answer":
+			if r.Method != http.MethodPost {
+				MethodNotAllowed(w, http.MethodPost)
+				return
+			}
+			s.handleDecisionAnswer(w, r, rowID)
+		default:
+			NotFound(w, "Decision")
+		}
+	})(w, r)
+}
+
+// decisionCaller returns the user calling a decision endpoint, or writes
+// the refusal: agents (an agent never answers directly, design 5 item 2),
+// visitors get 403, and every other credential that is not a web session
+// or dev credential (a user access token, a federated user) gets the
+// session-only 403 (reason INTERACTIVE_STATE, credential
+// session_required). Phase 1 answers come from the web session only.
+func decisionCaller(w http.ResponseWriter, r *http.Request) UserIdentity {
+	ctx := r.Context()
+	if GetAgentIdentityFromContext(ctx) != nil {
+		writeError(w, http.StatusForbidden, ErrCodeForbidden, "agents cannot answer or read decisions here", nil)
+		return nil
+	}
+	user := GetUserIdentityFromContext(ctx)
+	if isNilIdentity(user) {
+		Unauthorized(w)
+		return nil
+	}
+	if isVisitorIdentity(user) {
+		writeError(w, http.StatusForbidden, ErrCodeForbidden, "decisions are answered from a web session", nil)
+		return nil
+	}
+	// Only a web session (or a dev credential) may answer or read: every
+	// other user credential gets the session-only refusal the catalog
+	// records for both decision routes. That is a user access token, and
+	// also a federated user, which chatRoute admits and which is neither
+	// a visitor nor a token.
+	if cls, _ := inboxCredentialOf(ctx); cls != inboxCredentialSession {
+		writeSessionOnlyDenial(w, ErrCodeForbidden, "decisions are answered from a web session", authzop.ReasonInteractiveState)
+		return nil
+	}
+	return user
+}
+
+// decisionAsker reads the asking agent of a decision answer, before anything
+// is recorded; both answer endpoints use it. A hard-deleted (store.ErrNotFound)
+// or soft-deleted (!a.DeletedAt.IsZero()) asker is the gone case (design
+// choices v4: the answers are still recorded, and dispatch follows the
+// undeliverable semantics): the response row is stored failed and nothing is
+// delivered. Any other lookup error, or no agent without an error, writes an
+// error response and returns ok false, so the messaging check never runs on a
+// missing agent.
+func (s *Server) decisionAsker(w http.ResponseWriter, ctx context.Context, agentID string) (asker *store.Agent, gone bool, ok bool) {
+	a, err := s.store.GetAgent(ctx, agentID)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return nil, true, true
+	case err != nil:
+		writeErrorFromErr(w, err, "")
+		return nil, false, false
+	case a == nil:
+		InternalError(w)
+		return nil, false, false
+	case !a.DeletedAt.IsZero():
+		return nil, true, true
+	}
+	return a, false, true
+}
+
+// authorizeDecisionChatKey authorizes user on the prompt's conversation key
+// (stored chat_key, or fallback messages.thread_id): authorizeChatSend to
+// answer a topic, authorizeChatSendRead (with soft-deleted topic read fallback
+// for project readers) to read one, and canonical DM participant + live peer
+// read verification for a DM key. A deleted (hard or soft) agent peer in a DM
+// key remains readable and answerable by the DM participant under gone-asker
+// undeliverable semantics (decisionAsker); for a live agent peer, the caller
+// must hold ActionRead on the agent (live message-mode checks run in the
+// answer handlers after state resolution because confirm needs no delivery).
+func (s *Server) authorizeDecisionChatKey(ctx context.Context, user UserIdentity, key string, answering bool) *chatSendError {
+	if user == nil {
+		return chatSendForbidden()
+	}
+	s.mu.RLock()
+	wcs := s.webChatStore
+	s.mu.RUnlock()
+	if wcs == nil {
+		return newChatSendError(http.StatusServiceUnavailable, "SERVICE_UNAVAILABLE", "Chat not available", nil)
+	}
+	if strings.HasPrefix(key, "dm:") {
+		if serr := authorizeDMKeyParticipant(ctx, user, key, chatSendPath(key)); serr != nil {
+			return serr
+		}
+		kindA, idA, kindB, idB, err := messages.ParseDMKey(key)
+		if err != nil {
+			return chatSendBadRequest("invalid DM key format")
+		}
+		if canonical, cerr := messages.DMConversationKey(kindA, idA, kindB, idB); cerr != nil || canonical != key {
+			return chatSendBadRequest("invalid DM key format")
+		}
+		peerKind, peerID := kindA, idA
+		if kindA == "user" && idA == user.ID() {
+			peerKind, peerID = kindB, idB
+		}
+		switch peerKind {
+		case "agent":
+			ag, err := s.store.GetAgent(ctx, peerID)
+			if errors.Is(err, store.ErrNotFound) || (err == nil && ag != nil && !ag.DeletedAt.IsZero()) {
+				return nil
+			}
+			if err != nil || ag == nil {
+				slog.Warn("decisions: DM peer agent lookup failed", "error", err)
+				return newChatSendError(http.StatusServiceUnavailable, "SERVICE_UNAVAILABLE", "Chat not available", nil)
+			}
+			if s.authzService == nil || !s.authzService.CheckAccess(ctx, user, agentResource(ag), ActionRead).Allowed {
+				return dmPeerRefused(ctx, user, key, "sender may not read the DM peer agent")
+			}
+			return nil
+		case "user":
+			return s.authorizeDMPeer(ctx, user, key)
+		default:
+			return dmPeerRefused(ctx, user, key, "unknown DM peer kind")
+		}
+	}
+	if answering {
+		_, serr := s.authorizeChatSend(ctx, user, key)
+		return serr
+	}
+	_, serr := s.authorizeChatSendRead(ctx, user, key)
+	if serr == nil {
+		return nil
+	}
+	if serr.Status == http.StatusNotFound && validChatTopicKey(key) {
+		topic, terr := wcs.GetTopicIncludingDeleted(ctx, key)
+		if terr != nil {
+			logChatStoreFault(ctx, slog.Default(), "decision read: topic lookup failed", key, terr)
+			return newChatSendError(http.StatusInternalServerError, ErrCodeInternalError, "Internal server error", nil)
+		}
+		if topic != nil && topic.DeletedAt != nil {
+			project, perr := s.store.GetProject(ctx, topic.ProjectID)
+			if perr != nil {
+				if errors.Is(perr, store.ErrNotFound) {
+					return serr
+				}
+				logChatStoreFault(ctx, slog.Default(), "decision read: topic project lookup failed", key, perr)
+				return newChatSendError(http.StatusInternalServerError, ErrCodeInternalError, "Internal server error", nil)
+			}
+			access, aerr := s.chatThreadAccess(ctx, user, chatThreadRef{Key: key, Project: project})
+			if aerr != nil {
+				return newChatSendError(http.StatusInternalServerError, ErrCodeInternalError, "Internal server error", nil)
+			}
+			if access.Can(ChatActionRead) {
+				return nil
+			}
+			return chatSendRefusedAsNotFound("Thread")
+		}
+	}
+	return serr
+}
+
+// loadAuthorizedDecision reads the decision and authorizes the caller on the
+// prompt's conversation (using stored chat_key so authorization survives chat
+// retention purging the prompt message, falling back to messages.thread_id for
+// pre-backfill rows). A missing row, a purged row with no chat_key, and a
+// refused caller all answer 404, so a row id reveals nothing.
+func (s *Server) loadAuthorizedDecision(w http.ResponseWriter, ctx context.Context, user UserIdentity, rowID string, answering bool) (*store.Decision, string, bool) {
+	d, err := s.store.GetDecision(ctx, rowID)
+	if err != nil || d == nil {
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			writeErrorFromErr(w, err, "")
+			return nil, "", false
+		}
+		NotFound(w, "Decision")
+		return nil, "", false
+	}
+	var prompt *store.Message
+	if m, merr := s.store.GetMessage(ctx, d.MessageID); merr == nil {
+		prompt = m
+	} else if !errors.Is(merr, store.ErrNotFound) {
+		writeErrorFromErr(w, merr, "")
+		return nil, "", false
+	}
+	chatKey := d.ChatKey
+	if chatKey == "" && prompt != nil {
+		chatKey = prompt.ThreadID
+	}
+	if chatKey == "" {
+		NotFound(w, "Decision")
+		return nil, "", false
+	}
+	if serr := s.authorizeDecisionChatKey(ctx, user, chatKey, answering); serr != nil {
+		if serr.Status == http.StatusNotFound || serr.accessRefused {
+			NotFound(w, "Decision")
+			return nil, "", false
+		}
+		serr.write(w)
+		return nil, "", false
+	}
+	return d, chatKey, true
+}
+
+// handleDecisionGet serves GET /api/v1/decisions/{rowId}.
+func (s *Server) handleDecisionGet(w http.ResponseWriter, r *http.Request, rowID string) {
+	user := decisionCaller(w, r)
+	if user == nil {
+		return
+	}
+	d, _, ok := s.loadAuthorizedDecision(w, r.Context(), user, rowID, false)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"decision": s.decisionViewFor(r.Context(), d)})
+}
+
+// handleDecisionAnswer serves POST /api/v1/decisions/{rowId}/answer (design
+// 4.10 steps 1 to 6).
+func (s *Server) handleDecisionAnswer(w http.ResponseWriter, r *http.Request, rowID string) {
+	ctx := r.Context()
+	user := decisionCaller(w, r)
+	if user == nil {
+		return
+	}
+	var req DecisionAnswerRequest
+	if err := readJSON(r, &req); err != nil {
+		BadRequest(w, "Invalid request body: "+err.Error())
+		return
+	}
+	req.ChoiceID = strings.TrimSpace(req.ChoiceID)
+	if req.ChoiceID == "" {
+		ValidationError(w, "choice_id is required", map[string]interface{}{"field": "choice_id"})
+		return
+	}
+	if messages.IsReservedChoiceID(req.ChoiceID) && req.ChoiceID != messages.ChoiceIDOther {
+		ValidationError(w, fmt.Sprintf("choice %q is reserved", req.ChoiceID), map[string]interface{}{"field": "choice_id"})
+		return
+	}
+	if len(req.IdempotencyKey) > store.MaxDecisionIdempotencyKeyLen {
+		ValidationError(w, fmt.Sprintf("idempotency_key is at most %d bytes", store.MaxDecisionIdempotencyKeyLen),
+			map[string]interface{}{"field": "idempotency_key"})
+		return
+	}
+	surface, ok := normalizeAnswerSurface(req.Surface)
+	if !ok {
+		ValidationError(w, fmt.Sprintf("surface %q is not supported; expected %q or %q", req.Surface, store.DecisionSurfaceNative, store.DecisionSurfaceDecisionsPage),
+			map[string]interface{}{"field": "surface"})
+		return
+	}
+
+	// Steps 1 and 2: the row, its conversation, the caller's send rights.
+	d, chatKey, ok := s.loadAuthorizedDecision(w, ctx, user, rowID, true)
+	if !ok {
+		return
+	}
+	// A row of a prompt with two or more decisions is answered only with
+	// the rest of its set (design choices v5, 4.3).
+	if rows, err := s.store.GetDecisionsByMessageIDs(ctx, []string{d.MessageID}); err != nil {
+		writeErrorFromErr(w, err, "")
+		return
+	} else if ds := rows[d.MessageID]; len(ds) >= 2 {
+		s.writeBatchRequired(w, ctx, user, d.MessageID, ds)
+		return
+	}
+	// Step 4: the choice is checked against the stored row; the label is
+	// never taken from the client. "$other" is allowed explicitly iff the
+	// decision enabled allow_other (design-8146 §4.3).
+	var choice messages.Choice
+	if req.ChoiceID == messages.ChoiceIDOther {
+		if d.Other == nil {
+			ValidationError(w, fmt.Sprintf("choice %q is not a choice of decision %s", req.ChoiceID, d.Key),
+				map[string]interface{}{"field": "choice_id", "code": ErrCodeInvalidChoice})
+			return
+		}
+		choice = messages.Choice{
+			ID:          messages.ChoiceIDOther,
+			Label:       d.Other.Label,
+			Description: d.Other.Description,
+		}
+	} else {
+		var ok bool
+		choice, ok = d.Choice(req.ChoiceID)
+		if !ok {
+			ValidationError(w, fmt.Sprintf("choice %q is not a choice of decision %s", req.ChoiceID, d.Key),
+				map[string]interface{}{"field": "choice_id", "code": ErrCodeInvalidChoice})
+			return
+		}
+	}
+	otherText, verr := messages.NormalizeOtherText(choice.ID, req.OtherText)
+	if verr != nil {
+		ValidationError(w, verr.Message, map[string]interface{}{
+			"field": verr.Field,
+			"code":  verr.Code,
+		})
+		return
+	}
+
+	// Step 3a: a true replay. The answer recorded under this idempotency
+	// key, if it is this user's answer with this choice and other_text, is
+	// answered again (200, replayed) before any state check, so a retry
+	// after the version was replaced or answered still gets its answer.
+	// The key used for any other answer is a conflict. A key with no
+	// recorded answer is a fresh answer and gets every check below.
+	if req.IdempotencyKey != "" {
+		if prior := answerWithIdempotencyKey(d, req.IdempotencyKey); prior != nil {
+			if prior.ChoiceID != choice.ID || prior.OtherText != otherText || prior.AnsweredByUserID != user.ID() {
+				s.writeDecisionAnswered(w, ctx, d)
+				return
+			}
+			writeJSON(w, http.StatusOK, DecisionAnswerResponse{
+				Decision: s.decisionViewFor(ctx, d), ResponseMessageID: prior.ResponseMessageID, Replayed: true,
+			})
+			return
+		}
+	}
+
+	// Step 3b: state, for every answer that is not a replay.
+	outcome := store.DecisionOutcomeAnswer
+	var overridden *store.DecisionAnswer
+	if store.DecisionStatusTerminal(d.Status) {
+		switch d.Status {
+		case store.DecisionStatusReplaced:
+			s.writeDecisionReplaced(w, ctx, d)
+		case store.DecisionStatusDismissed:
+			s.writeDecisionDismissed(w, ctx, d)
+		default:
+			s.writeDecisionWithdrawn(w, ctx, d)
+		}
+		return
+	}
+	if eff := d.EffectiveAnswer(); eff != nil {
+		if eff.Provenance == store.DecisionProvenanceDirect {
+			s.writeDecisionAnswered(w, ctx, d)
+			return
+		}
+		// An interpreted answer: only the user the agent recorded as
+		// the answerer may confirm or override it (Q2).
+		if eff.AnsweredByUserID == "" || eff.AnsweredByUserID != user.ID() {
+			s.writeNotRecordedAnswerer(w, ctx, d)
+			return
+		}
+		outcome = store.DecisionOutcomeConfirm
+		if eff.ChoiceID != choice.ID || eff.OtherText != otherText {
+			outcome = store.DecisionOutcomeOverride
+			overridden = eff
+		}
+	}
+
+	// Per-user answer rate limit: the chat send limiter (design 5 item 7).
+	if !s.allowChatSend(w, user.ID(), chatSenderHuman) {
+		return
+	}
+
+	asker, askerGone, ok := s.decisionAsker(w, ctx, d.AskerAgentID)
+	if !ok {
+		return
+	}
+	// The decision-response is a message from the user to the asking agent:
+	// it gets the messaging check of a chat send to an agent
+	// (sendAgentRouted), before anything is recorded. Nothing is delivered
+	// to a gone asker or for a confirm, so those need none.
+	willDeliver := !askerGone && outcome != store.DecisionOutcomeConfirm
+	if willDeliver {
+		if allowed, reason, _ := s.authorizeAgentMessage(ctx, user, asker, false); !allowed {
+			writeError(w, http.StatusForbidden, ErrCodeMessageDenied, "Message delivery denied", map[string]interface{}{
+				"reason":        mapReasonToCode(reason),
+				"senderMode":    "user",
+				"recipientMode": asker.MessageMode,
+			})
+			return
+		}
+	}
+	responseMsg := s.decisionResponseStoreMessage(ctx, user, d, chatKey, choice, otherText, asker, askerGone, willDeliver)
+
+	// Step 5: record the answer and store the response, in one transaction.
+	answer, replayed, err := s.store.RecordAnswer(ctx, &store.RecordAnswerInput{
+		DecisionRowID:    d.ID,
+		ChoiceID:         choice.ID,
+		OtherText:        otherText,
+		AnsweredByUserID: user.ID(),
+		AnsweredByName:   user.DisplayName(),
+		AnsweredByEmail:  user.Email(),
+		Provenance:       store.DecisionProvenanceDirect,
+		Outcome:          outcome,
+		Surface:          surface,
+		ResponseMessage:  responseMsg,
+		IdempotencyKey:   req.IdempotencyKey,
+	})
+	switch {
+	case err == nil:
+	case errors.Is(err, store.ErrDecisionReplaced), errors.Is(err, store.ErrDecisionWithdrawn):
+		if cur, gerr := s.store.GetDecision(ctx, d.ID); gerr == nil {
+			d = cur
+		}
+		if d.Status == store.DecisionStatusWithdrawn || (errors.Is(err, store.ErrDecisionWithdrawn) && d.Status != store.DecisionStatusReplaced) {
+			s.writeDecisionWithdrawn(w, ctx, d)
+			return
+		}
+		s.writeDecisionReplaced(w, ctx, d)
+		return
+	case errors.Is(err, store.ErrDecisionDismissed):
+		if cur, gerr := s.store.GetDecision(ctx, d.ID); gerr == nil {
+			d = cur
+		}
+		s.writeDecisionDismissed(w, ctx, d)
+		return
+	case errors.Is(err, store.ErrNotRecordedAnswerer):
+		// An interpreted answer recorded after the state check above.
+		if cur, gerr := s.store.GetDecision(ctx, d.ID); gerr == nil {
+			d = cur
+		}
+		s.writeNotRecordedAnswerer(w, ctx, d)
+		return
+	case errors.Is(err, store.ErrDecisionAnswerConflict), errors.Is(err, store.ErrDecisionOutcomeMismatch):
+		// The loser of a race, an idempotency key reused for another
+		// answer, or an interpreted answer recorded after the state check
+		// above (the outcome no longer fits): the current state wins.
+		if cur, gerr := s.store.GetDecision(ctx, d.ID); gerr == nil {
+			d = cur
+		}
+		s.writeDecisionAnswered(w, ctx, d)
+		return
+	case errors.Is(err, store.ErrInvalidInput):
+		ValidationError(w, err.Error(), nil)
+		return
+	default:
+		writeErrorFromErr(w, err, "")
+		return
+	}
+
+	cur, gerr := s.store.GetDecision(ctx, d.ID)
+	if gerr != nil {
+		writeErrorFromErr(w, gerr, "")
+		return
+	}
+	view := s.decisionViewFor(ctx, cur)
+	if replayed {
+		writeJSON(w, http.StatusOK, DecisionAnswerResponse{Decision: view, ResponseMessageID: answer.ResponseMessageID, Replayed: true})
+		return
+	}
+
+	// Step 6: publish the stored response, deliver it to the asker (not a
+	// confirmation: the agent already acted on that answer), and tell every
+	// open card.
+	s.publishDecisionResponse(ctx, responseMsg, cur, answer)
+	if !askerGone && outcome != store.DecisionOutcomeConfirm {
+		s.deliverDecisionResponse(ctx, asker, responseMsg, answer, overridden)
+	}
+	s.publishDecisionUpdatedAt(ctx, d.ProjectID, d.MessageID, chatKey, view)
+	writeJSON(w, http.StatusOK, DecisionAnswerResponse{Decision: view, ResponseMessageID: answer.ResponseMessageID})
+}
+
+// answerWithIdempotencyKey returns d's non-dismiss answer recorded under key, or nil.
+func answerWithIdempotencyKey(d *store.Decision, key string) *store.DecisionAnswer {
+	for _, a := range d.Answers {
+		if a.Outcome == store.DecisionOutcomeDismiss {
+			continue
+		}
+		if a.IdempotencyKey == key {
+			return a
+		}
+	}
+	return nil
+}
+
+// writeNotRecordedAnswerer answers 403: only the user an interpreted answer
+// records may confirm or change it.
+func (s *Server) writeNotRecordedAnswerer(w http.ResponseWriter, ctx context.Context, d *store.Decision) {
+	writeError(w, http.StatusForbidden, ErrCodeNotRecordedAnswerer,
+		"only the user recorded as the answerer can confirm or change this answer",
+		map[string]interface{}{"decision": s.decisionViewFor(ctx, d)})
+}
+
+// writeDecisionReplaced answers 409 replaced with the decision and the
+// newer version's view.
+func (s *Server) writeDecisionReplaced(w http.ResponseWriter, ctx context.Context, d *store.Decision) {
+	details := map[string]interface{}{"decision": s.decisionViewFor(ctx, d)}
+	if d.ReplacedByID != "" {
+		if newer, err := s.store.GetDecision(ctx, d.ReplacedByID); err == nil {
+			details["replacedBy"] = s.decisionViewFor(ctx, newer)
+		}
+	}
+	writeError(w, http.StatusConflict, ErrCodeDecisionReplaced,
+		fmt.Sprintf("decision %s v%d was replaced by a newer version", d.Key, d.Version), details)
+}
+
+// writeDecisionWithdrawn answers 409 withdrawn with the decision view.
+func (s *Server) writeDecisionWithdrawn(w http.ResponseWriter, ctx context.Context, d *store.Decision) {
+	writeError(w, http.StatusConflict, ErrCodeDecisionWithdrawn,
+		fmt.Sprintf("decision %s v%d was withdrawn", d.Key, d.Version),
+		map[string]interface{}{"decision": s.decisionViewFor(ctx, d)})
+}
+
+// writeDecisionDismissed answers 409 dismissed with the decision view.
+func (s *Server) writeDecisionDismissed(w http.ResponseWriter, ctx context.Context, d *store.Decision) {
+	writeError(w, http.StatusConflict, ErrCodeDecisionDismissed,
+		fmt.Sprintf("decision %s v%d was dismissed", d.Key, d.Version),
+		map[string]interface{}{"decision": s.decisionViewFor(ctx, d)})
+}
+
+// writeDecisionAnswered answers 409 already_answered with the effective
+// answer.
+func (s *Server) writeDecisionAnswered(w http.ResponseWriter, ctx context.Context, d *store.Decision) {
+	writeError(w, http.StatusConflict, ErrCodeDecisionAnswered,
+		fmt.Sprintf("decision %s v%d is already answered", d.Key, d.Version),
+		map[string]interface{}{"decision": s.decisionViewFor(ctx, d)})
+}
+
+// canAutoWakeDecisionAsker reports whether a decision-response to asker should
+// wake it in the background rather than marking the response unreachable.
+// Mirrors ordinary message auto-wake (ptone/scion#7826): lifecycle.idle_suspend
+// is on, the hub suspended the agent (idle or stalled) or an idle-suspend claim
+// is in flight, and the agent is not deleted, reincarnating, or held.
+func (s *Server) canAutoWakeDecisionAsker(ctx context.Context, asker *store.Agent) bool {
+	if asker == nil || !asker.DeletedAt.IsZero() || reincarnationInFlight(asker) {
+		return false
+	}
+	return s.shouldQueueAutoWake(asker) && !s.agentHeldOrUnknown(ctx, asker.ID)
+}
+
+// decisionResponseStoreMessage builds the decision-response row stored with the
+// answer: sender the answering user, recipient the asking agent, in the
+// prompt's conversation. A gone asker (askerGone; asker is then unused) or
+// one that cannot take a message (and will not auto-wake) gets the row born
+// failed, as a chat send to it would.
+func (s *Server) decisionResponseStoreMessage(ctx context.Context, user UserIdentity, d *store.Decision, chatKey string, choice messages.Choice, otherText string, asker *store.Agent, askerGone, willDeliver bool) *store.Message {
+	body := decisionResponseLine(userDisplay(user), d.Key, choice.Label, d.Question)
+	if choice.ID == messages.ChoiceIDOther {
+		body = decisionOtherResponseLine(userDisplay(user), d.Key, choice.Label, otherText, d.Question)
+	}
+	m := &store.Message{
+		ID:             api.NewUUID(),
+		ProjectID:      d.ProjectID,
+		Sender:         userSenderAddress(user),
+		SenderID:       user.ID(),
+		RecipientID:    d.AskerAgentID,
+		Msg:            body,
+		Type:           messages.TypeDecisionResponse,
+		AgentID:        d.AskerAgentID,
+		Channel:        "web",
+		ThreadID:       chatKey,
+		ConversationID: d.ConversationID,
+		DispatchState:  store.MessageDispatchDispatched,
+		CreatedAt:      time.Now().UTC(),
+	}
+	if askerGone {
+		m.Recipient = "agent:" + d.AskerAgentName
+		reason := agentGoneReason
+		m.DispatchState = store.MessageDispatchFailed
+		m.DispatchFailureReason = &reason
+	} else {
+		m.Recipient = "agent:" + asker.Slug
+		if unreachable, why := s.isAgentUnreachable(asker); unreachable && (!willDeliver || !s.canAutoWakeDecisionAsker(ctx, asker)) {
+			reason := agentUnreachableReason(why)
+			m.DispatchState = store.MessageDispatchFailed
+			m.DispatchFailureReason = &reason
+		}
+	}
+	return m
+}
+
+// userDisplay is how an answering user is named in the conversation.
+func userDisplay(user UserIdentity) string {
+	if n := strings.TrimSpace(user.DisplayName()); n != "" {
+		return n
+	}
+	if e := user.Email(); e != "" {
+		return e
+	}
+	return user.ID()
+}
+
+// decisionResponseLine is the stored body of a decision-response (design 4.4):
+// `ptone chose "yes" for D234 "Ship the feature now?"`.
+func decisionResponseLine(who, key, label, question string) string {
+	return fmt.Sprintf("%s chose %q for %s %q", who, label, key, truncateRunes(plainLine(question), decisionResponseQuestionMax))
+}
+
+// decisionOtherResponseLine is the stored fallback body of a free-form Other
+// decision-response (design-8146 §4.5):
+// `Alice answered "europe-west4 canary" (Another region) for region "Which region for the canary?"`,
+// with EscapeMarkdownPlain (which includes NeutralizeMentions) applied to the
+// typed text so @mentions, Markdown, and HTML stay literal.
+func decisionOtherResponseLine(who, key, label, otherText, question string) string {
+	return fmt.Sprintf("%s answered \"%s\" (%s) for %s %q",
+		who,
+		messages.EscapeMarkdownPlain(otherText),
+		messages.EscapeMarkdownPlain(label),
+		key,
+		truncateRunes(plainLine(question), decisionResponseQuestionMax))
+}
+
+// decisionResponseAgentLine is the hub-formatted line delivered to the asking
+// agent (design 4.4; Other free-form text per design-8146 §4.5): the question
+// is the agent's own text, truncated.
+func decisionResponseAgentLine(a *store.DecisionAnswer, overridden *store.DecisionAnswer) string {
+	who := a.AnsweredByEmail
+	if who == "" {
+		who = a.AnsweredByName
+	}
+	otherPart := ""
+	if a.ChoiceID == messages.ChoiceIDOther && a.OtherText != "" {
+		otherPart = " text=" + strconv.Quote(a.OtherText)
+	}
+	line := fmt.Sprintf("[decision-response] %s v%d (%q) answer=%s (choice %s)%s by %s",
+		a.Key, a.Version, truncateRunes(plainLine(a.QuestionText), decisionResponseQuestionMax), a.ChoiceLabel, a.ChoiceID, otherPart, who)
+	if overridden != nil {
+		line += ", overriding interpreted answer " + overridden.ChoiceLabel
+		if overridden.ChoiceID == messages.ChoiceIDOther && overridden.OtherText != "" {
+			line += " text=" + strconv.Quote(overridden.OtherText)
+		}
+	}
+	return line
+}
+
+// plainLine collapses whitespace so a multi-line question fits one line.
+func plainLine(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// truncateRunes cuts s to at most n runes, marking a cut with an ellipsis.
+func truncateRunes(s string, n int) string {
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	r := []rune(s)
+	return string(r[:n-1]) + "…"
+}
+
+// publishDecisionResponse emits the chat events of the stored response,
+// carrying its DecisionResponseView.
+func (s *Server) publishDecisionResponse(ctx context.Context, m *store.Message, d *store.Decision, a *store.DecisionAnswer) {
+	view := decisionResponseViewOf(a, d)
+	pubCtx := context.WithoutCancel(ctx)
+	opt := withDecisionEvent(&decisionEventPayload{Response: &view})
+	s.touchConversationActivity(pubCtx, m.ThreadID, m.ID)
+	s.events.PublishUserMessage(pubCtx, m, nil, nil, opt)
+	if !strings.HasPrefix(m.ThreadID, "dm:") {
+		s.fanOutThreadMessageToMembersAsync(pubCtx, m, nil, nil, opt)
+	}
+}
+
+// decisionResponseAutoWakeItem queues delivery of a persisted decision-response
+// behind a background auto-wake of the asking agent. It captures only immutable
+// values so it never races with the HTTP handler returning.
+func (s *Server) decisionResponseAutoWakeItem(messageID, agentSlug, text string, sm *messages.StructuredMessage, label string) autoWakeItem {
+	return autoWakeItem{
+		deliver: func(ctx context.Context, woken *store.Agent) {
+			var err error
+			if dispatcher := s.GetDispatcher(); dispatcher == nil {
+				err = errors.New("dispatch not available")
+			} else {
+				dctx, cancel := context.WithTimeout(withDispatchMessageID(ctx, messageID), chatWakeDeliveryBudget)
+				_, err = s.holdOrDispatch(dctx, woken, messageID, nil, func() error {
+					return dispatchWithBrokerRetry(dctx, s.deliveryMarker(), s.recordLog(), dispatcher, woken, text, false, sm)
+				})
+				cancel()
+			}
+			if err != nil {
+				fctx, fcancel := finalizationContext(ctx)
+				defer fcancel()
+				s.messageLog.Error("decisions: failed to deliver "+label+" after auto-wake", "agent", woken.Slug, "message_id", messageID, "error", err)
+				_ = s.markFailed(fctx, messageID, err.Error())
+			}
+		},
+		fail: func(ctx context.Context, dmErr *AgentDMError) {
+			fctx, fcancel := finalizationContext(ctx)
+			defer fcancel()
+			s.messageLog.Error("decisions: auto-wake failed for "+label, "agent", agentSlug, "message_id", messageID, "code", dmErr.Code, "error", dmErr.Message)
+			_ = s.markFailed(fctx, messageID, fmt.Sprintf("auto-wake failed: %s", dmErr.Message))
+		},
+	}
+}
+
+// dispatchDecisionResponse delivers a persisted decision-response to asker,
+// auto-waking a hub-suspended (or idle-suspending) asker in the background
+// just like web chat secondaries and mention fan-out. It returns
+// (queuedOrHeld, err), where queuedOrHeld is true when delivery is held for
+// the next session or queued behind a background auto-wake.
+func (s *Server) dispatchDecisionResponse(ctx context.Context, asker *store.Agent, m *store.Message, text string, sm *messages.StructuredMessage, populateMeta func(map[string]string), label string) (bool, error) {
+	dispatcher := s.GetDispatcher()
+	if dispatcher == nil {
+		return false, nil
+	}
+	// Strip reserved metadata keys first, as every dispatch site does, so no
+	// value from another source reaches the agent; hub-owned decision keys
+	// are populated after the strip.
+	sm.Metadata = messaging.StripReservedMetadata(sm.Metadata)
+	if sm.Metadata == nil {
+		sm.Metadata = make(map[string]string, 7)
+	}
+	if populateMeta != nil {
+		populateMeta(sm.Metadata)
+	}
+	canAutoWake := func(target *store.Agent) bool {
+		hctx, hcancel := finalizationContext(ctx)
+		defer hcancel()
+		return s.canAutoWakeDecisionAsker(hctx, target)
+	}
+	if canAutoWake(asker) &&
+		s.queueAutoWake(asker, s.decisionResponseAutoWakeItem(m.ID, asker.Slug, text, sm, label)) {
+		return true, nil
+	}
+	dctx, cancel := context.WithTimeout(withDispatchMessageID(context.WithoutCancel(ctx), m.ID), 30*time.Second)
+	defer cancel()
+	held, err := s.holdOrDispatch(dctx, asker, m.ID, m, func() error {
+		return dispatchWithBrokerRetry(dctx, s.deliveryMarker(), s.recordLog(), dispatcher, asker, text, false, sm)
+	})
+	if err != nil {
+		var idleErr *errAgentIdleSuspending
+		if errors.As(err, &idleErr) {
+			target := idleErr.agent
+			if target == nil {
+				target = asker
+			}
+			if canAutoWake(target) &&
+				s.queueAutoWake(target, s.decisionResponseAutoWakeItem(m.ID, target.Slug, text, sm, label)) {
+				return true, nil
+			}
+		}
+		s.messageLog.Error("decisions: failed to deliver "+label, "agent", asker.Slug, "message_id", m.ID, "error", err)
+		fctx, fcancel := finalizationContext(ctx)
+		_ = s.markFailed(fctx, m.ID, err.Error())
+		fcancel()
+		return false, err
+	}
+	return held, nil
+}
+
+// deliverDecisionResponse dispatches the stored response to the asking agent
+// with the hub-formatted line and the hub-set decision metadata. A stopped or
+// deleted asker leaves the row failed (undeliverable semantics); the answer
+// stands either way.
+func (s *Server) deliverDecisionResponse(ctx context.Context, asker *store.Agent, m *store.Message, a *store.DecisionAnswer, overridden *store.DecisionAnswer) {
+	if asker == nil || m.DispatchState != store.MessageDispatchDispatched {
+		return
+	}
+	if s.GetDispatcher() == nil {
+		return
+	}
+	line := decisionResponseAgentLine(a, overridden)
+	sm := &messages.StructuredMessage{
+		Version:        messages.Version,
+		Timestamp:      m.CreatedAt.UTC().Format(time.RFC3339),
+		Sender:         m.Sender,
+		SenderID:       m.SenderID,
+		Recipient:      m.Recipient,
+		RecipientID:    m.RecipientID,
+		Msg:            line,
+		Type:           messages.TypeDecisionResponse,
+		Channel:        m.Channel,
+		ThreadID:       m.ThreadID,
+		ConversationID: m.ConversationID,
+	}
+	_, _ = s.dispatchDecisionResponse(ctx, asker, m, line, sm, func(meta map[string]string) {
+		meta[messages.MetadataDecisionKey] = a.Key
+		meta[messages.MetadataDecisionVersion] = strconv.Itoa(a.Version)
+		meta[messages.MetadataChoiceID] = a.ChoiceID
+		meta[messages.MetadataDecisionProvenance] = a.Provenance
+		if a.ChoiceID == messages.ChoiceIDOther && a.OtherText != "" {
+			meta[messages.MetadataDecisionOtherText] = a.OtherText
+		}
+	}, "decision-response")
+}
+
+// publishDecisionUpdated tells every open card of the decision about its new
+// state: on project.<id>.chat.decision.updated for a thread, and on
+// user.<id>.chat.decision.updated for each user of a DM, so a DM's decisions reach
+// only its participants.
+func (s *Server) publishDecisionUpdated(ctx context.Context, prompt *store.Message, view DecisionView) {
+	if prompt == nil {
+		return
+	}
+	s.publishDecisionUpdatedAt(ctx, prompt.ProjectID, prompt.ID, prompt.ThreadID, view)
+}
+
+// publishDecisionUpdatedAt publishes chat.decision.updated using the decision's
+// stored project_id, message_id, and chat_key so SSE updates continue to work
+// after chat retention purges the prompt message.
+func (s *Server) publishDecisionUpdatedAt(ctx context.Context, projectID, messageID, threadID string, view DecisionView) {
+	namedUserID := ""
+	if view.Decision != nil {
+		namedUserID = view.Decision.AnsweredByUserID
+	}
+	defer s.enqueueDecisionBellEvent(projectID, threadID, namedUserID)
+
+	s.publishDecisionUpdatedEventAt(projectID, messageID, threadID, view)
+}
+
+// publishDecisionUpdatedEventAt publishes chat.decision.updated on the row's
+// conversation subject without enqueuing a bell recompute, for callers (such as
+// multi-row withdrawal) that batch bell recomputes once per call.
+func (s *Server) publishDecisionUpdatedEventAt(projectID, messageID, threadID string, view DecisionView) {
+	if s == nil || s.events == nil {
+		return
+	}
+	evt := map[string]interface{}{"decision": view, "messageId": messageID, "threadId": threadID}
+	if strings.HasPrefix(threadID, "dm:") {
+		parts := strings.Split(threadID, ":")
+		if len(parts) >= 5 {
+			for i, id := range []string{parts[2], parts[4]} {
+				kind := parts[1]
+				if i == 1 {
+					kind = parts[3]
+				}
+				if kind == "user" && id != "" {
+					s.events.PublishRaw("user."+id+".chat.decision.updated", evt)
+				}
+			}
+		}
+		return
+	}
+	if projectID != "" {
+		s.events.PublishRaw("project."+projectID+".chat.decision.updated", evt)
+	}
+}

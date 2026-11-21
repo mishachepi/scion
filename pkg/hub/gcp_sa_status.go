@@ -24,6 +24,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/experiments"
+	"github.com/GoogleCloudPlatform/scion/pkg/k8s"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
@@ -47,14 +50,17 @@ import (
 // listed.
 const (
 	GCPSAMappingMapped      = SAMappingStateMapped
+	GCPSAMappingCreatable   = SAMappingStateCreatable
 	GCPSAMappingNotMapped   = SAMappingStateNotMapped
 	GCPSAMappingUnknown     = SAMappingStateUnknown
 	GCPSAMappingNotReported = "not_reported"
 )
 
-// Workload Identity binding states. Only "unknown" is produced today: the hub
-// does not read IAM policy for this view, and the binding is never reported
-// as bound without evidence.
+// Workload Identity binding states. When hub.k8s_workload_identity_setup is
+// enabled, minted accounts read the GSA's IAM policy and report "bound" or
+// "not_bound" per target, while bring-your-own accounts stay "unknown" ("not
+// minted by this hub"); with the experiment off only "unknown" ("not checked")
+// is returned.
 const (
 	GCPSABindingBound    = "bound"
 	GCPSABindingNotBound = "not_bound"
@@ -68,10 +74,13 @@ const (
 	GCPSADefaultHub     = "hub"
 )
 
-// Next-step codes: the first missing link.
+// Next-step codes: the first missing link. GCPSANextStepNotBound is returned
+// only when hub.k8s_workload_identity_setup is enabled and at least one
+// Workload Identity target is not bound.
 const (
 	GCPSANextStepNotVerified = "not_verified"
 	GCPSANextStepNotMapped   = "not_mapped"
+	GCPSANextStepNotBound    = "not_bound"
 	GCPSANextStepNone        = "none"
 )
 
@@ -143,12 +152,16 @@ type GCPServiceAccountProfileMapping struct {
 	// reason (SAMappingReason*), for example report_stale or
 	// ambiguous_mapping.
 	UnknownReason string `json:"unknownReason,omitempty"`
+	// WorkloadIdentityBinding is this profile's Workload Identity IAM binding
+	// state when hub.k8s_workload_identity_setup is enabled; omitted when off.
+	WorkloadIdentityBinding *GCPServiceAccountProfileBinding `json:"workloadIdentityBinding,omitempty"`
 }
 
 // GCPServiceAccountBinding is the Workload Identity binding state.
 type GCPServiceAccountBinding struct {
-	State  string `json:"state"`
-	Reason string `json:"reason,omitempty"`
+	State   string                           `json:"state"`
+	Reason  string                           `json:"reason,omitempty"`
+	Targets []GCPServiceAccountBindingTarget `json:"targets,omitempty"`
 }
 
 // GCPServiceAccountDefault names one default that points at the account.
@@ -235,29 +248,38 @@ func (s *Server) getGCPServiceAccountStatus(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	status := s.buildGCPServiceAccountStatus(ctx, project, sa,
-		s.projectKubernetesProfileMappings(ctx, projectID))
+	brokers, _ := s.projectProviderBrokers(ctx, projectID)
+	status := s.buildGCPServiceAccountStatus(ctx, project, sa, brokers)
 	status.Agents = s.gcpServiceAccountAgents(ctx, projectID, sa.ID)
 	writeJSON(w, http.StatusOK, status)
 }
 
 // buildGCPServiceAccountStatus assembles every section except agents, which
 // needs the caller's identity.
-func (s *Server) buildGCPServiceAccountStatus(ctx context.Context, project *store.Project, sa *store.GCPServiceAccount, profiles []kubernetesProfileMappings) GCPServiceAccountStatus {
+func (s *Server) buildGCPServiceAccountStatus(ctx context.Context, project *store.Project, sa *store.GCPServiceAccount, brokers []*store.RuntimeBroker) GCPServiceAccountStatus {
+	now := gcpSAWIBindingNow()
+	expOn := s.experimentEnabled(experiments.K8sWorkloadIdentitySetup)
+	allowCreate := expOn && sa.Managed
+	profiles := s.brokerKubernetesProfileMappings(brokers)
+	mappings := gcpSAProfileMappingsFor(sa.Email, allowCreate, profiles, now)
+	binding := GCPServiceAccountBinding{
+		State:  GCPSABindingUnknown,
+		Reason: GCPSABindingReasonNotChecked,
+	}
+	if expOn {
+		binding = s.evaluateWorkloadIdentityStatus(ctx, sa, brokers, mappings, now)
+	}
 	st := GCPServiceAccountStatus{
 		Account: GCPServiceAccountStatusIdentity{
 			ID: sa.ID, DisplayName: sa.DisplayName, Scope: sa.Scope, Email: sa.Email,
 		},
-		Verification: gcpSAVerificationOf(sa),
-		Mappings:     gcpSAProfileMappings(sa.Email, profiles, time.Now()),
-		WorkloadIdentityBinding: GCPServiceAccountBinding{
-			State:  GCPSABindingUnknown,
-			Reason: "not checked",
-		},
-		DefaultFor: s.gcpSADefaultsFor(project, sa.ID),
-		Agents:     GCPServiceAccountAgents{Names: []string{}},
+		Verification:            gcpSAVerificationOf(sa),
+		Mappings:                mappings,
+		WorkloadIdentityBinding: binding,
+		DefaultFor:              s.gcpSADefaultsFor(project, sa.ID),
+		Agents:                  GCPServiceAccountAgents{Names: []string{}},
 	}
-	st.NextStep = gcpSANextStep(st.Verification.Verified, st.Mappings, st.DefaultFor)
+	st.NextStep = gcpSANextStepForBinding(st.Verification.Verified, st.Mappings, st.DefaultFor, st.WorkloadIdentityBinding)
 	return st
 }
 
@@ -280,12 +302,12 @@ func gcpSAVerificationOf(sa *store.GCPServiceAccount) GCPServiceAccountVerificat
 	return v
 }
 
-// gcpSAProfileMappings maps each Kubernetes profile to a state for email,
+// gcpSAProfileMappingsFor maps each Kubernetes profile to a state for email,
 // sorted by broker then profile name. The state is the shared decision's
-// (kubernetesProfileMappings.decision, the dispatch refusal's rule), so the
+// (kubernetesProfileMappings.decisionFor, the dispatch refusal's rule), so the
 // view, the warnings and the refusal agree. A profile with no report at all
 // is "not_reported"; one whose decision is not_required is left out.
-func gcpSAProfileMappings(email string, profiles []kubernetesProfileMappings, now time.Time) []GCPServiceAccountProfileMapping {
+func gcpSAProfileMappingsFor(email string, allowCreate bool, profiles []kubernetesProfileMappings, now time.Time) []GCPServiceAccountProfileMapping {
 	out := make([]GCPServiceAccountProfileMapping, 0, len(profiles))
 	key := strings.ToLower(email)
 	for _, p := range profiles {
@@ -293,14 +315,21 @@ func gcpSAProfileMappings(email string, profiles []kubernetesProfileMappings, no
 			BrokerID: p.brokerID, BrokerName: p.brokerName, Profile: p.profile, State: GCPSAMappingNotReported,
 		}
 		if p.reported {
-			d := p.decision(email, now)
+			d := p.decisionFor(email, allowCreate, now)
 			if d.State == SAMappingStateNotRequired {
 				continue
 			}
 			m.State, m.UnknownReason = d.State, d.Reason
-			if m.State == GCPSAMappingMapped {
+			switch m.State {
+			case GCPSAMappingMapped:
 				e := p.entries[key]
 				m.KubernetesServiceAccount, m.Namespace, m.Source = e.KSA, e.Namespace, e.Source
+			case GCPSAMappingCreatable:
+				if ksa, err := k8s.ConventionalKSAName(email); err == nil {
+					m.KubernetesServiceAccount = ksa
+				}
+				m.Namespace = d.Namespace
+				m.Source = api.BrokerKSASourceCreated
 			}
 			m.ReportedAt = p.report.MappingsReportedAt
 			if p.report.MappingsReported && !p.report.MappingsComplete {
@@ -320,22 +349,22 @@ func gcpSAProfileMappings(email string, profiles []kubernetesProfileMappings, no
 	return out
 }
 
-// gcpSAMappedCount counts, with the shared decision at now
-// (kubernetesProfileMappings.decision), the profiles whose decision for
-// email is mapped and the profiles that reported. A profile whose decision
-// is not_required is counted in neither (the status view does not list it);
-// notRequired counts those so the summary can leave them out of the
-// unreported count too.
-func gcpSAMappedCount(email string, profiles []kubernetesProfileMappings, now time.Time) (mapped, reported, notRequired int) {
+// gcpSAMappedCountFor counts, with the shared decision at now
+// (kubernetesProfileMappings.decisionFor), the profiles whose decision for
+// email is mapped (or creatable, when allowCreate is true) and the profiles
+// that reported. A profile whose decision is not_required is counted in
+// neither (the status view does not list it); notRequired counts those so the
+// summary can leave them out of the unreported count too.
+func gcpSAMappedCountFor(email string, allowCreate bool, profiles []kubernetesProfileMappings, now time.Time) (mapped, reported, notRequired int) {
 	for _, p := range profiles {
 		if !p.reported {
 			continue
 		}
-		switch p.decision(email, now).State {
+		switch p.decisionFor(email, allowCreate, now).State {
 		case SAMappingStateNotRequired:
 			notRequired++
 			continue
-		case SAMappingStateMapped:
+		case SAMappingStateMapped, SAMappingStateCreatable:
 			mapped++
 		}
 		reported++
@@ -377,8 +406,16 @@ func (s *Server) gcpSADefaultsFor(project *store.Project, saID string) []GCPServ
 // unknown, is not a known missing link, except an ambiguous mapping on a
 // current, complete report (the broker refuses it, and an operator can fix
 // it).
-// The Workload Identity binding is not checked, so it never produces a step.
+// The Workload Identity binding is not checked when gcpSANextStep is called
+// directly (experiment-off behavior), so it never produces a step there.
 func gcpSANextStep(verified bool, mappings []GCPServiceAccountProfileMapping, defaults []GCPServiceAccountDefault) GCPServiceAccountNextStep {
+	return gcpSANextStepForBinding(verified, mappings, defaults, GCPServiceAccountBinding{
+		State:  GCPSABindingUnknown,
+		Reason: GCPSABindingReasonNotChecked,
+	})
+}
+
+func gcpSANextStepForBinding(verified bool, mappings []GCPServiceAccountProfileMapping, defaults []GCPServiceAccountDefault, binding GCPServiceAccountBinding) GCPServiceAccountNextStep {
 	if !verified {
 		return GCPServiceAccountNextStep{
 			Code: GCPSANextStepNotVerified,
@@ -397,7 +434,7 @@ func gcpSANextStep(verified bool, mappings []GCPServiceAccountProfileMapping, de
 	for i := range mappings {
 		m := &mappings[i]
 		switch m.State {
-		case GCPSAMappingMapped:
+		case GCPSAMappingMapped, GCPSAMappingCreatable:
 			anyMapped = true
 		case GCPSAMappingNotMapped, GCPSAMappingUnknown:
 			if m.State == GCPSAMappingUnknown && !m.Ambiguous {
@@ -414,9 +451,82 @@ func gcpSANextStep(verified bool, mappings []GCPServiceAccountProfileMapping, de
 	if !anyMapped && firstUnmapped != nil {
 		return gcpSANotMappedStep(firstUnmapped)
 	}
+	switch binding.State {
+	case GCPSABindingNotBound:
+		return gcpSANotBoundStep(binding)
+	case GCPSABindingBound:
+		for _, t := range binding.Targets {
+			if t.Stale {
+				return GCPServiceAccountNextStep{
+					Code: GCPSANextStepNone,
+					Message: "Verification and mapping have nothing missing; stored Workload Identity targets are bound, " +
+						"but one or more targets come from stale broker reports.",
+				}
+			}
+		}
+		return GCPServiceAccountNextStep{
+			Code:    GCPSANextStepNone,
+			Message: "Nothing missing that the hub can check.",
+		}
+	default:
+		return GCPServiceAccountNextStep{
+			Code:    GCPSANextStepNone,
+			Message: gcpSAUnknownBindingNextStepMessage(binding),
+		}
+	}
+}
+
+func gcpSANotBoundStep(binding GCPServiceAccountBinding) GCPServiceAccountNextStep {
+	var first *GCPServiceAccountBindingTarget
+	notBoundCount := 0
+	for i := range binding.Targets {
+		if binding.Targets[i].State == GCPSABindingNotBound {
+			notBoundCount++
+			if first == nil {
+				first = &binding.Targets[i]
+			}
+		}
+	}
+	if first == nil || first.ManualStep == "" {
+		return GCPServiceAccountNextStep{
+			Code: GCPSANextStepNotBound,
+			Message: fmt.Sprintf("Workload Identity role %s is not granted on this account for one or more targets; "+
+				"run each unbound target's manualStep gcloud command.", roleWorkloadIdentityUser),
+		}
+	}
+	where := strings.Join(first.Profiles, ", ")
+	target := first.Member
+	if where != "" && target != "" {
+		target = fmt.Sprintf("%s (%s)", target, where)
+	} else if target == "" {
+		target = where
+	}
+	msg := fmt.Sprintf("Workload Identity role %s is not granted on this account for %s. "+
+		"Run the per-target manualStep gcloud command to grant it: %s",
+		roleWorkloadIdentityUser, target, first.ManualStep)
+	if notBoundCount > 1 {
+		msg = fmt.Sprintf("Workload Identity role %s is not granted on this account for %d targets (first: %s). "+
+			"Run each unbound target's manualStep gcloud command, starting with: %s",
+			roleWorkloadIdentityUser, notBoundCount, target, first.ManualStep)
+	}
 	return GCPServiceAccountNextStep{
-		Code:    GCPSANextStepNone,
-		Message: "Nothing missing that the hub can check. The Workload Identity binding is not checked.",
+		Code:    GCPSANextStepNotBound,
+		Message: msg,
+	}
+}
+
+func gcpSAUnknownBindingNextStepMessage(binding GCPServiceAccountBinding) string {
+	switch binding.Reason {
+	case "", GCPSABindingReasonNotChecked:
+		return "Nothing missing that the hub can check. The Workload Identity binding is not checked."
+	case GCPSABindingReasonNotMinted:
+		return "Nothing missing that the hub can check. The Workload Identity binding is not checked (not minted by this hub)."
+	case GCPSABindingReasonNoKubernetesTargets:
+		return "Nothing missing that the hub can check."
+	case GCPSABindingReasonIAMClientUnconfigured, GCPSABindingReasonPermissionDenied, GCPSABindingReasonIAMReadFailed:
+		return fmt.Sprintf("Verification and mapping have nothing missing; the Workload Identity binding could not be checked (%s).", binding.Reason)
+	default:
+		return fmt.Sprintf("Verification and mapping have nothing missing; the Workload Identity binding could not be checked for every Kubernetes target (%s).", binding.Reason)
 	}
 }
 
@@ -454,7 +564,8 @@ func (s *Server) gcpServiceAccountAgents(ctx context.Context, projectID, saID st
 	}
 	scopeResult, err := s.authzService.ResolveListScopes(ctx, identity, "agent.list")
 	if err != nil {
-		slog.WarnContext(ctx, "GCP SA status: agent scope resolution failed", "error", err)
+		logAuthzCheckFault(ctx, nil, "gcp_sa_agents_scope",
+			"GCP SA status: agent scope resolution failed", err)
 		return out
 	}
 	if scopeResult.Scopes.IsNone() {
@@ -495,10 +606,15 @@ type GCPServiceAccountMappingSummary struct {
 }
 
 // annotateGCPSAMappings sets the mapping summary on every listed account.
-func annotateGCPSAMappings(items []GCPServiceAccountWithCapabilities, profiles []kubernetesProfileMappings) {
+func (s *Server) annotateGCPSAMappings(items []GCPServiceAccountWithCapabilities, profiles []kubernetesProfileMappings) {
+	annotateGCPSAMappingsWithExperiment(items, profiles, s.experimentEnabled(experiments.K8sWorkloadIdentitySetup))
+}
+
+func annotateGCPSAMappingsWithExperiment(items []GCPServiceAccountWithCapabilities, profiles []kubernetesProfileMappings, expOn bool) {
 	now := time.Now()
 	for i := range items {
-		mapped, reported, notRequired := gcpSAMappedCount(items[i].Email, profiles, now)
+		allowCreate := expOn && items[i].Managed
+		mapped, reported, notRequired := gcpSAMappedCountFor(items[i].Email, allowCreate, profiles, now)
 		items[i].Mapping = &GCPServiceAccountMappingSummary{
 			MappedProfiles:     mapped,
 			ReportedProfiles:   reported,

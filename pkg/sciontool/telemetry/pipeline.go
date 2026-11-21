@@ -74,10 +74,12 @@ type Pipeline struct {
 	analytics        analyticsState // agent.usage outbox + drainer (analytics_drainer.go)
 	health           healthEmitter  // telemetry.health events (health.go)
 	sessionUsageSink atomic.Pointer[SessionUsageSink]
-	intakeMu         sync.Mutex
-	intakeClosed     bool
-	intakeActive     int
-	intakeDone       chan struct{}
+	// apiOutcomeObserver receives model API outcomes (api_outcome.go).
+	apiOutcomeObserver atomic.Pointer[APIOutcomeObserver]
+	intakeMu           sync.Mutex
+	intakeClosed       bool
+	intakeActive       int
+	intakeDone         chan struct{}
 
 	metricsDropWarned        sync.Once
 	logsDropWarned           sync.Once
@@ -226,6 +228,7 @@ func (p *Pipeline) ActivateUsageSource(ctx context.Context, source string) (Usag
 		return "", fmt.Errorf("creating usage deriver: %w", err)
 	}
 	deriver.sessionUsage = p.forwardSessionUsage
+	deriver.apiOutcome = p.forwardAPIOutcome
 	deriver.analytics = p.analytics.native
 	if len(deriver.rules) == 0 {
 		return UsageActivationNoHarnessRule, nil
@@ -315,15 +318,44 @@ func (p *Pipeline) Start(ctx context.Context) error {
 			log.Info("Cloud exporter initialized (%s, project: %s)", mode, p.config.ProjectID)
 		}
 	} else {
-		if p.config.CloudEnabled {
+		switch {
+		case p.config.CloudEnabled && p.config.isGCPBlockedWithoutCredentials():
+			// Hub-wide GCP telemetry may be enabled on an agent running in
+			// metadata mode block without an assigned service account or
+			// telemetry key file. Disable cloud export cleanly and keep the
+			// local pipeline (and hub-reported counts) running instead of
+			// failing Start or logging repeated ADC auth errors (ptone/scion#8494).
+			p.config.CloudEnabled = false
+			slog.Info("telemetry cloud export disabled: GCP metadata mode is block and no telemetry credentials file is present; assign a service account (--service-account) or configure the scion-telemetry-gcp-credentials secret (SCION_OTEL_GCP_CREDENTIALS)",
+				"metadata_mode", p.config.MetadataMode,
+				"provider", p.config.CloudProvider,
+			)
+		case p.config.CloudEnabled && p.config.CloudEnabledExplicit:
+			// Cloud export was asked for explicitly but has nowhere to go:
+			// a real misconfiguration, so the pipeline refuses to start.
 			p.deliveryState.Store("failed")
 			p.logDeliverySnapshot(true)
 			if p.config.IsGCP() && p.config.ProjectID == "" {
 				slog.Warn("telemetry cloud export disabled — GCP mode requires a project ID", "env_checked", EnvProjectID)
 			}
 			return fmt.Errorf("cloud telemetry enabled but destination is not configured")
+		case p.config.CloudEnabled:
+			// Cloud export is on only by default and no destination is
+			// configured: leave it off and run the local pipeline, the
+			// same as with cloud export disabled (ptone/scion#7104).
+			// CloudEnabled is cleared so intake, delivery state and Stop
+			// all behave exactly as they do with cloud export disabled;
+			// left set, intake would reject every batch as "cloud
+			// exporter unavailable".
+			p.config.CloudEnabled = false
+			if p.config.IsGCP() && p.config.ProjectID == "" {
+				slog.Warn("telemetry cloud export disabled — GCP mode requires a project ID", "env_checked", EnvProjectID)
+			} else {
+				slog.Info("telemetry cloud export disabled: no destination configured")
+			}
+		default:
+			slog.Info("telemetry cloud export disabled")
 		}
-		slog.Info("telemetry cloud export disabled")
 	}
 
 	// Create receiver with span and metric handlers
@@ -367,6 +399,7 @@ func (p *Pipeline) Start(ctx context.Context) error {
 		log.Error("Failed to create usage deriver: %v", err)
 	} else {
 		deriver.sessionUsage = p.forwardSessionUsage
+		deriver.apiOutcome = p.forwardAPIOutcome
 		deriver.analytics = p.analytics.native
 		p.usageDeriver.Store(deriver)
 	}

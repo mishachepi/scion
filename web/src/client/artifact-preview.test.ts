@@ -24,6 +24,7 @@ import { join } from 'path';
 import { describe, expect, it } from 'vitest';
 
 import {
+  artifactLinkTarget,
   PREVIEW_CSP,
   PREVIEW_SANDBOX,
   imageSource,
@@ -164,6 +165,82 @@ describe('rewriteImages', () => {
   });
 });
 
+describe('artifactLinkTarget (shared by the preview and the review editor)', () => {
+  const ctx = { id: ID, seq: 2, entryPath: 'docs/index.md', files: [file('docs/other.md')] };
+  const none = [
+    'javascript:alert(1)',
+    'JaVaScRiPt:alert(1)',
+    'java\tscript:alert(1)',
+    ' javascript:alert(1)',
+    'data:text/html,x',
+    'vbscript:x',
+    'blob:https://h.example/x',
+    'file:///etc/passwd',
+    '//evil.example/x',
+    '\\\\evil.example\\x',
+    'tel:+15551234',
+    'ftp://h.example/f',
+    'nope.md',
+    '../../outside.md',
+    '#',
+    '',
+  ];
+  for (const href of none) {
+    it(`gives ${JSON.stringify(href)} no target`, () => {
+      expect(artifactLinkTarget(href, ctx)).toEqual({ kind: 'none' });
+    });
+  }
+  it('keeps http, https and mailto, opens version files, and reads fragments', () => {
+    expect(artifactLinkTarget('https://x.example', ctx)).toEqual({
+      kind: 'external',
+      href: 'https://x.example/',
+    });
+    expect(artifactLinkTarget('HTTP://x.example/a', ctx)).toEqual({
+      kind: 'external',
+      href: 'http://x.example/a',
+    });
+    expect(artifactLinkTarget('mailto:a@b.example', ctx)).toEqual({
+      kind: 'external',
+      href: 'mailto:a@b.example',
+    });
+    expect(artifactLinkTarget('other.md', ctx)).toEqual({
+      kind: 'file',
+      href: `/api/v1/artifacts/${ID}/versions/2/files/docs/other.md`,
+    });
+    expect(artifactLinkTarget('#part-two', ctx)).toEqual({ kind: 'fragment', id: 'part-two' });
+  });
+  it('strips what the URL parser strips, and nothing more', () => {
+    // C0 controls and spaces around the value, tabs and line breaks inside.
+    expect(artifactLinkTarget('\u0001 \x1fhttps://x.example/a\tb\u0000 ', ctx)).toEqual({
+      kind: 'external',
+      href: 'https://x.example/ab',
+    });
+    // Other whitespace is part of the value, as for the browser: a relative
+    // link to a file the version does not have.
+    expect(artifactLinkTarget('\u00a0https://x.example/', ctx)).toEqual({ kind: 'none' });
+    expect(artifactLinkTarget('\ufeffjavascript:alert(1)', ctx)).toEqual({ kind: 'none' });
+    expect(new URL('\u00a0https://x.example/', 'https://base.example/').host).toBe('base.example');
+  });
+  it('the preview shows tel: and ftp: links and fragments as text, and keeps https', () => {
+    const tpl = document.createElement('template');
+    tpl.innerHTML = rewriteImages(
+      '<a href="tel:+15551234">t</a><a href="ftp://h.example/f">f</a><a href="#s">s</a><a href="https://x.example/">x</a>',
+      ctx
+    );
+    const links = Array.from(tpl.content.querySelectorAll('a'));
+    expect(links.map((a) => a.getAttribute('href'))).toEqual([
+      null,
+      null,
+      null,
+      'https://x.example/',
+    ]);
+  });
+  it('the preview keeps any data image (the review editor shows raster types only, on purpose)', () => {
+    const out = rewriteImages('<img src="data:image/svg+xml;base64,PHN2Zy8+" alt="s">', ctx);
+    expect(imgs(out)[0].getAttribute('src')).toBe('data:image/svg+xml;base64,PHN2Zy8+');
+  });
+});
+
 describe('previewDocument', () => {
   it('carries the policy and keeps theme values from breaking out of the style', () => {
     const doc = previewDocument('<p>hi</p>', { text: 'red;}</style><script>', link: '#123456' });
@@ -175,6 +252,32 @@ describe('previewDocument', () => {
   it('allows images from the hub only and never scripts', () => {
     expect(PREVIEW_CSP).toBe("default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'");
     expect(PREVIEW_SANDBOX.split(' ')).not.toContain('allow-scripts');
+  });
+  it('applies custom dark-mode review and error theme tokens to CriticMarkup and failed image placeholders', () => {
+    const doc = previewDocument('<mark class="critic-hl">hi</mark>', {
+      reviewHlBg: '#713f12',
+      reviewInsBg: '#14532d',
+      reviewInsText: '#bbf7d0',
+      reviewDelBg: '#7f1d1d',
+      reviewDelText: '#fecaca',
+      reviewNoteBlockText: '#e1d5ff',
+      reviewNoteBlockBg: '#3b1c66',
+      reviewNoteLine: '#a78bfa',
+      errorBg: 'rgba(239, 68, 68, 0.15)',
+      errorText: '#fca5a5',
+      errorBorder: 'rgba(248, 113, 113, 0.4)',
+    });
+    expect(doc).toContain('mark.critic-hl{background:#713f12;color:inherit}');
+    expect(doc).toContain(
+      'ins.critic-ins{color:#bbf7d0;background:#14532d;text-decoration:underline}'
+    );
+    expect(doc).toContain(
+      'del.critic-del{color:#fecaca;background:#7f1d1d;text-decoration:line-through}'
+    );
+    expect(doc).toContain('color:#e1d5ff;background:#3b1c66;border-left:3px solid #a78bfa');
+    expect(doc).toContain(
+      '.image-placeholder.failed{border-color:rgba(248, 113, 113, 0.4);color:#fca5a5;background:rgba(239, 68, 68, 0.15)}'
+    );
   });
 });
 

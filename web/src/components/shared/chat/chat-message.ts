@@ -31,9 +31,11 @@
  */
 
 import { LitElement, html, css, nothing } from 'lit';
+import type { TemplateResult } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import { styleMap } from 'lit/directives/style-map.js';
 import { apiFetch } from '../../../client/api.js';
+import { peekUser, resolveUser, userDisplayName } from '../../../client/user-directory.js';
 import { getMarkdownRenderer } from '../../../utils/markdown.js';
 import { formatInstant, formatInstantWithZone } from '../../../utils/time.js';
 import { DisplayZoneController } from '../../../utils/display-zone-controller.js';
@@ -52,7 +54,7 @@ import {
   ARTIFACT_REF_PATTERN,
   buildArtifactLinkElement,
 } from '../../../utils/chat-file-links.js';
-import { isFeatureEnabled } from '../../../utils/feature-flags.js';
+import { decisionsEnabled, isFeatureEnabled } from '../../../utils/feature-flags.js';
 import {
   ARTIFACTS_FLAG,
   orderArtifactRefs,
@@ -62,6 +64,18 @@ import './chat-file-preview.js';
 import type { PreviewTarget } from './chat-file-preview.js';
 import '../code-editor.js';
 import '../markdown-preview.js';
+import { userMentionSlug } from './prose-mentions.js';
+import './chat-decisions.js';
+import './chat-decision-response.js';
+import { ANSWERABLE } from '../../../client/decision-prompts.js';
+import type { AskerAnswerability } from '../../../client/decision-prompts.js';
+import type {
+  DecisionAnswerMode,
+  DecisionResponseSetView,
+  DecisionResponseView,
+  DecisionView,
+} from '../../../shared/types.js';
+import { copyToClipboard, showCopyFailedToast } from '../../../utils/clipboard.js';
 
 /** Structured attachment reference from the W7 API. */
 export interface AttachmentRefInfo {
@@ -73,6 +87,27 @@ export interface AttachmentRefInfo {
   width?: number;
   /** Pixel height of an image attachment, when the server knows it. */
   height?: number;
+}
+
+/** Roster entry used to resolve `@<email>` mentions to known Scion users (ptone/scion#8133). */
+export interface ChatMessageMember {
+  name?: string;
+  displayName?: string;
+  email?: string;
+  kind?: string;
+}
+
+/**
+ * A reply preview: the message a reply quotes. `unavailable` is set when
+ * that message no longer exists (for example removed by the hub's chat
+ * retention policy); `content` is then a placeholder and `senderName` is
+ * empty.
+ */
+export interface ReplyPreviewInfo {
+  messageId: string;
+  senderName: string;
+  content: string;
+  unavailable?: boolean;
 }
 
 /** The largest box an inline image thumbnail is drawn in, in CSS px. */
@@ -259,13 +294,12 @@ function replaceMatches(
  * Run one link pass over the text nodes under `root`. An element `skip`
  * matches is stepped over together with everything inside it. `linkify`
  * returns the pieces that replace a text node's text, or null to leave it.
- * Returns whether anything changed.
  */
 function linkifyTextNodes(
   root: DocumentFragment,
   skip: (el: Element) => boolean,
   linkify: (text: string) => LinkPiece[] | null
-): boolean {
+): void {
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
     acceptNode: (node) => {
       if (node.nodeType !== Node.ELEMENT_NODE) return NodeFilter.FILTER_ACCEPT;
@@ -275,14 +309,11 @@ function linkifyTextNodes(
   // Collect first: replacing a node while walking would move the walker.
   const texts: Text[] = [];
   for (let node = walker.nextNode(); node; node = walker.nextNode()) texts.push(node as Text);
-  let changed = false;
   for (const node of texts) {
     const pieces = linkify(node.data);
     if (!pieces) continue;
     node.replaceWith(...pieces.filter((p) => p !== ''));
-    changed = true;
   }
-  return changed;
 }
 
 /** A skip test for elements with any of these (lowercase) local names. */
@@ -373,7 +404,7 @@ const ENTITY_PATTERNS: EntityPattern[] = [
           {
             class: 'entity-link path-link',
             'data-file-path': path,
-            href: 'javascript:void(0)',
+            href: '#',
             title: `Open ${path}`,
           },
           path
@@ -550,18 +581,248 @@ function styleGithubRefsInText(text: string): LinkPiece[] | null {
   });
 }
 
+const MENTION_NON_BOUNDARY_PREV_RE = /[\p{L}\p{N}.@+/`-]/u;
+
+function prevCharBefore(text: string, index: number): { ch: string; start: number } | null {
+  if (index <= 0) return null;
+  const low = text.charCodeAt(index - 1);
+  if (low >= 0xdc00 && low <= 0xdfff && index >= 2) {
+    const high = text.charCodeAt(index - 2);
+    if (high >= 0xd800 && high <= 0xdbff) {
+      return { ch: text.slice(index - 2, index), start: index - 2 };
+    }
+  }
+  return { ch: text.charAt(index - 1), start: index - 1 };
+}
+
+function isValidMentionStart(text: string, atIndex: number): boolean {
+  let pos = atIndex;
+  while (pos > 0 && text.charCodeAt(pos - 1) === 0x5f /* '_' */) {
+    pos--;
+  }
+  const prev = prevCharBefore(text, pos);
+  return !prev || !MENTION_NON_BOUNDARY_PREV_RE.test(prev.ch);
+}
+
+function isAsciiWordOrUnderscore(code: number): boolean {
+  return (
+    (code >= 0x30 && code <= 0x39) ||
+    (code >= 0x41 && code <= 0x5a) ||
+    (code >= 0x61 && code <= 0x7a) ||
+    code === 0x5f
+  );
+}
+
+function isMentionSlugContinue(code: number): boolean {
+  return isAsciiWordOrUnderscore(code) || code === 0x2e /* '.' */ || code === 0x2d /* '-' */;
+}
+
+function isEmailLocalContinue(code: number): boolean {
+  return isMentionSlugContinue(code) || code === 0x2b /* '+' */;
+}
+
+function trimTrailingDots(text: string, start: number, end: number): number {
+  let cur = end;
+  while (cur > start && text.charCodeAt(cur - 1) === 0x2e /* '.' */) {
+    cur--;
+  }
+  return cur;
+}
+
+function mentionSpan(slug: string): HTMLSpanElement {
+  const span = document.createElement('span');
+  span.setAttribute('class', 'mention clickable');
+  span.setAttribute('data-mention', slug);
+  span.textContent = `@${slug}`;
+  return span;
+}
+
 /**
- * Wrap @mentions in one text node in styled, clickable spans. The slug is
- * limited to `[\w.-]`, with an optional `@project` part.
+ * Wrap @mentions in one text node in styled, clickable spans (ptone/scion#8133):
+ * - Non-email `@<slug>` tokens at a valid mention boundary render as `@<slug>` mentions.
+ * - `@<email>` tokens render as that user's canonical mention only when `<email>`
+ *   resolves to a known Scion user in `knownUsersByEmail`; unknown `@<email>` tokens
+ *   are left as literal plain text.
+ * - Plain `user@example.com` tokens (without a leading `@` at a mention boundary)
+ *   are left untouched.
+ *
+ * Uses explicit index scanning rather than regex lookbehind so older Safari
+ * (<16.4) engines never fail module parsing.
  */
-function styleMentionsInText(text: string): LinkPiece[] | null {
-  return replaceMatches(text, /@([\w.-]+(?:@[\w.-]+)?)/g, (m) => {
-    const span = document.createElement('span');
-    span.setAttribute('class', 'mention clickable');
-    span.setAttribute('data-mention', m[1]);
-    span.textContent = `@${m[1]}`;
-    return [span];
-  });
+function styleMentionsInText(
+  text: string,
+  knownUsersByEmail: ReadonlyMap<string, string>
+): LinkPiece[] | null {
+  if (!text.includes('@')) return null;
+
+  const pieces: LinkPiece[] = [];
+  let lastEmitted = 0;
+  let cursor = 0;
+  let matched = false;
+
+  while (cursor < text.length) {
+    const atIndex = text.indexOf('@', cursor);
+    if (atIndex < 0) break;
+
+    if (!isValidMentionStart(text, atIndex)) {
+      cursor = atIndex + 1;
+      continue;
+    }
+
+    const tokenStart = atIndex + 1;
+    if (tokenStart >= text.length || !isAsciiWordOrUnderscore(text.charCodeAt(tokenStart))) {
+      cursor = tokenStart;
+      continue;
+    }
+
+    let localEnd = tokenStart + 1;
+    while (localEnd < text.length && isEmailLocalContinue(text.charCodeAt(localEnd))) {
+      localEnd++;
+    }
+
+    if (localEnd < text.length && text.charCodeAt(localEnd) === 0x40 /* '@' */) {
+      // Candidate `@<local>@<domain>` email mention.
+      const domainStart = localEnd + 1;
+      if (domainStart >= text.length || !isAsciiWordOrUnderscore(text.charCodeAt(domainStart))) {
+        cursor = domainStart;
+        continue;
+      }
+      let domainEnd = domainStart + 1;
+      while (domainEnd < text.length && isMentionSlugContinue(text.charCodeAt(domainEnd))) {
+        domainEnd++;
+      }
+      if (domainEnd < text.length && text.charCodeAt(domainEnd) === 0x40 /* '@' */) {
+        // Multi-`@` sequence (e.g. `@a@b@c`) — not a valid mention or email.
+        while (
+          domainEnd < text.length &&
+          (isEmailLocalContinue(text.charCodeAt(domainEnd)) ||
+            text.charCodeAt(domainEnd) === 0x40) /* '@' */
+        ) {
+          domainEnd++;
+        }
+        cursor = domainEnd;
+        continue;
+      }
+
+      const trimmedDomainEnd = trimTrailingDots(text, domainStart, domainEnd);
+      if (trimmedDomainEnd <= domainStart) {
+        cursor = domainEnd;
+        continue;
+      }
+
+      const email = text.slice(tokenStart, trimmedDomainEnd).toLowerCase();
+      const resolvedSlug = knownUsersByEmail.get(email);
+      if (resolvedSlug) {
+        matched = true;
+        pieces.push(text.slice(lastEmitted, atIndex), mentionSpan(resolvedSlug));
+        lastEmitted = trimmedDomainEnd;
+        cursor = trimmedDomainEnd;
+      } else {
+        // Unknown email: leave `@<email>` as literal plain text.
+        cursor = domainEnd;
+      }
+      continue;
+    }
+
+    // Non-email `@<slug>` mention (`[\w.-]+`, without trailing sentence dots).
+    let slugEnd = tokenStart + 1;
+    while (slugEnd < text.length && isMentionSlugContinue(text.charCodeAt(slugEnd))) {
+      slugEnd++;
+    }
+    const trimmedSlugEnd = trimTrailingDots(text, tokenStart, slugEnd);
+    if (trimmedSlugEnd <= tokenStart) {
+      cursor = slugEnd;
+      continue;
+    }
+
+    const slug = text.slice(tokenStart, trimmedSlugEnd);
+    matched = true;
+    pieces.push(text.slice(lastEmitted, atIndex), mentionSpan(slug));
+    lastEmitted = trimmedSlugEnd;
+    cursor = trimmedSlugEnd;
+  }
+
+  if (!matched) return null;
+  pieces.push(text.slice(lastEmitted));
+  return pieces;
+}
+
+function isMailtoLink(el: Element): boolean {
+  return el.localName.toLowerCase() === 'a' && /^mailto:/i.test(el.getAttribute('href') ?? '');
+}
+
+/**
+ * `marked`'s GFM autolinker splits `@user@example.com` into a text node ending
+ * with `@` followed by `<a href="mailto:user@example.com">user@example.com</a>`.
+ * Merge those GFM-autolinked `@<email>` sequences back into plain text before
+ * the mention pass so known-user `@<email>` mentions render as mentions and
+ * unknown `@<email>` tokens remain plain text as entered, while bare
+ * `user@example.com` in prose keeps its ordinary `mailto:` link (ptone/scion#8133).
+ */
+function unwrapLeadingAtMailtoLinks(root: DocumentFragment): void {
+  const anchors = Array.from(root.querySelectorAll('a[href]'));
+  for (const a of anchors) {
+    if (a.closest('pre, code')) continue;
+    const href = a.getAttribute('href') ?? '';
+    if (!/^mailto:/i.test(href)) continue;
+    const rawAddr = href.slice(7);
+    if (!rawAddr || rawAddr.includes('?')) continue;
+    if (a.childNodes.length !== 1 || a.firstChild?.nodeType !== Node.TEXT_NODE) continue;
+    const linkText = a.textContent ?? '';
+    if (linkText.toLowerCase() !== rawAddr.toLowerCase()) continue;
+
+    const prev = a.previousSibling;
+    if (!prev || prev.nodeType !== Node.TEXT_NODE) continue;
+    const prevText = prev as Text;
+    if (!prevText.data.endsWith('@')) continue;
+    if (!isValidMentionStart(prevText.data, prevText.data.length - 1)) continue;
+
+    let merged = prevText.data + linkText;
+    const next = a.nextSibling;
+    if (next && next.nodeType === Node.TEXT_NODE) {
+      merged += (next as Text).data;
+      next.remove();
+    }
+    prevText.data = merged;
+    a.remove();
+  }
+}
+
+/** Build a lowercase-email -> canonical-mention-slug map for known Scion users. */
+export function buildKnownUsersByEmail(
+  members: readonly ChatMessageMember[],
+  currentUserId: string
+): ReadonlyMap<string, string> {
+  const map = new Map<string, string>();
+  for (const m of members) {
+    if (m.kind === 'agent') continue;
+    const email = m.email?.trim().toLowerCase() ?? '';
+    if (!email || map.has(email)) continue;
+    const slug = userMentionSlug({ name: m.name || m.displayName || '', email });
+    if (slug) {
+      map.set(email, slug);
+    }
+  }
+  if (currentUserId) {
+    const self = peekUser(currentUserId);
+    const selfEmail = self?.email?.trim().toLowerCase() ?? '';
+    if (self && selfEmail && !map.has(selfEmail)) {
+      const slug = userMentionSlug({ name: self.displayName || '', email: selfEmail });
+      if (slug) {
+        map.set(selfEmail, slug);
+      }
+    }
+  }
+  return map;
+}
+
+/** Deterministic content key for a `knownUsersByEmail` map so unchanged human rosters skip markdown re-renders. */
+export function knownUsersByEmailKey(map: ReadonlyMap<string, string>): string {
+  if (map.size === 0) return '';
+  return [...map.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([email, slug]) => `${email}\0${slug}`)
+    .join('\n');
 }
 
 /**
@@ -571,38 +832,38 @@ function styleMentionsInText(text: string): LinkPiece[] | null {
  * What each pass steps over:
  *
  * - Artifact references: code (`<pre>`, `<code>`) and existing links.
- * - @mentions: code, and the artifact links just built. Existing links are
- *   not stepped over, so an `@name` in a link's text is still styled.
+ * - @mentions: code, `mailto:` links, and the artifact links just built.
+ *   Non-`mailto:` links are not stepped over, so an `@name` in a markdown
+ *   link's text is still styled.
  * - Entity references: `<pre>` fences and existing links. Inline `<code>`
  *   is not stepped over, so a file path inside backticks still links.
  * - GitHub refs: code and existing links; a ref inside backticks is
  *   literal text.
  *
- * Returns the input unchanged when nothing was linked.
+ * Works in place on the nodes the markdown renderer returned, with DOM calls
+ * only: link text is set as text, never parsed as markup.
  */
-function linkifyRenderedHtml(htmlStr: string, opts: { artifacts: boolean; gcs: boolean }): string {
-  const tpl = document.createElement('template');
-  tpl.innerHTML = htmlStr;
-  const root = tpl.content;
+function linkifyRenderedFragment(
+  root: DocumentFragment,
+  opts: { artifacts: boolean; gcs: boolean; knownUsersByEmail: ReadonlyMap<string, string> }
+): void {
   const isCode = elementsNamed('pre', 'code');
-  let changed = false;
   const artifactLinks = new WeakSet<Element>();
   if (opts.artifacts) {
-    changed =
-      linkifyTextNodes(root, elementsNamed('pre', 'code', 'a'), (text) =>
-        styleArtifactLinksInText(text, artifactLinks)
-      ) || changed;
+    linkifyTextNodes(root, elementsNamed('pre', 'code', 'a'), (text) =>
+      styleArtifactLinksInText(text, artifactLinks)
+    );
   }
-  changed =
-    linkifyTextNodes(root, (el) => isCode(el) || artifactLinks.has(el), styleMentionsInText) ||
-    changed;
-  changed =
-    linkifyTextNodes(root, elementsNamed('pre', 'a'), (text) =>
-      styleEntityLinksInText(text, opts.gcs)
-    ) || changed;
-  changed =
-    linkifyTextNodes(root, elementsNamed('pre', 'a', 'code'), styleGithubRefsInText) || changed;
-  return changed ? tpl.innerHTML : htmlStr;
+  unwrapLeadingAtMailtoLinks(root);
+  linkifyTextNodes(
+    root,
+    (el) => isCode(el) || artifactLinks.has(el) || isMailtoLink(el),
+    (text) => styleMentionsInText(text, opts.knownUsersByEmail)
+  );
+  linkifyTextNodes(root, elementsNamed('pre', 'a'), (text) =>
+    styleEntityLinksInText(text, opts.gcs)
+  );
+  linkifyTextNodes(root, elementsNamed('pre', 'a', 'code'), styleGithubRefsInText);
 }
 
 /** True when the file is a Markdown document. */
@@ -703,6 +964,37 @@ export class ScionChatMessage extends LitElement {
   fromAgent = false;
 
   /**
+   * Whether the viewer starred this message (web.chat_starred_messages).
+   * Shows a small, noninteractive filled star in the message meta; the
+   * Star/Unstar toggle lives in the message menu.
+   */
+  @property({ type: Boolean })
+  starred = false;
+
+  /**
+   * Show the message's More actions button (web.chat_starred_messages):
+   * the keyboard entry to the message menu. The thread makes one message's
+   * button the list's single tab stop (`actionsTabIndex` 0, the others
+   * -1) and moves it with the arrow keys. It is always visible: bare dots
+   * in the upper-right corner inside the bubble.
+   */
+  @property({ type: Boolean })
+  actionsEnabled = false;
+
+  /** The tab index of the More actions button (set by the thread). */
+  @property({ type: Number })
+  actionsTabIndex = -1;
+
+  /** The message menu is open for this message (the button's aria-expanded). */
+  @property({ type: Boolean })
+  actionsExpanded = false;
+
+  /** The More actions button, when rendered. */
+  get actionsButton(): HTMLButtonElement | null {
+    return this.renderRoot?.querySelector<HTMLButtonElement>('button.msg-actions') ?? null;
+  }
+
+  /**
    * Whether the message's actual sender is an agent, independent of
    * `fromAgent`. v2 chat-thread computes `fromAgent` as "not me" (any
    * sender other than the current viewer, including another *user*) for
@@ -765,6 +1057,34 @@ export class ScionChatMessage extends LitElement {
   @property()
   dispatchState = '';
 
+  /** A decision prompt's decisions (web.decisions; absent while off). */
+  @property({ type: Array })
+  decisions: DecisionView[] | undefined = undefined;
+
+  /** A decision prompt's intro, shown instead of the body when the card renders. */
+  @property()
+  decisionIntro: string | undefined = undefined;
+
+  /** A decision prompt's answer mode. */
+  @property()
+  answerMode: DecisionAnswerMode | undefined = undefined;
+
+  /** Whether the viewer can answer the prompt's asker (design §4.5). */
+  @property({ attribute: false })
+  answerability: AskerAnswerability | undefined = undefined;
+
+  /** Display label of the conversation (e.g. `#release` or `your DM`), forwarded to decision cards. */
+  @property()
+  conversationLabel = '';
+
+  /** A decision-response's one-click answer (web.decisions; absent while off). */
+  @property({ attribute: false })
+  decisionResponse: DecisionResponseView | undefined = undefined;
+
+  /** A decision-response's set submit (web.decisions; absent while off). */
+  @property({ attribute: false })
+  decisionResponseSet: DecisionResponseSetView | undefined = undefined;
+
   /** Reason for dispatch failure. */
   @property()
   dispatchFailureReason = '';
@@ -809,7 +1129,7 @@ export class ScionChatMessage extends LitElement {
 
   /** Reply preview data: the message this one is replying to. */
   @property({ type: Object })
-  replyPreview: { messageId: string; senderName: string; content: string } | null = null;
+  replyPreview: ReplyPreviewInfo | null = null;
 
   /** When set, indicates the message was edited at this timestamp. */
   @property()
@@ -823,12 +1143,50 @@ export class ScionChatMessage extends LitElement {
   @property()
   senderProjectSlug = '';
 
+  /**
+   * The user who authorized a message sent with an agent delegated
+   * credential (.design/agent-delegation.md §14.5). The sender stays the
+   * agent; the message shows "authorized by <user>". Empty otherwise.
+   */
+  @property()
+  authorizingUserId = '';
+
+  /** The delegation grant of a message sent with an agent delegated credential. */
+  @property()
+  delegationGrantId = '';
+
+  /** The authorizing user's display name, email or ID, once resolved. */
+  @state()
+  private authorizerName = '';
+
   /** The signed-in user's id; the artifact preview shows their artifacts' owner as "You". */
   @property()
   currentUserId = '';
 
+  /**
+   * Known roster members on the thread/hub, used to resolve `@<email>` mentions
+   * to known Scion users while leaving unknown emails unstyled (ptone/scion#8133).
+   */
+  @property({ type: Array })
+  members: readonly ChatMessageMember[] = [];
+
+  /**
+   * Pre-computed lowercase-email -> canonical-mention-slug map supplied by
+   * `<scion-chat-thread>` (memoized on human entries so agent-only roster
+   * snapshots do not re-render every bubble's markdown). When null, derived
+   * from `members` and `currentUserId`.
+   */
+  @property({ attribute: false })
+  knownUsersByEmail: ReadonlyMap<string, string> | null = null;
+
+  /**
+   * The rendered body: a `.md-content` element holding the markdown
+   * renderer's nodes, or null to show the body as plain text. Built once per
+   * body, and kept as one element so later renders move it rather than
+   * rebuild it.
+   */
   @state()
-  private renderedHtml = '';
+  private renderedContent: HTMLElement | null = null;
 
   /** Preview load state per attachment ID. Replaced, never mutated. */
   @state()
@@ -915,6 +1273,27 @@ export class ScionChatMessage extends LitElement {
       position: relative;
     }
 
+    /* A decision-response is a compact line in the answerer's lane (design §4.6). */
+    .decision-response-row {
+      display: flex;
+      padding: 0.25rem 1rem;
+    }
+
+    .decision-response-row.own {
+      justify-content: flex-end;
+    }
+
+    .decision-response-row.other {
+      justify-content: flex-start;
+      padding-left: 3.5rem;
+    }
+
+    /* A choice card needs room for its buttons (design §4.1). */
+    .bubble.decision {
+      max-width: min(100%, 640px);
+      width: 100%;
+    }
+
     .bubble-header {
       display: flex;
       align-items: center;
@@ -938,6 +1317,13 @@ export class ScionChatMessage extends LitElement {
       color: var(--scion-text-muted, #64748b);
       font-size: var(--chat-fs-sm);
       font-weight: 400;
+    }
+
+    .authorized-by {
+      font-size: var(--chat-fs-sm);
+      font-weight: 400;
+      color: var(--scion-text-muted, #64748b);
+      margin-bottom: 0.125rem;
     }
 
     .cross-project-label {
@@ -1633,22 +2019,35 @@ export class ScionChatMessage extends LitElement {
       padding: 0.25rem 0.5rem;
       margin-bottom: 0.25rem;
       border-left: 3px solid var(--scion-primary-400, #60a5fa);
-      background: var(--scion-surface-50, #f8fafc);
+      background: var(--scion-bg, #f8fafc);
       border-radius: 0 0.25rem 0.25rem 0;
       cursor: pointer;
       font-size: var(--chat-fs-base);
-      color: var(--scion-neutral-500, #64748b);
+      color: var(--scion-text-muted, #64748b);
       max-width: 100%;
       overflow: hidden;
     }
 
     .reply-preview:hover {
-      background: var(--scion-surface-100, #f1f5f9);
+      background: var(--scion-bg-subtle, #f1f5f9);
     }
 
+    .reply-preview.unavailable {
+      cursor: default;
+      border-left-color: var(--scion-border, #e2e8f0);
+      color: var(--scion-neutral-400, #94a3b8);
+      font-style: italic;
+    }
+
+    .reply-preview.unavailable:hover {
+      background: var(--scion-bg, #f8fafc);
+    }
+
+    /* primary-600 in the light theme and primary-300 in the dark one, so the
+       name keeps AA contrast on the reply background in both. */
     .reply-preview .reply-sender {
       font-weight: 600;
-      color: var(--scion-primary-600, #2563eb);
+      color: var(--scion-primary-hover, #2563eb);
       white-space: nowrap;
     }
 
@@ -1662,6 +2061,107 @@ export class ScionChatMessage extends LitElement {
     .deleted-message {
       font-style: italic;
       color: var(--scion-neutral-400, #94a3b8);
+    }
+
+    /* ---- More actions button: the keyboard entry to the message menu ----
+       Always visible: bare dots in the upper-right corner inside the text
+       bubble. The bubble reserves a right-hand column for them, so they
+       never sit over the message text. An attachment-only message has no
+       text bubble: its bubble reserves the same column beside the
+       attachments. */
+    .bubble-content.has-actions,
+    .bubble.actions-corner {
+      position: relative;
+      padding-right: 2rem;
+    }
+
+    .msg-actions {
+      position: absolute;
+      top: 0.25rem;
+      right: 0.25rem;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      /* The touch target; the glyph inside is smaller. */
+      width: 1.5rem;
+      height: 1.5rem;
+      padding: 0;
+      border: none;
+      border-radius: 0.25rem;
+      background: none;
+      color: var(--scion-text-muted, #64748b);
+      font-size: 0.875rem;
+      line-height: 1;
+      cursor: pointer;
+    }
+
+    /* The reserved column counts toward the bubble's max-width, so an
+       attachment-only bubble is no wider than its text neighbours. */
+    .bubble.actions-corner {
+      box-sizing: border-box;
+    }
+
+    .bubble.actions-corner > .msg-actions {
+      top: 0;
+    }
+
+    @media (hover: hover) {
+      .msg-actions:hover {
+        color: var(--scion-text, #1e293b);
+      }
+    }
+
+    .msg-actions:focus {
+      outline: none;
+    }
+
+    .msg-actions:focus-visible {
+      outline: 2px solid var(--scion-primary, #3b82f6);
+      outline-offset: 0;
+    }
+
+    /* The message whose action button has keyboard focus. */
+    .message-wrapper.actions-focused .bubble-content {
+      box-shadow: 0 0 0 2px var(--scion-primary, #3b82f6);
+    }
+
+    .actions-help {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0 0 0 0);
+      white-space: nowrap;
+    }
+
+    /* ---- Starred indicator (shape plus accent, never colour alone) ---- */
+    .star-indicator {
+      display: inline-flex;
+      align-items: center;
+      color: var(--scion-warning-500, #d97706);
+      font-size: var(--chat-fs-xs);
+      margin-left: 0.25rem;
+    }
+
+    /* Renderings without a header (grouped and dense rows, user bubbles):
+       the star sits in the gutter beside the bubble, level with its first
+       line, so a starred row is no taller than its neighbours. */
+    .star-meta {
+      position: absolute;
+      top: 0.5rem;
+      right: calc(100% + 0.25rem);
+      display: flex;
+      line-height: 1;
+    }
+
+    .from-agent .star-meta {
+      right: auto;
+      left: calc(100% + 0.25rem);
+    }
+
+    .star-meta .star-indicator {
+      margin-left: 0;
     }
 
     /* ---- Phase-3: Edited label ---- */
@@ -1820,6 +2320,15 @@ export class ScionChatMessage extends LitElement {
         padding-right: 0.5rem;
       }
 
+      .decision-response-row {
+        padding-left: 0.5rem;
+        padding-right: 0.5rem;
+      }
+
+      .decision-response-row.other {
+        padding-left: 3rem;
+      }
+
       .bubble-content {
         padding: 0.625rem 0.75rem;
       }
@@ -1828,6 +2337,8 @@ export class ScionChatMessage extends LitElement {
 
   override connectedCallback(): void {
     super.connectedCallback();
+    this.renderedCardMode = this.showsDecisionCard;
+    this.renderedKnownUsersKey = knownUsersByEmailKey(this.effectiveKnownUsersByEmail());
     void this.renderContent();
   }
 
@@ -1838,11 +2349,55 @@ export class ScionChatMessage extends LitElement {
     this.observedPreviews = new WeakSet();
   }
 
+  override willUpdate(changed: Map<string, unknown>): void {
+    super.willUpdate(changed);
+    if (changed.has('authorizingUserId')) {
+      this.resolveAuthorizer();
+    }
+  }
+
+  /**
+   * Names the authorizing user: a cached user row at once, else the ID
+   * until `resolveUser` answers (display name, else email, else the ID).
+   */
+  private resolveAuthorizer(): void {
+    const id = this.authorizingUserId;
+    if (!id) {
+      this.authorizerName = '';
+      return;
+    }
+    const cached = peekUser(id);
+    this.authorizerName = cached ? userDisplayName(cached) : id;
+    if (cached) return;
+    void resolveUser(id).then((user) => {
+      if (user && this.authorizingUserId === id) {
+        this.authorizerName = userDisplayName(user);
+      }
+    });
+  }
+
+  private renderAuthorizedBy() {
+    if (!this.authorizingUserId) return nothing;
+    const name = this.authorizerName || this.authorizingUserId;
+    const title = this.delegationGrantId ? `via delegation ${this.delegationGrantId}` : nothing;
+    return html`<div class="authorized-by" title=${title}>authorized by ${name}</div>`;
+  }
+
   override updated(changed: Map<string, unknown>): void {
-    if (changed.has('body') || changed.has('plain')) {
+    const cardMode = this.showsDecisionCard;
+    const knownUsersKey = knownUsersByEmailKey(this.effectiveKnownUsersByEmail());
+    if (
+      changed.has('body') ||
+      changed.has('plain') ||
+      changed.has('decisionIntro') ||
+      knownUsersKey !== this.renderedKnownUsersKey ||
+      cardMode !== this.renderedCardMode
+    ) {
+      this.renderedCardMode = cardMode;
+      this.renderedKnownUsersKey = knownUsersKey;
       void this.renderContent();
     }
-    if (changed.has('renderedHtml')) {
+    if (changed.has('renderedContent')) {
       this.wrapTables();
       this.injectCopyButtons();
       this.injectSyntaxHighlighting();
@@ -1942,14 +2497,19 @@ export class ScionChatMessage extends LitElement {
       btn.textContent = 'Copy';
       btn.addEventListener('click', () => {
         const code = pre.querySelector('code')?.textContent ?? pre.textContent ?? '';
-        void navigator.clipboard.writeText(code);
-        btn.textContent = 'Copied!';
-        const prev = (btn as CopyButton)._copyTimer;
-        if (prev) clearTimeout(prev);
-        (btn as CopyButton)._copyTimer = setTimeout(() => {
-          if (!this.isConnected) return;
-          btn.textContent = 'Copy';
-        }, 1500);
+        void copyToClipboard(code).then((ok) => {
+          if (!ok) {
+            showCopyFailedToast();
+            return;
+          }
+          btn.textContent = 'Copied!';
+          const prev = (btn as CopyButton)._copyTimer;
+          if (prev) clearTimeout(prev);
+          (btn as CopyButton)._copyTimer = setTimeout(() => {
+            if (!this.isConnected) return;
+            btn.textContent = 'Copy';
+          }, 1500);
+        });
       });
       pre.appendChild(btn);
     });
@@ -2136,26 +2696,65 @@ export class ScionChatMessage extends LitElement {
     });
   }
 
+  /** The card mode the rendered body was built for. */
+  private renderedCardMode = false;
+
+  /** Content key of the `knownUsersByEmail` map the rendered body was built for. */
+  private renderedKnownUsersKey = '';
+
+  private effectiveKnownUsersByEmail(): ReadonlyMap<string, string> {
+    return this.knownUsersByEmail ?? buildKnownUsersByEmail(this.members, this.currentUserId);
+  }
+
+  /**
+   * Whether this message renders as a choice card (design §4.1): a
+   * decision-prompt with decisions, and the browser flag on. The hub omits
+   * the fields while the experiment is off; the flag gates presentation.
+   */
+  private get showsDecisionCard(): boolean {
+    const d = this.decisions;
+    return this.messageType === 'decision-prompt' && !!d && d.length > 0 && decisionsEnabled();
+  }
+
+  /** The text the bubble renders: the intro alone under a choice card. */
+  private get displayBody(): string {
+    return this.showsDecisionCard ? (this.decisionIntro ?? '') : this.body;
+  }
+
   private async renderContent(): Promise<void> {
-    if (!this.body || this.plain) {
-      this.renderedHtml = '';
+    const body = this.displayBody;
+    if (!body || this.plain) {
+      this.renderedContent = null;
       return;
     }
     const taskId = ++this.renderTaskId;
     try {
       const renderer = await getMarkdownRenderer();
       if (taskId !== this.renderTaskId) return;
+      const fragment = renderer.renderFragment(body);
       // gs:// links are gated on the server-reported feature flag AND the
       // message being agent-sent — a user-sent message never links, however
       // the body happens to be spelled.
-      this.renderedHtml = linkifyRenderedHtml(renderer.render(this.body), {
+      linkifyRenderedFragment(fragment, {
         artifacts: isFeatureEnabled(ARTIFACTS_FLAG),
         gcs: this.senderIsAgent && isFeatureEnabled('web.gcs_links'),
+        knownUsersByEmail: this.effectiveKnownUsersByEmail(),
       });
+      this.renderedContent = fragment.hasChildNodes() ? this.contentElement(fragment) : null;
     } catch {
       if (taskId !== this.renderTaskId) return;
-      this.renderedHtml = '';
+      this.renderedContent = null;
     }
+  }
+
+  /** Wraps rendered nodes in the clickable `.md-content` element. */
+  private contentElement(fragment: DocumentFragment): HTMLElement {
+    const content = document.createElement('div');
+    content.className = 'md-content';
+    content.addEventListener('click', (e) => this.handleContentClick(e));
+    content.addEventListener('auxclick', (e) => this.handleContentAuxClick(e));
+    content.append(fragment);
+    return content;
   }
 
   /**
@@ -2184,11 +2783,15 @@ export class ScionChatMessage extends LitElement {
 
   /**
    * A middle-click fires auxclick, not click: keep it from opening the
-   * artifact link's "#" href in a new tab. The preview opens on a plain
-   * click only.
+   * "#" href of an artifact, gs:// or file path link in a new tab. These
+   * links open their preview on a plain click only.
    */
   private handleContentAuxClick(e: MouseEvent): void {
-    if ((e.target as HTMLElement | null)?.closest('.artifact-link[data-artifact-id]')) {
+    if (
+      (e.target as HTMLElement | null)?.closest(
+        '.artifact-link[data-artifact-id], .gcs-link[data-gcs-uri], .path-link[data-file-path]'
+      )
+    ) {
       e.preventDefault();
     }
   }
@@ -2274,7 +2877,15 @@ export class ScionChatMessage extends LitElement {
   /** Render the reply preview block above the bubble content. */
   private renderReplyPreview() {
     if (!this.replyPreview) return nothing;
-    const { messageId, senderName, content } = this.replyPreview;
+    const { messageId, senderName, content, unavailable } = this.replyPreview;
+    if (unavailable) {
+      // The quoted message is gone: a muted quote with nothing to jump to.
+      return html`
+        <div class="reply-preview unavailable">
+          <span class="reply-content">${content || '[no longer available]'}</span>
+        </div>
+      `;
+    }
     return html`
       <div class="reply-preview" @click=${() => this.handleScrollToMessage(messageId)}>
         <span class="reply-sender">${senderName}</span>
@@ -2294,12 +2905,26 @@ export class ScionChatMessage extends LitElement {
   }
 
   override render() {
+    if (this.showsDecisionResponse && !this.deletedAt) return this.renderDecisionResponse();
     const dirClass = this.fromAgent ? 'from-agent' : 'from-user';
     const groupClass = !this.showHeader ? ' grouped' : '';
     const isDeleted = !!this.deletedAt;
+    // An attachment-only message (ptone/scion#6146) has no text: its
+    // attachments render without an empty text bubble above them.
+    const decisionCard = this.showsDecisionCard;
+    const attachmentOnly =
+      !decisionCard &&
+      !(this.body ?? '').trim() &&
+      ((this.attachmentRefs?.length ?? 0) > 0 || (this.attachments?.length ?? 0) > 0);
+    // The More actions dots sit inside the text bubble, in a reserved corner.
+    const contentActions = this.actionsEnabled ? ' has-actions' : '';
 
     return html`
-      <div class="message-wrapper ${dirClass}${groupClass}">
+      <div
+        class="message-wrapper ${dirClass}${groupClass}${this.actionsFocused
+          ? ' actions-focused'
+          : ''}"
+      >
         ${this.showHeader && this.fromAgent
           ? html`<div class="avatar" style="background: ${this.getAvatarColor()}">
               ${this.getInitials()}
@@ -2307,7 +2932,11 @@ export class ScionChatMessage extends LitElement {
           : this.fromAgent
             ? html`<div class="avatar-spacer"></div>`
             : nothing}
-        <div class="bubble">
+        <div
+          class="bubble${attachmentOnly && !isDeleted && this.actionsEnabled
+            ? ' actions-corner'
+            : ''}${decisionCard && !isDeleted ? ' decision' : ''}"
+        >
           ${this.showHeader && this.fromAgent
             ? html`
                 <div class="bubble-header">
@@ -2320,6 +2949,7 @@ export class ScionChatMessage extends LitElement {
                     : nothing}
                   <span class="msg-time" title=${this.formatTimeTitle()}>${this.formatTime()}</span>
                   ${this.editedAt ? html`<span class="edited-label">(edited)</span>` : nothing}
+                  ${this.renderStarIndicator()}
                 </div>
               `
             : nothing}
@@ -2333,23 +2963,147 @@ export class ScionChatMessage extends LitElement {
                   <span class="routed-to"> &rarr; ${this.routedTo}</span>
                   <span class="msg-time" title=${this.formatTimeTitle()}>${this.formatTime()}</span>
                   ${this.editedAt ? html`<span class="edited-label">(edited)</span>` : nothing}
+                  ${this.renderStarIndicator()}
                 </div>
               `
             : nothing}
-          ${this.replyPreview ? this.renderReplyPreview() : nothing}
+          ${this.renderAuthorizedBy()} ${this.replyPreview ? this.renderReplyPreview() : nothing}
           ${isDeleted
-            ? html`<div class="bubble-content">
+            ? html`<div class="bubble-content${contentActions}">
                 <span class="deleted-message">This message was deleted</span>
+                ${this.renderActionsButton()}
               </div>`
-            : html`<div class="bubble-content">${this.renderBody()}</div>`}
+            : attachmentOnly
+              ? nothing
+              : html`<div class="bubble-content${contentActions}">
+                  ${decisionCard && !this.displayBody.trim()
+                    ? nothing
+                    : this.renderBody()}${decisionCard
+                    ? this.renderDecisionCard()
+                    : nothing}${this.renderActionsButton()}
+                </div>`}
           ${isDeleted ? nothing : this.renderAttachments()}
           ${isDeleted ? nothing : this.renderArtifactChips()}
           ${isDeleted ? nothing : this.renderBadges()}
           ${isDeleted ? nothing : this.renderDeliveryState()}
+          ${this.showsStarMeta() ? this.renderStarMeta() : nothing}
+          ${attachmentOnly && !isDeleted ? this.renderActionsButton() : nothing}
+          ${this.renderActionsHelp()}
         </div>
       </div>
       ${this.renderFullPreview()}
     `;
+  }
+
+  /** The keys that move the message-list tab stop between messages. */
+  private static readonly NAV_KEYS = new Set(['ArrowUp', 'ArrowDown', 'Home', 'End']);
+
+  @state() private actionsFocused = false;
+
+  /**
+   * The More actions button: a native button (Enter and Space open the
+   * menu) carrying the message context in its name. Up/Down/Home/End ask
+   * the thread to move the tab stop (`message-actions-nav`); activation,
+   * Shift+F10 and the ContextMenu key ask it to open the menu here
+   * (`message-actions-open`). Nothing else is intercepted.
+   */
+  private renderActionsButton(): TemplateResult | typeof nothing {
+    if (!this.actionsEnabled) return nothing;
+    const who = this.senderName || this.sender;
+    const label = `More actions, message from ${who}, ${this.formatTime()}`;
+    const active = this.actionsTabIndex === 0;
+    return html`<button
+      type="button"
+      class="msg-actions"
+      tabindex=${this.actionsTabIndex}
+      aria-label=${label}
+      aria-haspopup="menu"
+      aria-expanded=${this.actionsExpanded ? 'true' : 'false'}
+      aria-describedby=${active ? 'actions-help' : nothing}
+      @click=${this.handleActionsClick}
+      @keydown=${this.handleActionsKeydown}
+      @focus=${(): void => {
+        this.actionsFocused = true;
+      }}
+      @blur=${(): void => {
+        this.actionsFocused = false;
+      }}
+    >
+      <sl-icon name="three-dots-vertical" aria-hidden="true"></sl-icon>
+    </button>`;
+  }
+
+  /**
+   * The tab stop's usage hint (the button's aria-describedby). It renders
+   * outside the text bubble so the bubble's text stays the message alone.
+   */
+  private renderActionsHelp(): TemplateResult | typeof nothing {
+    if (!this.actionsEnabled || this.actionsTabIndex !== 0) return nothing;
+    return html`<span class="actions-help" id="actions-help"
+      >Up and Down arrows move between messages. Shift+F10 also opens the menu. Tab leaves the
+      messages.</span
+    >`;
+  }
+
+  private handleActionsClick = (e: MouseEvent): void => {
+    e.stopPropagation();
+    this.dispatchActions('message-actions-open', {});
+  };
+
+  private handleActionsKeydown = (e: KeyboardEvent): void => {
+    if (e.altKey || e.ctrlKey || e.metaKey) return;
+    if (ScionChatMessage.NAV_KEYS.has(e.key) && !e.shiftKey) {
+      e.preventDefault();
+      e.stopPropagation();
+      this.dispatchActions('message-actions-nav', { key: e.key });
+      return;
+    }
+    if (e.key === 'ContextMenu' || (e.key === 'F10' && e.shiftKey)) {
+      e.preventDefault();
+      e.stopPropagation();
+      this.dispatchActions('message-actions-open', {});
+    }
+  };
+
+  private dispatchActions(type: string, extra: Record<string, unknown>): void {
+    this.dispatchEvent(
+      new CustomEvent(type, {
+        detail: { messageId: this.messageId, ...extra },
+        bubbles: true,
+        composed: true,
+      })
+    );
+  }
+
+  /** Whether the star shows in the gutter (a starred row without a header). */
+  private showsStarMeta(): boolean {
+    return this.starred && !this.deletedAt && !this.hasHeaderMeta();
+  }
+
+  /** Whether this rendering shows a header carrying the time (and the star). */
+  private hasHeaderMeta(): boolean {
+    return this.showHeader && (this.fromAgent || !!this.routedTo);
+  }
+
+  /**
+   * The private starred indicator: a filled star with the accessible name
+   * "Starred by you". It is an image, not a control, so it adds no tab stop.
+   */
+  private renderStarIndicator(): TemplateResult | typeof nothing {
+    if (!this.starred || this.deletedAt) return nothing;
+    return html`<span
+      class="star-indicator"
+      role="img"
+      aria-label="Starred by you"
+      title="Starred by you"
+      ><sl-icon name="star-fill" aria-hidden="true"></sl-icon
+    ></span>`;
+  }
+
+  /** The indicator on its own meta line, for renderings without a header. */
+  private renderStarMeta(): TemplateResult | typeof nothing {
+    if (!this.starred) return nothing;
+    return html`<div class="star-meta">${this.renderStarIndicator()}</div>`;
   }
 
   /** Render delivery state indicator for outbound (user-sent) messages. */
@@ -2429,6 +3183,26 @@ export class ScionChatMessage extends LitElement {
         const isUnreachable =
           this.dispatchFailureCode === 'agent_unreachable' ||
           (!this.dispatchFailureCode && this.dispatchFailureReason.startsWith('Agent unreachable'));
+        // ptone/scion#7405: pending-TTL expiry means dispatch confirmation was
+        // lost or never completed — delivery may already have occurred, so show
+        // "Delivery unconfirmed" rather than claiming a definite failure.
+        const isUnconfirmed =
+          this.dispatchFailureCode === 'delivery_unconfirmed' ||
+          (!this.dispatchFailureCode &&
+            this.dispatchFailureReason === 'expired: stuck in pending state beyond TTL');
+        if (isUnconfirmed) {
+          return html`
+            <sl-tooltip
+              content="Delivery unconfirmed: it may have been delivered; check before resending"
+              hoist
+            >
+              <div class="delivery-state failed">
+                <sl-icon name="exclamation-triangle"></sl-icon>
+                Delivery unconfirmed
+              </div>
+            </sl-tooltip>
+          `;
+        }
         return html`
           <sl-tooltip content=${this.dispatchFailureReason || 'Delivery failed'} hoist>
             <div class="delivery-state failed">
@@ -2443,16 +3217,66 @@ export class ScionChatMessage extends LitElement {
     }
   }
 
+  private renderDecisionCard(): TemplateResult {
+    return html`<scion-chat-decisions
+      .messageId=${this.messageId}
+      .decisions=${this.decisions ?? []}
+      .answerMode=${this.answerMode}
+      .currentUserId=${this.currentUserId}
+      .answerability=${this.answerability ?? ANSWERABLE}
+      .createdAt=${this.timestamp}
+      .conversationLabel=${this.conversationLabel}
+    ></scion-chat-decisions>`;
+  }
+
+  /**
+   * Whether this message renders as a compact decision-response line
+   * (design §4.6): a decision-response carrying its view, and the browser
+   * flag on (double gate, as for the card).
+   */
+  private get showsDecisionResponse(): boolean {
+    return (
+      this.messageType === 'decision-response' &&
+      !!(this.decisionResponse || this.decisionResponseSet) &&
+      decisionsEnabled()
+    );
+  }
+
+  /**
+   * The response line in the answerer's lane (or the left lane for an
+   * agent-sent interpreted response), attributed by `answeredByUserId`
+   * rather than message sender (ptone/scion#7775).
+   */
+  private renderDecisionResponse(): TemplateResult {
+    const first = this.decisionResponse ?? this.decisionResponseSet?.answers?.[0];
+    const answeredByUserId = first?.answeredByUserId ?? '';
+    const answeredByName = first?.answeredByName ?? '';
+    const provenance = first?.provenance ?? '';
+    const own = Boolean(this.currentUserId && answeredByUserId === this.currentUserId);
+    const interpreted = provenance === 'agent_interpreted';
+    const lane = !interpreted && own ? 'own' : 'other';
+    const fallbackAnswerer = !interpreted && !this.senderIsAgent ? this.senderName : '';
+    const answererName = own ? 'you' : answeredByName || fallbackAnswerer || 'Someone';
+    const agentName = interpreted ? (this.senderName || this.sender).replace(/^agent:/, '') : '';
+    return html`<div class="decision-response-row ${lane}">
+      <scion-chat-decision-response
+        lane=${lane}
+        .response=${this.decisionResponse}
+        .responseSet=${this.decisionResponseSet}
+        .isOwnAnswerer=${own}
+        answererName=${answererName}
+        agentName=${agentName}
+        timestamp=${this.timestamp}
+        dispatchState=${this.dispatchState}
+      ></scion-chat-decision-response>
+    </div>`;
+  }
+
   private renderBody() {
-    if (this.plain || !this.renderedHtml) {
-      return html`<div class="plain-text">${this.body}</div>`;
+    if (this.plain || !this.renderedContent) {
+      return html`<div class="plain-text">${this.displayBody}</div>`;
     }
-    return html`<div
-      class="md-content"
-      @click=${this.handleContentClick}
-      @auxclick=${(e: MouseEvent) => this.handleContentAuxClick(e)}
-      .innerHTML=${this.renderedHtml}
-    ></div>`;
+    return this.renderedContent;
   }
 
   private renderBadges() {
@@ -2650,24 +3474,23 @@ export class ScionChatMessage extends LitElement {
   private async copyAttachmentText(id: string): Promise<void> {
     const state = this.previews.get(id);
     if (!state || state.status !== 'ready' || !state.text) return;
-    try {
-      await navigator.clipboard.writeText(state.text);
-      const next = new Set(this.copiedIds);
-      next.add(id);
-      this.copiedIds = next;
-      const existing = this.copyTimers.get(id);
-      if (existing) clearTimeout(existing);
-      const timer = setTimeout(() => {
-        if (!this.isConnected) return;
-        const after = new Set(this.copiedIds);
-        after.delete(id);
-        this.copiedIds = after;
-        this.copyTimers.delete(id);
-      }, 1500);
-      this.copyTimers.set(id, timer);
-    } catch {
-      // Clipboard write may fail in insecure contexts; silently ignore.
+    if (!(await copyToClipboard(state.text))) {
+      showCopyFailedToast();
+      return;
     }
+    const next = new Set(this.copiedIds);
+    next.add(id);
+    this.copiedIds = next;
+    const existing = this.copyTimers.get(id);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      if (!this.isConnected) return;
+      const after = new Set(this.copiedIds);
+      after.delete(id);
+      this.copiedIds = after;
+      this.copyTimers.delete(id);
+    }, 1500);
+    this.copyTimers.set(id, timer);
   }
 
   /** Rendered markdown body for a markdown attachment preview. */

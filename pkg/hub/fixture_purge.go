@@ -23,7 +23,6 @@ import (
 	"sort"
 	"time"
 
-	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
@@ -160,10 +159,12 @@ func fixturePurgeBasisFor(ctx context.Context, stamp store.FixtureProvenance) *f
 
 // TestIdentityPurgeCounts counts what one purge run removed.
 type TestIdentityPurgeCounts struct {
-	Agents    int `json:"agents"`
-	Schedules int `json:"schedules"`
-	Groups    int `json:"groups"`
-	Projects  int `json:"projects"`
+	Agents           int `json:"agents"`
+	Schedules        int `json:"schedules"`
+	Triggers         int `json:"triggers"`
+	WebhookEndpoints int `json:"webhookEndpoints"`
+	Groups           int `json:"groups"`
+	Projects         int `json:"projects"`
 	// Grants counts the grant rows removed by their issuance stamp
 	// (admin kinds only).
 	Grants int `json:"grants,omitempty"`
@@ -370,6 +371,37 @@ func (s *Server) purgeTestIdentityRun(ctx context.Context, run fixturePurgeRun) 
 		}
 	}
 
+	// 2b. Triggers.
+	for i := range set.Triggers {
+		tr := &set.Triggers[i]
+		deleted, err := s.purgeFixtureTrigger(ctx, tr, basis)
+		if err != nil {
+			slog.ErrorContext(ctx, "test identity purge: trigger delete failed", "trigger_id", tr.ID, "error", err)
+			report.NotDone = append(report.NotDone, TestIdentityPurgeItem{Type: "trigger", ID: tr.ID, ProjectID: tr.ProjectID, Status: "failed", Reason: "store_error"})
+			continue
+		}
+		if deleted {
+			report.Deleted.Triggers++
+		}
+	}
+
+	// 2c. Webhook endpoints, after stamped triggers so stamped triggers are
+	// already deleted and any remaining unstamped triggers attached to a
+	// stamped endpoint are paused as source_deleted while the endpoint's
+	// hub-scoped SecretTypeInternal rows are removed atomically.
+	for i := range set.WebhookEndpoints {
+		ep := &set.WebhookEndpoints[i]
+		deleted, err := s.purgeFixtureWebhookEndpoint(ctx, ep, basis)
+		if err != nil {
+			slog.ErrorContext(ctx, "test identity purge: webhook endpoint delete failed", "endpoint_id", ep.ID, "error", err)
+			report.NotDone = append(report.NotDone, TestIdentityPurgeItem{Type: "webhook_endpoint", ID: ep.ID, ProjectID: ep.ProjectID, Status: "failed", Reason: "store_error"})
+			continue
+		}
+		if deleted {
+			report.Deleted.WebhookEndpoints++
+		}
+	}
+
 	// 3. Groups, before any project decision: every stamped group except a
 	// project's own agents and members groups (those are created with
 	// their project and go, or stay, with it in step 4). A group of the
@@ -457,9 +489,8 @@ func (s *Server) purgeFixtureAgent(ctx context.Context, listed *store.Agent, req
 	if deletionActive(a) {
 		return notDone("deleting", "")
 	}
-	createdNoLaunch := a.Phase == string(state.PhaseCreated) && a.LaunchState != store.LaunchStateActive
 	finalizing := a.DeletionState == store.DeletionStateFinalizing
-	if !isManagedAgentRuntime(a.Runtime) && !createdNoLaunch && !finalizing && !s.brokerReachable(ctx, a) {
+	if !isManagedAgentRuntime(a.Runtime) && !deleteSkipsBrokerCheck(a) && !finalizing && !s.brokerReachable(ctx, a) {
 		return notDone("broker_unavailable", "")
 	}
 	plan, err := s.claimAgentDeletion(ctx, a.ID, agentDeleteParams{
@@ -631,6 +662,67 @@ func (s *Server) purgeFixtureSchedule(ctx context.Context, sc *store.Schedule, b
 	return true, nil
 }
 
+// purgeFixtureTrigger removes one stamped trigger with its audit row.
+func (s *Server) purgeFixtureTrigger(ctx context.Context, tr *store.Trigger, basis fixturePurgeBasis) (bool, error) {
+	b := fixturePurgeBasisFor(ctx, tr.Fixture)
+	if b == nil {
+		return false, nil
+	}
+	record := newTriggerAudit(ctx, mutationTypeTriggerDelete, tr.ID)
+	record.AfterSummary = fixturePurgeSummary(map[string]any{"project_id": tr.ProjectID, "name": tr.Name}, *b)
+	record.CorrelationID = basis.RunID
+	err := s.store.WithTx(ctx, func(tx store.Store) error {
+		if err := tx.DeleteTrigger(ctx, tr.ID); err != nil {
+			return err
+		}
+		return writeFixturePurgeAuditTx(ctx, tx, record, *b)
+	})
+	if errors.Is(err, store.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	s.invalidateTriggerRuleCache(tr.ProjectID, tr.ID, 0)
+	return true, nil
+}
+
+// purgeFixtureWebhookEndpoint removes one stamped webhook endpoint along with
+// its hub-scoped SecretTypeInternal HMAC secret rows, pausing any unstamped
+// dependent triggers as source_deleted, and writes the provenance_basis audit
+// row in the same transaction.
+func (s *Server) purgeFixtureWebhookEndpoint(ctx context.Context, ep *store.WebhookEndpoint, basis fixturePurgeBasis) (bool, error) {
+	b := fixturePurgeBasisFor(ctx, ep.Fixture)
+	if b == nil {
+		return false, nil
+	}
+	record := newWebhookEndpointAudit(ctx, mutationTypeWebhookEndpointDelete, ep.ID)
+	record.CorrelationID = basis.RunID
+	err := s.store.WithTx(ctx, func(tx store.Store) error {
+		if err := tx.LockTriggerQuota(ctx, ep.ProjectID); err != nil {
+			return err
+		}
+		pausedTriggerIDs, deletedSecretKeys, err := tx.DeleteWebhookEndpoint(ctx, ep.ProjectID, ep.ID)
+		if err != nil {
+			return err
+		}
+		record.AfterSummary = fixturePurgeSummary(map[string]any{
+			"project_id":           ep.ProjectID,
+			"name":                 ep.Name,
+			"paused_trigger_count": len(pausedTriggerIDs),
+			"deleted_secret_count": len(deletedSecretKeys),
+		}, *b)
+		return writeFixturePurgeAuditTx(ctx, tx, record, *b)
+	})
+	if errors.Is(err, store.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // purgeFixtureGroup removes one stamped group with its audit row, then
 // re-evaluates the project access of the users who were in it, as the
 // group API's delete does.
@@ -784,15 +876,21 @@ func (s *Server) purgeFixtureUser(ctx context.Context, run fixturePurgeRun, basi
 		return nil
 	}
 	var lastOwnerErr *lastProjectOwnerDeleteError
-	var ownsAgentsErr *userOwnsAgentsDeleteError
+	var blockedErr *userDeleteBlockedError
+	var inProgressErr *userDeletionInProgressError
 	switch {
+	case errors.As(err, &inProgressErr):
+		// A forced deletion of the identity is in progress; it removes
+		// the identity when it completes.
+		report.IdentityKeptReason = "deletion_in_progress"
+		return nil
 	case errors.Is(err, store.ErrNotFound):
 		// Deleted concurrently: nothing is left to do.
 		report.IdentityDeleted = false
 		return nil
-	case errors.As(err, &ownsAgentsErr):
+	case errors.As(err, &blockedErr):
 		report.IdentityKeptReason = "owns_agents"
-		report.IdentityKeptDetails = map[string]any{"agents": ownsAgentsErr.agents}
+		report.IdentityKeptDetails = map[string]any{"agents": blockedErr.blockers.Agents, "edges": blockedErr.blockers.Edges}
 		return nil
 	case errors.As(err, &lastOwnerErr):
 		report.IdentityKeptReason = "last_owner"

@@ -100,6 +100,53 @@ describe('StateManager user-scoped chat subjects', () => {
     const detail = (scheduled.mock.calls[0]?.[0] as CustomEvent).detail as { data: unknown };
     expect(detail.data).toEqual(data);
   });
+
+  it('routes user.{id}.chat.stars to chat-stars-updated, never as a message', () => {
+    const sm = new StateManager();
+    const stars = vi.fn();
+    const message = vi.fn();
+    sm.addEventListener('chat-stars-updated', stars);
+    sm.addEventListener('chat-message-received', message);
+
+    emit(sm, 'user.b.chat.stars', { action: 'changed' });
+
+    expect(message).not.toHaveBeenCalled();
+    expect(stars).toHaveBeenCalledTimes(1);
+    const detail = (stars.mock.calls[0]?.[0] as CustomEvent).detail as { data: unknown };
+    expect(detail.data).toEqual({ action: 'changed' });
+  });
+
+  it('routes user.{id}.chat.decision.updated to decision-updated, never as a message', () => {
+    const sm = new StateManager();
+    const choice = vi.fn();
+    const message = vi.fn();
+    sm.addEventListener('decision-updated', choice);
+    sm.addEventListener('chat-message-received', message);
+
+    const data = { messageId: 'm1', threadId: 'dm:agent:a:user:b', decision: { rowId: 'r1' } };
+    emit(sm, 'user.b.chat.decision.updated', data);
+
+    expect(message).not.toHaveBeenCalled();
+    expect(choice).toHaveBeenCalledTimes(1);
+    const detail = (choice.mock.calls[0]?.[0] as CustomEvent).detail as { data: unknown };
+    expect(detail.data).toEqual(data);
+  });
+
+  it('routes project.{id}.chat.decision.updated to decision-updated with the project id', () => {
+    const sm = new StateManager();
+    const choice = vi.fn();
+    const message = vi.fn();
+    sm.addEventListener('decision-updated', choice);
+    sm.addEventListener('chat-message-received', message);
+
+    const data = { messageId: 'm1', threadId: 'topic-1', decision: { rowId: 'r1' } };
+    emit(sm, 'project.p1.chat.decision.updated', data);
+
+    expect(message).not.toHaveBeenCalled();
+    expect(choice).toHaveBeenCalledTimes(1);
+    const detail = (choice.mock.calls[0]?.[0] as CustomEvent).detail as { data: unknown };
+    expect(detail.data).toEqual({ projectId: 'p1', ...data });
+  });
 });
 
 /**
@@ -192,6 +239,53 @@ describe('StateManager own chat subject', () => {
     sm.setCurrentUserId('me');
     const subjects = subjectsFor(sm, { type: 'chat', spaceIds: ['p1'], userId: 'me' });
     expect(subjects.filter((s) => s === 'user.me.chat.>')).toHaveLength(1);
+  });
+});
+
+describe('StateManager profile scope', () => {
+  const subjectsFor = (
+    sm: StateManager,
+    scope: Parameters<StateManager['setScope']>[0]
+  ): string[] =>
+    (sm as unknown as { subjectsForScope(s: unknown): string[] }).subjectsForScope(scope);
+
+  it('subscribes to project.>, notification.>, and user.<id>.chat.> for DM choice updates', () => {
+    const sm = new StateManager();
+    expect(subjectsFor(sm, { type: 'profile', userId: 'u-1' })).toEqual([
+      'project.>',
+      'notification.>',
+      'user.u-1.chat.>',
+      'user.u-1.notification',
+    ]);
+
+    sm.setCurrentUserId('u-1');
+    const deduped = subjectsFor(sm, { type: 'profile', userId: 'u-1' });
+    expect(deduped.filter((s) => s === 'user.u-1.chat.>')).toHaveLength(1);
+  });
+
+  it('adds user.<id>.chat.> when setCurrentUserId arrives after setScope({ type: "profile" }) and dedupes identical scopes', () => {
+    const sm = new StateManager();
+    const connect = vi.fn();
+    (sm as unknown as { sseClient: { connect: (s: string[]) => void } }).sseClient.connect =
+      connect;
+
+    sm.setScope({ type: 'profile' });
+    expect(connect).toHaveBeenCalledTimes(1);
+    expect(connect).toHaveBeenLastCalledWith(['project.>', 'notification.>']);
+
+    sm.setCurrentUserId('u-2');
+    expect(connect).toHaveBeenCalledTimes(2);
+    expect(connect).toHaveBeenLastCalledWith([
+      'project.>',
+      'notification.>',
+      'user.u-2.chat.>',
+      'user.u-2.notification',
+    ]);
+
+    sm.setScope({ type: 'profile', userId: 'u-2' });
+    const gen = sm.scopeGeneration;
+    sm.setScope({ type: 'profile', userId: 'u-2' });
+    expect(sm.scopeGeneration).toBe(gen);
   });
 });
 

@@ -61,11 +61,6 @@ var layer1NotWritableKeys = map[string]string{
 	"default_agent_role":     "accepted only as an unchanged echo of GET (dbUnwrittenLayer1Paths)",
 }
 
-// layer1ExemptKeys are Layer-1 koanf paths left out of this check.
-var layer1ExemptKeys = map[string]string{
-	"server.auth.authorized_domains": "handled in a separate change",
-}
-
 func observeLocked[T any](f func(s *Server) T) func(s *Server, _ *OperationalSettings) any {
 	return func(s *Server, _ *OperationalSettings) any {
 		s.mu.RLock()
@@ -81,6 +76,17 @@ func observeTelemetry(s *Server, _ *OperationalSettings) any {
 		Default any
 		Config  any
 	}{s.config.TelemetryDefault, s.config.TelemetryConfig})
+	return string(b)
+}
+
+func observeBranding(s *Server, _ *OperationalSettings) any {
+	s.mu.RLock()
+	cfg := s.config.Branding.Clone()
+	s.mu.RUnlock()
+	b, _ := json.Marshal(struct {
+		Config *config.BrandingConfig
+		Public *config.PublicBranding
+	}{cfg, s.ResolvedBranding().Public()})
 	return string(b)
 }
 
@@ -191,6 +197,58 @@ var telemetryProbeDocs = map[string]string{
 	"telemetry.resource":                       `{"resource":{"service.namespace":"probe"}}`,
 }
 
+// brandingProbeDocs maps each branding koanf path to a valid section document
+// that sets it and changes the running branding snapshot.
+var brandingProbeDocs = map[string]string{
+	"server.hub.branding":                              `{"name":"Probe Brand"}`,
+	"server.hub.branding.name":                         `{"name":"Probe Brand"}`,
+	"server.hub.branding.short_name":                   `{"short_name":"Probe"}`,
+	"server.hub.branding.subtitle":                     `{"subtitle":"Probe Subtitle"}`,
+	"server.hub.branding.attribution":                  `{"attribution":"hidden"}`,
+	"server.hub.branding.logo":                         `{"logo":{"light":"https://cdn.example.com/logo.svg"}}`,
+	"server.hub.branding.logo.light":                   `{"logo":{"light":"https://cdn.example.com/logo-light.svg"}}`,
+	"server.hub.branding.logo.dark":                    `{"logo":{"dark":"https://cdn.example.com/logo-dark.svg"}}`,
+	"server.hub.branding.icons":                        `{"icons":{"favicon":"https://cdn.example.com/favicon.svg"}}`,
+	"server.hub.branding.icons.favicon":                `{"icons":{"favicon":"https://cdn.example.com/favicon.svg"}}`,
+	"server.hub.branding.icons.apple_touch_icon":       `{"icons":{"apple_touch_icon":"https://cdn.example.com/apple.png"}}`,
+	"server.hub.branding.icons.icon_192":               `{"icons":{"icon_192":"https://cdn.example.com/192.png"}}`,
+	"server.hub.branding.icons.icon_512":               `{"icons":{"icon_512":"https://cdn.example.com/512.png"}}`,
+	"server.hub.branding.icons.icon_maskable_512":      `{"icons":{"icon_maskable_512":"https://cdn.example.com/maskable.png"}}`,
+	"server.hub.branding.accent_color":                 `{"accent_color":"#0d9488"}`,
+	"server.hub.branding.palette":                      `{"palette":{"primary":{"600":"#0f766e"}}}`,
+	"server.hub.branding.palette.primary":              `{"palette":{"primary":{"600":"#0f766e"}}}`,
+	"server.hub.branding.palette.neutral":              `{"palette":{"neutral":{"900":"#111827"}}}`,
+	"server.hub.branding.palette.success":              `{"palette":{"success":{"600":"#15803d"}}}`,
+	"server.hub.branding.palette.warning":              `{"palette":{"warning":{"600":"#b45309"}}}`,
+	"server.hub.branding.palette.danger":               `{"palette":{"danger":{"600":"#b91c1c"}}}`,
+	"server.hub.branding.palette.light":                `{"palette":{"light":{"primary":"#0f766e"}}}`,
+	"server.hub.branding.palette.light.bg":             `{"palette":{"light":{"bg":"#fafaf9"}}}`,
+	"server.hub.branding.palette.light.bg_subtle":      `{"palette":{"light":{"bg_subtle":"#ffffff"}}}`,
+	"server.hub.branding.palette.light.surface":        `{"palette":{"light":{"surface":"#fafaf9"}}}`,
+	"server.hub.branding.palette.light.surface_raised": `{"palette":{"light":{"surface_raised":"#fafaf9"}}}`,
+	"server.hub.branding.palette.light.text":           `{"palette":{"light":{"text":"#111827"}}}`,
+	"server.hub.branding.palette.light.text_secondary": `{"palette":{"light":{"text_secondary":"#334155"}}}`,
+	"server.hub.branding.palette.light.text_muted":     `{"palette":{"light":{"text_muted":"#475569"}}}`,
+	"server.hub.branding.palette.light.border":         `{"palette":{"light":{"border":"#cbd5e1"}}}`,
+	"server.hub.branding.palette.light.primary":        `{"palette":{"light":{"primary":"#0f766e"}}}`,
+	"server.hub.branding.palette.light.primary_hover":  `{"palette":{"light":{"primary_hover":"#115e59"}}}`,
+	"server.hub.branding.palette.light.primary_active": `{"palette":{"light":{"primary_active":"#134e4a"}}}`,
+	"server.hub.branding.palette.light.primary_text":   `{"palette":{"light":{"primary_text":"#f8fafc"}}}`,
+	"server.hub.branding.palette.dark":                 `{"palette":{"dark":{"primary":"#2dd4bf"}}}`,
+	"server.hub.branding.palette.dark.bg":              `{"palette":{"dark":{"bg":"#020617"}}}`,
+	"server.hub.branding.palette.dark.bg_subtle":       `{"palette":{"dark":{"bg_subtle":"#0f172a"}}}`,
+	"server.hub.branding.palette.dark.surface":         `{"palette":{"dark":{"surface":"#0f172a"}}}`,
+	"server.hub.branding.palette.dark.surface_raised":  `{"palette":{"dark":{"surface_raised":"#1e293b"}}}`,
+	"server.hub.branding.palette.dark.text":            `{"palette":{"dark":{"text":"#ffffff"}}}`,
+	"server.hub.branding.palette.dark.text_secondary":  `{"palette":{"dark":{"text_secondary":"#e2e8f0"}}}`,
+	"server.hub.branding.palette.dark.text_muted":      `{"palette":{"dark":{"text_muted":"#cbd5e1"}}}`,
+	"server.hub.branding.palette.dark.border":          `{"palette":{"dark":{"border":"#475569"}}}`,
+	"server.hub.branding.palette.dark.primary":         `{"palette":{"dark":{"primary":"#2dd4bf"}}}`,
+	"server.hub.branding.palette.dark.primary_hover":   `{"palette":{"dark":{"primary_hover":"#5eead4"}}}`,
+	"server.hub.branding.palette.dark.primary_active":  `{"palette":{"dark":{"primary_active":"#99f6e4"}}}`,
+	"server.hub.branding.palette.dark.primary_text":    `{"palette":{"dark":{"primary_text":"#020617"}}}`,
+}
+
 func layer1LiveProbes(t *testing.T) map[string]layer1LiveProbe {
 	jwks := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -208,12 +266,19 @@ func layer1LiveProbes(t *testing.T) map[string]layer1LiveProbe {
 			observe: observeLocked(func(s *Server) any { return s.config.UserAccessMode })},
 		"server.auth.default_user_role": {section: "access", doc: `{"default_user_role":"viewer"}`,
 			observe: observeLocked(func(s *Server) any { return s.config.DefaultUserRole })},
+		// ptone/scion#6000: a saved list was stored but not applied.
+		"server.auth.authorized_domains": {section: "access", doc: `{"authorized_domains":["probe.example.com"]}`,
+			observe: func(s *Server, _ *OperationalSettings) any { return s.AuthorizedDomains() }},
 
 		// lifecycle
 		"server.hub.auto_suspend_stalled": {section: "lifecycle", doc: `{"auto_suspend_stalled":true}`,
 			observe: observeLocked(func(s *Server) any { return s.config.AutoSuspendStalled })},
 		"server.hub.stalled_threshold": {section: "lifecycle", doc: `{"stalled_threshold":"17m"}`,
 			observe: observeLocked(func(s *Server) any { return s.config.StalledThreshold })},
+		"server.hub.auto_suspend_idle": {section: "lifecycle", doc: `{"auto_suspend_idle":true}`,
+			observe: observeLocked(func(s *Server) any { return s.config.AutoSuspendIdle })},
+		"server.hub.idle_suspend_after": {section: "lifecycle", doc: `{"idle_suspend_after":"23m"}`,
+			observe: observeLocked(func(s *Server) any { return s.config.IdleSuspendAfter })},
 		"server.hub.soft_delete_retention": {section: "lifecycle", doc: `{"soft_delete_retention":"3h"}`,
 			observe: func(s *Server, _ *OperationalSettings) any { r, _ := s.softDeleteSettings(); return r }},
 		"server.hub.soft_delete_retain_files": {section: "lifecycle", doc: `{"soft_delete_retain_files":true}`,
@@ -262,13 +327,19 @@ func layer1LiveProbes(t *testing.T) map[string]layer1LiveProbe {
 			observe: func(s *Server, _ *OperationalSettings) any { return s.resolveImageRegistry() }},
 		"server.hub.monitoring_dashboard_url": {section: "endpoints", doc: `{"monitoring_dashboard_url":"https://monitoring.example.com/d/1"}`,
 			observe: observeLocked(func(s *Server) any { return s.config.MonitoringDashboardURL })},
+		"server.hub.content_url": {section: "endpoints", doc: `{"content_url":"https://content.example.net"}`,
+			observe: func(s *Server, _ *OperationalSettings) any { return s.contentURLLiveState().URL }},
+		"server.hub.content_url_allow_same_site": {section: "endpoints", doc: `{"content_url_allow_same_site":true}`,
+			observe: func(s *Server, _ *OperationalSettings) any { return s.contentURLAllowSameSiteLiveValue() }},
 
 		// github_app
-		"server.github_app":                  {section: "github_app", base: ghBase + `}`, doc: ghBase + `,"api_base_url":"https://ghe.example.com/api/v3"}`, observe: observeGitHubApp},
-		"server.github_app.api_base_url":     {section: "github_app", base: ghBase + `}`, doc: ghBase + `,"api_base_url":"https://ghe.example.com/api/v3"}`, observe: observeGitHubApp},
-		"server.github_app.webhooks_enabled": {section: "github_app", base: ghBase + `}`, doc: ghBase + `,"webhooks_enabled":true}`, observe: observeGitHubApp},
-		"server.github_app.installation_url": {section: "github_app", base: ghBase + `}`, doc: ghBase + `,"installation_url":"https://github.com/apps/probe/installations/new"}`, observe: observeGitHubApp},
-		"server.github_app.private_key_path": {section: "github_app", base: ghBase + `}`, doc: ghBase + `,"private_key_path":"/etc/probe.pem"}`, observe: observeGitHubApp},
+		"server.github_app":                         {section: "github_app", base: ghBase + `}`, doc: ghBase + `,"api_base_url":"https://ghe.example.com/api/v3"}`, observe: observeGitHubApp},
+		"server.github_app.api_base_url":            {section: "github_app", base: ghBase + `}`, doc: ghBase + `,"api_base_url":"https://ghe.example.com/api/v3"}`, observe: observeGitHubApp},
+		"server.github_app.webhooks_enabled":        {section: "github_app", base: ghBase + `}`, doc: ghBase + `,"webhooks_enabled":true}`, observe: observeGitHubApp},
+		"server.github_app.installation_url":        {section: "github_app", base: ghBase + `}`, doc: ghBase + `,"installation_url":"https://github.com/apps/probe/installations/new"}`, observe: observeGitHubApp},
+		"server.github_app.private_key_path":        {section: "github_app", base: ghBase + `}`, doc: ghBase + `,"private_key_path":"/etc/probe.pem"}`, observe: observeGitHubApp},
+		"server.github_app.app_slug":                {section: "github_app", base: ghBase + `}`, doc: ghBase + `,"app_slug":"scion-probe"}`, observe: observeGitHubApp},
+		"server.github_app.command_mention_aliases": {section: "github_app", base: ghBase + `}`, doc: ghBase + `,"command_mention_aliases":["scion","scion-probe"]}`, observe: observeGitHubApp},
 
 		// notifications
 		"server.notification_channels": {section: "notifications",
@@ -303,6 +374,8 @@ func layer1LiveProbes(t *testing.T) map[string]layer1LiveProbe {
 			observe: func(_ *Server, o *OperationalSettings) any { return o.Artifacts() }},
 		"profiling": {section: "profiling", doc: `{"readiness_marks":true}`,
 			observe: func(_ *Server, o *OperationalSettings) any { return o.ReadinessMarks() }},
+		"chat_retention": {section: "chat_retention", doc: `{"enabled":true,"messages_retention_days":30}`,
+			observe: func(_ *Server, o *OperationalSettings) any { return o.ChatRetention() }},
 		"agent_delegation_policy": {section: "agent_delegation_policy", doc: `{"remove":{"hub":["agent.read"]}}`,
 			observe: func(_ *Server, o *OperationalSettings) any {
 				p, err := o.AgentDelegationPolicy()
@@ -311,6 +384,9 @@ func layer1LiveProbes(t *testing.T) map[string]layer1LiveProbe {
 	}
 	for path, doc := range telemetryProbeDocs {
 		p[path] = layer1LiveProbe{section: "telemetry", doc: doc, observe: observeTelemetry}
+	}
+	for path, doc := range brandingProbeDocs {
+		p[path] = layer1LiveProbe{section: opsettings.BrandingSectionName, doc: doc, observe: observeBranding}
 	}
 	return p
 }
@@ -344,12 +420,6 @@ func TestLayer1Keys_AppliedLiveOrRestartRequired(t *testing.T) {
 		_, live := probes[key]
 		restart := opsettings.IsRestartRequired(key)
 		_, exempt := layer1NotWritableKeys[key]
-		if _, skip := layer1ExemptKeys[key]; skip {
-			if live || restart || exempt {
-				t.Errorf("%s is exempt from this check but also has a probe, the restart_required flag or a not-writable entry", key)
-			}
-			continue
-		}
 		switch {
 		case live && restart:
 			t.Errorf("%s has a live-apply probe and is flagged restart_required; it must be one or the other", key)

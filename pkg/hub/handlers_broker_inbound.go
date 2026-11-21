@@ -25,6 +25,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/artifacts"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/messaging"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectkeys"
@@ -46,6 +47,12 @@ type inboundMessageRequest struct {
 	Surface     string `json:"surface,omitempty"`
 	ExternalRef string `json:"external_ref,omitempty"`
 	ParentRef   string `json:"parent_ref,omitempty"`
+
+	// AttachmentIDs names attachments stored as artifacts that the sender
+	// uploaded (POST /api/v1/broker/inbound/attachments). Each must be an
+	// unsent upload of the resolved "user:" sender; they are bound to the
+	// stored message and delivered into the recipient agent's inbox.
+	AttachmentIDs []string `json:"attachment_ids,omitempty"`
 }
 
 // handleBrokerInbound handles POST /api/v1/broker/inbound.
@@ -106,11 +113,16 @@ func (s *Server) handleBrokerInbound(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if isReservedSchedulerChannel(req.Message.Channel) {
+		ValidationError(w, fmt.Sprintf("channel %q is reserved for internal use", req.Message.Channel), nil)
+		return
+	}
 
 	// #2257 P2 (design auto-offload-large-dm §4.2 item 1): strip hub-reserved
 	// offload metadata keys from plugin-supplied messages before any further
 	// processing, render, or dispatch.
 	req.Message.Metadata = messaging.StripReservedMetadata(req.Message.Metadata)
+	clearInboundClientEvent(req.Message)
 
 	// Parse topic to extract project ID and agent slug
 	projectID, agentSlug, err := parseAgentMessageTopic(req.Topic)
@@ -149,55 +161,23 @@ func (s *Server) handleBrokerInbound(w http.ResponseWriter, r *http.Request) {
 	// broker identity, whose Type()="broker" does not match any allowed
 	// sender type and is denied.
 	var senderIdentity Identity
+	var senderUser *AuthenticatedUser
 	if strings.HasPrefix(req.Message.Sender, "user:") {
-		senderEmail := strings.TrimPrefix(req.Message.Sender, "user:")
-		// A hub test identity is reachable only through its own hub-issued
-		// token; this path resolves by email, so it refuses one outright.
-		if emailResolvedPrincipalRefused(senderEmail, nil) {
-			writeError(w, http.StatusForbidden, ErrCodeForbidden,
-				"sender identity not eligible", map[string]interface{}{"sender": req.Message.Sender})
-			return
-		}
-		senderUser, err := s.store.GetUserByEmail(r.Context(), senderEmail)
-		if err != nil {
-			log.Warn("Could not resolve sender identity for permission check",
-				"sender", req.Message.Sender, "error", err)
-			if errors.Is(err, store.ErrNotFound) {
-				writeError(w, http.StatusForbidden, ErrCodeForbidden,
-					"sender identity could not be resolved", map[string]interface{}{
-						"sender": req.Message.Sender,
-					})
-			} else {
-				writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
-					"internal error resolving sender identity", nil)
-			}
-			return
-		}
-		// C2a containment: require active status before constructing an
-		// AuthenticatedUser from broker-supplied sender data. This identity
-		// is synthesized below the auth middleware, which normally enforces
-		// suspension. Without this check, a suspended or otherwise non-active
-		// user can be impersonated through the broker inbound path.
-		if senderUser.Status != store.UserStatusActive {
-			log.Warn("broker inbound sender is not active",
-				"sender", req.Message.Sender, "status", senderUser.Status)
-			writeError(w, http.StatusForbidden, ErrCodeForbidden,
-				"sender identity is not active", map[string]interface{}{
-					"sender": req.Message.Sender,
-					"status": senderUser.Status,
-				})
-			return
-		}
-		if emailResolvedPrincipalRefused(senderEmail, senderUser) {
-			log.Warn("broker inbound sender is a test identity", "sender", req.Message.Sender)
-			writeError(w, http.StatusForbidden, ErrCodeForbidden,
-				"sender identity not eligible", map[string]interface{}{"sender": req.Message.Sender})
+		var refusal *apiError
+		senderUser, refusal = s.resolveBrokerInboundSender(r.Context(), req.Message.Sender)
+		if refusal != nil {
+			log.Warn("broker inbound sender refused",
+				"sender", req.Message.Sender, "refusal", brokerRefusalLogText(refusal))
+			refusal.write(w)
 			return
 		}
 		// Cache the resolved user ID so downstream DM-ownership and
 		// persistence blocks can reuse it without redundant DB lookups.
-		req.Message.SenderID = senderUser.ID
-		senderIdentity = NewAuthenticatedUser(senderUser.ID, senderUser.Email, senderUser.DisplayName, senderUser.Role, "integration")
+		req.Message.SenderID = senderUser.ID()
+		// The sender's profile time zone travels with the message (the
+		// reserved-key strip above removed any plugin-supplied value).
+		req.Message.Metadata = s.stampSenderTimezone(r.Context(), req.Message.Metadata, req.Message.Sender, senderUser.ID())
+		senderIdentity = senderUser
 	} else {
 		// Non-user senders use the broker identity (non-nil by the HMAC
 		// check above). Its Type()="broker" is not an allowed sender type,
@@ -233,6 +213,31 @@ func (s *Server) handleBrokerInbound(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Attachments stored as artifacts named by id: only a resolved "user:"
+	// sender may name them, and each must be that user's own unsent upload
+	// (checked with the sender as the caller, never the broker), within
+	// the delivery budget. A request without ids is unaffected.
+	var attachRefs []AttachmentRef
+	var senderCtx context.Context
+	if len(req.AttachmentIDs) > 0 {
+		if senderUser == nil {
+			log.Warn("broker inbound attachment ids refused: sender is not a user", "agent_slug", agentSlug)
+			Forbidden(w)
+			return
+		}
+		if req.Message.Broadcasted {
+			ValidationError(w, "attachment_ids are not accepted on broadcasts", nil)
+			return
+		}
+		senderCtx = brokerSenderContext(withStandingMemo(r.Context()), senderUser)
+		refs, msg := s.validateUserAttachmentIDs(senderCtx, senderUser, req.AttachmentIDs, req.Message.Attachments, "broker-inbound")
+		if msg != "" {
+			ValidationError(w, msg, nil)
+			return
+		}
+		attachRefs = refs
+	}
+
 	// A held agent (ptone/scion#3433) is refused like a suspended one,
 	// whatever its phase; a lookup fault refuses.
 	if held, holdErr := s.agentHeld(r.Context(), agent.ID); holdErr != nil {
@@ -244,7 +249,13 @@ func (s *Server) handleBrokerInbound(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Reject messages to non-running agents.
+	// Reject messages to non-running agents (including running rows with an
+	// active idle-suspend claim, treated as suspended).
+	if agent.IdleSuspendClaimActive {
+		writeError(w, http.StatusConflict, ErrCodeAgentNotRunning,
+			fmt.Sprintf("Agent %q is suspended.", agent.Slug), nil)
+		return
+	}
 	if phase := state.Phase(agent.Phase); phase != state.PhaseRunning {
 		var msg string
 		switch phase {
@@ -285,6 +296,11 @@ func (s *Server) handleBrokerInbound(w http.ResponseWriter, r *http.Request) {
 	// (Phase 7, AC-8).
 	if err := messaging.ValidateLegacyMessage(req.Message); err != nil {
 		writeError(w, http.StatusBadRequest, ErrCodeValidationError, err.Error(), nil)
+		return
+	}
+	// decision-prompt and decision-response are minted by the hub only; a
+	// plugin relays user messages and never sets either.
+	if rejectHubMintedType(w, req.Message.Type) {
 		return
 	}
 
@@ -429,6 +445,122 @@ func (s *Server) handleBrokerInbound(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// The inbound message is persisted and an SSE event published so that
+	// messages from external channels (Discord, Telegram) appear in the web
+	// chat, both live and after a refresh, as handleAgentMessage does. The
+	// row is built here. It is written after dispatch, except for a message
+	// that carries attachment ids, which is written before dispatch (below).
+	//
+	// Dispatch is skipped while the recipient is mid-`scion reincarnate`;
+	// the persisted row is then stamped "deferred" via agentReincarnating.
+	agentReincarnating := reincarnationInFlight(agent)
+	storeMsg := &store.Message{
+		ID:            brokerInboundMsgID,
+		ProjectID:     agent.ProjectID,
+		Sender:        req.Message.Sender,
+		SenderID:      senderUserID,
+		Recipient:     "agent:" + agent.Slug,
+		RecipientID:   agent.ID,
+		Msg:           req.Message.Msg,
+		Type:          req.Message.Type,
+		Urgent:        req.Message.Urgent,
+		AgentID:       agent.ID,
+		Channel:       req.Message.Channel,
+		ThreadID:      req.Message.ThreadID,
+		Broadcasted:   req.Message.Broadcasted,
+		DispatchState: store.MessageDispatchDispatched,
+		CreatedAt:     now,
+	}
+	if agentReincarnating {
+		storeMsg.DispatchState = store.MessageDispatchDeferred
+	}
+	if req.Message.Metadata != nil {
+		if gid, ok := req.Message.Metadata["group_id"]; ok {
+			storeMsg.GroupID = gid
+		}
+	}
+	// Stamp the effectiveConv — the same value the envelope carried.
+	if effectiveConv != nil {
+		storeMsg.ConversationID = effectiveConv.ConversationID
+	}
+	// persistInbound runs the divergence and consistency logging and
+	// writes storeMsg.
+	persistInbound := func() error {
+		// Divergence logging and consistency check.
+		if !storeMsg.Broadcasted {
+			oldRouting := messaging.OldRoutingFromMessage(senderUserID, agent.ID, storeMsg.ThreadID)
+			convID := ""
+			actualRef := ""
+			if effectiveConv != nil {
+				convID = effectiveConv.ConversationID
+				actualRef = effectiveConv.ExternalRef
+			}
+			match, reason := messaging.ComputeDivergenceMatch(oldRouting, actualRef, convID)
+			messaging.LogDivergence(log, messaging.DivergenceEntry{
+				MessageID:  storeMsg.ID,
+				OldRouting: oldRouting,
+				NewRouting: messaging.NewRoutingStr(convID),
+				Match:      match,
+				Reason:     reason,
+			})
+			// DEF-3: Independent consistency check against prior messages, run
+			// off the request path with its own deadline.
+			messaging.GoConsistencyCheck(messaging.ConsistencyInput{
+				Store: s.store, Log: log, MessageID: storeMsg.ID, ConversationID: convID,
+				ThreadID: storeMsg.ThreadID, SenderID: senderUserID, RecipientID: agent.ID,
+			}, func(ctx context.Context, in messaging.ConsistencyInput) {
+				if consistent := messaging.CheckConversationConsistency(ctx, in.Store, in.MessageID, in.ConversationID, in.ThreadID, in.SenderID, in.RecipientID, in.Log); !consistent {
+					in.Log.Warn("DEF-3: conversation consistency mismatch (inbound broker)",
+						"message_id", in.MessageID, "conversation_id", in.ConversationID, "agent_id", in.RecipientID)
+				}
+			})
+		}
+		return s.store.CreateMessage(r.Context(), storeMsg)
+	}
+
+	// When hub.conduit_deliver is enabled, persist BEFORE dispatch so Conduit
+	// row binding (withDispatchMessageID) and awaiting_session hold/re-drive
+	// cover all broker-inbound messages, not only messages carrying attachments
+	// (ptone/scion#7881, REQ-4). When hub.conduit_deliver is off, preserve
+	// exact Phase A dispatch-first ordering for non-attachment messages.
+	conduitDeliverOn := s.conduitDeliverEnabled()
+	persisted := false
+	var persistErr error
+	var boundAttachments []AttachmentRef
+	if len(attachRefs) > 0 {
+		if err := persistInbound(); err != nil {
+			log.Error("Failed to persist inbound broker message with attachments",
+				"error", err, "message_id", storeMsg.ID, "agent_id", agent.ID)
+			writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
+				"failed to persist message", nil)
+			return
+		}
+		persisted = true
+		boundAttachments = s.bindChatAttachments(senderCtx, artifacts.PrincipalKindUser, senderUser.ID(), storeMsg.ID,
+			s.bindProject(senderCtx, storeMsg, attachRefs), attachRefs)
+		req.Message.AttachmentDeliveries = attachmentDeliveries(storeMsg.ID, boundAttachments)
+		s.applyAttachmentPlan(r.Context(), agent, req.Message)
+	} else if conduitDeliverOn {
+		persistErr = persistInbound()
+		if persistErr == nil {
+			persisted = true
+		} else if agentReincarnating {
+			// F1 (p2a-r2 review): while the recipient is mid-`scion
+			// reincarnate`, dispatch is skipped below (agentReincarnating), so
+			// a persist failure means the message is neither saved nor
+			// dispatched — fail loudly so the caller can retry safely.
+			log.Error("Failed to persist inbound broker message",
+				"error", persistErr,
+				"message_id", storeMsg.ID,
+				"conversation_id", storeMsg.ConversationID,
+				"agent_id", agent.ID,
+			)
+			writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
+				"failed to persist message; agent is reincarnating, retry", nil)
+			return
+		}
+	}
+
 	// Phase 9b(ii): render the delivery envelope before dispatch when the
 	// envelope switch is ON. The message ID is pre-generated here (same UUID
 	// that will be persisted). effectiveConv may be nil for broadcasts or
@@ -440,6 +572,7 @@ func (s *Server) handleBrokerInbound(w http.ResponseWriter, r *http.Request) {
 			ConvResult: effectiveConv,
 			Msg:        req.Message,
 			CreatedAt:  now,
+			Plan:       req.Message.AttachmentPlan,
 		}
 		// Additive mention routing: read co-addressees from broker metadata
 		// so the delivery envelope includes the "to" field listing all
@@ -470,12 +603,6 @@ func (s *Server) handleBrokerInbound(w http.ResponseWriter, r *http.Request) {
 		req.Message.DeliveryText = messaging.RenderDeliveryText(renderInput)
 	}
 
-	// Migration gate (design agent-reincarnate §3.7, R3 p2a-r1 review): skip
-	// dispatch while the recipient is mid-`scion reincarnate`. This legacy
-	// endpoint dispatches before persisting (unlike every other path in this
-	// package), so the gate here only skips the dispatch call; the
-	// persisted row below is stamped "deferred" via agentReincarnating.
-	agentReincarnating := reincarnationInFlight(agent)
 	// The hub's message record, written before the gate and the dispatch
 	// outcome (see logMessageRecord); the delivered line below is an event.
 	// Logged from a copy carrying the hub's recipient and conversation, so
@@ -488,13 +615,53 @@ func (s *Server) handleBrokerInbound(w http.ResponseWriter, r *http.Request) {
 	}
 	logMessageRecord(s.recordLog(), agent, &recordMsg)
 	if !agentReincarnating {
-		retryCtx, retryCancel := context.WithTimeout(r.Context(), 30*time.Second)
+		dispatchParent := r.Context()
+		inboundMsgID := ""
+		var inboundStorePtr *store.Message
+		if persisted {
+			dispatchParent = withDispatchMessageID(r.Context(), storeMsg.ID)
+			inboundMsgID = storeMsg.ID
+			inboundStorePtr = storeMsg
+		}
+		retryCtx, retryCancel := context.WithTimeout(dispatchParent, 30*time.Second)
 		defer retryCancel()
 
-		if err := dispatchWithBrokerRetry(retryCtx, nil, dispatcher, agent, req.Message.Msg, req.Message.Urgent, req.Message); errors.Is(err, ErrBrokerTimeout) {
+		if _, err := s.holdOrDispatch(retryCtx, agent, inboundMsgID, inboundStorePtr, func() error {
+			return dispatchWithBrokerRetry(retryCtx, s.deliveryMarker(), nil, dispatcher, agent, req.Message.Msg, req.Message.Urgent, req.Message)
+		}); errors.Is(err, ErrBrokerTimeout) {
+			if persisted {
+				s.markInboundFailed(r.Context(), storeMsg.ID, err)
+			}
 			GatewayTimeout(w, "Broker unreachable after 30s deadline")
 			return
 		} else if err != nil {
+			var idleErr *errAgentIdleSuspending
+			if errors.As(err, &idleErr) {
+				susp := idleErr.asSuspendedAgent()
+				refusal := fmt.Sprintf("Agent %q is suspended.", agent.Slug)
+				if susp != nil {
+					switch state.Phase(susp.Phase) {
+					case state.PhaseSuspended:
+						refusal = fmt.Sprintf("Agent %q is suspended.", susp.Slug)
+					case state.PhaseStopped:
+						refusal = fmt.Sprintf("Agent %q is stopped.", susp.Slug)
+					case state.PhaseHalted:
+						refusal = fmt.Sprintf("Agent %q is halted.", susp.Slug)
+					case state.PhaseError:
+						refusal = fmt.Sprintf("Agent %q is in error state.", susp.Slug)
+					default:
+						refusal = fmt.Sprintf("Agent %q is not yet running (phase: %s).", susp.Slug, susp.Phase)
+					}
+				}
+				if persisted {
+					s.markInboundFailed(r.Context(), storeMsg.ID, errors.New(refusal))
+				}
+				writeError(w, http.StatusConflict, ErrCodeAgentNotRunning, refusal, nil)
+				return
+			}
+			if persisted {
+				s.markInboundFailed(r.Context(), storeMsg.ID, err)
+			}
 			log.Error("Failed to dispatch inbound message",
 				"agent_id", agent.ID, "agent_slug", agentSlug, "error", err)
 			writeError(w, http.StatusBadGateway, ErrCodeRuntimeError,
@@ -511,81 +678,27 @@ func (s *Server) handleBrokerInbound(w http.ResponseWriter, r *http.Request) {
 		"type", req.Message.Type,
 	)
 
-	// F5 fix (Phase 6): Persist the inbound message and publish an SSE event
-	// so that messages from external channels (Discord, Telegram) appear in
-	// the web chat — both live and after a refresh. This mirrors the
-	// persistence + SSE pattern used by handleAgentMessage.
-	storeMsg := &store.Message{
-		ID:            brokerInboundMsgID,
-		ProjectID:     agent.ProjectID,
-		Sender:        req.Message.Sender,
-		SenderID:      senderUserID,
-		Recipient:     "agent:" + agent.Slug,
-		RecipientID:   agent.ID,
-		Msg:           req.Message.Msg,
-		Type:          req.Message.Type,
-		Urgent:        req.Message.Urgent,
-		AgentID:       agent.ID,
-		Channel:       req.Message.Channel,
-		ThreadID:      req.Message.ThreadID,
-		Broadcasted:   req.Message.Broadcasted,
-		DispatchState: store.MessageDispatchDispatched,
-		CreatedAt:     now,
-	}
-	if agentReincarnating {
-		storeMsg.DispatchState = store.MessageDispatchDeferred
-	}
-	if req.Message.Metadata != nil {
-		if gid, ok := req.Message.Metadata["group_id"]; ok {
-			storeMsg.GroupID = gid
+	if !persisted && persistErr == nil {
+		persistErr = persistInbound()
+		if persistErr != nil && agentReincarnating {
+			log.Error("Failed to persist inbound broker message",
+				"error", persistErr,
+				"message_id", storeMsg.ID,
+				"conversation_id", storeMsg.ConversationID,
+				"agent_id", agent.ID,
+			)
+			writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
+				"failed to persist message; agent is reincarnating, retry", nil)
+			return
 		}
 	}
-	// Stamp the effectiveConv — the same value the envelope carried.
-	if effectiveConv != nil {
-		storeMsg.ConversationID = effectiveConv.ConversationID
-	}
-	// Divergence logging and consistency check.
-	if !storeMsg.Broadcasted {
-		oldRouting := messaging.OldRoutingFromMessage(senderUserID, agent.ID, storeMsg.ThreadID)
-		convID := ""
-		actualRef := ""
-		if effectiveConv != nil {
-			convID = effectiveConv.ConversationID
-			actualRef = effectiveConv.ExternalRef
-		}
-		match, reason := messaging.ComputeDivergenceMatch(oldRouting, actualRef, convID)
-		messaging.LogDivergence(log, messaging.DivergenceEntry{
-			MessageID:  storeMsg.ID,
-			OldRouting: oldRouting,
-			NewRouting: messaging.NewRoutingStr(convID),
-			Match:      match,
-			Reason:     reason,
-		})
-		// DEF-3: Independent consistency check against prior messages.
-		if consistent := messaging.CheckConversationConsistency(r.Context(), s.store, storeMsg.ID, convID, storeMsg.ThreadID, senderUserID, agent.ID, log); !consistent {
-			log.Warn("DEF-3: conversation consistency mismatch (inbound broker)",
-				"message_id", storeMsg.ID, "conversation_id", convID, "agent_id", agent.ID)
-		}
-	}
-	if err := s.store.CreateMessage(r.Context(), storeMsg); err != nil {
+	if err := persistErr; err != nil {
 		log.Error("Failed to persist inbound broker message",
 			"error", err,
 			"message_id", storeMsg.ID,
 			"conversation_id", storeMsg.ConversationID,
 			"agent_id", agent.ID,
 		)
-		// F1 (p2a-r2 review): while the recipient is mid-`scion
-		// reincarnate`, dispatch was skipped above (agentReincarnating), so
-		// a persist failure here means the message is neither saved nor
-		// dispatched — the "deferred ⇒ persisted" promise the gate makes
-		// would be a lie. Fail loudly instead. This is safe to retry (no
-		// dispatch happened, so a retry cannot double-deliver), unlike the
-		// non-fatal case below where the dispatch already succeeded.
-		if agentReincarnating {
-			writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
-				"failed to persist message; agent is reincarnating, retry", nil)
-			return
-		}
 		// Non-fatal: the dispatch already succeeded, so the agent got the
 		// message. The agent now holds identifiers (message_id,
 		// conversation_id) that reference an unpersisted row. Failing the
@@ -604,7 +717,7 @@ func (s *Server) handleBrokerInbound(w http.ResponseWriter, r *http.Request) {
 				s.autoAdvanceSenderReadState(r.Context(), senderUserID, storeMsg.ThreadID, storeMsg.ID)
 			}
 		}
-		s.events.PublishUserMessage(r.Context(), storeMsg, nil, nil)
+		s.events.PublishUserMessage(r.Context(), storeMsg, boundAttachments, nil)
 
 		// Group conversations: list the dispatched agent and the posting
 		// user as participants, mirroring the native group path (listing
@@ -737,4 +850,13 @@ func (s *Server) resolvePhase5Conversation(
 		return messaging.ResolveOrCreateDMConversation(ctx, s.store, s.store, s.messageLog, "user", senderUserID, "agent", agentID)
 	}
 	return nil, nil
+}
+
+// markInboundFailed records a failed dispatch on an inbound message that was
+// persisted before dispatch (one carrying attachments). A failure to mark is
+// logged.
+func (s *Server) markInboundFailed(ctx context.Context, messageID string, cause error) {
+	if err := s.markFailed(ctx, messageID, cause.Error()); err != nil {
+		s.messageLog.Error("Failed to mark inbound message as failed", "id", messageID, "error", err)
+	}
 }

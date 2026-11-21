@@ -16,6 +16,7 @@ package plugin
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -24,6 +25,8 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
+	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/eventbus"
 	goplugin "github.com/hashicorp/go-plugin"
@@ -40,6 +43,7 @@ type Manager struct {
 	configs         map[string]DiscoveredPlugin // "type:name" -> original config (for reconnection)
 	configFiles     map[string]string           // "type:name" -> config file path (immutable after load)
 	pluginEntries   map[string]PluginEntry      // "type:name" -> original PluginEntry (for mode resolution)
+	pluginsDir      string                      // user plugins directory passed to LoadAll/LoadOne
 	mu              sync.RWMutex
 	logger          *slog.Logger
 	brokerCallbacks *HostCallbacksForwarder // lazily-wired host callbacks for broker plugins
@@ -48,6 +52,12 @@ type Manager struct {
 	// Shutdown). From then on a plugin process exit is expected and is not
 	// logged as an error (ptone/scion#4869).
 	stopping atomic.Bool
+
+	// sup supervises the loaded broker plugins (see StartSupervisor).
+	sup *supervisor
+	// restartLocks holds a *sync.Mutex per "type:name" that serializes
+	// supervisor restarts with the admin restart and update paths.
+	restartLocks sync.Map
 
 	// NewGRPCBrokerAdapter creates a GRPCBrokerClient for a given plugin entry.
 	// Injected at startup to avoid an import cycle with pkg/plugin/grpcbroker.
@@ -69,6 +79,7 @@ func NewManager(logger *slog.Logger) *Manager {
 		pluginEntries:   make(map[string]PluginEntry),
 		logger:          logger,
 		brokerCallbacks: &HostCallbacksForwarder{},
+		sup:             newSupervisor(),
 	}
 }
 
@@ -115,6 +126,12 @@ func (f *HostCallbacksForwarder) CancelSubscription(pattern string) error {
 
 // LoadAll discovers and loads all plugins from the given configuration and plugins directory.
 func (m *Manager) LoadAll(cfg PluginsConfig, pluginsDir string) error {
+	if pluginsDir != "" {
+		m.mu.Lock()
+		m.pluginsDir = pluginsDir
+		m.mu.Unlock()
+	}
+
 	// Handle gRPC mode entries before standard discovery.
 	for name, entry := range cfg.Broker {
 		if entry.ResolvedDeploymentMode() == DeploymentModeHA {
@@ -161,6 +178,11 @@ func (m *Manager) LoadAll(cfg PluginsConfig, pluginsDir string) error {
 
 // LoadOne loads a single plugin by type and name from the given configuration.
 func (m *Manager) LoadOne(pluginType, name string, entry PluginEntry, pluginsDir string) error {
+	if pluginsDir != "" {
+		m.mu.Lock()
+		m.pluginsDir = pluginsDir
+		m.mu.Unlock()
+	}
 	if entry.ConfigFile != "" {
 		if entry.Config == nil {
 			entry.Config = make(map[string]string)
@@ -180,16 +202,17 @@ func (m *Manager) LoadOne(pluginType, name string, entry PluginEntry, pluginsDir
 			Address:     entry.Address,
 		})
 	}
-	path := resolvePluginPath(name, pluginType, entry.Path, pluginsDir, m.logger)
+	path, explicit := resolvePluginPath(name, pluginType, entry.Path, pluginsDir, m.logger)
 	if path == "" {
 		return fmt.Errorf("plugin binary not found: %s/%s", pluginType, name)
 	}
 	return m.loadPlugin(DiscoveredPlugin{
-		Name:       name,
-		Type:       pluginType,
-		Path:       path,
-		Config:     entry.Config,
-		FromConfig: true,
+		Name:         name,
+		Type:         pluginType,
+		Path:         path,
+		ExplicitPath: explicit,
+		Config:       entry.Config,
+		FromConfig:   true,
 	})
 }
 
@@ -226,8 +249,23 @@ func (m *Manager) loadGRPCPlugin(pluginType, name string, entry PluginEntry) err
 	return nil
 }
 
-// loadPlugin starts a plugin process (or connects to a self-managed one) and stores its client.
+// loadPlugin starts a plugin process (or connects to a self-managed one),
+// configures it with dp.Config and stores its client. A loaded broker
+// plugin is supervised as running.
 func (m *Manager) loadPlugin(dp DiscoveredPlugin) error {
+	if err := m.loadPluginWithConfig(dp, dp.Config); err != nil {
+		return err
+	}
+	if dp.Type == PluginTypeBroker {
+		m.supervisedLoaded(dp.Type + ":" + dp.Name)
+	}
+	return nil
+}
+
+// loadPluginWithConfig is loadPlugin, except that the plugin is configured
+// with cfg while dp (with its own Config) is what is stored for the key.
+// It does not update the supervision state.
+func (m *Manager) loadPluginWithConfig(dp DiscoveredPlugin, cfg map[string]string) error {
 	var protocolVersion uint
 	var pluginMap map[string]goplugin.Plugin
 
@@ -257,44 +295,69 @@ func (m *Manager) loadPlugin(dp DiscoveredPlugin) error {
 		})
 	}
 
-	// Connect to the plugin process and get the RPC client
-	rpcClient, err := client.Client()
-	if err != nil {
-		if !dp.SelfManaged {
-			client.Kill()
-		}
-		return fmt.Errorf("failed to connect to plugin %s/%s: %w", dp.Type, dp.Name, err)
-	}
-
-	// Dispense the plugin interface
+	// Connect to the plugin and dispense its interface, bounded so that a
+	// session that hangs right after the dial cannot block the caller (a
+	// restart attempt holds the plugin's restart lock).
 	var dispenseName string
 	switch dp.Type {
 	case PluginTypeBroker:
 		dispenseName = BrokerPluginName
 	}
-
-	raw, err := rpcClient.Dispense(dispenseName)
-	if err != nil {
-		if !dp.SelfManaged {
-			client.Kill()
+	type dispenseResult struct {
+		raw interface{}
+		err error
+	}
+	res := make(chan dispenseResult, 1)
+	go func() {
+		rpcClient, err := client.Client()
+		if err != nil {
+			res <- dispenseResult{err: fmt.Errorf("failed to connect to plugin %s/%s: %w", dp.Type, dp.Name, err)}
+			return
 		}
-		return fmt.Errorf("failed to dispense plugin %s/%s: %w", dp.Type, dp.Name, err)
+		raw, err := rpcClient.Dispense(dispenseName)
+		if err != nil {
+			res <- dispenseResult{err: fmt.Errorf("failed to dispense plugin %s/%s: %w", dp.Type, dp.Name, err)}
+			return
+		}
+		res <- dispenseResult{raw: raw}
+	}()
+	var raw interface{}
+	timer := time.NewTimer(restartStepTimeout)
+	select {
+	case r := <-res:
+		timer.Stop()
+		if r.err != nil {
+			m.discardClient(dp.Type+":"+dp.Name, client, nil, dp.SelfManaged, false)
+			return r.err
+		}
+		raw = r.raw
+	case <-timer.C:
+		m.discardClient(dp.Type+":"+dp.Name, client, nil, dp.SelfManaged, false)
+		// A connect that succeeds later must not leave a live dispensed
+		// connection behind.
+		go func() {
+			if r := <-res; r.raw != nil {
+				if bc, ok := r.raw.(*BrokerRPCClient); ok {
+					bc.discard()
+				}
+			}
+		}()
+		return fmt.Errorf("plugin %s/%s did not connect within %v", dp.Type, dp.Name, restartStepTimeout)
 	}
 
 	// For broker plugins, configure them immediately
 	if dp.Type == PluginTypeBroker {
 		if brokerClient, ok := raw.(*BrokerRPCClient); ok {
-			config := dp.Config
+			brokerClient.onTransportError = m.transportErrorHandler(dp.Type + ":" + dp.Name)
+			config := cfg
 			if config == nil {
 				config = make(map[string]string)
 			}
 			if brokerClient.hostCallbacksAvailable {
 				config[hostCallbacksConfigKey] = "true"
 			}
-			if err := brokerClient.Configure(config); err != nil {
-				if !dp.SelfManaged {
-					client.Kill()
-				}
+			if err := brokerClient.configureWithin(config, restartStepTimeout); err != nil {
+				m.discardClient(dp.Type+":"+dp.Name, client, raw, dp.SelfManaged, false)
 				return fmt.Errorf("failed to configure broker plugin %s: %w", dp.Name, err)
 			}
 		}
@@ -302,13 +365,17 @@ func (m *Manager) loadPlugin(dp DiscoveredPlugin) error {
 
 	key := dp.Type + ":" + dp.Name
 	m.mu.Lock()
-	// Kill any existing plugin with the same key (only if not self-managed)
-	if existing, ok := m.clients[key]; ok {
-		if !m.selfManaged[key] {
-			existing.Kill()
-		}
-		delete(m.dispensed, key)
+	if m.stopping.Load() {
+		// Shutdown has begun (and may already have reset the maps): do
+		// not store a client it will never stop.
+		m.mu.Unlock()
+		m.discardClient(dp.Type+":"+dp.Name, client, raw, dp.SelfManaged, false)
+		return fmt.Errorf("plugin manager is shutting down; not storing plugin %s/%s", dp.Type, dp.Name)
 	}
+	// Take out any existing client with the same key; it is discarded
+	// below, outside the lock.
+	existing, existingRaw := m.clients[key], m.dispensed[key]
+	existingSelf := m.selfManaged[key]
 	m.clients[key] = client
 	m.selfManaged[key] = dp.SelfManaged
 	m.configs[key] = dp
@@ -323,6 +390,9 @@ func (m *Manager) loadPlugin(dp DiscoveredPlugin) error {
 	m.dispensed[key] = raw
 	m.mu.Unlock()
 
+	if existing != nil {
+		m.discardClient(key, existing, existingRaw, existingSelf, true)
+	}
 	return nil
 }
 
@@ -418,25 +488,68 @@ func (m *Manager) Get(pluginType, name string) (interface{}, error) {
 
 // Reconnect reloads a self-managed plugin by establishing a fresh connection
 // to its RPC address. This is used when a self-managed plugin process restarts
-// and the existing connection is dead.
+// and the existing connection is dead. The plugin is configured with the
+// config from the BrokerConfigProvider when one is set (otherwise its stored
+// config), and the restart hooks run afterwards so the fan-out spoke uses
+// the new connection.
 func (m *Manager) Reconnect(pluginType, name string) error {
 	key := pluginType + ":" + name
+	lock := m.restartLock(key)
+	lock.Lock()
+	defer lock.Unlock()
+
 	m.mu.RLock()
 	dp, ok := m.configs[key]
+	old := m.clients[key]
 	m.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("no stored config for plugin %s/%s (not self-managed?)", pluginType, name)
 	}
+	cfg := dp.Config
+	m.sup.mu.Lock()
+	provider := m.sup.provider
+	m.sup.mu.Unlock()
+	if provider != nil {
+		pctx, cancel := context.WithTimeout(context.Background(), restartStepTimeout)
+		resolved, err := provider(pctx, name)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("resolve config for plugin %s/%s: %w", pluginType, name, err)
+		}
+		cfg = resolved
+	}
 	m.logger.Info("Reconnecting to self-managed plugin",
 		"type", pluginType, "name", name, "address", dp.Address)
-	return m.loadPlugin(dp)
+	m.replaceClient(key, old, true)
+	if err := m.loadPluginWithConfig(dp, cfg); err != nil {
+		return err
+	}
+	if m.stopping.Load() {
+		return fmt.Errorf("plugin manager is shutting down")
+	}
+	if err := m.runRestartHooksWithin(name, restartStepTimeout); err != nil {
+		// The new connection is up but its spoke is not refreshed: leave
+		// it to the supervisor, which replaces it with backoff.
+		// Counted as an attempt, like a supervisor attempt.
+		m.sup.mu.Lock()
+		attempt := 0
+		if sp, ok := m.sup.plugins[key]; ok {
+			sp.status.Attempt++
+			attempt = sp.status.Attempt
+		}
+		m.sup.mu.Unlock()
+		m.attemptFailed(key, attempt, fmt.Errorf("restart hook: %w", err))
+		return err
+	}
+	m.supervisedLoaded(key)
+	return nil
 }
 
 // GetBroker returns an eventbus.EventBus backed by the named broker plugin.
-// For self-managed plugins, it returns a reconnecting adapter that automatically
-// re-establishes the connection if the plugin process restarts.
-// For gRPC mode plugins, it returns the GRPCBrokerAdapter directly (which has
-// its own reconnection logic).
+// A lost connection to a hub-managed or self-managed plugin is recovered by
+// the supervisor (see StartSupervisor), whose restart hooks replace the
+// fan-out spoke. For gRPC mode plugins, it returns the GRPCBrokerAdapter
+// directly (which has its own reconnection logic).
 func (m *Manager) GetBroker(name string) (eventbus.EventBus, error) {
 	key := PluginTypeBroker + ":" + name
 	m.mu.RLock()
@@ -457,11 +570,7 @@ func (m *Manager) GetBroker(name string) (eventbus.EventBus, error) {
 		return nil, fmt.Errorf("plugin %s is not a broker plugin", name)
 	}
 
-	rpcAdapter := NewBrokerPluginAdapter(rpcClient)
-	if m.IsSelfManaged(PluginTypeBroker, name) {
-		return newReconnectingBrokerAdapter(m, name, rpcAdapter, m.logger), nil
-	}
-	return rpcAdapter, nil
+	return NewBrokerPluginAdapter(rpcClient), nil
 }
 
 // ConfigureBroker re-configures a loaded broker plugin by merging extra
@@ -520,6 +629,9 @@ func (m *Manager) ConfigureBroker(name string, extra map[string]string) error {
 // own their process). For gRPC/HA adapters, it pushes the config directly.
 func (m *Manager) RestartBrokerPlugin(name string, cfg map[string]string) error {
 	key := PluginTypeBroker + ":" + name
+	lock := m.restartLock(key)
+	lock.Lock()
+	defer lock.Unlock()
 
 	m.mu.Lock()
 	dp, ok := m.configs[key]
@@ -533,16 +645,13 @@ func (m *Manager) RestartBrokerPlugin(name string, cfg map[string]string) error 
 		return fmt.Errorf("broker plugin not loaded: %s", name)
 	}
 
-	// Kill the old process first to avoid port/database/resource conflicts
-	// when the new process starts up and runs its Configure phase.
-	if client, hasClient := m.clients[key]; hasClient {
-		if !m.selfManaged[key] {
-			client.Kill()
-		}
-		delete(m.clients, key)
-		delete(m.dispensed, key)
-	}
 	m.mu.Unlock()
+
+	// Replace the old client first to avoid port/database/resource
+	// conflicts when the new process starts up and runs its Configure
+	// phase (a self-managed plugin's old connection is discarded so it can
+	// never close the plugin instance; see discardClient).
+	m.replaceClient(key, nil, true)
 
 	// Update the stored config so the new process starts with it.
 	dp.Config = cfg
@@ -794,9 +903,167 @@ func (m *Manager) BrokerInfo(name string) (version, channelID string, capabiliti
 	return info.Version, info.ChannelID, info.Capabilities, nil
 }
 
+// mkdirTemp creates a temporary directory; overridden in tests to simulate
+// read-only mounts (EROFS) without requiring mount privileges.
+var mkdirTemp = os.MkdirTemp
+
+func isUnwritable(err error) bool {
+	return errors.Is(err, os.ErrPermission) || errors.Is(err, syscall.EROFS)
+}
+
+// UpdateResult describes the binary placement after Manager.UpdatePlugin succeeds.
+type UpdateResult struct {
+	BinaryPath   string
+	PreviousPath string
+	Relocated    bool
+}
+
+// PermissionError reports that the Hub process lacks filesystem permission to
+// stage or install a rebuilt plugin binary at BinaryPath.
+type PermissionError struct {
+	Plugin       string
+	BinaryPath   string
+	PluginsDir   string
+	ExplicitPath bool
+	Err          error
+}
+
+func (e *PermissionError) Error() string {
+	return fmt.Sprintf("permission denied installing plugin %q at %s: %v", e.Plugin, e.BinaryPath, e.Err)
+}
+
+func (e *PermissionError) Unwrap() error {
+	return e.Err
+}
+
+// UserMessage returns a concise, human-readable summary suitable for the Admin UI.
+func (e *PermissionError) UserMessage() string {
+	if e.ExplicitPath {
+		return fmt.Sprintf("Cannot update plugin %q: configured binary path %s is in a directory not writable by the Hub process", e.Plugin, e.BinaryPath)
+	}
+	return fmt.Sprintf("Cannot update plugin %q: plugins directory %s is not writable by the Hub process", e.Plugin, filepath.Dir(e.BinaryPath))
+}
+
+// Guidance returns actionable operator instructions (including exact commands)
+// for resolving the permission error without privilege escalation in the Hub.
+func (e *PermissionError) Guidance(repoPath string) string {
+	if e.ExplicitPath {
+		binaryName := PluginBinaryPrefix + e.Plugin
+		sourceDir := filepath.Join(repoPath, "extras", "scion-"+e.Plugin)
+		brokerDir := "~/.scion/plugins/broker"
+		if e.PluginsDir != "" {
+			brokerDir = filepath.Join(e.PluginsDir, PluginTypeBroker)
+		}
+		return fmt.Sprintf(
+			"Remove server.plugins.broker.%s.path from settings.yaml and restart the Hub server (`scion server restart` or your service manager) so Scion can manage updates in %s — then retry Update (or use Install if %s is not on the Hub's PATH). Alternatively, rebuild manually (`tmp=$(mktemp -d) && go -C %s build -o \"$tmp/%s\" ./cmd/%s && sudo install -m 0755 \"$tmp/%s\" %s && rm -rf \"$tmp\"`) and click Restart.",
+			e.Plugin, brokerDir, binaryName, sourceDir, binaryName, binaryName, binaryName, e.BinaryPath,
+		)
+	}
+	dir := filepath.Dir(e.BinaryPath)
+	return fmt.Sprintf(
+		"Ensure %s is owned and writable by the Hub service user (for example: `sudo install -d -m 0755 -o <hub-user> %s`), then retry Update.",
+		dir, dir,
+	)
+}
+
+func (m *Manager) effectivePluginsDir() (string, error) {
+	m.mu.RLock()
+	dir := m.pluginsDir
+	m.mu.RUnlock()
+	if dir != "" {
+		return dir, nil
+	}
+	return DefaultPluginsDir()
+}
+
+// preparePluginBuildTarget selects the destination binary path and creates a
+// staging directory on the same filesystem so os.Rename is atomic and any
+// directory-permission failure is caught before compiling or stopping the
+// running plugin. When the current binary lives in an unwritable directory
+// (such as /usr/local/bin owned by root or on a read-only mount) and no
+// explicit path was pinned in settings, it relocates the updated binary to
+// <pluginsDir>/broker/ (the same location InstallPlugin uses and
+// resolvePluginPath prefers over $PATH).
+func (m *Manager) preparePluginBuildTarget(name string, dp DiscoveredPlugin) (binaryPath, tmpDir string, relocated bool, err error) {
+	binaryPath = dp.Path
+	if binaryPath == "" {
+		pluginsDir, dirErr := m.effectivePluginsDir()
+		if dirErr != nil {
+			return "", "", false, dirErr
+		}
+		targetDir := filepath.Join(pluginsDir, PluginTypeBroker)
+		binaryPath = filepath.Join(targetDir, PluginBinaryPrefix+name)
+		if mkErr := os.MkdirAll(targetDir, 0o755); mkErr != nil {
+			if isUnwritable(mkErr) {
+				return "", "", false, &PermissionError{
+					Plugin:       name,
+					BinaryPath:   binaryPath,
+					PluginsDir:   pluginsDir,
+					ExplicitPath: false,
+					Err:          mkErr,
+				}
+			}
+			return "", "", false, fmt.Errorf("failed to create plugins directory %s: %w", targetDir, mkErr)
+		}
+	}
+
+	tmpDir, err = mkdirTemp(filepath.Dir(binaryPath), ".scion-plugin-build-*")
+	if err == nil {
+		return binaryPath, tmpDir, false, nil
+	}
+	if !isUnwritable(err) {
+		return "", "", false, fmt.Errorf("failed to prepare staging directory for plugin %q: %w", name, err)
+	}
+	if dp.ExplicitPath {
+		pluginsDir, _ := m.effectivePluginsDir()
+		return "", "", false, &PermissionError{
+			Plugin:       name,
+			BinaryPath:   binaryPath,
+			PluginsDir:   pluginsDir,
+			ExplicitPath: true,
+			Err:          err,
+		}
+	}
+
+	pluginsDir, dirErr := m.effectivePluginsDir()
+	if dirErr != nil {
+		return "", "", false, dirErr
+	}
+	fallbackDir := filepath.Join(pluginsDir, PluginTypeBroker)
+	fallbackPath := filepath.Join(fallbackDir, PluginBinaryPrefix+name)
+	if mkErr := os.MkdirAll(fallbackDir, 0o755); mkErr != nil {
+		if isUnwritable(mkErr) {
+			return "", "", false, &PermissionError{
+				Plugin:       name,
+				BinaryPath:   fallbackPath,
+				PluginsDir:   pluginsDir,
+				ExplicitPath: false,
+				Err:          mkErr,
+			}
+		}
+		return "", "", false, fmt.Errorf("failed to create plugins directory %s: %w", fallbackDir, mkErr)
+	}
+	tmpDir, err = mkdirTemp(fallbackDir, ".scion-plugin-build-*")
+	if err != nil {
+		if isUnwritable(err) {
+			return "", "", false, &PermissionError{
+				Plugin:       name,
+				BinaryPath:   fallbackPath,
+				PluginsDir:   pluginsDir,
+				ExplicitPath: false,
+				Err:          err,
+			}
+		}
+		return "", "", false, fmt.Errorf("failed to prepare staging directory in %s: %w", fallbackDir, err)
+	}
+	m.logger.Warn("Plugin directory is not writable; installing updated binary to user plugins directory (previous binary remains on disk)",
+		"name", name, "previous_binary", binaryPath, "binary", fallbackPath)
+	return fallbackPath, tmpDir, true, nil
+}
+
 // UpdatePlugin rebuilds a hub-managed (non-self-managed) plugin binary from
 // source and restarts it. Self-managed plugins cannot be updated this way.
-func (m *Manager) UpdatePlugin(name string, repoPath string) error {
+func (m *Manager) UpdatePlugin(name string, repoPath string) (UpdateResult, error) {
 	key := PluginTypeBroker + ":" + name
 	m.mu.RLock()
 	dp, ok := m.configs[key]
@@ -804,19 +1071,24 @@ func (m *Manager) UpdatePlugin(name string, repoPath string) error {
 	m.mu.RUnlock()
 
 	if !ok {
-		return fmt.Errorf("plugin %q is not loaded", name)
+		return UpdateResult{}, fmt.Errorf("plugin %q is not loaded", name)
 	}
 	if isSelf {
-		return fmt.Errorf("plugin %q is self-managed and cannot be updated this way", name)
+		return UpdateResult{}, fmt.Errorf("plugin %q is self-managed and cannot be updated this way", name)
 	}
 
 	sourceDir := filepath.Join(repoPath, "extras", "scion-"+name)
 	if _, err := os.Stat(sourceDir); err != nil {
-		return fmt.Errorf("plugin source directory not found: %s", sourceDir)
+		return UpdateResult{}, fmt.Errorf("plugin source directory not found: %s", sourceDir)
 	}
 
-	binaryPath := dp.Path
-	tmpBinaryPath := binaryPath + ".tmp"
+	previousPath := dp.Path
+	binaryPath, tmpDir, relocated, err := m.preparePluginBuildTarget(name, dp)
+	if err != nil {
+		return UpdateResult{}, err
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+	tmpBinaryPath := filepath.Join(tmpDir, PluginBinaryPrefix+name)
 
 	m.logger.Info("Building plugin from source",
 		"name", name, "source", sourceDir, "binary", binaryPath)
@@ -824,30 +1096,75 @@ func (m *Manager) UpdatePlugin(name string, repoPath string) error {
 	tidyCmd := exec.Command("go", "mod", "tidy")
 	tidyCmd.Dir = sourceDir
 	if output, err := tidyCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("go mod tidy failed for plugin %q: %w\n%s", name, err, string(output))
+		return UpdateResult{}, fmt.Errorf("go mod tidy failed for plugin %q: %w\n%s", name, err, string(output))
 	}
 
 	buildCmd := exec.Command("go", "build", "-o", tmpBinaryPath, "./cmd/scion-plugin-"+name)
 	buildCmd.Dir = sourceDir
 	if output, err := buildCmd.CombinedOutput(); err != nil {
-		_ = os.Remove(tmpBinaryPath)
-		return fmt.Errorf("go build failed for plugin %q: %w\n%s", name, err, string(output))
+		return UpdateResult{}, fmt.Errorf("go build failed for plugin %q: %w\n%s", name, err, string(output))
 	}
-	defer func() { _ = os.Remove(tmpBinaryPath) }()
 
-	m.mu.Lock()
-	if client, hasClient := m.clients[key]; hasClient {
-		delete(m.dispensed, key)
-		delete(m.clients, key)
-		client.Kill()
+	lock := m.restartLock(key)
+	lock.Lock()
+	defer lock.Unlock()
+
+	m.mu.RLock()
+	_, stillLoaded := m.configs[key]
+	stopping := m.stopping.Load()
+	m.mu.RUnlock()
+	if stopping {
+		return UpdateResult{}, fmt.Errorf("plugin manager is shutting down; aborting update for plugin %q", name)
 	}
-	m.mu.Unlock()
+	if !stillLoaded {
+		return UpdateResult{}, fmt.Errorf("plugin %q was unloaded during update", name)
+	}
 
 	if err := os.Rename(tmpBinaryPath, binaryPath); err != nil {
-		return fmt.Errorf("failed to move new binary into place for plugin %q: %w", name, err)
+		if isUnwritable(err) {
+			pluginsDir, _ := m.effectivePluginsDir()
+			return UpdateResult{}, &PermissionError{
+				Plugin:       name,
+				BinaryPath:   binaryPath,
+				PluginsDir:   pluginsDir,
+				ExplicitPath: dp.ExplicitPath && !relocated,
+				Err:          err,
+			}
+		}
+		return UpdateResult{}, fmt.Errorf("failed to move new binary into place for plugin %q: %w", name, err)
 	}
 
-	return m.loadPlugin(dp)
+	m.mu.Lock()
+	latest, exists := m.configs[key]
+	if stoppingNow := m.stopping.Load(); stoppingNow || !exists {
+		m.mu.Unlock()
+		if relocated {
+			_ = os.Remove(binaryPath)
+		}
+		if stoppingNow {
+			return UpdateResult{}, fmt.Errorf("plugin manager is shutting down; aborting update for plugin %q", name)
+		}
+		return UpdateResult{}, fmt.Errorf("plugin %q was unloaded during update", name)
+	}
+	dp = latest
+	dp.Path = binaryPath
+	if relocated {
+		dp.ExplicitPath = false
+	}
+	m.configs[key] = dp
+	m.mu.Unlock()
+
+	m.replaceClient(key, nil, true)
+
+	if err := m.loadPlugin(dp); err != nil {
+		return UpdateResult{}, err
+	}
+	res := UpdateResult{BinaryPath: binaryPath}
+	if relocated {
+		res.Relocated = true
+		res.PreviousPath = previousPath
+	}
+	return res, nil
 }
 
 // InstallPlugin builds a plugin binary from source and loads it into the manager.
@@ -889,7 +1206,7 @@ func (m *Manager) InstallPlugin(name, repoPath, pluginsDir, configFile string) e
 		return fmt.Errorf("go build failed for plugin %q: %w\n%s", name, err, string(output))
 	}
 
-	return m.LoadOne(PluginTypeBroker, name, PluginEntry{Path: targetPath, ConfigFile: configFile}, pluginsDir)
+	return m.LoadOne(PluginTypeBroker, name, PluginEntry{ConfigFile: configFile}, pluginsDir)
 }
 
 // BeginShutdown records that the owner has started shutting down, before
@@ -906,24 +1223,33 @@ func (m *Manager) BeginShutdown() {
 // gRPC adapters are closed (connection terminated, remote process unaffected).
 func (m *Manager) Shutdown() {
 	m.stopping.Store(true)
+	// Let the supervisor see the stop, and wait (bounded) for an attempt in
+	// progress: a client it loads now is discarded when it would be stored,
+	// so its plugin process does not outlive the hub.
+	m.kickSupervisor()
+	supDone := make(chan struct{})
+	go func() {
+		m.waitSupervisorStopped()
+		close(supDone)
+	}()
+	select {
+	case <-supDone:
+	case <-time.After(2 * gracefulStopTimeout):
+		m.logger.Warn("Plugin supervisor still busy at shutdown; continuing", "waited", 2*gracefulStopTimeout)
+	}
+
+	type held struct {
+		key    string
+		client *goplugin.Client
+		raw    interface{}
+		self   bool
+	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
+	clients := make([]held, 0, len(m.clients))
 	for key, client := range m.clients {
-		if m.selfManaged[key] {
-			m.logger.Info("Disconnecting self-managed plugin", "plugin", key)
-		} else {
-			m.logger.Info("Shutting down plugin", "plugin", key)
-		}
-		client.Kill()
+		clients = append(clients, held{key: key, client: client, raw: m.dispensed[key], self: m.selfManaged[key]})
 	}
-
-	for key, adapter := range m.grpcAdapters {
-		m.logger.Info("Closing gRPC broker adapter", "plugin", key)
-		if err := adapter.Close(); err != nil {
-			m.logger.Error("Failed to close gRPC adapter", "plugin", key, "error", err)
-		}
-	}
+	adapters := m.grpcAdapters
 
 	m.clients = make(map[string]*goplugin.Client)
 	m.dispensed = make(map[string]interface{})
@@ -932,6 +1258,34 @@ func (m *Manager) Shutdown() {
 	m.configs = make(map[string]DiscoveredPlugin)
 	m.configFiles = make(map[string]string)
 	m.pluginEntries = make(map[string]PluginEntry)
+	m.mu.Unlock()
+
+	m.sup.mu.Lock()
+	m.sup.plugins = make(map[string]*supervised)
+	m.sup.mu.Unlock()
+
+	// Outside the lock, all at once: each graceful stop is bounded.
+	var stops sync.WaitGroup
+	for _, h := range clients {
+		if h.self {
+			m.logger.Info("Disconnecting self-managed plugin", "plugin", h.key)
+		} else {
+			m.logger.Info("Shutting down plugin", "plugin", h.key)
+		}
+		stops.Add(1)
+		go func() {
+			defer stops.Done()
+			m.discardClient(h.key, h.client, h.raw, h.self, true)
+		}()
+	}
+	stops.Wait()
+
+	for key, adapter := range adapters {
+		m.logger.Info("Closing gRPC broker adapter", "plugin", key)
+		if err := adapter.Close(); err != nil {
+			m.logger.Error("Failed to close gRPC adapter", "plugin", key, "error", err)
+		}
+	}
 
 	goplugin.CleanupClients()
 }

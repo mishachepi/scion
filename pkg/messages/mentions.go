@@ -72,7 +72,8 @@ type MentionResult struct {
 
 // ExtractMentions scans message text for @name tokens and returns a deduplicated
 // list of mentioned names (without the @ prefix). Trailing punctuation (except
-// underscores and hyphens) is stripped from each token.
+// underscores and hyphens) and trailing possessive suffixes ('s and ’s) are
+// stripped from each token.
 //
 // An @ preceded by a non-whitespace character (e.g. inside an email address like
 // user@example.com) is not treated as a mention trigger.
@@ -108,6 +109,106 @@ func ExtractMentions(text string) []string {
 // only used for agent-authored sends.
 func ExtractProseMentions(text string) []string {
 	return ExtractMentions(stripNonProseSpans(text))
+}
+
+// ExtractWrappedMentions scans message text for @name and @email mention
+// tokens, including mentions wrapped in common punctuation or markdown (such
+// as (@user), **@user**, *@user*, _@user_, ~~@user~~, "@user", [@user], or
+// FYI:@user), returning deduplicated names without the leading @.
+//
+// An @ preceded by a letter, digit, hyphen, @, backtick, or intraword
+// underscore (such as inside user@example.com, `@user`, or foo_@bar) is not
+// treated as a mention trigger. Agent @mention routing continues to use
+// ExtractMentions / ExtractProseMentions unchanged.
+func ExtractWrappedMentions(text string) []string {
+	runes := []rune(text)
+	var mentions []string
+	seen := make(map[string]bool)
+	for i := 0; i < len(runes); {
+		if runes[i] != '@' {
+			i++
+			continue
+		}
+		leadingUnderscores, ok := wrappedMentionStart(runes, i)
+		if !ok {
+			i++
+			continue
+		}
+		end := scanWrappedMentionEnd(runes, i+1)
+		name := string(runes[i+1 : end])
+		for k := 0; k < leadingUnderscores && strings.HasSuffix(name, "_"); k++ {
+			name = strings.TrimSuffix(name, "_")
+		}
+		name = trimMentionPunct(name)
+		if name != "" {
+			lower := strings.ToLower(name)
+			if !seen[lower] {
+				seen[lower] = true
+				mentions = append(mentions, name)
+			}
+		}
+		if end > i+1 {
+			i = end
+		} else {
+			i++
+		}
+	}
+	return mentions
+}
+
+// ExtractProseWrappedMentions is ExtractWrappedMentions over prose only:
+// fenced code blocks, inline backtick code spans, and '>' blockquote lines
+// are skipped via stripNonProseSpans.
+func ExtractProseWrappedMentions(text string) []string {
+	return ExtractWrappedMentions(stripNonProseSpans(text))
+}
+
+func isWrappedWordRune(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '-'
+}
+
+func wrappedMentionStart(runes []rune, atIdx int) (leadingUnderscores int, ok bool) {
+	if atIdx == 0 {
+		return 0, true
+	}
+	prev := runes[atIdx-1]
+	if prev == '_' {
+		j := atIdx - 1
+		for j >= 0 && runes[j] == '_' {
+			j--
+		}
+		if j >= 0 && (isWrappedWordRune(runes[j]) || runes[j] == '@' || runes[j] == '`') {
+			return 0, false
+		}
+		return atIdx - 1 - j, true
+	}
+	if isWrappedWordRune(prev) || prev == '@' || prev == '`' {
+		return 0, false
+	}
+	return 0, true
+}
+
+func scanWrappedMentionEnd(runes []rune, start int) int {
+	sawAt := false
+	i := start
+	for i < len(runes) {
+		r := runes[i]
+		if isWrappedWordRune(r) {
+			i++
+			continue
+		}
+		if (r == '.' || r == '+') && i > start && i+1 < len(runes) && isWrappedWordRune(runes[i+1]) {
+			i++
+			continue
+		}
+		if r == '@' && !sawAt && i > start && i+1 < len(runes) && isWrappedWordRune(runes[i+1]) {
+			sawAt = true
+			i++
+			continue
+		}
+		break
+	}
+	return i
 }
 
 // stripNonProseSpans blanks fenced code blocks, inline code spans, and
@@ -351,8 +452,8 @@ func blankRunes(out []rune, start, end int) {
 
 // IsLeadingMention reports whether text begins with an @-mention token
 // whose extracted name matches firstMentionName (case-insensitive).
-// The extraction uses the same rules as ExtractMentions: TrimPrefix "@",
-// then TrimRightFunc for trailing punctuation (except _ and -).
+// The extraction uses the same rules as ExtractMentions: TrimPrefix "@"
+// followed by trimMentionPunct.
 //
 // This is used to detect the "leading @-mention override" pattern where
 // a message starting with @agent-name signals explicit address override
@@ -362,10 +463,7 @@ func IsLeadingMention(text, firstMentionName string) bool {
 	if len(fields) == 0 || !strings.HasPrefix(fields[0], "@") {
 		return false
 	}
-	name := strings.TrimPrefix(fields[0], "@")
-	name = strings.TrimRightFunc(name, func(r rune) bool {
-		return unicode.IsPunct(r) && r != '_' && r != '-'
-	})
+	name := trimMentionPunct(strings.TrimPrefix(fields[0], "@"))
 	return name != "" && strings.EqualFold(name, firstMentionName)
 }
 
@@ -497,12 +595,147 @@ func agentMentionSlug(word string) (string, bool) {
 	return slug, true
 }
 
-// trimMentionPunct strips trailing punctuation, except underscores and
-// hyphens, from a mention name.
+// trimMentionPunct strips trailing punctuation (except underscores and
+// hyphens) and a trailing possessive suffix ('s or ’s, case-insensitive)
+// from a mention name.
 func trimMentionPunct(name string) string {
+	name = trimTrailingMentionPunct(name)
+	name = trimPossessiveSuffix(name)
+	return trimTrailingMentionPunct(name)
+}
+
+func trimTrailingMentionPunct(name string) string {
 	return strings.TrimRightFunc(name, func(r rune) bool {
 		return unicode.IsPunct(r) && r != '_' && r != '-'
 	})
+}
+
+func trimPossessiveSuffix(name string) string {
+	if len(name) < 2 {
+		return name
+	}
+	last := name[len(name)-1]
+	if last != 's' && last != 'S' {
+		return name
+	}
+	stem := name[:len(name)-1]
+	if strings.HasSuffix(stem, "'") {
+		return stem[:len(stem)-1]
+	}
+	if strings.HasSuffix(stem, "\u2019") {
+		return stem[:len(stem)-len("\u2019")]
+	}
+	return name
+}
+
+// ReplaceProseMention replaces standalone @oldName mention tokens with @newName
+// across prose lines in text, matching case-insensitively while leaving fenced
+// code blocks, inline backtick code spans, and '>' blockquote lines unchanged.
+func ReplaceProseMention(text, oldName, newName string) string {
+	if oldName == "" {
+		return text
+	}
+	needleLower := "@" + strings.ToLower(oldName)
+	if !strings.Contains(strings.ToLower(text), needleLower) {
+		return text
+	}
+	targetRunes := []rune(strings.ToLower(oldName))
+	replacementRunes := []rune("@" + newName)
+
+	lines := strings.Split(text, "\n")
+	prose := proseLines(lines)
+	for i, line := range lines {
+		if prose[i] && strings.Contains(strings.ToLower(line), needleLower) {
+			lines[i] = replaceProseMentionInLine(line, targetRunes, replacementRunes)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func replaceProseMentionInLine(line string, targetLower, replacement []rune) string {
+	runes := []rune(line)
+	inCode := make([]bool, len(runes))
+	for _, span := range inlineCodeSpans(runes) {
+		for k := span[0]; k < span[1]; k++ {
+			inCode[k] = true
+		}
+	}
+
+	out := make([]rune, 0, len(runes))
+	for i := 0; i < len(runes); {
+		if runes[i] != '@' || inCode[i] {
+			out = append(out, runes[i])
+			i++
+			continue
+		}
+		end := i + 1 + len(targetLower)
+		if end > len(runes) || !proseMentionMatchAt(runes, i, targetLower, inCode) {
+			out = append(out, runes[i])
+			i++
+			continue
+		}
+		out = append(out, replacement...)
+		i = end
+	}
+	return string(out)
+}
+
+func proseMentionMatchAt(runes []rune, atIdx int, targetLower []rune, inCode []bool) bool {
+	leadingUnderscores, ok := wrappedMentionStart(runes, atIdx)
+	if !ok {
+		return false
+	}
+	preIdx := atIdx - 1 - leadingUnderscores
+	if preIdx >= 0 && (runes[preIdx] == '.' || runes[preIdx] == '+' || runes[preIdx] == '/') {
+		return false
+	}
+	for k, want := range targetLower {
+		idx := atIdx + 1 + k
+		if inCode[idx] || unicode.ToLower(runes[idx]) != want {
+			return false
+		}
+	}
+	return proseMentionEndBoundary(runes, atIdx+1+len(targetLower), leadingUnderscores, inCode)
+}
+
+func proseMentionEndBoundary(runes []rune, end, leadingUnderscores int, inCode []bool) bool {
+	if end >= len(runes) {
+		return true
+	}
+	if inCode[end] {
+		return false
+	}
+	next := runes[end]
+	if next == '_' {
+		if leadingUnderscores <= 0 {
+			return false
+		}
+		closeEnd := end
+		for closeEnd < len(runes) && closeEnd-end < leadingUnderscores && runes[closeEnd] == '_' {
+			closeEnd++
+		}
+		if closeEnd >= len(runes) {
+			return true
+		}
+		after := runes[closeEnd]
+		if isWrappedWordRune(after) || after == '@' {
+			return false
+		}
+		return proseMentionPunctOrSpace(runes, closeEnd)
+	}
+	return proseMentionPunctOrSpace(runes, end)
+}
+
+func proseMentionPunctOrSpace(runes []rune, idx int) bool {
+	next := runes[idx]
+	if (next == '.' || next == '+') && idx+1 < len(runes) && isWrappedWordRune(runes[idx+1]) {
+		return false
+	}
+	return unicode.IsSpace(next) ||
+		next == ',' || next == '.' || next == '!' || next == '?' ||
+		next == ')' || next == '(' || next == ':' || next == ';' ||
+		next == '"' || next == '\'' || next == ']' || next == '[' ||
+		next == '*' || next == '~' || next == '>'
 }
 
 // RewriteAgentMentions rewrites every @-mention written in recipient syntax

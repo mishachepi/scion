@@ -53,6 +53,13 @@ var dispatchRuntimeCases = []dispatchRuntimeCase{
 	{name: "kubernetes default, docker agent", defaultRuntime: "kubernetes", profileRuntime: "docker", useProfile: true, wantContainerRouting: true},
 }
 
+// substrateDispatchCase and cloudrunSandboxDispatchCase dispatch to a
+// broker whose default runtime cannot run an agent in a host worktree.
+var (
+	substrateDispatchCase       = dispatchRuntimeCase{name: "substrate default, substrate agent", defaultRuntime: "substrate", profileRuntime: "docker"}
+	cloudrunSandboxDispatchCase = dispatchRuntimeCase{name: "cloudrun-sandbox default, cloudrun-sandbox agent", defaultRuntime: "cloudrun-sandbox", profileRuntime: "docker"}
+)
+
 // newDispatchRuntimeServer builds a broker whose default runtime is
 // tc.defaultRuntime, with a second profile resolving to tc.profileRuntime,
 // a container hub endpoint pointing at the docker bridge, and a colocated hub
@@ -332,6 +339,87 @@ func TestBuildStartContext_EmptyPerAgentFollowsNoDispatchRuntime(t *testing.T) {
 			}
 			if !sc.Opts.EmptyPerAgentWorkspace {
 				t.Error("EmptyPerAgentWorkspace = false, want true")
+			}
+		})
+	}
+}
+
+// TestBuildStartContext_WorktreeFallbackWorkspaceModeLabel pins the
+// SCION_WORKSPACE_MODE an agent gets on each outcome of a worktree-per-agent
+// dispatch (ptone/scion#7906). A container-runtime agent that falls back to
+// the in-container clone is labelled clone-per-agent, which is what it
+// actually gets. A provisioned host worktree keeps worktree-per-agent, and so
+// does a kubernetes dispatch: the broker passes the label on, and pkg/agent
+// Start decides from it whether the agent gets an NFS worktree or is
+// relabelled clone-per-agent (TestStartK8sWorktreeFallbackWorkspaceModeLabel).
+// substrate and cloudrun-sandbox always get the in-container clone, labelled
+// clone-per-agent (ptone/scion#7913).
+func TestBuildStartContext_WorktreeFallbackWorkspaceModeLabel(t *testing.T) {
+	requireWorktreeGit(t)
+	clearSCIONEnv(t)
+	cases := []struct {
+		name string
+		tc   dispatchRuntimeCase
+		// agentID empty makes a create dispatch fall back (no identity
+		// to provision a worktree for).
+		agentID   string
+		wantClone bool
+		wantMode  store.WorkspaceSharingMode
+	}{
+		{name: "docker, host worktree provisioned", tc: dispatchRuntimeCases[0], agentID: "agent-a",
+			wantMode: store.SharingModeWorktreePerAgent},
+		{name: "docker, falls back to in-container clone", tc: dispatchRuntimeCases[0], agentID: "",
+			wantClone: true, wantMode: store.SharingModeClonePerAgent},
+		{name: "kubernetes, label passed on to pkg/agent", tc: dispatchRuntimeCases[2], agentID: "agent-a",
+			wantClone: true, wantMode: store.SharingModeWorktreePerAgent},
+		// substrate and cloudrun-sandbox never run the agent in a host
+		// worktree: with or without an identity to provision one for, they
+		// get the in-container clone, labelled clone-per-agent
+		// (ptone/scion#7913).
+		{name: "substrate, eligible dispatch gets in-container clone", tc: substrateDispatchCase, agentID: "agent-a",
+			wantClone: true, wantMode: store.SharingModeClonePerAgent},
+		{name: "substrate, falls back to in-container clone", tc: substrateDispatchCase, agentID: "",
+			wantClone: true, wantMode: store.SharingModeClonePerAgent},
+		{name: "cloudrun-sandbox, eligible dispatch gets in-container clone", tc: cloudrunSandboxDispatchCase, agentID: "agent-a",
+			wantClone: true, wantMode: store.SharingModeClonePerAgent},
+		{name: "cloudrun-sandbox, falls back to in-container clone", tc: cloudrunSandboxDispatchCase, agentID: "",
+			wantClone: true, wantMode: store.SharingModeClonePerAgent},
+	}
+	// cloudrun-sandbox resolves its hub endpoint from the metadata bind
+	// address and the hub listen port.
+	t.Setenv("SCION_METADATA_BIND_ADDRESS", "203.0.113.5")
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv, dotScion := newDispatchRuntimeServer(t, c.tc, "")
+			srv.config.HubListenPort = 8080
+			bare := initBareRepoWithCommit(t)
+			depth := 1
+			sc, err := srv.buildStartContext(context.Background(), startContextInputs{
+				Name:          "agent-a",
+				AgentID:       c.agentID,
+				ProjectID:     "p1",
+				ProjectSlug:   "proj",
+				ProjectPath:   dotScion,
+				HubEndpoint:   "http://localhost:8080",
+				WorkspaceMode: store.WorkspaceModeWorktreePerAgent,
+				Config: &CreateAgentConfig{
+					Profile:  c.tc.profile(),
+					GitClone: &api.GitCloneConfig{URL: bare, Branch: "main", Depth: &depth},
+				},
+				HTTPRequest: httptest.NewRequest("POST", "/api/v1/agents", nil),
+				Operation:   opCreate,
+			})
+			if err != nil {
+				t.Fatalf("buildStartContext: %v", err)
+			}
+			if got := sc.Opts.Env["SCION_GIT_CLONE_URL"] != ""; got != c.wantClone {
+				t.Fatalf("in-container clone = %v, want %v", got, c.wantClone)
+			}
+			if c.wantClone && sc.Opts.Workspace != "" {
+				t.Errorf("expected no host worktree with the in-container clone, got Workspace=%q", sc.Opts.Workspace)
+			}
+			if got := sc.Opts.Env["SCION_WORKSPACE_MODE"]; got != string(c.wantMode) {
+				t.Errorf("SCION_WORKSPACE_MODE = %q, want %q", got, c.wantMode)
 			}
 		})
 	}

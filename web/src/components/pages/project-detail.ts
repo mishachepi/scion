@@ -47,6 +47,7 @@ import {
 } from '../../shared/types.js';
 import { agentStatusBadge } from '../../shared/agent-state-display.js';
 import { apiFetch, extractApiError } from '../../client/api.js';
+import { showPendingSecretsStartHint } from '../../client/pending-secrets.js';
 import { dispatchPageTitle } from '../../client/page-title.js';
 import {
   READINESS_MARKS,
@@ -79,6 +80,7 @@ import '../shared/git-remote-display.js';
 import type { ViewMode } from '../shared/view-toggle.js';
 import '../shared/status-badge.js';
 import { DeletionLeaseController } from '../shared/deletion-badge.js';
+import '../shared/authority-badge.js';
 import '../shared/deletion-banner.js';
 import { runAgentDelete, lifecycleActionErrorMessage } from '../../client/agent-delete.js';
 import type { AgentDeleteRequest } from '../../client/agent-delete.js';
@@ -111,7 +113,20 @@ import { formatInstantWithZone, formatRelative } from '../../utils/time.js';
 import { formatNumber } from '../../utils/format-number.js';
 import { DisplayZoneController } from '../../utils/display-zone-controller.js';
 import { navigateTo } from '../../client/navigation.js';
-import { AGENT_BADGES_FLAG, isFeatureEnabled } from '../../utils/feature-flags.js';
+import {
+  leaveVisibility,
+  PROJECT_NO_ACCESS_MESSAGE,
+  PROJECT_NO_ACCESS_TITLE,
+} from '../../client/project-leave.js';
+import '../shared/project-leave-dialog.js';
+import type { ProjectLeftDetail, ScionProjectLeaveDialog } from '../shared/project-leave-dialog.js';
+import {
+  AGENT_BADGES_FLAG,
+  FEATURE_FLAGS_CHANGED_EVENT,
+  decisionsEnabled,
+  isFeatureEnabled,
+} from '../../utils/feature-flags.js';
+import { fetchProjectDecisionCounts } from '../../client/project-decisions.js';
 import { agentBadges } from '../shared/agent-badges.js';
 import { ARTIFACTS_FLAG } from '../../client/artifacts.js';
 import '../shared/artifact-list.js';
@@ -236,6 +251,13 @@ export class ScionPageProjectDetail extends LitElement {
    */
   @state()
   private error: string | null = null;
+
+  /**
+   * The project answered 404: it is gone, or the user no longer has access
+   * (left it, or was removed). Rendered as a no-access state.
+   */
+  @state()
+  private noAccess = false;
 
   /**
    * Loading state for actions
@@ -454,6 +476,54 @@ export class ScionPageProjectDetail extends LitElement {
 
   private boundOnAgentsResync = () => {
     this.agentWindow.markResync();
+  };
+
+  @state()
+  private decisionsEnabled = false;
+
+  @state()
+  private waitingOnYouDecisionsCount = 0;
+
+  private decisionsCountAbort: AbortController | null = null;
+  private decisionsCountTimer: ReturnType<typeof setTimeout> | null = null;
+
+  private boundOnFeatureFlagsChanged = (): void => {
+    const next = decisionsEnabled();
+    if (next === this.decisionsEnabled) return;
+    this.decisionsEnabled = next;
+    if (!next) {
+      this.cancelDecisionsCountLoad();
+      this.waitingOnYouDecisionsCount = 0;
+      return;
+    }
+    if (this.project && this.projectId) {
+      void this.loadDecisionsCount();
+    }
+  };
+
+  private boundOnDecisionUpdated = (e: Event): void => {
+    if (!this.decisionsEnabled || !this.projectId) return;
+    const raw = (e as CustomEvent).detail as {
+      data?: { projectId?: string };
+      projectId?: string;
+    } | null;
+    const data = raw?.data ?? raw;
+    if (data?.projectId && data.projectId !== this.projectId) return;
+    this.scheduleDecisionsCountRefresh();
+  };
+
+  private boundOnChatMessageReceived = (e: Event): void => {
+    if (!this.decisionsEnabled || !this.projectId) return;
+    const raw = (e as CustomEvent).detail as {
+      data?: { projectId?: string; type?: string; decisions?: unknown };
+      projectId?: string;
+      type?: string;
+      decisions?: unknown;
+    } | null;
+    const data = raw?.data ?? raw;
+    if (data?.projectId && data.projectId !== this.projectId) return;
+    if (data?.type !== 'decision-prompt' && !Array.isArray(data?.decisions)) return;
+    this.scheduleDecisionsCountRefresh();
   };
 
   /**
@@ -944,6 +1014,13 @@ export class ScionPageProjectDetail extends LitElement {
       margin-bottom: 1rem;
     }
 
+    .leave-blocked-reason {
+      max-width: 18rem;
+      white-space: normal;
+      font-size: var(--sl-font-size-x-small, 0.75rem);
+      color: var(--sl-color-neutral-600, #4b5563);
+    }
+
     .error-state {
       text-align: center;
       padding: 3rem 2rem;
@@ -1167,6 +1244,11 @@ export class ScionPageProjectDetail extends LitElement {
       cursor: pointer;
     }
 
+    .decisions-btn sl-badge::part(base) {
+      font-size: 0.65rem;
+      margin-left: 0.35rem;
+    }
+
     @media (max-width: 768px) {
       .hide-mobile {
         display: none;
@@ -1250,6 +1332,8 @@ export class ScionPageProjectDetail extends LitElement {
       view: listViewOf(this.viewMode),
     });
 
+    this.decisionsEnabled = decisionsEnabled();
+
     // Set SSE scope to this project (receives all agent events within
     // project) before the first load: a drain belongs to the scope
     // generation it started in, and is discarded if the scope changes
@@ -1262,19 +1346,26 @@ export class ScionPageProjectDetail extends LitElement {
     void this.loadHubProjectCapabilities();
 
     // Listen for real-time updates
+    window.addEventListener(FEATURE_FLAGS_CHANGED_EVENT, this.boundOnFeatureFlagsChanged);
     stateManager.addEventListener('projects-updated', this.boundOnProjectsUpdated);
     stateManager.addEventListener('agents-changed', this.boundOnAgentsChanged);
     stateManager.addEventListener('agents-resync', this.boundOnAgentsResync);
+    stateManager.addEventListener('decision-updated', this.boundOnDecisionUpdated);
+    stateManager.addEventListener('chat-message-received', this.boundOnChatMessageReceived);
     this.agentWindow.addEventListener('change', this.boundOnWindowChange);
   }
 
   override disconnectedCallback(): void {
     super.disconnectedCallback();
+    window.removeEventListener(FEATURE_FLAGS_CHANGED_EVENT, this.boundOnFeatureFlagsChanged);
     stateManager.removeEventListener('projects-updated', this.boundOnProjectsUpdated);
     stateManager.removeEventListener('agents-changed', this.boundOnAgentsChanged);
     stateManager.removeEventListener('agents-resync', this.boundOnAgentsResync);
+    stateManager.removeEventListener('decision-updated', this.boundOnDecisionUpdated);
+    stateManager.removeEventListener('chat-message-received', this.boundOnChatMessageReceived);
     this.agentWindow.removeEventListener('change', this.boundOnWindowChange);
     this.cancelAgentsLoad();
+    this.cancelDecisionsCountLoad();
     this.filesSectionObserver?.disconnect();
     this.filesSectionObserver = null;
     this.observedFilesPlaceholder = null;
@@ -1524,6 +1615,7 @@ export class ScionPageProjectDetail extends LitElement {
    */
   private async loadData(): Promise<void> {
     this.error = null;
+    this.noAccess = false;
     const agentsLoad = this.loadPageAgents();
 
     const offered = this.hydrationOffered
@@ -1541,6 +1633,11 @@ export class ScionPageProjectDetail extends LitElement {
     try {
       const projectResponse = await apiFetch(`/api/v1/projects/${this.projectId}`);
 
+      if (projectResponse.status === 404) {
+        this.noAccess = true;
+        this.project = null;
+        return;
+      }
       if (!projectResponse.ok) {
         throw new Error(
           await extractApiError(
@@ -1596,6 +1693,9 @@ export class ScionPageProjectDetail extends LitElement {
     // Fetch metrics summary (non-blocking, gracefully degrades)
     void this.loadMetricsSummary();
     void this.loadSessionMetricsSummary();
+    if (this.decisionsEnabled) {
+      void this.loadDecisionsCount();
+    }
 
     // Auto-discover GitHub App installation if project has a GitHub remote but no installation
     if (
@@ -1626,6 +1726,46 @@ export class ScionPageProjectDetail extends LitElement {
       this.metricsSummary = data;
     } catch {
       this.metricsSummary = null;
+    }
+  }
+
+  private cancelDecisionsCountLoad(): void {
+    if (this.decisionsCountTimer !== null) {
+      clearTimeout(this.decisionsCountTimer);
+      this.decisionsCountTimer = null;
+    }
+    this.decisionsCountAbort?.abort();
+    this.decisionsCountAbort = null;
+  }
+
+  private scheduleDecisionsCountRefresh(): void {
+    if (this.decisionsCountTimer !== null) {
+      clearTimeout(this.decisionsCountTimer);
+    }
+    this.decisionsCountTimer = setTimeout(() => {
+      this.decisionsCountTimer = null;
+      if (this.isConnected && this.decisionsEnabled && this.projectId) {
+        void this.loadDecisionsCount();
+      }
+    }, 100);
+  }
+
+  private async loadDecisionsCount(): Promise<void> {
+    if (!this.decisionsEnabled || !this.projectId) return;
+    this.decisionsCountAbort?.abort();
+    const ac = new AbortController();
+    this.decisionsCountAbort = ac;
+    try {
+      const counts = await fetchProjectDecisionCounts(this.projectId, ac.signal);
+      if (ac.signal.aborted || !this.isConnected || !this.decisionsEnabled) return;
+      this.waitingOnYouDecisionsCount = counts.waitingOnYou;
+    } catch {
+      if (ac.signal.aborted) return;
+      // Non-blocking badge fetch: leave previous/0 count if unavailable.
+    } finally {
+      if (this.decisionsCountAbort === ac) {
+        this.decisionsCountAbort = null;
+      }
     }
   }
 
@@ -1798,6 +1938,7 @@ export class ScionPageProjectDetail extends LitElement {
     params.set('limit', String(this.pagerPageSize));
     params.set('fit', String(projectAgentsFitFor(this.pagerPageSize)));
     params.set('stats', '1');
+    params.set('include', 'authority');
     if (label) params.set('label', label);
     if (this.phaseFilter) params.set('phase', this.phaseFilter);
 
@@ -1881,6 +2022,7 @@ export class ScionPageProjectDetail extends LitElement {
 
     const params = new URLSearchParams();
     if (label.includes('=')) params.append('label', label);
+    params.set('include', 'authority');
     const qs = params.toString();
     const url = qs
       ? `/api/v1/projects/${this.projectId}/agents?${qs}`
@@ -2022,6 +2164,7 @@ export class ScionPageProjectDetail extends LitElement {
     if (params.cursor) qs.set('cursor', params.cursor);
     if (params.ids?.length) qs.set('ids', params.ids.join(','));
     if (params.wantStats) qs.set('stats', '1');
+    qs.set('include', 'authority');
     if (label) qs.set('label', label);
     if (this.phaseFilter) qs.set('phase', this.phaseFilter);
 
@@ -2272,6 +2415,7 @@ export class ScionPageProjectDetail extends LitElement {
       if (!response.ok) {
         throw new Error(await lifecycleActionErrorMessage(response, `Failed to ${action} agent`));
       }
+      if (actionUrls[action].endsWith('/start')) void showPendingSecretsStartHint();
 
       this.backgroundRefresh();
     } catch (err) {
@@ -2756,6 +2900,25 @@ export class ScionPageProjectDetail extends LitElement {
                   </sl-button>
                 `
             : nothing}
+          ${this.decisionsEnabled
+            ? html`
+                <a
+                  href="/projects/${encodeURIComponent(this.projectId)}/decisions"
+                  style="text-decoration: none;"
+                  data-decisions-link
+                >
+                  <sl-button size="small" class="decisions-btn" data-decisions-button>
+                    <sl-icon slot="prefix" name="signpost-split"></sl-icon>
+                    Decisions
+                    ${this.waitingOnYouDecisionsCount > 0
+                      ? html`<sl-badge variant="primary" pill class="decisions-badge"
+                          >${this.waitingOnYouDecisionsCount}</sl-badge
+                        >`
+                      : nothing}
+                  </sl-button>
+                </a>
+              `
+            : nothing}
           <a href="/projects/${this.projectId}/metrics" style="text-decoration: none;">
             <sl-button size="small">
               <sl-icon slot="prefix" name="graph-up"></sl-icon>
@@ -2772,6 +2935,7 @@ export class ScionPageProjectDetail extends LitElement {
                 </a>
               `
             : nothing}
+          ${this.renderHeaderOverflow()}
         </div>
       </scion-detail-header>
 
@@ -3196,7 +3360,69 @@ export class ScionPageProjectDetail extends LitElement {
     `;
   }
 
+  /**
+   * The header overflow menu. Its only item is Leave project, offered as the
+   * project's capabilities say (ptone/scion#7494): every member can reach the
+   * header, while Settings needs update, delete or manage.
+   */
+  private renderHeaderOverflow(): TemplateResult | typeof nothing {
+    const leave = leaveVisibility(this.project?._capabilities);
+    if (leave.kind === 'hidden') return nothing;
+    return html`
+      <sl-dropdown placement="bottom-end" data-header-overflow>
+        <sl-icon-button
+          slot="trigger"
+          name="three-dots-vertical"
+          label="More project actions"
+        ></sl-icon-button>
+        <sl-menu>
+          <sl-menu-item
+            data-leave-project
+            ?disabled=${leave.kind === 'blocked'}
+            @click=${() => this.openLeaveDialog()}
+          >
+            <sl-icon slot="prefix" name="box-arrow-right"></sl-icon>
+            Leave project
+            ${leave.kind === 'blocked'
+              ? html`<div class="leave-blocked-reason" data-leave-blocked>${leave.reason}</div>`
+              : nothing}
+          </sl-menu-item>
+        </sl-menu>
+      </sl-dropdown>
+      <scion-project-leave-dialog
+        projectId=${this.projectId}
+        projectName=${this.project?.name ?? ''}
+        ?transferAvailable=${can(this.project?._capabilities, 'manage')}
+        @scion-project-left=${(e: CustomEvent<ProjectLeftDetail>) => {
+          if (e.detail.result.remainingAccess !== 'none') void this.loadData();
+        }}
+        @scion-leave-transfer-ownership=${() => {
+          navigateTo(`/projects/${this.projectId}/settings?transfer=1`);
+        }}
+      ></scion-project-leave-dialog>
+    `;
+  }
+
+  private openLeaveDialog(): void {
+    if (leaveVisibility(this.project?._capabilities).kind !== 'enabled') return;
+    const dialog = this.shadowRoot?.querySelector<ScionProjectLeaveDialog>(
+      'scion-project-leave-dialog'
+    );
+    void dialog?.show();
+  }
+
   private renderError() {
+    if (this.noAccess) {
+      return html`
+        <scion-back-link href="/projects">Back to Projects</scion-back-link>
+
+        <div class="error-state" data-project-no-access>
+          <sl-icon name="exclamation-triangle"></sl-icon>
+          <h2>${PROJECT_NO_ACCESS_TITLE}</h2>
+          <p>${PROJECT_NO_ACCESS_MESSAGE}</p>
+        </div>
+      `;
+    }
     return html`
       <scion-back-link href="/projects">Back to Projects</scion-back-link>
 
@@ -3469,6 +3695,7 @@ export class ScionPageProjectDetail extends LitElement {
             .deletion=${this.deletingView(agent)}
             size="small"
           ></scion-deletion-badge>
+          <scion-authority-badge .authority=${agent.authority} size="small"></scion-authority-badge>
           ${this.renderDeletionBanner(agent, true)}
         </td>
         <td class="hide-mobile">
@@ -3646,6 +3873,7 @@ export class ScionPageProjectDetail extends LitElement {
             .deletion=${this.deletingView(agent)}
             size="small"
           ></scion-deletion-badge>
+          <scion-authority-badge .authority=${agent.authority} size="small"></scion-authority-badge>
         </div>
 
         ${this.renderDeletionBanner(agent, false)}

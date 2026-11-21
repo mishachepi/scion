@@ -21,7 +21,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
@@ -191,7 +190,10 @@ func TestBuildCloudRunInstance_FallbackEnvIsLast(t *testing.T) {
 		},
 		SuppressedFallbackKeys: []string{"SUPP_KEY"},
 	}
-	inst := rt.buildCloudRunInstance(cfg, 1000, 1000, nil)
+	inst, err := rt.buildCloudRunInstance(cfg, 1000, 1000, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	env := map[string]string{}
 	count := map[string]int{}
 	for _, ev := range inst.Containers[0].Env {
@@ -235,14 +237,7 @@ func TestCloudRunSandboxRuntime_Run_FallbackEnvIsLast(t *testing.T) {
 		rootDir:      rootDir,
 		watchCancels: make(map[string]context.CancelFunc),
 	}
-	t.Cleanup(func() {
-		rt.watchMu.Lock()
-		for _, cancel := range rt.watchCancels {
-			cancel()
-		}
-		rt.watchMu.Unlock()
-		time.Sleep(100 * time.Millisecond) // let goroutines exit
-	})
+	stopWatchersOnCleanup(t, rt.state.path, rt)
 	cfg := fallbackRunConfig(RunConfig{
 		Name:      "fallback-agent",
 		HomeDir:   homeDir,

@@ -117,10 +117,10 @@ async function viewState(page: Page): Promise<{
 }
 
 /** Use the header's mode switch: segmented buttons, or the narrow dropdown. */
-async function switchMode(page: Page, mode: 'Dashboard' | 'Chat' | 'Terminal'): Promise<void> {
+async function switchMode(page: Page, mode: 'Console' | 'Chat' | 'Terminals'): Promise<void> {
   const header = page.locator('scion-header:visible').first();
   // Wait for a header before choosing the path: right after a switch to
-  // Terminal no header is visible until the lazy terminal workspace chunk has
+  // Terminals no header is visible until the lazy terminal workspace chunk has
   // loaded, and count() below would then pick the phone path on desktop.
   await expect(header).toBeVisible();
   const button = header.locator('.mode-switch button:visible', { has: page.getByText(mode) });
@@ -184,16 +184,16 @@ async function expectSamePosition(
     .toBeLessThanOrEqual(TOLERANCE_PX);
 }
 
-test('thread and scroll position survive dashboard and terminal round trips', async ({ page }) => {
+test('thread and scroll position survive console and terminal round trips', async ({ page }) => {
   const before = await openScrolledThread(page);
 
-  await switchMode(page, 'Dashboard');
+  await switchMode(page, 'Console');
   await expect(page).toHaveURL('/');
   await expect(page.locator('scion-page-chat')).toHaveCount(0);
   await switchMode(page, 'Chat');
   await expectSamePosition(page, before);
 
-  await switchMode(page, 'Terminal');
+  await switchMode(page, 'Terminals');
   await expect(page).toHaveURL(/\/terminals/);
   await switchMode(page, 'Chat');
   await expectSamePosition(page, before);

@@ -36,6 +36,9 @@ var layer0Prefixes = []string{
 	"server.keyring_file",
 	// Operator override for a world-readable keyring file: restart-bound.
 	"server.keyring_file_allow_world_readable",
+	// TLS-terminating proxy allowlist for the hub-broker transport check:
+	// operator-only and read once at startup.
+	"server.trusted_proxies",
 	// Database
 	"server.database",
 	// Listeners
@@ -56,6 +59,7 @@ var layer0Prefixes = []string{
 	// Secrets/storage
 	"server.secrets",
 	"server.storage",
+	"server.project_storage",
 	"server.workspace_storage",
 	"server.shared_dir_storage",
 	"server.home_storage",
@@ -64,6 +68,9 @@ var layer0Prefixes = []string{
 	"server.env",
 	"server.hub.hub_id",
 	"server.hub.gcp_project_id",
+	// Plugin hub_url (ptone/scion#555): read once at startup and handed to
+	// broker plugins; the server-config API refuses it in every mode.
+	"server.hub.internal_url",
 	// Hub class (test admin tier gate input). Layer-0 so no DB section can
 	// hold it; the server-config API additionally refuses it in every mode,
 	// including workstation hubs where other Layer-0 keys are writable.
@@ -90,6 +97,9 @@ var layer0Prefixes = []string{
 	// Request performance tracing — the middleware and the authorization
 	// store and audit-emitter decorators are installed at startup.
 	"server.hub.perf_trace",
+	// Browser policy report samples — the report handler is built at
+	// startup.
+	"server.hub.csp_report_raw_samples",
 	// Membership-standing sweep report-only mode — the sweep reads it from
 	// ServerConfig, set at startup.
 	"server.hub.membership_sweep_report_only",
@@ -101,6 +111,16 @@ var layer0Prefixes = []string{
 	// Agent port proxy settings — the response header bound is read into
 	// ServerConfig at startup.
 	"server.hub.port_proxy",
+	// Events stream bounds and the declared platform request timeout — the
+	// web server and the conduit relay read them at startup.
+	"server.hub.sse",
+	"server.hub.platform_request_timeout",
+	// Web chat search limits (timeout, hub-wide cap) — read into
+	// ServerConfig at startup (ptone/scion#7586).
+	"server.hub.chat",
+	// System One rule evaluation ceiling (max_eval_time) — read into
+	// ServerConfig at startup (ptone/scion#8044).
+	"server.hub.system_one",
 	// Separate relay process settings (scion server --role relay) — read
 	// at startup.
 	"server.relay",
@@ -131,6 +151,8 @@ var koanfPathToJSONField = map[string]map[string]string{
 	"lifecycle": {
 		"server.hub.auto_suspend_stalled":          "auto_suspend_stalled",
 		"server.hub.stalled_threshold":             "stalled_threshold",
+		"server.hub.auto_suspend_idle":             "auto_suspend_idle",
+		"server.hub.idle_suspend_after":            "idle_suspend_after",
 		"server.hub.soft_delete_retention":         "soft_delete_retention",
 		"server.hub.soft_delete_retain_files":      "soft_delete_retain_files",
 		"server.hub.start_claim_lease_ttl":         "start_claim_lease_ttl",
@@ -139,17 +161,21 @@ var koanfPathToJSONField = map[string]map[string]string{
 		"server.hub.start_create_unconfirmed_hold": "start_create_unconfirmed_hold",
 	},
 	"endpoints": {
-		"server.hub.public_url":               "public_url",
-		"server.hub.hub_name":                 "hub_name",
-		"image_registry":                      "image_registry",
-		"server.hub.monitoring_dashboard_url": "monitoring_dashboard_url",
+		"server.hub.public_url":                  "public_url",
+		"server.hub.hub_name":                    "hub_name",
+		"server.hub.content_url":                 "content_url",
+		"server.hub.content_url_allow_same_site": "content_url_allow_same_site",
+		"image_registry":                         "image_registry",
+		"server.hub.monitoring_dashboard_url":    "monitoring_dashboard_url",
 	},
 	"github_app": {
-		"server.github_app.app_id":           "app_id",
-		"server.github_app.api_base_url":     "api_base_url",
-		"server.github_app.webhooks_enabled": "webhooks_enabled",
-		"server.github_app.installation_url": "installation_url",
-		"server.github_app.private_key_path": "private_key_path",
+		"server.github_app.app_id":                  "app_id",
+		"server.github_app.api_base_url":            "api_base_url",
+		"server.github_app.webhooks_enabled":        "webhooks_enabled",
+		"server.github_app.installation_url":        "installation_url",
+		"server.github_app.private_key_path":        "private_key_path",
+		"server.github_app.app_slug":                "app_slug",
+		"server.github_app.command_mention_aliases": "command_mention_aliases",
 	},
 	"auto_expose_ports": {
 		"auto_expose_ports.enabled": "enabled",
@@ -195,6 +221,8 @@ var jsonFieldToKoanfPaths = map[string]map[string]string{
 	"lifecycle": {
 		"auto_suspend_stalled":          "server.hub.auto_suspend_stalled",
 		"stalled_threshold":             "server.hub.stalled_threshold",
+		"auto_suspend_idle":             "server.hub.auto_suspend_idle",
+		"idle_suspend_after":            "server.hub.idle_suspend_after",
 		"soft_delete_retention":         "server.hub.soft_delete_retention",
 		"soft_delete_retain_files":      "server.hub.soft_delete_retain_files",
 		"start_claim_lease_ttl":         "server.hub.start_claim_lease_ttl",
@@ -203,17 +231,21 @@ var jsonFieldToKoanfPaths = map[string]map[string]string{
 		"start_create_unconfirmed_hold": "server.hub.start_create_unconfirmed_hold",
 	},
 	"endpoints": {
-		"public_url":               "server.hub.public_url",
-		"hub_name":                 "server.hub.hub_name",
-		"image_registry":           "image_registry",
-		"monitoring_dashboard_url": "server.hub.monitoring_dashboard_url",
+		"public_url":                  "server.hub.public_url",
+		"hub_name":                    "server.hub.hub_name",
+		"content_url":                 "server.hub.content_url",
+		"content_url_allow_same_site": "server.hub.content_url_allow_same_site",
+		"image_registry":              "image_registry",
+		"monitoring_dashboard_url":    "server.hub.monitoring_dashboard_url",
 	},
 	"github_app": {
-		"app_id":           "server.github_app.app_id",
-		"api_base_url":     "server.github_app.api_base_url",
-		"webhooks_enabled": "server.github_app.webhooks_enabled",
-		"installation_url": "server.github_app.installation_url",
-		"private_key_path": "server.github_app.private_key_path",
+		"app_id":                  "server.github_app.app_id",
+		"api_base_url":            "server.github_app.api_base_url",
+		"webhooks_enabled":        "server.github_app.webhooks_enabled",
+		"installation_url":        "server.github_app.installation_url",
+		"private_key_path":        "server.github_app.private_key_path",
+		"app_slug":                "server.github_app.app_slug",
+		"command_mention_aliases": "server.github_app.command_mention_aliases",
 	},
 	"auto_expose_ports": {
 		"enabled": "auto_expose_ports.enabled",
@@ -263,6 +295,8 @@ func ExtractSectionFromKoanf(k *koanf.Koanf, sectionName string) (json.RawMessag
 	switch sectionName {
 	case "telemetry":
 		return extractSubtree(k, "telemetry")
+	case BrandingSectionName:
+		return extractSubtree(k, config.BrandingSectionKey)
 	case "runtimes":
 		return extractSubtree(k, "runtimes")
 	case "profiles":
@@ -354,6 +388,8 @@ func loadSectionIntoKoanf(k *koanf.Koanf, sectionName string, doc json.RawMessag
 	switch sectionName {
 	case "telemetry":
 		return loadPrefixed(k, "telemetry", raw)
+	case BrandingSectionName:
+		return loadPrefixed(k, config.BrandingSectionKey, raw)
 	case "runtimes":
 		return loadPrefixed(k, "runtimes", raw)
 	case "profiles":
@@ -387,7 +423,12 @@ func loadPrefixed(k *koanf.Koanf, prefix string, raw map[string]interface{}) err
 	if len(pruned) == 0 {
 		return nil
 	}
-	return k.Load(confmap.Provider(map[string]interface{}{prefix: pruned}, ""), nil)
+	wrapped := pruned
+	segs := strings.Split(prefix, ".")
+	for i := len(segs) - 1; i >= 0; i-- {
+		wrapped = map[string]interface{}{segs[i]: wrapped}
+	}
+	return k.Load(confmap.Provider(wrapped, ""), nil)
 }
 
 // withoutEmptyMaps returns a copy of m without nested maps that are empty,
@@ -510,10 +551,26 @@ func init() {
 	}
 }
 
+// subtreeSectionPrefixes maps subtree-extracted sections whose koanf prefix is
+// not "<section>." to their koanf root prefix.
+var subtreeSectionPrefixes = map[string]string{
+	BrandingSectionName: config.BrandingSectionKey,
+}
+
 // SectionKeyFromKoanfPath returns the JSON field name (section-level key) for a
 // given koanf path, or empty string if the path is not in the registry.
 func SectionKeyFromKoanfPath(koanfPath string) string {
-	return koanfPathToJSONKey[koanfPath]
+	if k := koanfPathToJSONKey[koanfPath]; k != "" {
+		return k
+	}
+	for secName, prefix := range subtreeSectionPrefixes {
+		if rest, ok := strings.CutPrefix(koanfPath, prefix+"."); ok && !strings.Contains(rest, ".") {
+			if OwningSection(koanfPath) == secName {
+				return rest
+			}
+		}
+	}
+	return ""
 }
 
 // KoanfPathFromSectionKey returns the full koanf path for a section-level JSON
@@ -521,6 +578,12 @@ func SectionKeyFromKoanfPath(koanfPath string) string {
 func KoanfPathFromSectionKey(sectionName, jsonKey string) string {
 	if mapping, ok := jsonFieldToKoanfPaths[sectionName]; ok {
 		return mapping[jsonKey]
+	}
+	if prefix, ok := subtreeSectionPrefixes[sectionName]; ok && jsonKey != "" && !strings.Contains(jsonKey, ".") {
+		kp := prefix + "." + jsonKey
+		if OwningSection(kp) == sectionName {
+			return kp
+		}
 	}
 	return ""
 }
@@ -573,8 +636,20 @@ func DetectDeprecatedServerEnv(serverEnvKoanf *koanf.Koanf) []DeprecatedEnvVar {
 // variable is the supported way to pin the value on a node, not a
 // deprecated seed input. server.hub.public_url resolves env first, then the
 // database, then settings.yaml (ptone/scion#3905).
+// server.auth.authorized_domains resolves the same way (ptone/scion#6000):
+// a node that restricts sign-in through SCION_SERVER_* keeps that list
+// whatever is saved. This differs on purpose from the other access keys,
+// where a saved value wins over SCION_SERVER_*.
 var envPinnedLayer1Keys = map[string]bool{
-	"server.hub.public_url": true,
+	"server.hub.public_url":          true,
+	"server.auth.authorized_domains": true,
+}
+
+// IsEnvPinnedLayer1Key reports whether a SCION_SERVER_* variable pins the
+// Layer-1 key on a node (envPinnedLayer1Keys), so the saved value does not
+// apply where the variable is set.
+func IsEnvPinnedLayer1Key(key string) bool {
+	return envPinnedLayer1Keys[key]
 }
 
 // koanfKeyToEnvSuffix converts a koanf key back to the env var suffix form:

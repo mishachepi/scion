@@ -93,6 +93,9 @@ var RelationshipPolicies = []RelationshipPolicy{
 	// TestRelationshipCharacterization_OwnerProjectGrantsNothing pins this.
 	{
 		// owner/user/template (TestRelationshipCharacterization_Owner).
+		// template.create_global, template.update_global and template.delete_global
+		// are deliberately excluded: global templates record CreatedBy only, never
+		// OwnerID, and global catalog writes require explicit role authority.
 		Relationship:   "owner",
 		PrincipalKinds: []string{"user"},
 		ResourceType:   ResourceTemplate,
@@ -142,11 +145,15 @@ var RelationshipPolicies = []RelationshipPolicy{
 	},
 	{
 		// owner/user/skill (TestRelationshipCharacterization_Owner).
+		// Global-catalog twins (skill.*_global) are excluded: writes on a
+		// global record check skill.*_global, which no relationship row
+		// carries (Q5), so global catalog authorship is role-governed.
+		// OwnerID stays stamped on global records for audit only.
 		Relationship:   "owner",
 		PrincipalKinds: []string{"user"},
 		ResourceType:   ResourceSkill,
 		PermissionIDs: []string{
-			"skill.create", "skill.create_global", "skill.read", "skill.update", "skill.delete",
+			"skill.create", "skill.read", "skill.update", "skill.delete",
 			"skill.list", "skill.register",
 		},
 	},
@@ -228,6 +235,49 @@ var RelationshipPolicies = []RelationshipPolicy{
 		// progeny/agent/env_var exact pair (ptone/scion#2129): launch delivery
 		// of an opted-in user-scope env var. Not read only.
 		Relationship:   "progeny",
+		PrincipalKinds: []string{"agent"},
+		ResourceType:   "env_var",
+		PermissionIDs:  []string{"env_var.deliver"},
+	},
+	// Association rows (ptone/scion#2129): launch delivery of a project-,
+	// hub- or broker-scope secret or env var to an agent whose stored record
+	// is associated with that scope. They admit only the deliver
+	// permissions, and only for the internal delivery credential: pkg/hub's
+	// association candidate (authz_material_association.go) is built for no
+	// other principal, and its fact reads the stored material record and the
+	// stored agent, never request input.
+	{
+		Relationship:   "project_association",
+		PrincipalKinds: []string{"agent"},
+		ResourceType:   "secret",
+		PermissionIDs:  []string{"secret.deliver"},
+	},
+	{
+		Relationship:   "project_association",
+		PrincipalKinds: []string{"agent"},
+		ResourceType:   "env_var",
+		PermissionIDs:  []string{"env_var.deliver"},
+	},
+	{
+		Relationship:   "hub_association",
+		PrincipalKinds: []string{"agent"},
+		ResourceType:   "secret",
+		PermissionIDs:  []string{"secret.deliver"},
+	},
+	{
+		Relationship:   "hub_association",
+		PrincipalKinds: []string{"agent"},
+		ResourceType:   "env_var",
+		PermissionIDs:  []string{"env_var.deliver"},
+	},
+	{
+		Relationship:   "broker_association",
+		PrincipalKinds: []string{"agent"},
+		ResourceType:   "secret",
+		PermissionIDs:  []string{"secret.deliver"},
+	},
+	{
+		Relationship:   "broker_association",
 		PrincipalKinds: []string{"agent"},
 		ResourceType:   "env_var",
 		PermissionIDs:  []string{"env_var.deliver"},

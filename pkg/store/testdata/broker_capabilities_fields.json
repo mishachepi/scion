@@ -8,13 +8,20 @@
     "attachmentDelivery",
     "changedFields",
     "clearedFields",
+    "clearedResourceSubfields",
     "emptyPerAgentWorkspace",
+    "ephemeralPersistence",
+    "homeFiles",
     "nodeImageRegistry",
     "reprovision",
     "reprovisionEmptyPerAgent",
+    "reprovisionResetHomeRuntimes",
+    "restartingRuntimes",
     "startsInFlight",
     "sync",
     "templateTiers",
-    "webPty"
+    "unlimitedCountLimits",
+    "webPty",
+    "wiTargetsV1"
   ]
 }

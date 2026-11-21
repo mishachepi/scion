@@ -42,15 +42,16 @@ var appIconContentTypes = map[string]string{
 }
 
 // newAppIconWebServer returns a web server (no dev auth, so no session)
-// serving a temp assets dir holding every app icon path plus an unrelated
-// root-level file.
+// serving a temp assets dir holding every app icon path plus
+// scion-notification-icon.png, a root-level file served without a session
+// that is not an app icon.
 func newAppIconWebServer(t *testing.T, maintenance bool) *WebServer {
 	t.Helper()
 	dir := t.TempDir()
 	for p := range appIconContentTypes {
 		require.NoError(t, os.WriteFile(filepath.Join(dir, strings.TrimPrefix(p, "/")), []byte("data"), 0o644))
 	}
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "robots.txt"), []byte("data"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "scion-notification-icon.png"), []byte("data"), 0o644))
 	ws := newTestWebServer(t, WebServerConfig{AssetsDir: dir})
 	if maintenance {
 		ws.SetMaintenanceState(NewMaintenanceState(true, ""))
@@ -77,21 +78,21 @@ func TestAppIcons_ServedWithoutSession(t *testing.T) {
 }
 
 func TestAppIcons_AdminModeStillBlocksOtherPaths(t *testing.T) {
-	// robots.txt is a real root-level file that skips session auth: the
-	// admin-mode allowlist must stay exact rather than letting every
-	// root-level static file through.
+	// scion-notification-icon.png is a real root-level file that skips
+	// session auth: the admin-mode allowlist must stay exact rather than
+	// letting every root-level static file through.
 	ws := newAppIconWebServer(t, true)
-	req := httptest.NewRequest(http.MethodGet, "/robots.txt", nil)
+	req := httptest.NewRequest(http.MethodGet, "/scion-notification-icon.png", nil)
 	rec := httptest.NewRecorder()
 	ws.Handler().ServeHTTP(rec, req)
-	assert.Equal(t, http.StatusServiceUnavailable, rec.Code, "GET /robots.txt in admin mode")
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code, "GET /scion-notification-icon.png in admin mode")
 
 	// Without a session the full chain redirects other paths to /login
 	// before admin mode runs, so check the middleware directly.
 	mw := newTestWebServerWithMaintenance(true, "")
 	mw.mux.HandleFunc("/", passthrough)
 	handler := mw.adminModeWebMiddleware(mw.mux)
-	for _, p := range []string{"/robots.txt", "/dashboard", "/manifest.webmanifest/x", "/icon-1024.png"} {
+	for _, p := range []string{"/scion-notification-icon.png", "/robots.txt", "/dashboard", "/manifest.webmanifest/x", "/icon-1024.png"} {
 		req := httptest.NewRequest(http.MethodGet, p, nil)
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
@@ -142,23 +143,29 @@ func appIconsBlock(t *testing.T, html string) string {
 	return strings.Join(strings.Fields(block), " ")
 }
 
-// TestSPAShellAppIconTags keeps the icon, manifest and theme-color tags in
-// the production shell identical to web/index.html, and every linked file
-// on the admin-mode allowlist.
+// TestSPAShellAppIconTags keeps the default unbranded icon, manifest and
+// theme-color tags rendered by the production shell identical to
+// web/index.html, and every linked file on the admin-mode allowlist.
 func TestSPAShellAppIconTags(t *testing.T) {
 	indexHTML, err := os.ReadFile("../../web/index.html")
 	require.NoError(t, err)
 
-	shellBlock := appIconsBlock(t, spaShellTemplate)
-	assert.Equal(t, shellBlock, appIconsBlock(t, string(indexHTML)),
-		"app icon tags must match between pkg/hub/web.go and web/index.html")
+	wantBlock := appIconsBlock(t, string(indexHTML))
+	rendered := renderSPAShell(t)
+	// html/template strips HTML comments, so extract the exact rendered region
+	// between </title> and the Google Fonts preconnect link and assert strict
+	// equality rather than substring containment.
+	renderedRegion := strings.TrimPrefix(extractBetween(t, rendered, "</title>", `<link rel="preconnect"`), "</title>")
+	renderedBlock := strings.Join(strings.Fields(renderedRegion), " ")
+	assert.Equal(t, wantBlock, renderedBlock,
+		"default unbranded app icon tags rendered by pkg/hub/web.go must match web/index.html exactly")
 
 	for _, tag := range []string{`rel="icon"`, `rel="apple-touch-icon"`, `rel="manifest"`, `name="theme-color"`} {
-		assert.Contains(t, shellBlock, tag)
+		assert.Contains(t, renderedBlock, tag)
 	}
-	for _, m := range appIconHrefRE.FindAllStringSubmatch(shellBlock, -1) {
+	for _, m := range appIconHrefRE.FindAllStringSubmatch(renderedBlock, -1) {
 		assert.True(t, isAppIconPath(m[1]), "%s not in appIconPaths", m[1])
 	}
 
-	assert.Contains(t, renderSPAShell(t), `<link rel="manifest" href="/manifest.webmanifest" />`)
+	assert.Contains(t, rendered, `<link rel="manifest" href="/manifest.webmanifest" />`)
 }

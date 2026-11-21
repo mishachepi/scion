@@ -110,9 +110,10 @@ first sign-in from the hub's configured policy.
 Running the command again with the same details is safe: it reports that
 the user is already pre-registered.
 
-Requires the user.invite permission (hub admins hold it) and an interactive
-sign-in (scion hub auth login); it is not available on a hub running with
-dev auth.
+Requires the user.invite permission (hub admins hold it), with an interactive
+sign-in (scion hub auth login) or, where no interactive login is stored, a
+hub-boundary user access token carrying user:invite (SCION_HUB_TOKEN); it is
+not available on a hub running with dev auth.
 
 Examples:
   scion hub users provision alice@example.com
@@ -226,6 +227,9 @@ type hubUsersInviteOptions struct {
 	Note     string
 	Projects []string
 	JSON     bool
+	// UAT reports that the client sends a user access token
+	// (authSourceIsUserAccessToken), for the --project lookups.
+	UAT bool
 }
 
 // inviteProjectSpec is one parsed --project flag.
@@ -235,13 +239,14 @@ type inviteProjectSpec struct {
 }
 
 func runHubUsersInvite(cmd *cobra.Command, args []string) error {
-	_, client, err := loadHubClient()
+	_, client, uat, err := loadHubClientUAT()
 	if err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(cmd.Context(), 90*time.Second)
 	defer cancel()
 	return inviteHubUsers(ctx, cmd.OutOrStdout(), client, hubUsersInviteOptions{
+		UAT:      uat,
 		Args:     args,
 		File:     hubUsersInviteFile,
 		Stdin:    cmd.InOrStdin(),
@@ -377,7 +382,7 @@ func inviteHubUsers(ctx context.Context, out io.Writer, client hubclient.Client,
 		if err != nil {
 			return err
 		}
-		project, err := resolveProjectNameOrID(ctx, client, spec.Arg)
+		project, err := resolveProjectNameOrID(ctx, client, spec.Arg, opts.UAT)
 		if err != nil {
 			return fmt.Errorf("project %s: %w", spec.Arg, err)
 		}

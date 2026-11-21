@@ -241,7 +241,7 @@ func classesInclude(classes []permissions.TargetClassKind, want ...permissions.T
 type targetFacts struct {
 	hasProjectParent bool
 	hasSystemParent  bool
-	hasGlobalScope   bool // explicit global/core/user ScopeKind, reviewed types only
+	hasGlobalScope   bool // explicit global/user ScopeKind, reviewed types only
 	hasProjectScope  bool // explicit "project" ScopeKind, reviewed types only
 }
 
@@ -303,7 +303,7 @@ func computeTargetFacts(effectiveType string, r Resource) (targetFacts, bool) {
 	}
 	if hasScopeKindSemantics {
 		switch r.ScopeKind {
-		case store.SkillScopeGlobal, store.SkillScopeCore, store.SkillScopeUser:
+		case store.SkillScopeGlobal, store.SkillScopeUser:
 			facts.hasGlobalScope = true
 		case store.SkillScopeProject:
 			facts.hasProjectScope = true
@@ -335,7 +335,7 @@ func isReviewedScopeKindResourceType(resourceType string) bool {
 // contradiction; any other unrecognized value is.
 func isRecognizedScopeKindValue(scopeKind string) bool {
 	switch scopeKind {
-	case "", store.SkillScopeProject, store.SkillScopeGlobal, store.SkillScopeCore, store.SkillScopeUser:
+	case "", store.SkillScopeProject, store.SkillScopeGlobal, store.SkillScopeUser:
 		return true
 	default:
 		return false
@@ -869,7 +869,7 @@ type ProjectTargetClass struct {
 // ContemplatedProjectClass returns the definite project-scoped
 // ProjectTargetClass for permissionID, for use where a real project ID is
 // known but no real target instance exists yet (Project-boundary mint, and
-// SystemAuthorityProof's caller in general) — never global/core for the
+// SystemAuthorityProof's caller in general) — never global for the
 // scope-kind-split types (skill/template/harness_config), empty ScopeKind
 // for every other resource type.
 func ContemplatedProjectClass(permissionID string) ProjectTargetClass {
@@ -1089,6 +1089,24 @@ func (a *AuthzService) activeSystemScopeCandidates(ctx context.Context, principa
 // uncached body, split out so the cache wrapper above never duplicates
 // this logic.
 func (a *AuthzService) loadActiveSystemScopeCandidates(ctx context.Context, principal PrincipalContext) ([]CandidateBinding, map[string]*RolePermissions, []store.PrincipalRef, error) {
+	refs, systemBindings, roleDefs, err := a.loadScopedActiveBindings(ctx, principal, time.Now(), func(b *store.RoleBinding) bool {
+		return b.ScopeType == ScopeTypeSystem
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return toCandidateBindings(systemBindings), roleDefs, refs, nil
+}
+
+// loadScopedActiveBindings resolves principal's group-expanded closure, loads
+// clamped role bindings in one batch, filters to active bindings matching
+// includeScope at evalTime, and batch-loads their role definitions.
+func (a *AuthzService) loadScopedActiveBindings(
+	ctx context.Context,
+	principal PrincipalContext,
+	evalTime time.Time,
+	includeScope func(*store.RoleBinding) bool,
+) ([]store.PrincipalRef, []*store.RoleBinding, map[string]*RolePermissions, error) {
 	refs, _, _, err := a.principalClosure(ctx, principal)
 	if err != nil {
 		return nil, nil, nil, projectAccessLookupFault(fmt.Errorf("%w: %v", ErrProjectAccessDenied, err))
@@ -1097,23 +1115,21 @@ func (a *AuthzService) loadActiveSystemScopeCandidates(ctx context.Context, prin
 	if err != nil {
 		return nil, nil, nil, projectAccessLookupFault(fmt.Errorf("%w: binding resolution failed: %v", ErrProjectAccessDenied, err))
 	}
-	now := time.Now()
-	var systemBindings []*store.RoleBinding
+	var active []*store.RoleBinding
 	for _, b := range bindings {
-		if b.ScopeType != ScopeTypeSystem {
+		if b == nil || !includeScope(b) {
 			continue
 		}
-		if !bindingActivationOK(b, now) {
+		if !bindingActivationOK(b, evalTime) {
 			continue
 		}
-		systemBindings = append(systemBindings, b)
+		active = append(active, b)
 	}
-	roleDefs, err := a.loadRoleDefinitions(ctx, collectRoleDefinitionIDs(systemBindings))
+	roleDefs, err := a.loadRoleDefinitions(ctx, collectRoleDefinitionIDs(active))
 	if err != nil {
 		return nil, nil, nil, projectAccessLookupFault(fmt.Errorf("%w: role resolution failed: %v", ErrProjectAccessDenied, err))
 	}
-	candidates := toCandidateBindings(systemBindings)
-	return candidates, roleDefs, refs, nil
+	return refs, active, roleDefs, nil
 }
 
 func candidateSetHasPermission(candidates []CandidateBinding, roleDefs map[string]*RolePermissions, permissionID string) bool {
@@ -1606,7 +1622,21 @@ const (
 	MintDenialBoundaryNotAllowed      MintDenialReason = "boundary_not_allowed"
 	MintDenialFlatRoleInsufficient    MintDenialReason = "flat_role_insufficient"
 	MintDenialNoRelationshipCandidacy MintDenialReason = "no_relationship_candidacy"
+	// MintDenialAuthorityRequired is the hub-boundary denial: the principal
+	// holds the permission through no system grant, no project binding and
+	// no relationship candidacy with relevant project admission.
+	MintDenialAuthorityRequired MintDenialReason = "authority_required"
 )
+
+// uniformMintRefusal reports whether a CanMintSelector denial is answered with
+// the uniform, detail-free 403: a project boundary whose project admission
+// failed (MintDenialProjectAccessRequired), so a non-member and a nonexistent
+// project get the same answer. A hub boundary names no project, so every hub
+// denial is answered per selector: a scope_violation naming the selector and
+// its reason. Token mint and agent delegation issuance both use it.
+func uniformMintRefusal(boundary TokenBoundary, reason MintDenialReason) bool {
+	return boundary.Kind == BoundaryKindProject && reason == MintDenialProjectAccessRequired
+}
 
 // SelectorEligibility is one selector's result within a CanMintSelector call.
 type SelectorEligibility struct {
@@ -1671,9 +1701,10 @@ var ErrEmptySelectorList = errors.New("no selectors requested")
 // boundary even with no system role and no blanket project permission grant.
 //
 // Any failure sets MintDenialProjectAccessRequired for Project-boundary
-// admission, or the specific MintEligibilityRegistry-derived reason
-// otherwise — no oracle distinguishing "no membership" from "wrong
-// permission" for the admission gate itself.
+// admission, MintDenialAuthorityRequired for a Hub-boundary permission the
+// principal cannot select, or the specific MintEligibilityRegistry-derived
+// reason otherwise. The project admission gate gives the same reason for
+// "no membership" and "wrong permission".
 func (a *AuthzService) CanMintSelector(ctx context.Context, principal PrincipalContext, boundary TokenBoundary, selectors []string) ([]SelectorEligibility, error) {
 	if err := requireLocalUserPrincipal(principal); err != nil {
 		return nil, err
@@ -1776,6 +1807,7 @@ func (a *AuthzService) selectorAdmitted(ctx context.Context, principal Principal
 // selector's expansion via hubPermissionEligible, combining admission and
 // mint eligibility into one per-permission decision (the flat/system path
 // and the relationship path are genuine alternatives — see CanMintSelector).
+// A hub boundary names no project, so a denial is MintDenialAuthorityRequired.
 func (a *AuthzService) hubSelectorEligible(ctx context.Context, principal PrincipalContext, permIDs []string) (bool, MintDenialReason, error) {
 	for _, permID := range permIDs {
 		ok, err := a.hubPermissionEligible(ctx, principal, permID)
@@ -1783,7 +1815,7 @@ func (a *AuthzService) hubSelectorEligible(ctx context.Context, principal Princi
 			return false, MintDenialNone, err
 		}
 		if !ok {
-			return false, MintDenialProjectAccessRequired, nil
+			return false, MintDenialAuthorityRequired, nil
 		}
 	}
 	return true, MintDenialNone, nil

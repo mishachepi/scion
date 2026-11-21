@@ -35,6 +35,14 @@ import (
 // grandchild whose exit code is otherwise invisible to the supervisor).
 const HarnessExitCodeFile = "/tmp/scion-harness-exit-code"
 
+// HarnessTailFile is the container-local path where the tmux agent-window
+// wrapper saves the last lines of the harness pane once the harness exits,
+// before it writes HarnessExitCodeFile. `sciontool init` appends the last
+// non-empty lines to the crash reason ("Agent crashed with exit code N:
+// <tail>"), so a reader that waits on the exit-code file also sees the
+// tail. Like HarnessExitCodeFile it is a shared runtime/init contract.
+const HarnessTailFile = "/tmp/scion-harness-tail"
+
 // HarnessInitRunFile is the container-local path where `sciontool init`
 // records the current init run, written at the start of each run before the
 // tmux session is created. Line 1 is "nonce=HEX mode=hook" or
@@ -100,6 +108,16 @@ const (
 // ready spec from the broker to `sciontool init`, in the JSON form written by
 // FormatReadySpecEnv.
 const HarnessReadyEnv = "SCION_HARNESS_READY"
+
+// LivenessHarnessRootDepthEnv names the environment variable a harness
+// config sets (in its env map) when the harness's TUI is not the direct
+// child of the agent window's wrapper: it is how many process levels below
+// the wrapper the liveness sampler treats as the harness itself (default 1).
+// Codex sets 2: its npm launcher (node bin/codex.js) spawns the native TUI
+// as a child. It travels in the existing env map, not a new config.yaml
+// key, so the bundled config still validates on older binaries
+// (ptone/scion#5196).
+const LivenessHarnessRootDepthEnv = "SCION_LIVENESS_HARNESS_ROOT_DEPTH"
 
 // DefaultReadySpec returns the ready spec used for strategy when no value is
 // configured: the readiness constants above. An unknown strategy gets the
@@ -460,6 +478,21 @@ const (
 	ActivityStalled         Activity = "stalled"
 	ActivityOffline         Activity = "offline"
 	ActivityCrashed         Activity = "crashed"
+
+	// ActivityIdle is agent-reported only (`sciontool status idle`): the
+	// agent has no known future action until new work arrives, for example
+	// between assignments or after answering a message when no task was
+	// assigned. Unlike blocked it waits on no specific event. The platform
+	// never infers it.
+	ActivityIdle Activity = "idle"
+
+	// ActivityHarnessError means the harness process is alive at its prompt
+	// but reported that a model, API or auth error ended its turn. The
+	// reason is in Detail.Message. It is sticky and is cleared by the next
+	// turn-progress hook (a new message makes the harness retry). Only
+	// sciontool sets it, from a harness signal; a dead harness is
+	// PhaseError instead. Displayed as "harness error".
+	ActivityHarnessError Activity = "harness_error"
 )
 
 // ExitReason describes why an agent process terminated. Unlike Activity
@@ -554,11 +587,13 @@ var allActivities = []Activity{
 	ActivityExecuting,
 	ActivityWaitingForInput,
 	ActivityBlocked,
+	ActivityIdle,
 	ActivityCompleted,
 	ActivityLimitsExceeded,
 	ActivityStalled,
 	ActivityOffline,
 	ActivityCrashed,
+	ActivityHarnessError,
 }
 
 // Activities returns a copy of all valid Activity values.
@@ -595,13 +630,67 @@ func (a Activity) Validate() error {
 
 // IsSticky reports whether this activity resists being overwritten by normal
 // event-driven updates. Sticky activities are only cleared by "new work" events
-// (prompt-submit, agent-start, session-start).
+// (prompt-submit, agent-start, session-start); harness_error is also cleared
+// by any other turn-progress event (model-start, tool-start).
 func (a Activity) IsSticky() bool {
 	switch a {
-	case ActivityWaitingForInput, ActivityBlocked, ActivityCompleted, ActivityLimitsExceeded, ActivityCrashed:
+	case ActivityWaitingForInput, ActivityBlocked, ActivityIdle, ActivityCompleted, ActivityLimitsExceeded, ActivityCrashed,
+		ActivityHarnessError:
 		return true
 	}
 	return false
+}
+
+// IsSuspendEligible reports whether an agent holding this activity may be
+// auto-suspended by the hub's idle policy once the grace period has passed.
+// It is the only list of suspend-eligible activities: blocked and
+// waiting_for_input wait on a specific event and are never eligible.
+// harness_error is eligible because an idle-suspended agent auto-wakes on
+// new work so a message still makes the harness retry.
+func (a Activity) IsSuspendEligible() bool {
+	switch a {
+	case ActivityIdle, ActivityCompleted, ActivityHarnessError:
+		return true
+	}
+	return false
+}
+
+// SuspendEligibleActivities returns the string values of all Activity
+// constants for which IsSuspendEligible reports true.
+func SuspendEligibleActivities() []string {
+	var out []string
+	for _, a := range allActivities {
+		if a.IsSuspendEligible() {
+			out = append(out, string(a))
+		}
+	}
+	return out
+}
+
+// IsRetainedOnSuspend reports whether this activity survives a transition to
+// PhaseSuspended so that operators can tell what state the agent was in when
+// suspended. All other activities are cleared on suspend. Comparison is
+// case-insensitive.
+func (a Activity) IsRetainedOnSuspend() bool {
+	switch Activity(strings.ToLower(string(a))) {
+	case ActivityIdle, ActivityCompleted, ActivityHarnessError:
+		return true
+	}
+	return false
+}
+
+// RetainedSuspendActivity returns the canonical lowercase activity to preserve
+// on transition to PhaseSuspended, or "" when the activity should be cleared.
+// For a stalled agent, the candidate is stalledFrom rather than stalled itself.
+func RetainedSuspendActivity(activity, stalledFrom Activity) Activity {
+	candidate := Activity(strings.ToLower(string(activity)))
+	if candidate == ActivityStalled {
+		candidate = Activity(strings.ToLower(string(stalledFrom)))
+	}
+	if candidate.IsRetainedOnSuspend() {
+		return candidate
+	}
+	return ""
 }
 
 // IsTerminal reports whether this activity represents a terminal outcome that
@@ -621,7 +710,7 @@ func (a Activity) IsTerminal() bool {
 func (a Activity) ImpliesRunning() bool {
 	switch a {
 	case ActivityWorking, ActivityThinking, ActivityExecuting,
-		ActivityWaitingForInput, ActivityBlocked, ActivityCompleted:
+		ActivityWaitingForInput, ActivityBlocked, ActivityIdle, ActivityCompleted, ActivityHarnessError:
 		return true
 	}
 	return false
@@ -664,12 +753,16 @@ func (s AgentState) AcceptsInput() bool {
 }
 
 // DisplayLabel returns the user-facing label for an activity. It differs
-// from the raw value only for initializing, which is shown as "starting".
-// Use it in display code keyed on activity; the legacy Status string comes
-// from DisplayStatus instead.
+// from the raw value only for initializing, which is shown as "starting",
+// and harness_error, which is shown as "harness error". Use it in display
+// code keyed on activity; the legacy Status string comes from DisplayStatus
+// instead.
 func (a Activity) DisplayLabel() string {
-	if a == ActivityInitializing {
+	switch a {
+	case ActivityInitializing:
 		return "starting"
+	case ActivityHarnessError:
+		return "harness error"
 	}
 	return string(a)
 }
@@ -694,9 +787,29 @@ func (s AgentState) DisplayStatus() string {
 	return string(s.Phase)
 }
 
+// StalledNoHookActivityHint is the status message set by the Hub stall
+// detector when an agent stalls without having reported any harness hook
+// event since start (ptone/scion#4556).
+// Keep in sync with STALLED_NO_HOOK_ACTIVITY_HINT in web/src/shared/agent-state-display.ts.
+const StalledNoHookActivityHint = "no harness activity since start; check harness credentials/task"
+
+// IsPreHookStartupMessage reports whether msg is one of the startup status
+// messages emitted by sciontool init or its readiness watcher before any
+// harness hook event has been observed.
+func IsPreHookStartupMessage(msg string) bool {
+	switch msg {
+	case "Agent started",
+		"Harness started",
+		"Harness readiness not confirmed by deadline; assuming ready":
+		return true
+	default:
+		return false
+	}
+}
+
 // Validate checks cross-field constraints on the agent state.
-// Activity is only meaningful when phase is running; setting an activity
-// with a non-running phase is invalid.
+// Activity is meaningful when phase is running, when phase is stopped with a
+// terminal activity, or when phase is suspended with a retained activity.
 func (s AgentState) Validate() error {
 	if err := s.Phase.Validate(); err != nil {
 		return err
@@ -705,7 +818,9 @@ func (s AgentState) Validate() error {
 		return err
 	}
 	if s.Activity != "" && s.Phase != PhaseRunning {
-		if s.Phase != PhaseStopped || !s.Activity.IsTerminal() {
+		validStopped := s.Phase == PhaseStopped && s.Activity.IsTerminal()
+		validSuspended := s.Phase == PhaseSuspended && s.Activity.IsRetainedOnSuspend()
+		if !validStopped && !validSuspended {
 			return fmt.Errorf("activity %q is not valid when phase is %q (must be %q)", s.Activity, s.Phase, PhaseRunning)
 		}
 	}

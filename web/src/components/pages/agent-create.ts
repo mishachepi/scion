@@ -48,6 +48,7 @@ interface HarnessConfigEntry {
 
 import { isAgentLaunching, isIncompleteCreate, isSharedWorkspace } from '../../shared/types.js';
 import { isTargetKubernetesOnly } from '../../shared/runtime-kind.js';
+import { isFlatBroker, runtimeTargetLabel } from '../../shared/runtime-target.js';
 import { KNOWN_HARNESS_NAMES, harnessDisplayName } from '../../shared/harness-utils.js';
 import { AGENT_CREATE_TRIGGERS, defaultTriggersHint } from '../../shared/notification-triggers.js';
 import {
@@ -60,7 +61,13 @@ import { GcpIdentityState } from '../../shared/gcp-identity-state.js';
 import { assignStatusTarget } from '../../shared/gcp-sa-assign-status.js';
 import { GCPServiceAccountsLoader } from '../../client/gcp-sa-accounts-loader.js';
 import { apiFetch, apiFetchAllPages, parseApiError } from '../../client/api.js';
+import { showPendingSecretsStartHint } from '../../client/pending-secrets.js';
 import { getPublicSettings } from '../../client/server-feature-flags.js';
+import {
+  FEATURE_FLAGS_CHANGED_EVENT,
+  FLAT_BROKERS_FLAG,
+  isFeatureEnabled,
+} from '../../utils/feature-flags.js';
 import { navigateTo } from '../../client/navigation.js';
 import { showToast } from '../../utils/toast.js';
 import { showResponseWarnings, showResponseBodyWarnings } from '../../client/response-warnings.js';
@@ -124,11 +131,24 @@ export class ScionPageAgentCreate extends LitElement {
   /** Cached project settings keyed by projectId */
   private projectSettingsCache: Map<string, ProjectCreateDefaults> = new Map();
 
-  /** Profiles available on the currently selected broker */
+  /** The currently selected Runtime Broker, if any. */
+  private get selectedBroker(): RuntimeBroker | undefined {
+    if (!this.brokerId) return undefined;
+    return this.brokers.find((b) => b.id === this.brokerId);
+  }
+
+  /** Effective runtime profile for the selected broker (flat brokers never take a profile). */
+  private get effectiveProfile(): string {
+    const broker = this.selectedBroker;
+    if (broker && isFlatBroker(broker)) return '';
+    return this.profile;
+  }
+
+  /** Profiles available on the currently selected legacy broker (empty for flat brokers). */
   private get selectedBrokerProfiles(): import('../../shared/types.js').BrokerProfile[] {
-    if (!this.brokerId) return [];
-    const broker = this.brokers.find((b) => b.id === this.brokerId);
-    return broker?.profiles?.filter((p) => p.available) ?? [];
+    const broker = this.selectedBroker;
+    if (!broker || isFlatBroker(broker)) return [];
+    return broker.profiles?.filter((p) => p.available) ?? [];
   }
 
   /**
@@ -140,9 +160,7 @@ export class ScionPageAgentCreate extends LitElement {
    * profiles mix runtime types, this is false.
    */
   private get targetRuntimeIsKubernetesOnly(): boolean {
-    if (!this.brokerId) return false;
-    const broker = this.brokers.find((b) => b.id === this.brokerId);
-    return isTargetKubernetesOnly(broker, this.profile);
+    return isTargetKubernetesOnly(this.selectedBroker, this.effectiveProfile);
   }
 
   /** The currently selected project */
@@ -163,11 +181,41 @@ export class ScionPageAgentCreate extends LitElement {
 
   /** Inherited values for the form's unset fields, from what this page fetched. */
   private get placeholders(): Record<string, AgentConfigPlaceholder> {
+    const broker = this.selectedBroker;
     return resolveInheritedPlaceholders({
       template: this.selectedTemplate,
       projectSettings: this.projectSettings,
       hubSettings: this.hubSettings,
+      broker: broker
+        ? { id: broker.id, name: broker.name || broker.id, flat: isFlatBroker(broker) }
+        : null,
+      profile: this.effectiveProfile,
+      flatBrokersEnabled: isFeatureEnabled(FLAT_BROKERS_FLAG),
+      gcpServiceAccounts: this.gcp.gcpServiceAccounts,
     });
+  }
+
+  private unsubscribeGcp: (() => void) | null = null;
+
+  private readonly boundOnFeatureFlagsChanged = (): void => {
+    this.syncGcpTarget();
+    this.requestUpdate();
+  };
+
+  private syncGcpTarget(): void {
+    const broker = this.selectedBroker;
+    const flat = !!broker && isFlatBroker(broker);
+    this.gcp.setTarget(
+      this.targetRuntimeIsKubernetesOnly,
+      this.effectiveProfile,
+      flat
+        ? {
+            brokerId: broker.id,
+            brokerLabel: broker.name || broker.id,
+            flatBrokersEnabled: isFeatureEnabled(FLAT_BROKERS_FLAG),
+          }
+        : null
+    );
   }
 
   private get form(): ScionAgentConfigForm | null {
@@ -378,7 +426,10 @@ export class ScionPageAgentCreate extends LitElement {
   override connectedCallback(): void {
     super.connectedCallback();
 
+    this.unsubscribeGcp = this.gcp.subscribe(() => this.requestUpdate());
+
     if (typeof window !== 'undefined') {
+      window.addEventListener(FEATURE_FLAGS_CHANGED_EVENT, this.boundOnFeatureFlagsChanged);
       const params = new URLSearchParams(window.location.search);
 
       const projectParam = params.get('projectId');
@@ -395,18 +446,28 @@ export class ScionPageAgentCreate extends LitElement {
     void this.loadFormData();
   }
 
+  override disconnectedCallback(): void {
+    super.disconnectedCallback();
+    this.unsubscribeGcp?.();
+    this.unsubscribeGcp = null;
+    if (typeof window !== 'undefined') {
+      window.removeEventListener(FEATURE_FLAGS_CHANGED_EVENT, this.boundOnFeatureFlagsChanged);
+    }
+  }
+
   override willUpdate(changedProperties: Map<string, unknown>): void {
     super.willUpdate(changedProperties);
     // Hand the GCP identity state the current target whenever the
     // broker/profile selection or the broker list changes: its hint
-    // describes Block on a Kubernetes target. Whether an explicit identity
-    // is sent is gated separately by gcpIdentityUserSet.
+    // describes Block on a Kubernetes target and per-broker defaults on flat
+    // Runtime Brokers. Whether an explicit identity is sent is gated
+    // separately by gcpIdentityUserSet.
     if (
       changedProperties.has('brokerId') ||
       changedProperties.has('profile') ||
       changedProperties.has('brokers')
     ) {
-      this.gcp.setTarget(this.targetRuntimeIsKubernetesOnly, this.profile);
+      this.syncGcpTarget();
       // The accounts' mapping state is for one target: ask again when it
       // changes (ptone/scion#4391). Not before the first load has started.
       void this.gcpAccounts.targetChanged();
@@ -638,6 +699,11 @@ export class ScionPageAgentCreate extends LitElement {
   }
 
   private autoSelectProfile(): void {
+    const broker = this.selectedBroker;
+    if (!broker || isFlatBroker(broker)) {
+      this.profile = '';
+      return;
+    }
     const profiles = this.selectedBrokerProfiles;
     if (profiles.length === 1) {
       this.profile = profiles[0].name;
@@ -706,7 +772,7 @@ export class ScionPageAgentCreate extends LitElement {
   private readonly gcpAccounts = new GCPServiceAccountsLoader({
     projectId: () => this.projectId,
     target: () =>
-      assignStatusTarget(this.targetRuntimeIsKubernetesOnly, this.brokerId, this.profile),
+      assignStatusTarget(this.targetRuntimeIsKubernetesOnly, this.brokerId, this.effectiveProfile),
     accounts: () => this.gcp.gcpServiceAccounts,
     setAccounts: (accounts) => this.gcp.setAccounts(accounts),
   });
@@ -811,8 +877,8 @@ export class ScionPageAgentCreate extends LitElement {
 
     // The submit-time guards read the live target, even if no update has
     // handed it to the identity state yet.
-    this.gcp.targetKubernetesOnly = this.targetRuntimeIsKubernetesOnly;
-    this.gcp.profile = this.profile;
+    const profile = this.effectiveProfile;
+    this.syncGcpTarget();
 
     // The form's validation includes the GCP identity rules. The form is
     // rendered once the page has loaded; the identity state is checked
@@ -834,8 +900,8 @@ export class ScionPageAgentCreate extends LitElement {
         projectId: this.projectId,
         notify: this.notify,
         // Take the hub's async launch path when it has it on (the
-        // hub.async_agent_launch experiment); a hub with it off ignores this
-        // and answers synchronously as before.
+        // hub.async_agent_launch experiment, on by default); a hub with it
+        // off ignores this and answers synchronously.
         acceptAsyncLaunch: true,
       };
 
@@ -843,7 +909,7 @@ export class ScionPageAgentCreate extends LitElement {
       // Only a picked harness config; unset, the hub applies its own order.
       if (this.resolvedHarness) body.harnessConfig = this.resolvedHarness;
       if (this.brokerId) body.runtimeBrokerId = this.brokerId;
-      if (this.profile) body.profile = this.profile;
+      if (profile) body.profile = profile;
       if (this.task.trim()) body.task = this.task.trim();
 
       // Additional Options: only what the user set. Everything else
@@ -903,6 +969,10 @@ export class ScionPageAgentCreate extends LitElement {
       const startedPhases = ['running', 'provisioning', 'cloning', 'starting'];
       const alreadyStarted = agent?.phase ? startedPhases.includes(agent.phase) : false;
       const hubLaunch = !!agent && (isAgentLaunching(agent) || isIncompleteCreate(agent));
+      // The pending secrets hint follows a create that started the agent or
+      // whose launch the hub is running, and a successful explicit start;
+      // not an incomplete create or a failed start.
+      let started = alreadyStarted || (!!agent && isAgentLaunching(agent));
       if (!alreadyStarted && !hubLaunch) {
         // The agent exists, so a failed start, including a rejected fetch,
         // is reported and its page still opens, where the user can start
@@ -919,6 +989,7 @@ export class ScionPageAgentCreate extends LitElement {
             startError = (await parseApiError(startResp, fallback)).message;
           } else {
             await showResponseBodyWarnings(startResp, shownWarnings);
+            started = true;
           }
         } catch (startErr) {
           startError =
@@ -929,6 +1000,7 @@ export class ScionPageAgentCreate extends LitElement {
           showToast(`Agent was created but did not start: ${startError}`, 'danger');
         }
       }
+      if (started) void showPendingSecretsStartHint();
 
       // Navigate to agent detail page
       navigateTo(`/agents/${agentId}`);
@@ -1195,18 +1267,22 @@ export class ScionPageAgentCreate extends LitElement {
             this.autoSelectProfile();
           }}
         >
-          ${this.brokers.map(
-            (b) =>
-              html`<sl-option value=${b.id} ?disabled=${b.status === 'offline'}>
-                ${b.name} (${b.status})
-              </sl-option>`
-          )}
+          ${this.brokers.map((b) => {
+            const target = isFlatBroker(b) ? runtimeTargetLabel(b) : '';
+            const label = target
+              ? `${b.name} — ${target} (${b.status})`
+              : `${b.name} (${b.status})`;
+            return html`<sl-option value=${b.id} ?disabled=${b.status === 'offline'}>
+              ${label}
+            </sl-option>`;
+          })}
         </sl-select>
         <div class="hint">The compute node that will run this agent.</div>
       </div>
 
-      <!-- Runtime Profile (conditional: broker has profiles) -->
-      ${this.selectedBrokerProfiles.length > 0
+      <!-- Runtime Profile (conditional: legacy broker with profiles) -->
+      ${(!this.selectedBroker || !isFlatBroker(this.selectedBroker)) &&
+      this.selectedBrokerProfiles.length > 0
         ? html`
             <div class="form-field">
               <label for="profile">Runtime Profile</label>

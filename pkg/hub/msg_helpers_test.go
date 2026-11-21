@@ -26,9 +26,12 @@ import (
 var effectCallSiteClassifications = []effectCallSiteEntry{
 	// ---- dispatchWithBrokerRetry ----
 
-	// broker_routing.go: the primitive itself — calls DispatchAgentMessage
-	// in its retry loop. This is the wrapper, not a call site.
-	{file: "broker_routing.go", function: "dispatchWithBrokerRetry", symbol: "DispatchAgentMessage",
+	// broker_routing.go: dispatchMarkedAgentMessage is the single choke point
+	// calling MarkAgentDelivery and DispatchAgentMessage; dispatchWithBrokerRetry
+	// wraps it with transient broker retries. Both are primitives, not call sites.
+	{file: "broker_routing.go", function: "dispatchMarkedAgentMessage", symbol: "DispatchAgentMessage",
+		class: "exempt", reason: "primitive wrapper: single message-dispatch choke point calling MarkAgentDelivery then DispatchAgentMessage"},
+	{file: "broker_routing.go", function: "dispatchWithBrokerRetry", symbol: "dispatchMarkedAgentMessage",
 		class: "exempt", reason: "primitive wrapper: the retry loop implementation itself"},
 
 	// handlers_agent_messaging.go: handleAgentMessage — guarded by routers
@@ -42,6 +45,20 @@ var effectCallSiteClassifications = []effectCallSiteEntry{
 	{file: "agent_dm_operation.go", function: "ExecuteAgentDM", symbol: "dispatchWithBrokerRetry",
 		class: "guarded", reason: "authorizeAgentMessage called inside ExecuteAgentDM before persistence/dispatch/observer (#1688)"},
 
+	// agent_dm_operation.go: agentDMAutoWakeItem — the dispatch of a mention
+	// queued behind a background auto-wake (ptone/scion#7826). It is built
+	// only inside ExecuteAgentDM, after authorizeAgentMessage admitted the
+	// send and the row was persisted.
+	{file: "agent_dm_operation.go", function: "agentDMAutoWakeItem", symbol: "dispatchWithBrokerRetry",
+		class: "guarded", reason: "built only inside ExecuteAgentDM after authorizeAgentMessage admitted the send (ptone/scion#7826)"},
+
+	// auto_wake.go: chatSecondaryAutoWakeItemWithLog — the dispatch of a
+	// mention secondary's copy queued behind a background auto-wake. It is
+	// built only in sendAgentRouted's secondary loop and processMentions,
+	// after each secondary's authorizeAgentMessage.
+	{file: "auto_wake.go", function: "chatSecondaryAutoWakeItemWithLog", symbol: "dispatchWithBrokerRetry",
+		class: "guarded", reason: "built only in sendAgentRouted / processMentions after the secondary's authorizeAgentMessage (ptone/scion#7826)"},
+
 	// handlers_agent_messaging.go: handleGroupMessage — guarded at :1286.
 	{file: "handlers_agent_messaging.go", function: "handleGroupMessage", symbol: "dispatchWithBrokerRetry",
 		class: "guarded", reason: "authorizeAgentMessage at handlers_agent_messaging.go:1286"},
@@ -51,9 +68,23 @@ var effectCallSiteClassifications = []effectCallSiteEntry{
 	{file: "handlers_agent_messaging.go", function: "broadcastDirect", symbol: "dispatchWithBrokerRetry",
 		class: "guarded", reason: "authorizeAgentMessage per-recipient at handlers_agent_messaging.go:1644"},
 
+	// decisions_answer.go: dispatchDecisionResponse — shared delivery helper
+	// for single answer (handleDecisionAnswer), set/batch answer
+	// (handleDecisionSetAnswer), and dismiss (handleDecisionPromptDismiss).
+	// Every caller calls authorizeAgentMessage on the asker before recording
+	// and before delivery (and confirm-only answers are never delivered).
+	{file: "decisions_answer.go", function: "dispatchDecisionResponse", symbol: "dispatchWithBrokerRetry",
+		class: "guarded", reason: "authorizeAgentMessage in handleDecisionAnswer / handleDecisionSetAnswer / handleDecisionPromptDismiss before recording and delivery"},
+
+	// decisions_answer.go: decisionResponseAutoWakeItem — background auto-wake
+	// delivery built only inside dispatchDecisionResponse after the caller's
+	// authorizeAgentMessage admitted delivery (ptone/scion#8517).
+	{file: "decisions_answer.go", function: "decisionResponseAutoWakeItem", symbol: "dispatchWithBrokerRetry",
+		class: "guarded", reason: "built only inside dispatchDecisionResponse after authorizeAgentMessage admitted delivery (ptone/scion#8517)"},
+
 	// handlers_agent_messaging.go: publishBroadcastDeliveryFailed — derivative
 	// notice back to the original sender agent.
-	{file: "handlers_agent_messaging.go", function: "publishBroadcastDeliveryFailed", symbol: "DispatchAgentMessage",
+	{file: "handlers_agent_messaging.go", function: "publishBroadcastDeliveryFailed", symbol: "dispatchMarkedAgentMessage",
 		class: "exempt", reason: "derivative: delivery-failure notice to original sender, not attacker-chosen target"},
 
 	// handlers_agent_messaging.go: processMentions — guarded at :1852.
@@ -79,15 +110,22 @@ var effectCallSiteClassifications = []effectCallSiteEntry{
 		class: "exempt", reason: "UNGUARDED internal surface (F-RS6-07); no external reach identified; deferred to RS6/AH"},
 
 	// messagebroker.go: publishDeliveryFailed — derivative notice.
-	{file: "messagebroker.go", function: "publishDeliveryFailed", symbol: "DispatchAgentMessage",
+	{file: "messagebroker.go", function: "publishDeliveryFailed", symbol: "dispatchMarkedAgentMessage",
 		class: "exempt", reason: "derivative: delivery-failure notice to original sender"},
 
 	// messagebroker.go: publishDeliveryDeferred — derivative notice (design
 	// agent-reincarnate §3.7, O2 p2a-r1 review). Same shape as
 	// publishDeliveryFailed above: tells the original sender their message
 	// was deferred, not dropped, while the recipient is mid-migration.
-	{file: "messagebroker.go", function: "publishDeliveryDeferred", symbol: "DispatchAgentMessage",
+	{file: "messagebroker.go", function: "publishDeliveryDeferred", symbol: "dispatchMarkedAgentMessage",
 		class: "exempt", reason: "derivative: delivery-deferred notice to original sender"},
+
+	// messagebroker.go: publishDeliveryUnconfirmed — derivative notice
+	// (ptone/scion#7405). Same shape as publishDeliveryFailed above: tells the
+	// original sender their expired pending message may already have been
+	// delivered and to check before resending.
+	{file: "messagebroker.go", function: "publishDeliveryUnconfirmed", symbol: "dispatchMarkedAgentMessage",
+		class: "exempt", reason: "derivative: delivery-unconfirmed notice to original sender"},
 
 	// artifacts_review.go: deliverArtifactReview — derivative notice
 	// (ptone/scion#3229). Sent after the artifact service finalized a review
@@ -102,19 +140,25 @@ var effectCallSiteClassifications = []effectCallSiteEntry{
 	{file: "notifications.go", function: "dispatchToAgent", symbol: "dispatchWithBrokerRetry",
 		class: "exempt", reason: "UNGUARDED notification fan-out (F-RS6-08); subscription-only authz; deferred to RS6/AH"},
 
-	// server.go: messageEventHandler — GUARDED after C1 containment.
-	// authorizeScheduledMessageFire calls authorizeAgentMessage before dispatch.
-	{file: "server.go", function: "messageEventHandler", symbol: "dispatchWithBrokerRetry",
-		class: "guarded", reason: "C1 containment: authorizeScheduledMessageFire before dispatch"},
+	// action_message.go: deliverMessageAction — GUARDED after C1 containment.
+	// messageAction.Authorize calls authorizeMessageFire -> authorizeAgentMessage before dispatch.
+	{file: "action_message.go", function: "deliverMessageAction", symbol: "dispatchWithBrokerRetry",
+		class: "guarded", reason: "C1 containment: authorizeMessageFire before dispatch"},
 
-	// server.go: dispatchAgentEventHandler — guarded at server.go:3103
-	// (authorizeScheduledAgentCreate).
-	{file: "server.go", function: "dispatchAgentEventHandler", symbol: "DispatchAgentCreate",
-		class: "guarded", reason: "authorizeScheduledAgentCreate at server.go fire-time authorization"},
+	// message_hold_redrive.go: dispatchClaimedHeldMessage — GUARDED (ptone/scion#7881, A2-S4).
+	// revalidateClaimedHeldMessage re-evaluates target incarnation, delegation grant,
+	// and authorizeAgentMessage immediately before dispatchClaimedHeldMessage.
+	{file: "message_hold_redrive.go", function: "dispatchClaimedHeldMessage", symbol: "dispatchWithBrokerRetry",
+		class: "guarded", reason: "A2-S4: revalidateClaimedHeldMessage runs authorizeAgentMessage before dispatchClaimedHeldMessage"},
+
+	// agent_create_headless.go: createAgentHeadless — guarded by
+	// dispatchAgentAction.Authorize -> authorizeDispatchAgentFire before Fire.
+	{file: "agent_create_headless.go", function: "createAgentHeadless", symbol: "DispatchAgentCreateWithGather",
+		class: "guarded", reason: "dispatchAgentAction.Authorize runs authorizeDispatchAgentFire before createAgentHeadless"},
 
 	// reconcile.go: deliverMessage — dead code. The seam is assigned but
 	// never invoked in production.
-	{file: "reconcile.go", function: "deliverMessage", symbol: "DispatchAgentMessage",
+	{file: "reconcile.go", function: "deliverMessage", symbol: "dispatchMarkedAgentMessage",
 		class: "exempt", reason: "dead code: seam assigned at server.go but never invoked (F-RS6-18)"},
 
 	// reconcile.go: execDispatchStart — durable-intent replay. Replays

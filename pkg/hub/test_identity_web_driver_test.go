@@ -436,6 +436,11 @@ func TestTIWebIAP_TransportIdentityInvariant(t *testing.T) {
 	}
 	exempt := map[string]string{
 		"seedDevUser": "seeds the config-fixed dev pseudo-user (DevUserID); no request input reaches it",
+		// internal/hubtestutil (scanned through guardScanSubdirs): only test
+		// code may import it (its no_hub_import_test.go).
+		"SystemRoleUserWithPermissions": "test-only fixture seeder (internal/hubtestutil): creates the user a test names in the test's own store; no request input reaches it",
+		"CreateTestUserWithRole":        "test-only fixture seeder (internal/hubtestutil): creates the user a test names in the test's own store; no request input reaches it",
+		"CreateTestUserWithProjectRole": "test-only fixture seeder (internal/hubtestutil): creates the user a test names in the test's own store; no request input reaches it",
 	}
 	// Helpers whose callers carry the check, with every caller listed.
 	helperCallers := map[string][]string{
@@ -454,7 +459,31 @@ func TestTIWebIAP_TransportIdentityInvariant(t *testing.T) {
 		"createPendingUserTx": true, "provisionNewUser": true, "provisionUser": true, "handleTestLogin": true,
 		"seedDevUser": true, "proxyAuthMiddleware": true, "handleOAuthCallback": true,
 		"grantProjectVisitor": true, "linkPendingVisitor": true,
+		// Test-only fixture seeders in the test support package
+		// (internal/hubtestutil, scanned through guardScanSubdirs), not
+		// request-path user creators; exempt above.
+		"SystemRoleUserWithPermissions": true, "CreateTestUserWithRole": true, "CreateTestUserWithProjectRole": true,
 	}, creators, "every function that calls CreateUser, CreateFederatedUser or another checked Create*User method")
+	// The hubtestutil exemptions are keyed by function name, so each name
+	// may occur in the census only in files under internal/hubtestutil/: a
+	// production function that reuses one of them must not inherit the
+	// exemption. The census key is the slash path guardScanEntry gives.
+	for _, name := range []string{"SystemRoleUserWithPermissions", "CreateTestUserWithRole", "CreateTestUserWithProjectRole"} {
+		var files []string
+		for _, recvs := range census {
+			for _, calls := range recvs {
+				for _, c := range calls {
+					if c.fn == name {
+						files = append(files, filepath.ToSlash(fset.Position(c.pos).Filename))
+					}
+				}
+			}
+		}
+		assert.NotEmpty(t, files, "%s: exempt as a hubtestutil seeder but absent from the census", name)
+		for _, f := range files {
+			assert.True(t, strings.HasPrefix(f, "internal/hubtestutil/"), "%s: exempt as a hubtestutil seeder but defined in %s", name, f)
+		}
+	}
 	for fn := range creators {
 		if reason, ok := exempt[fn]; ok {
 			t.Logf("exempt: %s (%s)", fn, reason)
@@ -513,13 +542,27 @@ func TestTIWebIAP_TransportIdentityInvariant(t *testing.T) {
 	// transport identity before its first lookup.
 	assert.Equal(t, []string{
 		"Exchange s.resolver",
+		// slog.Value.Resolve in the test log capture helper
+		// (internal/hubtestutil, scanned through guardScanSubdirs), not a
+		// user or transport resolver.
+		"RecordAttrs a.Value",
+		// The conduit router (router.Resolve: whether the agent has a
+		// deliver-message or any session for its run), not a user or transport resolver.
+		"agentConduitDeliverSessionState rtr",
+		"agentHasConduitSession rtr",
 		"agentPTYPath rtr",
 		"authenticateExternalBearer cfg.GoogleResolver",
 		"brokerPTYPath rtr",
-		"cleanupNFSSharedDirTree runtime.NewNFSBackend()",
 		// The experiments registry (Registry.Resolve), not a user or
 		// transport resolver.
 		"experimentEnabledIn s.experimentRegistry()",
+		// The chat_retention settings document's bounds check
+		// (opsettings.ChatRetentionSettings.Resolve), not a user or
+		// transport resolver.
+		"handlePutChatRetention settings",
+		// The conduit router (router.Resolve: which session would carry a
+		// page view stream), not a user or transport resolver.
+		"portViewConduitRoute rtr",
 		// The project storage layout authority (pkg/projectfs), not a
 		// user or transport resolver.
 		"projectRecordSharedDirPath localLayout",
@@ -527,6 +570,10 @@ func TestTIWebIAP_TransportIdentityInvariant(t *testing.T) {
 		// (projectfs.Layout.Resolve; workspace_layout.go), not a user or
 		// transport resolver.
 		"projectWorkspaceResolved layout",
+		// The workspace Mount of a project tree, for the one-shot
+		// provisioning state promotion (provision_promote.go), through
+		// the same layout authority; not a user or transport resolver.
+		"promoteProjectProvisionState layout",
 		"resolveAsNeededForKeys d.secretBackend",
 		"resolveNFSSharedDir layout",
 		"resolveOutboundRouting messaging",

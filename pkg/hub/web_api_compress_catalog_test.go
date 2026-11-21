@@ -102,6 +102,22 @@ var compressBypassedUntagged = map[string]string{
 	"DELETE /api/v1/secrets/{key}":                      "env/secrets segment",
 	"pending DELETE /api/v1/env/{key}":                  "env/secrets segment",
 	"pending PATCH /api/v1/secrets/{key}":               "env/secrets segment",
+	// The session-only user- and hub-scope variants of the same routes.
+	"DELETE /api/v1/env/{key} #scope=user":     "env/secrets segment",
+	"GET /api/v1/secrets #scope=user":          "env/secrets segment",
+	"GET /api/v1/secrets/{key} #scope=user":    "env/secrets segment",
+	"PUT /api/v1/secrets/{key} #scope=user":    "env/secrets segment",
+	"PATCH /api/v1/secrets/{key} #scope=user":  "env/secrets segment",
+	"DELETE /api/v1/secrets/{key} #scope=user": "env/secrets segment",
+	"DELETE /api/v1/env/{key} #scope=hub":      "env/secrets segment",
+	"GET /api/v1/secrets #scope=hub":           "env/secrets segment",
+	"GET /api/v1/secrets/{key} #scope=hub":     "env/secrets segment",
+	"PUT /api/v1/secrets/{key} #scope=hub":     "env/secrets segment",
+	"PATCH /api/v1/secrets/{key} #scope=hub":   "env/secrets segment",
+	"DELETE /api/v1/secrets/{key} #scope=hub":  "env/secrets segment",
+	// The merged user secret list returns metadata and provenance only,
+	// never a value, like the plain user secret list.
+	"GET /api/v1/secrets #scope=user&includePending=true": "env/secrets segment",
 
 	// Auth routes: /api/v1/auth/ is bypassed as a whole. Token list and get
 	// return the token prefix only.
@@ -126,6 +142,11 @@ var compressBypassedUntagged = map[string]string{
 	"POST /api/v1/admin/invites/{id}/revoke": "invites prefix",
 	"DELETE /api/v1/admin/invites/{id}":      "invites prefix",
 
+	// Webhook endpoints collection: /api/v1/projects/{projectId}/webhook-endpoints
+	// is bypassed as a path so POST's one-time signing secret is never compressed;
+	// GET on the same path returns metadata only.
+	"GET /api/v1/projects/{projectId}/webhook-endpoints": "webhook endpoints collection: POST returns secret",
+
 	// Test identity routes: /api/v1/test-identities is bypassed as a whole. Only
 	// create, token, web login code and admin create return a credential.
 	"GET /api/v1/test-identities":                    "test identities prefix",
@@ -139,25 +160,32 @@ var compressBypassedUntagged = map[string]string{
 	// versions and resolve paths are bypassed as a whole. These carry no
 	// signed URL: workspace status and finalize, the link list and revoke,
 	// skill version reads and deprecation, and the per-skill resolve.
-	"GET /api/v1/agents/{id}/workspace":                   "signed-URL path",
-	"POST /api/v1/agents/{id}/workspace/sync-to/finalize": "signed-URL path",
-	"GET /api/v1/artifacts/{id}/links":                    "signed-URL path",
-	"DELETE /api/v1/artifacts/{id}/links/{linkId}":        "signed-URL path",
-	"GET /api/v1/skills/{id}/resolve":                     "signed-URL path",
-	"GET /api/v1/skills/{id}/versions":                    "signed-URL path",
-	"GET /api/v1/skills/{id}/versions/{vid}":              "signed-URL path",
-	"POST /api/v1/skills/{id}/versions/{vid}/deprecate":   "signed-URL path",
+	"GET /api/v1/agents/{id}/workspace":                               "signed-URL path",
+	"POST /api/v1/agents/{id}/workspace/sync-to/finalize":             "signed-URL path",
+	"GET /api/v1/artifacts/{id}/links":                                "signed-URL path",
+	"DELETE /api/v1/artifacts/{id}/links/{linkId}":                    "signed-URL path",
+	"GET /api/v1/skills/{id}/resolve":                                 "signed-URL path",
+	"GET /api/v1/skills/{id}/versions":                                "signed-URL path",
+	"GET /api/v1/skills/{id}/versions/{vid}":                          "signed-URL path",
+	"POST /api/v1/skills/{id}/versions/{vid}/deprecate":               "signed-URL path",
+	"POST /api/v1/skills/{id}/versions/{vid}/deprecate #scope=global": "signed-URL path",
 
 	// Artifact capability routes: the shared link answers with a redirect
 	// whose Location header carries the view capability, and the view route
 	// serves the artifact's own files under that capability; neither body
 	// carries a credential.
-	"pending GET /api/v1/artifacts/shared/{token}": "artifact capability route",
-	"exemption /api/v1/artifacts/shared/":          "artifact capability route",
-	"exemption /api/v1/artifacts/view/":            "artifact capability route",
+	"exemption /api/v1/artifacts/shared/": "artifact capability route",
+	"exemption /api/v1/artifacts/view/":   "artifact capability route",
+	"exemption /api/v1/portview/":         "port page view route: streams the agent port's own responses",
 
 	// Agent auth reset: the path ends in agents/{segment} like an agent item.
 	"POST /api/v1/admin/agents/reset-auth-all": "item route",
+
+	// Agent-token decision routes: /api/v1/agent/ is bypassed as a whole for
+	// secrets and GCP tokens; decision list, show, and interpreted record
+	// carry decision state only, never a credential.
+	"exemption /api/v1/agent/decisions":  "agent prefix",
+	"exemption /api/v1/agent/decisions/": "agent prefix",
 }
 
 // compressRequestBypassed mirrors the MountHubAPI decision: the request
@@ -315,6 +343,7 @@ func TestCompressBypass_SensitiveResponsesFromCatalog(t *testing.T) {
 		"POST /api/v1/artifacts/{id}/links",
 		"POST /api/v1/artifacts/{id}/versions/{seq}/view",
 		"POST /api/v1/agents/{id}/workspace/sync-from",
+		"POST /api/v1/runtime-brokers/{id}/agents/{agentId}/workspace-download",
 		"POST /api/v1/skills/resolve #ref=skill",
 		"pending POST /api/v1/skills/resolve #ref=registry",
 	} {

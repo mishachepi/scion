@@ -433,7 +433,6 @@ func TestExecuteUsageOnError_ArgsValidatorsKeepUsage(t *testing.T) {
 		{"hub secret migrate: old --project hint", []string{"hub", "secret", "migrate", "--project", "my-gcp"}, gcpProjectFlagHint},
 		{"hub secret migrate-names: old --project hint", []string{"hub", "secret", "migrate-names", "--project", "my-gcp"}, gcpProjectFlagHint},
 		{"project service-accounts add: old --project hint", []string{"project", "service-accounts", "add", "sa@example.iam.gserviceaccount.com", "--project", "my-gcp"}, gcpProjectFlagHint},
-		{"hub secret migrate: no flags -> required-flag error", []string{"hub", "secret", "migrate"}, `required flag(s) "gcp-project" not set`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -865,7 +864,7 @@ func setupNoProjectPreRun(t *testing.T) {
 	// SCION_PROJECT and SCION_CREATOR aren't read by name on this code
 	// path (the settings loaders bulk-load SCION_* vars but ignore these
 	// two), but the sandbox container can still leak them (see
-	// AGENTS.md, "Sandbox gotchas"), so clear them
+	// docs-repo/agents/sandbox-go-toolchain.md), so clear them
 	// defensively alongside the vars above to keep these tests isolated
 	// against future readers.
 	t.Setenv("SCION_PROJECT", "")

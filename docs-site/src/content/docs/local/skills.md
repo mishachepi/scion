@@ -49,6 +49,7 @@ Frontmatter fields:
 | :--- | :--- | :--- |
 | `name` | Yes | Skill name in **kebab-case** (lowercase alphanumeric with hyphens, 1–64 chars, no leading/trailing hyphen). |
 | `description` | Yes | A short, human-readable summary shown in listings. |
+| `experiment` | No | Built-in platform skills only: gates the whole skill (`SKILL.md`) or a supporting `.md` file on a registered [experiment](/scion/reference/experiments/) (sections inside Markdown files can also be wrapped in `<!-- scion:experiment <id> -->` … `<!-- scion:end-experiment -->`; see [Platform and Workspace Skills](/scion/reference/agent-config/#platform-and-workspace-skills)). |
 
 ### Scaffolding a new skill
 
@@ -86,7 +87,7 @@ skills:
 | `as` | No | Mount the skill under a different directory name. |
 | `optional` | No | If `true`, provisioning continues even when the skill cannot be resolved or installed. The skipped skill is logged as a warning that names it and gives the reason. |
 
-At provisioning time Scion resolves every required skill, downloads its files (using the [content-hash cache](#content-hash-caching)), and mounts them into the harness's skills directory (for example `.claude/skills/` or `.gemini/skills/`).
+At provisioning time Scion resolves every required skill, downloads its files (using the [content-hash cache](#content-hash-caching)), and installs them into the harness's skills directory inside the Agent home (for example `.claude/skills/` or `.gemini/skills/`). The harness's `skills_dir` must be a relative path inside the Agent home (`harness skills_dir must be a relative path inside the agent home`), and Scion installs each skill without following symbolic links in the source or the Agent home, within `4096` entries, `64 MiB`, and `32` directory levels per skill (skipping symlinks, special files, and files with multiple hard links in the source, and refusing if a directory on the skill's path in the Agent home or source is a symlink or not a directory).
 
 When a Hub dispatches the agent, the Hub resolves Hub-registry skill references with the permissions of the principal creating the agent. That principal is the user, or the parent agent when an agent creates a child. The Runtime Broker's own identity is not used. A required skill provisions whenever the agent's creator can read it. A skill the creator cannot read is reported the same way as one that does not exist, so the failure does not reveal that the skill is there. The broker installs Hub-resolved skills as-is. It resolves only what the Hub did not cover itself, such as `gh://`, `gcp-skill://`, federated registries, and references found only in broker-local templates.
 
@@ -104,6 +105,7 @@ The error uses code `skill_resolution_failed`. Its message names the skill refer
 | `timeout` | 504 | GitHub did not respond before the deadline. |
 | `upstream_unavailable`, `unreachable` | 502 | GitHub returned repeated server errors, or could not be reached. |
 | `install_failed` | 500 | The skill resolved, but its files could not be downloaded, verified or installed. The message gives a short reason, such as `download failed with status 404`; a failure on the broker's own filesystem is reported as `install failed on the broker`. |
+| `unsupported_skill_content` | 500 | A `gh://` skill cannot be installed as it is in the repository: its directory contains a git submodule, has more than 1000 files or a path that would leave the skill directory, or GitHub truncated its listing. Retrying does not help; change the skill. |
 | any other cause | 500 | An internal failure while resolving the skill. |
 
 For `scion create` (which only provisions), a provisioning failure for any other reason is reported as a warning on the created agent.
@@ -129,6 +131,7 @@ Most segments are optional. Common forms:
 | `skill://scion/project/<projectId>/deploy-checklist` | Project-scoped skill (scope + scope ID). |
 | `skill://scion/user/<userId>/scratch@1.4.0` | User-scoped skill, exact version. |
 | `skill://project/deploy-checklist` | Scope-alias form (registry defaults to `scion`). |
+| `skill://global/deploy-checklist` | Scope-alias form for a global skill; the same as `skill://scion/global/deploy-checklist`. Prefer the full form: older Hubs read `skill://global/...` as a federated registry named `global`. |
 | `skill://registry.example.com/global/tool@^2.0` | External registry (federation). |
 | `gh://<owner>/<repo>/<path>[@<ref>][?token=<SECRET>]` | Skill sourced from a GitHub repository. Supports private repos and per-URI credentials. |
 | `gcp-skill://<alias>/<skillId>@<version>` | Skill sourced from GCP Vertex AI. |
@@ -137,14 +140,16 @@ Most segments are optional. Common forms:
 
 The `@version` suffix accepts:
 
-- `latest` (the default when omitted) — the highest published, non-deprecated stable version.
+- `latest` (the default when omitted) — the highest published stable version, or the highest deprecated stable version when no published stable version exists.
 - An exact version, e.g. `1.4.0` (a leading `v` is stripped).
-- A semver range, e.g. `^1.0`, `~1.2`, `>=1.0.0` — resolves to the highest matching version.
-- A content hash, e.g. `sha256:abc123…` — resolves to the exact bytes with that hash.
+- A semver range, e.g. `^1.0`, `~1.2`, `>=1.0.0` — resolves to the highest matching published stable version, or the highest matching deprecated stable version when no published stable version matches.
+- A content hash, e.g. `sha256:abc123…` — resolves to the exact version with that hash (matching `contentHash`, or `contentHashV2` while the `hub.skill_content_hash_v2` [experiment](/scion/reference/experiments/) is enabled; see [Content hash forms](/scion/hosted/single-node/skill-registry/#content-hash-forms)). `published` and `deprecated` versions match; `draft` and `archived` versions never do.
 
 ### GitHub skill URIs (`gh://`)
 
 The `gh://` scheme retrieves skill files directly from a GitHub repository. It works out-of-the-box for public repositories, and supports secure private repository resolution.
+
+A `gh://` skill contains every regular file under the skill directory, including files in subdirectories such as `scripts/` or `references/`. Scion reads the directory with one GitHub git trees API call per resolution. A file that is executable in the repository is installed executable (`0755`); every other file is installed `0644`. Setuid, setgid and sticky bits are never applied. Symlinks in the skill directory are skipped. Resolution fails with an error, before any file is downloaded, when the skill directory contains a git submodule, has more than 1000 files, or has a path that would leave the skill directory, or when GitHub truncates the listing because the directory has too many entries. These failures carry the error code `unsupported_skill_content`.
 
 If GitHub rejects the credential sent with a skill file download at install time (`401`, `403` or `404`, for example because the token expired or was revoked), as can happen when the skill's resolution was cached or done by the Hub, Scion retries that file once without credentials. Hash checks apply to the result as usual. A fresh resolution with a rejected token still fails.
 
@@ -172,13 +177,16 @@ To make adding skills as seamless as possible, Scion automatically validates and
 The old `scion://` scheme is no longer supported and is rejected during validation with a clear error pointing to `skill://`.
 :::
 
+:::note[The `core` scope is retired]
+Skills used to have a fourth scope, `core`. It is retired: a reference with a `core` scope segment, such as `skill://core/<name>`, `skill://scion/core/<name>` or `skill://<registry>/core/<name>`, is rejected with an error that names the `global` replacement (for example `skill://scion/global/<name>`). The `skill://global/` and `skill://core/` prefixes always mean the local Hub's scope, even if a federated registry named `global` or `core` is configured. Existing `core` skills became `global` skills when the Hub was upgraded; see the [release notes](/scion/release-notes/#global-catalog-writes-need-the-global-permissions-and-the-core-skill-scope-is-retired).
+:::
+
 ### Scopes and resolution order
 
-Skills live in one of four **scopes**:
+Skills live in one of three **scopes**:
 
 | Scope | Description |
 | :--- | :--- |
-| `core` | Built-in platform skills. |
 | `global` | Shared across all users of the Hub. |
 | `project` | Scoped to a specific project (requires a scope ID). |
 | `user` | Personal to a specific user (requires a scope ID). |
@@ -186,7 +194,7 @@ Skills live in one of four **scopes**:
 When a reference does not name a scope, the Hub searches in this order and returns the first match:
 
 ```text
-user → project → global → core
+user → project → global
 ```
 
 More specific scopes therefore override broader ones — a user's own skill shadows a global skill of the same name.
@@ -237,11 +245,11 @@ scion skills publish ./deploy-checklist --version 1.1.0 --skill-id <skill-id>
 | Flag | Default | Description |
 | :--- | :--- | :--- |
 | `--version` | *(required)* | SemVer version to publish (e.g. `1.0.0`). |
-| `--scope` | `global` | Scope for a **newly created** skill: `core`, `global`, `project`, or `user`. With `project`, the skill is attached to the current Hub-linked project. The command fails if no project can be determined (run `scion hub link` first). |
-| `--skill-id` | *(auto)* | Publish a new version for an existing skill ID. If omitted, Scion matches by directory name and creates the skill when no match exists. |
+| `--scope` | `global` (for a new skill) | Scope to publish into: `global`, `project`, or `user`. When `--scope` is set and `--skill-id` is not, Scion adds the version only to a skill of that name **in that scope**: the current project's skill for `project`, your own skill for `user`. It creates the skill there if there is none, so a same-named skill in another scope, project or user's scope is never published to. If that lookup fails (for example because the Hub refuses the list), the command stops with an error rather than creating a possibly duplicate skill. Without `--scope`, any skill of that name you can see gets the version, and a new skill is created in `global`. With `project`, the skill is attached to the current Hub-linked project; the command fails if no project can be determined (run `scion hub link` first). With `global`, no project is linked or looked up; outside a Scion project, add the root `--global` flag. |
+| `--skill-id` | *(auto)* | Publish a new version for an existing skill ID. If omitted, Scion matches by directory name as described for `--scope` and creates the skill when no match exists. |
 
 :::note[Global scope permissions]
-Publishing a skill to the `global` scope requires either the `hub-admin` role or the `global-catalog-author` role. The `global-catalog-author` role grants only the `skill.create_global` permission, allowing non-admin users to author global catalog skills without full Hub administrator authority. See [Permissions & Policy](/scion/hosted/ha/permissions/#roles) for role details.
+Creating a skill in the `global` scope needs the `skill.create_global` permission; publishing a new version of a global skill, changing it or deprecating a version needs `skill.update_global`, and deleting it needs `skill.delete_global`. The `global-catalog-author` role grants all three (and the matching template permissions) without Hub administrator authority, and `hub-admin` holds them as well. Owning a global skill grants nothing: the user who created it needs the role to keep changing it. For a CI token that publishes global skills, see [Hub-boundary tokens for global catalog authoring](/scion/hosted/user/personal-access-tokens/#hub-boundary-tokens-for-global-catalog-authoring); for the role and permission details, see [Global catalog authoring](/scion/hosted/ha/permissions/#global-catalog-authoring).
 :::
 
 **Per-version limits:** at most **50 files**, **10 MB** per file, and **50 MB** total. `.git/`, `.DS_Store`, `__pycache__`, and files matching `.gitignore` patterns are excluded automatically.
@@ -254,9 +262,9 @@ Published deploy-checklist v1.0.0 (hash: sha256:9f2b…)
 
 ## Versioning and immutability
 
-Each publish creates a new `SkillVersion`. Versions are content-addressed by a `sha256:` hash computed over their files, so a given `name@version` always resolves to the same bytes. This makes resolution reproducible and enables the [content-hash cache](#content-hash-caching).
+Each publish creates a new `SkillVersion`. Versions are content-addressed by a `sha256:` hash computed over their files (`contentHash`, plus `contentHashV2` covering file paths and normalized modes when the `hub.skill_content_hash_v2` [experiment](/scion/reference/experiments/) is enabled; see [Content hash forms](/scion/hosted/single-node/skill-registry/#content-hash-forms)), so a given `name@version` always resolves to the same bytes. This makes resolution reproducible and enables the [content-hash cache](#content-hash-caching).
 
-To retire a version without deleting it, deprecate it. Deprecated versions remain resolvable by exact reference but are skipped by `latest` and range resolution.
+To retire a version without deleting it, deprecate it. Deprecated versions remain resolvable by exact semver reference and by `@sha256:` content hash. `latest` and semver ranges prefer published versions and return a deprecated version only when no published version matches.
 
 ```bash
 scion skills deprecate deploy-checklist \
@@ -330,6 +338,10 @@ Hub (System + User-Defined) → User → Project → Template
 ```
 
 1. **Hub Scope** (broadest): Configured by the Hub administrator for the entire platform. This includes pre-seeded **System** (built-in) skills under the `scion-platform://` URI scheme (such as status signaling and messaging operations) as well as admin-defined global skills.
+
+   :::caution
+   A **global** skill on the Hub's injected list reaches every agent, and every holder of `skill.update_global` (every `global-catalog-author` and hub admin) can change its content, for example by publishing a new version. Add a global skill here only if you trust every holder of that permission with that reach, or pin it to an exact version (`@1.2.0`) or content hash (`@sha256:<hash>`), whose content cannot change. See [Global catalog authoring](/scion/hosted/ha/permissions/#global-catalog-authoring).
+   :::
 2. **User Scope**: Configured by you. These skills are automatically injected into every agent you provision, regardless of the project.
 3. **Project Scope**: Configured for a specific project. These skills are automatically injected into all agents running within that project.
 4. **Template Scope** (highest): Defined directly inside the agent's template. A template-level skill reference always overrides any injected skill of the same name.

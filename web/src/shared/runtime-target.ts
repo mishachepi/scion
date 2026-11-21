@@ -88,7 +88,7 @@ function resourcesLabel(r: PresentedResourceSpec | undefined): string {
   return parts.join('; ');
 }
 
-/** The stored target's rows: ID, type, display name, and the reported namespace. */
+/** The stored target's rows: ID, type, display name, and the reported namespace or region. */
 export function runtimeTargetRows(
   target: RuntimeTargetDescriptor,
   presentation?: RuntimeTargetPresentation
@@ -98,6 +98,7 @@ export function runtimeTargetRows(
   push(rows, 'Type', target.type);
   push(rows, 'Display name', target.displayName);
   push(rows, 'Namespace', presentation?.target?.namespace);
+  push(rows, 'Region', presentation?.target?.region);
   return rows;
 }
 
@@ -172,16 +173,29 @@ export function isFlatBroker(broker: ClassifiableBroker): boolean {
 
 /**
  * The one-line runtime target label of a flat broker, for example
- * "kubernetes · Cluster A · ns agents"; the namespace appears only when the
- * instance reported one. Empty for a legacy broker.
+ * "kubernetes · Cluster A · ns agents" or "Cloud Run · us-central1"; the
+ * namespace or Cloud Run region appears only when the instance reported one.
+ * Empty for a legacy broker.
  */
 export function runtimeTargetLabel(broker: ClassifiableBroker): string {
   const target = broker.runtimeTarget;
   if (!target) return '';
-  const parts = [target.type];
-  if (target.displayName) parts.push(target.displayName);
+  const typeLabel = target.type === 'cloudrun' ? 'Cloud Run' : target.type;
+  const parts = [typeLabel];
+  // Broker registration defaults an unset display_name to target.type; omit
+  // displayName when it merely repeats the raw type or formatted type label.
+  if (
+    target.displayName &&
+    target.displayName !== target.type &&
+    target.displayName !== typeLabel
+  ) {
+    parts.push(target.displayName);
+  }
   const ns = broker.runtimeTargetPresentation?.target?.namespace;
   if (ns) parts.push(`ns ${ns}`);
+  const region =
+    target.type === 'cloudrun' ? broker.runtimeTargetPresentation?.target?.region : undefined;
+  if (region) parts.push(region);
   return parts.join(' · ');
 }
 
@@ -206,8 +220,12 @@ export function tolerationLabel(t: PresentedToleration): string {
 
 /**
  * The Placement rows of a Kubernetes flat target: node selector,
- * tolerations and runtime class, each only when reported. Empty for any
- * other runtime type, so docker and future types show no Placement group.
+ * tolerations and runtime class, each only when reported. With none of
+ * them, one row says whether the instance reported no placement
+ * (placementReported true) or did not report placement at all. Empty for
+ * any other runtime type, so docker and future types show no Placement
+ * group, and when there is no presentation. The rows are read-only: the
+ * placement is configured on the broker.
  */
 export function placementRows(
   target: RuntimeTargetDescriptor,
@@ -227,5 +245,11 @@ export function placementRows(
   const objects = tolerations.filter((x) => !!x && typeof x === 'object' && !Array.isArray(x));
   push(rows, 'Tolerations', objects.map(tolerationLabel).join('; '));
   push(rows, 'Runtime class', t.runtimeClassName);
+  if (rows.length === 0) {
+    rows.push({
+      label: 'Placement',
+      value: t.placementReported === true ? 'None configured on the broker' : 'Not reported',
+    });
+  }
   return rows;
 }

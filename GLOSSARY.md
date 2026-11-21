@@ -6,6 +6,10 @@ Scion is a container-based orchestration platform for running multiple LLM "deep
 
 ## Orchestration
 
+**Lead**:
+An agent that carries continuity for a project or workstream from its initial request through closure, including non-code and non-repository work. The first agent, an agent coordinating that workstream, or a human-designated lead is protected regardless of its starting template. Only a human may authorize deletion of that lead. A bounded delegated supervisor is not automatically a lead; workflow-specific role mappings belong to that workflow.
+_Avoid_: initiator (for the agent role; unrelated to the `initiatorPrincipal` provenance concept).
+
 **Agent**:
 An isolated worker: one LLM-plus-harness loop in its own container with its own identity, credentials, and workspace. The fundamental unit of execution in Scion.
 _Avoid_: worker, bot, instance, process
@@ -98,7 +102,7 @@ A workspace sharing mode where one workspace directory is mounted into every age
 _Avoid_: shared mount, plain workspace
 
 **Worktree-per-agent**:
-A workspace sharing mode where each agent gets its own git worktree over a shared checkout, isolating working trees while sharing one clone's history. Supported on repositories linked to the local workstation Hub (registered with this mode automatically; the worktrees are of your own checkout) and on Hub-managed git projects created with `worktree-per-agent` (see "Linked git projects" in the docs); on Kubernetes it requires NFS workspace storage.
+A workspace sharing mode where each agent gets its own git worktree over a shared checkout, isolating working trees while sharing one clone's history (with the shared `.git` root mounted read-only into each container). Supported on repositories linked to the local workstation Hub (registered with this mode automatically; the worktrees are of your own checkout) and on Hub-managed git projects created with `worktree-per-agent` (see "Linked git projects" in the docs); not supported on Kubernetes or Cloud Run Instances (`cloudrun-sandbox` is unaffected).
 _Avoid_: worktree mode, shared checkout
 
 **Clone-per-agent**:
@@ -222,6 +226,11 @@ _Avoid_: service, module, role
 A server process running both the Hub and Runtime Broker components together (the default in workstation mode).
 _Avoid_: hub-broker, all-in-one, standalone, monolith
 
+**Console** (web UI mode):
+The management view in the web UI's three-way header mode switcher (**Console**, **Chat**, **Terminals**), holding the left-hand navigation and the overview, project, agent, Runtime Broker, and admin pages. Distinct from **Dashboard**, which is the overview landing page (`/`) inside Console's left-hand navigation.
+_Avoid_: Dashboard (when naming the mode-switcher option rather than the `/` overview page)
+_See also_: Native Web Chat
+
 **Secret**:
 A credential made available to an agent at runtime (e.g. API keys, tokens). A harness-config's `secrets` field *declares* which secrets an agent needs; the **Secret Backend** — a pluggable store (local SQLite for development, GCP Secret Manager in production, selected via `SCION_SERVER_SECRETS_BACKEND`) — *stores and resolves* them, scoped by user, project, runtime broker, or hub, and injects them into the container. Also holds the Hub's signing keys.
 _Avoid_: credential, vault, secret store, env secret
@@ -256,33 +265,22 @@ A short-lived, single-use token the Hub issues when a user creates or re-registe
 _Avoid_: registration token, bootstrap secret
 _See also_: Runtime Broker, User Access Token (UAT) (a different credential)
 
+**Deliverable**:
+A general work product, such as a code change, design, report or document. Use **File / Document** for concrete content and **Artifact** for a resource published through Scion's artifact system. Not every deliverable needs artifact-system publication.
+_See also_: File / Document, Artifact, Durability
+
+**File / Document**:
+Concrete content, including a file in a scratchpad. A file remains a file whether or not it is published as a Scion artifact. Its existence alone does not make it durable.
+_See also_: Deliverable, Artifact, Durability
+
+**Durability**:
+The property of a deliverable being reachable by someone else after its producing agent's container has been deleted. A verified shared-volume document or pushed remote ref can be durable without artifact-system publication. Publication alone does not guarantee retention: published content may expire or be deleted.
+_See also_: Deliverable, File / Document, Artifact
+
 **Artifact**:
 A published file or folder (a bundle) stored by the Hub, with numbered immutable versions and a stable reference `scion://artifact/<id>[@<seq>]` that works from any Runtime Broker and in the web UI. Owned by the publishing agent or user and homed in a project. Gated by the `hub.artifacts` experiment. Not a build output or a chat attachment.
 _Avoid_: attachment, upload, build artifact
-_See also_: Project
-
-## Users & Access
-
-**Access Boundary**:
-The user-facing term and UI representation of an underlying **AccessConstraint**. It defines a monotonic maximum-permissions boundary (permission ceiling) for users, group closures, or all principals. Admins can view, create, and manage access boundaries via a guided authoring workflow, previewing and dry-running changes using the built-in preview engine and effective-access integration before committing. It is not a User Access Token's boundary (the single project or the hub a UAT is bound to).
-_Avoid_: access ceiling, permission boundary, role constraint
-_See also_: AccessConstraint, Group, RoleBinding, User Access Token (UAT)
-
-**Agent Authorization Role**:
-A named authority tier (one of `none`, `readonly`, `baseline`, or `full`) assigned to an agent that governs the API scopes granted in its Hub-issued JWT. At creation, the requested or default role is capped by the project maximum and, for sub-agents, the parent agent's role. Live delegation checks separately verify the caller's authority.
-_Avoid_: raw template scopes, agent scopes
-_See also_: User Access Token (UAT)
-
-**Group**:
-A named collection of Hub users, agents and nested groups used by the Hub permissions system to assign access. This is the primary meaning of "group" in Scion.
-_Avoid_: team, org, role
-_See also_: Message Group (different concept — message recipients, not users), Thread Group (different concept — a project's threads, not users)
-
-**User Access Token (UAT)**:
-A scoped, revocable bearer token (prefixed with `scion_pat_`) linked to a user account and used for non-interactive Hub authentication (e.g., CLI, CI/CD pipelines, desktop app integration). Every UAT has a boundary, either a single project or (for a hub-bound token, minted through the API) the hub, and carries a specific list of action permissions (scopes). The token boundary is not an **Access Boundary**.
-_Avoid_: personal access token (PAT), API key, secret token
-_See also_: Hub
-
+_See also_: Project, Deliverable, File / Document, Durability
 
 **Quota System**:
 An advisory-lock-based enforcement system that governs resource consumption at agent and project creation. It uses fail-closed semantics and prevents reservation leaks, operating on schemas including LimitDefinition, EntitlementBinding, and UsageReservation.
@@ -307,6 +305,29 @@ _See also_: Inventory target key, Flat Runtime Broker
 **Inventory target key**:
 The `auxiliaryRuntimeIdentity` string (runtime name, plus context and namespace on Kubernetes) that heartbeats, start claims and recovery use to name the runtime an agent was observed on. It appears as `appliedConfig.runtimeTarget`/`runtimeTargetCandidate`, `hubclient.AgentHeartbeat.RuntimeTarget` and the Hub-side heartbeat agent type. It is not a runtime target ID.
 _See also_: Runtime target ID
+
+## Users & Access
+
+**Access Boundary**:
+The user-facing term and UI representation of an underlying **AccessConstraint**. It defines a monotonic maximum-permissions boundary (permission ceiling) for users, group closures, or all principals. Admins can view, create, and manage access boundaries via a guided authoring workflow, previewing and dry-running changes using the built-in preview engine and effective-access integration before committing. It is not a User Access Token's boundary (the single project or the hub a UAT is bound to).
+_Avoid_: access ceiling, permission boundary, role constraint
+_See also_: AccessConstraint, Group, RoleBinding, User Access Token (UAT)
+
+**Agent Authorization Role**:
+A named authority tier (one of `none`, `readonly`, `baseline`, or `full`) assigned to an agent that governs the API scopes granted in its Hub-issued JWT. At creation, the requested or default role is capped by the project maximum and, for sub-agents, the parent agent's role. Live delegation checks separately verify the caller's authority.
+_Avoid_: raw template scopes, agent scopes
+_See also_: User Access Token (UAT)
+
+**Group**:
+A named collection of Hub users, agents and nested groups used by the Hub permissions system to assign access. This is the primary meaning of "group" in Scion.
+_Avoid_: team, org, role
+_See also_: Message Group (different concept — message recipients, not users), Thread Group (different concept — a project's threads, not users)
+
+**User Access Token (UAT)**:
+A scoped, revocable bearer token (prefixed with `scion_pat_`) linked to a user account and used for non-interactive Hub authentication (e.g., CLI, CI/CD pipelines, desktop app integration). Every user access token has a boundary and carries a specific list of action permissions (scopes). Each request is allowed only when the token carries the scope and the user currently has that access. The token boundary is not an **Access Boundary**.
+_Token boundary_: the reach of a user access token, chosen when it is created in the web UI, the CLI or the API: a single project (a project token), or the hub (a hub token), which works in every project the user can currently access and is the only boundary that can carry hub-level scopes.
+_Avoid_: personal access token (PAT), API key, secret token
+_See also_: Hub
 
 ## Messaging
 
@@ -368,6 +389,36 @@ A named set of a project's group conversations (threads), owned by the project a
 _Avoid_: group (bare), folder, channel, conversation group, thread folder
 _See also_: Group (hub users, not threads), Message Group (recipients of one send, not threads), Native Web Chat
 
+**Decision** (decisions):
+One thing an agent needs a human to decide, posted in a decision prompt. It has a per-agent **key** (one the agent picks, such as `D234`, which has at least one non-digit, or a number the Hub assigns from a per-agent counter, such as `17`), **versions** (reposting the key with `--update` adds one), and a **status**: `pending`, `decided` or `replaced`. It is named across versions by `<asker-agent-uuid>/<key>`, and one version by `<asker-agent-uuid>/<key>@<version>`. The feature as a whole is called **Decisions** (the `web.decisions` experiment).
+_Avoid_: prompt (for the decision), poll, ticket, request
+_See also_: Question, Choice, Answer, Decision prompt
+
+**Question** (decisions):
+The text of a decision: a markdown field the agent writes.
+_Avoid_: prompt, title
+_See also_: Decision
+
+**Choice** (decisions):
+One of the options offered for a decision: an id (agent-supplied or `1..N` by position), a plain-text label, and an optional description.
+_Avoid_: option, button (for the data; acceptable for the UI control)
+_See also_: Decision, Answer
+
+**Answer** (decisions):
+The choice recorded for a decision. It is **direct** (a user's click) or **interpreted** (recorded by the asking agent from a user's free-text reply), and a direct answer may **confirm** or **override** an interpreted one. The answer comes back to the agent as a `decision-response` message.
+_Avoid_: decision (for the answer), vote, selection, response (for the record)
+_See also_: Decision, Decision log
+
+**Decision prompt**:
+The message (type `decision-prompt`) that carries one or more decisions. Its text also holds a markdown copy of them, so surfaces that cannot show the cards still show the decisions.
+_Avoid_: choice prompt, choices message, poll, question message
+_See also_: Decision, Answer
+
+**Decision log**:
+The list of answers, append-only and kept forever, each with the question and label snapshots, who answered, the surface and the provenance (direct or interpreted).
+_Avoid_: answer history, audit log (the audit log is a different record)
+_See also_: Answer, Decision
+
 ## Identity & State
 
 **Project ID**:
@@ -384,9 +435,9 @@ _Avoid_: status, stage, lifecycle state
 _See also_: Activity (what the agent is *doing*, vs. its container stage)
 
 **Activity**:
-What a running agent is currently doing, such as `thinking`, `executing`, `waiting_for_input`, or `blocked`. Distinct from phase.
+What a running agent is currently doing, such as `thinking`, `executing`, `waiting_for_input`, `blocked`, or `harness_error`. Distinct from phase.
 _Avoid_: status, state, mode
-_See also_: Phase (the container stage), Blocked (a specific activity value)
+_See also_: Phase (the container stage), Blocked and Harness error (specific activity values)
 
 **Blocked**:
 The activity an agent assigns to itself when intentionally waiting for an expected event, so it is not mistaken for stalled.
@@ -394,12 +445,22 @@ _Avoid_: stalled, stuck, idle, waiting
 _See also_: Activity (Blocked is one of its values)
 
 **Stalled**:
-A platform-set activity for a `running` agent whose heartbeat is still arriving (the process is alive) but that has produced no activity events within the stall threshold (`server.hub.stalled_threshold`, default 5 minutes; a value under 2 minutes falls back to the default). Indicates a hung agent. Agents whose activity is `blocked`, `waiting_for_input`, `completed`, `limits_exceeded` or `offline` are excluded. Distinct from `offline`, which means no heartbeat for over 2 minutes.
+A platform-set activity for a `running` agent whose heartbeat is still arriving (the process is alive) but that has produced no activity events within the stall threshold (`server.hub.stalled_threshold`, default 5 minutes; a value under 2 minutes falls back to the default). Indicates a hung agent. Agents whose activity is `blocked`, `idle`, `waiting_for_input`, `completed`, `limits_exceeded`, `harness_error` or `offline` are excluded, and so is an agent whose container reported live work within the threshold. A stalled agent whose container then reports live work gets its previous activity back. A tool call stops holding off the stall after 60 minutes, or after 10 minutes without progress, but its agent is still never auto-suspended. A stalled notification says how long the agent has had no activity. Distinct from `offline`, which means no heartbeat for over 2 minutes.
 _Avoid_: stuck, hung (as a state name), offline
-_See also_: Activity, Blocked, Auto-Suspend
+_See also_: Activity, Blocked, Harness error, Auto-Suspend, Live work
+
+**Harness error**:
+The `harness_error` activity of a `running` agent whose harness process is alive at its prompt but reported that a model, API or auth error ended its turn (for example a 400 from the model provider). The reason is in the agent's message, as `<source>: <text>` (for example `model API: APIError (status 400)`), redacted and at most 300 characters. Shown as `harness error` in `scion list` and the web UI; notifies the `HARNESS_ERROR` trigger, which is in the default triggers. Cleared by the harness's next turn-progress event (a new prompt, model call or tool call), so a new message to the agent retries. Excluded from stall detection; still marked `offline` when heartbeats stop. Distinct from the `error` phase, which means the harness process is dead, and from the `ERROR` trigger, which matches only that phase.
+_Avoid_: error (for a live agent), crashed, failed
+_See also_: Activity, Phase, Stalled
+
+**Live work**:
+Work in an agent's container that emits no activity events, such as a build, a test run or a background job the agent is waiting on. `sciontool init` samples `/proc` on each 30-second Hub heartbeat. It reports a tool call in flight: while the activity is `executing`, a process the harness started after the tool call began, whatever its CPU use. It also reports a process doing CPU work (at least 1% of one core since the previous sample). The tmux server, the pane shells, the harness's own process, sciontool and its services don't count. The Hub records it as `lastLiveWorkAt` and `lastLiveProcessAt`. An agent with live work is not marked `stalled` and is not auto-suspended. A tool call holds off the stall for at most 60 minutes, and for only 10 minutes when its processes make no progress (no change in their set, CPU time or I/O). Detection never sets an activity, except to restore the one a stall replaced. While live work runs, `sciontool init`'s API-error watchdog also holds off reporting a swallowed model API error as `harness_error`: the turn is not over.
+_Avoid_: busy (as a state name)
+_See also_: Stalled, Auto-Suspend
 
 **Auto-Suspend**:
-A Hub behavior, off by default (`server.hub.auto_suspend_stalled`), that suspends an agent when it is marked `stalled`, reclaiming its container. Agents whose harness does not support session resume are skipped. A message sent with wake (`scion message --wake`, or accepting the web UI's wake prompt) resumes the agent and then delivers it; a message without wake is not delivered (`scion message` gets `409 agent_not_running`).
+A Hub behavior, off by default (`server.hub.auto_suspend_stalled`), that suspends an agent when it is marked `stalled`, reclaiming its container. Agents whose harness does not support session resume are skipped, and so are agents whose container reported live work in the last 90 seconds. A message sent with wake (`scion message --wake`, or accepting the web UI's wake prompt) resumes the agent and then delivers it; a message without wake is not delivered (`scion message` gets `409 agent_not_running`).
 _Avoid_: idle timeout, auto-stop
 _See also_: Stalled, Phase
 

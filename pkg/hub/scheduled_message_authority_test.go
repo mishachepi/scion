@@ -59,7 +59,7 @@ func newSchedMsg(t *testing.T, name string) *schedMsg {
 	grantFixtureRole(t, f.bypassAgentsFixture, f.creator.ID, store.ProjectRoleAdmin)
 	target := &store.Agent{
 		ID: api.NewUUID(), Name: name + "-target", Slug: name + "-target",
-		ProjectID: f.proj.ID, MessageMode: store.MessageModeProject,
+		ProjectID: f.proj.ID, Phase: "running", MessageMode: store.MessageModeProject,
 	}
 	require.NoError(t, f.store.CreateAgent(context.Background(), target))
 	spy := &containmentDispatchSpy{}
@@ -84,7 +84,16 @@ func (f *schedMsg) msgEvent() store.ScheduledEvent {
 
 func (f *schedMsg) fireMsg(t *testing.T, evt store.ScheduledEvent) error {
 	t.Helper()
-	return f.srv.messageEventHandler()(context.Background(), evt)
+	return fireScheduledActionForTest(context.Background(), f.srv, "message", evt)
+}
+
+// sessionAgent creates the fixture sender agent and clears its create dispatch
+// from f.spy so subsequent message fire assertions observe only the fire under test.
+func (f *schedMsg) sessionAgent(t *testing.T, slug string) *store.Agent {
+	t.Helper()
+	a := f.schedFire.sessionAgent(t, slug)
+	f.spy.reset()
+	return a
 }
 
 func (f *schedMsg) assertDelivered(t *testing.T, n int) {
@@ -304,7 +313,8 @@ func TestScheduledMessageAuthority(t *testing.T) {
 		grantFixtureRole(t, f.bypassAgentsFixture, ownerUser.ID, store.ProjectRoleOwner)
 		owner := authUser(ownerUser)
 		f.srv.scheduler = NewScheduler(f.store, slog.Default())
-		f.srv.scheduler.RegisterEventHandler("message", f.srv.messageEventHandler())
+		f.srv.scheduler.srv = f.srv
+		f.srv.RegisterAction(&messageAction{srv: f.srv})
 
 		// A legacy message schedule: CreatedBy only, no recorded revision.
 		legacy := f.msgEvent()

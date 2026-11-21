@@ -66,13 +66,19 @@ func validateServerRole(role string) error {
 // validateRelayRoleConfig checks the configuration a separate relay needs.
 // Errors name the setting, never a value.
 func validateRelayRoleConfig(cfg *config.GlobalConfig) error {
-	if err := validateConduitPeerSecret(cfg.Hub.Conduit, true, ""); err != nil {
+	if err := validateConduitPeerSecret(cfg.Hub.Conduit, true, "", nil); err != nil {
 		return err
 	}
 	if err := config.ValidatePeerSecret(cfg.Hub.Conduit.PeerSecretValue()); err != nil {
 		return err
 	}
 	if err := cfg.Hub.Conduit.Validate(); err != nil {
+		return err
+	}
+	// The relay clamps and jitters its session lifetime cap with the
+	// declared platform request timeout (ptone/scion#5245); it reads no
+	// server.hub.sse setting.
+	if err := config.ValidatePlatformRequestTimeout(cfg.Hub.PlatformRequestTimeout); err != nil {
 		return err
 	}
 	if err := cfg.Relay.Validate(); err != nil {
@@ -137,8 +143,29 @@ func relayDatabaseOptions(cfg *config.GlobalConfig) relaydb.Options {
 		DSN:           cfg.Database.URL,
 		MaxOpenConns:  cfg.Database.MaxOpenConns,
 		MaxIdleConns:  cfg.Database.MaxIdleConns,
-		EventSubjects: append(append([]string(nil), relayserver.RevocationSubjects...), relayserver.SettingsUpdatedSubject),
+		EventSubjects: append(append([]string(nil), relayserver.RevocationSubjects...), relayserver.SettingsUpdatedSubject, relayserver.GrantKeysChangedSubject),
 	}
+}
+
+// relayPeerAuthOptions builds the relay's relay-peer auth options. They
+// come from the conduit settings only: the peer secret, the enrolled peers
+// and this node's key. A relay never takes the session secret or the
+// signing ring, which are hub-only.
+func relayPeerAuthOptions(cfg *config.GlobalConfig, id string, onGCP bool) (relay.ConduitPeerAuthOptions, error) {
+	peers, key, err := relay.PeerKeyOptions(cfg.Hub.Conduit)
+	if err != nil {
+		return relay.ConduitPeerAuthOptions{}, err
+	}
+	return relay.ConduitPeerAuthOptions{
+		Mode:            cfg.Hub.Conduit.PeerAuthMode(),
+		OnGCP:           onGCP,
+		SelfID:          id,
+		PeerSecret:      cfg.Hub.Conduit.PeerSecretValue(),
+		Audience:        cfg.Hub.Conduit.PeerAudience,
+		ServiceAccounts: cfg.Hub.Conduit.PeerServiceAccounts,
+		Peers:           peers,
+		PeerKey:         key,
+	}, nil
 }
 
 // openRelayDB opens the relay's database access (a var for tests).
@@ -153,13 +180,9 @@ func relayServerConfig(ctx context.Context, cfg *config.GlobalConfig, db *relayd
 	}
 	id := relay.InstanceID(cfg.Hub.Conduit.InstanceID)
 	onGCP := metadata.OnGCE()
-	opts := relay.ConduitPeerAuthOptions{
-		Mode:            cfg.Hub.Conduit.PeerAuthMode(),
-		OnGCP:           onGCP,
-		SelfID:          id,
-		PeerSecret:      cfg.Hub.Conduit.PeerSecretValue(),
-		Audience:        cfg.Hub.Conduit.PeerAudience,
-		ServiceAccounts: cfg.Hub.Conduit.PeerServiceAccounts,
+	opts, err := relayPeerAuthOptions(cfg, id, onGCP)
+	if err != nil {
+		return relayserver.Config{}, err
 	}
 	if onGCP {
 		if email, err := metadata.EmailWithContext(ctx, "default"); err == nil {
@@ -172,6 +195,21 @@ func relayServerConfig(ctx context.Context, cfg *config.GlobalConfig, db *relayd
 	}
 	slog.Info("Conduit relay-peer authentication", "mode", mode)
 	podIP := os.Getenv("POD_IP")
+	hopServerTLS, hopClientTLS, err := conduitHopTLS(cfg.Hub.Conduit)
+	if err != nil {
+		return relayserver.Config{}, err
+	}
+	// The public listener trusts a forwarded protocol only from the
+	// operator's server.trusted_proxies, resolved as the hub resolves it
+	// (config.TransportTrustedProxies): not set, a proxy on this host;
+	// an empty list, none.
+	trusted, usedDefault, err := config.TransportTrustedProxies(cfg.TrustedProxies, cfg.TrustedProxiesSet)
+	if err != nil {
+		return relayserver.Config{}, err
+	}
+	if usedDefault {
+		slog.Warn(config.TransportTrustedProxiesDefaultWarning)
+	}
 	return relayserver.Config{
 		InstanceID:     id,
 		PublicURL:      cfg.Relay.PublicURL,
@@ -179,9 +217,12 @@ func relayServerConfig(ctx context.Context, cfg *config.GlobalConfig, db *relayd
 		PublicListen:   net.JoinHostPort(cfg.Hub.Host, strconv.Itoa(cfg.Hub.Port)),
 		InternalListen: cfg.Hub.Conduit.InternalListen,
 		Advertise: func(bound net.Addr) string {
-			return conduitAdvertiseEndpoint(cfg.Hub.Conduit.InternalAdvertise, bound, podIP)
+			return conduitAdvertiseEndpoint(cfg.Hub.Conduit.InternalAdvertise, bound, podIP, hopServerTLS != nil)
 		},
+		InternalTLS:      hopServerTLS,
+		HopTLS:           hopClientTLS,
 		PeerAuth:         auth,
+		TrustedProxies:   trusted,
 		Registry:         db.Registry,
 		Experiment:       db.Settings,
 		Events:           db.Events(),
@@ -191,6 +232,8 @@ func relayServerConfig(ctx context.Context, cfg *config.GlobalConfig, db *relayd
 		LifetimeCap:      conduitLifetimeCapSetting(cfg),
 		RequireSelfCheck: hostedMode && isHADeployment(cfg),
 		Singleton:        cfg.Relay.Singleton,
+		// Per-session jitter of the cap (ptone/scion#5245).
+		JitterLifetimeCap: conduitLifetimeJitter(cfg),
 	}, nil
 }
 

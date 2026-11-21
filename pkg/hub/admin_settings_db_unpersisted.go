@@ -23,6 +23,8 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/config"
 )
 
 // The DB-backed server-config PUT must never answer 200 "saved" for a key it
@@ -71,6 +73,12 @@ var dbFileOnlyRequestPaths = [][]string{
 	{"server", "hub", "missing_agent_grace"},
 	{"server", "hub", "conduit"},
 	{"server", "hub", "port_proxy"},
+	{"server", "hub", "sse"},
+	{"server", "hub", "platform_request_timeout"},
+	// Web chat search limits (ptone/scion#7586): Layer 0, read at startup.
+	{"server", "hub", "chat"},
+	// System One rule evaluation ceiling (ptone/scion#8044): Layer 0, read at startup.
+	{"server", "hub", "system_one"},
 	{"server", "hub", "disable_legacy_storage_fallback"},
 	{"server", "relay"},
 	// server.keyring_file is never API-writable: rejectGateProtectedSettingsKeys
@@ -79,6 +87,10 @@ var dbFileOnlyRequestPaths = [][]string{
 	{"server", "keyring_file"},
 	// Likewise its operator-only world-readable override.
 	{"server", "keyring_file_allow_world_readable"},
+	// Likewise server.trusted_proxies (never API-writable).
+	{"server", "trusted_proxies"},
+	// Likewise server.hub.internal_url (never API-writable; ptone/scion#555).
+	{"server", "hub", "internal_url"},
 	{"server", "auth", "username"},
 	{"server", "auth", "display_name"},
 	{"server", "auth", "email"},
@@ -156,14 +168,17 @@ func (s *Server) rejectUnpersistedKeys(ctx context.Context, w http.ResponseWrite
 // the ServerConfigUpdateRequest decode would drop, unless that key is a
 // no-op echo of the file-mode GET view. It runs before settings.yaml is
 // read for the merge, so a rejected request writes nothing. done is true
-// if the response has been written.
-func rejectUnknownFileConfigKeys(w http.ResponseWriter, rawBody []byte) (done bool) {
+// if the response has been written. startup is passed to the GET view
+// (buildServerConfigFileResponse).
+func rejectUnknownFileConfigKeys(w http.ResponseWriter, rawBody []byte, startup *config.V1ServerConfig) (done bool) {
 	var top map[string]json.RawMessage
 	if err := json.Unmarshal(rawBody, &top); err != nil {
 		return false
 	}
 	candidates := unknownSettingsKeys(top, reflect.TypeOf(ServerConfigUpdateRequest{}), reflect.TypeOf(ServerConfigResponse{}))
-	rejected, err := rejectedSettingsKeys(candidates, serverConfigFileView)
+	rejected, err := rejectedSettingsKeys(candidates, func() (map[string]any, error) {
+		return serverConfigFileView(startup)
+	})
 	if err != nil {
 		slog.Error("PUT server-config: failed to build GET view for echo check", "error", err)
 		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to read existing settings", nil)
@@ -221,17 +236,14 @@ func rejectedSettingsKeys(candidates []rawPath, view func() (map[string]any, err
 // handlers return for keys they would otherwise drop.
 func writeUnpersistedKeysRejected(w http.ResponseWriter, rejected []string) {
 	slog.Warn("PUT server-config: rejecting keys that cannot be persisted", "keys", rejected)
-	writeJSON(w, http.StatusUnprocessableEntity, map[string]interface{}{
-		"error":   "unpersisted_keys_rejected",
-		"message": "These settings are not recognised or cannot be saved through the server config API. Nothing was saved.",
-		"keys":    rejected,
-	})
+	writeSettingsCodedKeysError(w, "unpersisted_keys_rejected",
+		"These settings are not recognised or cannot be saved through the server config API. Nothing was saved.", rejected)
 }
 
 // serverConfigFileView returns the file-mode GET /api/v1/admin/server-config
 // body as a generic JSON value, the reference for echo detection.
-func serverConfigFileView() (map[string]any, error) {
-	resp, err := buildServerConfigFileResponse()
+func serverConfigFileView(startup *config.V1ServerConfig) (map[string]any, error) {
+	resp, err := buildServerConfigFileResponse(startup)
 	if err != nil {
 		return nil, err
 	}

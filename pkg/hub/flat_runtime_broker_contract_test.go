@@ -296,6 +296,16 @@ func TestFlatCreate_PassthroughGateUsesTargetType(t *testing.T) {
 	allowed, pinnedProfile = f.srv.hubDefaultPassthroughAllowed(context.Background(), k8s.ID, f.project.ID, "agent", "")
 	assert.False(t, allowed, "a kubernetes target is not a local container runtime")
 	assert.Empty(t, pinnedProfile)
+
+	// A cloudrun target is denied too: the gate stays limited to the docker
+	// and podman runtime types (amendment P5-CR, E-10).
+	cr := &store.RuntimeBroker{ID: tid("flat-cr-" + t.Name()), Name: "flat-cr", Slug: "flat-cr", Status: store.BrokerStatusOnline,
+		Endpoint: "http://cr.invalid", RuntimeTarget: &api.RuntimeTargetDescriptor{ID: tid("flat-cr-target-" + t.Name()), Type: "cloudrun"}}
+	require.NoError(t, f.s.CreateRuntimeBroker(context.Background(), cr))
+	f.srv.SetEmbeddedBrokerID(cr.ID)
+	allowed, pinnedProfile = f.srv.hubDefaultPassthroughAllowed(context.Background(), cr.ID, f.project.ID, "agent", "")
+	assert.False(t, allowed, "a cloudrun target is not a local container runtime")
+	assert.Empty(t, pinnedProfile)
 }
 
 func TestFlatCreate_PinsPlacementAndSendsExpectedTarget(t *testing.T) {
@@ -923,7 +933,7 @@ func TestFlatReincarnate_StalePinRefusedBeforeStop(t *testing.T) {
 func TestFlatReincarnate_ReprovisionSendsExpectedTarget(t *testing.T) {
 	f := newFlatHubFixture(t, flatHubOpts{experimentOn: true, linkFlat: true})
 	a := f.pinnedAgent(t, "reprovision", string(state.PhaseStopped))
-	require.NoError(t, f.srv.GetDispatcher().DispatchAgentReprovision(context.Background(), a))
+	require.NoError(t, f.srv.GetDispatcher().DispatchAgentReprovision(context.Background(), a, ReprovisionOptions{}))
 	require.True(t, f.client.createCalled)
 	assert.Equal(t, f.flat.RuntimeTarget.ID, jsonField(t, f.client.lastCreateReq, "expectedRuntimeTargetId"))
 }
@@ -1083,7 +1093,7 @@ func fireScheduledCreate(t *testing.T, srv *Server, s store.Store, projectID, ag
 	require.NoError(t, err)
 	// The event carries the recorded authorization revision a session
 	// create by the dev user writes (a fire refuses an event without one).
-	return srv.dispatchAgentEventHandler()(ctx, withSessionRevision(store.ScheduledEvent{
+	return fireScheduledActionForTest(ctx, srv, "dispatch_agent", withSessionRevision(store.ScheduledEvent{
 		ID: tid("sched-" + agentName + "-" + t.Name()), ProjectID: projectID, EventType: "dispatch_agent",
 		Payload: string(payload), CreatedBy: DevUserID,
 	}, DevUserID))

@@ -53,7 +53,7 @@ var relationshipOwnerExcluded = map[relationshipAllowKey][]string{
 	// by the management handlers (issuer and current owner from the stored
 	// rows, the permission on the hub or on the grant's boundary project),
 	// never through a relationship grant.
-	{"owner", "user", "agent"}: {"agent.log_append", "agent.delegation.exchange", "agent.delegation.revoke", "agent.delegation.credential.revoke", "agent.delegation.list", "agent.delegation.read"},
+	{"owner", "user", "agent"}: {"agent.log_append", "agent.delegation.exchange", "agent.delegation.revoke", "agent.delegation.credential.revoke", "agent.delegation.list", "agent.delegation.read", "agent.delegation.revoke_all"},
 	// Project.OwnerID grants nothing (ptone/scion#2586): project authority
 	// comes only from project-scoped role bindings, so every project
 	// permission is excluded from the owner relationship.
@@ -61,9 +61,9 @@ var relationshipOwnerExcluded = map[relationshipAllowKey][]string{
 		"project.create", "project.read", "project.update", "project.delete",
 		"project.manage", "project.register", "project.set_messaging_policy",
 		"project.clone", "project.list", "project.secret_read", "project.manage_visitors",
-		"project.chat_post",
+		"project.chat_post", "project.manage_message_policies", "project.read_message_policies",
 	},
-	{"owner", "user", "template"}:       {},
+	{"owner", "user", "template"}:       {"template.create_global", "template.update_global", "template.delete_global"},
 	{"owner", "user", "harness_config"}: {},
 	{"owner", "user", "group"}:          {},
 	// broker.auto_provide offers a broker to every project; it is held by
@@ -75,14 +75,15 @@ var relationshipOwnerExcluded = map[relationshipAllowKey][]string{
 	// satisfies it until the slice that wires the token-mint check adds that
 	// mapping. No user relationship, including ownership, should grant it.
 	{"owner", "user", "gcp_service_account"}: {"gcp_service_account.use"},
-	{"owner", "user", "skill"}:               {},
-	{"ancestor", "user", "agent"}:            {"agent.log_append", "agent.delegation.exchange", "agent.delegation.revoke", "agent.delegation.credential.revoke", "agent.delegation.list", "agent.delegation.read"},
+	{"owner", "user", "skill"}:               {"skill.create_global", "skill.update_global", "skill.delete_global"},
+	{"ancestor", "user", "agent"}:            {"agent.log_append", "agent.delegation.exchange", "agent.delegation.revoke", "agent.delegation.credential.revoke", "agent.delegation.list", "agent.delegation.read", "agent.delegation.revoke_all"},
 	// Agent ancestors: permissions with no agent JWT scope, and the
 	// Reserved agent.log_append.
 	{"ancestor", "agent", "agent"}: {
 		"agent.read", "agent.list", "agent.update", "agent.port_access", "agent.stop_all",
 		"agent.message", "agent.grant_hub_mode", "agent.log_append", "agent.delegation.create", "agent.delegation.exchange",
 		"agent.delegation.revoke", "agent.delegation.credential.revoke", "agent.delegation.list", "agent.delegation.read",
+		"agent.delegation.revoke_all",
 	},
 	// Launcher status read (ptone/scion#3409): agent.read only.
 	{"launcher", "agent", "agent"}: {
@@ -92,6 +93,7 @@ var relationshipOwnerExcluded = map[relationshipAllowKey][]string{
 		"agent.log_append", "agent.notify", "agent.token_refresh", "agent.port_forward",
 		"agent.identity_token", "agent.delegation.create", "agent.delegation.exchange",
 		"agent.delegation.revoke", "agent.delegation.credential.revoke", "agent.delegation.list", "agent.delegation.read",
+		"agent.delegation.revoke_all",
 	},
 	{"hub_member_sa_assign", "user", "gcp_service_account"}: {
 		"gcp_service_account.create", "gcp_service_account.read", "gcp_service_account.delete",
@@ -99,7 +101,7 @@ var relationshipOwnerExcluded = map[relationshipAllowKey][]string{
 		"gcp_service_account.use",
 	},
 	{"progeny", "agent", "skill"}: {
-		"skill.create", "skill.create_global", "skill.update", "skill.delete", "skill.list", "skill.register",
+		"skill.create", "skill.create_global", "skill.update", "skill.update_global", "skill.delete", "skill.delete_global", "skill.list", "skill.register",
 	},
 	// Progeny material pairs (ptone/scion#2129). Every secret and env_var
 	// permission is admitted; skill_injection.deliver is granted by
@@ -107,6 +109,15 @@ var relationshipOwnerExcluded = map[relationshipAllowKey][]string{
 	{"progeny", "agent", "secret"}:          {},
 	{"progeny", "agent", "env_var"}:         {},
 	{"progeny", "agent", "skill_injection"}: {"skill_injection.deliver"},
+	// Association delivery (ptone/scion#2129). Only the deliver permissions
+	// are admitted: runtime retrieval (secret.use) is never an association
+	// grant (F design section 4.6).
+	{"project_association", "agent", "secret"}:  {"secret.use"},
+	{"project_association", "agent", "env_var"}: {},
+	{"hub_association", "agent", "secret"}:      {"secret.use"},
+	{"hub_association", "agent", "env_var"}:     {},
+	{"broker_association", "agent", "secret"}:   {"secret.use"},
+	{"broker_association", "agent", "env_var"}:  {},
 }
 
 func policyCellPermissions() map[relationshipAllowKey]map[string]bool {

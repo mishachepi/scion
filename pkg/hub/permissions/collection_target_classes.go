@@ -85,6 +85,7 @@ var CollectionTargetClasses = map[string][]TargetClassKind{
 	// it, never as a collection-level request.
 	"agent.delegation.revoke": {}, "agent.delegation.credential.revoke": {},
 	"agent.delegation.list": {}, "agent.delegation.read": {},
+	"agent.delegation.revoke_all": {},
 
 	// project.* — create/list are CapabilityScope; register/clone are
 	// CapabilityResource (register/clone target an EXISTING project — the
@@ -94,6 +95,7 @@ var CollectionTargetClasses = map[string][]TargetClassKind{
 	"project.create": {TargetClassKindHubResource}, "project.read": {},
 	"project.update": {}, "project.delete": {}, "project.manage": {},
 	"project.register": {}, "project.set_messaging_policy": {}, "project.clone": {},
+	"project.manage_message_policies": {}, "project.read_message_policies": {},
 	"project.manage_visitors": {}, "project.chat_post": {}, "project.list": {TargetClassKindHubResource},
 
 	// artifact.* — create is CapabilityScope (publish into a project);
@@ -106,27 +108,27 @@ var CollectionTargetClasses = map[string][]TargetClassKind{
 	"artifact.update": {}, "artifact.delete": {}, "artifact.manage": {}, "artifact.steward": {},
 
 	// skill.* — create/create_global/list/register are CapabilityScope;
-	// read/update/delete are CapabilityResource (always an existing skill).
+	// read/update/delete and update_global/delete_global always target an
+	// existing skill record.
 	"skill.create":        {TargetClassKindProjectScoped},
 	"skill.create_global": {TargetClassKindHubResource},
 	"skill.read":          {}, "skill.update": {}, "skill.delete": {},
+	"skill.update_global": {}, "skill.delete_global": {},
 	"skill.list":     {TargetClassKindProjectScoped, TargetClassKindGlobalCatalog},
 	"skill.register": {TargetClassKindHubResource},
 
-	// template.*, harness_config.* — same CapabilityKind shape as skill,
-	// but unlike skill, there is no separate *_create_global permission ID:
-	// the single template.create/harness_config.create permission covers
-	// every scope. templateScopeResource(store.TemplateScopeGlobal, "")
-	// (template_handlers.go, global create) and templateUserScopeResource
-	// (template_handlers.go, user-scope create) both build a parentless
-	// Resource with ScopeKind global/user — computeTargetFacts maps both to
-	// the same hasGlobalScope fact, so both need TargetClassKindGlobalCatalog
-	// here alongside the project-scoped create path
-	// (templateScopeResource(store.TemplateScopeProject, projectID)).
-	// harnessConfigScopeResource (harness_config_handlers.go) is the same
-	// shape for harness_config.create.
-	"template.create": {TargetClassKindProjectScoped, TargetClassKindGlobalCatalog},
-	"template.read":   {}, "template.update": {}, "template.delete": {},
+	// template.* — create/list are CapabilityScope; create_global is a
+	// hub-level collection action (CapabilityNone) and update_global/
+	// delete_global target an existing global template record. template.create
+	// keeps TargetClassKindGlobalCatalog alongside TargetClassKindProjectScoped
+	// because templateUserScopeResource (user-scope create) builds a parentless
+	// Resource with ScopeKind user, which computeTargetFacts maps to
+	// hasGlobalScope; global-scope create routes through template.create_global.
+	// harness_config.* still uses harness_config.create across every scope.
+	"template.create":        {TargetClassKindProjectScoped, TargetClassKindGlobalCatalog},
+	"template.create_global": {TargetClassKindHubResource},
+	"template.read":          {}, "template.update": {}, "template.delete": {},
+	"template.update_global": {}, "template.delete_global": {},
 	"template.list": {TargetClassKindProjectScoped, TargetClassKindGlobalCatalog},
 
 	"harness_config.create": {TargetClassKindProjectScoped, TargetClassKindGlobalCatalog},
@@ -201,7 +203,13 @@ var CollectionTargetClasses = map[string][]TargetClassKind{
 	// test_identity.issue_admin and issue_super_admin — admin-kind
 	// issuance and revoke-all target the same hub-level collection.
 	"test_identity.issue_admin": {TargetClassKindHubResource}, "test_identity.issue_super_admin": {TargetClassKindHubResource},
-	"hub.github_app.read": {TargetClassKindHubResource}, "hub.github_app.update": {TargetClassKindHubResource},
+	// system_one_instance.* — read/create authorize against the hub-scoped
+	// collection target; delete/execute target an existing named instance.
+	"system_one_instance.read":    {TargetClassKindHubResource},
+	"system_one_instance.create":  {TargetClassKindHubResource},
+	"system_one_instance.delete":  {},
+	"system_one_instance.execute": {},
+	"hub.github_app.read":         {TargetClassKindHubResource}, "hub.github_app.update": {TargetClassKindHubResource},
 	"hub.metrics.read": {TargetClassKindHubResource}, "hub.audit.read": {},
 	"hub.env_vars.read": {TargetClassKindHubResource},
 
@@ -249,6 +257,19 @@ var CollectionTargetClasses = map[string][]TargetClassKind{
 	"scheduled_event.read": {}, "scheduled_event.list": {TargetClassKindProjectScoped},
 	"scheduled_event.create": {TargetClassKindProjectScoped}, "scheduled_event.delete": {},
 	"scheduled_event.update": {},
+
+	// github_trigger.* — comment is CapabilityScope (authoring/firing a
+	// github.comment trigger action within a project); configure authorizes
+	// against the existing project's github_trigger settings instance.
+	"github_trigger.comment": {TargetClassKindProjectScoped}, "github_trigger.configure": {},
+
+	// trigger.* and webhook_endpoint.* — list/create are CapabilityScope;
+	// read/delete/update target an existing trigger or webhook endpoint.
+	"trigger.read": {}, "trigger.list": {TargetClassKindProjectScoped},
+	"trigger.create": {TargetClassKindProjectScoped}, "trigger.delete": {},
+	"trigger.update":        {},
+	"webhook_endpoint.read": {}, "webhook_endpoint.list": {TargetClassKindProjectScoped},
+	"webhook_endpoint.create": {TargetClassKindProjectScoped}, "webhook_endpoint.delete": {},
 
 	// project.secret_read — agent self-service, no CapabilityKind, always
 	// an existing project's secret.

@@ -19,7 +19,7 @@ The P4 work depends on eight points. Each is frozen here or deliberately deferre
 | Zero, false and unknown-key semantics | FC7 |
 | Saved storage records and applied config | FC9 |
 | Project-level overrides | FC8 (no new project rung; deferred) |
-| Per-profile default GCP service account | FC10 (node-local; Hub default per instance deferred) |
+| Per-profile / per-broker default GCP service account | FC10 (node-local policy on `runtime_target`; Hub project default per flat Runtime Broker via `defaultGCPIdentityServiceAccountIDByBroker`) |
 | Capacity surfaces | FC11 |
 
 **Delivery of the schema is phased.** FC1 freezes every field now. P3.1-a wires `runtime_target.shared_dir_storage_class` and `runtime_target.shared_dir_size`. The other FC1 fields were **reserved** until they were wired: the strict instance loader refused each of them with an explicit error naming its path ("reserved … not supported in this release"), never by silently dropping it. P3.1-b wires the remaining `runtime_target` fields and P3.1-c wires `agent_defaults`; each removes its keys from the reserved list in the same change that wires them. A reserved key never has a partial effect. Errata (P3.1-d): with P3.1-b and P3.1-c, every FC1 field is wired and both reserved lists are empty; the loader keeps the reserved-key check for a field a later change freezes before it wires it.
@@ -139,11 +139,13 @@ P3 also freezes the **maximum publishable set**: the Go type `config.FlatInstanc
 | `runtime_target.context` | **never** | a local kubeconfig alias, not a stable identity |
 | `runtime_target.kubeconfig` | **never** | a local credential path |
 | `runtime_target.kubernetes_service_account_mappings`, `kubernetes_block_service_account` | **never** | local operator identity policy |
+| `runtime_target.workload_identity_pool`, `create_service_accounts` | **never** | local operator Workload Identity / ServiceAccount creation policy; reported only in kind-neutral `workloadIdentityTargets` to the Hub and redacted from Runtime Broker read responses unless the viewer holds `hub.config.read` (ptone/scion#7967) |
 | `runtime_target.gke` | as is (bool) | behaviour flag |
 | `runtime_target.priority_class_name`, `shared_dir_storage_class`, `shared_dir_size` | as is | scheduling and storage defaults |
 | `runtime_target.safe_to_evict` | as is, tri-state (unset / true / false) | scheduling default |
 | `runtime_target.shared_dir_storage_backend`, `shared_dir_storage_backends` (dir name → `local`/`nfs`), `home_storage_backend` | as is | backend choice only; NFS server addresses live in `server.shared_dir_storage.nfs`, not in the instance |
 | `runtime_target.home_storage_leaf` | **never** | a host path component |
+| `runtime_target.node_selector`, `tolerations` (`key`, `operator`, `value`, `effect`), `runtime_class_name` | as is, plus the marker `placement_reported` (wire `placementReported`), true when the instance reports placement (a Kubernetes target). Absent or false means not reported, not "no placement"; the Hub stores the marker as received and never sets it | scheduling placement for new agents (amendment: Kubernetes scheduling design v2, P1.1) |
 | `agent_defaults.default_harness_config`, `image_registry`, `clone_depth` | as is | names and values without credentials |
 | `agent_defaults.resources` | as is (requests / limits) | quantities |
 | `agent_defaults.volumes[]` (`api.VolumeMount`) | **`target`, `read_only`, `type` only**; `source`, `bucket`, `prefix`, `server`, `mode`, `volume_name` **never** | host paths and storage locations are node-local layout |
@@ -160,6 +162,7 @@ Normative: **each field keeps its own existing precedence chain, and the instanc
 | `safe_to_evict` | below the agent's own (inline or persisted) `kubernetes.safeToEvict`, which wins whether true or false (`ApplySafeToEvictDefault`); it stays an overridable default, never mandatory policy. Errata (P3.1-b): an earlier text said the template's value wins; a template's `kubernetes` block is not applied to the agent's job config (ptone/scion#4524), so the agent's own config is the outranking tier |
 | `priority_class_name` | below the agent's own (inline or persisted) `kubernetes.priorityClassName`. Errata (P3.1-b): an earlier text said a template's value wins; a template's `kubernetes` block is not applied to the agent's job config (ptone/scion#4524) |
 | `gke` | consumed when the instance runtime is built |
+| `node_selector`, `tolerations`, `runtime_class_name` | operator-owned, not a default (amendment: Kubernetes scheduling design v2, P1.1): the agent's own `kubernetes` block may add node selector keys, but cannot change a key the instance sets or the runtime class, and its tolerations must be among the instance's, so an agent toleration is refused when the instance sets none (`config.ApplyOperatorPlacement`) |
 | `shared_dir_storage_backend(s)` | between the agent's recorded backend (always kept) and `server.shared_dir_storage.backend`; flat order is instance per-dir, instance single, global |
 | `home_storage_backend`, `home_storage_leaf` | above `server.home_storage`; first start only, the recorded decision is kept afterwards |
 | `default_harness_config` | rung 6 of `ResolveHarnessConfigName`: below template and stored rungs, above top-level `default_harness_config` |
@@ -219,10 +222,12 @@ Rules:
 4. **Never auto-merge, never generate templates.**
 5. No-effect legacy fields (`runtimes.<r>.host`, `.env`, `.sync`, `profiles.<p>.default_template`) → notice `legacy_field_no_effect`. `profiles.<p>.env` in raw input → notice `legacy_field_removed`.
 6. `list_all_namespaces: true` → blocking `flat_target_scope_violation`. A runtime type without a flat target (podman, container, cloudrun, cloudrun-instances, cloudrun-sandbox, substrate) → blocking `unsupported_flat_target_type`.
+   - **Amendment (P5-CR):** this rule is replaced by CR10 in `p5-cloudrun-amendment.md`, which is authoritative: `cloudrun` and `cloudrun-instances` convert to a `cloudrun` instance, and `cloudrun-sandbox` and `substrate` stay blocking.
 7. Unknown keys under `profiles.<p>` / `runtimes.<r>` → blocking `unknown_settings_key`.
 8. Secret declarations are copied; no secret value is ever read, resolved or emitted, and the converter has no secret-backend dependency.
 
 **Frozen finding codes:** `unsupported_flat_target_type`, `flat_target_scope_violation`, `profile_conflict`, `profile_conflict_resolved`, `legacy_field_no_effect`, `legacy_field_removed`, `unknown_settings_key`, `field_not_valid_for_target_type`.
+- **Amendment (P5-CR):** CR11 in `p5-cloudrun-amendment.md` adds `flat_target_field_required` and `flat_target_operator_input_required` to this list.
 
 `ProfileMap` is the explicit, unambiguous migration mapping that P4.1 uses to translate an old `profile` request field or `defaultProfile` preference. A profile with a blocking finding, or with no `ProfileMap` entry, has no translation; P4.1 returns its actionable error.
 
@@ -232,6 +237,8 @@ Rules:
 - **Instance keys.** `TargetGroup` keys are derived from the scope only: `docker`, `k8s` plus the context and namespace that are set, and for a Split group the group's key plus its profiles, each part made key-safe. An 8-hex sha256 suffix of the scope (and Split members) is appended when a part is not key-safe, when the key would be too long, or when two groups of one conversion would share a key, so every group has its own key and the same input always gives the same keys.
 - **Harness override presence.** A harness override that only some profiles of a group set is reported for its presence only when none of its sub-fields conflicts; a sub-field conflict already names the override.
 - **Docker targets.** A Kubernetes-only key on a profile or runtime entry whose target is docker is not copied (a docker runtime ignores it) and is reported as the notice `field_not_valid_for_target_type`.
+
+**Errata (preserve by splitting).** This replaces rules 3 and 4 for representable fields; no frozen name, type or code changes. Profiles of one group that differ in a field a flat instance holds (placement included) are split into one instance per set of profiles with equal values, never blocked. Each split instance has the group key plus its profile names (the operator Split scheme). One notice, `profile_conflict` at `Path` `profiles.*`, names the differing fields (no values) and the new instances. A field choice for the group key consolidates that field on the chosen value, and `profile_conflict_resolved` still lists every dropped value. A profile pool that differs from its runtime entry's is kept, with a notice at `profiles.<p>.node_selector`. Runtime entries that may share a cluster and namespace but disagree on placement keep their own placement, with a notice at `runtimes.<r>`. Blocking findings remain only for details no flat instance can hold (rules 6 and 7, invalid choices).
 
 ## FC7. Zero, false and unknown-key rules
 
@@ -256,9 +263,11 @@ Project settings never set instance values. The strict loader reads only global 
 
 **Frozen as unchanged.** The `shared-dir-storage.json` and `home-storage.json` formats and semantics are untouched: a recorded backend is always kept, a settings change only warns, and instance policy affects only first-start resolution. P3 adds no instance-default provenance to `agents.applied_config` and no agent columns. The resolved source label appears only in Runtime Broker logs and errors.
 
-## FC10. GCP service-account policy on flat Kubernetes instances
+## FC10. GCP service-account policy on flat instances
 
-**Frozen:** flat service-account policy stays node-local in `runtime_target` (`kubernetes_block_service_account`, `kubernetes_service_account_mappings`; `pkg/runtimebroker/flat_k8s_identity.go`) and is never sent to the Hub (FC4-a "never"). The per-profile default service-account project annotation (`scion.io/default-gcp-identity-service-account-id-by-profile`) is not applied to pinned agents. **Deferred to P4.1:** a per-instance Hub-side default service account. It is a Hub settings feature with authorization implications, not a profile-default mapping, and has no source field in FC1.
+**Frozen:** flat service-account policy stays node-local in `runtime_target` (`kubernetes_block_service_account`, `kubernetes_service_account_mappings` on `kubernetes`, `pkg/runtimebroker/flat_k8s_identity.go`; `block_service_account`, `assignable_service_accounts` on `cloudrun`, `pkg/runtimebroker/flat_cloudrun_identity.go`, per `p5-cloudrun-amendment.md` CR1–CR3) and is never sent to the Hub (FC4-a "never"). The per-profile default service-account project annotation (`scion.io/default-gcp-identity-service-account-id-by-profile`) is not applied to pinned agents on flat Runtime Brokers.
+
+**Amendment (2026-11-16; ptone/scion#4895):** projects may configure a per-broker default GCP service account on the Hub via `ProjectSettings.DefaultGCPIdentityServiceAccountIDByBroker` (`map[brokerID]serviceAccountID`, stored in project annotation `scion.io/default-gcp-identity-service-account-id-by-broker`; no database schema migration). Writes require project-admin permission and `hub.flat_runtime_brokers` enabled in the Hub, accept only existing flat Runtime Broker IDs as keys (at most 64 entries), and require verified project GCP service account IDs as values (`assign` mode only, matching by-profile defaults). On both interactive and scheduled agent create, when the target Runtime Broker is flat and `hub.flat_runtime_brokers` is enabled, the Hub evaluates the default ladder in order: explicit request GCP identity > project per-broker default (`defaultGCPIdentityServiceAccountIDByBroker[brokerID]`) > project-wide default > Hub default (per-profile defaults remain legacy-only). Entries for deleted Runtime Brokers, or stored entries while `hub.flat_runtime_brokers` is disabled, are ignored at ladder resolution; an unverified or unauthorized configured default fails closed without falling through to a lower rung. When a flat Runtime Broker returns HTTP 400 rejecting a GCP identity supplied by a default rung (for example an account absent from a flat Cloud Run instance's `assignable_service_accounts`), the create response attributes the default rung and how to change or clear it.
 
 ## FC11. Capacity surfaces
 
@@ -285,3 +294,23 @@ Binding points for the release:
 ## Not frozen
 
 P4 is free to choose: the Hub transport of FC4, web and CLI presentation, flat-awareness of `/api/v1/info`, health-summary and GCP service-account status display of the runtime target, and the `hub.*` → `server.broker.*` key move. Sequence P4 settings-file edits after the P3.1 schema changes merge, to avoid schema conflicts.
+
+## Change log
+
+### Amendment (P5-CR) (2026-11-04; ptone/scion#7308)
+
+`p5-cloudrun-amendment.md` is authoritative for these changes; the frozen text above carries a pointer at rule 6.
+- **FC1 (CR7):** `runtime_target` admits the six Cloud Run fields for `type: cloudrun`.
+- **FC4-a (CR8):** new rows. `runtime_target.region` is published as is; `project_id`, `service_account`, `network`, `subnetwork` and `credentials_file` are never published.
+- **FC6 rule 1 (CR9):** Cloud Run groups by type plus `project_id` and `region`; errata instance keys are `cloudrun` plus project and region.
+- **FC6 rule 6 (CR10):** replacement text. `cloudrun` and `cloudrun-instances` convert to a `cloudrun` instance.
+- **Frozen finding codes (CR11):** add `flat_target_field_required` (always blocking) and `flat_target_operator_input_required` (always a notice; `convert --plan` exits 3 for it).
+
+### Amendment (flat GCP identity & Cloud Run converter) (2026-11-16; ptone/scion#7764, ptone/scion#4895)
+
+`p5-cloudrun-amendment.md` (amended 2026-11-13 and 2026-11-16 for ptone/scion#7308 and ptone/scion#7764) and FC10 above (ptone/scion#4895) are authoritative for these changes:
+- **FC1 / CR1–CR2:** `runtime_target` for `type: cloudrun` requires `block_service_account` (a dedicated no-role customer-managed service account distinct from `service_account`) and accepts optional `assignable_service_accounts` (at most 64 customer-managed service accounts, excluding `block_service_account`).
+- **CR3:** replaces the initial E-10 blanket per-agent GCP identity refusal on flat `cloudrun` with always-native execution (`unset`, `block`, and confined `passthrough` run as `block_service_account` with `SCION_METADATA_MODE=block`; `assign` runs as an allow-listed entry of `assignable_service_accounts`; explicit `passthrough` runs as `service_account`; `hub.cloudrun_native_identity` does not apply to flat Runtime Brokers; `scion doctor` checks `iam.serviceAccounts.actAs` across all configured agent accounts with the instance's `credentials_file` credentials).
+- **FC4-a / CR8:** `runtime_target.block_service_account` and `runtime_target.assignable_service_accounts` are **never** published.
+- **FC6 / CR9–CR10:** derived Cloud Run instance keys use `cloudrun-<region>` (omitting `project_id`, with the 8-hex scope hash on collision); `cloudrun.block_service_account` and `cloudrun.assignable_service_accounts` fold onto `runtime_target` (splitting on differing values; missing `block_service_account` on `cloudrun` is blocking `flat_target_field_required`, and on `cloudrun-instances` is notice `flat_target_operator_input_required`).
+- **FC10:** replaces the deferred Hub per-instance default note with the landed project-scoped `defaultGCPIdentityServiceAccountIDByBroker` (`explicit > by-broker > project > hub` on flat Runtime Brokers, `assign` only, gated on `hub.flat_runtime_brokers`).

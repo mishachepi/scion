@@ -238,14 +238,20 @@ func TestProjectCreateToken_SeededOwnerRoleNeedsUnmappedPermissions(t *testing.T
 	unmapped := pctUnmappedOwnerPerms()
 	require.NotEmpty(t, unmapped, "the seeded project-owner role carries permissions with no selector")
 	// The token carries project:create and every owner selector the holder
-	// can select on a hub boundary.
+	// can select on a hub boundary. Delete each single-selector probe token
+	// before minting the combined token so growing projectOwnerPermissionIDs
+	// past store.UATMaxPerUser (50) does not trip ErrUATLimitExceeded.
 	scopes := []string{"project:create"}
 	for _, p := range projectOwnerPermissionIDs() {
 		sel := bearerMatrixSelector(p)
 		if sel == "" || !permissionEligibleForBoundary(p, BoundaryKindHub) {
 			continue
 		}
-		if pctMintErr(srv, holder, hubBoundary(), sel) == nil {
+		_, probeTok, err := srv.uatService.CreateTokenWithParams(rs4MintContext(holder), CreateTokenParams{
+			UserID: holder, Name: "pct-" + tid("tok"), Boundary: hubBoundary(), Scopes: []string{sel},
+		})
+		if err == nil {
+			require.NoError(t, s.DeleteUserAccessToken(context.Background(), probeTok.ID))
 			scopes = append(scopes, sel)
 		}
 	}
@@ -465,11 +471,43 @@ func TestProjectRegisterToken_EmbeddedBrokerFormIsSessionOnly(t *testing.T) {
 }
 
 // TestBuiltInRoles_SuperAdminRevision pins the super-admin revision and its
-// latest changes: revision 9 adds project.chat_post (ptone/scion#5518),
+// latest changes: revision 16 adds project.manage_message_policies and
+// project.read_message_policies (ptone/scion#8047), revision 15 adds trigger.*
+// and webhook_endpoint.* (ptone/scion#8028), revision 14 adds
+// github_trigger.{comment,configure} (ptone/scion#8090), revision 13 adds
+// system_one_instance.{read,create,delete,execute}
+// (ptone/scion#8044), revision 12 adds template.create_global,
+// template.update_global, and template.delete_global (ptone/scion#1713),
+// revision 11 adds skill.update_global and skill.delete_global
+// (ptone/scion#1713), revision 10 adds agent.delegation.revoke_all
+// (ptone/scion#2132), revision 9 project.chat_post (ptone/scion#5518),
 // revision 8 drops project.register, a reserved row.
 func TestBuiltInRoles_SuperAdminRevision(t *testing.T) {
 	admin := builtInRoleByName(t, store.SystemRoleSuperAdmin)
-	assert.Equal(t, 9, admin.Revision)
+	assert.Equal(t, 16, admin.Revision)
+	assert.Contains(t, admin.Permissions, "project.manage_message_policies")
+	assert.Contains(t, admin.Permissions, "project.read_message_policies")
+	assert.Contains(t, admin.Permissions, "github_trigger.comment")
+	assert.Contains(t, admin.Permissions, "github_trigger.configure")
+	assert.Contains(t, admin.Permissions, "trigger.read")
+	assert.Contains(t, admin.Permissions, "trigger.list")
+	assert.Contains(t, admin.Permissions, "trigger.create")
+	assert.Contains(t, admin.Permissions, "trigger.delete")
+	assert.Contains(t, admin.Permissions, "trigger.update")
+	assert.Contains(t, admin.Permissions, "webhook_endpoint.read")
+	assert.Contains(t, admin.Permissions, "webhook_endpoint.list")
+	assert.Contains(t, admin.Permissions, "webhook_endpoint.create")
+	assert.Contains(t, admin.Permissions, "webhook_endpoint.delete")
+	assert.Contains(t, admin.Permissions, "system_one_instance.read")
+	assert.Contains(t, admin.Permissions, "system_one_instance.create")
+	assert.Contains(t, admin.Permissions, "system_one_instance.delete")
+	assert.Contains(t, admin.Permissions, "system_one_instance.execute")
+	assert.Contains(t, admin.Permissions, "template.create_global")
+	assert.Contains(t, admin.Permissions, "template.update_global")
+	assert.Contains(t, admin.Permissions, "template.delete_global")
+	assert.Contains(t, admin.Permissions, "skill.update_global")
+	assert.Contains(t, admin.Permissions, "skill.delete_global")
+	assert.Contains(t, admin.Permissions, "agent.delegation.revoke_all")
 	assert.Contains(t, admin.Permissions, "project.chat_post")
 	assert.NotContains(t, admin.Permissions, "project.register")
 	assert.Contains(t, admin.Permissions, "project.create")

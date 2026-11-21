@@ -53,6 +53,11 @@ func (s *Server) notificationDispatchSweepHandler() func(ctx context.Context) {
 				"count", expired, "maxAge", notificationRetryMaxAge)
 		}
 
+		// Parked notifications of subscribers the hub suspended: wake them
+		// in the background (a primary dispatch's wake may have failed, or
+		// the hub restarted meanwhile); the drain after each wake delivers.
+		s.autoWakeParkedNotificationSubscribers(ctx)
+
 		notifs, err := s.store.GetUndispatchedAgentNotifications(ctx, "")
 		if err != nil {
 			s.agentLifecycleLog.Error("notification-dispatch-sweep: query failed", "error", err)
@@ -206,6 +211,9 @@ func (nd *NotificationDispatcher) retryBatch(ctx context.Context, notifs []store
 				"remaining", len(notifs)-i)
 			return
 		}
+		// This RuntimeBrokerID read only skips brokers already found
+		// unreachable in this pass; it never delivers, so it does not break
+		// retryDispatch's hold-before-broker order (ptone/scion#7145).
 		if len(skipBrokers) > 0 && skipBrokers[nd.subscriberBrokerID(ctx, &notifs[i])] {
 			continue
 		}
@@ -294,10 +302,12 @@ func (nd *NotificationDispatcher) setOutcome(ctx context.Context, notificationID
 // is called before delivery to prevent double-dispatch when the sweep and hook
 // race on the same notification. If the claim fails (another caller already
 // claimed it), this is a no-op. If delivery cannot proceed (no dispatcher, no
-// broker, a suspended subscriber) the claim is reverted with no attempt
-// counted. If the delivery attempt fails, the claim is reverted with a retry
-// backoff (store.NotificationRetryBackoff) before which the sweep does not
-// claim it again. When it gives up instead (a failed delivery older than
+// broker, a suspended subscriber, a subscriber whose hold cannot be read) the
+// claim is reverted with no attempt counted. A held subscriber's notification
+// keeps the claim and is recorded as failed with reason subscriber_held
+// (ptone/scion#7145). If the delivery attempt fails, the claim is reverted with
+// a retry backoff (store.NotificationRetryBackoff) before which the sweep
+// does not claim it again. When it gives up instead (a failed delivery older than
 // notificationRetryMaxAge, or a subscription, subscriber or watched agent
 // that is gone), the notification stays claimed with the failed outcome and
 // a reason (store.NotificationReason*). A
@@ -399,6 +409,23 @@ func (nd *NotificationDispatcher) retryDispatch(ctx context.Context, notif *stor
 		return retryNotAttempted, ""
 	}
 
+	// A held subscriber gets no notice (ptone/scion#7145), whatever its
+	// phase. This check comes BEFORE the suspended check and before any use
+	// of the subscriber's runtime broker (the sweep query selects a held
+	// subscriber's notifications even when it is suspended or has no
+	// broker): the claim is kept and the notification is recorded as
+	// failed with reason subscriber_held, with no delivery attempt. When
+	// the hold cannot be read nothing is delivered and the claim is
+	// reverted, so a later pass checks it again.
+	switch noticeHoldOf(ctx, nd.store, noticeLogger(nd.messageLog, nd.log), subscriber, heldNoticeNotification) {
+	case noticeHeld:
+		nd.setOutcome(ctx, notif.ID, store.NotificationOutcomeFailed, store.NotificationReasonSubscriberHeld)
+		return retryNotAttempted, ""
+	case noticeHoldUnknown:
+		nd.revertClaim(ctx, notif.ID)
+		return retryNotAttempted, ""
+	}
+
 	// A suspended subscriber has no running agent to deliver to. Its
 	// notifications stay pending (parked) with no attempt counted: the sweep
 	// query leaves them out until the agent leaves the suspended phase, and
@@ -408,6 +435,7 @@ func (nd *NotificationDispatcher) retryDispatch(ctx context.Context, notif *stor
 		nd.log.Debug("retry: subscriber is suspended, reverting claim",
 			"subscriberID", sub.SubscriberID, "notificationID", notif.ID)
 		nd.revertClaim(ctx, notif.ID)
+		nd.offerAutoWake(subscriber)
 		return retryNotAttempted, ""
 	}
 
@@ -468,8 +496,33 @@ func (nd *NotificationDispatcher) retryDispatch(ctx context.Context, notif *stor
 	attemptCtx, cancel := context.WithTimeout(ctx, retryDispatchAttemptTimeout)
 	defer cancel()
 	brokerID = subscriber.RuntimeBrokerID
-	nd.recordAttempt(ctx, notif.ID)
-	if err := dispatchWithBrokerRetry(attemptCtx, nd.messageLog, dispatcher, subscriber, notif.Message, false, structuredMsg); err != nil {
+	err = dispatchWithBrokerRetry(
+		attemptCtx,
+		nd.deliveryMarker(),
+		nd.messageLog,
+		dispatcher,
+		subscriber,
+		notif.Message,
+		false,
+		structuredMsg,
+		withBeforeBrokerAttempt(func() { nd.recordAttempt(ctx, notif.ID) }),
+	)
+	if err != nil {
+		var idleErr *errAgentIdleSuspending
+		if errors.As(err, &idleErr) {
+			nd.log.Debug("retry: subscriber is suspending or suspended, reverting claim",
+				"subscriberID", sub.SubscriberID, "notificationID", notif.ID)
+			nd.revertClaim(ctx, notif.ID)
+			nd.offerAutoWake(subscriber)
+			return retryNotAttempted, ""
+		}
+		var markErr *errDeliveryMarkFailed
+		if errors.As(err, &markErr) {
+			nd.log.Warn("retry: delivery mark failed before dispatch, reverting claim",
+				"notificationID", notif.ID, "subscriberID", sub.SubscriberID, "error", err)
+			nd.revertClaim(ctx, notif.ID)
+			return retryNotAttempted, ""
+		}
 		outcome = retryFailed
 		// ErrBrokerTimeout: deferred (unroutable) until the attempt timed out.
 		// DeadlineExceeded: the broker call itself ran out the attempt.

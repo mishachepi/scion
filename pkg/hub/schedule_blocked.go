@@ -19,9 +19,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/hubfire"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/google/uuid"
 )
@@ -31,47 +33,86 @@ import (
 // (ptone/scion#3701). One is created per blocked fire, not deduplicated.
 const NotificationScheduleBlocked = "SCHEDULE_BLOCKED"
 
+// isScheduleBlockedPlacementRefusal reports whether existing's delete would be
+// refused for an inconsistent saved placement (ptone/scion#4844): its failed
+// delete already recorded placement_conflict, its create-failure cleanup
+// recorded a placement refusal, or its current saved placement fails the
+// delete placement check.
+func (s *Server) isScheduleBlockedPlacementRefusal(ctx context.Context, existing *store.Agent) bool {
+	if existing == nil {
+		return false
+	}
+	if existing.DeletionEffectiveCode(time.Now()) == store.DeletionCodePlacementConflict {
+		return true
+	}
+	if isCreateCleanupRefusedRow(existing) && strings.Contains(existing.Message, inconsistentPlacementDocsURL) {
+		return true
+	}
+	if s != nil && s.store != nil {
+		if _, ok := placementRefusalOf(agentDeletePlacementCheck(ctx, s.store, existing)); ok {
+			return true
+		}
+	}
+	return false
+}
+
 // scheduleBlockedError is a dispatch_agent fire's error when an agent row in
-// phase error already holds the name. Deleting the row is the only remedy:
-// the hub neither retries nor removes it. A row left by a refused
-// create-failure cleanup has its message quoted. One-shot events get the same
-// text (lead ruling on ptone/scion#3701).
-func scheduleBlockedError(existing *store.Agent) error {
+// phase error already holds the name. Deleting the row is the only remedy
+// unless the row's saved placement is inconsistent (where ordinary and force
+// delete also refuse it, ptone/scion#4844): the hub neither retries nor
+// removes it. A row left by a refused create-failure cleanup has its message
+// quoted. One-shot events get the same text (lead ruling on ptone/scion#3701).
+func scheduleBlockedError(existing *store.Agent, placementRefused bool) error {
 	detail := ""
 	if isCreateCleanupRefusedRow(existing) {
 		detail = " (" + existing.Message + ")"
+	}
+	if placementRefused {
+		if detail != "" {
+			return fmt.Errorf("agent %q already exists in project in phase error%s; ordinary and force delete cannot remove this agent while its saved placement is inconsistent",
+				existing.Slug, detail)
+		}
+		return fmt.Errorf("agent %q already exists in project in phase error; its saved placement is inconsistent, so ordinary and force delete cannot remove it (see %s)",
+			existing.Slug, inconsistentPlacementDocsURL)
 	}
 	return fmt.Errorf("agent %q already exists in project in phase error%s; delete the agent to resume this schedule",
 		existing.Slug, detail)
 }
 
-// notifyScheduleBlocked creates a SCHEDULE_BLOCKED notification for the
-// owner of evt (scheduleNotificationRecipient) and publishes it on that
-// user's subject only. Only recurring-schedule fires notify; a one-shot
-// event (no ScheduleID) records its error and nothing else (lead ruling on
-// ptone/scion#3701). Every failure is logged and skipped: it never changes
-// the fire's result.
-func (s *Server) notifyScheduleBlocked(ctx context.Context, evt store.ScheduledEvent, existing *store.Agent) {
-	if evt.ScheduleID == "" {
+// notifyFireBlocked creates a SCHEDULE_BLOCKED notification for the owner of
+// a recurring schedule fire (scheduleNotificationRecipient) blocked by an
+// existing agent row in phase error (ptone/scion#3701) and publishes it on
+// that user's subject only. Only recurring-schedule fires notify; a one-shot
+// event (no ScheduleID) or Stage 1 trigger records its error and nothing else
+// (lead ruling on ptone/scion#3701). Every failure is logged and skipped: it
+// never changes the fire's result.
+func (s *Server) notifyFireBlocked(ctx context.Context, req hubfire.FireRequest, existing *store.Agent, placementRefused bool) {
+	if req.Authority.DefinitionKind != hubfire.DefinitionKindSchedule || req.Authority.DefinitionID == "" {
 		return
 	}
-	log := slog.With("subsystem", "scheduler", "eventID", evt.ID,
-		"scheduleID", evt.ScheduleID, "projectID", evt.ProjectID, "agentID", existing.ID)
-	recipient := s.scheduleNotificationRecipient(ctx, evt.CreatedBy)
+	scheduleID := req.Authority.DefinitionID
+	createdBy := fireHistoryCreatorFromContext(ctx)
+	log := slog.With("subsystem", "scheduler", "eventID", req.Authority.FireID,
+		"scheduleID", scheduleID, "projectID", req.ProjectID, "agentID", existing.ID)
+	recipient := s.scheduleNotificationRecipient(ctx, createdBy)
 	if recipient == "" {
 		log.Warn("Scheduler: blocked fire has no owning user to notify; skipping notification",
-			"createdBy", evt.CreatedBy)
+			"createdBy", createdBy)
 		return
 	}
 
-	name := evt.ScheduleID
-	if sched, err := s.store.GetSchedule(ctx, evt.ScheduleID); err == nil && sched.Name != "" {
+	name := scheduleID
+	if sched, err := s.store.GetSchedule(ctx, scheduleID); err == nil && sched.Name != "" {
 		name = sched.Name
 	}
 	message := fmt.Sprintf("Schedule %q is blocked: agent %q is in phase error. Delete the agent to resume this schedule.",
 		name, existing.Slug)
+	if placementRefused {
+		message = fmt.Sprintf("Schedule %q is blocked: agent %q is in phase error with an inconsistent saved placement. Ordinary and force delete cannot remove this agent; see %s.",
+			name, existing.Slug, inconsistentPlacementDocsURL)
+	}
 
-	projectID := evt.ProjectID
+	projectID := req.ProjectID
 	if projectID == "" {
 		projectID = uuid.Nil.String()
 	}

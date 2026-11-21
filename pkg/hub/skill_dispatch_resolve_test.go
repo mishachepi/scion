@@ -354,6 +354,11 @@ func (d *preResolvingDispatcher) DispatchAgentCreate(ctx context.Context, agent 
 	return d.createAgentDispatcher.DispatchAgentCreate(ctx, agent)
 }
 
+func (d *preResolvingDispatcher) DispatchAgentCreateWithGather(ctx context.Context, agent *store.Agent) (*CreateDispatchResult, error) {
+	d.pre = d.srv.preResolveAgentSkills(ctx, agent)
+	return d.createAgentDispatcher.DispatchAgentCreateWithGather(ctx, agent)
+}
+
 // End to end through the scheduler: a dispatch_agent event created by a
 // regular member, naming a Hub template whose scion-agent.yaml requires a
 // private skill, stamps the template ID (#1795) and pre-resolves that skill as
@@ -361,6 +366,7 @@ func (d *preResolvingDispatcher) DispatchAgentCreate(ctx context.Context, agent 
 func TestSchedulerDispatch_PreResolvesTemplatePrivateSkill(t *testing.T) {
 	const skillURI = "skill://scion/global/sched-private@latest"
 	srv, s, alice, _, project := setupSkillAuthzTest(t)
+	linkScheduledDispatchBroker(t, s, project.ID)
 	ctx := context.Background()
 	stor := newContentMockStorage("test-bucket")
 	srv.SetStorage(stor)
@@ -374,7 +380,7 @@ func TestSchedulerDispatch_PreResolvesTemplatePrivateSkill(t *testing.T) {
 
 	payload, err := json.Marshal(DispatchAgentEventPayload{AgentName: "sched-skill-agent", Template: "sched-skill-tmpl"})
 	require.NoError(t, err)
-	require.NoError(t, srv.dispatchAgentEventHandler()(ctx, withSessionRevision(store.ScheduledEvent{
+	require.NoError(t, fireScheduledActionForTest(ctx, srv, "dispatch_agent", withSessionRevision(store.ScheduledEvent{
 		ID:        tid("sched-skill-event"),
 		ProjectID: project.ID,
 		EventType: "dispatch_agent",

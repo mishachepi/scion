@@ -62,7 +62,7 @@ type MessageBrokerProxy struct {
 	// memberFanout, when non-nil, fans a stored web thread message out to
 	// the thread's members on their user subjects (see
 	// Server.fanOutThreadMessageToMembersAsync).
-	memberFanout func(ctx context.Context, msg *store.Message, attachments []AttachmentRef, artifactRefs []artifacts.MessageRef)
+	memberFanout func(ctx context.Context, msg *store.Message, attachments []AttachmentRef, artifactRefs []artifacts.MessageRef, opts ...ChatEventOption)
 	// writeDenyEnabled returns whether the G2 write-deny switch is on.
 	// When nil or returning false, conversation resolution failures are non-fatal
 	// (B10 contract). When returning true, they deny the write (G2 contract).
@@ -78,6 +78,21 @@ type MessageBrokerProxy struct {
 	// recordArtifactRefs, when non-nil, persists the admitted artifact
 	// references of a user message deliverToUser stored (ptone/scion#3222).
 	recordArtifactRefs func(ctx context.Context, messageID string, refs []artifacts.MessageRef) []artifacts.MessageRef
+
+	// recordHumanMentions, when non-nil, records per-recipient mention rows
+	// for human project members @mentioned in a thread message deliverToUser
+	// stored, before its SSE event is published.
+	recordHumanMentions func(ctx context.Context, conversationKey, messageID string, userIDs []string)
+
+	// holdOrDispatch, when non-nil, runs the server's awaiting_session hold
+	// gate before dispatching a persisted broker message (ptone/scion#7881).
+	holdOrDispatch func(ctx context.Context, agent *store.Agent, messageID string, storeMsg *store.Message, dispatchFn func() error) (bool, error)
+
+	// idleSuspendGate, when non-nil, reports whether lifecycle.idle_suspend is
+	// enabled (marking deliveries whenever the experiment is on, while active
+	// row claims are always honoured regardless of setting). Nil means off on
+	// unclaimed rows (AC 8).
+	idleSuspendGate func() bool
 
 	mu                  sync.Mutex
 	subscriptions       map[string][]eventbus.Subscription // projectID -> active subscriptions
@@ -677,9 +692,19 @@ func (p *MessageBrokerProxy) deliverToUser(ctx context.Context, projectID, topic
 		agentID = msg.SenderID
 	}
 
+	// The row takes the id and creation time the sending handler already
+	// reported (PersistMessageID, PersistCreatedAt), so the receipt's
+	// message_id and the published Timestamp name this row.
 	storeID := msg.StoredMessageID
 	if storeID == "" {
+		storeID = msg.PersistMessageID
+	}
+	if storeID == "" {
 		storeID = api.NewUUID()
+	}
+	createdAt := msg.PersistCreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now()
 	}
 	storeMsg := &store.Message{
 		ID:          storeID,
@@ -698,7 +723,7 @@ func (p *MessageBrokerProxy) deliverToUser(ctx context.Context, projectID, topic
 		// This delivery *is* the dispatch; Ent defaults dispatch_state to
 		// "pending" if left unset (nc-promote-busy).
 		DispatchState: store.MessageDispatchDispatched,
-		CreatedAt:     time.Now(),
+		CreatedAt:     createdAt,
 	}
 	// A message the sending handler already stored (StoredMessageID,
 	// ptone/scion#4596 decision D2): the handler resolved its conversation,
@@ -754,6 +779,18 @@ func (p *MessageBrokerProxy) deliverToUser(ctx context.Context, projectID, topic
 	if msg.ArtifactRefsAdmitted && p.recordArtifactRefs != nil {
 		if refs, _ := artifacts.ParseMessageRefs(msg.Metadata[artifacts.MessageMetadataKey]); len(refs) > 0 {
 			artifactRefs = p.recordArtifactRefs(ctx, storeMsg.ID, refs)
+		}
+	}
+
+	if len(msg.MentionedUserIDs) > 0 {
+		if p.recordHumanMentions != nil {
+			p.recordHumanMentions(ctx, storeMsg.ThreadID, storeMsg.ID, msg.MentionedUserIDs)
+		} else if p.webChatStore != nil && storeMsg.ThreadID != "" &&
+			!strings.HasPrefix(storeMsg.ThreadID, "dm:") && !strings.HasPrefix(storeMsg.ThreadID, "agent:") {
+			if err := p.webChatStore.RecordMentions(ctx, storeMsg.ThreadID, storeMsg.ID, msg.MentionedUserIDs); err != nil {
+				p.log.Warn("chat: failed to record mentions",
+					"conversation_key", storeMsg.ThreadID, "message_id", storeMsg.ID, "error", err)
+			}
 		}
 	}
 
@@ -972,11 +1009,17 @@ func (p *MessageBrokerProxy) resolveUserMessageConversation(ctx context.Context,
 			Reason:     reason,
 		})
 	}
-	// DEF-3: Independent consistency check against prior messages.
-	if consistent := messaging.CheckConversationConsistency(ctx, p.store, storeMsg.ID, storeMsg.ConversationID, msg.ThreadID, msg.SenderID, msg.RecipientID, p.log); !consistent {
-		p.log.Warn("DEF-3: conversation consistency mismatch (user message from broker)",
-			"message_id", storeMsg.ID, "conversation_id", storeMsg.ConversationID)
-	}
+	// DEF-3: Independent consistency check against prior messages, run off
+	// the delivery path with its own deadline.
+	messaging.GoConsistencyCheck(messaging.ConsistencyInput{
+		Store: p.store, Log: p.log, MessageID: storeMsg.ID, ConversationID: storeMsg.ConversationID,
+		ThreadID: msg.ThreadID, SenderID: msg.SenderID, RecipientID: msg.RecipientID,
+	}, func(ctx context.Context, in messaging.ConsistencyInput) {
+		if consistent := messaging.CheckConversationConsistency(ctx, in.Store, in.MessageID, in.ConversationID, in.ThreadID, in.SenderID, in.RecipientID, in.Log); !consistent {
+			in.Log.Warn("DEF-3: conversation consistency mismatch (user message from broker)",
+				"message_id", in.MessageID, "conversation_id", in.ConversationID)
+		}
+	})
 	return true
 }
 
@@ -1112,10 +1155,24 @@ func (p *MessageBrokerProxy) deliverToAgent(ctx context.Context, projectID, agen
 	// the recipient's phase. Skipped for a migrating agent — the migration
 	// gate above already decided this message is deferred, not dropped.
 	if !deferred {
-		if phaseErr := validateAgentDeliverable(agent); phaseErr != nil {
+		if phaseErr := p.validateAgentDeliverable(agent); phaseErr != nil {
 			p.log.Warn("Rejecting broker message to non-running agent",
 				"agentSlug", agentSlug, "projectID", projectID, "phase", agent.Phase)
 			p.publishDeliveryFailed(ctx, projectID, agentSlug, msg, errors.New(phaseErr.Message))
+			return
+		}
+		// A held agent (ptone/scion#3433) is refused like a suspended one,
+		// for a topic message and a broadcast alike (ptone/scion#6859); a
+		// lookup fault refuses. The same predicate as Server.agentHeld.
+		held, holdErr := p.store.HasActiveAgentHold(ctx, agent.ID)
+		if holdErr != nil || held {
+			refusal := heldTargetDMError(agent)
+			if holdErr != nil {
+				refusal = heldLookupFaultDMError()
+			}
+			p.log.Warn("Rejecting broker message to held agent",
+				"agentSlug", agentSlug, "projectID", projectID, "error", holdErr)
+			p.publishDeliveryFailed(ctx, projectID, agentSlug, msg, errors.New(refusal.Message))
 			return
 		}
 	}
@@ -1208,11 +1265,17 @@ func (p *MessageBrokerProxy) deliverToAgent(ctx context.Context, projectID, agen
 			Match:      match,
 			Reason:     reason,
 		})
-		// DEF-3: Independent consistency check against prior messages.
-		if consistent := messaging.CheckConversationConsistency(ctx, p.store, storeMsg.ID, convID, msg.ThreadID, msg.SenderID, agent.ID, p.log); !consistent {
-			p.log.Warn("DEF-3: conversation consistency mismatch (agent message from broker)",
-				"message_id", storeMsg.ID, "conversation_id", convID, "agent_id", agent.ID)
-		}
+		// DEF-3: Independent consistency check against prior messages, run
+		// off the delivery path with its own deadline.
+		messaging.GoConsistencyCheck(messaging.ConsistencyInput{
+			Store: p.store, Log: p.log, MessageID: storeMsg.ID, ConversationID: convID,
+			ThreadID: msg.ThreadID, SenderID: msg.SenderID, RecipientID: agent.ID,
+		}, func(ctx context.Context, in messaging.ConsistencyInput) {
+			if consistent := messaging.CheckConversationConsistency(ctx, in.Store, in.MessageID, in.ConversationID, in.ThreadID, in.SenderID, in.RecipientID, in.Log); !consistent {
+				in.Log.Warn("DEF-3: conversation consistency mismatch (agent message from broker)",
+					"message_id", in.MessageID, "conversation_id", in.ConversationID, "agent_id", in.RecipientID)
+			}
+		})
 	}
 	if err := p.store.CreateMessage(ctx, storeMsg); err != nil {
 		p.log.Error("Failed to persist broker message to store", "agentSlug", agentSlug, "error", err)
@@ -1261,7 +1324,9 @@ func (p *MessageBrokerProxy) deliverToAgent(ctx context.Context, projectID, agen
 
 	// The 30s brokerCallbackTimeout is shared with pre-dispatch work above
 	// (agent lookup, persistence), so retries get slightly less than 30s.
-	if err := dispatchWithBrokerRetry(withDispatchMessageID(ctx, storeMsg.ID), nil, dispatcher, agent, msg.Msg, msg.Urgent, msg); err != nil {
+	if _, err := p.holdOrDispatchMessage(ctx, agent, storeMsg, func() error {
+		return dispatchWithBrokerRetry(withDispatchMessageID(ctx, storeMsg.ID), p.deliveryMarker(), nil, dispatcher, agent, msg.Msg, msg.Urgent, msg)
+	}); err != nil {
 		p.log.Error("Failed to dispatch broker message to agent",
 			"agentSlug", agentSlug, "error", err)
 		if markErr := markMessageFailed(ctx, p.store, storeMsg.ID, err.Error()); markErr != nil {
@@ -1286,6 +1351,15 @@ func (p *MessageBrokerProxy) deliverToAgent(ctx context.Context, projectID, agen
 		logAttrs = append(logAttrs, msg.LogAttrs()...)
 		p.messageLog.Info("broker message delivered", logAttrs...)
 	}
+}
+
+// holdOrDispatchMessage routes a persisted message-broker delivery through
+// Server.holdOrDispatch when wired, or invokes dispatchFn directly in tests.
+func (p *MessageBrokerProxy) holdOrDispatchMessage(ctx context.Context, agent *store.Agent, storeMsg *store.Message, dispatchFn func() error) (bool, error) {
+	if p != nil && p.holdOrDispatch != nil && storeMsg != nil {
+		return p.holdOrDispatch(ctx, agent, storeMsg.ID, storeMsg, dispatchFn)
+	}
+	return false, dispatchFn()
 }
 
 // fanOutToProject dispatches a broadcast message to all running agents in a project.
@@ -1402,6 +1476,10 @@ func (p *MessageBrokerProxy) publishDeliveryFailed(ctx context.Context, projectI
 			"senderID", msg.SenderID, "error", err)
 		return
 	}
+	// A held sender gets no notice (ptone/scion#7145).
+	if heldNoticeWithheld(ctx, p.store, noticeLogger(p.messageLog, p.log), senderAgent, heldNoticeDeliveryFailed) {
+		return
+	}
 
 	var failMsg string
 	if deliveryErr != nil && !errors.Is(deliveryErr, store.ErrNotFound) {
@@ -1418,23 +1496,58 @@ func (p *MessageBrokerProxy) publishDeliveryFailed(ctx context.Context, projectI
 	if dispatcher == nil {
 		return
 	}
-	logMessageRecord(p.messageLog, senderAgent, structuredMsg)
-	if err := dispatcher.DispatchAgentMessage(ctx, senderAgent, failMsg, false, structuredMsg); err != nil {
+	if err := dispatchMarkedAgentMessage(ctx, p.deliveryMarker(), p.messageLog, nil, dispatcher, senderAgent, failMsg, false, structuredMsg); err != nil {
 		p.log.Warn("Failed to dispatch DELIVERY_FAILED notification",
 			"senderID", msg.SenderID, "error", err)
 	}
 }
 
 // newDeliveryNotice builds the system notice sent to an agent sender about the
-// fate of its message (DELIVERY_FAILED, DELIVERY_DEFERRED). It goes through
-// messages.NewSystemMessage so every notice carries Version and an RFC3339 UTC
-// Timestamp (ptone/scion#2100); new notice sites should use it rather than a
-// StructuredMessage literal so they cannot drift.
+// fate of its message (DELIVERY_FAILED, DELIVERY_DEFERRED,
+// DELIVERY_UNCONFIRMED). It goes through messages.NewSystemMessage so every
+// notice carries Version and an RFC3339 UTC Timestamp (ptone/scion#2100); new
+// notice sites should use it rather than a StructuredMessage literal so they
+// cannot drift.
 func newDeliveryNotice(recipient, recipientID, text, status, category string) *messages.StructuredMessage {
 	notice := messages.NewSystemMessage("system", recipient, text, category)
 	notice.RecipientID = recipientID
 	notice.Status = status
 	return notice
+}
+
+// publishDeliveryUnconfirmed tells an agent sender that a message row to
+// agentSlug expired in dispatch_state="pending" without dispatch confirmation
+// (ptone/scion#7405): because existing row data cannot distinguish a never-sent
+// pending row from an AC-3 (broker accepted, MarkMessageDispatched failed) or
+// AC-4 (deadline-ambiguous) row, delivery may have occurred and the sender
+// should check before resending rather than blindly duplicating the message.
+func (p *MessageBrokerProxy) publishDeliveryUnconfirmed(ctx context.Context, agentSlug string, msg *messages.StructuredMessage) {
+	if !strings.HasPrefix(msg.Sender, "agent:") || msg.SenderID == "" {
+		return
+	}
+	ctx, cancel := detachedContext(ctx, deliveryNoticeTimeout)
+	defer cancel()
+	senderAgent, err := p.store.GetAgent(ctx, msg.SenderID)
+	if err != nil {
+		p.log.Warn("Could not resolve sender agent for DELIVERY_UNCONFIRMED notification",
+			"senderID", msg.SenderID, "error", err)
+		return
+	}
+	if heldNoticeWithheld(ctx, p.store, noticeLogger(p.messageLog, p.log), senderAgent, heldNoticeDeliveryUnconfirmed) {
+		return
+	}
+
+	unconfirmedMsg := fmt.Sprintf("Message delivery to agent %q is unconfirmed: it may have been delivered; check before resending", agentSlug)
+	structuredMsg := newDeliveryNotice(msg.Sender, senderAgent.ID, unconfirmedMsg, "DELIVERY_UNCONFIRMED", messages.SystemCategoryDeliveryUnconfirmed)
+
+	dispatcher := p.getDispatcher()
+	if dispatcher == nil {
+		return
+	}
+	if err := dispatchMarkedAgentMessage(ctx, p.deliveryMarker(), p.messageLog, nil, dispatcher, senderAgent, unconfirmedMsg, false, structuredMsg); err != nil {
+		p.log.Warn("Failed to dispatch DELIVERY_UNCONFIRMED notification",
+			"senderID", msg.SenderID, "error", err)
+	}
 }
 
 // publishDeliveryDeferred tells an agent sender that their message to
@@ -1456,6 +1569,10 @@ func (p *MessageBrokerProxy) publishDeliveryDeferred(ctx context.Context, agentS
 			"senderID", msg.SenderID, "error", err)
 		return
 	}
+	// A held sender gets no notice (ptone/scion#7145).
+	if heldNoticeWithheld(ctx, p.store, noticeLogger(p.messageLog, p.log), senderAgent, heldNoticeDeliveryDeferred) {
+		return
+	}
 
 	deferredMsg := fmt.Sprintf("agent %q is reincarnating; message saved to history and will be seen on catch-up", agentSlug)
 	structuredMsg := newDeliveryNotice(msg.Sender, senderAgent.ID, deferredMsg, "DELIVERY_DEFERRED", messages.SystemCategoryDeliveryDeferred)
@@ -1464,11 +1581,37 @@ func (p *MessageBrokerProxy) publishDeliveryDeferred(ctx context.Context, agentS
 	if dispatcher == nil {
 		return
 	}
-	logMessageRecord(p.messageLog, senderAgent, structuredMsg)
-	if err := dispatcher.DispatchAgentMessage(ctx, senderAgent, deferredMsg, false, structuredMsg); err != nil {
+	if err := dispatchMarkedAgentMessage(ctx, p.deliveryMarker(), p.messageLog, nil, dispatcher, senderAgent, deferredMsg, false, structuredMsg); err != nil {
 		p.log.Warn("Failed to dispatch DELIVERY_DEFERRED notification",
 			"senderID", msg.SenderID, "error", err)
 	}
+}
+
+// SetIdleSuspendGate sets the callback reporting whether the idle-suspend
+// delivery gate is active (lifecycle.idle_suspend enabled; active claims on
+// target rows are always honoured regardless of auto_suspend_idle).
+func (p *MessageBrokerProxy) SetIdleSuspendGate(fn func() bool) {
+	p.mu.Lock()
+	p.idleSuspendGate = fn
+	p.mu.Unlock()
+}
+
+func (p *MessageBrokerProxy) idleSuspendGateActive() bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	fn := p.idleSuspendGate
+	p.mu.Unlock()
+	return fn != nil && fn()
+}
+
+func (p *MessageBrokerProxy) deliveryMarker() agentDeliveryMarker {
+	return gatedDeliveryMarker{store: p.store, gate: p.idleSuspendGateActive}
+}
+
+func (p *MessageBrokerProxy) validateAgentDeliverable(agent *store.Agent) *AgentDMError {
+	return validateAgentDeliverable(agent)
 }
 
 // containsSuffix checks if a dot-separated subject string ends with the given suffix.

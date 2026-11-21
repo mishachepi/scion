@@ -21,6 +21,7 @@ package hub
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -85,6 +86,24 @@ func TestPublishDeliveryDeferred_StampsVersionAndTimestamp(t *testing.T) {
 	assertVersionAndTimestamp(t, got[0].structured)
 }
 
+func TestPublishDeliveryUnconfirmed_StampsVersionAndTimestamp(t *testing.T) {
+	s := newBrokerTestStore(t)
+	projectID := setupBrokerTestProject(t, s)
+	sender := setupBrokerTestAgent(t, s, projectID, "vt-pdu-sender", "running")
+	dispatcher := &brokerMockDispatcher{}
+	proxy := newNoticeTestProxy(t, s, dispatcher)
+
+	msg := messages.NewInstruction("agent:"+sender.Slug, "agent:target", "hello")
+	msg.SenderID = sender.ID
+	proxy.publishDeliveryUnconfirmed(context.Background(), "target-agent", msg)
+
+	got := mockDispatchesTo(dispatcher, sender.Slug)
+	require.Len(t, got, 1)
+	assert.Equal(t, "DELIVERY_UNCONFIRMED", got[0].structured.Status)
+	assert.Equal(t, messages.SystemCategoryDeliveryUnconfirmed, got[0].structured.Metadata["system_category"])
+	assertVersionAndTimestamp(t, got[0].structured)
+}
+
 func TestPublishBroadcastDeliveryFailed_StampsVersionAndTimestamp(t *testing.T) {
 	srv, s := testServer(t)
 	_, agents := setupGroupTest(t, s, "2100-bcast", map[string]string{
@@ -145,6 +164,14 @@ func TestAgentOutboundUserDM_StampsVersionAndTimestamp(t *testing.T) {
 	}, 5*time.Second, 10*time.Millisecond)
 	require.Len(t, rows, 1)
 	assert.Equal(t, rows[0].CreatedAt.UTC().Format(time.RFC3339), dm.Timestamp)
+	// The stored row is the one the handler stamped and reported: same id
+	// as the receipt's message_id (deterministic, not clock-dependent).
+	var receipt struct {
+		MessageID string `json:"message_id"`
+	}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &receipt))
+	require.NotEmpty(t, receipt.MessageID)
+	assert.Equal(t, receipt.MessageID, rows[0].ID, "the receipt's message_id names the stored row")
 }
 
 // A minimal client broadcast (no Version/Timestamp/Type) is filled in

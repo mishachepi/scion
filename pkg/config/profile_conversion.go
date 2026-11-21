@@ -29,16 +29,18 @@ import (
 )
 
 // The conversion finding codes (.design/flat-runtime-brokers/contract-appendix-p3.md
-// FC6). The set is frozen.
+// FC6 and .design/flat-runtime-brokers/p5-cloudrun-amendment.md CR11). The set is frozen.
 const (
-	ConversionUnsupportedFlatTargetType  = "unsupported_flat_target_type"
-	ConversionFlatTargetScopeViolation   = "flat_target_scope_violation"
-	ConversionProfileConflict            = "profile_conflict"
-	ConversionProfileConflictResolved    = "profile_conflict_resolved"
-	ConversionLegacyFieldNoEffect        = "legacy_field_no_effect"
-	ConversionLegacyFieldRemoved         = "legacy_field_removed"
-	ConversionUnknownSettingsKey         = "unknown_settings_key"
-	ConversionFieldNotValidForTargetType = "field_not_valid_for_target_type"
+	ConversionUnsupportedFlatTargetType       = "unsupported_flat_target_type"
+	ConversionFlatTargetScopeViolation        = "flat_target_scope_violation"
+	ConversionProfileConflict                 = "profile_conflict"
+	ConversionProfileConflictResolved         = "profile_conflict_resolved"
+	ConversionLegacyFieldNoEffect             = "legacy_field_no_effect"
+	ConversionLegacyFieldRemoved              = "legacy_field_removed"
+	ConversionUnknownSettingsKey              = "unknown_settings_key"
+	ConversionFieldNotValidForTargetType      = "field_not_valid_for_target_type"
+	ConversionFlatTargetFieldRequired         = "flat_target_field_required"
+	ConversionFlatTargetOperatorInputRequired = "flat_target_operator_input_required"
 )
 
 // Severities of a ConversionFinding. A profile named by a blocking finding
@@ -66,15 +68,24 @@ type ProfileConversionInput struct {
 	Profiles []string
 	// Choices are explicit operator choices from a reviewed manifest.
 	Choices []ConversionChoice
+	// ConfiguredRuntimes reports whether a runtime entry is the operator's
+	// (ConfiguredRuntimeNames), as a legacy start decides when it matches
+	// sibling entries for placement. nil counts every Kubernetes entry as
+	// the operator's (fail closed: a built-in entry with different
+	// placement is then a sibling that does not merge, with a notice).
+	ConfiguredRuntimes func(string) bool
 }
 
 // ConversionChoice is one operator choice. A Split choice sets TargetGroup
 // and Split only; a field choice sets TargetGroup, Field and ChosenProfile
 // and leaves Split empty.
 type ConversionChoice struct {
-	// TargetGroup is the proposed instance Key of the group in
-	// ProfileConversionResult.Instances. For a Split choice it is the key
-	// of the group before the split.
+	// TargetGroup is the key of the group the choice applies to: the
+	// instance Key of an unsplit group in ProfileConversionResult.Instances,
+	// or, for a group whose profiles differ, the group key the split notice
+	// names. For a Split choice it is the key of the group before the
+	// split. A field choice consolidates the group's profiles on the chosen
+	// value instead of splitting them on it.
 	TargetGroup string
 	// Field is the conflicting field, as the settings path under a profile
 	// (for example "shared_dir_size" or "harness_overrides.claude.image");
@@ -90,7 +101,8 @@ type ConversionChoice struct {
 
 // ProfileConversionResult is the result of ConvertProfilesToInstances.
 type ProfileConversionResult struct {
-	// Instances has one proposed instance per target group, sorted by
+	// Instances has one proposed instance per target group, or per set of
+	// profiles with equal values when a group's profiles differ, sorted by
 	// Key. Key and Name are proposals the operator may edit.
 	Instances []V1RuntimeBrokerInstanceConfig
 	// ProfileMap maps each profile with no blocking finding to its
@@ -115,18 +127,24 @@ type ConversionFinding struct {
 }
 
 var (
-	knownProfileKeys      = knownYAMLKeys(V1ProfileConfig{})
-	knownRuntimeEntryKeys = knownYAMLKeys(V1RuntimeConfig{})
+	knownProfileKeys           = knownYAMLKeys(V1ProfileConfig{})
+	knownRuntimeEntryKeys      = knownYAMLKeys(V1RuntimeConfig{})
+	knownCloudRunKeys          = knownYAMLKeys(CloudRunConfig{})
+	knownCloudRunInstancesKeys = knownYAMLKeys(V1CloudRunInstancesConfig{})
 )
 
 // convProfile is one profile in scope, with its folded instance values.
 type convProfile struct {
-	name   string
-	typ    string // docker or kubernetes once the target is supported
-	scope  string
-	ctx    string
-	ns     string
-	fields map[string]convValue
+	name       string
+	rtKey      string
+	legacyType string
+	typ        string // docker, kubernetes or cloudrun once the target is supported
+	scope      string
+	ctx        string
+	ns         string
+	proj       string
+	region     string
+	fields     map[string]convValue
 }
 
 // convValue is one folded field value and the legacy key it came from.
@@ -144,6 +162,8 @@ type convGroup struct {
 	typ      string
 	ctx      string
 	ns       string
+	proj     string
+	region   string
 	profiles []*convProfile
 }
 
@@ -178,10 +198,14 @@ func (s *convState) add(code, severity, path, message string, profiles ...string
 // profile's value, else its runtime entry's; maps per key; for the shared
 // dir backends a profile's single value shadows the runtime entry's per-dir
 // map). Profiles are grouped by resolved target scope. When the profiles of
-// a group disagree on a field, the field is reported as a blocking
-// profile_conflict and left unset, unless an operator choice resolves it:
-// nothing is merged or chosen silently, and no template is generated.
-// Secret declarations are copied; no secret value is read or emitted.
+// a group disagree on a field, every value is preserved: the group is split
+// into one instance per set of profiles with equal values, and a notice
+// names the differing fields so the operator can consolidate. An operator
+// field choice consolidates a field on the chosen value instead, and the
+// values it drops are reported. Nothing is merged or chosen silently, and
+// no template is generated. Only a detail no flat instance can hold blocks
+// a profile. Secret declarations are copied; no secret value is read or
+// emitted.
 func ConvertProfilesToInstances(in ProfileConversionInput) ProfileConversionResult {
 	st := &convState{findings: map[string]*ConversionFinding{}}
 	vs := in.Settings
@@ -205,7 +229,7 @@ func ConvertProfilesToInstances(in ProfileConversionInput) ProfileConversionResu
 				fmt.Sprintf("profile %s is not defined in these settings; remove it from the profiles in scope", name), name)
 			continue
 		}
-		if cp := foldProfile(st, vs, name, prof); cp != nil {
+		if cp := foldProfile(st, vs, in.ConfiguredRuntimes, name, prof); cp != nil {
 			profiles = append(profiles, cp)
 		}
 	}
@@ -225,10 +249,30 @@ func ConvertProfilesToInstances(in ProfileConversionInput) ProfileConversionResu
 
 	result := ProfileConversionResult{ProfileMap: map[string]string{}}
 	fieldChoices := fieldChoicesByGroup(st, groups, in.Choices)
+	splits := make([]*convSplit, 0, len(groups))
+	var parts []*convGroup
 	for _, g := range groups {
-		result.Instances = append(result.Instances, buildGroupInstance(st, g, fieldChoices[g.key]))
+		sp := splitGroup(g, fieldChoices[g.key])
+		splits = append(splits, sp)
+		parts = append(parts, sp.parts...)
 	}
-	reportUnusedFieldChoices(st, groups, fieldChoices)
+	uniqueGroupKeys(parts)
+	partByKey := make(map[string]*convGroup, len(parts))
+	for _, part := range parts {
+		partByKey[part.key] = part
+	}
+	for _, sp := range splits {
+		result.Instances = append(result.Instances, buildSplitInstances(st, sp, fieldChoices[sp.key])...)
+	}
+	sort.Slice(result.Instances, func(i, j int) bool { return result.Instances[i].Key < result.Instances[j].Key })
+	for i, inst := range result.Instances {
+		if inst.RuntimeTarget == nil || inst.RuntimeTarget.Type != RuntimeTargetTypeCloudRun {
+			continue
+		}
+		part := partByKey[inst.Key]
+		checkProposedCloudRunTarget(st, i, inst.Key, inst.RuntimeTarget, part)
+	}
+	reportUnusedFieldChoices(st, splits, fieldChoices)
 
 	blocked := map[string]bool{}
 	for _, f := range st.findings {
@@ -238,7 +282,7 @@ func ConvertProfilesToInstances(in ProfileConversionInput) ProfileConversionResu
 			}
 		}
 	}
-	for _, g := range groups {
+	for _, g := range parts {
 		for _, p := range g.profiles {
 			if !blocked[p.name] {
 				result.ProfileMap[p.name] = g.key
@@ -266,13 +310,16 @@ func ConvertProfilesToInstances(in ProfileConversionInput) ProfileConversionResu
 }
 
 // flatTargetType maps a legacy runtime type to its flat target type, or ""
-// when it has none. "k8s" and "remote" are the legacy names of kubernetes.
+// when it has none. "k8s" and "remote" are the legacy names of kubernetes;
+// "cloudrun-instances" maps to cloudrun.
 func flatTargetType(t string) string {
 	switch t {
 	case RuntimeTargetTypeDocker:
 		return RuntimeTargetTypeDocker
 	case RuntimeTargetTypeKubernetes, "k8s", "remote":
 		return RuntimeTargetTypeKubernetes
+	case RuntimeTargetTypeCloudRun, "cloudrun-instances":
+		return RuntimeTargetTypeCloudRun
 	}
 	return ""
 }
@@ -280,11 +327,11 @@ func flatTargetType(t string) string {
 // foldProfile resolves profile name's target and folds its values per
 // field. It returns nil when the profile cannot become a flat instance
 // (a blocking finding says why).
-func foldProfile(st *convState, vs *VersionedSettings, name string, prof V1ProfileConfig) *convProfile {
+func foldProfile(st *convState, vs *VersionedSettings, configured func(string) bool, name string, prof V1ProfileConfig) *convProfile {
 	pp := "profiles." + name + "."
 	if prof.Runtime == "" {
 		st.add(ConversionUnsupportedFlatTargetType, ConversionSeverityBlocking, pp+"runtime",
-			fmt.Sprintf("profile %s names no runtime entry, so its runtime type is detected on the host and has no fixed flat Runtime Broker target; set its runtime to a docker or kubernetes runtime entry, or keep profile %s on its legacy Runtime Broker", name, name), name)
+			fmt.Sprintf("profile %s names no runtime entry, so its runtime type is detected on the host and has no fixed flat Runtime Broker target; set its runtime to a docker, kubernetes or cloudrun runtime entry, or keep profile %s on its legacy Runtime Broker", name, name), name)
 		return nil
 	}
 	rtKey := prof.Runtime
@@ -308,8 +355,7 @@ func foldProfile(st *convState, vs *VersionedSettings, name string, prof V1Profi
 	for _, b := range []struct {
 		key string
 		set bool
-	}{{"cloudrun", rt.CloudRun != nil}, {"cloudrun_instances", rt.CloudRunInstances != nil},
-		{"cloudrun_sandbox", rt.CloudRunSandbox != nil}, {"substrate", rt.Substrate != nil}} {
+	}{{"cloudrun_sandbox", rt.CloudRunSandbox != nil}, {"substrate", rt.Substrate != nil}} {
 		if b.set {
 			st.add(ConversionUnsupportedFlatTargetType, ConversionSeverityBlocking, rp+b.key,
 				fmt.Sprintf("runtime entry %s configures %s, which has no flat Runtime Broker target; keep the profiles that use it on their legacy Runtime Broker", rtKey, b.key), name)
@@ -332,19 +378,79 @@ func foldProfile(st *convState, vs *VersionedSettings, name string, prof V1Profi
 				fmt.Sprintf("runtimes.%s.%s has no effect today and has no flat Runtime Broker instance field; it is not converted", rtKey, f.key), name)
 		}
 	}
+	// A profile pool that differs from its runtime entry's is preserved:
+	// the profile's selector keys are folded over the entry's below.
+	if typ == RuntimeTargetTypeKubernetes && ProfilePoolConflict(rt, prof) {
+		st.add(ConversionProfileConflict, ConversionSeverityNotice, pp+"node_selector",
+			fmt.Sprintf("profiles.%s.node_selector sets %s to %s and its runtime entry %s sets %s; the instance keeps the profile's configured pool %s",
+				name, PoolNodeSelectorKey, prof.NodeSelector[PoolNodeSelectorKey], rtKey, rt.NodeSelector[PoolNodeSelectorKey], prof.NodeSelector[PoolNodeSelectorKey]), name)
+	}
+	// Runtime entries that may share a cluster and namespace merge their
+	// placement when they agree. When they disagree, each entry keeps its
+	// own placement, and profiles on them are split onto separate
+	// instances when their placement differs.
+	placementEntries := []string{rtKey}
+	if typ == RuntimeTargetTypeKubernetes {
+		entries, other := PlacementSiblingEntries(vs.Runtimes, rtKey, configured)
+		if other == "" {
+			placementEntries = entries
+		} else {
+			st.add(ConversionProfileConflict, ConversionSeverityNotice, strings.TrimSuffix(rp, "."),
+				fmt.Sprintf("runtime entries %s, %s may target the same cluster and namespace (equal, or empty context or namespace) with different placement (a legacy start is refused today when both resolve to the same cluster and namespace); profiles on runtime entry %s keep its own placement, on a separate instance when it differs", rtKey, other, rtKey), name)
+		}
+	}
 	if prof.DefaultTemplate != "" {
 		st.add(ConversionLegacyFieldNoEffect, ConversionSeverityNotice, pp+"default_template",
 			fmt.Sprintf("profiles.%s.default_template has no effect today (the default template comes from the top-level default_template and the Hub agent_defaults); it is not converted", name), name)
+	}
+	if prof.ImageTag != "" {
+		// A flat instance's agent_defaults carry no image_tag (out of
+		// scope for ptone/scion#6625), so the value is reported, not
+		// silently dropped.
+		st.add(ConversionLegacyFieldNoEffect, ConversionSeverityNotice, pp+"image_tag",
+			fmt.Sprintf("profiles.%s.image_tag is not converted: a flat Runtime Broker instance has no image_tag; set the top-level image_tag or the Hub image_tag instead", name), name)
 	}
 	if !ok {
 		return nil
 	}
 
-	cp := &convProfile{name: name, typ: typ, fields: map[string]convValue{}}
-	if typ == RuntimeTargetTypeKubernetes {
+	cp := &convProfile{name: name, rtKey: rtKey, legacyType: legacyType, typ: typ, fields: map[string]convValue{}}
+	switch typ {
+	case RuntimeTargetTypeKubernetes:
 		cp.ctx, cp.ns = strings.TrimSpace(rt.Context), strings.TrimSpace(rt.Namespace)
 		cp.scope = "kubernetes\x00" + cp.ctx + "\x00" + cp.ns
-	} else {
+	case RuntimeTargetTypeCloudRun:
+		if legacyType == "cloudrun-instances" {
+			if rt.CloudRunInstances != nil {
+				cp.proj = strings.TrimSpace(rt.CloudRunInstances.ProjectID)
+				cp.region = strings.TrimSpace(rt.CloudRunInstances.Region)
+			}
+			if rt.CloudRun != nil {
+				st.add(ConversionFieldNotValidForTargetType, ConversionSeverityNotice, rp+"cloudrun",
+					fmt.Sprintf("%scloudrun is not valid for runtime type cloudrun-instances; a cloudrun-instances runtime ignores it today, so it is not converted", rp), name)
+			}
+		} else {
+			if rt.CloudRun != nil {
+				cp.proj = strings.TrimSpace(rt.CloudRun.ProjectID)
+				cp.region = strings.TrimSpace(rt.CloudRun.Location)
+				if rt.CloudRun.NFSServer != "" {
+					st.add(ConversionLegacyFieldNoEffect, ConversionSeverityNotice, rp+"cloudrun.nfs_server",
+						fmt.Sprintf("%scloudrun.nfs_server has no effect on a flat cloudrun Runtime Broker instance (Cloud Run agents mount server.project_storage.nfs); it is not converted", rp), name)
+				}
+				if rt.CloudRun.NFSExport != "" {
+					st.add(ConversionLegacyFieldNoEffect, ConversionSeverityNotice, rp+"cloudrun.nfs_export",
+						fmt.Sprintf("%scloudrun.nfs_export has no effect on a flat cloudrun Runtime Broker instance (Cloud Run agents mount server.project_storage.nfs); it is not converted", rp), name)
+				}
+			}
+			if rt.CloudRunInstances != nil {
+				st.add(ConversionFieldNotValidForTargetType, ConversionSeverityNotice, rp+"cloudrun_instances",
+					fmt.Sprintf("%scloudrun_instances is not valid for runtime type cloudrun; a cloudrun runtime ignores it today, so it is not converted", rp), name)
+			}
+		}
+		// Keep cloudrun-instances in its own scope so it never merges with a
+		// sibling cloudrun entry (even when both leave service_account empty).
+		cp.scope = legacyType + "\x00" + cp.proj + "\x00" + cp.region
+	default:
 		cp.scope = RuntimeTargetTypeDocker
 	}
 
@@ -371,9 +477,12 @@ func foldProfile(st *convState, vs *VersionedSettings, name string, prof V1Profi
 	} else if rt.SafeToEvict != nil {
 		set("safe_to_evict", *rt.SafeToEvict, rp+"safe_to_evict")
 	}
-	str("home_storage_backend", prof.HomeStorageBackend, rt.HomeStorageBackend)
-	str("home_storage_leaf", prof.HomeStorageLeaf, rt.HomeStorageLeaf)
 	str("kubernetes_block_service_account", prof.KubernetesBlockServiceAccount, rt.KubernetesBlockServiceAccount)
+	// The Workload Identity pool and opt-in KSA creation exist on runtime entries only.
+	str("workload_identity_pool", "", rt.WorkloadIdentityPool)
+	if rt.CreateServiceAccounts {
+		set("create_service_accounts", true, rp+"create_service_accounts")
+	}
 	// Service-account mappings are a per-key lookup, the profile first,
 	// with no single value that shadows the map.
 	for gsa, ksa := range rt.KubernetesServiceAccountMappings {
@@ -386,34 +495,66 @@ func foldProfile(st *convState, vs *VersionedSettings, name string, prof V1Profi
 			set("kubernetes_service_account_mappings."+gsa, ksa, pp+"kubernetes_service_account_mappings."+gsa)
 		}
 	}
-	// Rule 2a, the shadowing fold of the shared-dir backend pair: today's
-	// order is profile per-dir, profile single, runtime per-dir, runtime
-	// single, so the runtime entry's per-dir map applies only when the
-	// profile sets no single value.
-	str("shared_dir_storage_backend", prof.SharedDirStorageBackend, rt.SharedDirStorageBackend)
-	if prof.SharedDirStorageBackend == "" {
-		for dir, b := range rt.SharedDirStorageBackends {
-			if b != "" {
-				set("shared_dir_storage_backends."+dir, b, rp+"shared_dir_storage_backends."+dir)
-			}
+	// Placement: the runtime entry's (and its agreeing siblings', as a
+	// legacy start matches them), with the profile's over it, merged
+	// exactly as a legacy start merges them (LegacyPlacementPolicy).
+	placement := LegacyPlacementPolicy(vs.Runtimes, placementEntries, name, &prof)
+	placementSrc := func(field string, inProfile bool) string {
+		if inProfile {
+			return pp + field
 		}
+		return rp + field
 	}
-	for dir, b := range prof.SharedDirStorageBackends {
-		if b != "" {
-			set("shared_dir_storage_backends."+dir, b, pp+"shared_dir_storage_backends."+dir)
+	if len(placement.NodeSelector) > 0 {
+		set("node_selector", placement.NodeSelector, placementSrc("node_selector", len(prof.NodeSelector) > 0))
+	}
+	if len(placement.Tolerations) > 0 {
+		set("tolerations", placement.Tolerations, placementSrc("tolerations", len(prof.Tolerations) > 0))
+	}
+	if placement.RuntimeClassName != "" {
+		set("runtime_class_name", placement.RuntimeClassName, placementSrc("runtime_class_name", prof.RuntimeClassName != ""))
+	}
+	// The per-profile and per-runtime storage overrides are removed
+	// (design OQ2-A): each one set is reported and none is converted.
+	reportRemovedStorageOverrides(st, name, rtKey, prof, rt)
+
+	// Cloud Run runtime_target fields (CR10): folded from runtimes.<rt>.cloudrun
+	// on a cloudrun entry.
+	if typ == RuntimeTargetTypeCloudRun && legacyType != "cloudrun-instances" && rt.CloudRun != nil {
+		if sa := strings.TrimSpace(rt.CloudRun.ServiceAccount); sa != "" {
+			set("service_account", sa, rp+"cloudrun.service_account")
+		}
+		if blockSA := strings.TrimSpace(rt.CloudRun.BlockServiceAccount); blockSA != "" {
+			set("block_service_account", blockSA, rp+"cloudrun.block_service_account")
+		}
+		if len(rt.CloudRun.AssignableServiceAccounts) > 0 {
+			assignable := make([]string, len(rt.CloudRun.AssignableServiceAccounts))
+			for i, sa := range rt.CloudRun.AssignableServiceAccounts {
+				assignable[i] = strings.TrimSpace(sa)
+			}
+			set("assignable_service_accounts", assignable, rp+"cloudrun.assignable_service_accounts")
+		}
+		if net := strings.TrimSpace(rt.CloudRun.Network); net != "" {
+			set("network", net, rp+"cloudrun.network")
+		}
+		if subnet := strings.TrimSpace(rt.CloudRun.Subnetwork); subnet != "" {
+			set("subnetwork", subnet, rp+"cloudrun.subnetwork")
 		}
 	}
 
-	// A docker target has no Kubernetes settings: a legacy docker runtime
-	// ignores them, so they are not converted, and each one set is
-	// reported.
-	if typ == RuntimeTargetTypeDocker {
+	// Non-Kubernetes targets have no Kubernetes settings, and non-Cloud-Run
+	// targets ignore cloudrun / cloudrun_instances blocks: each one set is
+	// reported and none is converted.
+	if typ != RuntimeTargetTypeKubernetes {
 		for field := range cp.fields {
 			if isKubernetesOnlyTargetField(field) {
 				delete(cp.fields, field)
 			}
 		}
-		reportDockerKubernetesFields(st, name, rtKey, prof, rt)
+		reportNotValidKubernetesFields(st, typ, name, rtKey, prof, rt)
+	}
+	if typ != RuntimeTargetTypeCloudRun {
+		reportNotValidCloudRunBlocks(st, typ, name, rtKey, rt)
 	}
 
 	// agent_defaults: copied from the profile (rule 2; these keys exist
@@ -457,18 +598,19 @@ func foldProfile(st *convState, vs *VersionedSettings, name string, prof V1Profi
 func isKubernetesOnlyTargetField(field string) bool {
 	switch field {
 	case "gke", "priority_class_name", "shared_dir_storage_class", "shared_dir_size", "safe_to_evict",
-		"home_storage_backend", "home_storage_leaf", "kubernetes_block_service_account":
+		"kubernetes_block_service_account", "workload_identity_pool", "create_service_accounts",
+		"node_selector", "tolerations", "runtime_class_name":
 		return true
 	}
 	return strings.HasPrefix(field, "kubernetes_service_account_mappings.")
 }
 
-// reportDockerKubernetesFields reports every Kubernetes-only key that
-// profile name or its docker runtime entry sets.
-func reportDockerKubernetesFields(st *convState, name, rtKey string, prof V1ProfileConfig, rt V1RuntimeConfig) {
+// reportNotValidKubernetesFields reports every Kubernetes-only key that
+// profile name or its non-Kubernetes runtime entry sets.
+func reportNotValidKubernetesFields(st *convState, typ, name, rtKey string, prof V1ProfileConfig, rt V1RuntimeConfig) {
 	report := func(path string) {
 		st.add(ConversionFieldNotValidForTargetType, ConversionSeverityNotice, path,
-			fmt.Sprintf("%s is not valid for runtime target type docker; a docker runtime ignores it today, so it is not converted", path), name)
+			fmt.Sprintf("%s is not valid for runtime target type %s; a %s runtime ignores it today, so it is not converted", path, typ, typ), name)
 	}
 	pp, rp := "profiles."+name+".", "runtimes."+rtKey+"."
 	for _, f := range []struct {
@@ -476,10 +618,11 @@ func reportDockerKubernetesFields(st *convState, name, rtKey string, prof V1Prof
 		set bool
 	}{
 		{"shared_dir_storage_class", prof.SharedDirStorageClass != ""}, {"shared_dir_size", prof.SharedDirSize != ""},
-		{"safe_to_evict", prof.SafeToEvict != nil}, {"home_storage_backend", prof.HomeStorageBackend != ""},
-		{"home_storage_leaf", prof.HomeStorageLeaf != ""},
+		{"safe_to_evict", prof.SafeToEvict != nil},
 		{"kubernetes_service_account_mappings", len(prof.KubernetesServiceAccountMappings) > 0},
 		{"kubernetes_block_service_account", prof.KubernetesBlockServiceAccount != ""},
+		{"node_selector", len(prof.NodeSelector) > 0}, {"tolerations", len(prof.Tolerations) > 0},
+		{"runtime_class_name", prof.RuntimeClassName != ""},
 	} {
 		if f.set {
 			report(pp + f.key)
@@ -492,10 +635,191 @@ func reportDockerKubernetesFields(st *convState, name, rtKey string, prof V1Prof
 		{"context", rt.Context != ""}, {"namespace", rt.Namespace != ""}, {"gke", rt.GKE},
 		{"priority_class_name", rt.PriorityClassName != ""},
 		{"shared_dir_storage_class", rt.SharedDirStorageClass != ""}, {"shared_dir_size", rt.SharedDirSize != ""},
-		{"safe_to_evict", rt.SafeToEvict != nil}, {"home_storage_backend", rt.HomeStorageBackend != ""},
-		{"home_storage_leaf", rt.HomeStorageLeaf != ""},
+		{"safe_to_evict", rt.SafeToEvict != nil},
 		{"kubernetes_service_account_mappings", len(rt.KubernetesServiceAccountMappings) > 0},
 		{"kubernetes_block_service_account", rt.KubernetesBlockServiceAccount != ""},
+		{"workload_identity_pool", rt.WorkloadIdentityPool != ""},
+		{"create_service_accounts", rt.CreateServiceAccounts},
+		{"node_selector", len(rt.NodeSelector) > 0}, {"tolerations", len(rt.Tolerations) > 0},
+		{"runtime_class_name", rt.RuntimeClassName != ""},
+	} {
+		if f.set {
+			report(rp + f.key)
+		}
+	}
+}
+
+// reportNotValidCloudRunBlocks reports cloudrun and cloudrun_instances blocks
+// set on a non-Cloud-Run runtime entry (CR10).
+func reportNotValidCloudRunBlocks(st *convState, typ, name, rtKey string, rt V1RuntimeConfig) {
+	rp := "runtimes." + rtKey + "."
+	for _, b := range []struct {
+		key string
+		set bool
+	}{{"cloudrun", rt.CloudRun != nil}, {"cloudrun_instances", rt.CloudRunInstances != nil}} {
+		if b.set {
+			path := rp + b.key
+			st.add(ConversionFieldNotValidForTargetType, ConversionSeverityNotice, path,
+				fmt.Sprintf("%s is not valid for runtime target type %s; a %s runtime ignores it today, so it is not converted", path, typ, typ), name)
+		}
+	}
+}
+
+// checkProposedCloudRunTarget checks the CR2-required and identity fields on a
+// proposed Cloud Run instance: fields with legacy sources emit blocking
+// flat_target_field_required at each affected profile's legacy path when
+// missing or invalid, while required fields with no legacy source
+// (credentials_file on all Cloud Run entries, plus service_account,
+// block_service_account and network/subnetwork on cloudrun-instances) emit
+// notice flat_target_operator_input_required at the proposed instance path.
+func checkProposedCloudRunTarget(st *convState, index int, key string, t *V1RuntimeTargetConfig, part *convGroup) {
+	if part == nil {
+		return
+	}
+	targetPrefix := fmt.Sprintf("server.broker.instances[%d].runtime_target.", index)
+	credPath := targetPrefix + "credentials_file"
+	st.add(ConversionFlatTargetOperatorInputRequired, ConversionSeverityNotice, credPath,
+		fmt.Sprintf("%s (%s) has no legacy settings source and is required for runtime target type cloudrun; set it to an absolute local service-account or impersonated-service-account JSON file path before starting the instance", credPath, key),
+		groupProfileNames(part)...)
+
+	for _, p := range part.profiles {
+		rp := "runtimes." + p.rtKey + "."
+		projPath, regionPath := rp+"cloudrun.project_id", rp+"cloudrun.location"
+		if p.legacyType == "cloudrun-instances" {
+			projPath, regionPath = rp+"cloudrun_instances.project_id", rp+"cloudrun_instances.region"
+		}
+
+		switch {
+		case t.ProjectID == "":
+			st.add(ConversionFlatTargetFieldRequired, ConversionSeverityBlocking, projPath,
+				fmt.Sprintf("%s is required for runtime target type cloudrun", projPath), p.name)
+		case strings.Contains(t.ProjectID, ":"):
+			st.add(ConversionFlatTargetFieldRequired, ConversionSeverityBlocking, projPath,
+				fmt.Sprintf("%s cannot be used on a flat cloudrun instance: domain-scoped project IDs are not supported", projPath), p.name)
+		case !cloudRunProjectIDRe.MatchString(t.ProjectID):
+			st.add(ConversionFlatTargetFieldRequired, ConversionSeverityBlocking, projPath,
+				fmt.Sprintf("%s cannot be used on a flat cloudrun instance: project_id must be a GCP project ID (6 to 30 lower-case letters, digits or hyphens, starting with a letter)", projPath), p.name)
+		}
+
+		switch {
+		case t.Region == "":
+			st.add(ConversionFlatTargetFieldRequired, ConversionSeverityBlocking, regionPath,
+				fmt.Sprintf("%s is required for runtime target type cloudrun (e.g. us-central1)", regionPath), p.name)
+		case !cloudRunRegionRe.MatchString(t.Region):
+			st.add(ConversionFlatTargetFieldRequired, ConversionSeverityBlocking, regionPath,
+				fmt.Sprintf("%s cannot be used on a flat cloudrun instance: region must be a Cloud Run region (e.g. us-central1)", regionPath), p.name)
+		}
+
+		if p.legacyType == "cloudrun-instances" {
+			saTargetPath := targetPrefix + "service_account"
+			st.add(ConversionFlatTargetOperatorInputRequired, ConversionSeverityNotice, saTargetPath,
+				fmt.Sprintf("%s (%s) has no legacy settings source on runtime type cloudrun-instances and is required for runtime target type cloudrun; set it to a user-managed service account (name@project.iam.gserviceaccount.com) before starting the instance", saTargetPath, key),
+				p.name)
+			blockTargetPath := targetPrefix + "block_service_account"
+			st.add(ConversionFlatTargetOperatorInputRequired, ConversionSeverityNotice, blockTargetPath,
+				fmt.Sprintf("%s (%s) has no legacy settings source on runtime type cloudrun-instances and is required for runtime target type cloudrun: agents with no GCP identity run as this no-role account; set it to a user-managed service account (name@project.iam.gserviceaccount.com) before starting the instance", blockTargetPath, key),
+				p.name)
+			netTargetPath := targetPrefix + "network"
+			st.add(ConversionFlatTargetOperatorInputRequired, ConversionSeverityNotice, netTargetPath,
+				fmt.Sprintf("%s or subnetwork (%s) has no legacy settings source on runtime type cloudrun-instances and is required for runtime target type cloudrun; set network or subnetwork before starting the instance", netTargetPath, key),
+				p.name)
+			continue
+		}
+
+		saPath, blockPath, assignablePath, netPath := rp+"cloudrun.service_account", rp+"cloudrun.block_service_account", rp+"cloudrun.assignable_service_accounts", rp+"cloudrun.network"
+		if t.ServiceAccount == "" {
+			st.add(ConversionFlatTargetFieldRequired, ConversionSeverityBlocking, saPath,
+				fmt.Sprintf("%s is required for runtime target type cloudrun; the platform default compute identity is never implied", saPath), p.name)
+		} else if err := validateCloudRunServiceAccountForm("service_account", t.ServiceAccount, t.ProjectID); err != nil {
+			st.add(ConversionFlatTargetFieldRequired, ConversionSeverityBlocking, saPath,
+				fmt.Sprintf("%s cannot be used on a flat cloudrun instance: %s", saPath, err.Error()), p.name)
+		}
+
+		if t.BlockServiceAccount == "" {
+			st.add(ConversionFlatTargetFieldRequired, ConversionSeverityBlocking, blockPath,
+				fmt.Sprintf("%s is required for runtime target type cloudrun: agents with no GCP identity run as this no-role account", blockPath), p.name)
+		} else if err := validateCloudRunServiceAccountForm("block_service_account", t.BlockServiceAccount, t.ProjectID); err != nil {
+			st.add(ConversionFlatTargetFieldRequired, ConversionSeverityBlocking, blockPath,
+				fmt.Sprintf("%s cannot be used on a flat cloudrun instance: %s", blockPath, err.Error()), p.name)
+		}
+
+		if len(t.AssignableServiceAccounts) > maxCloudRunAssignableServiceAccounts {
+			st.add(ConversionFlatTargetFieldRequired, ConversionSeverityBlocking, assignablePath,
+				fmt.Sprintf("%s cannot be used on a flat cloudrun instance: assignable_service_accounts accepts at most %d entries (got %d)", assignablePath, maxCloudRunAssignableServiceAccounts, len(t.AssignableServiceAccounts)), p.name)
+		} else {
+			seen := make(map[string]int, len(t.AssignableServiceAccounts))
+			for i, sa := range t.AssignableServiceAccounts {
+				elemField := fmt.Sprintf("assignable_service_accounts[%d]", i)
+				elemPath := fmt.Sprintf("%s[%d]", assignablePath, i)
+				if sa == "" {
+					st.add(ConversionFlatTargetFieldRequired, ConversionSeverityBlocking, elemPath,
+						fmt.Sprintf("%s cannot be used on a flat cloudrun instance: %s must be a user-managed service account (name@project.iam.gserviceaccount.com)", elemPath, elemField), p.name)
+					continue
+				}
+				if err := validateCloudRunServiceAccountForm(elemField, sa, t.ProjectID); err != nil {
+					st.add(ConversionFlatTargetFieldRequired, ConversionSeverityBlocking, elemPath,
+						fmt.Sprintf("%s cannot be used on a flat cloudrun instance: %s", elemPath, err.Error()), p.name)
+					continue
+				}
+				lower := strings.ToLower(sa)
+				if prev, dup := seen[lower]; dup {
+					st.add(ConversionFlatTargetFieldRequired, ConversionSeverityBlocking, elemPath,
+						fmt.Sprintf("%s cannot be used on a flat cloudrun instance: duplicate service account in assignable_service_accounts (also at index %d)", elemPath, prev), p.name)
+					continue
+				}
+				seen[lower] = i
+			}
+		}
+
+		for _, overlap := range cloudRunServiceAccountOverlapErrors("cloudrun", t) {
+			switch {
+			case overlap.Path == "cloudrun.block_service_account":
+				st.add(ConversionFlatTargetFieldRequired, ConversionSeverityBlocking, blockPath,
+					fmt.Sprintf("%s cannot be used on a flat cloudrun instance: %s", blockPath, overlap.Message), p.name)
+			case strings.HasPrefix(overlap.Path, "cloudrun.assignable_service_accounts"):
+				elemPath := assignablePath + strings.TrimPrefix(overlap.Path, "cloudrun.assignable_service_accounts")
+				st.add(ConversionFlatTargetFieldRequired, ConversionSeverityBlocking, elemPath,
+					fmt.Sprintf("%s cannot be used on a flat cloudrun instance: %s", elemPath, overlap.Message), p.name)
+			}
+		}
+
+		if t.Network == "" && t.Subnetwork == "" {
+			st.add(ConversionFlatTargetFieldRequired, ConversionSeverityBlocking, netPath,
+				fmt.Sprintf("%s or subnetwork is required for runtime target type cloudrun: Cloud Run agents mount the NFS share over the VPC", netPath), p.name)
+		}
+	}
+}
+
+// reportRemovedStorageOverrides reports each removed storage override
+// (shared_dir_storage_backend, shared_dir_storage_backends,
+// home_storage_backend, home_storage_leaf) that profile name or its runtime
+// entry sets, as not converted. The message names the replacement,
+// server.project_storage and volumes: (RemovedStorageOverrideErrors).
+func reportRemovedStorageOverrides(st *convState, name, rtKey string, prof V1ProfileConfig, rt V1RuntimeConfig) {
+	report := func(path string) {
+		st.add(ConversionLegacyFieldRemoved, ConversionSeverityNotice, path,
+			fmt.Sprintf("%s is no longer supported and is not converted: %s", path, removedOverrideRemedyFn), name)
+	}
+	type key struct {
+		key string
+		set bool
+	}
+	pp, rp := "profiles."+name+".", "runtimes."+rtKey+"."
+	for _, f := range []key{
+		{"shared_dir_storage_backend", prof.SharedDirStorageBackend != ""},
+		{"shared_dir_storage_backends", len(prof.SharedDirStorageBackends) > 0},
+		{"home_storage_backend", prof.HomeStorageBackend != ""},
+		{"home_storage_leaf", prof.HomeStorageLeaf != ""},
+	} {
+		if f.set {
+			report(pp + f.key)
+		}
+	}
+	for _, f := range []key{
+		{"shared_dir_storage_backend", rt.SharedDirStorageBackend != ""},
+		{"shared_dir_storage_backends", len(rt.SharedDirStorageBackends) > 0},
+		{"home_storage_backend", rt.HomeStorageBackend != ""},
+		{"home_storage_leaf", rt.HomeStorageLeaf != ""},
 	} {
 		if f.set {
 			report(rp + f.key)
@@ -510,10 +834,21 @@ func groupProfiles(profiles []*convProfile) []*convGroup {
 	for _, p := range profiles {
 		g, ok := byScope[p.scope]
 		if !ok {
-			g = &convGroup{seed: p.scope, scope: p.scope, typ: p.typ, ctx: p.ctx, ns: p.ns}
-			if p.typ == RuntimeTargetTypeKubernetes {
+			g = &convGroup{
+				seed:   p.scope,
+				scope:  p.scope,
+				typ:    p.typ,
+				ctx:    p.ctx,
+				ns:     p.ns,
+				proj:   p.proj,
+				region: p.region,
+			}
+			switch p.typ {
+			case RuntimeTargetTypeKubernetes:
 				g.key = conversionKey(p.scope, "k8s", p.ctx, p.ns)
-			} else {
+			case RuntimeTargetTypeCloudRun:
+				g.key = conversionKey(p.scope, RuntimeTargetTypeCloudRun, p.region)
+			default:
 				g.key = conversionKey(p.scope, RuntimeTargetTypeDocker)
 			}
 			byScope[p.scope] = g
@@ -661,6 +996,8 @@ func applySplitChoices(st *convState, groups []*convGroup, choices []ConversionC
 			typ:      g.typ,
 			ctx:      g.ctx,
 			ns:       g.ns,
+			proj:     g.proj,
+			region:   g.region,
 			profiles: moved,
 		})
 	}
@@ -767,51 +1104,168 @@ func fieldChoicesByGroup(st *convState, groups []*convGroup, choices []Conversio
 
 // reportUnusedFieldChoices reports each field choice that matched no
 // conflict, so a stale manifest entry is never ignored silently.
-func reportUnusedFieldChoices(st *convState, groups []*convGroup, choices map[string]map[string]*fieldChoice) {
-	for _, g := range groups {
-		for field, fc := range choices[g.key] {
+func reportUnusedFieldChoices(st *convState, splits []*convSplit, choices map[string]map[string]*fieldChoice) {
+	for _, sp := range splits {
+		for field, fc := range choices[sp.key] {
 			if !fc.used {
 				invalidChoice(st, fmt.Sprintf("choices[%d]", fc.index),
-					fmt.Sprintf("field %s of target group %s has no conflict to resolve", field, g.key), g)
+					fmt.Sprintf("field %s of target group %s has no conflict to resolve", field, sp.key), sp.parent)
 			}
 		}
 	}
 }
 
-// buildGroupInstance compares every field across the group's profiles
-// (rule 3) and builds the proposed instance from the fields they agree on
-// or an operator choice resolves.
-func buildGroupInstance(st *convState, g *convGroup, choices map[string]*fieldChoice) V1RuntimeBrokerInstanceConfig {
-	target := &V1RuntimeTargetConfig{Type: g.typ, Context: g.ctx, Namespace: g.ns}
-	defaults := &V1InstanceAgentDefaults{}
+// convSplit is one group (a scope group or an operator Split group) and
+// the instances it becomes: one when its profiles agree on every field it
+// splits on (splitsOn), else one per distinct set of those values.
+type convSplit struct {
+	parent *convGroup
+	// key is the parent's key as operator choices name it, kept even when
+	// uniqueGroupKeys later renames an unsplit parent's instance.
+	key         string
+	fields      []string // every folded field of the parent's profiles, sorted
+	conflicting map[string]bool
+	splitOn     []string // the conflicting fields the parent splits on, sorted
+	parts       []*convGroup
+}
 
-	var fields []string
+// splitsOn reports whether profiles of one group that differ in field go
+// to separate instances. It is the one place that decides which details a
+// split preserves: every field a flat instance holds, except one an
+// operator field choice consolidates, and except a harness override's
+// presence when a choice consolidates one of its conflicting sub-fields
+// (the chosen sub-field decides whether the override exists).
+func splitsOn(field string, choices map[string]*fieldChoice, conflicting map[string]bool) bool {
+	if choices[field] != nil {
+		return false
+	}
+	rest, ok := strings.CutPrefix(field, "harness_overrides.")
+	if !ok {
+		return true
+	}
+	hc, sub := splitHarnessOverrideField(rest)
+	if sub != "" {
+		return true
+	}
+	for f := range choices {
+		if r, isOverride := strings.CutPrefix(f, "harness_overrides."); isOverride {
+			if fhc, fsub := splitHarnessOverrideField(r); fhc == hc && fsub != "" && conflicting[f] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// splitGroup partitions g's profiles by the fields it splits on: each
+// profile, in name order, joins the first part whose first profile has
+// equal values (conversionValuesEqual) for all of them. With one part, g
+// is unchanged. Otherwise each part gets g's key with its profile names
+// appended, as an operator Split does.
+func splitGroup(g *convGroup, choices map[string]*fieldChoice) *convSplit {
+	sp := &convSplit{parent: g, key: g.key, conflicting: map[string]bool{}}
 	seen := map[string]bool{}
 	for _, p := range g.profiles {
 		for f := range p.fields {
 			if !seen[f] {
 				seen[f] = true
-				fields = append(fields, f)
+				sp.fields = append(sp.fields, f)
 			}
 		}
 	}
-	sort.Strings(fields)
-
-	conflicting := map[string]bool{}
-	for _, field := range fields {
+	sort.Strings(sp.fields)
+	for _, field := range sp.fields {
 		first := g.profiles[0].fields[field]
 		for _, p := range g.profiles[1:] {
 			if !conversionValuesEqual(field, first.v, p.fields[field].v) {
-				conflicting[field] = true
+				sp.conflicting[field] = true
 				break
 			}
 		}
 	}
+	for _, field := range sp.fields {
+		if sp.conflicting[field] && splitsOn(field, choices, sp.conflicting) {
+			sp.splitOn = append(sp.splitOn, field)
+		}
+	}
 
-	for _, field := range fields {
-		first := g.profiles[0].fields[field]
-		if !conflicting[field] {
-			setInstanceField(target, defaults, field, first.v)
+	var groupsOfParts [][]*convProfile
+	for _, p := range g.profiles {
+		placed := false
+		for i, part := range groupsOfParts {
+			if sameSplitValues(sp.splitOn, part[0], p) {
+				groupsOfParts[i] = append(part, p)
+				placed = true
+				break
+			}
+		}
+		if !placed {
+			groupsOfParts = append(groupsOfParts, []*convProfile{p})
+		}
+	}
+	if len(groupsOfParts) == 1 {
+		sp.parts = []*convGroup{g}
+		return sp
+	}
+	for _, members := range groupsOfParts {
+		names := make([]string, 0, len(members))
+		for _, p := range members {
+			names = append(names, p.name)
+		}
+		seed := g.seed + "\x00split\x00" + strings.Join(names, "\x00")
+		sp.parts = append(sp.parts, &convGroup{
+			key:      conversionKey(seed, g.key, strings.Join(names, "-")),
+			seed:     seed,
+			scope:    g.scope,
+			typ:      g.typ,
+			ctx:      g.ctx,
+			ns:       g.ns,
+			proj:     g.proj,
+			region:   g.region,
+			profiles: members,
+		})
+	}
+	return sp
+}
+
+// sameSplitValues reports whether profiles a and b agree on every field.
+func sameSplitValues(fields []string, a, b *convProfile) bool {
+	for _, f := range fields {
+		if !conversionValuesEqual(f, a.fields[f].v, b.fields[f].v) {
+			return false
+		}
+	}
+	return true
+}
+
+// buildSplitInstances builds the instances of one split group (rule 3, as
+// amended: a difference is preserved on separate instances). A field that
+// an operator choice consolidates is reported once for the whole group,
+// with every profile's value, and every part takes the chosen value.
+func buildSplitInstances(st *convState, sp *convSplit, choices map[string]*fieldChoice) []V1RuntimeBrokerInstanceConfig {
+	g := sp.parent
+	profiles := groupProfileNames(g)
+	if len(sp.parts) > 1 {
+		var parts []string
+		for _, part := range sp.parts {
+			parts = append(parts, fmt.Sprintf("%s (%s)", part.key, strings.Join(groupProfileNames(part), ", ")))
+		}
+		st.add(ConversionProfileConflict, ConversionSeverityNotice, "profiles.*",
+			fmt.Sprintf("profiles %s on target %s differ in %s; they are split into instances %s. To merge them, give the profiles the same values or add a field choice for target %s",
+				strings.Join(profiles, ", "), sp.key, strings.Join(sp.splitOn, ", "), strings.Join(parts, ", "), sp.key), profiles...)
+	}
+
+	type chosenValue struct {
+		v   interface{}
+		set bool
+	}
+	chosen := map[string]chosenValue{}
+	splitField := map[string]bool{}
+	for _, f := range sp.splitOn {
+		splitField[f] = true
+	}
+	for _, field := range sp.fields {
+		if !sp.conflicting[field] || splitField[field] {
 			continue
 		}
 		// A harness override that only some profiles have differs in its
@@ -819,50 +1273,92 @@ func buildGroupInstance(st *convState, g *convGroup, choices map[string]*fieldCh
 		// conflict already names the override, so the presence is not
 		// reported again; the entry exists once a sub-field is agreed or
 		// chosen.
-		if coveredHarnessOverrideMarker(field, conflicting) {
+		if coveredHarnessOverrideMarker(field, sp.conflicting) {
 			continue
 		}
-		profiles := groupProfileNames(g)
 		path := "profiles.*." + field
-		fc := choices[field]
-		if fc == nil {
-			st.add(ConversionProfileConflict, ConversionSeverityBlocking, path, conflictMessage(g, field), profiles...)
-			continue
-		}
+		fc := choices[field] // not nil: an unchosen difference is split on
 		fc.used = true
 		if tmpl, isTemplate := strings.CutPrefix(fc.choice.ChosenProfile, ConversionChoiceTemplatePrefix); isTemplate {
 			st.add(ConversionProfileConflictResolved, ConversionSeverityNotice, path,
 				fmt.Sprintf("operator choice: %s stays unset on instance %s and template %s sets it; no template is generated, so create or update template %s before the profiles are retired (%s)",
-					field, g.key, tmpl, tmpl, conflictValues(g, field)), profiles...)
+					field, sp.key, tmpl, tmpl, conflictValues(g, field)), profiles...)
 			continue
 		}
 		// A chosen profile that leaves the field unset leaves it unset on
 		// the instance too.
-		if chosen, set := groupProfile(g, fc.choice.ChosenProfile).fields[field]; set {
-			setInstanceField(target, defaults, field, chosen.v)
-		}
+		cv, set := groupProfile(g, fc.choice.ChosenProfile).fields[field]
+		chosen[field] = chosenValue{v: cv.v, set: set}
 		st.add(ConversionProfileConflictResolved, ConversionSeverityNotice, path,
-			fmt.Sprintf("operator choice: instance %s takes profile %s's %s (%s)", g.key, fc.choice.ChosenProfile, field, conflictValues(g, field)), profiles...)
+			fmt.Sprintf("operator choice: instance %s takes profile %s's %s (%s)", sp.key, fc.choice.ChosenProfile, field, conflictValues(g, field)), profiles...)
 	}
 
-	inst := V1RuntimeBrokerInstanceConfig{Key: g.key, Name: g.key, RuntimeTarget: target}
-	if !reflect.DeepEqual(*defaults, V1InstanceAgentDefaults{}) {
-		inst.AgentDefaults = defaults
+	var out []V1RuntimeBrokerInstanceConfig
+	for _, part := range sp.parts {
+		target := &V1RuntimeTargetConfig{
+			Type:      part.typ,
+			Context:   part.ctx,
+			Namespace: part.ns,
+			ProjectID: part.proj,
+			Region:    part.region,
+		}
+		defaults := &V1InstanceAgentDefaults{}
+		for _, field := range sp.fields {
+			switch {
+			case !sp.conflicting[field]:
+				// Agreed by the group: copied as the group's first profile
+				// writes it, so every part carries the same value.
+				if cv, set := g.profiles[0].fields[field]; set {
+					setInstanceField(target, defaults, field, cv.v)
+				}
+			case splitField[field]:
+				// Agreed by this part, which is split on the field.
+				if cv, set := part.profiles[0].fields[field]; set {
+					setInstanceField(target, defaults, field, cv.v)
+				}
+			default:
+				if c, ok := chosen[field]; ok && c.set {
+					setInstanceField(target, defaults, field, c.v)
+				}
+			}
+		}
+		inst := V1RuntimeBrokerInstanceConfig{Key: part.key, Name: part.key, RuntimeTarget: target}
+		if !reflect.DeepEqual(*defaults, V1InstanceAgentDefaults{}) {
+			inst.AgentDefaults = defaults
+		}
+		out = append(out, inst)
 	}
-	return inst
+	return out
 }
 
 // conversionValuesEqual is rule 3's deep equality. A missing value (nil)
 // differs from every set one, so false and unset safe_to_evict differ.
-// Lists are order-sensitive, except secret declarations, which compare as
-// a set keyed by key.
+// Lists are order-sensitive, except secret declarations (keyed by key),
+// tolerations (key, operator with "" as Equal, value, effect), and Cloud Run
+// assignable_service_accounts (an unordered allow-list).
 func conversionValuesEqual(field string, a, b interface{}) bool {
+	if field == "tolerations" {
+		at, aok := a.([]api.K8sToleration)
+		bt, bok := b.([]api.K8sToleration)
+		return aok == bok && reflect.DeepEqual(tolerationSet(at), tolerationSet(bt))
+	}
 	if field == "secrets" {
 		as, _ := a.([]api.RequiredSecret)
 		bs, _ := b.([]api.RequiredSecret)
 		return reflect.DeepEqual(sortedSecrets(as), sortedSecrets(bs))
 	}
+	if field == "assignable_service_accounts" {
+		as, aok := a.([]string)
+		bs, bok := b.([]string)
+		return aok == bok && reflect.DeepEqual(sortedStrings(as), sortedStrings(bs))
+	}
 	return reflect.DeepEqual(a, b)
+}
+
+func sortedStrings(s []string) []string {
+	out := append([]string(nil), s...)
+	sort.Strings(out)
+	return out
 }
 
 func sortedSecrets(s []api.RequiredSecret) []api.RequiredSecret {
@@ -880,13 +1376,6 @@ func setInstanceField(t *V1RuntimeTargetConfig, d *V1InstanceAgentDefaults, fiel
 			t.KubernetesServiceAccountMappings = map[string]string{}
 		}
 		t.KubernetesServiceAccountMappings[rest] = v.(string)
-		return
-	}
-	if rest, ok := strings.CutPrefix(field, "shared_dir_storage_backends."); ok {
-		if t.SharedDirStorageBackends == nil {
-			t.SharedDirStorageBackends = map[string]string{}
-		}
-		t.SharedDirStorageBackends[rest] = v.(string)
 		return
 	}
 	if rest, ok := strings.CutPrefix(field, "harness_overrides."); ok {
@@ -930,14 +1419,28 @@ func setInstanceField(t *V1RuntimeTargetConfig, d *V1InstanceAgentDefaults, fiel
 	case "safe_to_evict":
 		b := v.(bool)
 		t.SafeToEvict = &b
-	case "shared_dir_storage_backend":
-		t.SharedDirStorageBackend = v.(string)
-	case "home_storage_backend":
-		t.HomeStorageBackend = v.(string)
-	case "home_storage_leaf":
-		t.HomeStorageLeaf = v.(string)
 	case "kubernetes_block_service_account":
 		t.KubernetesBlockServiceAccount = v.(string)
+	case "workload_identity_pool":
+		t.WorkloadIdentityPool = v.(string)
+	case "create_service_accounts":
+		t.CreateServiceAccounts = v.(bool)
+	case "node_selector":
+		t.NodeSelector = copyStringMap(v.(map[string]string))
+	case "tolerations":
+		t.Tolerations = append([]api.K8sToleration(nil), v.([]api.K8sToleration)...)
+	case "runtime_class_name":
+		t.RuntimeClassName = v.(string)
+	case "service_account":
+		t.ServiceAccount = v.(string)
+	case "block_service_account":
+		t.BlockServiceAccount = v.(string)
+	case "assignable_service_accounts":
+		t.AssignableServiceAccounts = append([]string(nil), v.([]string)...)
+	case "network":
+		t.Network = v.(string)
+	case "subnetwork":
+		t.Subnetwork = v.(string)
 	case "default_harness_config":
 		d.DefaultHarnessConfig = v.(string)
 	case "image_registry":
@@ -994,18 +1497,6 @@ var harnessOverrideSubFields = map[string]bool{
 	"env": true, "volumes": true, "resources": true,
 }
 
-// agentKubernetesEquivalents names the agent's own (inline or persisted)
-// kubernetes setting that outranks the instance value of an infrastructure
-// field. A template's kubernetes block is not applied to an agent's job
-// config (ptone/scion#4524, contract-appendix-p3.md FC5 errata), so no
-// template can set these.
-var agentKubernetesEquivalents = map[string]string{
-	"priority_class_name":      "kubernetes.priorityClassName",
-	"shared_dir_storage_class": "kubernetes.shared_dir_storage_class",
-	"shared_dir_size":          "kubernetes.shared_dir_size",
-	"safe_to_evict":            "kubernetes.safeToEvict",
-}
-
 // isWorkloadField reports whether field is an agent_defaults field (W2-W9).
 func isWorkloadField(field string) bool {
 	switch field {
@@ -1013,24 +1504,6 @@ func isWorkloadField(field string) bool {
 		return true
 	}
 	return strings.HasPrefix(field, "harness_overrides.")
-}
-
-// conflictMessage names the field, the profiles and their values, and the
-// operator dispositions (rule 3).
-func conflictMessage(g *convGroup, field string) string {
-	head := fmt.Sprintf("profiles %s use target %s with different %s (%s). ",
-		strings.Join(groupProfileNames(g), ", "), g.key, field, conflictValues(g, field))
-	switch {
-	case isWorkloadField(field):
-		return head + fmt.Sprintf("Choose one value as the instance's agent_defaults.%s, and express the others through a template "+
-			"(a template's value outranks the instance default, except a harness_overrides image, which ranks above the template image: see ptone/scion#1799), "+
-			"or keep the profiles on separate instances on the same target scope.", field)
-	case agentKubernetesEquivalents[field] != "":
-		return head + fmt.Sprintf("Choose one value as the instance's runtime_target.%s, and express the others through the agent's own %s "+
-			"(inline or persisted), which outranks the instance default, or keep the profiles on separate instances on the same target scope.", field, agentKubernetesEquivalents[field])
-	default:
-		return head + fmt.Sprintf("Choose one value for the instance's runtime_target.%s, or declare a second instance with its own key on the same target scope.", field)
-	}
 }
 
 // conflictValues lists each profile's effective value of field and where
@@ -1138,6 +1611,10 @@ func checkRawConversionKeys(st *convState, vs *VersionedSettings, raw []byte, na
 	}
 	for rtKey, users := range runtimeUsers {
 		checkMap("runtimes."+rtKey, rawRuntimes[rtKey], knownRuntimeEntryKeys, users)
+		if rm, ok := rawRuntimes[rtKey].(map[string]interface{}); ok {
+			checkMap("runtimes."+rtKey+".cloudrun", rm["cloudrun"], knownCloudRunKeys, users)
+			checkMap("runtimes."+rtKey+".cloudrun_instances", rm["cloudrun_instances"], knownCloudRunInstancesKeys, users)
+		}
 	}
 }
 

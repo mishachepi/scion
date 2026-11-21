@@ -586,13 +586,13 @@ func TestBuildRecord_CT1_ResolutionKinds(t *testing.T) {
 			// the saved profile.
 			name:    "requested profile not in settings is refused at create",
 			profile: "absent",
-			mode:    profileRequested,
+			mode:    profileCreate,
 			want:    want{how: resolutionDefaultFallback, defaultHolder: true, record: brDefaultRecord, err: errProfileUnresolved},
 		},
 		{
 			name:    "requested profile in settings resolves",
 			profile: "local",
-			mode:    profileRequested,
+			mode:    profileCreate,
 			want:    want{how: resolutionProfile, defaultHolder: true, record: brDefaultRecord, profile: "local", entry: "docker"},
 		},
 		{

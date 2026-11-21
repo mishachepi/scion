@@ -16,7 +16,6 @@ package hub
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 	"slices"
 	"sort"
@@ -50,6 +49,16 @@ type brokerStartSupport struct {
 	// cleared key api.ClearableConfigPath accepts, and a removed env key,
 	// take effect at the next start (ptone/scion#4890).
 	ClearedFields bool
+	// UnlimitedCountLimits: the broker keeps an explicit max_turns or
+	// max_model_calls of 0 ("no limit") over an inherited limit at start
+	// (ptone/scion#5605). Without it the hub refuses a change of a count
+	// limit to 0 (unlimitedCountRefusal).
+	UnlimitedCountLimits bool
+	// ClearedResourceSubfields: the broker applies the resources
+	// sub-field entries of cleared_fields (api.ResourceSubPaths) at start,
+	// so a resources edit that drops a sub-field restores its inherited
+	// value at the next start (ptone/scion#5676).
+	ClearedResourceSubfields bool
 }
 
 // brokerStartSupportFrom reads a broker's capabilities.
@@ -57,27 +66,49 @@ func brokerStartSupportFrom(caps *store.BrokerCapabilities) brokerStartSupport {
 	if caps == nil {
 		return brokerStartSupport{}
 	}
-	return brokerStartSupport{ChangedFields: caps.ChangedFields, ClearedFields: caps.ClearedFields}
+	return brokerStartSupport{
+		ChangedFields:            caps.ChangedFields,
+		ClearedFields:            caps.ClearedFields,
+		UnlimitedCountLimits:     caps.UnlimitedCountLimits,
+		ClearedResourceSubfields: caps.ClearedResourceSubfields,
+	}
 }
 
 // agentBrokerStartSupport is brokerStartSupportFrom for the agent's
-// assigned broker. An agent with no broker, or a broker lookup that fails,
-// gets the zero value, so edits are reported as waiting for a
-// reincarnation rather than promised at the next start.
-func (s *Server) agentBrokerStartSupport(ctx context.Context, agent *store.Agent) brokerStartSupport {
-	if agent == nil || agent.RuntimeBrokerID == "" || s.store == nil {
-		return brokerStartSupport{}
+// assigned broker. An agent with no broker, or whose broker record no
+// longer exists, gets the zero value: no start would re-render or clear
+// anything for it. A broker record that cannot be read is errBrokerLookup
+// (ptone/scion#7544): the zero value would report an edit the broker
+// applies at the next start as held for reincarnation, while the start
+// still asks the broker to apply it. The caller refuses with 503 and
+// writes nothing, as agentBrokerStartSupportStrict's callers do.
+func (s *Server) agentBrokerStartSupport(ctx context.Context, agent *store.Agent) (brokerStartSupport, error) {
+	sup, _, err := s.agentBrokerStartSupportStrict(ctx, agent)
+	if err != nil {
+		slog.WarnContext(ctx, "agent edit: runtime broker record could not be read; when the edit takes effect is not decided",
+			"agent", agent.ID, "broker", agent.RuntimeBrokerID, "error", err)
 	}
-	broker, err := s.store.GetRuntimeBroker(ctx, agent.RuntimeBrokerID)
-	if err != nil || broker == nil {
-		if err != nil {
-			slog.DebugContext(ctx, "agent edit: broker lookup failed; edits of provision-rendered keys reported as held for reincarnation",
-				"agent", agent.ID, "broker", agent.RuntimeBrokerID, "error", err)
-		}
-		return brokerStartSupport{}
-	}
-	return brokerStartSupportFrom(broker.Capabilities)
+	return sup, err
 }
+
+// brokerSupportSource yields the agent's broker start support for a
+// classification that needs it, so an edit whose disposition does not
+// depend on the broker never reads its record.
+type brokerSupportSource func() (brokerStartSupport, error)
+
+// knownBrokerSupport is a brokerSupportSource for support already read.
+func knownBrokerSupport(sup brokerStartSupport) brokerSupportSource {
+	return func() (brokerStartSupport, error) { return sup, nil }
+}
+
+// brokerUnavailableMessage is the 503 message of a config edit whose
+// disposition needs the agent's broker record when it cannot be read.
+const brokerUnavailableMessage = "The agent's runtime broker could not be read to decide when the edit takes effect; retry"
+
+// pendingFoldBrokerUnavailableMessage is the 503 message of a start whose
+// held edits could not be folded because the agent's broker record could
+// not be read.
+const pendingFoldBrokerUnavailableMessage = "the agent's runtime broker could not be read to apply its held edits; retry"
 
 // appliesAtStart reports whether the broker applies an edit of the field
 // with wire key key at the next start although its tier alone would hold
@@ -151,30 +182,32 @@ func skillReferencesRemoved(old, req *api.ScionConfig) bool {
 	return false
 }
 
-// clearAppliesAtStart reports whether the broker can apply a clear or zero
-// of the config key with wire key key at the next start: with
-// ClearedFields, a key api.ClearableConfigPath accepts, and env, whose
-// removed keys are sent as env.KEY entries. Whether a given PATCH's clear
-// is applied also depends on what it recorded (heldClearEdits). The count
-// limits are left out: their 0 (Unlimited) is not applied by any start or
-// reincarnation over an inherited limit (ptone/scion#5605), so the field
-// keeps clearNeedsReincarnate; their null clear is handled by
-// heldClearEdits.
+// clearAppliesAtStart reports whether the broker can apply a clear of the
+// config key with wire key key at the next start: with ClearedFields, a key
+// api.ClearableConfigPath accepts, and env, whose removed keys are sent as
+// env.KEY entries. Whether a given PATCH's clear is applied also depends on
+// what it recorded (heldClearEdits). A count limit's clear is its null; its
+// 0 is Unlimited, a value, not a clear (ptone/scion#5605).
 func (sup brokerStartSupport) clearAppliesAtStart(key string) bool {
 	k, ok := strings.CutPrefix(key, agentConfigKeyPrefix)
-	return ok && sup.ClearedFields && !countLimitKeys[k] && (k == "env" || api.ClearableConfigPath(k))
+	return ok && sup.ClearedFields && (k == "env" || api.ClearableConfigPath(k))
 }
 
-// countLimitKeys are the count limits, whose 0 is the Edit page's
-// Unlimited rather than a clear.
-var countLimitKeys = map[string]bool{"max_turns": true, "max_model_calls": true}
+// resourceSubfieldClearAppliesAtStart reports whether the broker applies a
+// resources sub-field entry of cleared_fields at the next start: it
+// applies cleared_fields and accepts the sub-field entries
+// (ptone/scion#5676).
+func (sup brokerStartSupport) resourceSubfieldClearAppliesAtStart() bool {
+	return sup.ClearedFields && sup.ClearedResourceSubfields
+}
 
 // heldClearEdits returns the entries of cleared (wire keys of cleared
-// container keys, from reincarnateOnlyConfigEdits) that still wait for a
-// reincarnation with this broker. rawConfig is the request's raw config
-// object, recorded the cleared paths the PATCH recorded (the new
-// ClearedFields), and envDropped the env keys the request drops
-// (droppedEnvKeys).
+// container keys, from reincarnateOnlyConfigEdits and
+// withDroppedResourcesSubField) that still wait for a reincarnation with
+// this broker. recorded is the cleared paths the PATCH recorded (the new
+// ClearedFields), envDropped the env keys the request drops
+// (droppedEnvKeys), and resDropped the resources sub-paths it drops
+// (droppedResourceSubPaths).
 //
 // A clear is reported applied only when the broker applies cleared_fields
 // and the PATCH actually recorded it: the key itself, or, for env, an
@@ -182,13 +215,16 @@ var countLimitKeys = map[string]bool{"max_turns": true, "max_model_calls": true}
 // agent's env records no env entries, and the auto-expose and TZ keys are
 // never recorded, so such an env edit stays held.
 //
-// A count limit sent as a number (0, Unlimited) is excluded from the
-// applied path and stays held, with today's warning: the broker would
-// restore the inherited limit rather than remove it, and no start or
-// reincarnation can yet express "no limit" over an inherited one
-// (ptone/scion#5605). Only a null value is reported as a clear the broker
-// applies.
-func (sup brokerStartSupport) heldClearEdits(cleared []string, rawConfig map[string]json.RawMessage, recorded, envDropped []string) []string {
+// A resources edit that drops a sub-field (resDropped not empty) is
+// reported applied only when the broker applies the sub-field entries
+// (resourceSubfieldClearAppliesAtStart) and every dropped sub-path was
+// recorded; a whole resources clear follows the general rule.
+//
+// A count limit's 0 (Unlimited) never reaches here: it is a set value the
+// start merge applies, so reincarnateOnlyConfigEdits does not report it as
+// cleared, and the hub accepts it only for a broker with
+// UnlimitedCountLimits (unlimitedCountRefusal, ptone/scion#5605).
+func (sup brokerStartSupport) heldClearEdits(cleared, recorded, envDropped, resDropped []string) []string {
 	var out []string
 	for _, key := range cleared {
 		k := strings.TrimPrefix(key, agentConfigKeyPrefix)
@@ -197,8 +233,8 @@ func (sup brokerStartSupport) heldClearEdits(cleared []string, rawConfig map[str
 		case !sup.ClearedFields:
 		case k == "env":
 			applied = envKeysRecorded(envDropped, recorded)
-		case countLimitKeys[k]:
-			applied = !countLimitSentAsNumber(key, rawConfig) && slices.Contains(recorded, k)
+		case k == "resources" && len(resDropped) > 0 && !slices.Contains(recorded, k):
+			applied = sup.resourceSubfieldClearAppliesAtStart() && pathsRecorded(resDropped, recorded)
 		default:
 			applied = sup.clearAppliesAtStart(key) && slices.Contains(recorded, k)
 		}
@@ -207,6 +243,16 @@ func (sup brokerStartSupport) heldClearEdits(cleared []string, rawConfig map[str
 		}
 	}
 	return out
+}
+
+// pathsRecorded reports whether every path in paths is in recorded.
+func pathsRecorded(paths, recorded []string) bool {
+	for _, p := range paths {
+		if !slices.Contains(recorded, p) {
+			return false
+		}
+	}
+	return true
 }
 
 // envKeysRecorded reports whether every key in keys has an env.KEY entry
@@ -244,22 +290,6 @@ func droppedEnvKeys(old, req *api.ScionConfig, present map[string]bool) []string
 	}
 	sort.Strings(out)
 	return out
-}
-
-// countLimitSentAsNumber reports whether the wire key key is a count limit
-// the request's raw config sends as a number rather than null.
-func countLimitSentAsNumber(key string, rawConfig map[string]json.RawMessage) bool {
-	k := strings.TrimPrefix(key, agentConfigKeyPrefix)
-	if !countLimitKeys[k] {
-		return false
-	}
-	for rk, v := range rawConfig {
-		if strings.EqualFold(rk, k) {
-			s := strings.TrimSpace(string(v))
-			return s != "" && s != "null"
-		}
-	}
-	return false
 }
 
 // heldRemovals returns removed (the entries removedConfigEntries reports

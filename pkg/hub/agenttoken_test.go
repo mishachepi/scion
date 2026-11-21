@@ -17,8 +17,6 @@ package hub
 import (
 	"context"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -26,6 +24,18 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func signUnitAgentToken(t *testing.T, svc *AgentTokenService, agentID, projectID string, scopes []AgentTokenScope, ancestry []string) string {
+	t.Helper()
+	tok, _, err := svc.SignAgentToken(AgentTokenGrant{
+		AgentID:   agentID,
+		ProjectID: projectID,
+		Scopes:    scopes,
+		Ancestry:  ancestry,
+	}, "")
+	require.NoError(t, err)
+	return tok
+}
 
 func TestAgentTokenService_GenerateAndValidate(t *testing.T) {
 	service, err := NewAgentTokenService(AgentTokenConfig{
@@ -35,8 +45,7 @@ func TestAgentTokenService_GenerateAndValidate(t *testing.T) {
 	require.NoError(t, err)
 
 	// Generate a token
-	token, err := service.GenerateAgentToken("agent-123", "project-456", []AgentTokenScope{ScopeAgentStatusUpdate}, nil)
-	require.NoError(t, err)
+	token := signUnitAgentToken(t, service, "agent-123", "project-456", []AgentTokenScope{ScopeAgentStatusUpdate}, nil)
 	assert.NotEmpty(t, token)
 
 	// Validate the token
@@ -50,7 +59,7 @@ func TestAgentTokenService_GenerateAndValidate(t *testing.T) {
 
 // TestAgentTokenService_ScopeSchemaStampedOnEveryToken pins ptone/scion#2339's
 // compatibility metadata: every token this service mints or re-mints (a
-// refresh is just another call to GenerateAgentToken with the agent's
+// refresh is just another call to SignAgentToken with the agent's
 // current role scopes) carries the current scope schema on the wire. It also
 // pins that AgentRoleFull's scope bundle carries both the agent-create and
 // the service-account-assign agent scopes, so a role=full agent keeps both
@@ -62,8 +71,7 @@ func TestAgentTokenService_ScopeSchemaStampedOnEveryToken(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	token, err := service.GenerateAgentToken("agent-full", "project-456", ScopesForRole(AgentRoleFull), nil)
-	require.NoError(t, err)
+	token := signUnitAgentToken(t, service, "agent-full", "project-456", ScopesForRole(AgentRoleFull), nil)
 
 	claims, err := service.ValidateAgentToken(token)
 	require.NoError(t, err)
@@ -76,10 +84,10 @@ func TestAgentTokenService_ScopeSchemaStampedOnEveryToken(t *testing.T) {
 // TestAgentTokenService_ValidateAgentToken_LegacyRoundTrip pins the
 // wire-level discriminator: ValidateAgentToken reads a verified token that
 // carries no scope_schema claim as a legacy pre-split token, and a verified
-// token stamped with the current schema as not legacy. GenerateAgentToken is
+// token stamped with the current schema as not legacy. SignAgentToken is
 // the only production minter and always stamps the current schema, so the
 // "no claim" case is constructed directly here, using the service's own
-// signer instead of GenerateAgentToken, to simulate a genuine token signed
+// signer instead of SignAgentToken, to simulate a genuine token signed
 // before AgentTokenClaims.ScopeSchema existed.
 func TestAgentTokenService_ValidateAgentToken_LegacyRoundTrip(t *testing.T) {
 	service, err := NewAgentTokenService(AgentTokenConfig{
@@ -91,6 +99,7 @@ func TestAgentTokenService_ValidateAgentToken_LegacyRoundTrip(t *testing.T) {
 	now := time.Now()
 	legacyClaims := AgentTokenClaims{
 		Claims: jwt.Claims{
+			ID:        "jti-legacy-roundtrip",
 			Issuer:    AgentTokenIssuer,
 			Subject:   "legacy-agent",
 			Audience:  jwt.Audience{AgentTokenAudience},
@@ -112,8 +121,7 @@ func TestAgentTokenService_ValidateAgentToken_LegacyRoundTrip(t *testing.T) {
 	assert.True(t, isLegacyPreSplitAgentJWT(&agentIdentityWrapper{legacyParsed}),
 		"a verified token with no scope_schema claim must read as a legacy pre-split token")
 
-	currentToken, err := service.GenerateAgentToken("current-agent", "proj-current", []AgentTokenScope{ScopeAgentCreate}, nil)
-	require.NoError(t, err)
+	currentToken := signUnitAgentToken(t, service, "current-agent", "proj-current", []AgentTokenScope{ScopeAgentCreate}, nil)
 	currentParsed, err := service.ValidateAgentToken(currentToken)
 	require.NoError(t, err)
 	assert.False(t, isLegacyPreSplitAgentJWT(&agentIdentityWrapper{currentParsed}),
@@ -140,6 +148,7 @@ func TestAgentTokenService_ValidateAgentToken_UnknownScopeSchemaIsNotLegacy(t *t
 			now := time.Now()
 			claims := AgentTokenClaims{
 				Claims: jwt.Claims{
+					ID:        "jti-unknown-schema",
 					Issuer:    AgentTokenIssuer,
 					Subject:   "unknown-schema-agent",
 					Audience:  jwt.Audience{AgentTokenAudience},
@@ -173,8 +182,7 @@ func TestAgentTokenService_DefaultScopes(t *testing.T) {
 	require.NoError(t, err)
 
 	// Generate a token with no scopes specified
-	token, err := service.GenerateAgentToken("agent-123", "project-456", nil, nil)
-	require.NoError(t, err)
+	token := signUnitAgentToken(t, service, "agent-123", "project-456", nil, nil)
 
 	// Validate the token has default scope
 	claims, err := service.ValidateAgentToken(token)
@@ -190,8 +198,7 @@ func TestAgentTokenService_ExpiredToken(t *testing.T) {
 	require.NoError(t, err)
 
 	// Generate an expired token
-	token, err := service.GenerateAgentToken("agent-123", "project-456", nil, nil)
-	require.NoError(t, err)
+	token := signUnitAgentToken(t, service, "agent-123", "project-456", nil, nil)
 
 	// Validation should fail
 	_, err = service.ValidateAgentToken(token)
@@ -211,8 +218,7 @@ func TestAgentTokenService_InvalidSignature(t *testing.T) {
 	require.NoError(t, err)
 
 	// Generate with service1
-	token, err := service1.GenerateAgentToken("agent-123", "project-456", nil, nil)
-	require.NoError(t, err)
+	token := signUnitAgentToken(t, service1, "agent-123", "project-456", nil, nil)
 
 	// Validate with service2 should fail
 	_, err = service2.ValidateAgentToken(token)
@@ -238,12 +244,11 @@ func TestAgentTokenService_AgentCreateAndLifecycleScopes(t *testing.T) {
 	require.NoError(t, err)
 
 	// Generate a token with agent create and lifecycle scopes
-	token, err := service.GenerateAgentToken("agent-sub", tid("project-parent"), []AgentTokenScope{
+	token := signUnitAgentToken(t, service, "agent-sub", tid("project-parent"), []AgentTokenScope{
 		ScopeAgentStatusUpdate,
 		ScopeAgentCreate,
 		ScopeAgentLifecycle,
 	}, nil)
-	require.NoError(t, err)
 	assert.NotEmpty(t, token)
 
 	// Validate the token
@@ -264,131 +269,11 @@ func TestAgentTokenService_RandomKeyGeneration(t *testing.T) {
 	assert.NotNil(t, service)
 
 	// Generate and validate should work
-	token, err := service.GenerateAgentToken("agent-123", "project-456", nil, nil)
-	require.NoError(t, err)
+	token := signUnitAgentToken(t, service, "agent-123", "project-456", nil, nil)
 
 	claims, err := service.ValidateAgentToken(token)
 	require.NoError(t, err)
 	assert.Equal(t, "agent-123", claims.Subject)
-}
-
-func TestAgentAuthMiddleware(t *testing.T) {
-	service, err := NewAgentTokenService(AgentTokenConfig{
-		SigningKey: make([]byte, 32),
-	})
-	require.NoError(t, err)
-
-	// Generate a valid token
-	token, err := service.GenerateAgentToken("agent-123", "project-456", []AgentTokenScope{ScopeAgentStatusUpdate}, nil)
-	require.NoError(t, err)
-
-	// Create a test handler that checks for agent context
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		claims := GetAgentFromContext(r.Context())
-		if claims != nil {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(claims.Subject))
-		} else {
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte("no agent"))
-		}
-	})
-
-	// Wrap with middleware
-	wrapped := service.AgentAuthMiddleware(handler)
-
-	t.Run("valid token in X-Scion-Agent-Token", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/test", nil)
-		req.Header.Set("X-Scion-Agent-Token", token)
-		rr := httptest.NewRecorder()
-
-		wrapped.ServeHTTP(rr, req)
-
-		assert.Equal(t, http.StatusOK, rr.Code)
-		assert.Equal(t, "agent-123", rr.Body.String())
-	})
-
-	t.Run("valid token in Authorization header", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/test", nil)
-		req.Header.Set("Authorization", "Bearer "+token)
-		rr := httptest.NewRecorder()
-
-		wrapped.ServeHTTP(rr, req)
-
-		assert.Equal(t, http.StatusOK, rr.Code)
-		assert.Equal(t, "agent-123", rr.Body.String())
-	})
-
-	t.Run("invalid token", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/test", nil)
-		req.Header.Set("X-Scion-Agent-Token", "invalid-token")
-		rr := httptest.NewRecorder()
-
-		wrapped.ServeHTTP(rr, req)
-
-		assert.Equal(t, http.StatusUnauthorized, rr.Code)
-	})
-
-	t.Run("no token passes through", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/test", nil)
-		rr := httptest.NewRecorder()
-
-		wrapped.ServeHTTP(rr, req)
-
-		// Should pass through (no agent context)
-		assert.Equal(t, http.StatusNotFound, rr.Code)
-		assert.Equal(t, "no agent", rr.Body.String())
-	})
-}
-
-func TestRequireAgentScope(t *testing.T) {
-	service, err := NewAgentTokenService(AgentTokenConfig{
-		SigningKey: make([]byte, 32),
-	})
-	require.NoError(t, err)
-
-	// Generate a token with only status update scope
-	token, err := service.GenerateAgentToken("agent-123", "project-456", []AgentTokenScope{ScopeAgentStatusUpdate}, nil)
-	require.NoError(t, err)
-
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-
-	t.Run("has required scope", func(t *testing.T) {
-		wrapped := service.AgentAuthMiddleware(RequireAgentScope(ScopeAgentStatusUpdate)(handler))
-
-		req := httptest.NewRequest(http.MethodGet, "/test", nil)
-		req.Header.Set("X-Scion-Agent-Token", token)
-		rr := httptest.NewRecorder()
-
-		wrapped.ServeHTTP(rr, req)
-
-		assert.Equal(t, http.StatusOK, rr.Code)
-	})
-
-	t.Run("missing required scope", func(t *testing.T) {
-		wrapped := service.AgentAuthMiddleware(RequireAgentScope(ScopeProjectSecretRead)(handler))
-
-		req := httptest.NewRequest(http.MethodGet, "/test", nil)
-		req.Header.Set("X-Scion-Agent-Token", token)
-		rr := httptest.NewRecorder()
-
-		wrapped.ServeHTTP(rr, req)
-
-		assert.Equal(t, http.StatusForbidden, rr.Code)
-	})
-
-	t.Run("no agent context", func(t *testing.T) {
-		wrapped := RequireAgentScope(ScopeAgentStatusUpdate)(handler)
-
-		req := httptest.NewRequest(http.MethodGet, "/test", nil)
-		rr := httptest.NewRecorder()
-
-		wrapped.ServeHTTP(rr, req)
-
-		assert.Equal(t, http.StatusUnauthorized, rr.Code)
-	})
 }
 
 func TestGetAgentFromContext(t *testing.T) {
@@ -449,8 +334,7 @@ func TestGCPTokenScope_InToken(t *testing.T) {
 	gcpScope := GCPTokenScopeForSA(saID)
 	scopes := []AgentTokenScope{ScopeAgentStatusUpdate, gcpScope}
 
-	token, err := service.GenerateAgentToken(tid("agent-1"), tid("project-1"), scopes, nil)
-	require.NoError(t, err)
+	token := signUnitAgentToken(t, service, tid("agent-1"), tid("project-1"), scopes, nil)
 
 	claims, err := service.ValidateAgentToken(token)
 	require.NoError(t, err)

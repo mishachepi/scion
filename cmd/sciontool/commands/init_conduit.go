@@ -18,7 +18,9 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	core "github.com/GoogleCloudPlatform/scion/pkg/conduit"
@@ -81,8 +83,10 @@ func (p portForwarding) run(ctx context.Context) {
 // newPortForwarding wires portForwarding to the hub client; getenv reads
 // the agent environment (os.Getenv outside tests). ptyUser is the agent
 // user that PTY streams' tmux clients run as; ssh is the conduit SSH
-// server (prepareConduitSSH), nil when there is none.
-func newPortForwarding(c *hub.Client, disableConduit bool, ptyUser conduit.PTYUser, ssh *sshd.Config, getenv func(string) string) portForwarding {
+// server (prepareConduitSSH), nil when there is none. deliver, when not nil,
+// registers the deliver-message control route (conduitDeliverOptions);
+// execOpts, when not nil, registers the exec routes (conduitExecOptions).
+func newPortForwarding(c *hub.Client, disableConduit bool, ptyUser conduit.PTYUser, ssh *sshd.Config, deliver *control.DeliverOptions, execOpts *control.ExecOptions, getenv func(string) string) portForwarding {
 	return portForwarding{
 		getenv:         getenv,
 		disableConduit: disableConduit,
@@ -90,7 +94,7 @@ func newPortForwarding(c *hub.Client, disableConduit bool, ptyUser conduit.PTYUs
 			// The control handler is the session's only RPC target: a
 			// hub-originated RpcRequest reaches /v1/control/* and nothing
 			// else in sciontool.
-			ctl := control.New(control.Options{KickTokenRefresh: c.KickTokenRefresh})
+			ctl := control.New(control.Options{KickTokenRefresh: c.KickTokenRefresh, Deliver: deliver, Exec: execOpts})
 			a, err := conduit.New(conduit.Options{
 				HubURL:                c.HubURL(),
 				AgentID:               c.AgentID(),
@@ -101,6 +105,7 @@ func newPortForwarding(c *hub.Client, disableConduit bool, ptyUser conduit.PTYUs
 				HTTPClient:            c.HTTPClient(),
 				PTYUser:               ptyUser,
 				SSH:                   ssh,
+				Policy:                conduitPolicy(getenv),
 				// After a 4401 the reconnect waits for the refresh loop's
 				// next result instead of refreshing itself, so refreshes
 				// stay single-flight; the redial then presents the token
@@ -154,6 +159,70 @@ func (r authRefreshingAgent) Run(ctx context.Context) error {
 	})
 	defer unsubscribe()
 	return r.agent.Run(ctx)
+}
+
+// conduitDeliverOptions returns the deliver-message route options, or nil
+// when the route must not be registered (design v2.22 §1.5): the agent was
+// launched without hub.conduit_deliver, tmux is not on PATH, or the child
+// does not run the harness in the "scion" tmux session the route pastes
+// into. Commands run as the PTY user, which owns that tmux server.
+func conduitDeliverOptions(getenv func(string) string, lookPath func(string) (string, error), childArgs []string, u conduit.PTYUser) *control.DeliverOptions {
+	_, err := lookPath("tmux")
+	if !control.DeliverEnabled(getenv, err == nil) || !childRunsScionTmux(childArgs) {
+		return nil
+	}
+	return &control.DeliverOptions{Runner: control.NewLocalRunner(u.UID, u.GID, u.Username, u.RequirePrivilegeDrop)}
+}
+
+// conduitExecOptions returns the exec route options (exec-start and
+// exec-status), or nil when the routes must not be registered: the agent
+// was launched without hub.exec_schedules (or the platform cannot run
+// them; control.ExecEnabled). Runs execute as the PTY user, with its
+// privilege-drop rule, in env: the harness's tmux session environment
+// (harnessShellEnv).
+func conduitExecOptions(getenv func(string) string, u conduit.PTYUser, env func() ([]string, error)) *control.ExecOptions {
+	if !control.ExecEnabled(getenv) {
+		return nil
+	}
+	return &control.ExecOptions{
+		UID:                  u.UID,
+		GID:                  u.GID,
+		Username:             u.Username,
+		RequirePrivilegeDrop: u.RequirePrivilegeDrop,
+		Env:                  env,
+		LaunchID:             getenv(conduit.EnvLaunchID),
+	}
+}
+
+// harnessShellEnv returns the environment of scheduled exec runs, built
+// for each run from the harness's configuration: the same environment the
+// harness child (and so its tmux session) gets, secret overrides included.
+func harnessShellEnv(cfg supervisor.Config) func() ([]string, error) {
+	return func() ([]string, error) { return supervisor.HarnessShellEnv(cfg, os.Environ()) }
+}
+
+// childRunsScionTmux reports whether the child command starts tmux session
+// "scion" (`tmux new-session ... -s scion ...`), where the harness runs in
+// window 0. The runtimes pass it as one shell string (`sh -c "tmux
+// new-session -d -s scion -n agent ..."`, pkg/runtime/common.go
+// buildTmuxStartCmd), so every argument is split into words.
+func childRunsScionTmux(args []string) bool {
+	var words []string
+	for _, a := range args {
+		words = append(words, strings.Fields(a)...)
+	}
+	tmux, newSession := false, false
+	for i, w := range words {
+		switch {
+		case filepath.Base(w) == "tmux":
+			tmux, newSession = true, false
+		case tmux && (w == "new-session" || w == "new"):
+			newSession = true
+		case tmux && newSession && w == "-s" && i+1 < len(words) && words[i+1] == "scion":
+			return true
+		}
+	}
+	return false
 }
 
 // conduitPTYUser is the identity PTY streams' tmux clients run as: the
@@ -215,8 +284,9 @@ var conduitSSHFirstReportWait = 5 * time.Second
 // prepareConduitSSH builds the conduit SSH server's configuration and
 // makes the first attempt to report its host key, before the harness
 // starts. It returns nil, building and reporting nothing, unless enabled
-// (conduit not disabled) and the hub serves conduit; the caller checks
-// that a hub client is configured and port forwarding is not disabled.
+// (conduit not disabled), the hub serves conduit and the operator policy
+// allows ssh; the caller checks that a hub client is configured and port
+// forwarding is not disabled.
 // A first report that does not succeed within conduitSSHFirstReportWait
 // continues in the background (reportSSHHostKey). The first host key
 // reported for a run is kept; a repeat of the same key succeeds.
@@ -224,11 +294,17 @@ func prepareConduitSSH(r sshHostKeyReporter, enabled bool, ptyUser conduit.PTYUs
 	if !enabled || !conduit.HubServesConduit(getenv) {
 		return nil
 	}
+	policy := conduitPolicy(getenv)
+	if policy.DisableSSH {
+		log.Info("Conduit: SSH server disabled by the hub's conduit policy")
+		return nil
+	}
 	ssh, err := newConduitSSH(ptyUser, env, getenv)
 	if err != nil {
 		log.Error("Conduit: SSH server unavailable (%v); not offering ssh streams", err)
 		return nil
 	}
+	ssh.Policy = policy
 	key := sshd.AuthorizedKey(ssh.HostKey)
 	ctx, cancel := context.WithTimeout(context.Background(), conduitSSHFirstReportWait)
 	err = r.ReportSSHHostKey(ctx, key)
@@ -273,4 +349,13 @@ func sshMaxChannels(getenv func(string) string) int {
 		return sshd.DefaultMaxChannels
 	}
 	return n
+}
+
+// conduitPolicy reads core.EnvPolicy, failing closed on a bad value.
+func conduitPolicy(getenv func(string) string) core.Policy {
+	p, err := core.ParsePolicy(getenv(core.EnvPolicy))
+	if err != nil {
+		log.Error("Conduit: %v; refusing ssh and every port", err)
+	}
+	return p
 }

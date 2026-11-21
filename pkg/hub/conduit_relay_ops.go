@@ -130,10 +130,22 @@ func (s *Server) recheckRelayAdmission(ctx context.Context, c conduitAdmissionCl
 		// The admitting agent token's current status and the agent's
 		// hold, as agent-token authentication checks them on every
 		// request.
-		if cs := s.authConfig.CredentialStore; cs != nil && c.CredentialID != "" {
-			if _, _, err := evaluateAgentCredentialStatus(ctx, cs, c.CredentialID); errors.Is(err, errAgentCredentialRevoked) {
+		if c.CredentialID == "" {
+			return deny(conduit.CloseUnauthenticated, "agent credential missing jti")
+		}
+		cs := s.authConfig.CredentialStore
+		if cs == nil {
+			return unavailable("agent credential store not configured")
+		}
+		if _, err := evaluateAgentCredentialStatus(ctx, cs, c.CredentialID); err != nil {
+			switch {
+			case errors.Is(err, errAgentCredentialRevoked):
 				return deny(conduit.CloseUnauthenticated, "agent credential revoked")
-			} else if err != nil {
+			case errors.Is(err, errAgentCredentialNotFound):
+				return deny(conduit.CloseUnauthenticated, "agent credential not recorded")
+			case errors.Is(err, errAgentCredentialEmptyJTI):
+				return deny(conduit.CloseUnauthenticated, "agent credential missing jti")
+			default:
 				return unavailable("agent credential lookup failed")
 			}
 		}
@@ -190,9 +202,15 @@ func (s *Server) relayUserIdentity(ctx context.Context, c conduitAdmissionClaims
 		return nil, conduitAuthzDenied, accountRefusalReason(refusal)
 	}
 	if devToken {
-		return NewDevUser(s.authConfig.DevUserCfg), conduitAuthzAllowed, ""
+		return s.authConfig.currentDevUser(), conduitAuthzAllowed, ""
 	}
 	base := NewAuthenticatedUser(u.ID, u.Email, u.DisplayName, u.Role, string(ClientTypeAPI))
+	if c.AuthType == AuthTypeJWT {
+		if !conduitSessionGenerationCurrent(u.SessionGeneration, c.SessionGen) {
+			return nil, conduitAuthzDenied, conduitReasonSessionRevoked
+		}
+		return base.WithCapturedSessionGeneration(c.SessionGen), conduitAuthzAllowed, ""
+	}
 	if c.AuthType != AuthTypeUAT {
 		return base, conduitAuthzAllowed, ""
 	}
@@ -392,6 +410,9 @@ func (s *Server) hubRelaySessionRecheck(w http.ResponseWriter, r *http.Request, 
 				break
 			}
 			res.OK = true
+			if c.Kind == registry.PrincipalAgent {
+				s.maybeScheduleHeldMessageRedriveIfConnected(c.ID)
+			}
 			// Re-issued only while the credential itself is valid.
 			if admissionHalfLifeLeft(c, now) && (c.CredentialExpiry == 0 || now.Unix() < c.CredentialExpiry) {
 				if tok, err := s.reissueAdmissionToken(c, time.Time{}, now); err == nil {

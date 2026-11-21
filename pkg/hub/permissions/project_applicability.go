@@ -47,6 +47,7 @@ var ProjectTargetApplicability = map[string]bool{
 	// Grant management is held on a project for grants bounded to it.
 	"agent.delegation.revoke": true, "agent.delegation.credential.revoke": true,
 	"agent.delegation.list": true, "agent.delegation.read": true,
+	"agent.delegation.revoke_all": true,
 
 	// project.* — read/update/delete/manage/set_messaging_policy target an
 	// existing project; create/register/clone/list are hub-level collection
@@ -57,20 +58,27 @@ var ProjectTargetApplicability = map[string]bool{
 	"project.create": false, "project.read": true, "project.update": true,
 	"project.delete": true, "project.manage": true, "project.register": false,
 	"project.set_messaging_policy": true, "project.clone": false, "project.list": false,
+	"project.manage_message_policies": true, "project.read_message_policies": true,
 	"project.manage_visitors": true,
 	// project.chat_post targets an existing project's chat threads.
 	"project.chat_post": true,
 
 	// skill.* — create/read/update/delete/list can target a project-scoped
-	// skill; create_global and register are explicitly hub-catalog actions.
+	// skill; *_global and register are explicitly hub-catalog actions.
 	"skill.create": true, "skill.create_global": false, "skill.read": true,
-	"skill.update": true, "skill.delete": true, "skill.list": true, "skill.register": false,
+	"skill.update": true, "skill.update_global": false,
+	"skill.delete": true, "skill.delete_global": false,
+	"skill.list": true, "skill.register": false,
 
-	// template.*, harness_config.* — no *_global counterpart registered
-	// today; project/user-scoped, reviewed true (ScopeKind still governs
+	// template.* — create/read/update/delete/list can target a project-scoped
+	// template; *_global are explicitly hub-catalog actions.
+	// harness_config.* — no *_global counterpart registered today;
+	// project/user-scoped, reviewed true (ScopeKind still governs
 	// ResolveTargetScope's actual per-instance classification).
-	"template.create": true, "template.read": true, "template.update": true,
-	"template.delete": true, "template.list": true,
+	"template.create": true, "template.create_global": false, "template.read": true,
+	"template.update": true, "template.update_global": false,
+	"template.delete": true, "template.delete_global": false,
+	"template.list":         true,
 	"harness_config.create": true, "harness_config.read": true, "harness_config.update": true,
 	"harness_config.delete": true, "harness_config.list": true,
 
@@ -151,6 +159,13 @@ var ProjectTargetApplicability = map[string]bool{
 	"test_identity.issue":       false,
 	"test_identity.issue_admin": false, "test_identity.issue_super_admin": false,
 
+	// system_one_instance.* — hub-scoped System One provider instances
+	// (ptone/scion#8044); never project-scoped.
+	"system_one_instance.read":    false,
+	"system_one_instance.create":  false,
+	"system_one_instance.delete":  false,
+	"system_one_instance.execute": false,
+
 	// quota.* — every live check (the quota route guard, handlers_quota.go
 	// and broker_settings_handlers.go) authorizes against the hub-scoped
 	// quota target hubScopedResource("quota", "hub"), matching this family's
@@ -178,6 +193,15 @@ var ProjectTargetApplicability = map[string]bool{
 	// scheduled_event.* — always scoped to a project.
 	"scheduled_event.read": true, "scheduled_event.list": true, "scheduled_event.create": true,
 	"scheduled_event.delete": true, "scheduled_event.update": true,
+
+	// github_trigger.* — always scoped to an existing project.
+	"github_trigger.comment": true, "github_trigger.configure": true,
+
+	// trigger.* and webhook_endpoint.* — always scoped to a project.
+	"trigger.read": true, "trigger.list": true, "trigger.create": true,
+	"trigger.delete": true, "trigger.update": true,
+	"webhook_endpoint.read": true, "webhook_endpoint.list": true,
+	"webhook_endpoint.create": true, "webhook_endpoint.delete": true,
 
 	"project.secret_read": true,
 
@@ -226,6 +250,7 @@ var PermissionAllowedBoundaries = map[string][]BoundaryKind{
 	"agent.update": {BoundaryKindProject, BoundaryKindHub}, "agent.stop_all": {BoundaryKindProject, BoundaryKindHub}, "agent.set_message_mode": {BoundaryKindProject, BoundaryKindHub},
 	"project.read": {BoundaryKindProject, BoundaryKindHub}, "project.update": {BoundaryKindProject, BoundaryKindHub},
 	"project.manage": {BoundaryKindProject, BoundaryKindHub}, "project.clone": {BoundaryKindProject, BoundaryKindHub}, "project.set_messaging_policy": {BoundaryKindProject, BoundaryKindHub},
+	"project.manage_message_policies": {BoundaryKindProject, BoundaryKindHub}, "project.read_message_policies": {BoundaryKindProject, BoundaryKindHub},
 	// project.chat_post's selector targets an existing project, like
 	// project.set_messaging_policy.
 	"project.chat_post": {BoundaryKindProject, BoundaryKindHub},
@@ -238,13 +263,15 @@ var PermissionAllowedBoundaries = map[string][]BoundaryKind{
 
 	"skill.create": {BoundaryKindProject, BoundaryKindHub}, "skill.read": {BoundaryKindProject, BoundaryKindHub},
 	"skill.update": {BoundaryKindProject, BoundaryKindHub}, "skill.delete": {BoundaryKindProject, BoundaryKindHub},
-	"skill.list": {BoundaryKindProject, BoundaryKindHub}, "skill.register": {BoundaryKindHub}, "skill.create_global": {BoundaryKindHub},
+	"skill.list": {BoundaryKindProject, BoundaryKindHub}, "skill.register": {BoundaryKindHub},
+	"skill.create_global": {BoundaryKindHub}, "skill.update_global": {BoundaryKindHub}, "skill.delete_global": {BoundaryKindHub},
 	"artifact.read": {BoundaryKindProject, BoundaryKindHub}, "artifact.create": {BoundaryKindProject, BoundaryKindHub},
 	"artifact.update": {BoundaryKindProject, BoundaryKindHub}, "artifact.delete": {BoundaryKindProject, BoundaryKindHub},
 	"artifact.manage": {BoundaryKindProject, BoundaryKindHub}, "artifact.steward": {BoundaryKindProject, BoundaryKindHub},
 	"template.create": {BoundaryKindProject, BoundaryKindHub}, "template.read": {BoundaryKindProject, BoundaryKindHub},
 	"template.update": {BoundaryKindProject, BoundaryKindHub}, "template.delete": {BoundaryKindProject, BoundaryKindHub},
-	"template.list":         {BoundaryKindProject, BoundaryKindHub},
+	"template.list":          {BoundaryKindProject, BoundaryKindHub},
+	"template.create_global": {BoundaryKindHub}, "template.update_global": {BoundaryKindHub}, "template.delete_global": {BoundaryKindHub},
 	"harness_config.create": {BoundaryKindProject, BoundaryKindHub}, "harness_config.read": {BoundaryKindProject, BoundaryKindHub},
 	"harness_config.update": {BoundaryKindProject, BoundaryKindHub}, "harness_config.delete": {BoundaryKindProject, BoundaryKindHub},
 	"harness_config.list": {BoundaryKindProject, BoundaryKindHub},
@@ -253,6 +280,7 @@ var PermissionAllowedBoundaries = map[string][]BoundaryKind{
 	"group.removeMember": {BoundaryKindHub},
 	"user.read":          {BoundaryKindHub}, "user.invite": {BoundaryKindHub}, "user.list": {BoundaryKindHub},
 	"user.update": {BoundaryKindHub}, "user.suspend": {BoundaryKindHub},
+	"user.promote": {BoundaryKindHub}, "user.delete": {BoundaryKindHub},
 	"broker.read": {BoundaryKindHub}, "broker.list": {BoundaryKindHub},
 	"gcp_service_account.read": {BoundaryKindHub}, "gcp_service_account.list": {BoundaryKindHub},
 	"gcp_service_account.verify": {BoundaryKindHub}, "gcp_service_account.assign": {BoundaryKindProject, BoundaryKindHub},
@@ -299,6 +327,18 @@ var PermissionAllowedBoundaries = map[string][]BoundaryKind{
 	"scheduled_event.read": {BoundaryKindProject, BoundaryKindHub}, "scheduled_event.list": {BoundaryKindProject, BoundaryKindHub},
 	"scheduled_event.update": {BoundaryKindProject, BoundaryKindHub}, "scheduled_event.delete": {BoundaryKindProject, BoundaryKindHub},
 	"scheduled_event.create": {BoundaryKindProject, BoundaryKindHub},
+
+	// github_trigger.* act on one project's GitHub App trigger actions and
+	// source settings.
+	"github_trigger.comment": {BoundaryKindProject, BoundaryKindHub}, "github_trigger.configure": {BoundaryKindProject, BoundaryKindHub},
+
+	// trigger.* and webhook_endpoint.* act on one project's triggers and
+	// webhook endpoints.
+	"trigger.read": {BoundaryKindProject, BoundaryKindHub}, "trigger.list": {BoundaryKindProject, BoundaryKindHub},
+	"trigger.update": {BoundaryKindProject, BoundaryKindHub}, "trigger.delete": {BoundaryKindProject, BoundaryKindHub},
+	"trigger.create":        {BoundaryKindProject, BoundaryKindHub},
+	"webhook_endpoint.read": {BoundaryKindProject, BoundaryKindHub}, "webhook_endpoint.list": {BoundaryKindProject, BoundaryKindHub},
+	"webhook_endpoint.create": {BoundaryKindProject, BoundaryKindHub}, "webhook_endpoint.delete": {BoundaryKindProject, BoundaryKindHub},
 
 	// hub.* integration and observability permissions act on the hub
 	// itself, so their selectors are hub-only.
@@ -355,7 +395,7 @@ const (
 	// applicable resource type with no scope-kind split at all — agent,
 	// gcp_service_account.assign's existing-SA project scope).
 	TargetClassKindProjectScoped TargetClassKind = "project_scoped"
-	// TargetClassKindGlobalCatalog represents the hub-wide (global/core)
+	// TargetClassKindGlobalCatalog represents the hub-wide (global)
 	// catalog instance space, for the resource types that have one
 	// (skill/template/harness_config read/list).
 	TargetClassKindGlobalCatalog TargetClassKind = "global_catalog"
@@ -406,6 +446,7 @@ var SupportedTargetClasses = map[string][]TargetClassKind{
 	// ProjectTargetApplicability) even though it is mintable.
 	"project.read": {TargetClassKindProjectScoped}, "project.update": {TargetClassKindProjectScoped},
 	"project.manage": {TargetClassKindProjectScoped}, "project.clone": {TargetClassKindHubResource}, "project.set_messaging_policy": {TargetClassKindProjectScoped},
+	"project.manage_message_policies": {TargetClassKindProjectScoped}, "project.read_message_policies": {TargetClassKindProjectScoped},
 	// project.chat_post targets an existing project's chat threads.
 	"project.chat_post": {TargetClassKindProjectScoped},
 	// project.list is a hub-level collection action (false in
@@ -422,22 +463,29 @@ var SupportedTargetClasses = map[string][]TargetClassKind{
 
 	// skill.* — read/list support both project and global catalog classes;
 	// create/update/delete are project-scoped only; register is a hub-level
-	// registry action and create_global a hub-level catalog action.
+	// registry action and *_global are hub-level catalog actions.
 	"skill.create": {TargetClassKindProjectScoped},
 	"skill.read":   {TargetClassKindProjectScoped, TargetClassKindGlobalCatalog},
 	"skill.update": {TargetClassKindProjectScoped}, "skill.delete": {TargetClassKindProjectScoped},
-	"skill.list":     {TargetClassKindProjectScoped, TargetClassKindGlobalCatalog},
-	"skill.register": {TargetClassKindHubResource}, "skill.create_global": {TargetClassKindHubResource},
+	"skill.list":          {TargetClassKindProjectScoped, TargetClassKindGlobalCatalog},
+	"skill.register":      {TargetClassKindHubResource},
+	"skill.create_global": {TargetClassKindHubResource},
+	"skill.update_global": {TargetClassKindGlobalCatalog},
+	"skill.delete_global": {TargetClassKindGlobalCatalog},
 
-	// template.*, harness_config.* — unlike skill, a single create
-	// permission covers every scope (templateScopeResource/
-	// templateUserScopeResource/harnessConfigScopeResource all route through
-	// template.create/harness_config.create regardless of scope), so create
-	// supports GlobalCatalog too, not just ProjectScoped.
+	// template.* — read/list support both project and global catalog classes;
+	// update/delete are project-scoped only; *_global are hub-level catalog
+	// actions. template.create keeps GlobalCatalog alongside ProjectScoped
+	// because templateUserScopeResource maps user-scope create to
+	// hasGlobalScope, whereas global-scope create uses template.create_global.
+	// harness_config.* still uses harness_config.create across every scope.
 	"template.create": {TargetClassKindProjectScoped, TargetClassKindGlobalCatalog},
 	"template.read":   {TargetClassKindProjectScoped, TargetClassKindGlobalCatalog},
 	"template.update": {TargetClassKindProjectScoped}, "template.delete": {TargetClassKindProjectScoped},
-	"template.list": {TargetClassKindProjectScoped, TargetClassKindGlobalCatalog},
+	"template.list":          {TargetClassKindProjectScoped, TargetClassKindGlobalCatalog},
+	"template.create_global": {TargetClassKindHubResource},
+	"template.update_global": {TargetClassKindGlobalCatalog},
+	"template.delete_global": {TargetClassKindGlobalCatalog},
 
 	"harness_config.create": {TargetClassKindProjectScoped, TargetClassKindGlobalCatalog},
 	"harness_config.read":   {TargetClassKindProjectScoped, TargetClassKindGlobalCatalog},
@@ -464,6 +512,8 @@ var SupportedTargetClasses = map[string][]TargetClassKind{
 	"user.list": {TargetClassKindHubResource},
 	// user.update and user.suspend target the hub-level user record.
 	"user.update": {TargetClassKindHubResource}, "user.suspend": {TargetClassKindHubResource},
+	// user.promote and user.delete target the hub-level user record.
+	"user.promote": {TargetClassKindHubResource}, "user.delete": {TargetClassKindHubResource},
 
 	// broker.* — user-owned hub resource.
 	"broker.read": {TargetClassKindHubResource}, "broker.list": {TargetClassKindHubResource},
@@ -511,6 +561,17 @@ var SupportedTargetClasses = map[string][]TargetClassKind{
 	"scheduled_event.read": {TargetClassKindProjectScoped}, "scheduled_event.list": {TargetClassKindProjectScoped},
 	"scheduled_event.update": {TargetClassKindProjectScoped}, "scheduled_event.delete": {TargetClassKindProjectScoped},
 	"scheduled_event.create": {TargetClassKindProjectScoped},
+
+	// github_trigger.* target a project's GitHub trigger actions and source settings.
+	"github_trigger.comment": {TargetClassKindProjectScoped}, "github_trigger.configure": {TargetClassKindProjectScoped},
+
+	// trigger.* and webhook_endpoint.* target a project's triggers and
+	// webhook endpoints.
+	"trigger.read": {TargetClassKindProjectScoped}, "trigger.list": {TargetClassKindProjectScoped},
+	"trigger.update": {TargetClassKindProjectScoped}, "trigger.delete": {TargetClassKindProjectScoped},
+	"trigger.create":        {TargetClassKindProjectScoped},
+	"webhook_endpoint.read": {TargetClassKindProjectScoped}, "webhook_endpoint.list": {TargetClassKindProjectScoped},
+	"webhook_endpoint.create": {TargetClassKindProjectScoped}, "webhook_endpoint.delete": {TargetClassKindProjectScoped},
 
 	// hub.* integration and observability permissions target the hub
 	// instance.

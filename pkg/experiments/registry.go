@@ -121,6 +121,29 @@ func (e Experiment) ReviewOverdue(now time.Time) bool {
 // which uses an NFS home only when it is on.
 const K8sNFSHome = "hub.k8s_nfs_home"
 
+// CloudRunNativeIdentity gates running each Cloud Run instance as the GCP
+// identity the hub resolved for its agent, instead of the runtime's one
+// configured service account. The hub resolves it at each agent dispatch
+// and sends it to the broker, which reads it only from the dispatch
+// (HubAgentDefaults). While it is off, Cloud Run instances are created
+// exactly as before.
+const CloudRunNativeIdentity = "hub.cloudrun_native_identity"
+
+// CloudRunEphemeralAgents gates ephemeral persistence for Cloud Run agents
+// (ptone/scion#7780): the hub refuses an ephemeral create while it is off,
+// and sends its state with each dispatch so the broker refuses an ephemeral
+// start while it is off. Persistent agents are unchanged either way.
+const CloudRunEphemeralAgents = "hub.cloudrun_ephemeral_agents"
+
+// K8sWorkloadIdentitySetup gates the hub's Workload Identity setup for the
+// GCP service accounts it mints (ptone/scion#3329 phase 5): at mint, the hub
+// grants roles/iam.workloadIdentityUser on the new account to the
+// conventional Kubernetes ServiceAccount of every Kubernetes runtime target
+// that reports a Workload Identity pool. The hub checks it; Runtime Brokers
+// report their pools whether it is on or off. While it is off, minting is
+// exactly as before.
+const K8sWorkloadIdentitySetup = "hub.k8s_workload_identity_setup"
+
 // FlatRuntimeBrokers gates flat (single-target) Runtime Brokers: the hub
 // accepts single-target Runtime Broker registrations, pins new agents to
 // that target and refuses mismatched dispatches
@@ -128,6 +151,40 @@ const K8sNFSHome = "hub.k8s_nfs_home"
 // code; Runtime Brokers do not need it (their flat behaviour comes from
 // their own configuration).
 const FlatRuntimeBrokers = "hub.flat_runtime_brokers"
+
+// FlatCloudRunTarget gates the flat Cloud Run runtime target (runtime target
+// type "cloudrun") on top of FlatRuntimeBrokers: with it off, the hub
+// refuses a new flat registration whose target type is cloudrun and agent
+// create on a flat Runtime Broker whose stored target type is cloudrun
+// (.design/flat-runtime-brokers/p5-cloudrun-amendment.md, CR5). An existing
+// cloudrun row still re-registers, so turning it off stops new agents
+// without stranding the row. It is enforced in hub server code and is not
+// dispatched to agents. It may not leave alpha or become default-on until
+// agent secrets are delivered by a means other than plain Cloud Run
+// instance environment variables (ptone/scion#7309).
+const FlatCloudRunTarget = "hub.flat_cloudrun_target"
+
+// ConduitDeliver gates message delivery over an agent's Conduit session (the
+// deliver-message control route; ptone/scion#7353,
+// .design/conduit/v2.22-deliver-message.md). It requires hub.conduit: the
+// hub enforces both, on its broker-facing /deliver endpoint and when it
+// tells brokers and agents at launch. An agent launched with it registers
+// the route; its broker then sends that agent's deliveries through the hub
+// instead of runtime exec (Cloud Run agents in this phase). An agent started
+// before it was turned on keeps using exec until it restarts.
+const ConduitDeliver = "hub.conduit_deliver"
+
+// ExecSchedules gates exec-only schedules (ptone/scion#7818, design D8): a
+// scheduled command run in the target agent's container over its Conduit
+// session (the exec-start and exec-status control routes,
+// .design/conduit/exec-control-routes.md). It requires hub.conduit: the hub
+// sends it to agents at launch only while conduit is served, and an agent
+// launched with it registers the two routes. The hub checks both flags when
+// an exec schedule or event is created, updated or resumed and again when it
+// fires (a fire with either off is skipped); turning either off stops new
+// runs but not the outcome recovery of runs already started (ptone/scion#7883),
+// and the web UI shows the exec authoring option only while it is on.
+const ExecSchedules = "hub.exec_schedules"
 
 // Artifacts gates the artifact service (pkg/artifacts): the hub's
 // /api/v1/artifacts routes answer 404 while it is off, and the web UI hides
@@ -139,7 +196,11 @@ const Artifacts = "hub.artifacts"
 // stores each file through the artifact service, which must be installed
 // with its settings section enabled (hub.artifacts need not be on). The hub
 // checks it on every upload. Attachments stored while it was on stay
-// readable after it is turned off.
+// readable after it is turned off. Its compiled default is off, but a hub
+// whose artifact service is ready (local blob storage included) or whose
+// resource storage is an object store resolves it on unless an override is
+// stored (ptone/scion#5827, ptone/scion#5828; pkg/hub
+// deploymentExperimentDefault).
 const AttachmentArtifacts = "hub.attachment_artifacts"
 
 // ChatScheduledSend gates scheduled send in native web chat: the Schedule
@@ -148,10 +209,47 @@ const AttachmentArtifacts = "hub.attachment_artifacts"
 // the delivery sweeper, which holds pending messages while it is off.
 const ChatScheduledSend = "web.chat_scheduled_send"
 
+// Decisions gates agent decision prompts, cards, routes, pages, CLI listing
+// and coalesced bell notifications (ptone/scion#7514, ptone/scion#8223):
+// agent sends carrying decisions (refused with experiment_disabled while off),
+// the hub's decision, answer, agent, project and profile decision routes (404
+// while off), the decision fields of chat history, the coalesced
+// decisions_waiting bell notification, and the decision cards, Decisions pages
+// and preference card in the web UI. Stored decisions and answers are kept
+// while it is off, and the markdown fallback in each prompt's text stays
+// readable.
+const Decisions = "web.decisions"
+
+// ChatStarredMessages gates starred messages in native web chat: the
+// message Star/Unstar action, the private starred indicator, the
+// conversation header's starred-message list, the starred-only center and
+// the rail's Starred filter in the web UI, and the hub's /api/v1/chat/stars
+// and /api/v1/chat/starred-conversations routes and the starred=true
+// history variant (404 while off). Stored stars are kept while it is off.
+const ChatStarredMessages = "web.chat_starred_messages"
+
+// ChatRetention gates hub-wide chat message retention: the
+// chat_retention operational-settings section and its admin API (404 while
+// off), the chat-retention sweeper, which purges nothing while it is off,
+// and the history "retention" marker. It has both layers: the hub checks it
+// in the settings handlers, the sweeper and the history handler; the web
+// layer only shows the settings panel and the history divider. Turning it
+// on deletes nothing until an admin also enables the sweep and sets a
+// window.
+const ChatRetention = "hub.chat_retention"
+
 // AuthorizationDecisionAuditV2 gates decision logging (remaining-audit P1).
 // It is the only activation control and stays default-off; turning it on
 // needs explicit owner approval.
 const AuthorizationDecisionAuditV2 = "hub.authorization_decision_audit_v2"
+
+// PortView gates the page view mode of the agent port proxy
+// (ptone/scion#5569): a user who opens an exposed port's link from the hub
+// is sent to a short-lived page link under /api/v1/portview/, through
+// which the page's relative scripts, styles, images, requests and
+// WebSockets load. While it is off, the port link behaves as before and
+// /api/v1/portview/ answers 404.
+const PortView = "hub.port_view"
 
 // AgentEdit gates what the web Edit agent page (/agents/{id}/edit) adds
 // beyond the retired Configure page: the grouping of its fields by when an
@@ -164,16 +262,18 @@ const AgentEdit = "web.agent_edit"
 // AgentEditHeld gates held config edits (ptone/scion#3976): while it is on,
 // a config edit of an agent with a live or transitional container is kept
 // as the agent's pending config and applied at its next start, a
-// provision-rendered key is kept pending, and DELETE
+// provision-rendered key is kept pending, an edit a start does not bring
+// into effect (a clear or removal the broker does not apply at start, and
+// the whole key of a collection edit with such a part) stays pending until
+// a reincarnation applies pending edits, and DELETE
 // /api/v1/agents/{id}/pending-config discards pending edits. A
 // reincarnation does not apply pending edits yet (ptone/scion#3978), so it
 // must stay off until that lands. While it is off the hub refuses a config
-// edit of such an agent, as before, and applies no stored pending config;
-// a config edit it writes removes the pending keys that edit names, so a
-// stale pending value cannot later override it. It has its own default-off
-// switch
-// because the Edit page experiment (AgentEdit) is turned on separately; the
-// web layer only mirrors the hub's check.
+// edit of such an agent, as before, applies no stored pending config and
+// returns none, and clears it at the agent's next start or config edit, so
+// a stale pending value cannot later override a newer one. It has its own
+// default-off switch because the Edit page experiment (AgentEdit) is turned
+// on separately; the web layer only mirrors the hub's check.
 const AgentEditHeld = "hub.agent_edit_held"
 
 // AgentDelegation gates agent delegation (.design/agent-delegation.md §10):
@@ -184,8 +284,10 @@ const AgentEditHeld = "hub.agent_edit_held"
 const AgentDelegation = "hub.agent_delegation"
 
 // FederationProjectVisitors gates project access for users of trusted
-// external issuers (ptone/scion#4603). While it is off, a verified
-// federated user token always yields the same federated user identity as
+// external issuers (ptone/scion#4603). It has both layers: the web layer
+// shows the project Visitors tab and the per-issuer visitor access switch,
+// and the server layer gates the hub behaviour below. While it is off, a
+// verified federated user token always yields the same federated user identity as
 // before; while it is on, a token whose (issuer, subject) is linked to an
 // active federated account yields that account's visitor identity. It also
 // gates POST /api/v1/auth/federation-token (404 while off), where this
@@ -204,18 +306,23 @@ const AgentPlugins = "hub.agent_plugins"
 
 // AsyncAgentLaunch gates asynchronous agent create (ptone/scion#4991): the
 // hub sends a create to the broker as an async launch only while it is on
-// and the request opted in (acceptAsyncLaunch). It is read at each create
-// send, so toggling needs no restart; launches already accepted finish or
-// are reaped either way.
+// and the request opted in (acceptAsyncLaunch). It is on by default
+// (ptone/scion#6640); an admin override turns it off. It is read at each
+// create send, so toggling needs no restart; launches already accepted
+// finish or are reaped either way.
 const AsyncAgentLaunch = "hub.async_agent_launch"
 
 // AsyncAgentStart gates asynchronous start, resume and restart of existing
 // agents (ptone/scion#4669). It applies only while hub.async_agent_launch is
-// on too. Turn it on only after every hub node runs a version that
-// advertises async_start_v1 in the hub-instance registry; to roll back,
-// turn it off and wait launch_timeout plus 15 seconds before downgrading
-// any node. While any live hub instance lacks async_start_v1, starts stay
-// synchronous whatever its value.
+// on too. It is on by default (ptone/scion#7250); an admin override turns it
+// off. While any live hub instance in the hub-instance registry lacks
+// async_start_v1, starts stay synchronous whatever its value. The check sees
+// only nodes that write the registry: a node on a version from before the
+// registry (GoogleCloudPlatform/scion#3078) writes no row and is not counted, so an
+// operator upgrading a multi-node hub from such a version turns this off
+// until every node is upgraded. To roll back, turn it off with an admin
+// override and wait launch_timeout plus 15 seconds before downgrading any
+// node.
 const AsyncAgentStart = "hub.async_agent_start"
 
 // AgentBadges gates the agent badges (ptone/scion#5503): a harness vendor
@@ -231,9 +338,12 @@ const SSEHiddenTabClose = "web.sse_hidden_tab_close"
 
 // SecretRotation gates opt-in Hub server keyring configuration
 // (server.keyring_file, ptone/scion#1530): a hub configured with a keyring
-// file refuses to start while it is off. It is checked once at startup
-// (the keyring is loaded once, before any listener opens); turning it off
-// later changes nothing until the next restart. Readers of persisted
+// file refuses to start while it is off. For the keyring it is checked once
+// at startup (the keyring is loaded once, before any listener opens);
+// turning it off later changes nothing there until the next restart. The
+// admin key status endpoint (GET /api/v1/admin/keys/status) checks it on
+// every request (requireExperiment), so the endpoint answers 404 as soon as
+// it is off. Readers of persisted
 // keyring-format data must never depend on it. The design names it
 // "server.secret-rotation"; NamePattern allows no hyphen.
 const SecretRotation = "server.secret_rotation"
@@ -245,23 +355,247 @@ const SecretRotation = "server.secret_rotation"
 // checks it at every commit, so toggling needs no restart. Rows keep the
 // version they were last committed with, and the commit compare-and-swap is
 // a strict equality on the stored value, so mixed rows are safe in both
-// directions. Skill hashes are v1 regardless. Brokers and CLIs do not read
-// it: their cache keys and sync checks do not depend on the hash version.
+// directions. Skill hashes do not follow it (see SkillContentHashV2).
+// Brokers and CLIs do not read it: their cache keys and sync checks do not
+// depend on the hash version.
 // While it is off, a rename-only or chmod-only re-upload is not visible to
 // the expected-hash check (the behaviour before ptone/scion#5658). Enable it
 // once every CLI and agent image is at or after the release that added it;
 // ptone/scion#5995 makes it the default and removes the gate.
 const ContentHashV2 = "hub.content_hash_v2"
 
+// LifecycleEvents gates the agent lifecycle event pipeline (WP1): with it
+// on, every authoritative agent-row write records versioned
+// agent.lifecycle events in a transactional outbox, which the hub delivers
+// to the Cloud Logging log scion-analytics. It takes effect only with a
+// pinned hub ID and a configured sink; the state is exported as
+// lifecycle_observer_state. Turning it off stops new events; pending rows
+// are still delivered.
+const LifecycleEvents = "hub.lifecycle_events"
+
+// SkillContentHashV2 gates the skill content hash v2 transition
+// (ptone/scion#5935). Skill hash v2 is transfer.ComputeContentHashV2 over a
+// skill's files (paths, normalised modes and per-file hashes); v1
+// (transfer.ComputeContentHashV1, file hashes only) stays the recorded
+// skill_versions.content_hash and the contentHash field of every response,
+// because brokers before ptone/scion#5935 verify an installed bundle by
+// recomputing v1 and existing registry pins hold v1. v2 is never stored: it
+// is derived from a version's immutable file list. While it is on, the hub
+// adds contentHashV2 to skill resolve and skill version responses, accepts a
+// v2 value wherever it accepts a skill content hash ("@sha256:" version
+// lookup and pinned-registry trust; v1 is tried first). For a federated
+// skill, at every trust level, it recomputes v1 and v2 from the registry's
+// file list (paths, per-file hashes, modes) and fails closed when the
+// claimed contentHash or a claimed contentHashV2 disagrees, and it sends
+// only its own recomputed v2. A pinned registry must list a hash for every
+// file and its pin must equal the recomputed v1 or v2; a skill that has no
+// contentHash and cannot be recomputed fails at every trust level; a
+// trusted registry that lists no per-file hashes but does send a
+// contentHash is accepted without contentHashV2 (the broker still verifies
+// v1). While it is off the API is unchanged and a claimed v1 that
+// disagrees with the files is only logged. Brokers verify contentHashV2 when a
+// response carries it and do not read the experiment. ptone/scion#5995 makes
+// it the default and removes the gate.
+const SkillContentHashV2 = "hub.skill_content_hash_v2"
+
+// ArtifactReviewEditor gates the graphical review editor for Markdown
+// artifacts (ptone/scion#5913). It is web-only: every save goes through the
+// unchanged review publish, and the hub's review checks are the same
+// whether or not it is on.
+const ArtifactReviewEditor = "web.artifact_review_editor"
+
+// ArtifactManageAccess gates the Manage access button and dialog on the
+// artifact page (ptone/scion#7107). It is web-only: the dialog calls the
+// existing grant, link and expiry routes, which decide every change the
+// same way whether or not it is on.
+const ArtifactManageAccess = "web.artifact_manage_access"
+
+// ArtifactSponsorReviewGrant gates the automatic review grant for the
+// delegating user (ptone/scion#7134): when an agent with a recorded
+// delegating user creates a new artifact in a project, the hub gives that
+// user review access to it, provided the user holds a role that reads in
+// the artifact's home project. The hub checks it at creation
+// (artifactHost.SponsorReviewGrant). Turning it off stops new grants;
+// grants already made stay until removed.
+const ArtifactSponsorReviewGrant = "hub.artifact_sponsor_review_grant"
+
+// ArtifactArchive gates the zip download of an artifact version's files
+// (ptone/scion#7106): GET|HEAD /api/v1/artifacts/{id}/versions/{seq}/archive
+// and the archive field of a version response, which the Files tab's
+// Download all button follows. The hub checks it in the artifact service
+// (SetArchiveEnabled); while it is off the route answers 404 and the field
+// is left out. It needs hub.artifacts.
+const ArtifactArchive = "hub.artifact_archive"
+
+// ArtifactsOpenReviewCheck gates the open-review check on artifact
+// publishes (ptone/scion#6849): review tabs report that they are open, and
+// a publish that would overtake an open review is refused with 409
+// review_open unless it is forced. While it is off the review-session routes
+// answer 404 and publishing behaves exactly as before.
+const ArtifactsOpenReviewCheck = "hub.artifacts_open_review_check"
+
+// UserDeleteForceCascade gates the forced user delete (ptone/scion#2143):
+// DELETE /api/v1/users/{id}?force=true, which revokes the user's authority,
+// records a deletion tombstone and stops the user's agents, the GET
+// /api/v1/users/{id}/deletion resource, and the hub's reconciler that
+// completes such deletions. The hub checks it (the force parameter with
+// experimentEnabled, the sub-route with requireExperiment); the web layer
+// only mirrors it to show the force option.
+const UserDeleteForceCascade = "hub.user_delete_force_cascade"
+
+// ImageTagSetting gates the image_tag setting (ptone/scion#6625), which
+// selects the tag of the bundled scion-* agent images ("version" for the
+// hub binary's release version, latest for any non-release build, or a
+// literal tag) instead of :latest. The hub checks it: while it is off,
+// image_tag is ignored and every image reference is unchanged, a hub save
+// that sets image_tag is refused (412 experiment_disabled), and a value
+// from the environment or a settings file other than latest is reported
+// with a startup warning (latest, the opt-out, is logged at Info). While it
+// is on, the hub applies the tag to the images it sends and checks and
+// sends it with each dispatch, so the Runtime Broker applies it to the
+// images it resolves.
+const ImageTagSetting = "hub.image_tag_setting"
+
+// ReincarnateHarnessSwitch gates `scion reincarnate --harness`
+// (ptone/scion#7757): moving an agent to another harness config in place,
+// with a full reset of its home. The hub checks it before anything else in
+// a request that names a harness config; brokers act only on an explicit
+// reset request, so they need no flag.
+const ReincarnateHarnessSwitch = "hub.reincarnate_harness_switch"
+
+// IdleSuspend gates the hub's idle lifecycle policy (ptone/scion#7826):
+// auto-wake of an agent the hub suspended (suspend_reason idle or stalled)
+// when a message, mention, notification or scheduled message arrives for
+// it, and the idle auto-suspend sweep (server.hub.auto_suspend_idle,
+// server.hub.idle_suspend_after). It is checked in hub server code.
+// While it is off, suspend_reason is still recorded and shown, and nothing
+// is idle-suspended or woken without an explicit wake.
+const IdleSuspend = "lifecycle.idle_suspend"
+
+// ImageTagVersionDefault gates the version default of image_tag
+// (ptone/scion#6625): while it is on and image_tag is unset, a release
+// build of the hub (vX.Y.Z, vX.Y.Z-preview.N or vX.Y.Z-rc.N) applies its
+// own version as the tag of the bundled scion-* agent images, as if
+// image_tag were "version"; any other build leaves images at :latest. It
+// ships on. A set image_tag always wins, and suppresses the default even
+// while hub.image_tag_setting is off. The hub checks it; while it is off,
+// an unset image_tag leaves every image reference unchanged.
+const ImageTagVersionDefault = "hub.image_tag_version_default"
+
+// RuntimeOrphanReconcile gates the runtime orphan report
+// (ptone/scion#7930): the hub classifies the broker heartbeat inventory
+// entries no hub agent owns, records them in runtime_orphans, logs each new
+// one, exports scion.hub.runtime_orphans and serves GET
+// /api/v1/admin/runtime-orphans. Report only: nothing is stopped or
+// deleted. While it is off the hub classifies and writes nothing, and the
+// route answers 404.
+const RuntimeOrphanReconcile = "hub.runtime_orphan_reconcile"
+
+// ProjectSelfLeave gates project self-leave (ptone/scion#7494): POST
+// /api/v1/projects/{id}/leave, with which a user removes their own direct
+// project bindings, and the canLeave and leaveBlockedReason capabilities.
+// The hub checks it on the route; while it is off the route answers 404
+// and the capabilities are left out.
+const ProjectSelfLeave = "hub.project_self_leave"
+
+// WelcomeProject gates the welcome project (ptone/scion#7534): a one-time
+// onboarding step that installs the latest agent-team templates, pinned to
+// commit shas, into a "welcome" project and starts a coordinator that greets
+// its owner. Server layer: the hub refuses the welcome preview, install and
+// skip routes (404) while it is off. Web layer: shows the Welcome project
+// step in the setup wizard.
+const WelcomeProject = "hub.welcome_project"
+
+// SystemOne gates Hub-scoped System One provider instance administration and
+// probing (ptone/scion#8044): /api/v1/admin/system-one/instances[/{name}[/probe]]
+// and scion admin system-one instance create|list|delete|probe, with runtime
+// probe evaluations bounded by server.hub.system_one.max_eval_time. While it is
+// off, the System One admin routes answer 404 and stored provider instances are
+// kept. The design names it "hub.system-one"; NamePattern allows no hyphen.
+const SystemOne = "hub.system_one"
+
+// GitHubTriggers gates routing GitHub App webhook deliveries into the trigger
+// system, GitHub trigger presets, App readiness reporting, and repository
+// primary-project routing (ptone/scion#836). Requires hub.triggers to be
+// enabled as well; while off, content events remain ignored, GitHub trigger
+// routes answer 404, and the web section is hidden.
+const GitHubTriggers = "hub.github_triggers"
+
+// Triggers gates Stage 1 event triggers and webhook endpoints
+// (ptone/scion#7961): Server layer returns 404 on /api/v1/hooks/{id} and all
+// /webhook-endpoints, /triggers and /trigger-events project routes and omits
+// the trigger delivery drainer and fire-lease reaper while off; Web layer
+// exposes the flag for UI presentation.
+const Triggers = "hub.triggers"
+
+// MessagePolicies gates project-scoped message admission policies
+// (ptone/scion#8047): /api/v1/projects/{id}/message-policies[/{policyId}[/test|/decisions]],
+// scion message-policy create|list|get|delete|test|decisions, and the H2
+// outbound agent message gate (agent->user DMs, agent conversation posts and
+// choice prompts; shadow and enforce modes). While it is off, the message
+// policy routes answer 404, the outbound gate evaluates and records nothing,
+// and stored policies and decision records are kept.
+const MessagePolicies = "hub.message_policies"
+
+// EffectivePermissions gates the admin effective-permissions viewer
+// (ptone/scion#8439): GET|HEAD /api/v1/admin/effective-permissions (404 while
+// off) and the Effective permissions tab in the admin Users Roles dialog
+// (while off, the dialog shows only the roles content without tabs).
+const EffectivePermissions = "hub.effective_permissions"
+
 // compiled is the production experiment list. It is reachable only through
 // Default(); there is no package-level Lookup/All, so hub code cannot bypass
 // the Registry instance it was given (ptone/scion#2217).
 var compiled = []Experiment{
 	{
+		Name:        EffectivePermissions,
+		Title:       "Effective permissions viewer",
+		Description: "Adds an Effective permissions tab to the admin Users Roles dialog backed by GET /api/v1/admin/effective-permissions, showing resolved hub and per-project permissions, all contributing role bindings, and permissions removed by access constraints. Server layer: the endpoint answers 404 while it is off. Web layer: shows the two-tab Roles dialog; while off, the dialog shows roles content without tabs.",
+		Default:     false,
+		Layers:      []Layer{LayerWeb, LayerServer},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#8439",
+		Owner:       "authz",
+		ReviewBy:    "2027-05-20",
+	},
+	{
+		Name:        ProjectSelfLeave,
+		Title:       "Leave a project",
+		Description: "Lets a user leave a project they were added to directly: POST /api/v1/projects/{id}/leave removes the caller's own direct project roles in one step, and revokes their access tokens limited to that project when they keep no other access. The last usable direct owner and a member only through a group are refused. The user's agents in the project are held by the existing membership check. While off, the route answers 404 and the leave capabilities are not reported.",
+		Default:     false,
+		Layers:      []Layer{LayerServer},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#7494",
+		Owner:       "authz",
+		ReviewBy:    "2027-02-05",
+	},
+	{
+		Name:        WelcomeProject,
+		Title:       "Welcome project",
+		Description: "Adds a Welcome project step to the workstation setup wizard. It downloads the latest agent-team templates and the skills they use, pinned to commit shas and shown before install, installs them into a new \"welcome\" project and starts a coordinator agent that greets the owner once in chat. It runs at most once per hub: Skip, a failure or deleting the project never re-creates it. Server layer: the welcome preview, install and skip routes answer 404 while it is off. Web layer: shows the wizard step.",
+		Default:     false,
+		Layers:      []Layer{LayerWeb, LayerServer},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#7534",
+		Owner:       "onboarding",
+		ReviewBy:    "2027-05-08",
+	},
+	{
+		Name:        LifecycleEvents,
+		Title:       "Agent lifecycle events",
+		Description: "Records a versioned agent.lifecycle event for every authoritative agent transition (create, launch, start, stop, delete and the rest) in the transaction that commits it, and delivers them to the Cloud Logging log scion-analytics. Takes effect only with a pinned hub ID (server.hub.hub_id) and server Cloud Logging enabled; lifecycle_observer_state reports why it is not in effect. Enable it on every replica together. Turning it off stops new events; events already recorded are still delivered.",
+		Default:     false,
+		Layers:      []Layer{LayerServer},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#5900",
+		Owner:       "telemetry",
+		ReviewBy:    "2027-03-31",
+	},
+	{
 		Name:        AsyncAgentStart,
 		Title:       "Asynchronous agent start",
-		Description: "Lets the hub answer a start, resume or restart of an existing agent as soon as the Runtime Broker accepts it, like an asynchronous create; it applies only while hub.async_agent_launch is also on. Turn it on only after every hub node runs a version that supports it (each advertises async_start_v1). While any live hub instance lacks async_start_v1, starts stay synchronous. To roll back, turn it off and wait launch_timeout plus 15 seconds before downgrading any node.",
-		Default:     false,
+		Description: "Lets the hub answer a start, resume or restart of an existing agent as soon as the Runtime Broker accepts it, like an asynchronous create; it applies only while hub.async_agent_launch is also on. On by default. While any live hub instance in the hub-instance registry lacks async_start_v1, starts stay synchronous; nodes on a version from before the registry are not seen, so turn it off while upgrading a multi-node hub from such a version, until every node is upgraded. To roll back, turn it off and wait launch_timeout plus 15 seconds before downgrading any node.",
+		Default:     true,
 		Layers:      []Layer{LayerServer},
 		Stage:       StageAlpha,
 		Issue:       "ptone/scion#4669",
@@ -271,8 +605,8 @@ var compiled = []Experiment{
 	{
 		Name:        AsyncAgentLaunch,
 		Title:       "Asynchronous agent create",
-		Description: "Lets the hub answer an agent create as soon as the Runtime Broker accepts it, while the broker finishes the launch in the background; clients that opt in (scion start and resume, the web create form, scheduled creates) follow its progress. Provision-only creates, reprovisioning and brokers without async launch support stay synchronous. Turning it off makes new creates synchronous; launches already accepted finish or time out as before.",
-		Default:     false,
+		Description: "Lets the hub answer an agent create as soon as the Runtime Broker accepts it, while the broker finishes the launch in the background; clients that opt in (scion start and resume, the web create form, scheduled creates) follow its progress. Provision-only creates, reprovisioning and brokers without async launch support stay synchronous. On by default; turning it off makes new creates synchronous, and launches already accepted finish or time out as before.",
+		Default:     true,
 		Layers:      []Layer{LayerServer},
 		Stage:       StageAlpha,
 		Issue:       "ptone/scion#4991",
@@ -282,9 +616,9 @@ var compiled = []Experiment{
 	{
 		Name:        FederationProjectVisitors,
 		Title:       "Project visitors from trusted issuers",
-		Description: "Lets a user of a trusted external issuer who is linked to a local federated account act as that account (a project visitor), and lets this hub's users obtain short-lived user access credentials for the peer hubs in server.oidc.user_token_audiences, and accepts user access credentials from peer hub issuers that have accept_user_tokens. While off, federated user tokens behave exactly as before, no user access credentials are issued, no user access credentials are accepted from peer hubs, and stored accounts are kept.",
+		Description: "Lets a user of a trusted external issuer who is linked to a local federated account act as that account (a project visitor), and lets this hub's users obtain short-lived user access credentials for the peer hubs in server.oidc.user_token_audiences, and accepts user access credentials from peer hub issuers that have accept_user_tokens. While off, federated user tokens behave exactly as before, no user access credentials are issued, no user access credentials are accepted from peer hubs, and stored accounts are kept. Web layer: shows the project Visitors tab and the visitor access switch on Admin > Federation. Server layer: the project visitor grant and rule routes (404 while off), visitor identities and user access credentials; the hub checks it on every request, whatever the UI shows.",
 		Default:     false,
-		Layers:      []Layer{LayerServer},
+		Layers:      []Layer{LayerWeb, LayerServer},
 		Stage:       StageAlpha,
 		Issue:       "ptone/scion#4603",
 		Owner:       "federation",
@@ -335,6 +669,39 @@ var compiled = []Experiment{
 		ReviewBy:    "2027-01-04",
 	},
 	{
+		Name:        CloudRunNativeIdentity,
+		Title:       "Native agent identity on Cloud Run Instances",
+		Description: "Runs each Cloud Run instance as the service account the hub assigned to its agent, taken from the dispatch and checked against the Runtime Broker's cloudrun.assignable_service_accounts list, instead of the runtime's configured account. Existing instances are recreated at their next start. Other identity modes are refused on Cloud Run while it is on.",
+		Default:     false,
+		Layers:      []Layer{LayerServer},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#7374",
+		Owner:       "cloudrun-runtime",
+		ReviewBy:    "2027-02-04",
+	},
+	{
+		Name:        CloudRunEphemeralAgents,
+		Title:       "Ephemeral Cloud Run agents",
+		Description: "Lets an agent be created with persistence: ephemeral on a Cloud Run Runtime Broker. Its home and workspace live in the instance's memory and start fresh at every start: anything not pushed is lost when it stops. With it off, an ephemeral create is refused with experiment_disabled and the Runtime Broker refuses an ephemeral start; persistent agents are unchanged. On a flat Cloud Run Runtime Broker, hub.flat_cloudrun_target must be on too.",
+		Default:     false,
+		Layers:      []Layer{LayerServer},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#7780",
+		Owner:       "cloudrun-runtime",
+		ReviewBy:    "2027-02-12",
+	},
+	{
+		Name:        K8sWorkloadIdentitySetup,
+		Title:       "Workload Identity setup for minted service accounts",
+		Description: "When the hub mints a GCP service account (project-scoped or hub-scoped), it also grants roles/iam.workloadIdentityUser on it to the Kubernetes ServiceAccount named after the account ID, in the namespace of every serving Kubernetes runtime target that sets workload_identity_pool (the project's Runtime Brokers for a project-scoped mint, every Runtime Broker on the hub for a hub-scoped mint). A failed grant never fails the mint: the response lists each target as bound, skipped or failed, with the gcloud command for any target not bound; the web layer shows these binding lines in the mint dialog.",
+		Default:     false,
+		Layers:      []Layer{LayerServer, LayerWeb},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#3329",
+		Owner:       "k8s-runtime",
+		ReviewBy:    "2027-02-14",
+	},
+	{
 		Name:        FlatRuntimeBrokers,
 		Title:       "Flat Runtime Brokers",
 		Description: "Lets a Runtime Broker serve exactly one runtime target with a stable identity: the hub accepts single-target Runtime Broker registrations, pins new agents to that target and rejects mismatched dispatches. Existing profile-based Runtime Brokers are unchanged. The web layer only lets the web UI read the flag (presentation only); every hub check is LayerServer. With it on, the web UI shows the Brokers area.",
@@ -347,6 +714,28 @@ var compiled = []Experiment{
 		Issue:    "ptone/scion#2926",
 		Owner:    "runtime-broker",
 		ReviewBy: "2027-03-31",
+	},
+	{
+		Name:        FlatCloudRunTarget,
+		Title:       "Flat Cloud Run runtime target",
+		Description: "Lets a flat Runtime Broker serve a Cloud Run runtime target (target type cloudrun). Requires hub.flat_runtime_brokers. With it off, the hub refuses a new flat registration whose target type is cloudrun, and agent create on a flat Runtime Broker whose target type is cloudrun, with experiment_disabled; an existing cloudrun Runtime Broker still re-registers, so its agents are not stranded. Docker and Kubernetes targets do not need it. GA gate: it stays alpha and off by default until agent secrets are delivered by a means other than plain Cloud Run instance environment variables (ptone/scion#7309).",
+		Default:     false,
+		Layers:      []Layer{LayerServer},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#7308",
+		Owner:       "runtime-broker",
+		ReviewBy:    "2027-03-31",
+	},
+	{
+		Name:        PortView,
+		Title:       "Port page view",
+		Description: "Opening an agent's exposed port from the hub serves the page through a short-lived page link, so its relative scripts (including modules), styles, images, same-app requests and WebSockets work. Pages opened this way can only use relative URLs: URLs that start with / do not work. Browser storage, cookies and web workers are not available to the page. The link lasts server.hub.port_proxy.view_ttl (default 2h); opening the port from the hub again gives a new one. It works over either port proxy transport; a page's WebSocket works only over Conduit. The page link grants access, so do not share it. Gates the hub's port link redirect and the /api/v1/portview/ route (LayerServer), which answers 404 while it is off. Keep it off on a hub behind an authenticating front proxy (for example IAP) until it has been verified with one (ptone/scion#5989).",
+		Default:     false,
+		Layers:      []Layer{LayerServer},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#5569",
+		Owner:       "hub",
+		ReviewBy:    "2027-01-20",
 	},
 	{
 		Name:        Artifacts,
@@ -362,7 +751,7 @@ var compiled = []Experiment{
 	{
 		Name:        AttachmentArtifacts,
 		Title:       "Attachments as artifacts",
-		Description: "Stores files uploaded in web chat in the artifact service as attachments of the message they are sent in: each one is readable exactly by the readers of that message, and is removed when the message is deleted. Gates the hub's attachment upload path (LayerServer; it also needs the artifact service with its settings section enabled, but not hub.artifacts) and is reserved for the web surfaces that follow (LayerWeb). Attachments stored while it was on stay readable after it is turned off.",
+		Description: "Stores files uploaded in web chat in the artifact service as attachments of the message they are sent in: the stored file is readable exactly by the readers of that message, and is removed when the message is deleted. It is delivered into each recipient agent's inbox; for a message in a project topic thread a copy is also placed in the project's scratchpad shared directory, where every agent and member with access to that directory can read it (direct and group conversations get inbox delivery only). Gates the hub's attachment upload path (LayerServer; it also needs the artifact service with its settings section enabled, but not hub.artifacts) and is reserved for the web surfaces that follow (LayerWeb). Attachments stored while it was on stay readable after it is turned off. Defaults on wherever the artifact service is ready, local blob storage included, and on hubs whose resource storage is an object store (GCS).",
 		Default:     false,
 		Layers:      []Layer{LayerWeb, LayerServer},
 		Stage:       StageAlpha,
@@ -382,6 +771,28 @@ var compiled = []Experiment{
 		ReviewBy:    "2027-03-31",
 	},
 	{
+		Name:        ConduitDeliver,
+		Title:       "Message delivery over Conduit",
+		Description: "Delivers messages to Cloud Run agents over their Conduit session (the deliver-message control route) instead of through runtime exec, so no IAP exec connector is needed. Requires hub.conduit. Agents started before it is turned on keep using exec until they restart; Docker and Kubernetes agents keep using exec. Text and interrupts only: messages with attachments, oversize text or delivery settings outside the route bounds use exec where the runtime has it. Before an agent's session is up, delivery retries, then uses exec or fails before anything is pasted.",
+		Default:     false,
+		Layers:      []Layer{LayerServer},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#7353",
+		Owner:       "conduit",
+		ReviewBy:    "2027-03-31",
+	},
+	{
+		Name:        ExecSchedules,
+		Title:       "Exec schedules",
+		Description: "Exec-only schedules: run a command in an agent's container on a recurring schedule or as a one-shot event, over the agent's Conduit session, with no message and no LLM turn. Requires hub.conduit. Covers one-shot and recurring exec schedules (API: eventType exec on scheduled-events and schedules) and the web authoring option (LayerWeb); the creator needs attach permission on the target agent, checked at creation, dispatch-changing edits, and every fire. Command output is not stored, and the command is shown only to callers who may attach to the target. Agents launched while it is on advertise the exec-start and exec-status control routes; agents started before it was turned on do not until they restart, and their runs are skipped. While either flag is off, exec schedules and events are refused on creation, update, and resume, and skipped when they fire.",
+		Default:     false,
+		Layers:      []Layer{LayerServer, LayerWeb},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#7818",
+		Owner:       "@ptone",
+		ReviewBy:    "2027-03-31",
+	},
+	{
 		Name:        ChatScheduledSend,
 		Title:       "Scheduled send in chat",
 		Description: "Adds Schedule send to the chat Send button menu: the message is held by the hub and sent as the user at the chosen time; until then only the sender sees it, with a Cancel button. Gates the menu item and banners (LayerWeb), the hub's scheduled-message routes, which answer 404 while it is off, and delivery (LayerServer): while it is off, pending messages are held, neither sent nor failed. A message found due more than 60 minutes late (for example after the experiment was off) is not sent; it fails as missed and the sender can send it now.",
@@ -391,6 +802,39 @@ var compiled = []Experiment{
 		Issue:       "ptone/scion#3666",
 		Owner:       "native-chat",
 		ReviewBy:    "2027-01-31",
+	},
+	{
+		Name:        Decisions,
+		Title:       "Decisions",
+		Description: "Lets an agent ask a user to decide between concrete choices: a prompt carries one or more keyed decisions, which web chat shows as cards with one button per choice; clicking records the answer and sends it back to the agent, and each project and profile gets a Decisions page showing open prompts waiting on the viewer and the append-only log of decisions made, even after chat retention purges the originating messages, plus a coalesced Decisions waiting bell notification. Gates sending decisions (400 experiment_disabled while off), the hub's decision, answer, agent, project and profile decision routes (404 while off), the decision fields of chat history, and the bell notification (LayerServer), and the chat cards, project and profile Decisions pages, header/sidebar badges and Profile Settings card (LayerWeb). Every prompt also carries a markdown copy of its decisions, so other surfaces and clients with it off still show them. Stored decisions and answers are kept while it is off.",
+		Default:     false,
+		Layers:      []Layer{LayerWeb, LayerServer},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#7514",
+		Owner:       "native-chat",
+		ReviewBy:    "2027-02-13",
+	},
+	{
+		Name:        ChatStarredMessages,
+		Title:       "Starred messages in chat",
+		Description: "Lets each user star chat messages privately and find them again from the conversation header. Gates the Star message action, the starred indicator and the header list (LayerWeb) and the hub's starred-message routes, which answer 404 while it is off (LayerServer). Stars are stored per user and are never shown to anyone else; turning it off keeps them.",
+		Default:     true,
+		Layers:      []Layer{LayerWeb, LayerServer},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#5797",
+		Owner:       "native-chat",
+		ReviewBy:    "2027-01-31",
+	},
+	{
+		Name:        ChatRetention,
+		Title:       "Chat message retention",
+		Description: "Lets a hub admin bound how long chat history is kept, with one hub-wide age window: a background sweep hard-deletes messages older than the window, with their mentions, stars, reply metadata and attachment links, in small paced batches. Gates the Chat retention settings section and its admin API (404 while off), the sweep and the history marker (LayerServer) and the settings panel and history divider (LayerWeb). Turning it on deletes nothing until an admin also enables the sweep and sets a window; turning it off stops the sweep. Take a database backup before enabling.",
+		Default:     false,
+		Layers:      []Layer{LayerServer, LayerWeb},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#6596",
+		Owner:       "native-chat",
+		ReviewBy:    "2027-03-31",
 	},
 	{
 		Name:        AgentEdit,
@@ -406,7 +850,7 @@ var compiled = []Experiment{
 	{
 		Name:        AgentEditHeld,
 		Title:       "Held edits for running agents",
-		Description: "Lets an agent config edit be saved while the agent is running or starting: the hub keeps it as the agent's pending config and applies it at the next start, restart or resume. System prompt, agent instructions, skills and services edits are kept pending, unless the agent's Runtime Broker re-renders them at start (changedFields), in which case they are applied like other edits; a reincarnation does not apply pending edits yet, so what a start does not apply stays pending, and the rest is applied at the next start after a reincarnation, over the values it set. Keep it off until reincarnation applies pending edits. Pending edits can be discarded. While off, a config edit of a running agent is refused as before; stored pending edits are kept but not applied, except that an edit saved while off removes the pending keys it names.",
+		Description: "Lets an agent config edit be saved while the agent is running or starting: the hub keeps it as the agent's pending config and applies it at the next start, restart or resume. System prompt, agent instructions, skills and services edits are kept pending, unless the agent's Runtime Broker re-renders them at start (changedFields), in which case they are applied like other edits. What a start does not bring into effect stays pending until reincarnation applies pending edits: clears and removals only a reincarnation applies, and the whole key of a collection edit that has such a part, including the parts a start could apply. Keep it off until reincarnation applies pending edits. Pending edits can be discarded. While off, a config edit of a running agent is refused as before; stored pending edits are not applied or shown, and are cleared at the agent's next start or config edit.",
 		Default:     false,
 		Layers:      []Layer{LayerServer, LayerWeb},
 		Stage:       StageAlpha,
@@ -437,6 +881,72 @@ var compiled = []Experiment{
 		ReviewBy:    "2027-01-22",
 	},
 	{
+		Name:        ArtifactReviewEditor,
+		Title:       "Graphical review editor",
+		Description: "Opens a Markdown artifact review in a graphical editor that shows marks inline, records typing, deleting and replacing as suggestions, and has a Graphical and Source toggle. Needs hub.artifacts. Web only; the hub saves and checks reviews the same way whether or not it is on. Do not turn it on before the page script policy (ptone/scion#5912) is deployed on the hub.",
+		Default:     false,
+		Layers:      []Layer{LayerWeb},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#5913",
+		Owner:       "artifacts",
+		ReviewBy:    "2027-01-21",
+	},
+	{
+		Name:        ArtifactManageAccess,
+		Title:       "Manage access dialog",
+		Description: "Replaces Share, Grant review access and Retention… on the artifact page with one Manage access button and dialog for review access, link sharing and retention. Needs hub.artifacts. Web only; the hub decides every change the same way whether or not it is on.",
+		Default:     false,
+		Layers:      []Layer{LayerWeb},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#7107",
+		Owner:       "artifacts",
+		ReviewBy:    "2027-02-01",
+	},
+	{
+		Name:        ArtifactSponsorReviewGrant,
+		Title:       "Automatic review access for the delegating user",
+		Description: "When an agent creates a new artifact in a project, gives the user who delegated to the agent review access to it, if that user holds a role that reads in the artifact's home project. The grant counts only while they keep that role, until someone changes its level, and can be removed like any grant. Existing artifacts get nothing. Needs hub.artifacts.",
+		Default:     false,
+		Layers:      []Layer{LayerServer},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#7134",
+		Owner:       "artifacts",
+		ReviewBy:    "2027-02-01",
+	},
+	{
+		Name:        ArtifactArchive,
+		Title:       "Artifact zip download",
+		Description: "Adds a Download all (.zip) button to an artifact's Files tab and the hub route behind it. Needs hub.artifacts.",
+		Default:     false,
+		Layers:      []Layer{LayerServer, LayerWeb},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#7106",
+		Owner:       "artifacts",
+		ReviewBy:    "2027-02-01",
+	},
+	{
+		Name:        ArtifactsOpenReviewCheck,
+		Title:       "Warn publishers about open reviews",
+		Description: "Review mode on the artifact page reports that a review is open, and a publish that would overtake an open review of the current version is refused with 409 review_open, naming the reviewers and their last activity, until the publisher publishes anyway (force). Needs hub.artifacts. While off, the review-session routes answer 404, force is ignored and publishing behaves as before. Do not turn it on, on any hub, before the filter that drops reviewers who lost access to the artifact has landed (ptone/scion#6849).",
+		Default:     false,
+		Layers:      []Layer{LayerServer, LayerWeb},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#6849",
+		Owner:       "artifacts",
+		ReviewBy:    "2027-02-04",
+	},
+	{
+		Name:        UserDeleteForceCascade,
+		Title:       "Force user delete",
+		Description: "Lets an admin delete a user who has agents: DELETE /api/v1/users/{id}?force=true revokes the user's authority at once (status deleting, role bindings, access tokens, delegations), stops the user's agents through the agent delete, and removes the user once every agent is stopped or removed by an operator. Needs agent.delete on every one of those agents. While off, force is ignored (a user with agents is refused as before) and the deletion resource answers 404; a deletion accepted while it was on runs to completion.",
+		Default:     false,
+		Layers:      []Layer{LayerServer, LayerWeb},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#2143",
+		Owner:       "authz",
+		ReviewBy:    "2027-01-31",
+	},
+	{
 		Name:        AgentPlugins,
 		Title:       "Agent Plugins (native install)",
 		Description: "Installs Agent Plugins 1.0.0 bundles declared in a template's agent_plugins into harnesses that support them natively (codex, copilot, muse-code, claude). While off, agent_plugins is ignored with a start warning and previously installed plugins are removed at the next start.",
@@ -450,7 +960,7 @@ var compiled = []Experiment{
 	{
 		Name:        SecretRotation,
 		Title:       "Server keyring (session cookie pilot)",
-		Description: "Lets a hub start with a versioned keyring file (server.keyring_file). In this release only web session cookies use it: several signing generations can be read at once, with deadlines, while every other purpose keeps the legacy server secret. Checked at startup; a hub with a keyring file refuses to start while it is off. Full server-secret rotation is not available yet.",
+		Description: "Lets a hub start with a versioned keyring file (server.keyring_file). In this release only web session cookies use it: several signing generations can be read at once, with deadlines, while every other purpose keeps the legacy server secret. The keyring file is checked at startup: a hub with a keyring file refuses to start while it is off. It also gates the admin key status endpoint (GET /api/v1/admin/keys/status), checked on every request, so turning it off hides that endpoint at once. Full server-secret rotation is not available yet.",
 		Default:     false,
 		Layers:      []Layer{LayerServer},
 		Stage:       StageAlpha,
@@ -470,6 +980,117 @@ var compiled = []Experiment{
 		// ptone/scion#5995 makes it the default and removes the gate.
 		ReviewBy: "2027-01-21",
 	},
+	{
+		Name:        SkillContentHashV2,
+		Title:       "Skill content hash v2 (paths and modes)",
+		Description: "While on, skill resolve and skill version responses also carry contentHashV2, a skill content hash that covers each file's path and executable bit as well as its content, and the hub accepts either hash form for an @sha256: version and for a pinned registry hash, so a skill can be pinned by a hash that a rename-only or chmod-only change would break. A federated skill is also checked against the hashes the hub recomputes from the registry's file list, and fails if the registry's claimed hash disagrees; a pinned registry must list a hash for every file, and a skill that sends no content hash and lists no per-file hashes is rejected from any registry. contentHash stays the earlier hash (file contents only), which older brokers verify and existing pins hold. While off (the default), responses are unchanged and pins match the earlier hash only. Brokers at or after this release verify contentHashV2 whenever a response carries it.",
+		Default:     false,
+		Layers:      []Layer{LayerServer},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#5935",
+		Owner:       "skills",
+		// ptone/scion#5995 makes it the default and removes the gate.
+		ReviewBy: "2027-01-24",
+	},
+	{
+		Name:        ReincarnateHarnessSwitch,
+		Title:       "Reincarnate harness switch",
+		Description: "Lets scion reincarnate --harness <harness-config> move an agent to another harness config in place, keeping its identity, workspace, branch, conversations and history. The agent's home directory is deleted and rebuilt for the new harness config: the harness session and transcripts, memory edits, tools and caches installed in the home, shell history and dotfile edits are lost, and there is no rollback; the handoff is the only continuity. The dry run and the real request both show this warning. Supported on the runtimes the agent's Runtime Broker advertises for home reset. While it is off, a reincarnate request that names a harness config is refused with 400 experiment_disabled.",
+		Default:     false,
+		Layers:      []Layer{LayerServer},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#7757",
+		Owner:       "lifecycle",
+		ReviewBy:    "2027-05-31",
+	},
+	{
+		Name:        ImageTagSetting,
+		Title:       "Image tag setting",
+		Description: "Lets the image_tag setting choose the tag of the bundled scion-* agent images whose tag is latest or absent: \"version\" selects the hub binary's release version (vX.Y.Z, vX.Y.Z-preview.N, vX.Y.Z-rc.N or nightly-YYYYMMDD; latest for any non-release build), any other value is a literal tag. Images with another tag, a digest, or a registry host are left alone, except exactly <image_registry>/scion-<name> (latest or untagged), the form the image_registry rewrite produces, which is retagged too. While it is off, image_tag is ignored and image references are unchanged; a hub save that sets image_tag is refused, and a settings-file or environment value is reported at startup. Maintenance builds and the system image build keep latest. Agents need images built for that tag (image-build/README.md, \"Build images for a release\").",
+		Default:     false,
+		Layers:      []Layer{LayerServer},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#6625",
+		Owner:       "hub",
+		ReviewBy:    "2027-02-05",
+	},
+	{
+		Name:        ImageTagVersionDefault,
+		Title:       "Image tag version default",
+		Description: "When image_tag is unset, a release build of the hub (vX.Y.Z, vX.Y.Z-preview.N, vX.Y.Z-rc.N or nightly-YYYYMMDD) uses its own version as the tag of the bundled scion-* agent images whose tag is latest or absent, so agents run the images published for that release; development and other non-release builds keep latest. Any set image_tag wins (image_tag: latest opts out), even while hub.image_tag_setting is off. While it is off, an unset image_tag leaves image references unchanged.",
+		Default:     true,
+		Layers:      []Layer{LayerServer},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#6625",
+		Owner:       "hub",
+		ReviewBy:    "2027-02-05",
+	},
+	{
+		Name:        RuntimeOrphanReconcile,
+		Title:       "Runtime orphan report",
+		Description: "Reports runtime objects (containers, pods, Cloud Run instances) that no Hub agent owns, from each Runtime Broker heartbeat's complete inventory: a warning log per new orphan, the scion.hub.runtime_orphans gauge and GET /api/v1/admin/runtime-orphans. Report only; nothing is stopped or deleted. While it is off, nothing is classified or recorded and the route answers 404.",
+		Default:     false,
+		Layers:      []Layer{LayerServer},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#7930",
+		Owner:       "cloudrun-runtime",
+		ReviewBy:    "2027-03-31",
+	},
+	{
+		Name:        IdleSuspend,
+		Title:       "Idle suspend and auto-wake",
+		Description: "An agent the hub suspended (because it was idle or stalled) is resumed automatically when a direct message, mention, notification or scheduled message arrives for it, with no --wake needed; the sender only needs permission to message it. Also gates the idle auto-suspend sweep (server.hub.auto_suspend_idle and server.hub.idle_suspend_after) and converting a hub suspension to a user suspension via suspend. Agents a user suspended are never woken this way, and held agents never are. While it is off, nothing is idle-suspended or woken without an explicit wake. The web layer offers Keep suspended on an agent the hub suspended.",
+		Default:     false,
+		Layers:      []Layer{LayerServer, LayerWeb},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#7826",
+		Owner:       "lifecycle",
+		ReviewBy:    "2027-03-31",
+	},
+	{
+		Name:        SystemOne,
+		Title:       "System One message guardrails",
+		Description: "Enables Hub-scoped System One provider instance administration and probing (/api/v1/admin/system-one/instances[/{name}[/probe]] and scion admin system-one instance create|list|delete|probe), with runtime probe evaluations bounded by server.hub.system_one.max_eval_time. While off, the System One admin routes answer 404 and stored provider instances are kept.",
+		Default:     false,
+		Layers:      []Layer{LayerServer},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#8044",
+		Owner:       "system-one",
+		ReviewBy:    "2027-02-15",
+	},
+	{
+		Name:        GitHubTriggers,
+		Title:       "GitHub App events as triggers",
+		Description: "Routes GitHub App webhook deliveries into the trigger system and enables GitHub trigger authoring, presets, App readiness reporting, and primary-project repository routing. Requires hub.triggers to be enabled as well: the hub checks both flags server-side, while the web flag affects presentation only. While off, the webhook route keeps returning ignored for content events, github triggers cannot be created, presets/status/settings/repo-routing routes answer 404, the web section is hidden, and existing github triggers and queued events wait.",
+		Default:     false,
+		Layers:      []Layer{LayerServer, LayerWeb},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#836",
+		Owner:       "triggers",
+		ReviewBy:    "2027-05-31",
+	},
+	{
+		Name:        Triggers,
+		Title:       "Triggers and webhook endpoints",
+		Description: "Lets projects define webhook endpoints and event triggers that deliver messages to agents when matching signed webhooks arrive. Server layer: while off, /api/v1/hooks/{id} and all /webhook-endpoints, /triggers and /trigger-events routes answer 404, and the trigger delivery drainer and fire-lease reaper do not register. Web layer: exposes the flag for UI presentation.",
+		Default:     false,
+		Layers:      []Layer{LayerServer, LayerWeb},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#7961",
+		Owner:       "triggers",
+		ReviewBy:    "2027-05-31",
+	},
+	{
+		Name:        MessagePolicies,
+		Title:       "Project message policies",
+		Description: "Enables project-scoped CEL message policies on outbound agent messages to users, conversations and choice prompts (/api/v1/projects/{id}/message-policies[/{policyId}[/test|/decisions]] and scion message-policy create|list|get|delete|test|decisions), with shadow and enforce modes and content-free decision records. Agent-to-agent DMs, group-set fan-out and mention deliveries are not covered yet and are reported in coverage.uncovered_agent_paths. While off, the routes answer 404, the gate evaluates nothing and stored policies and decisions are kept.",
+		Default:     false,
+		Layers:      []Layer{LayerServer},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#8047",
+		Owner:       "system-one",
+		ReviewBy:    "2027-02-15",
+	},
 }
 
 // compiledRetired lists names that PUT rejects true/false for, ignores and
@@ -485,6 +1106,9 @@ var compiledRetired = []string{
 	"web.terminal_workspace",
 	// Graduated: project thread groups are always on (ptone/scion#5546).
 	"hub.chat_thread_groups",
+	// Replaced by web.decisions (ptone/scion#8223).
+	"web.chat_choices",
+	"web.project_decisions",
 }
 
 // Registry is an immutable, validated set of experiments. It is the only way

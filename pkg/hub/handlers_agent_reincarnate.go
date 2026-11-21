@@ -21,16 +21,19 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
-	"sort"
+	"strings"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/config"
+	"github.com/GoogleCloudPlatform/scion/pkg/experiments"
+	"github.com/GoogleCloudPlatform/scion/pkg/harness"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
 // reincarnatePatchNeedsUpdateMsg is the 403 body for a user caller whose
 // reincarnate request has patch flags but who lacks agent.update.
-const reincarnatePatchNeedsUpdateMsg = "Reincarnate patch flags (--service-account, --role, --model, --thinking-level, --harness-auth, --image) need permission to update the agent (agent.update) in addition to lifecycle; a user access token also needs the agent:update scope"
+const reincarnatePatchNeedsUpdateMsg = "Reincarnate patch flags (--harness, --service-account, --role, --model, --thinking-level, --harness-auth, --image) need permission to update the agent (agent.update) in addition to lifecycle; a user access token also needs the agent:update scope"
 
 // maxHandoffBytes bounds the reincarnate request's handoff text (design §3.2).
 const maxHandoffBytes = 256 * 1024
@@ -55,15 +58,14 @@ type ReincarnateAgentRequest struct {
 	// TargetBroker. Never downgrades a move the export mode can carry.
 	ForceMove bool `json:"forceMove,omitempty"`
 
-	// SharedDirBackends changes the recorded shared-dir storage backend of
-	// the named shared dirs (dir name to "nfs" or "local"). Only the
-	// agent's record on its broker changes; no data is copied, moved or
-	// deleted. Not accepted for a self-reincarnation.
-	SharedDirBackends map[string]string `json:"sharedDirBackends,omitempty"`
-	// AllowEmptySharedDir, with SharedDirBackends, skips the start check
-	// that refuses an empty directory on the new backend while the dir's
-	// directory on its previous backend is not empty.
-	AllowEmptySharedDir bool `json:"allowEmptySharedDir,omitempty"`
+	// SharedDirBackends and AllowEmptySharedDir are the removed per-agent
+	// shared dir backend change (`scion reincarnate --shared-dir-backend`,
+	// `--allow-empty-shared-dir`). They stay on the wire only so a request
+	// from an older client that sets them gets a 400
+	// (removedSharedDirBackendOptionError) rather than being silently
+	// ignored: server.project_storage now places every agent's shared dirs.
+	SharedDirBackends   map[string]string `json:"sharedDirBackends,omitempty"`
+	AllowEmptySharedDir bool              `json:"allowEmptySharedDir,omitempty"`
 
 	// Patch fields (ptone/scion#3302): each changes the next generation's
 	// setting and is kept by later reincarnations. Empty (nil for
@@ -79,9 +81,13 @@ type ReincarnateAgentRequest struct {
 	Model         string `json:"model,omitempty"`
 	ThinkingLevel *int   `json:"thinkingLevel,omitempty"`
 	HarnessAuth   string `json:"harnessAuth,omitempty"`
+	// HarnessConfig (`--harness`) moves the agent to another harness config
+	// and resets its home (ptone/scion#7757). It needs the
+	// hub.reincarnate_harness_switch experiment and is a patch for
+	// authorization.
+	HarnessConfig string `json:"harnessConfig,omitempty"`
 
 	// Overrides not yet supported; any non-zero value here is a 400.
-	HarnessConfig  string            `json:"harnessConfig,omitempty"`
 	Env            map[string]string `json:"env,omitempty"`
 	TemplateHash   string            `json:"templateHash,omitempty"`
 	ResetOverrides bool              `json:"resetOverrides,omitempty"`
@@ -91,7 +97,7 @@ type ReincarnateAgentRequest struct {
 // hasUnsupportedOverrides reports whether the request sets any override
 // field that is not yet supported.
 func (r ReincarnateAgentRequest) hasUnsupportedOverrides() bool {
-	return r.HarnessConfig != "" || len(r.Env) > 0 || r.TemplateHash != "" || r.ResetOverrides || r.Rollback
+	return len(r.Env) > 0 || r.TemplateHash != "" || r.ResetOverrides || r.Rollback
 }
 
 // ReincarnateAgentResponse is the response body for a reincarnate request:
@@ -148,38 +154,25 @@ type ReincarnationPlan struct {
 	ServiceAccount *FieldChange `json:"serviceAccount,omitempty"`
 	ThinkingLevel  *FieldChange `json:"thinkingLevel,omitempty"`
 	HarnessAuth    *FieldChange `json:"harnessAuth,omitempty"`
-	// SharedDirBackends and AllowEmptySharedDir echo the request's explicit
-	// shared dir backend change.
-	SharedDirBackends   map[string]string `json:"sharedDirBackends,omitempty"`
-	AllowEmptySharedDir bool              `json:"allowEmptySharedDir,omitempty"`
+
+	// HomeReset is set when this reincarnation deletes and rebuilds the
+	// agent's home (a harness switch, ptone/scion#7757); Warnings[0] is
+	// then the home-reset warning. Harness is the harness-config name
+	// old→new, set when the request names a harness config (HarnessCfg is
+	// the content hash change).
+	HomeReset bool         `json:"homeReset,omitempty"`
+	Harness   *FieldChange `json:"harness,omitempty"`
 }
 
-// validateSharedDirBackendRequest checks a reincarnate request's explicit
-// shared dir backend change: each target must be "nfs" or "local". Whether
-// each dir is one of the agent's shared dirs, and whether the broker has a
-// complete nfs block, is checked by the broker, which holds the project
-// settings and the agent's record.
-func validateSharedDirBackendRequest(req ReincarnateAgentRequest) error {
-	if len(req.SharedDirBackends) == 0 {
-		if req.AllowEmptySharedDir {
-			return fmt.Errorf("allowEmptySharedDir needs a shared dir backend change")
-		}
-		return nil
+// removedSharedDirBackendOptionError is the 400 message for a reincarnate
+// request that still carries the removed per-agent shared dir backend
+// change, or "" when it carries none.
+func removedSharedDirBackendOptionError(req ReincarnateAgentRequest) string {
+	if len(req.SharedDirBackends) == 0 && !req.AllowEmptySharedDir {
+		return ""
 	}
-	names := make([]string, 0, len(req.SharedDirBackends))
-	for name := range req.SharedDirBackends {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		if err := api.ValidateSharedDirs([]api.SharedDir{{Name: name}}); err != nil {
-			return fmt.Errorf("sharedDirBackends: invalid shared dir name %q", name)
-		}
-		if backend := req.SharedDirBackends[name]; backend != "nfs" && backend != "local" {
-			return fmt.Errorf("sharedDirBackends: shared dir %q: only a change to the nfs or local backend is supported (got %q)", name, backend)
-		}
-	}
-	return nil
+	return "sharedDirBackends and allowEmptySharedDir (--shared-dir-backend, --allow-empty-shared-dir) were removed: " +
+		"server.project_storage places every agent's shared dirs. Existing node-local shared dirs: " + config.ProjectStorageMigrationText
 }
 
 // authorizeAgentReincarnate gates POST .../reincarnate for every caller kind
@@ -254,21 +247,31 @@ func (s *Server) handleReincarnateAgent(w http.ResponseWriter, r *http.Request, 
 		ValidationError(w, fmt.Sprintf("handoff exceeds %d bytes", maxHandoffBytes), nil)
 		return
 	}
+	// A harness switch (ptone/scion#7757) is gated by its experiment, ahead
+	// of every other check, so a disabled hub gives a clear reason.
+	if req.HarnessConfig != "" && !s.experimentEnabled(experiments.ReincarnateHarnessSwitch) {
+		writeError(w, http.StatusBadRequest, ErrCodeExperimentDisabled,
+			"--harness requires the "+experiments.ReincarnateHarnessSwitch+" experiment", nil)
+		return
+	}
 	if req.hasUnsupportedOverrides() {
 		writeError(w, http.StatusBadRequest, ErrCodeValidationError,
 			"config overrides are not yet supported for scion reincarnate", nil)
 		return
 	}
-	if err := validateSharedDirBackendRequest(req); err != nil {
-		writeError(w, http.StatusBadRequest, ErrCodeValidationError, err.Error(), nil)
+	if msg := removedSharedDirBackendOptionError(req); msg != "" {
+		writeError(w, http.StatusBadRequest, ErrCodeValidationError, msg, nil)
 		return
 	}
-	// A shared dir backend change is an operator action: the self
-	// exemption in authorizeAgentReincarnate does not cover it.
-	if (len(req.SharedDirBackends) > 0 || req.AllowEmptySharedDir) && isSelfRequest(ctx, agent) {
-		writeError(w, http.StatusForbidden, ErrCodeForbidden,
-			"an agent cannot change its own shared dir backend; ask a user or another agent with lifecycle access", nil)
-		return
+	if req.HarnessConfig != "" {
+		if !harnessConfigNameAllowed(req.HarnessConfig) {
+			ValidationError(w, fmt.Sprintf("invalid harnessConfig %q: must be a single harness-config name", req.HarnessConfig), nil)
+			return
+		}
+		if req.TargetBroker != "" {
+			ValidationError(w, "harnessConfig (--harness) cannot be combined with targetBroker (--broker): move the agent and switch its harness in separate requests", nil)
+			return
+		}
 	}
 	if !validateReincarnatePatchRequest(w, req) {
 		return
@@ -313,7 +316,25 @@ func (s *Server) handleReincarnateAgent(w http.ResponseWriter, r *http.Request, 
 	// broker and the agent state are examined and before anything is
 	// written, so a refused request claims nothing and a dry run reports
 	// the same refusal.
-	patch, ok := s.resolveReincarnatePatch(w, r, agent, project, req)
+	//
+	// A harness switch first resolves its target harness config; an
+	// unknown name is a 404 here, before anything is stopped, since a
+	// typo would otherwise reset the home for nothing (ptone/scion#7757).
+	var targetHC *store.HarnessConfig
+	if req.HarnessConfig != "" {
+		hc, err := s.resolveHarnessConfigBySlug(ctx, project.ID, req.HarnessConfig)
+		if err != nil {
+			writeErrorFromErr(w, err, "")
+			return
+		}
+		if hc == nil {
+			writeError(w, http.StatusNotFound, ErrCodeHarnessConfigNotFound,
+				fmt.Sprintf("harness config %q not found in this project or globally", req.HarnessConfig), nil)
+			return
+		}
+		targetHC = hc
+	}
+	patch, ok := s.resolveReincarnatePatch(w, r, agent, project, req, targetHC)
 	if !ok {
 		return
 	}
@@ -367,11 +388,6 @@ func (s *Server) handleReincarnateAgent(w http.ResponseWriter, r *http.Request, 
 				"--force applies only to a move to another broker", nil)
 			return
 		}
-	}
-	if moveTarget != nil && (len(req.SharedDirBackends) > 0 || req.AllowEmptySharedDir) {
-		writeError(w, http.StatusBadRequest, ErrCodeValidationError,
-			"a shared dir backend change cannot be combined with a move to another broker", nil)
-		return
 	}
 	gate := s.reincarnateWorkspaceGate(ctx, agent, project, moveTarget, req.ForceMove)
 	workspaceModeErr, sameBrokerEmptyPerAgent := gate.workspaceModeErr, gate.sameBrokerEmptyPerAgent
@@ -439,6 +455,16 @@ func (s *Server) handleReincarnateAgent(w http.ResponseWriter, r *http.Request, 
 			"runtime broker does not support in-place empty-per-agent reincarnation; upgrade the broker", nil)
 		return
 	}
+	// A harness switch resets the home: the broker must be able to do that
+	// completely on the agent's runtime (ptone/scion#7757). Refused, like
+	// the capabilities above, before anything is planned or stopped, also
+	// for a dry run. An empty runtime (ambiguous profiles) is refused too.
+	if req.HarnessConfig != "" {
+		if msg := resetHomeRuntimeRefusal(effectiveAgentRuntime(agent, broker), broker.Capabilities.ReprovisionResetHomeRuntimes); msg != "" {
+			writeError(w, http.StatusPreconditionFailed, ErrCodeUnsupportedCapability, msg, nil)
+			return
+		}
+	}
 
 	// AC-8 / design §3.4 Amendment A3, moved ahead of the plan computation
 	// (design §3.4 Amendment A11 item 3): a reincarnation already in flight
@@ -459,9 +485,20 @@ func (s *Server) handleReincarnateAgent(w http.ResponseWriter, r *http.Request, 
 	// it never writes. Any store writes happen only below this point, and
 	// only for a non-dry-run request.
 	resolveRegistry := reincarnateImageRegistry(dispatcher, agent.RuntimeBrokerID)
-	fresh, warnings, err := s.buildPatchedAppliedConfig(ctx, agent, project, resolveRegistry, patch)
+	buildCtx := ctx
+	if patch != nil && patch.HarnessConfig != nil {
+		// A harness switch never falls back to no credentials on its own
+		// (ptone/scion#7757 §3.3.4): `--harness-auth none` asks for that
+		// explicitly.
+		buildCtx = withNoAuthFallbackForbidden(ctx)
+	}
+	fresh, warnings, err := s.buildPatchedAppliedConfig(buildCtx, agent, project, resolveRegistry, reincarnateImageTag(dispatcher, agent.RuntimeBrokerID), patch)
 	if err != nil {
 		if writeWorkspaceStorageUnavailable(w, err) {
+			return
+		}
+		if errors.Is(err, errNoAuthFallbackRefused) {
+			writeReincarnateHarnessCredentialsMissing(w, targetHC, req.HarnessAuth)
 			return
 		}
 		writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
@@ -469,22 +506,39 @@ func (s *Server) handleReincarnateAgent(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	imageRegistry := resolveRegistry(fresh.Profile)
-	if len(req.SharedDirBackends) > 0 {
-		fresh.SharedDirBackendChanges = req.SharedDirBackends
-		fresh.AllowEmptySharedDir = req.AllowEmptySharedDir
+	runAs := *agent
+	runAs.AppliedConfig = fresh
+	if targetHC != nil && !fresh.NoAuth && fresh.HarnessAuth != harness.AuthTypeNone {
+		var authMeta *config.HarnessAuthMetadata
+		if targetHC.Config != nil {
+			authMeta = targetHC.Config.AuthMeta
+		}
+		// Broker-env-only credentials are invisible to this hub-side probe
+		// and can cause a false 422. Hosted deployments use hub secrets.
+		// The broker's reprovision gather remains the backstop and runs
+		// before resetting the home if its credential verdict differs.
+		hasCredentials, err := s.hasRequiredAuthCredentials(ctx, &runAs, targetHC.Harness, authMeta)
+		if err != nil {
+			s.agentLifecycleLog.Error("Failed to check target harness credentials", "agent_id", agent.ID, "error", err)
+			writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to check target harness credentials", nil)
+			return
+		}
+		if !hasCredentials {
+			writeReincarnateHarnessCredentialsMissing(w, targetHC, fresh.HarnessAuth)
+			return
+		}
 	}
 	// Fail fast, as start and restart do, when the GCP identity the fresh
 	// config will run with is no longer allowed for this agent. Checked
 	// before the claim and the worker's stop, so a refused request leaves
 	// the agent as it was, and a dry run reports the same refusal.
-	runAs := *agent
-	runAs.AppliedConfig = fresh
 	if s.gcpIdentityStartRefusal(ctx, w, &runAs, "reincarnate") {
 		return
 	}
 
 	plan := computeReincarnationPlan(agent.AppliedConfig, fresh, warnings, imageRegistry)
 	addPatchToPlan(&plan, agent.AppliedConfig, fresh, req)
+	addHarnessSwitchToPlan(&plan, agent.AppliedConfig, fresh, patch)
 	addAuthorityToPlan(&plan, auth)
 	targetGeneration := agent.Generation + 1
 
@@ -576,7 +630,19 @@ func (s *Server) startReincarnation(w http.ResponseWriter, r *http.Request, agen
 		SourceBrokerID:        moveSourceID(move),
 		TargetBrokerID:        moveTargetID(move),
 		TransferMode:          moveTransferMode(move),
+		HomeReset:             plan.HomeReset,
 	}
+	// A reincarnation starts the agent, so it is admitted like a start
+	// (ptone/scion#6033): reserve its project slot, and unless it moves its
+	// broker slot, with the cap check, before anything is claimed. Both
+	// reserves are idempotent for a slot the agent already holds. A move's
+	// target broker slot is checked when the worker moves the reservation.
+	capHold, err := s.reserveReincarnationCapacity(ctx, agent, move)
+	if err != nil {
+		writeQuotaReserveError(w, store.LimitMaxAgentsPerProject, err)
+		return
+	}
+
 	// The claim, the reincarnation record, the authority re-record, the
 	// reincarnate-claim hooks and the audit record commit in one
 	// transaction (reincarnateClaimTx), so a failure at any step leaves the
@@ -585,6 +651,9 @@ func (s *Server) startReincarnation(w http.ResponseWriter, r *http.Request, agen
 	// unconfirmed: a start whose outcome is unknown may still create a
 	// container this reincarnation would then compete with.
 	if err := s.reincarnateClaimTx(ctx, agent, rec, auth, saAssignment, auditActorFromContext(ctx)); err != nil {
+		// Undo the capacity this request reserved, conditionally: a start
+		// or a concurrent reincarnation that now owns the agent keeps it.
+		s.rollbackReincarnationCapacity(ctx, agent, capHold)
 		var held *store.ClaimHeldError
 		if errors.Is(err, store.ErrVersionConflict) {
 			Conflict(w, "agent was concurrently modified; retry")
@@ -606,6 +675,7 @@ func (s *Server) startReincarnation(w http.ResponseWriter, r *http.Request, agen
 		writeErrorFromErr(w, err, "")
 		return
 	}
+	s.expireHeldMessagesForAgent(ctx, agent.ID, holdFailReasonAgentStopped)
 	// A reincarnation starts the agent (also one that was stopped): record
 	// that the agent is meant to run, now, before the worker's start, so a
 	// stop the user records during the reincarnation is newer and wins.
@@ -639,7 +709,7 @@ func (s *Server) startReincarnation(w http.ResponseWriter, r *http.Request, agen
 	// this exact claim instant, not rec.RequestedAt — the store stamps that
 	// a few ms later inside CreateAgentReincarnation, after the gate in the
 	// three delivery paths could already have started deferring messages.
-	go s.runReincarnationWorker(context.Background(), agent.ID, rec.ID, rec.PreviousAppliedConfig, fresh, handoff, claimedAt, requestedBy, &plan, targetGeneration, admittedDeletionClaim, move)
+	go s.runReincarnationWorker(context.Background(), agent.ID, rec.ID, rec.PreviousAppliedConfig, fresh, handoff, claimedAt, requestedBy, &plan, targetGeneration, admittedDeletionClaim, move, capHold)
 
 	writeJSON(w, http.StatusAccepted, ReincarnateAgentResponse{
 		AgentID:        agent.ID,
@@ -744,7 +814,7 @@ func (s *Server) planReincarnateMove(w http.ResponseWriter, r *http.Request, req
 	// The new generation runs on dst: resolve its registry there, for the
 	// new profile (ptone/scion#3916).
 	resolveRegistry := reincarnateImageRegistry(dispatcher, dst.ID)
-	fresh, warnings, err := s.buildPatchedAppliedConfig(ctx, agent, project, resolveRegistry, patch)
+	fresh, warnings, err := s.buildPatchedAppliedConfig(ctx, agent, project, resolveRegistry, reincarnateImageTag(dispatcher, dst.ID), patch)
 	if err != nil {
 		if writeWorkspaceStorageUnavailable(w, err) {
 			return
@@ -932,6 +1002,11 @@ func effectiveAgentRuntime(agent *store.Agent, broker *store.RuntimeBroker) stri
 // unrecorded hop further up that the chain walk reaches before any hop it
 // does not accept (reincarnateChainUnrecorded): the reincarnate then
 // repairs the chain as a recreate by that user would (ptone/scion#3948).
+// It is re-recorded as well, with the owner as the recorded delegator, when
+// the agent's owner keeps the role of an agent whose recorded chain ends at
+// another user (owner reclaim, reincarnateOwnerReclaims). A re-record after
+// which the owner's unshared material is not delivered carries a plan
+// warning (ownerMaterialReRecordNotice).
 // In every other case, including any self-reincarnation, an agent
 // requester's reincarnation that keeps the role, and a user's that keeps
 // the role of an agent with a recorded own edge and either a fully recorded
@@ -995,7 +1070,7 @@ func (s *Server) reincarnateAuthorityFor(w http.ResponseWriter, r *http.Request,
 		writeForbiddenDenial(w, ceilingSourceDenialMessage(cause), DeniedByDelegationCeiling)
 		return nil, false
 	}
-	if _, cause, allowed := childRoleWithinCeiling(ceiling, role, true); !allowed {
+	if _, cause, allowed := childRoleWithinCeiling(uatHopEffectCeiling(prov.SourcePrincipalKind, prov.SourcePrincipalID, prov, ceiling), role, true); !allowed {
 		msg := fmt.Sprintf("the credential's scopes do not cover the agent's role %q", role)
 		logAuthzDenial(r, identity, resource, ActionLifecycle,
 			"effect ceiling denied: "+string(cause)+": "+msg)
@@ -1006,6 +1081,7 @@ func (s *Server) reincarnateAuthorityFor(w http.ResponseWriter, r *http.Request,
 		// Decision D1: a self request does not re-record the edge.
 		return nil, true
 	}
+	ownerReclaim := false
 	if !roleChanged {
 		// ptone/scion#3762: another requester's reincarnate that keeps the
 		// role keeps the existing edge, so the agent keeps its delegator.
@@ -1026,7 +1102,22 @@ func (s *Server) reincarnateAuthorityFor(w http.ResponseWriter, r *http.Request,
 			return nil, false
 		}
 		if !unrecorded {
-			return nil, true
+			// Owner reclaim: the agent's owner keeping the role of an agent
+			// whose recorded chain ends at another user re-records the edge
+			// with the owner as delegator, so the owner's unshared material
+			// follows the chain again (start_owner_material_chain.go).
+			reclaim, err := s.reincarnateOwnerReclaims(ctx, identity, agent)
+			if err != nil {
+				s.agentLifecycleLog.Error("handleReincarnateAgent: delegation chain lookup failed",
+					"agent_id", agent.ID, "error", err)
+				writeError(w, http.StatusServiceUnavailable, ErrCodeUnavailable,
+					"Unable to evaluate the agent's delegation chain; retry later", nil)
+				return nil, false
+			}
+			if !reclaim {
+				return nil, true
+			}
+			ownerReclaim = true
 		}
 	}
 	if agentIdent != nil {
@@ -1051,12 +1142,108 @@ func (s *Server) reincarnateAuthorityFor(w http.ResponseWriter, r *http.Request,
 		delegatorType = store.DelegationPrincipalAgent
 	}
 	return &reincarnateAuthority{
-		DelegatorType: delegatorType,
-		DelegatorID:   identity.ID(),
-		Role:          string(role),
-		Ceiling:       ceiling,
-		Provenance:    prov,
+		DelegatorType:       delegatorType,
+		DelegatorID:         identity.ID(),
+		Role:                string(role),
+		Ceiling:             ceiling,
+		Provenance:          prov,
+		OwnerMaterialNotice: s.ownerMaterialReRecordNotice(ctx, agent, delegatorType, identity.ID()),
+		OwnerReclaim:        ownerReclaim,
+		RuntimeReadNotice:   s.runtimeReadReRecordNotice(ctx, agent, delegatorType, identity.ID()),
 	}, true
+}
+
+// reincarnateOwnerReclaims reports whether a user's same-role reincarnate of
+// agent re-records its edge as an owner reclaim: the requester is the
+// agent's owner, and the agent's recorded chain ends at another user. The
+// re-record is bounded as every other one is, by checks that run before
+// this: CanDelegate, and the requester's credential ceiling read as the hop
+// it records would apply it (uatHopEffectCeiling). Only a chain lookup
+// fault is an error.
+func (s *Server) reincarnateOwnerReclaims(ctx context.Context, identity Identity, agent *store.Agent) (bool, error) {
+	if identity == nil || agent.OwnerID == "" || identity.ID() != agent.OwnerID {
+		return false, nil
+	}
+	v := s.authzService.ownerChainVerdict(ctx, agent)
+	switch {
+	case v.outcome == ownerChainWithhold && v.reason == ownerChainReasonLookupError:
+		return false, fmt.Errorf("owner material chain lookup for agent %s failed", agent.ID)
+	case v.outcome == ownerChainEndsAtUser && v.terminalUserID != agent.OwnerID:
+		return true, nil
+	}
+	return false, nil
+}
+
+// ownerMaterialReRecordNoticeText is the plan warning of a re-record after
+// which the owner's unshared material is not delivered to the agent;
+// ownerMaterialReclaimClause is appended when the owner can restore it by
+// reincarnating the agent (its ancestry, if any, starts at the owner).
+const (
+	ownerMaterialReRecordNoticeText = "the agent's recorded delegation chain will not end at its owner, so the owner's user secrets and env vars that are not shared with progeny will not be delivered to it"
+	ownerMaterialReclaimClause      = "; the owner can restore them by reincarnating the agent"
+)
+
+// ownerMaterialReRecordNotice returns the notice for a re-record of agent's
+// edge with the given delegator, or "" when the owner's unshared rows are
+// still delivered after it: the new chain ends at the owner (a user
+// delegator equal to the owner, or an agent delegator whose own chain ends
+// there) and the agent's ancestry, if any, starts at the owner. A lookup
+// fault on an agent delegator's chain gives the notice. The remedy clause is added only when
+// the new chain is what withholds the rows (terminal_user_not_owner).
+func (s *Server) ownerMaterialReRecordNotice(ctx context.Context, agent *store.Agent, delegatorType, delegatorID string) string {
+	if agent == nil || agent.OwnerID == "" || s.authzService == nil {
+		return ""
+	}
+	var v ownerChainVerdict
+	switch delegatorType {
+	case store.DelegationPrincipalUser:
+		v = ownerChainVerdict{outcome: ownerChainEndsAtUser, terminalUserID: delegatorID}
+	case store.DelegationPrincipalAgent:
+		v = s.authzService.ownerChainVerdict(ctx, &store.Agent{ID: delegatorID, ProjectID: agent.ProjectID})
+		if v.outcome == ownerChainLegacy {
+			// The delegator's own hop is unrecorded: above the agent.
+			v = ownerChainVerdict{outcome: ownerChainWithhold, reason: ownerChainReasonUnrecordedAbove}
+		}
+	default:
+		return ownerMaterialReRecordNoticeText
+	}
+	deliver, _, reason := ownerRowDecision(v, agent.Ancestry, agent.OwnerID)
+	switch {
+	case deliver:
+		return ""
+	case reason == ownerChainReasonTerminalNotOwner:
+		return ownerMaterialReRecordNoticeText + ownerMaterialReclaimClause
+	default:
+		return ownerMaterialReRecordNoticeText
+	}
+}
+
+// runtimeReadReRecordNoticeText is the notice of a re-record after which
+// the agent's delegation chain is still unrecorded above its own edge, so
+// the runtime read and the agent secret list refuse the owner's shared
+// user secrets (chain_unrecorded), and start withholds them.
+const runtimeReadReRecordNoticeText = "runtime reads of the owner's shared secrets are refused until the agent's chain is recorded (reincarnate it as its owner)"
+
+// runtimeReadReRecordNotice returns the notice for a re-record of agent's
+// edge with the given delegator when the agent's chain stays unrecorded
+// above it: the delegator is an agent whose own edge, or a hop above it,
+// has no recorded provenance. It is "" for a user delegator (the chain then
+// ends at the agent's own edge), for an agent without ancestry (the runtime
+// read refuses it before the chain), and when the delegator's chain lookup
+// faults.
+func (s *Server) runtimeReadReRecordNotice(ctx context.Context, agent *store.Agent, delegatorType, delegatorID string) string {
+	if agent == nil || len(agent.Ancestry) == 0 || s.authzService == nil || delegatorType != store.DelegationPrincipalAgent {
+		return ""
+	}
+	v := s.authzService.ownerChainVerdict(ctx, &store.Agent{ID: delegatorID, ProjectID: agent.ProjectID})
+	switch {
+	case v.outcome == ownerChainLegacy:
+		// The delegator's own hop is unrecorded: above the agent.
+		return runtimeReadReRecordNoticeText
+	case v.outcome == ownerChainWithhold && v.reason == ownerChainReasonUnrecordedAbove:
+		return runtimeReadReRecordNoticeText
+	}
+	return ""
 }
 
 // reincarnateChainUnrecorded reports whether a user's same-role reincarnate
@@ -1262,4 +1449,35 @@ func (s *Server) reincarnateWorkspaceGate(ctx context.Context, agent *store.Agen
 		cloneMode:               hasGitClone || emptyPerAgentMove,
 		sameBrokerEmptyPerAgent: sameBrokerEmptyPerAgent,
 	}
+}
+
+// writeReincarnateHarnessCredentialsMissing reports config-declared names only.
+// With automatic auth selection, any declared type could satisfy the probe, so
+// list all types' requirements in a stable order for dry-run/real parity.
+func writeReincarnateHarnessCredentialsMissing(w http.ResponseWriter, hc *store.HarnessConfig, authType string) {
+	var names []string
+	if hc.Config != nil && hc.Config.AuthMeta != nil {
+		meta := hc.Config.AuthMeta
+		for kind, requirements := range meta.Types {
+			if authType != "" && kind != authType {
+				continue
+			}
+			for _, group := range harness.RequiredAuthEnvKeysFromConfig(meta, kind) {
+				names = append(names, group...)
+			}
+			for _, file := range requirements.RequiredFiles {
+				names = append(names, file.Name)
+				names = append(names, file.AlternativeEnvKeys...)
+			}
+		}
+	}
+	slices.Sort(names)
+	names = slices.Compact(names)
+	requirements := ""
+	if len(names) > 0 {
+		requirements = " (credential requirements: " + strings.Join(names, ", ") + ")"
+	}
+	writeError(w, http.StatusUnprocessableEntity, ErrCodeHarnessCredentialsMissing,
+		fmt.Sprintf("harness config %q has no credentials available for this agent%s; set them as hub secrets, "+
+			"or pass --harness-auth (--harness-auth none runs the harness without credentials)", hc.Name, requirements), nil)
 }

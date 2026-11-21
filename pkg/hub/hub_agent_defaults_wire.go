@@ -15,10 +15,14 @@
 package hub
 
 import (
+	"context"
 	"slices"
+	"strings"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config/opsettings"
+	"github.com/GoogleCloudPlatform/scion/pkg/experiments"
+	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
 // remoteHubAgentDefaults converts the hub's operational agent_defaults section
@@ -97,6 +101,68 @@ func remoteHubAgentDefaults(d opsettings.AgentDefaultsSettings, autoExposePorts 
 // It returns nil when there is nothing to send.
 func startHubAgentDefaults(d opsettings.AgentDefaultsSettings, autoExposePorts *bool, experiments []string, telemetry *api.TelemetryConfig) *RemoteHubAgentDefaults {
 	return remoteHubAgentDefaults(d, autoExposePorts, experiments, telemetry)
+}
+
+// withDispatchImageTag returns h with the hub-resolved image_tag set
+// (ptone/scion#6625), allocating the wire value when the hub has no other
+// default to send. An empty tag returns h unchanged, so when no tag
+// applies (imageTagStateOf) the wire is byte-identical to the one without
+// the tag. Create, start (resume included) and restart
+// all send it, so the broker applies the tag on every path.
+func withDispatchImageTag(h *RemoteHubAgentDefaults, tag string) *RemoteHubAgentDefaults {
+	if tag == "" {
+		return h
+	}
+	if h == nil {
+		h = &RemoteHubAgentDefaults{}
+	}
+	h.ImageTag = tag
+	return h
+}
+
+// withDispatchCreateKSA returns h with CreateKSA set when createKSA is true
+// (ptone/scion#7966), allocating the wire value when the hub has no other
+// default to send. When createKSA is false it returns h unchanged, keeping
+// file-mode parity intact.
+func withDispatchCreateKSA(h *RemoteHubAgentDefaults, createKSA bool) *RemoteHubAgentDefaults {
+	if !createKSA {
+		return h
+	}
+	if h == nil {
+		h = &RemoteHubAgentDefaults{}
+	}
+	h.CreateKSA = true
+	return h
+}
+
+// shouldCreateKSA reports whether the Hub authorizes opt-in broker KSA
+// creation for agent's dispatch: hub.k8s_workload_identity_setup is enabled
+// in enabledExperiments, the agent's GCP identity mode is "assign", and the
+// assigned GCPServiceAccount row is Hub-minted (Managed == true).
+func (d *HTTPAgentDispatcher) shouldCreateKSA(ctx context.Context, agent *store.Agent, enabledExperiments []string) bool {
+	if d == nil || d.store == nil || agent == nil || agent.AppliedConfig == nil {
+		return false
+	}
+	if !slices.Contains(enabledExperiments, experiments.K8sWorkloadIdentitySetup) {
+		return false
+	}
+	gcpID := agent.AppliedConfig.GCPIdentity
+	if gcpID == nil || gcpID.MetadataMode != store.GCPMetadataModeAssign || gcpID.ServiceAccountID == "" {
+		return false
+	}
+	sa, err := d.store.GetGCPServiceAccount(ctx, gcpID.ServiceAccountID)
+	if err != nil || sa == nil || !sa.Managed {
+		return false
+	}
+	if gcpID.ServiceAccountEmail != "" && !strings.EqualFold(sa.Email, gcpID.ServiceAccountEmail) {
+		return false
+	}
+	return true
+}
+
+// dispatchImageTag is the image_tag for agent's broker and profile.
+func (d *HTTPAgentDispatcher) dispatchImageTag(agent *store.Agent) string {
+	return d.ImageTagFor(agentImageRegistryTarget(agent))
 }
 
 // hubAgentDefaults returns the hub's operational agent_defaults, or the zero

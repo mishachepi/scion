@@ -17,6 +17,9 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
 )
 
 // ErrLogsNotSupported is returned by GetLogs when a runtime cannot serve
@@ -27,6 +30,16 @@ import (
 // text never reaches a caller in its place. A runtime that supports logs
 // never returns this.
 var ErrLogsNotSupported = errors.New("agent logs are not available on this runtime")
+
+// ExecCapability is implemented by a runtime whose exec depends on its
+// configuration. ExecAvailable reports, without running anything, whether
+// Exec and ExecWithStdin can reach an agent at all (for Cloud Run: an exec
+// connector is configured). It says nothing about a particular container
+// or its tmux session. A runtime that does not implement it always has
+// exec.
+type ExecCapability interface {
+	ExecAvailable() bool
+}
 
 // RecordlessActor identifies one actor a RecordlessActorProber found running
 // with no in-memory record of which request created it — for example, after
@@ -110,6 +123,32 @@ func HasPerProfileInstances(rt Runtime) bool {
 	return ok && pp.PerProfileInstances()
 }
 
+// CopiedAgentHomeRuntime is an optional capability a Runtime may implement
+// when the container's agent home is a one-way copy the runtime makes during
+// Run (never a mount of the host's agent home), and the harness cannot start
+// until Run has returned successfully. For such a runtime the host's
+// agent-info.json is not shared with the container while it runs (only an
+// explicit user `scion sync from` copies the container home back), so the
+// host may write it after Run returns and still keep the ptone/scion#4766
+// invariant (no host write while the container may read the file).
+// Start then records "starting" before Run and "running" once Run returns,
+// so no reader sees "running" while the runtime is still preparing the
+// container.
+//
+// A runtime that does not implement this interface, or reports false, keeps
+// the default behavior: "running" is recorded before Run and the host does
+// not write agent-info.json after it.
+type CopiedAgentHomeRuntime interface {
+	CopiesAgentHome() bool
+}
+
+// CopiesAgentHome reports whether rt implements CopiedAgentHomeRuntime and
+// reports true.
+func CopiesAgentHome(rt Runtime) bool {
+	c, ok := rt.(CopiedAgentHomeRuntime)
+	return ok && c.CopiesAgentHome()
+}
+
 // AttachCapableRuntime is an optional capability a Runtime may implement to
 // report whether it supports interactive attach — a PTY or exec primitive a
 // caller can dial to reach an actor's running session. Attach has always
@@ -169,6 +208,37 @@ type EmptyPerAgentCapableRuntime interface {
 func HasEmptyPerAgentSupport(rt Runtime) bool {
 	ec, ok := rt.(EmptyPerAgentCapableRuntime)
 	return !ok || ec.SupportsEmptyPerAgentWorkspace()
+}
+
+// EphemeralPersistenceRuntime is an optional capability a Runtime implements
+// when it can run an agent with api.PersistenceEphemeral: a fresh home and
+// workspace at every start (ptone/scion#7780). No runtime implements it
+// yet (Cloud Run will); a runtime without it refuses an ephemeral start
+// (CheckPersistenceSupported).
+type EphemeralPersistenceRuntime interface {
+	SupportsEphemeralPersistence() bool
+}
+
+// HasEphemeralPersistenceSupport reports whether rt implements
+// EphemeralPersistenceRuntime and reports true (missing capability means
+// unsupported).
+func HasEphemeralPersistenceSupport(rt Runtime) bool {
+	ep, ok := rt.(EphemeralPersistenceRuntime)
+	return ok && ep.SupportsEphemeralPersistence()
+}
+
+// CheckPersistenceSupported refuses an ephemeral run on a runtime without
+// HasEphemeralPersistenceSupport. The hub refuses such a create already;
+// this backs it up for a dispatch that bypasses it.
+func CheckPersistenceSupported(rt Runtime, p api.Persistence) error {
+	if p.IsEphemeral() && !HasEphemeralPersistenceSupport(rt) {
+		name := "selected"
+		if rt != nil {
+			name = rt.Name()
+		}
+		return fmt.Errorf("ephemeral persistence is not supported by the %s runtime", name)
+	}
+	return nil
 }
 
 // AgentResourceCleaner is an optional capability a Runtime may implement

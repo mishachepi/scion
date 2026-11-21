@@ -498,6 +498,18 @@ func TestFormatNotificationMessage(t *testing.T) {
 			expected: "helper is WAITING_FOR_INPUT: Need API key",
 		},
 		{
+			name:     "IDLE without message",
+			agent:    &store.Agent{Slug: "lead"},
+			status:   "IDLE",
+			expected: "lead is IDLE",
+		},
+		{
+			name:     "IDLE with message",
+			agent:    &store.Agent{Slug: "lead", Message: "Between assignments"},
+			status:   "idle",
+			expected: "lead is IDLE: Between assignments",
+		},
+		{
 			name:     "LIMITS_EXCEEDED without message",
 			agent:    &store.Agent{Slug: "cruncher"},
 			status:   "LIMITS_EXCEEDED",
@@ -534,10 +546,28 @@ func TestFormatNotificationMessage(t *testing.T) {
 			expected: "bot has STALLED (was thinking)",
 		},
 		{
-			name:     "STALLED with prior activity and message",
-			agent:    &store.Agent{Slug: "bot", StalledFromActivity: "executing", Message: "Stuck on build"},
+			name:     "STALLED does not append the stale pre-stall message",
+			agent:    &store.Agent{Slug: "bot", StalledFromActivity: "working", Message: "Ready"},
 			status:   "STALLED",
-			expected: "bot has STALLED (was executing): Stuck on build",
+			expected: "bot has STALLED (was working)",
+		},
+		{
+			name:     "STALLED appends no-hook-since-start hint",
+			agent:    &store.Agent{Slug: "bot", StalledFromActivity: "working", Message: state.StalledNoHookActivityHint},
+			status:   "STALLED",
+			expected: "bot has STALLED (was working): " + state.StalledNoHookActivityHint,
+		},
+		{
+			name:     "HARNESS_ERROR without message",
+			agent:    &store.Agent{Slug: "bot"},
+			status:   "HARNESS_ERROR",
+			expected: "bot has a HARNESS_ERROR (harness alive; a new message retries)",
+		},
+		{
+			name:     "HARNESS_ERROR from the activity value",
+			agent:    &store.Agent{Slug: "bot", Message: "model API: APIError (status 400)"},
+			status:   "harness_error",
+			expected: "bot has a HARNESS_ERROR (harness alive; a new message retries): model API: APIError (status 400)",
 		},
 		{
 			name:     "Unknown status",
@@ -559,6 +589,81 @@ func TestFormatNotificationMessage(t *testing.T) {
 			assert.Equal(t, tt.expected, result)
 		})
 	}
+}
+
+func TestFormatNotificationMessage_StalledAge(t *testing.T) {
+	agent := &store.Agent{
+		Slug:                "bot",
+		StalledFromActivity: "executing",
+		Message:             "Harness started",
+		LastActivityEvent:   time.Now().Add(-6*time.Minute - 10*time.Second),
+	}
+	assert.Equal(t, "bot has STALLED (was executing): no activity for 6m", formatNotificationMessage(agent, "STALLED"))
+
+	noHookAgent := &store.Agent{
+		Slug:                "bot",
+		StalledFromActivity: "working",
+		Message:             state.StalledNoHookActivityHint,
+		LastActivityEvent:   time.Now().Add(-6*time.Minute - 10*time.Second),
+	}
+	assert.Equal(t, "bot has STALLED (was working): no activity for 6m ("+state.StalledNoHookActivityHint+")", formatNotificationMessage(noHookAgent, "STALLED"))
+}
+
+func TestFormatStallAge(t *testing.T) {
+	for d, want := range map[time.Duration]string{
+		-time.Second:                   "0s",
+		42 * time.Second:               "42s",
+		5*time.Minute + 59*time.Second: "5m",
+		time.Hour:                      "1h",
+		time.Hour + 5*time.Minute + 30*time.Second: "1h5m",
+	} {
+		assert.Equal(t, want, formatStallAge(d), d.String())
+	}
+}
+
+// TestNewNotifySubscription_DefaultTriggersIncludeHarnessError pins the
+// triggers an agent created with notify on gets: HARNESS_ERROR is a
+// separate trigger from ERROR, which stays phase-only, and SUSPENDED is
+// included so creators are notified when a child agent is suspended.
+func TestNewNotifySubscription_DefaultTriggersIncludeHarnessError(t *testing.T) {
+	sub := newNotifySubscription("p1", store.SubscriberTypeAgent, "parent", "test")
+	require.NotNil(t, sub)
+	assert.Equal(t, []string{"COMPLETED", "IDLE", "WAITING_FOR_INPUT", "LIMITS_EXCEEDED", "STALLED", "ERROR", "HARNESS_ERROR", "HALTED", "SUSPENDED"}, sub.TriggerActivities)
+	assert.True(t, sub.MatchesActivity("harness_error"))
+	assert.True(t, sub.MatchesActivity("suspended"))
+}
+
+// TestNotificationDispatcher_CreatorSubscriptionReceivesSuspended verifies that
+// a creator's default auto-subscription receives a SUSPENDED notification when
+// the watched agent enters PhaseSuspended, while retaining all existing triggers.
+func TestNotificationDispatcher_CreatorSubscriptionReceivesSuspended(t *testing.T) {
+	env := setupNotificationTest(t)
+	ctx := context.Background()
+
+	defaultSub := newNotifySubscription(env.project.ID, store.SubscriberTypeAgent, env.subscriber.Slug, "test")
+	require.NotNil(t, defaultSub)
+	require.NoError(t, env.store.UpdateNotificationSubscriptionTriggers(ctx, env.sub.ID, defaultSub.TriggerActivities))
+
+	require.NoError(t, env.store.UpdateAgentStatus(ctx, env.watched.ID, store.AgentStatusUpdate{
+		Phase:    string(state.PhaseSuspended),
+		Activity: string(state.ActivityIdle),
+	}))
+
+	env.nd.Start()
+	defer env.nd.Stop()
+
+	env.publishStatusWithPhase(string(state.PhaseSuspended), string(state.ActivityIdle))
+
+	require.Eventually(t, func() bool {
+		return len(env.dispatcher.getCalls()) == 1
+	}, 2*time.Second, 50*time.Millisecond)
+	assert.Equal(t, env.subscriber.ID, env.dispatcher.getCalls()[0].Agent.ID)
+	assert.Contains(t, env.dispatcher.getCalls()[0].Message, "SUSPENDED")
+
+	notifs, err := env.store.GetNotifications(ctx, store.SubscriberTypeAgent, env.subscriber.Slug, false)
+	require.NoError(t, err)
+	require.Len(t, notifs, 1)
+	assert.Equal(t, "SUSPENDED", notifs[0].Status)
 }
 
 func TestNotificationDispatcher_MultipleSubscribers(t *testing.T) {
@@ -592,8 +697,14 @@ func TestNotificationDispatcher_MultipleSubscribers(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, agentNotifs, 1)
 
-	userNotifs, err := env.store.GetNotifications(context.Background(), store.SubscriberTypeUser, "user-456", false)
-	require.NoError(t, err)
+	// The user subscriber is handled after the agent one, so its
+	// notification may be stored after the dispatch awaited above.
+	var userNotifs []store.Notification
+	require.Eventually(t, func() bool {
+		var err error
+		userNotifs, err = env.store.GetNotifications(context.Background(), store.SubscriberTypeUser, "user-456", false)
+		return err == nil && len(userNotifs) == 1
+	}, 2*time.Second, 50*time.Millisecond)
 	assert.Len(t, userNotifs, 1)
 }
 
@@ -778,6 +889,63 @@ func TestNotificationDispatcher_ErrorPhase(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, notifs, 1)
 	assert.Equal(t, "ERROR", notifs[0].Status)
+}
+
+// TestNotificationDispatcher_HarnessError checks that a harness_error
+// activity notifies HARNESS_ERROR subscribers with the reason, and that an
+// ERROR-only subscription (phase error) does not fire for it.
+func TestNotificationDispatcher_HarnessError(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		triggers []string
+		want     int
+	}{
+		{"default triggers fire", newNotifySubscription("", "", "x", "").TriggerActivities, 1},
+		{"ERROR subscriptions stay phase-only", []string{"COMPLETED", "ERROR"}, 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			env := setupNotificationTest(t)
+			ctx := context.Background()
+			require.NoError(t, env.store.DeleteNotificationSubscription(ctx, env.sub.ID))
+			require.NoError(t, env.store.CreateNotificationSubscription(ctx, &store.NotificationSubscription{
+				ID:                api.NewUUID(),
+				AgentID:           env.watched.ID,
+				SubscriberType:    store.SubscriberTypeAgent,
+				SubscriberID:      env.subscriber.Slug,
+				ProjectID:         env.project.ID,
+				TriggerActivities: tt.triggers,
+				CreatedAt:         time.Now().Add(-time.Minute),
+				CreatedBy:         "test",
+			}))
+			env.watched.Message = "model API: APIError (status 400)"
+			require.NoError(t, env.store.UpdateAgent(ctx, env.watched))
+
+			env.nd.Start()
+			defer env.nd.Stop()
+			env.publishStatus(string(state.ActivityHarnessError))
+
+			if tt.want == 0 {
+				// Publish a matching event after it, so the dispatcher has
+				// demonstrably processed the harness_error event first.
+				env.publishStatus("completed")
+				require.Eventually(t, func() bool {
+					return len(env.dispatcher.getCalls()) == 1
+				}, 2*time.Second, 50*time.Millisecond)
+				assert.Contains(t, env.dispatcher.getCalls()[0].Message, "COMPLETED")
+				return
+			}
+			require.Eventually(t, func() bool {
+				return len(env.dispatcher.getCalls()) == 1
+			}, 2*time.Second, 50*time.Millisecond)
+			assert.Equal(t,
+				"watched-agent has a HARNESS_ERROR (harness alive; a new message retries): model API: APIError (status 400)",
+				env.dispatcher.getCalls()[0].Message)
+			notifs, err := env.store.GetNotifications(ctx, store.SubscriberTypeAgent, env.subscriber.Slug, false)
+			require.NoError(t, err)
+			require.Len(t, notifs, 1)
+			assert.Equal(t, "HARNESS_ERROR", notifs[0].Status)
+		})
+	}
 }
 
 func TestNotificationDispatcher_BrokerUsedForUserNotification(t *testing.T) {

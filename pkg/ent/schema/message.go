@@ -50,8 +50,9 @@ func (Message) Fields() []ent.Field {
 			NotEmpty(),
 		field.String("recipient_id").
 			Optional(),
-		field.String("msg").
-			NotEmpty(),
+		// msg may be empty: an attachment-only chat message has no text.
+		// Send handlers enforce their own body rules.
+		field.String("msg"),
 		field.String("type").
 			Default("instruction"),
 		field.Bool("urgent").
@@ -65,8 +66,9 @@ func (Message) Fields() []ent.Field {
 		field.String("group_id").
 			Optional(),
 		// dispatch_state tracks cross-node delivery:
-		// pending|dispatched|failed|deferred|no_recipient (see the
-		// store.MessageDispatch* constants).
+		// pending|dispatched|failed|deferred|no_recipient, plus
+		// delivering|delivered|partial|awaiting_session for a delivery over
+		// conduit (see the store.MessageDispatch* constants).
 		// After Phase 4 (no-queuing delivery), every writer sets the state
 		// explicitly. Only ExecuteAgentDM writes "pending", for the length of its
 		// dispatch; a row stays pending only after a deadline-ambiguous dispatch,
@@ -79,6 +81,42 @@ func (Message) Fields() []ent.Field {
 			Optional().
 			Nillable(),
 		field.Time("dispatched_at").
+			Optional().
+			Nillable(),
+		// delivery_id, delivering_at and delivery_outcome bind the row to
+		// one deliver-message flush over the agent's conduit session
+		// (dispatch_state delivering, delivered or partial; design
+		// .design/conduit/v2.22-deliver-message.md §2.6). delivery_outcome
+		// is the stored answer JSON ({"outcome","stage"}), never text.
+		field.String("delivery_id").
+			Optional().
+			Nillable().
+			MaxLen(64),
+		field.Time("delivering_at").
+			Optional().
+			Nillable(),
+		field.String("delivery_outcome").
+			Optional().
+			Nillable().
+			MaxLen(256),
+		// hold_until, hold_launch_id, not_reached and not_reached_at track
+		// hold-until-session re-drive for deliver-message (ptone/scion#7881,
+		// .design/conduit/v2.22-deliver-message.md §2.5/§2.6). hold_until is
+		// set once via COALESCE and never extended; hold_launch_id pins the
+		// target agent's run_id at send time; not_reached/not_reached_at
+		// record the hub's own proof that /deliver saw router.ErrNoSession.
+		field.Time("hold_until").
+			Optional().
+			Nillable(),
+		field.String("hold_launch_id").
+			Optional().
+			Nillable().
+			MaxLen(128),
+		field.String("not_reached").
+			Optional().
+			Nillable().
+			MaxLen(32),
+		field.Time("not_reached_at").
 			Optional().
 			Nillable(),
 		// channel identifies the integration that originated or targets
@@ -109,6 +147,31 @@ func (Message) Fields() []ent.Field {
 			Optional().
 			Nillable().
 			Immutable(),
+		// authorizing_user_id / delegation_grant_id attribute a message
+		// sent with an agent delegated credential
+		// (.design/agent-delegation.md §14.5): the grant issuer and the
+		// grant. The sender columns name the actor agent. Nullable: every
+		// other message has neither. Stamped at admission and never
+		// updated afterwards.
+		field.String("authorizing_user_id").
+			Optional().
+			Nillable().
+			Immutable(),
+		field.String("delegation_grant_id").
+			Optional().
+			Nillable().
+			Immutable(),
+		// scheduled_event_id records the server-derived ScheduledEvent ID for
+		// a message persisted by the scheduler's messageEventHandler
+		// (ptone/scion#7881). Nullable: every client, agent, chat, choice or
+		// broker-inbound message leaves it NULL. Immutable and omitted from
+		// JSON so client-supplied fields (channel, thread_id) can never select
+		// scheduled-authority re-validation.
+		field.String("scheduled_event_id").
+			Optional().
+			Nillable().
+			Immutable().
+			MaxLen(64),
 		field.Time("created").
 			Default(time.Now).
 			Immutable(),
@@ -131,6 +194,74 @@ func (Message) Indexes() []ent.Index {
 		// (created, id) keyset cursor. Without this index every page reads
 		// and sorts all of the project's messages.
 		index.Fields("project_id", "created", "id"),
+		// Participant reads (the agent DM inter-agent view, a user's message
+		// listing) filter on recipient_id = X OR sender_id = X across all
+		// projects. ListMessages reads each branch as its own query, and the
+		// trailing created, id serves its ORDER BY ... LIMIT in index order,
+		// so a page reads at most limit+1 rows per branch however busy the
+		// participant is. The COUNT of the OR uses both indexes (a
+		// multi-index OR on SQLite) instead of scanning the whole table.
+		index.Fields("sender_id", "created", "id"),
+		index.Fields("recipient_id", "created", "id"),
+		// The inter-agent view's legacy lookup filters on project_id and
+		// the sender text ("agent:<slug>") and orders by created, id.
+		index.Fields("project_id", "sender", "created", "id"),
+		// The stuck-pending sweep filters on dispatch_state = 'pending' AND
+		// created < cutoff and orders by created, id. Pending rows are a
+		// tiny fraction of the table, so a partial index keeps the sweep
+		// proportional to the pending rows instead of every row older than
+		// the cutoff. The WHERE must match the query's literal for the
+		// planner to pick the index (store.MessageDispatchPending).
+		index.Fields("created", "id").
+			Annotations(entsql.IndexWhere("dispatch_state = 'pending'")),
+		// The failed-message retention purge walks dispatch_state = 'failed'
+		// AND created < cutoff in (created, id) keyset chunks. A separate
+		// partial index rather than widening the pending one: SQLite only
+		// uses a partial index whose WHERE terms appear in the query, so an
+		// IN ('pending', 'failed') index would not serve the pending sweep,
+		// and failed rows (kept for the retention window) would bloat the
+		// pending sweep's range. The WHERE must match the purge's literal
+		// (store.MessageDispatchFailed). The explicit name avoids colliding
+		// with the pending index's default name (ptone/scion#6954).
+		index.Fields("created", "id").
+			StorageKey("message_failed_created_id").
+			Annotations(entsql.IndexWhere("dispatch_state = 'failed'")),
+		// The stale-delivery sweep finds rows left in delivering (a hub
+		// restart mid-delivery) by delivering_at. Such rows are rare and
+		// short-lived, so a partial index keeps the sweep tiny.
+		index.Fields("delivering_at").
+			StorageKey("message_delivering_at").
+			Annotations(entsql.IndexWhere("dispatch_state = 'delivering'")),
+		// Hold-until-session re-drive (ptone/scion#7881): claims and expiry
+		// sweeps filter on dispatch_state = 'awaiting_session' and order by
+		// created, id (or recipient_id, created, id). Held rows are transient,
+		// so partial indexes keep claims and the 30 s sweep proportional to
+		// held rows rather than the full table.
+		index.Fields("created", "id").
+			StorageKey("message_awaiting_session_created_id").
+			Annotations(entsql.IndexWhere("dispatch_state = 'awaiting_session'")),
+		index.Fields("recipient_id", "created", "id").
+			StorageKey("message_awaiting_session_recipient_created_id").
+			Annotations(entsql.IndexWhere("dispatch_state = 'awaiting_session'")),
+		// The conversation consistency check reads the latest messages of a
+		// DM pair, one query per direction, filtering on sender_id and
+		// recipient_id and ordering by created, id. The single-column
+		// participant indexes above match only one side of the pair, so
+		// every row of that participant was read and sorted; with both
+		// columns the lookup reads at most limit+1 rows in index order.
+		// The index is partial on recipient_id IS NOT NULL so that only
+		// queries with a recipient_id term can use it: a sender_id-only
+		// read (the participant view's sender branch) cannot, and keeps
+		// (sender_id, created, id), which serves its ORDER BY with no sort.
+		// recipient_id = ? implies the WHERE, so the pair lookup still
+		// uses it.
+		index.Fields("sender_id", "recipient_id", "created", "id").
+			Annotations(entsql.IndexWhere("recipient_id IS NOT NULL")),
+		// The same check's thread lookup filters on thread_id alone. The
+		// (thread_id, channel, created, id) index has channel between the
+		// filter and the order, so it cannot serve that ORDER BY without
+		// sorting the whole thread.
+		index.Fields("thread_id", "created", "id"),
 	}
 }
 

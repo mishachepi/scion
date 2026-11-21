@@ -11,10 +11,11 @@ inject_when: git_workspace
 
 You are operating in a restricted, non-interactive sandbox environment. Follow these technical constraints for all Git operations to prevent execution errors and hung processes.
 
-## 1. Local-Only Operations (No Network Access)
+## 1. Local-Only Worktree Operations (When `SCION_GIT_DEPTH` Is Unset)
 
-- **Restriction:** The environment is air-gapped from `origin`. Commands like `git fetch`, `git pull`, or `git push` will fail.
-- **Directive:** Always assume the local `main` branch is the source of truth.
+- **Scope:** Applies to host-mounted worktree/shared sandboxes (`SCION_GIT_DEPTH` unset). If `SCION_GIT_DEPTH` is set, your workspace is an in-container per-agent clone — follow the project's remote policy and the `git-operations` skill (`## Shallow Clones`) for `git fetch --deepen` / `--unshallow` and remote pushes.
+- **Restriction:** Host-mounted worktree sandboxes have no remote credentials and may be air-gapped from `origin`; `git fetch`, `git pull`, or `git push` will fail unless the project grants remote access.
+- **Directive:** In local worktree sandboxes, assume the local `main` branch is the source of truth.
 - **Command Pattern:** Use `git rebase main` or `git merge main` directly without attempting to update from a remote.
 
 ## 2. Worktree-Aware Branch Management
@@ -34,7 +35,8 @@ You are operating in a restricted, non-interactive sandbox environment. Follow t
   - **Continue Rebase:** `GIT_EDITOR=true git rebase --continue`
   - **Standard Merge:** `git merge main --no-edit`
   - **Manual Commit:** `git commit -m "Your message" --no-edit`
-  - **Global Override:** If possible at the start of the session, run: `git config core.editor true`
+  - **Any Other Command:** Set the editor via environment variable per command: `GIT_EDITOR=true git <subcommand>`. Do **not** rely on `git -c core.editor=true <subcommand>` — agent harnesses often export `GIT_EDITOR=false` in command subshells, and Git evaluates `GIT_EDITOR` ahead of `-c core.editor`.
+  - **Never** run `git config core.editor ...` or otherwise write `core.editor`, `core.hooksPath` or any other key outside the repository git config allow-list (`pkg/util/git_config_policy.go`) into the repository config: brokers refuse to start or resume an agent whose checkout sets one. Pass non-editor config flags per command (`git -c <key>=<val> <subcommand>`), and override the editor with `GIT_EDITOR=true`.
 
 ## 4. Conflict Resolution Loop
 

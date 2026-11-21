@@ -100,8 +100,8 @@ Goals:
   (`:197`) stores the credential row. No token is returned unless the row is stored.
 - **Validation at the edge.** The agent arm of `UnifiedAuthMiddleware` (`pkg/hub/auth.go:270-377`)
   looks up the credential by JTI hash (`evaluateAgentCredentialStatus`, `agenttoken.go:216`). A
-  revoked row → 401. A store error → 503. A token with **no** row still authenticates as a legacy
-  token. Step 1b refuses a held agent, and step 1c applies the run-scope check.
+  revoked row, a missing row, or a token without a `jti` → 401 `invalid_token`. A store error →
+  503. Step 1b refuses a held agent, and step 1c applies the run-scope check.
 - **Refresh.** `handleAgentTokenRefresh` (`pkg/hub/handlers_agents_core.go:5188`) re-mints through
   `AuthorizeAgentToken` and then revokes the presented credential **best-effort**
   (`:5320-5325`).
@@ -347,7 +347,7 @@ the claim transaction.
 | --- | --- | --- | --- |
 | `agent.delegation.revoke` | `DELETE /api/v1/agents/{agentId}/delegations/{grantId}` | session; the bound agent's own agent JWT | the issuer; the bound agent (relinquish its own grant); the agent's current owner; hub admins (any grant); project admins of P, for project(P)-bounded grants only |
 | `agent.delegation.credential.revoke` | `DELETE /api/v1/agents/{agentId}/delegations/{grantId}/credentials/{credentialId}` | as above | as above |
-| `agent.delegation.revoke_all` | `POST /api/v1/users/me/delegations/revoke-all` (the caller's own grants); `POST /api/v1/agents/{agentId}/delegations/revoke-all` | session | the issuer, for their own grants; per agent, the same rule per grant. Grants the caller may not revoke are skipped and reported, not revoked |
+| `agent.delegation.revokeall` (permission `agent.delegation.revoke_all`; operation IDs take no underscore) | `POST /api/v1/users/me/delegations/revoke-all` (the caller's own grants); `POST /api/v1/agents/{agentId}/delegations/revoke-all` | session | the issuer, for their own grants; per agent, the same rule per grant. Grants the caller may not revoke are skipped and reported, not revoked |
 | `agent.delegation.list` | `GET /api/v1/agents/{agentId}/delegations`; `GET /api/v1/users/me/delegations` | session; the bound agent's own agent JWT (its own grants, metadata only) | as revoke, per grant. Grants outside the caller's authority are left out, not counted |
 | `agent.delegation.read` | `GET /api/v1/agents/{agentId}/delegations/{grantId}` | as list | as list, per grant. A grant outside the caller's authority returns 404 `grant_not_found` |
 
@@ -360,10 +360,11 @@ the claim transaction.
 - **Bound-agent JWT paths.** When the bound agent acts with its agent JWT, the handler itself
   applies exchange steps 1-3 (§8): the credential kind is a local agent JWT, the agent credential
   row is re-loaded by JTI hash and must exist, be unrevoked and be unexpired, and the path
-  `agentId` equals the subject. As at exchange, the middleware refuses a revoked row with 401
-  `unauthorized` and a status lookup fault with 503 `unavailable`; in the handler, a missing row, an
-  expired row or a lookup error denies with 401 `agent_credential_invalid`. G does not rely on the
-  middleware alone, because the middleware still admits a JWT with no credential row (§3.1).
+  `agentId` equals the subject. As at exchange, the middleware refuses a revoked or missing row (or
+  a token without a `jti`) with 401 `invalid_token` and a status lookup fault with 503
+  `unavailable`; in the handler, an expired row, an agent mismatch, or a lookup error denies with
+  401 `agent_credential_invalid`. G re-checks the row in the handler for defense in depth and to
+  enforce row expiry and agent matching.
 - **Effects.** Grant revoke marks the grant and all its credentials revoked, and writes the mutation
   audit (`agent_delegation_grant_revoke`) whose ID is stored as `revocation_audit_id`, all in one
   `WithTx`. Revoking an already revoked grant returns 204 with no new audit row. Credential revoke
@@ -411,14 +412,14 @@ codes. The precise reason goes only to the decision record.
 
 1. The credential kind is `agent_jwt` and the principal is a local agent (`AncestryIsHubAttested`).
    Otherwise 403 `credential_not_admitted`.
-2. **Re-load the agent credential row** by JTI hash. Two outcomes are decided earlier, by the
-   agent-token middleware (`auth.go:270-377`), before the handler runs: a **revoked** row is refused
-   with 401 `unauthorized`, and a credential-status lookup fault with 503 `unavailable`. In the
-   handler, a row that is not found (a legacy token with no row), an expired row, or a handler-level
-   lookup error → 401 `agent_credential_invalid`. sciontool treats **both** 401 responses
-   (`unauthorized` and `agent_credential_invalid`) as "re-authenticate": the current JWT is not
-   retried; it backs off (exponential, capped) and retries only after its next agent JWT refresh.
-   A 503 is retried with backoff using the same JWT.
+2. **Re-load the agent credential row** by JTI hash. Several outcomes are decided earlier, by the
+   agent-token middleware (`auth.go:270-377`), before the handler runs: a **revoked** row, a
+   missing credential row, or a token without a `jti` is refused with 401 `invalid_token`, and a
+   credential-status lookup fault with 503 `unavailable`. In the handler, an expired row, an agent
+   mismatch, or a handler-level lookup error → 401 `agent_credential_invalid`. sciontool treats
+   **both** 401 responses (`invalid_token` and `agent_credential_invalid`) as "re-authenticate":
+   the current JWT is not retried; it backs off (exponential, capped) and retries only after its
+   next agent JWT refresh. A 503 is retried with backoff using the same JWT.
 3. The path `agentId` equals the JWT subject. Otherwise 403 `credential_not_admitted`.
 4. **Load the grant filtered by `agent_id = subject`.** A grant that does not exist, or is bound to
    another agent, returns the same 404 `grant_not_found`. The decision record says which applied.
@@ -489,8 +490,8 @@ external code, goes to the decision record (§14.2).
 | 400 | `validation_error` | malformed body; malformed boundary (`details.field = boundary`, `details.reason` = `boundary_invalid` or `boundary_required`); empty ceiling; unknown selector at exchange; expiry in the past or beyond 30 days; TTL above 60 minutes; invalid name, purpose or labels (the value is never echoed) |
 | 400 | `subdelegation_not_supported` | issuance sets `allowSubdelegation` or `parentGrantId` |
 | 400 | `invalid_audience` | exchange audience is not this hub's |
-| 401 | `unauthorized` | exchange or bound-agent management: the agent credential row is revoked (refused by the agent-token middleware before the handler) |
-| 401 | `agent_credential_invalid` | exchange or bound-agent management: no agent credential row (legacy token), an expired row, or a handler-level lookup error |
+| 401 | `invalid_token` | exchange or bound-agent management: the agent credential row is revoked or missing, or the token has no `jti` (refused by the agent-token middleware before the handler) |
+| 401 | `agent_credential_invalid` | exchange or bound-agent management: an expired agent credential row, an agent mismatch, or a handler-level lookup error |
 | 503 | `unavailable` | exchange or bound-agent management: the middleware's credential-status lookup failed (retry with the same JWT) |
 | 403 | `credential_not_admitted` | a dev session at issuance; anything but a local agent JWT at exchange (including a session super-admin); path agent differs from the JWT subject; a delegated credential on a management route |
 | 403 | `forbidden` with `details.reason = CREDENTIAL_MANAGEMENT`, `details.credential = session_required` | a UAT on a session-only G route (`requireSessionCredentialFor`, `session_only_gate.go:93`) |
@@ -753,33 +754,76 @@ cross-request cache needs its own staleness bound and review.
 
 ### 11.8 Delegated lists (G.3-L)
 
-The list slice (`agent.list` and listing of skills and templates) lands last, in G.3-L, from D.2's
-merged list shape. Until then, no list operation is in the admission table and no list permission
-is in the policy, so delegated list requests are refused at the route gate. The rules G.3-L keeps:
+The list slice landed in two steps. The first admitted `agent.list` on the hub agent list,
+`GET /api/v1/agents` (`listAgentsDelegated`, `agent_delegation_list.go`). The second admitted the
+project agent list, the skill list and the template list (`agent_delegation_list_routes.go`). A
+list route that is not in the admission table refuses a delegated request at the route gate.
 
-- **Scope.** A delegated caller's list scope comes only from G's list arm: the issuer's own list
-  scopes for the operation's primary permission, intersected with the grant boundary, returned as a
-  tagged scope (none, an explicit project set, or all projects for a hub boundary). The agent's own
-  principals contribute nothing. `ResolveListScopes` returns an error, never a scope, for a delegated
-  identity, so `applyCredentialCaveats` (`authz_list.go:154`), whose default arm leaves scopes
-  unreduced, is never reached for it.
-- **Item filter.** Each delegable list operation declares exactly one per-item filter permission
-  (`agent.list → agent.read` and the matching skill and template reads). Every item is decided
-  through the same delegated procedure, including per-item `ProjectTargetAdmission` on the item's
-  own project. The UAT list-row widening (`listRowReadCeiling`, `authz.go:267`) does not apply to a
-  delegated ceiling: a grant without the filter permission returns no items.
-- **Paging.** Totals count only returned items, and denied item IDs never appear in a response or a
-  cursor. Delegated cursors are sealed (`listCursorSealer`, `authorized_list.go:531`). On the
-  endpoints that do not yet seal for other callers (the hub agent list, the project agent list and
-  the skill list, `authorized_list.go:469-479`), the delegated branch opens the cursor once and
-  seals once, following `listGroups` (`handlers_groups.go:102-190`). An invalid cursor answers 400
-  `invalid_cursor`, which clients treat as "restart from the first page". Cursors are bound by a
-  delegated arm in `scopedCursorBinding` (`authorized_list.go:404`) that includes agent, grant,
-  credential and boundary.
-- **Audit.** One primary decision record and one aggregated item-filter record per list request.
-- G.3-L confirms these against D.2's merged shape before coding. The planned store additions (a
-  template project-ID filter, an all-projects skill scope, and `SkipTotalCount` in the skill store)
-  are not on `main` yet.
+- **Scope.** A delegated caller's list scope comes only from the delegated list arm
+  (`delegatedListScope`). It runs the route, chain and permission checks of §11.2 for the
+  operation's primary permission, then resolves the issuer's own list scope for it through
+  `resolveListScopesForPrincipal` (`authz_list.go`). That function is `ResolveListScopes` for a
+  principal held as an argument; the issuer is never placed in the identity slot. The result is
+  intersected with the grant boundary and returned as a tagged scope: none, an explicit project
+  set, or all projects (a hub boundary and an unrestricted issuer), less the projects an access
+  constraint excludes. The agent's own principals contribute nothing. `ResolveListScopes` returns
+  `errDelegatedListScope`, never a scope, for a delegated identity. Any refusal by the arm answers 200
+  with an empty list plus the arm's deny record ("any error denies"), never a 403 that names the failed
+  check. A store error during the arm's checks is recorded as a `lookup_error` deny; an internal error in
+  the list arm itself is also logged at warn level, with no item IDs.
+- **Item filter.** Each admitted list route names exactly one per-item permission in its admission
+  entry (`agentDelegationAdmission.ItemFilter`; `agent.list → agent.read`, `skill.list →
+  skill.read`, `template.list → template.read`). Only the item filter
+  (`delegatedListItemRead`) accepts that permission; a request that asks `Decide` for it on the
+  list route is refused like any permission the route does not admit. Every item is decided by the
+  same procedure as a single request: the route, chain and permission checks once per request, then
+  per item the item's project must be inside the list scope and `EvaluateBearerCeiling` (which
+  includes `ProjectTargetAdmission` on the item's own project) must allow the item permission. An
+  item without a project parent is never listed. The UAT list-row widening does not apply: a grant
+  without the item permission lists nothing. A listed item carries only the item filter's action
+  as its capability, its environment is redacted, and the list has no scope capabilities.
+- **Paging.** Delegated lists page through `listAuthorizedOrAll` with `authorizeEach` always set
+  (`listDelegated`), so they never take the direct store path. That helper opens the request cursor
+  and seals the returned cursor once (`listCursorSealer`), so a delegated cursor is opaque even on
+  endpoints whose other callers still receive plaintext store cursors. Totals count only returned
+  items, and denied item IDs never appear in a response or a cursor. A page can be empty and still
+  carry a cursor, and the total can be approximate past the candidate cap. An invalid cursor
+  answers 400 `invalid_cursor`, which clients treat as "restart from the first page". Cursors are
+  bound by the delegated arm of `scopedCursorBinding` (agent, grant, credential and boundary), so a
+  cursor never carries over to another credential. The hub agent list serves the default order
+  only: `sort=` or `ids=` answers 400 `delegated_list_sort_unsupported`. `scope=mine`,
+  `scope=shared` and `mine=true` list nothing, because the caller is not a user.
+- **Audit.** One primary decision record (the list arm) and one aggregated item-filter record per
+  list request (§14.2). routeGuard installs the request's collector on admitted list routes and
+  flushes it when the request ends, including on a panic or a cancelled request.
+- **Second step (landed).** The project agent list, the skill list and the template list have
+  delegated branches on the same helpers:
+  - **Project agent list** (`GET /api/v1/projects/{id}/agents`, exact resolution
+    `projects.agents.collection`). The arm's scope is narrowed to that one project, so it is
+    Explicit {P} or None; a project outside the issuer's scope or the grant boundary lists nothing.
+    The binding key is the landed `project-agents:<projectID>` (through `sortSuffix`). The route
+    target is the project segment as the path names it, so a slug path, whose segment differs from
+    the loaded project's ID, is refused with 403 `credential_not_admitted`. An unknown project answers
+    the existing 404 from `handleProjectAgents`, which runs before the list arm for every caller, so
+    no decision record is written for it: unlike the empty 200 for a project outside the scope, the
+    404 tells the caller the project does not exist, as it does any other caller.
+    When the issuer's scope holds the project but the grant boundary removes it, the arm's deny code
+    is `outside_boundary`; otherwise `issuer_authority`.
+  - **Skill list** (`skills.list.collection`). No `project.list` scope is resolved for the caller.
+    The query lists project-scoped skills only: the scope's projects in Explicit mode, or every
+    project (`SkillAccessScope.AllProjects`) in AllProjects mode, with project admission per item.
+    Excluded projects are enforced per item, not pushed into the query. `scope=global`, `core` or
+    `user`, and a `scopeId` outside the scope, list nothing. The binding key is `skills`, and the
+    response gains `totalCountApproximate`.
+  - **Template list** (`templates.list.collection`). Project-scoped templates only, through
+    `TemplateFilter.ProjectIDs` (the scope's projects in Explicit mode, intersected with a caller
+    `projectId` or `scopeId`; a non-nil empty set matches nothing). An item's project is its
+    `ScopeID`, so a legacy row matched through its deprecated project ID is dropped when its scope ID
+    is outside the scope. `scope=global` and `scope=user` answer an empty 200, never a 401. The
+    binding key is `templates`; the request cursor is validated after it is opened.
+  - **Hub catalog.** Global and core skills and templates, and user-scoped ones, have no project
+    parent, so they are never listed. `catalogListReadBatch` denies every row for a delegated
+    identity.
 
 ### 11.9 What a delegated decision bounds, and what it does not
 
@@ -802,6 +846,10 @@ is in the policy, so delegated list requests are refused at the route gate. The 
     ([ptone/scion#1811](https://github.com/ptone/scion/issues/1811)). ptone included attach in v1
     on 2026-09-28 with this documentation obligation; the operator docs, the CLI help and the future
     web grant form repeat it.
+  - A delegated attach is not supported through the sciontool delegation socket: the socket
+    forwards plain HTTP requests only and copies no `Connection`, `Upgrade` or `Sec-WebSocket-*`
+    header, so the Hub answers the request as an attach preflight and no session opens. The scion
+    CLI does not use delegated credentials (§18.8). Tracked in ptone/scion#7473.
 - **No read-only allowance on errors.** Unlike the project delegation ceiling's read allowance
   (`ceilingReadAllowance`, `authz_delegation_ceiling.go:105`), a delegated credential denies on any
   lookup error, including for reads.
@@ -888,8 +936,9 @@ each, with a test:
   - no key is the base permission of a catalog operation whose effects include grant authority,
     change authority, change ownership, mint credential, issue credential, assign credential or
     create resource;
-  - every key has at least one catalog operation that admits the delegated credential, and every
-    such operation's permission is a key.
+  - every key has at least one catalog operation that admits the delegated credential, either as
+    its base permission or as the item filter of an admitted list route, and every such
+    operation's permission is a key.
   The effect guard covers every catalog operation, apart from the operations listed in
   `permissions.AgentDelegationSharedKeyExemptions`: operations that share a delegable key but are never
   admitted for the delegated credential (today `project.broadcast`, which shares `project.read`), as
@@ -904,10 +953,16 @@ each, with a test:
   | `project.read` | project, hub | `GET` project (operation `project.read`) | G.3-a |
   | `agent.message` | project, hub | the HTTP agent message route, operation `agent.action.message`, by ID (`agents.action.message`) and in the project form (`projects.agents.action.message`). `agent.message.send` (broker call) is not admitted | G.3-a |
   | `agent.attach` | project, hub | the PTY WebSocket (`agents.pty`, operation `agent.attach`) only. `agent.lifecycle.exec`, `.env` and `.resetauth` share the permission but are **not** admitted | G.3-a |
-  | `agent.list`; skill and template read and list | project, hub | per D.2's merged list operations (at `abc63c5`, skill and template listing is served by the `skill.read` and `template.read` operations) | G.3-L |
+  | `agent.list` | project, hub | the hub agent list `GET /api/v1/agents` (`agents.list`, exact resolution `agents.list.collection`) and the project agent list `GET /api/v1/projects/{id}/agents` (`projects.byId`, exact resolution `projects.agents.collection`), operation `agent.list`, with item filter `agent.read` (§11.8) | G.3-L |
+  | `skill.list` | project, hub | the skill list `GET /api/v1/skills` (`skills.list`, exact resolution `skills.list.collection`, operation `skill.list`), with item filter `skill.read` | G.3-L, step 2 |
+  | `template.list` | project, hub | the template list `GET /api/v1/templates` (`templates.list`, exact resolution `templates.list.collection`, operation `template.list`), with item filter `template.read` | G.3-L, step 2 |
+  | `skill.read`, `template.read` | project, hub | none of their own: item-filter-only keys of the skill and template lists. A single read, a download or a resolve is refused at the route gate | G.3-L, step 2 |
 
   A key enters `AgentDelegableRegistry` in the same change that admits its first route, so the
-  guard tests always hold.
+  guard tests always hold. A key is admitted by an admitted operation whose base permission it is,
+  or by an admitted list route whose item filter it is (an item-filter-only key). The effect guard
+  covers item-filter-only keys like any other key: every catalog operation whose base permission is
+  `skill.read` or `template.read` has a read effect only.
 - **Hub-level targets.** A.1 now resolves hub-level targets (hub resources, global and core skills
   and templates) to the hub target scope through explicit evidence (`authz_hub_target.go`). A
   delegated request on a hub-level target is evaluated like any other: only on an admitted route,
@@ -960,15 +1015,17 @@ renders `verified=true`, because the binding was checked at exchange, not per re
 - Every delegated deny sets `Decision.DeniedBy = "agent_delegation"` (a new `DeniedBy` constant next
   to `DeniedByDelegationCeiling`, `authz.go:418`). The fine-grained G code goes in the G block on
   `Decision` as `AgentDelegationCode` and in `Reason`, which the existing record builder already
-  maps; until the follow-up, a retained decision record carries `denied_by` and the reason, not the
-  G block.
+  maps. The decision log does not include decisions for a delegated credential (§14.4).
+  Tracked in ptone/scion#2132.
 - A deny from G's own issuance (§6) or exchange (§8) checks writes one decision record with the same
   `denied_by` and the code in `Reason`, built with `BuildDecisionAuditRecord`. An ordinary pipeline deny of those
   operations, before G's checks run, keeps the pipeline's own `denied_by`.
-- The list-scope arm and the item filter (G.3-L) emit through `BuildDecisionAuditRecord` with the
-  same flag. The item filter writes one aggregated record per list request, as a distinct record
-  kind, built from a decision with `DeniedBy` unset and carrying allowed, denied and
-  dropped-by-admission counts and up to 50 denied item IDs.
+- The list-scope arm and the item filter (§11.8) emit through `BuildDecisionAuditRecord` with the
+  same flag. The arm writes one allow or deny record for the list permission. The item filter writes
+  one aggregated record per list request, with `RecordKind = agent_delegation_list_filter`, built from
+  an allow decision with `DeniedBy` unset. Its `ListFilter` block carries allowed, denied and
+  dropped-by-admission counts of distinct items, up to 50 denied item IDs with a `Truncated` flag,
+  and `Incomplete` when the request ended before its list finished.
 
 ### 14.3 Mutation records
 
@@ -980,8 +1037,9 @@ Mutation audit is persisted and transactional. It is G's durable attribution:
   it revoked with the grant. Each credential an exchange supersedes gets its own
   `agent_delegation_credential_revoke` row (reason `superseded`), written in the exchange's
   transaction together with the new credential and its `agent_delegation_credential_issue` row;
-- every mutation made with a delegated credential, through the normal mutation-audit path, with the
-  G block filled in.
+- no other write. The one write a delegated credential can make, a message send, writes no
+  mutation record (no caller's message send does). It is attributed on the immutable message row:
+  the sender is the actor agent, and the row carries the authorizing user and the grant.
 
 Each row names the agent, the issuing user and the grant. Because credentials live at most 60
 minutes and each issuance is recorded, every delegated request falls inside a recorded,
@@ -993,9 +1051,15 @@ Per-decision records for delegated requests, including delegated reads, follow t
 decision-audit sink exactly as for every other caller: its experiment flag
 (`hub.authorization_decision_audit_v2`) and its domain and validation exclusions. `AlwaysAudit`
 only exempts a decision from allow sampling; it does not bring a decision into the sink's recorded
-domain. Many delegated decisions, for example `agent.read` on an agent inside a project, therefore
-produce no decision record even when the sink is on. G does not add its own per-request database
-writes.
+domain. The decision log does not include decisions for a delegated credential, allow or deny.
+Tracked in ptone/scion#2132. A deny from issuance or exchange is a decision for the issuing user or
+for the agent's own credential, and is recorded like any other decision of those principals. G does
+not add its own per-request database writes.
+
+The aggregated list-filter record (§14.2) is in-memory only and is not persisted or logged. The
+decision-log adapter excludes every record with a `RecordKind` under its own disposition,
+`excluded_record_kind`, so the in-process counts still show it. It is carried once the typed-schema
+follow-up below adds a form for it.
 
 G does not rely on decision records for attribution. The mutation records (§14.3), which are
 written unconditionally, are the attribution source. Adding G actor fields to the typed
@@ -1008,7 +1072,9 @@ does not change that schema.
 
 A message sent with a delegated credential is stored with `Sender = "agent:<A>"` (A's slug),
 `SenderID = A` and `SenderProjectID` = A's project, like every other agent-sender row (from G.3-a),
-plus two new nullable columns (G.3-b), `AuthorizingUserID` and `DelegationGrantID`. Recipients, the web UI
+plus two new nullable columns (G.3-b), `AuthorizingUserID` and `DelegationGrantID` (stored as
+`authorizing_user_id` and `delegation_grant_id`, returned as `authorizingUserId` and
+`delegationGrantId`, empty on every other message). Recipients, the web UI
 and the CLI render it as "from agent A, authorized by <issuer> via delegation <grantId>". A
 recipient never sees it as sent by the issuer.
 
@@ -1037,8 +1103,9 @@ sciontool delegation helper can use it.
 ### 16.1 Transactional revocation through B.3 hooks
 
 G registers one `AgentTxHook` in each of the four registries (§3.4). Each hook revokes the agent's
-active grants and their credentials, with `revoke_reason` and a mutation audit, on the
-transaction-scoped store. A hook error rolls back the lifecycle operation.
+unrevoked grants (expired ones included) and their unrevoked credentials, with `revoke_reason` and a
+mutation audit, on the transaction-scoped store. A hook error rolls back the lifecycle operation.
+The revoke route (§7) and every lifecycle revocation share one per-grant revocation body.
 
 | Registry | Revoke reason | Why it must be transactional |
 | --- | --- | --- |
@@ -1066,7 +1133,11 @@ transaction-scoped store. A hook error rolls back the lifecycle operation.
 These cascades are best-effort, because use-time checks are authoritative:
 
 - **Agent suspend** (`suspendAgent`, auto-suspend): use denies on the suspended phase. G.3 revokes
-  grants best-effort.
+  grants best-effort. The revocation locks and re-reads the agent row. If the row holds a newer,
+  non-empty run that is not deleted, suspended or stopped (a resume that started after the
+  suspension was recorded), the grants keyed to that run (`issued_run_id`) are kept. Every other
+  grant of the agent is revoked, unkeyed ones included
+  ([ptone/scion#6403](https://github.com/ptone/scion/issues/6403)).
 - **Agent holds** (membership loss): `agentStanding` refuses a held agent at exchange and use. If an
   admin lifts the hold, unrevoked grants work again, as after an issuer is unsuspended.
 - **Issuer suspend or delete** (`updateUser`, `deleteUser`): use and exchange deny on the issuer
@@ -1076,7 +1147,14 @@ These cascades are best-effort, because use-time checks are authoritative:
   does. Revoke-all is the way to end grants.
 - **Project delete** (`ProjectDeletionService`): it runs no agent lifecycle hooks. G adds an
   explicit step that revokes grants and credentials of the project's agents to the project deletion
-  cascade.
+  cascade. The step runs inside the cascade transaction, like every other cascade step, so a
+  revocation failure fails the project delete.
+- **Revoke reasons of these paths:** `agent_suspended` (agent suspend and auto-suspend),
+  `issuer_suspended` (`updateUser` setting the status to suspended), `issuer_deleted` (after
+  `deleteUser` or the test identity purge commits) and `project_deleted`. The best-effort paths run
+  in a transaction of their own after the change has committed; a failure is logged and never fails
+  the change. Each revoked grant gets one `agent_delegation_grant_revoke` mutation record, as in §7,
+  attributed to the principal whose action caused it (the hub when there is none).
 - **Purge of soft-deleted agents:** no hooks. Grants were already revoked at soft delete.
 - **Failed-create cleanup** (`compensateAgentCreate`, `agent_create_tx.go`): no hooks. If a grant
   was issued for an agent whose create is later rolled back, the agent row is removed, so exchange
@@ -1086,8 +1164,9 @@ These cascades are best-effort, because use-time checks are authoritative:
 
 ### 16.4 Agent credential gaps
 
-- A JWT with no agent credential row cannot exchange (§8 step 2). Mint now records the row before
-  returning a token, so only legacy tokens are affected, until the next refresh writes a row.
+- A JWT with no agent credential row is refused by the agent-token middleware with 401
+  `invalid_token` before reaching exchange or bound-agent management (§8 step 2). Mint and refresh
+  both record the credential row before returning a token.
 - If refresh fails to revoke the old agent credential, credentials exchanged with it stay valid
   until their own expiry (at most 60 minutes).
 
@@ -1110,7 +1189,9 @@ lifetime is not a maximum session duration. In v1 a delegated attach takes only 
 broker's terminal path: an attach that would take the agent's conduit path (for example, an agent
 on a managed runtime) is refused before the upgrade with 503 `runtime_attach_unsupported`, reason
 `delegated_credential_broker_path_only`. A future PTY ticket mint must deny for delegated
-credentials, or re-run `decideAgentDelegation` when the ticket is redeemed.
+credentials, or re-run `decideAgentDelegation` when the ticket is redeemed. The sciontool
+delegation socket does not forward the WebSocket upgrade, so a delegated attach is not supported
+through it (§11.9, ptone/scion#7473).
 
 ## 17. Concrete flows
 
@@ -1120,10 +1201,8 @@ credentials, or re-run `decideAgentDelegation` when the ticket is redeemed.
    issues a hub grant for `project:read`, `agent:read` and `agent:list` for 7 days. A exchanges it
    with its JWT, gets a 15-minute credential, and lists agents in P2. Allowed: Alice is admitted to
    P2 and holds `agent.list` and `agent.read` there. The mutation record of the exchange names
-   agent A, Alice and the grant. When `hub.authorization_decision_audit_v2` is admitted (or under
-   the test sink) and the decision is inside the sink's recorded domain, the decision record also
-   shows actor `agent:A`, authorizing user Alice and the
-   grant.
+   agent A, Alice and the grant. The decision log does not record the delegated decisions
+   (§14.4).
 2. **Read an agent in another project (G.2-a).** With a hub grant for `agent:read`, A reads agent B
    in P2. Allowed while Alice can read B. The environment in the response is redacted.
 3. **Attach to the issuer's own descendant.** Alice issues a project(P1) grant for `agent:attach`. A
@@ -1147,9 +1226,9 @@ credentials, or re-run `decideAgentDelegation` when the ticket is redeemed.
    identical to a missing grant. The decision record (under the test sink) says "bound to
    another agent".
 2. **Wrong credential at exchange:** a UAT or a user session → refused.
-3. **Legacy, revoked or expired agent JWT**: a revoked row → 401 `unauthorized` from the
-   middleware; no row (legacy) or an expired row → 401 `agent_credential_invalid`; a middleware
-   status lookup fault → 503 `unavailable`. No credential is issued in any case.
+3. **Unrecorded, revoked or expired agent JWT**: a revoked or missing row → 401 `invalid_token`
+   from the middleware; an expired row → 401 `agent_credential_invalid`; a middleware status lookup
+   fault → 503 `unavailable`. No credential is issued in any case.
 4. **Agent suspended, held or deleted after exchange** → the next use and the next exchange deny.
 5. **Issuer suspended, deleted or federated** → use and exchange deny. Issuer demoted from
    super-admin → per-target denial at the next use.
@@ -1245,6 +1324,7 @@ credentials, or re-run `decideAgentDelegation` when the ticket is redeemed.
 agent_delegation_grants
   id uuid pk
   agent_id uuid (index)   agent_project_id uuid   agent_generation int   agent_state_version int
+  issued_run_id string default ''                                    -- the agent's run at issuance
   issuer_user_id uuid (index)
   boundary_kind enum(project, hub)   boundary_project_id uuid NULL   -- hub ⇒ NULL, project ⇒ NOT NULL
   ceiling_version int NOT NULL (>= 1)   ceiling_permission_ids text (JSON array)
@@ -1339,7 +1419,7 @@ New catalog specs in a G-owned `pkg/hub/authzop/catalog_agent_delegation.go`:
 | `agent.delegation.create` | `session_jwt` | `SessionOnly(ReasonCredentialManagement)` | issue credential | governance and atomic audit |
 | `agent.delegation.exchange` | `agent_jwt` | `NonUser()` with a `Pin` naming G's UAT and session refusal test | mint credential | the bearer matrix skips non-user operations, so G pins its own test |
 | `agent.delegation.revoke`, `.credential.revoke`, `.list`, `.read` | `session_jwt`, `agent_jwt` | `SessionOnly(ReasonCredentialManagement)` | revoke authority (revokes); read (list, read) | the handler takes the bound-agent branch first and then requires a session, so a UAT gets 403 with `details.reason = CREDENTIAL_MANAGEMENT` and `details.credential = session_required` |
-| `agent.delegation.revoke_all` | `session_jwt` | `SessionOnly(ReasonCredentialManagement)` | revoke authority | |
+| `agent.delegation.revokeall` (permission `agent.delegation.revoke_all`; operation IDs take no underscore) | `session_jwt` | `SessionOnly(ReasonCredentialManagement)` | revoke authority | |
 
 No G operation lists `scoped_uat`. Operations admitted for delegated use (§13) add
 `PrincipalAgentDelegated` and `CredentialDelegatedAgent` as they are admitted.
@@ -1388,12 +1468,13 @@ and exchange (agent).
 
 - `ExchangeDelegation(ctx, grantID, audience)` next to `RefreshToken` (`pkg/sciontool/hub/client.go:744`)
   and a new `pkg/sciontool/delegation/` helper.
-- sciontool holds the delegated token in memory only and serves it to processes in the agent
-  container through a local unix socket (mode 0600, owned by the agent user). The preferred form is a
-  proxy that attaches the header to a hub request, so the token never leaves sciontool. It is never
+- sciontool holds the delegated token in memory only and forwards hub requests for processes in
+  the agent container through a local unix socket (mode 0600, owned by the agent user): a proxy
+  that attaches the header to each forwarded plain HTTP request, so the token never leaves
+  sciontool. It does not forward a WebSocket upgrade (§16.6). It is never
   written to the token file, a config file or a child process's environment.
 - sciontool re-exchanges before expiry and after every agent JWT refresh. It treats both 401
-  responses from exchange (`unauthorized` and `agent_credential_invalid`) as "re-authenticate" and
+  responses from exchange (`invalid_token` and `agent_credential_invalid`) as "re-authenticate" and
   a 503 as retryable, as in §8 step 2. Any same-UID process in the container that can open the
   socket can use the delegated authority; this is not proof of possession.
 
@@ -1539,11 +1620,11 @@ follow-up, coordinated with the audit workstream and approved by the maintainers
   federation explicitly (§11.5). One admission memo serves both G and the bearer evaluator.
 - The evaluator's `boundary_eligibility` stage has its own G code (§11.2).
 - Actor checks use `agentStanding`, which includes agent holds (§8, §11.2).
-- At exchange and on the bound-agent management paths, a revoked agent credential is refused by
-  the agent-token middleware with 401 `unauthorized`, and a status lookup fault with 503
-  `unavailable`. 401 `agent_credential_invalid` is kept for a legacy token with no row, an expired
-  row and a handler-level lookup error. Clients treat both 401 codes as "re-authenticate" (§8.2
-  step 2, §8.4).
+- At exchange and on the bound-agent management paths, a revoked or missing agent credential row
+  (or a token without a `jti`) is refused by the agent-token middleware with 401 `invalid_token`,
+  and a status lookup fault with 503 `unavailable`. 401 `agent_credential_invalid` covers an
+  expired row, an agent mismatch, and a handler-level lookup error. Clients treat both 401 codes
+  as "re-authenticate" (§8.2 step 2, §8.4).
 - At use, the reserved-identity revocation write happens in the authentication middleware, before
   the decision; `decideAgentDelegation` still denies a reserved issuer and writes nothing (§11.2
   step 4).

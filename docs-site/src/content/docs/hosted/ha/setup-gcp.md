@@ -224,7 +224,7 @@ When creating a project through the Hub web UI, Scion includes a default **"scra
 - **The Catch:** GKE Autopilot's default storage class (`standard-rwo`) **only supports `ReadWriteOnce` (RWO)**. Attempting to dispatch an agent will fail with an opaque scheduling error: `VolumeCapabilities is invalid: specified multi writer with mount access type`, and the Hub will output `pods not found`.
 - **The Fix (Option A - Easiest):** If you do not require shared directories, navigate to your project settings in the Hub UI *after* installation and **remove or disable the default shared directory** (e.g., delete the scratchpad entry).
 - **The Fix (Option B - Production):** Set up Google Cloud Filestore or a compatible NFS server, configure the Filestore CSI driver, and define the custom storage class in your GKE runtime profile to support native ReadWriteMany volumes.
-- **The Fix (Option C - Shared NFS export):** Set [`server.shared_dir_storage.backend`](/scion/reference/server-config/#shared-directory-storage-servershared_dir_storage) to `nfs` with a static PVC (`pv_name`) bound to your Filestore or NFS export. Pods then mount shared directories from that single claim by `subPath` instead of requesting a new RWX PVC per directory.
+- **The Fix (Option C - Shared NFS export):** Set [`server.project_storage.backend`](/scion/reference/server-config/#project-storage-serverproject_storage) to `nfs` with a static PVC (`pv_name`) bound to your Filestore or NFS export. This places workspaces on the export too. Pods then mount shared directories from that single claim by `subPath` instead of requesting a new RWX PVC per directory.
 :::
 
 Create the agent namespace:
@@ -274,13 +274,18 @@ account's ambient credentials. This works because the Hub SA has `roles/containe
 
 ### 1f. Generate Session Secret
 
-The Hub uses a 32-byte hex session signing key:
+The Hub uses a 32-byte hex session and JWT signing key shared across replicas. Generate it directly into Secret Manager so the plaintext value is never printed to your terminal, written to disk, or stored in the Cloud Run service spec:
 
 ```bash
-export SCION_SERVER_SESSION_SECRET=$(openssl rand -hex 32)
-echo "Session secret: $SCION_SERVER_SESSION_SECRET"
-# Save this — you'll use it in the deploy command.
+openssl rand -hex 32 | tr -d '\n' | gcloud secrets create scion-hub-session-secret \
+  --data-file=- \
+  --replication-policy=automatic \
+  --project=$PROJECT_ID
 ```
+
+:::note[Existing deployments]
+If you already deployed `scion-hub` with `SCION_SERVER_SESSION_SECRET` (or `SESSION_SECRET`) set directly in `--set-env-vars`, seed `scion-hub-session-secret` with the current value from the running revision's environment instead of generating a new random key, then redeploy in [Section 3d](#3d-deploy-the-hub-to-cloud-run). Generating a new value rotates the session and legacy JWT signing key, signing every user out and invalidating existing Hub-signed tokens.
+:::
 
 ### Infrastructure Verification Checklist
 
@@ -303,6 +308,10 @@ gcloud container clusters describe scion-agents --region=$GKE_REGION \
 
 echo "Kubeconfig Secret:"
 gcloud secrets describe scion-gke-kubeconfig --project=$PROJECT_ID \
+  --format="value(name)" 2>/dev/null && echo "  OK" || echo "  MISSING"
+
+echo "Session Secret:"
+gcloud secrets describe scion-hub-session-secret --project=$PROJECT_ID \
   --format="value(name)" 2>/dev/null && echo "  OK" || echo "  MISSING"
 ```
 
@@ -521,9 +530,23 @@ Pods dispatched to a different namespace (e.g. `default`) will fail with
 ### 2i. GKE Workload Identity for GCP Identity Mode Assign
 
 GCP identity mode **assign** on the Kubernetes runtime authenticates agent pods via
-Workload Identity, not via the sciontool metadata emulator used on Docker. Scion does
-not create, annotate, or bind Kubernetes ServiceAccounts (KSAs) for this — pre-provision
-each one yourself, then tell the broker about it in its own `settings.yaml`.
+Workload Identity, not via the sciontool metadata emulator used on Docker. By default, Scion does not create or annotate Kubernetes ServiceAccounts (KSAs) — you pre-provision each KSA yourself and map or annotate it.
+
+For a GSA the Hub mints while the `hub.k8s_workload_identity_setup` experiment is on:
+- Set `workload_identity_pool: <CLUSTER_PROJECT_ID>.svc.id.goog` on the broker's
+  `kubernetes` runtime entry (or `server.broker.instances[].runtime_target` on a flat
+  Runtime Broker instance) so the Hub grants `roles/iam.workloadIdentityUser` to the
+  conventional `<account ID>` KSA at mint.
+- Optionally set `create_service_accounts: true` on that same runtime entry (or flat
+  `runtime_target`) and grant the broker's Kubernetes identity `get`, `list`, and `create`
+  on `serviceaccounts` in the agent namespace (`get` and `create` on a flat instance, which
+  never lists `serviceaccounts`) so the broker creates and annotates the conventional
+  `<account ID>` KSA on first `assign` start (existing KSAs are never modified; a colliding
+  KSA fails with `identity_ksa_conflict`). New IAM bindings can take up to a few minutes to
+  propagate in GKE Workload Identity, and agent namespaces should be dedicated to Scion so
+  only the broker identity can create ServiceAccounts and pods there.
+See [Workload Identity binding at mint](/scion/hosted/ha/kubernetes/#workload-identity-binding-at-mint)
+and [GCP Identity Mode "assign"](/scion/hosted/ha/kubernetes/#gcp-identity-mode-assign-workload-identity-mapping).
 
 This section covers the cluster side: the Workload Identity binding and the broker
 mapping. Registering the GSA with the Hub and granting the Hub token-creator on it come
@@ -998,7 +1021,7 @@ rm /tmp/settings-final.yaml
 
 ### 3d. Deploy the Hub to Cloud Run
 
-We can now deploy the Hub to Cloud Run cleanly. Notice that we mount both the kubeconfig and the `settings.yaml` files as secrets directly under `/etc/scion/` and `/home/scion/.scion/`, keeping the start command extremely simple and robust.
+We can now deploy the Hub to Cloud Run cleanly. Notice that we mount the kubeconfig and `settings.yaml` files as secrets under `/etc/scion/` and `/home/scion/.scion/` and inject `SCION_SERVER_SESSION_SECRET` from Secret Manager, keeping secrets out of the command line and revision environment literals (if migrating an existing service from a literal env var, seed `scion-hub-session-secret` with the current value first — see [Section 1f](#1f-generate-session-secret)).
 
 ```bash
 gcloud run deploy scion-hub \
@@ -1007,8 +1030,8 @@ gcloud run deploy scion-hub \
   --project=$PROJECT_ID \
   --service-account=scion-hub-runner@$PROJECT_ID.iam.gserviceaccount.com \
   --add-cloudsql-instances=$PROJECT_ID:$REGION:scion-hub-db \
-  --set-env-vars="SCION_DEPLOY=$(date +%s),KUBECONFIG=/etc/scion/kubeconfig.yaml,SCION_K8S_NAMESPACE=scion-agents,SCION_SERVER_SESSION_SECRET=$SCION_SERVER_SESSION_SECRET,SCION_CLOUDRUN_CPU_ALWAYS_ALLOCATED=true" \
-  --set-secrets="/etc/scion/kubeconfig.yaml=scion-gke-kubeconfig:latest,/home/scion/.scion/settings.yaml=scion-hub-settings:latest" \
+  --set-env-vars="SCION_DEPLOY=$(date +%s),KUBECONFIG=/etc/scion/kubeconfig.yaml,SCION_K8S_NAMESPACE=scion-agents,SCION_CLOUDRUN_CPU_ALWAYS_ALLOCATED=true" \
+  --set-secrets="/etc/scion/kubeconfig.yaml=scion-gke-kubeconfig:latest,/home/scion/.scion/settings.yaml=scion-hub-settings:latest,SCION_SERVER_SESSION_SECRET=scion-hub-session-secret:latest" \
   --min-instances=2 \
   --max-instances=3 \
   --cpu=1 \
@@ -1034,7 +1057,7 @@ deployment is not HA (see [HA overview](/scion/hosted/ha/overview/)).
 
 :::caution[More than one replica requires shared workspace storage]
 The `settings.yaml` above leaves
-[`server.workspace_storage`](/scion/reference/server-config/#workspace-storage-serverworkspace_storage)
+[`server.project_storage`](/scion/reference/server-config/#project-storage-serverproject_storage)
 at its default `local` backend. With that backend each replica keeps
 hub-managed project workspaces on its own container storage, so replicas
 can see different workspace content, and the content is lost when an
@@ -1082,18 +1105,18 @@ mounted.
 
 ```yaml
 server:
-  workspace_storage:
+  project_storage:
     backend: cloudrun-volume
     cloudrun_volume:
       volume_name: VOLUME_NAME       # the volume declared on the service
       subpath_root: projects         # default
 ```
 
-The Hub derives every workspace path from `/mnt/<volume_name>`. If the
+The Hub derives every workspace and shared-directory path from `/mnt/<volume_name>`. If the
 volume is not mounted there, `GET /readyz` returns `503` instead of the
 Hub writing workspaces to container storage. A missing `volume_name`
 stops the Hub at startup. See
-[Workspace Storage](/scion/reference/server-config/#workspace-storage-serverworkspace_storage)
+[Project Storage](/scion/reference/server-config/#project-storage-serverproject_storage)
 for all backends and fields.
 :::
 

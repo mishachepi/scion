@@ -52,6 +52,7 @@ list|show|upgrade|reset|sync|pull`.
   capture_auth.py    # thin shim: sys.exit(scion_harness.capture_auth_main())
   dialect.yaml       # optional — data-driven hook-event dialect
   agent-plugins.yaml # optional — native Agent Plugins support (see Capabilities)
+  no-auth-env.yaml   # optional — env added only in no-auth mode (see no_auth)
   home/              # seeded into the agent home at install time
     .bashrc
     .<tool>/...      # native client settings, hook wiring, notify scripts
@@ -62,7 +63,7 @@ list|show|upgrade|reset|sync|pull`.
 ```
 
 At install time, `provision.py`, `scion_harness.py`, `capture_auth.py`,
-`dialect.yaml`, `agent-plugins.yaml` (plus `schema/`, `examples/`, `tests/fixtures/`) stay at the
+`dialect.yaml`, `agent-plugins.yaml`, `no-auth-env.yaml` (plus `schema/`, `examples/`, `tests/fixtures/`) stay at the
 bundle root; everything under `home/` is copied into the harness-config's
 `home/` directory verbatim. `Dockerfile`, `cloudbuild.yaml`, `README.md`,
 `provision_test.py`, `.gitkeep`, and `init-firewall.sh` are not installed.
@@ -293,10 +294,13 @@ harness-config overrides included) to the container, and both readiness
 readers use it: `sciontool init`, which ends the agent's initializing state,
 and the broker's wait before it pastes a held message. A session-start from
 `/clear` or `/compact` never counts as the hook signal. The built-in bundles
-use `hook` for claude, gemini-cli, copilot and grok-build, and `delay` 8s for
-every other harness; change a value only with evidence that the tool reads
-its input by then. A harness-config with no `ready` block gets the block of
-the built-in bundle for its `harness` type, or `delay` 8s if there is none.
+use `hook` for claude, gemini-cli and grok-build, and `delay` 8s for every
+other harness; change a value only with evidence that the tool reads its
+input by then. The copilot bundle uses `delay` because its `sessionStart`
+fires only when the first prompt is submitted, so `hook` held the first
+message of an agent started without a task for the whole `timeout`. A
+harness-config with no `ready` block gets the block of the built-in bundle
+for its `harness` type, or `delay` 8s if there is none.
 
 **`delivery`.** A message is loaded into a tmux buffer and pasted with
 bracketed paste. Then each key in `submit_keys` is sent with its own
@@ -466,6 +470,28 @@ with your message. The user logs in interactively, then runs the staged
 the host from your `required_files` declarations) and stores each credential
 as a project secret via `sciontool secret set` — so the next agent starts
 authenticated.
+
+`command` is optional: without it the agent starts the shell with the message
+only.
+
+**Env for no-auth mode goes in `no-auth-env.yaml`, not in `config.yaml`.** The
+file sits next to `config.yaml` and holds one key, `env`, a map of variable
+names to literal values. Scion adds them to the container only when the agent
+runs in no-auth mode (the bundle needs a `no_auth` block), never for a start
+with credentials. An entry never replaces env set by settings, the agent or
+the hub, and names reserved for scion (`SCION_*`, `GCE_METADATA_*`, hub-only
+keys) and entries with an empty value are ignored with a warning, as is an
+invalid file; an entry whose name is empty or contains `=` is ignored without a
+warning. Like
+`agent-plugins.yaml`, it is kept out of `config.yaml` so older binaries can
+still validate `config.yaml`; they ignore the file. Copilot uses it to run
+without a session bus:
+
+```yaml
+# harnesses/copilot/no-auth-env.yaml
+env:
+  DBUS_SESSION_BUS_ADDRESS: unix:path=/home/scion/.scion/harness/no-session-bus
+```
 
 ### MCP (declarative mapping)
 
@@ -735,10 +761,10 @@ Three wiring patterns, by how configurable your tool is:
 1. **Static config in `home/`** — claude and gemini-cli ship hook wiring in
    their seeded settings files, piping every lifecycle event to
    `sciontool hook --dialect=...` ([claude/home/.claude/settings.json](claude/home/.claude/settings.json)).
-2. **Notify/wrapper script in `home/`** — codex routes both its legacy
-   `notify` callback and its hooks through
-   [`scion_notify.sh`](codex/home/.codex/scion_notify.sh), which also turns
-   turn-completion into `sciontool status task_completed`.
+2. **Wrapper script in `home/`** — codex routes its registered hooks through
+   [`scion_notify.sh`](codex/home/.codex/scion_notify.sh), which filters the
+   event name and forwards known lifecycle payloads to
+   `sciontool hook --dialect=codex`.
 3. **Generated at provision time** — when hook config must contain runtime
    values or live in the workspace, write it from provision.py (antigravity
    generates `/workspace/.agents/hooks.json` wiring events through `jq` into
@@ -765,7 +791,26 @@ mappings:
 
 Map into the normalized event vocabulary: `session-start`, `session-end`,
 `prompt-submit`, `tool-start`, `tool-end`, `model-start`, `model-end`,
-`agent-end`, `subagent-end`, `response-complete`, `notification`.
+`agent-end`, `agent-error` (a turn that ended on an error, from a dedicated
+failure hook), `subagent-end`, `response-complete`, `notification`.
+
+Two optional per-mapping keys cover events that only sometimes mean what
+their name says:
+
+```yaml
+  Notification:
+    event: notification
+    skip_when:            # ignore the event when any condition holds
+      - field: notificationType   # dotted path; missing or non-string reads as ""
+        equals: agent_error       # or not_equals: <value>
+  errorOccurred:
+    event: model-end
+    uncounted: true       # not counted by max_model_calls, API-call metrics or usage
+```
+
+Use `uncounted` for a model-end the tool sends for only some calls (for
+example only failed ones); counting it would make `max_model_calls` count
+failures.
 Extractable fields include `prompt`, `tool_name`, `tool_input`,
 `tool_output`, `message`, `session_id`, `success`, `error`, `file_path`,
 and the token fields `input_tokens` (→ `input`), `output_tokens`
@@ -782,9 +827,12 @@ would sum them in Go instead.)
 Your `capabilities.limits` claims must match this wiring: `max_turns` needs
 `prompt-submit`, `max_model_calls` needs model start/end events.
 
-Agent-side status signaling (`sciontool status task_completed|blocked|ask_user`)
-is usually driven by agent instructions/templates, but a hook script may emit
-it directly where the tool has a reliable completion callback (codex).
+Agent-side status signaling (`sciontool status task_completed|blocked|idle|ask_user`)
+is usually driven by agent instructions/templates; a hook or bridge script may
+emit `task_completed` directly only from a run-settled callback (`pi`), never
+from a per-turn boundary, and never over a status set earlier in that run,
+whether the agent reported it (`ask_user`, `blocked`, `idle`) or limit
+enforcement set it (`limits_exceeded`).
 
 ## Dockerfile and image pipeline
 

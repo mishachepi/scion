@@ -15,8 +15,6 @@
 harness: codex
 image: scion-codex:latest
 user: scion
-env:
-  SCION_CODEX_NOTIFY_AUTO_COMPLETE: "true"
 # provisioner.type is container-script so the container-side provision.py
 # handles auth resolution, MCP server translation, and other harness-native
 # config writes. Existing installations that still have type: builtin can
@@ -43,6 +41,14 @@ delivery:
   extra_submits: 2
   extra_submit_delay: 300ms
 instructions_file: .codex/AGENTS.md
+env:
+  # The npm launcher (node bin/codex.js) spawns the native TUI as a child,
+  # so the TUI is two levels below the agent window's wrapper. The liveness
+  # sampler excludes both from live work (ptone/scion#7855); otherwise a
+  # hung agent's redrawing "Working" status would keep it from stalling.
+  # An env entry rather than a config.yaml key so older binaries still
+  # accept this file (ptone/scion#5196).
+  SCION_LIVENESS_HARNESS_ROOT_DEPTH: "2"
 system_prompt_mode: prepend_to_instructions
 # Default model for agents started without an explicit --model. Resolved
 # through model_aliases below broker-side only (pkg/agent/provision.go,
@@ -56,9 +62,9 @@ system_prompt_mode: prepend_to_instructions
 model: medium
 model_aliases:
   small: gpt-6-luna
-  medium: gpt-6.1-sol
-  large: gpt-6.1-sol
-  extra-large: gpt-6-astra
+  medium: gpt-6.1-terra
+  large: gpt-6.2-sol
+  extra-large: gpt-6.2-astra
 
 # SCION_THINKING_LEVEL (0-100) -> model_reasoning_effort in ~/.codex/config.toml.
 # Applied by scion_harness.resolve_thinking in provision.py. Each level maps

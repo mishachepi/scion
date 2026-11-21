@@ -1,3 +1,15 @@
+# Scion Hub image: web frontend, scion binary with the web UI embedded, and a
+# slim Debian runtime. The default target (no --target) is the runtime image;
+# `--target hub-gke` is the non-root variant for the scion-hub Helm chart.
+#
+# Cloud Build: upload with --ignore-file=image-build/gcloudignore-omni. The
+# default .gcloudignore drops the web source (web/package.json, web/src/, ...)
+# because the other Cloud Build configs compile with -tags no_embed_web, so
+# `gcloud builds submit` of this file with the default ignore file fails at the
+# frontend stage's `COPY web/package.json`. A plain `docker build` is not
+# affected. image-build/cloudbuild-hub-gke.yaml already passes that ignore file;
+# cmd/gcloudignore_copy_contract_test.go checks every in-repo Cloud Build step.
+
 # Stage 1: Build the web frontend assets
 FROM node:22-alpine AS frontend
 WORKDIR /web
@@ -22,9 +34,19 @@ COPY . .
 # Copy built frontend assets into the embed location
 COPY --from=frontend /web/dist/client web/dist/client
 
+# Version build arguments (.git is stripped by .dockerignore and
+# image-build/gcloudignore-omni, so VCS stamping is disabled and version
+# metadata is injected explicitly via ldflags, matching image-build/scion-base).
+ARG GIT_COMMIT=""
+ARG VERSION=""
+ARG BUILD_TIME=""
+
 # Build a static binary (CGO_ENABLED=0) so it runs on the debian runtime image
 # without musl/glibc mismatch from the Alpine builder.
-RUN CGO_ENABLED=0 go build -o /scion ./cmd/scion/
+RUN BUILD_TIME="${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" && \
+    CGO_ENABLED=0 go build -buildvcs=false \
+    -ldflags "-s -w -X github.com/GoogleCloudPlatform/scion/pkg/version.Version=${VERSION} -X github.com/GoogleCloudPlatform/scion/pkg/version.Commit=${GIT_COMMIT} -X github.com/GoogleCloudPlatform/scion/pkg/version.BuildTime=${BUILD_TIME}" \
+    -o /scion ./cmd/scion/
 
 # Stage 3: Create a minimal runtime image
 #
@@ -78,6 +100,11 @@ FROM runtime AS hub-gke
 RUN useradd -u 1000 -m -d /home/scion scion \
  && mkdir -p /home/scion/.scion \
  && chown -R 1000:1000 /home/scion
+# ARGs are stage-scoped in Docker; re-declare them here for OCI labels.
+ARG GIT_COMMIT=""
+ARG VERSION=""
+LABEL org.opencontainers.image.revision="${GIT_COMMIT}"
+LABEL org.opencontainers.image.version="${VERSION}"
 ENV HOME=/home/scion
 USER 1000:1000
 

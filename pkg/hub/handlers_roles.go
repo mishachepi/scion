@@ -352,7 +352,7 @@ func (s *Server) createRoleBindingScopeAware(w http.ResponseWriter, r *http.Requ
 			writeError(w, http.StatusInternalServerError, "internal_error", "failed to load role definition", nil)
 			return
 		}
-		if err == nil && !store.IsBuiltInProjectMembershipRole(roleDef.Name) {
+		if err == nil && !store.IsBuiltInProjectMembershipRoleDef(roleDef) {
 			// Custom project role — require hub-level auth.
 			requireHubAuth = true
 		}
@@ -889,6 +889,7 @@ var systemRoleNames = map[string]bool{
 	store.ProjectRoleOwner:     true,
 	store.ProjectRoleAdmin:     true,
 	store.ProjectRoleMember:    true,
+	store.ProjectRoleViewer:    true,
 	store.AgentRoleDefNone:     true,
 	store.AgentRoleDefReadonly: true,
 	store.AgentRoleDefBaseline: true,
@@ -1337,25 +1338,17 @@ func (s *Server) createRoleBinding(w http.ResponseWriter, r *http.Request, user 
 	// role_binding.create.
 	principalIsMembersGroup := false
 
-	// Verify group exists for group principals.
+	// Verify group exists and is visible to the caller for group principals.
 	// Try UUID first, fall back to slug lookup (mirrors email→UUID for users).
 	if req.PrincipalType == store.RoleBindingPrincipalGroup {
-		g, err := s.store.GetGroup(r.Context(), req.PrincipalID)
+		g, err := s.resolveVisibleGroupByIDOrSlug(r.Context(), user, req.PrincipalID)
 		if err != nil {
 			if errors.Is(err, store.ErrNotFound) {
-				g, err = s.store.GetGroupBySlug(r.Context(), req.PrincipalID)
-				if err != nil {
-					if errors.Is(err, store.ErrNotFound) {
-						BadRequest(w, "group not found: "+req.PrincipalID)
-					} else {
-						writeErrorFromErr(w, err, "")
-					}
-					return
-				}
+				BadRequest(w, "group not found: "+req.PrincipalID)
 			} else {
 				writeErrorFromErr(w, err, "")
-				return
 			}
+			return
 		}
 		req.PrincipalID = g.ID
 		principalIsMembersGroup = store.IsProjectMembersGroup(g)
@@ -1445,7 +1438,7 @@ func (s *Server) createRoleBinding(w http.ResponseWriter, r *http.Request, user 
 			BadRequest(w, "role definition not found")
 			return
 		}
-		if store.IsBuiltInProjectMembershipRole(roleDef.Name) {
+		if store.IsBuiltInProjectMembershipRoleDef(roleDef) {
 			// Built-in project role — route through membership service.
 			if s.membershipService == nil {
 				writeError(w, http.StatusInternalServerError, "internal_error",
@@ -1540,6 +1533,9 @@ func (s *Server) createRoleBinding(w http.ResponseWriter, r *http.Request, user 
 	// The binding and its audit record commit or roll back together.
 	var created *store.RoleBinding
 	err := s.store.WithTx(r.Context(), func(tx store.Store) error {
+		if err := rejectInvitedHubRoleBinding(r.Context(), tx, rb); err != nil {
+			return err
+		}
 		c, err := tx.CreateRoleBinding(r.Context(), rb)
 		if err != nil {
 			return err
@@ -1555,6 +1551,10 @@ func (s *Server) createRoleBinding(w http.ResponseWriter, r *http.Request, user 
 		})
 	})
 	if err != nil {
+		if errors.Is(err, errHubRoleOnInvitedUser) {
+			Conflict(w, errHubRoleOnInvitedUser.Error())
+			return
+		}
 		if errors.Is(err, store.ErrAlreadyExists) {
 			Conflict(w, "this role binding already exists")
 			return

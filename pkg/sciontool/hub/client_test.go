@@ -28,7 +28,6 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -1108,7 +1107,7 @@ func TestReadTokenFile_Hardening(t *testing.T) {
 
 		scionDir := filepath.Join(home, ".scion")
 		require.NoError(t, os.MkdirAll(scionDir, 0700))
-		require.NoError(t, syscall.Mkfifo(filepath.Join(scionDir, TokenFile), 0o600))
+		require.NoError(t, mkfifoForTest(filepath.Join(scionDir, TokenFile), 0o600))
 
 		done := make(chan string, 1)
 		go func() { done <- ReadTokenFile() }()
@@ -2370,4 +2369,73 @@ func TestClient_SetSecret_ServerError(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "500")
+}
+
+func TestClient_SetSecret_PendingApproval(t *testing.T) {
+	expires := time.Date(2026, 1, 8, 0, 0, 0, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"key": "MY_SECRET", "scope": "user", "state": "pending", "pendingId": "pend-1",
+			"expiresAt": expires, "replacesExisting": true, "message": "awaiting user approval",
+		})
+	}))
+	defer server.Close()
+
+	client := NewClientWithConfig(server.URL, "test-token", "agent-123")
+	resp, err := client.SetSecret(context.Background(), "MY_SECRET", "c2VjcmV0", "", "", "user", false, boolPtr(true))
+	require.NoError(t, err)
+	assert.True(t, resp.Pending())
+	assert.Equal(t, "pend-1", resp.PendingID)
+	assert.True(t, resp.ReplacesExisting)
+	assert.True(t, resp.ExpiresAt.Equal(expires))
+	assert.Equal(t, "user", resp.Scope)
+}
+
+func TestClient_SetSecret_Conflicts(t *testing.T) {
+	cases := []struct {
+		name     string
+		code     string
+		contains string
+		excludes string
+	}{
+		{"held by another agent", ErrCodeSecretPendingHeldByOtherAgent, ErrCodeSecretPendingHeldByOtherAgent, "already exists"},
+		{"existing secret", "conflict", "already exists", ErrCodeSecretPendingHeldByOtherAgent},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"error": map[string]string{"code": tc.code, "message": "conflict"},
+				})
+			}))
+			defer server.Close()
+			client := NewClientWithConfig(server.URL, "test-token", "agent-123")
+			_, err := client.SetSecret(context.Background(), "MY_SECRET", "c2VjcmV0", "", "", "user", true, nil)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.contains)
+			assert.NotContains(t, err.Error(), tc.excludes)
+		})
+	}
+}
+
+func TestClient_SetSecret_PendingCap(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]interface{}{"code": ErrCodeSecretPendingCap, "message": "cap",
+				"details": map[string]interface{}{"cap": "agent", "limit": 10}},
+		})
+	}))
+	defer server.Close()
+	client := NewClientWithConfig(server.URL, "test-token", "agent-123")
+	_, err := client.SetSecret(context.Background(), "MY_SECRET", "c2VjcmV0", "", "", "user", false, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), ErrCodeSecretPendingCap)
+	assert.Contains(t, err.Error(), "await your approval")
+	assert.NotContains(t, err.Error(), "already exists")
 }

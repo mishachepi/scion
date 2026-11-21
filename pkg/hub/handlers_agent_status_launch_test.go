@@ -38,10 +38,10 @@ const (
 	launchGen2 = "2026-09-27T12:05:00Z"
 )
 
-// postAgentStatus sends a status report the way sciontool does: with the
+// postAgentStatusBody sends a status report the way sciontool does: with the
 // agent's own token. The body is a plain map so these tests describe the
 // wire contract, not a Go struct.
-func postAgentStatus(t *testing.T, srv *Server, agent *store.Agent, body map[string]interface{}) *httptest.ResponseRecorder {
+func postAgentStatusBody(t *testing.T, srv *Server, agent *store.Agent, body map[string]interface{}) *httptest.ResponseRecorder {
 	t.Helper()
 	tokenSvc := srv.GetAgentTokenService()
 	require.NotNil(t, tokenSvc)
@@ -49,8 +49,7 @@ func postAgentStatus(t *testing.T, srv *Server, agent *store.Agent, body map[str
 	// credentials are revoked, and a still-running old sciontool adopts the
 	// NEW generation's token from the shared token file. Token identity
 	// therefore cannot tell the generations apart — only the launch can.
-	token, err := tokenSvc.GenerateAgentToken(agent.ID, agent.ProjectID, []AgentTokenScope{ScopeAgentStatusUpdate}, nil)
-	require.NoError(t, err)
+	token := srv.generateRecordedAgentToken(t, agent.ID, agent.ProjectID, []AgentTokenScope{ScopeAgentStatusUpdate}, nil)
 
 	raw, err := json.Marshal(body)
 	require.NoError(t, err)
@@ -72,7 +71,7 @@ func agentPhase(t *testing.T, s store.Store, id string) string {
 // registerLaunch is sciontool init's first report of a generation.
 func registerLaunch(t *testing.T, srv *Server, agent *store.Agent, launch string) {
 	t.Helper()
-	rec := postAgentStatus(t, srv, agent, map[string]interface{}{
+	rec := postAgentStatusBody(t, srv, agent, map[string]interface{}{
 		"phase":     string(state.PhaseRunning),
 		"activity":  string(state.ActivityWorking),
 		"message":   "Agent started",
@@ -105,7 +104,7 @@ func TestAgentStatus_SuspendResume_OldGenerationStoppedDoesNotClobberRunning(t *
 	registerLaunch(t, srv, agent, launchGen2)
 
 	// The old init's final report, sent with the adopted new token.
-	rec = postAgentStatus(t, srv, agent, map[string]interface{}{
+	rec = postAgentStatusBody(t, srv, agent, map[string]interface{}{
 		"phase":           string(state.PhaseStopped),
 		"message":         "Agent stopped",
 		"launchStartedAt": launchGen1,
@@ -115,7 +114,7 @@ func TestAgentStatus_SuspendResume_OldGenerationStoppedDoesNotClobberRunning(t *
 		"a previous generation's final stopped must not overwrite the resumed agent's running")
 
 	// The current generation's own stop is still honored.
-	rec = postAgentStatus(t, srv, agent, map[string]interface{}{
+	rec = postAgentStatusBody(t, srv, agent, map[string]interface{}{
 		"phase":           string(state.PhaseStopped),
 		"message":         "Agent stopped",
 		"launchStartedAt": launchGen2,
@@ -143,7 +142,7 @@ func TestAgentStatus_StopStart_OldGenerationCrashDoesNotClobberRunning(t *testin
 
 	registerLaunch(t, srv, agent, launchGen2)
 
-	rec = postAgentStatus(t, srv, agent, map[string]interface{}{
+	rec = postAgentStatusBody(t, srv, agent, map[string]interface{}{
 		"phase":           string(state.PhaseStopped),
 		"activity":        string(state.ActivityCrashed),
 		"launchStartedAt": launchGen1,
@@ -161,7 +160,7 @@ func TestAgentStatus_ReportWithoutLaunchIsAccepted(t *testing.T) {
 
 	registerLaunch(t, srv, agent, launchGen1)
 
-	rec := postAgentStatus(t, srv, agent, map[string]interface{}{
+	rec := postAgentStatusBody(t, srv, agent, map[string]interface{}{
 		"phase":   string(state.PhaseStopped),
 		"message": "Agent stopped",
 	})
@@ -178,7 +177,7 @@ func TestAgentStatus_NewerLaunchBeforeRegistrationIsAccepted(t *testing.T) {
 
 	registerLaunch(t, srv, agent, launchGen1)
 
-	rec := postAgentStatus(t, srv, agent, map[string]interface{}{
+	rec := postAgentStatusBody(t, srv, agent, map[string]interface{}{
 		"activity":        string(state.ActivityThinking),
 		"launchStartedAt": launchGen2,
 	})
@@ -196,7 +195,7 @@ func TestAgentStatus_SameLaunchIsAccepted(t *testing.T) {
 
 	registerLaunch(t, srv, agent, launchGen1)
 
-	rec := postAgentStatus(t, srv, agent, map[string]interface{}{
+	rec := postAgentStatusBody(t, srv, agent, map[string]interface{}{
 		"phase":           string(state.PhaseStopped),
 		"launchStartedAt": "2026-09-27T14:00:00+02:00", // == launchGen1
 	})

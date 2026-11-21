@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
@@ -105,6 +106,13 @@ func adminModeMiddleware(state *MaintenanceState) func(http.Handler) http.Handle
 				return
 			}
 
+			// Allow unauthenticated public settings GET so /login JS boot, Vite
+			// dev, and CLI auth login can read branding during maintenance mode.
+			if r.Method == http.MethodGet && r.URL.Path == "/api/v1/settings/public" {
+				next.ServeHTTP(w, r)
+				return
+			}
+
 			// Allow agents through — system operations must continue.
 			if agent := GetAgentIdentityFromContext(r.Context()); agent != nil {
 				next.ServeHTTP(w, r)
@@ -159,8 +167,8 @@ func (ws *WebServer) adminModeWebMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// Allow static assets (required for login page).
-		if strings.HasPrefix(path, "/assets/") || strings.HasPrefix(path, "/shoelace/") || isAppIconPath(path) {
+		// Allow static assets and branding assets (required for login and maintenance pages).
+		if strings.HasPrefix(path, "/assets/") || strings.HasPrefix(path, "/shoelace/") || strings.HasPrefix(path, "/brand/") || isAppIconPath(path) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -182,7 +190,7 @@ func (ws *WebServer) adminModeWebMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = fmt.Fprint(w, maintenancePageHTML(ws.maintenance.Message()))
+		_, _ = fmt.Fprint(w, maintenancePageHTMLWithBranding(ws.resolvedBranding(), ws.maintenance.Message()))
 	})
 }
 
@@ -301,16 +309,24 @@ func (s *Server) handleAdminScheduler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Exec argv is never shown here (D3): the admin view reveals nothing.
+	rev := s.noExecRevealer(r.Context())
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"scheduler":          status,
-		"scheduledEvents":    events,
-		"recurringSchedules": schedules,
+		"scheduledEvents":    s.scheduledEventResponses(r.Context(), rev, events),
+		"recurringSchedules": scheduleResponses(rev, schedules),
 		"serverTime":         time.Now().UTC(),
 	})
 }
 
-// maintenancePageHTML returns a self-contained HTML maintenance page,
-// using the shared renderErrorPage template.
+// maintenancePageHTML returns a self-contained HTML maintenance page using
+// stock Scion branding.
 func maintenancePageHTML(message string) string {
-	return renderErrorPage("Scion - Maintenance", "&#128295;", "maintenance", "Under Maintenance", message)
+	return maintenancePageHTMLWithBranding(nil, message)
+}
+
+// maintenancePageHTMLWithBranding returns a self-contained HTML maintenance
+// page with Hub branding applied, using the shared renderErrorPage template.
+func maintenancePageHTMLWithBranding(b *config.ResolvedBranding, message string) string {
+	return renderErrorPageWithBranding(b, brandPageTitle(b, "Maintenance"), "&#128295;", "maintenance", "Under Maintenance", message)
 }

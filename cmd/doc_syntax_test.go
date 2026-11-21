@@ -123,9 +123,16 @@ func findCommandProblems(lines []string, source string) []string {
 			if name == "" {
 				continue
 			}
-			if cmd.Flags().Lookup(name) == nil {
+			f := cmd.Flags().Lookup(name)
+			if f == nil {
+				f = cmd.InheritedFlags().Lookup(name)
+			}
+			if f == nil {
 				problems = append(problems,
 					fmt.Sprintf("unknown flag --%s: %s (from %s)", name, line, source))
+			} else if f.Deprecated != "" {
+				problems = append(problems,
+					fmt.Sprintf("deprecated flag --%s (%s): %s (from %s)", name, f.Deprecated, line, source))
 			}
 		}
 	}
@@ -180,6 +187,8 @@ func findDenyListProblems(lines []string, denyPatterns []string, source string) 
 func TestDocSyntax(t *testing.T) {
 	docFiles := []string{
 		"../resources/platform_skills/scion-messaging/SKILL.md",
+		"../resources/platform_skills/scion-messaging/references/decisions.md",
+		"../resources/platform_skills/scion-artifacts/SKILL.md",
 		"../docs-site/src/content/docs/hosted/user/messaging.md",
 		"../docs-site/src/content/docs/reference/cli.md",
 		"../docs-site/src/content/docs/glossary.md",
@@ -343,4 +352,173 @@ func TestAcceptsPositionalArgs(t *testing.T) {
 			assert.Equal(t, tt.want, acceptsPositionalArgs(tt.cmd))
 		})
 	}
+}
+
+// fencedScionLinesWithPlaceholders returns every `scion ...` line from
+// fenced code blocks, placeholder lines included (extractScionLines skips
+// those).
+func fencedScionLinesWithPlaceholders(t *testing.T, path string) []string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	require.NoError(t, err, "reading %s", path)
+	var lines []string
+	inFence := false
+	for _, raw := range strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(raw), "```") {
+			inFence = !inFence
+			continue
+		}
+		if s := strings.TrimSpace(raw); inFence && strings.HasPrefix(s, "scion ") {
+			lines = append(lines, s)
+		}
+	}
+	return lines
+}
+
+// placeholderFlagProblems checks the --flag names of fenced scion lines that
+// use placeholders: the command is resolved from the tokens before the first
+// flag, and every flag must exist on it.
+func placeholderFlagProblems(lines []string, source string) []string {
+	var problems []string
+	for _, line := range lines {
+		tokens := strings.Fields(line)[1:]
+		var path []string
+		for _, tok := range tokens {
+			if strings.HasPrefix(tok, "-") {
+				break
+			}
+			path = append(path, tok)
+		}
+		cmd, _, err := rootCmd.Find(path)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("command not found: %s (from %s)", line, source))
+			continue
+		}
+		for _, tok := range tokens {
+			if !strings.HasPrefix(tok, "--") {
+				continue
+			}
+			name, _, _ := strings.Cut(strings.TrimPrefix(tok, "--"), "=")
+			if name == "" {
+				continue
+			}
+			f := cmd.Flags().Lookup(name)
+			if f == nil {
+				f = cmd.InheritedFlags().Lookup(name)
+			}
+			if f == nil {
+				problems = append(problems, fmt.Sprintf("unknown flag --%s for %q: %s (from %s)", name, cmd.CommandPath(), line, source))
+			} else if f.Deprecated != "" {
+				problems = append(problems, fmt.Sprintf("deprecated flag --%s (%s) for %q: %s (from %s)", name, f.Deprecated, cmd.CommandPath(), line, source))
+			}
+		}
+	}
+	return problems
+}
+
+// TestDocSyntax_PlatformSkillDecisions checks every fenced scion line of the
+// scion-messaging skill and its Decisions reference (ptone/scion#7830,
+// ptone/scion#8225), placeholder lines included, against the cobra tree,
+// rejects hidden/deprecated aliases (--choices, --choices-file), and verifies
+// that no example passes decisions as inline JSON: the reference teaches
+// --decisions-file.
+func TestDocSyntax_PlatformSkillDecisions(t *testing.T) {
+	files := []string{
+		"../resources/platform_skills/scion-messaging/SKILL.md",
+		"../resources/platform_skills/scion-messaging/references/decisions.md",
+	}
+	total := 0
+	for _, rel := range files {
+		lines := fencedScionLinesWithPlaceholders(t, rel)
+		total += len(lines)
+		for _, p := range placeholderFlagProblems(lines, rel) {
+			t.Error(p)
+		}
+		for _, p := range agentHelpProblems(lines, rel) {
+			t.Error(p)
+		}
+		for _, line := range lines {
+			if strings.Contains(line, "--decisions ") || strings.Contains(line, "--decisions=") {
+				t.Errorf("fenced example passes inline --decisions JSON; use --decisions-file <file>: %s (from %s)", line, rel)
+			}
+		}
+	}
+	require.GreaterOrEqual(t, total, 10, "expected the scion-messaging skill files to hold at least 10 fenced scion lines; got %d", total)
+
+	t.Run("catches_unknown_flag_on_placeholder_line", func(t *testing.T) {
+		problems := placeholderFlagProblems([]string{"scion decisions record <key> <choice-id> --form <message-id>"}, "test")
+		assert.NotEmpty(t, problems)
+		assert.Empty(t, placeholderFlagProblems([]string{"scion decisions record <key> <choice-id> --from <message-id>"}, "test"))
+	})
+
+	t.Run("catches_deprecated_choices_aliases", func(t *testing.T) {
+		assert.NotEmpty(t, findCommandProblems([]string{`scion message @alice@example.com "hi" --choices '[]'`}, "test"))
+		assert.NotEmpty(t, findCommandProblems([]string{`scion message @alice@example.com "hi" --choices-file /tmp/d.json`}, "test"))
+		assert.Empty(t, findCommandProblems([]string{`scion message @alice@example.com "hi" --decisions-file /tmp/d.json`}, "test"))
+		assert.NotEmpty(t, agentHelpProblems([]string{`scion message "conv:<id>" --choices-file <file>`}, "test"))
+		assert.NotEmpty(t, agentHelpProblems([]string{`scion message "conv:<id>" --choices <json>`}, "test"))
+		assert.Empty(t, agentHelpProblems([]string{`scion message "conv:<id>" --decisions-file <file>`}, "test"))
+	})
+}
+
+// TestDocSyntax_PlatformSkillArtifacts checks every fenced scion line of the
+// scion-artifacts skill (ptone/scion#7897), placeholder lines included,
+// against the cobra tree as agents see it in --help: the command exists and
+// is available in agent mode, and each flag exists and is not hidden.
+func TestDocSyntax_PlatformSkillArtifacts(t *testing.T) {
+	const rel = "../resources/platform_skills/scion-artifacts/SKILL.md"
+	lines := fencedScionLinesWithPlaceholders(t, rel)
+	for _, p := range placeholderFlagProblems(lines, rel) {
+		t.Error(p)
+	}
+	for _, p := range agentHelpProblems(lines, rel) {
+		t.Error(p)
+	}
+	require.GreaterOrEqual(t, len(lines), 15, "expected the scion-artifacts skill to hold at least 15 fenced scion lines; got %d", len(lines))
+
+	t.Run("catches_hidden_flag_and_human_only_command", func(t *testing.T) {
+		assert.NotEmpty(t, agentHelpProblems([]string{`scion message @a "hi" --artifact <ref> --in 5m`}, "test"))
+		assert.NotEmpty(t, agentHelpProblems([]string{"scion artifact share <ref>"}, "test"))
+		assert.Empty(t, agentHelpProblems([]string{"scion artifact publish plan.md --review <ref> --note x"}, "test"))
+	})
+}
+
+// agentHelpProblems reports fenced scion lines whose command is not
+// available in agent mode (agentAllowed) or that use a hidden flag, which
+// --help does not list.
+func agentHelpProblems(lines []string, source string) []string {
+	var problems []string
+	for _, line := range lines {
+		tokens := strings.Fields(line)[1:]
+		var path []string
+		for _, tok := range tokens {
+			if strings.HasPrefix(tok, "-") {
+				break
+			}
+			path = append(path, tok)
+		}
+		cmd, _, err := rootCmd.Find(path)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("command not found: %s (from %s)", line, source))
+			continue
+		}
+		key := strings.ReplaceAll(strings.TrimPrefix(cmd.CommandPath(), rootCmd.Name()+" "), " ", ".")
+		if !agentAllowed[key] {
+			problems = append(problems, fmt.Sprintf("%q is not available in agent mode: %s (from %s)", cmd.CommandPath(), line, source))
+		}
+		for _, tok := range tokens {
+			if !strings.HasPrefix(tok, "--") {
+				continue
+			}
+			name, _, _ := strings.Cut(strings.TrimPrefix(tok, "--"), "=")
+			f := cmd.Flags().Lookup(name)
+			if f == nil {
+				f = cmd.InheritedFlags().Lookup(name)
+			}
+			if f != nil && f.Hidden {
+				problems = append(problems, fmt.Sprintf("hidden flag --%s for %q: %s (from %s)", name, cmd.CommandPath(), line, source))
+			}
+		}
+	}
+	return problems
 }

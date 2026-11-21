@@ -20,6 +20,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
+	"strings"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
@@ -52,8 +54,9 @@ const (
 	// HubEndpointForChatBridge is the hub URL written into chat-bridge
 	// configuration.
 	HubEndpointForChatBridge HubEndpointUse = "chat_bridge"
-	// HubEndpointForPluginBrokers is the hub URL handed to in-process
-	// broker plugins together with their credentials.
+	// HubEndpointForPluginBrokers is the public hub URL handed to broker
+	// plugins together with their credentials: their public_url, and their
+	// hub_url unless server.hub.internal_url is set (Server.PluginHubURLs).
 	HubEndpointForPluginBrokers HubEndpointUse = "plugin_brokers"
 	// HubEndpointForProjectSettings is the hub.endpoint written into the
 	// settings of hub-managed project workspaces.
@@ -70,6 +73,12 @@ const (
 	// HubEndpointForConduitCheck is the hub host the conduit relay refuses
 	// as its internal_advertise address in hosted HA.
 	HubEndpointForConduitCheck HubEndpointUse = "conduit_check"
+	// HubEndpointForAgentLinks is the base URL of user-facing web agent
+	// detail links (for example in trigger acknowledgement comments).
+	HubEndpointForAgentLinks HubEndpointUse = "agent_links"
+	// HubEndpointForWebhooks is the public hub URL prefixed onto webhook
+	// endpoint ingress paths (/api/v1/hooks/{id}).
+	HubEndpointForWebhooks HubEndpointUse = "webhooks"
 )
 
 // hubEndpointKind selects one of the two resolved endpoints.
@@ -98,6 +107,8 @@ var hubEndpointUses = map[HubEndpointUse]hubEndpointKind{
 	HubEndpointForOIDCIssuer:        hubEndpointPublic,
 	HubEndpointForTransportAudience: hubEndpointPublic,
 	HubEndpointForConduitCheck:      hubEndpointPublic,
+	HubEndpointForAgentLinks:        hubEndpointPublic,
+	HubEndpointForWebhooks:          hubEndpointPublic,
 }
 
 // Public endpoint sources reported by HubEndpoints.PublicSource besides the
@@ -123,6 +134,12 @@ type HubEndpoints struct {
 	// PublicSource is HubEndpointSourceDatabase when the database value
 	// applies, otherwise OperatorSource.
 	PublicSource string
+	// Content is the content host in effect (server.hub.content_url,
+	// normalized), or "" when none is set or the value is ignored (invalid,
+	// or on the public endpoint's host name; see contentURLInEffect). Unlike
+	// the other fields it is read live: Server.HubEndpoints fills it on
+	// every call, so a saved change applies without a restart.
+	Content string
 }
 
 // For returns the endpoint the hub hands out for use: the operator endpoint
@@ -202,15 +219,48 @@ const hubEndpointSourceLabelFile = "file"
 // HubEndpoints returns the endpoints this hub resolved at startup
 // (ServerConfig.HubEndpoints, else ServerConfig.HubEndpoint for both). They
 // never change while the hub runs: server.hub.public_url is
-// restart-required.
+// restart-required. Content is the exception: it is the content host in
+// effect now (contentURLInEffect).
 func (s *Server) HubEndpoints() HubEndpoints {
-	return hubEndpointsFromConfig(s.config)
+	e := hubEndpointsFromConfig(s.config)
+	e.Content = s.contentURLInEffect(e.Public)
+	return e
 }
 
 // HubEndpointFor returns the endpoint the hub hands out for use (see
 // hubEndpointUses).
 func (s *Server) HubEndpointFor(use HubEndpointUse) string {
 	return s.HubEndpoints().For(use)
+}
+
+// AgentWebURL composes the user-facing web URL for an agent detail page
+// (`<public-base>/agents/<agentID>`, matching web/src/client/main.ts).
+// It returns "" when either the resolved base endpoint or agentID is empty.
+func (s *Server) AgentWebURL(agentID string) string {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return ""
+	}
+	base := strings.TrimRight(strings.TrimSpace(s.HubEndpointFor(HubEndpointForAgentLinks)), "/")
+	if base == "" {
+		return ""
+	}
+	return base + "/agents/" + url.PathEscape(agentID)
+}
+
+// PluginHubURLs returns the two hub URLs handed to broker plugins
+// (ptone/scion#555): hubURL, the plugin's hub_url for Hub API calls, and
+// publicURL, its public_url for user-facing links (registration links,
+// settings panels, OAuth callbacks). publicURL is always the public
+// endpoint (HubEndpointForPluginBrokers, from server.hub.public_url).
+// hubURL is server.hub.internal_url when set, else that same public
+// endpoint.
+func (s *Server) PluginHubURLs() (hubURL, publicURL string) {
+	publicURL = s.HubEndpointFor(HubEndpointForPluginBrokers)
+	if s.config.InternalURL != "" {
+		return s.config.InternalURL, publicURL
+	}
+	return publicURL, publicURL
 }
 
 // StoredPublicURL returns the server.hub.public_url saved in the settings

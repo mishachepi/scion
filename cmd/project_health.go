@@ -28,6 +28,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
+	"github.com/GoogleCloudPlatform/scion/pkg/hubsync"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 	"github.com/spf13/cobra"
 )
@@ -46,7 +47,7 @@ for a Scion project.
 
 Queries the Hub to report:
   - Agent counts across all lifecycle phases (created, provisioning, cloning, starting, running, stopping, stopped, error, suspended)
-  - Agent counts across all activity states (working, thinking, executing, waiting_for_input, blocked, completed, stalled, limits_exceeded, offline, crashed)
+  - Agent counts across all activity states (working, thinking, executing, waiting_for_input, blocked, idle, completed, harness_error, stalled, limits_exceeded, offline, crashed)
   - Detailed agent matrix with template, harness, lifecycle phase, and activity state
   - Actionable troubleshooting hints for blocked, stalled, or errored agents
 
@@ -94,8 +95,10 @@ type ProjectHealthSummary struct {
 	Executing       int `json:"executing"`
 	WaitingForInput int `json:"waitingForInput"`
 	Blocked         int `json:"blocked"`
+	Idle            int `json:"idle"`
 	Completed       int `json:"completed"`
 	LimitsExceeded  int `json:"limitsExceeded"`
+	HarnessError    int `json:"harnessError"` // running, but the harness's last turn failed on a model/API error
 	Stalled         int `json:"stalled"`
 	Offline         int `json:"offline"`
 	Crashed         int `json:"crashed"`
@@ -137,7 +140,7 @@ func runProjectHealth(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load settings: %w", err)
 	}
 
-	client, err := getHubClient(settings)
+	client, uat, err := getHubClientUAT(settings)
 	if err != nil {
 		return fmt.Errorf("failed to initialize Hub client: %w", err)
 	}
@@ -162,6 +165,11 @@ func runProjectHealth(cmd *cobra.Command, args []string) error {
 			}
 		}
 		if len(targetProjects) == 0 {
+			// A user access token without project:list sees an empty list
+			// (ptone/scion#5294).
+			if uat {
+				return hubsync.ScopedTokenProjectLookupEmptyError(query)
+			}
 			return fmt.Errorf("project '%s' not found on Hub", query)
 		}
 	} else {
@@ -246,62 +254,8 @@ func runProjectHealth(cmd *cobra.Command, args []string) error {
 			Name:      p.Name,
 			Slug:      p.Slug,
 			GitRemote: p.GitRemote,
+			Summary:   summarizeAgents(allAgents),
 			Agents:    allAgents,
-		}
-
-		report.Summary.Total = len(allAgents)
-		for _, a := range allAgents {
-			switch state.Phase(a.Phase) {
-			case state.PhaseCreated:
-				report.Summary.Created++
-			case state.PhaseProvisioning:
-				report.Summary.Provisioning++
-			case state.PhaseCloning:
-				report.Summary.Cloning++
-			case state.PhaseStarting:
-				report.Summary.Starting++
-			case state.PhaseRunning:
-				report.Summary.Running++
-			case state.PhaseSuspended:
-				report.Summary.Suspended++
-			case state.PhaseStopping:
-				report.Summary.Stopping++
-			case state.PhaseStopped:
-				report.Summary.Stopped++
-			case state.PhaseError, state.PhaseHalted:
-				report.Summary.Error++
-			default:
-				report.Summary.OtherPhase++
-			}
-
-			switch state.Activity(a.Activity) {
-			case "":
-				// No activity set (e.g., when agent is not running)
-			case state.ActivityInitializing:
-				report.Summary.Initializing++
-			case state.ActivityWorking:
-				report.Summary.Working++
-			case state.ActivityThinking:
-				report.Summary.Thinking++
-			case state.ActivityExecuting:
-				report.Summary.Executing++
-			case state.ActivityWaitingForInput:
-				report.Summary.WaitingForInput++
-			case state.ActivityBlocked:
-				report.Summary.Blocked++
-			case state.ActivityCompleted:
-				report.Summary.Completed++
-			case state.ActivityLimitsExceeded:
-				report.Summary.LimitsExceeded++
-			case state.ActivityStalled:
-				report.Summary.Stalled++
-			case state.ActivityOffline:
-				report.Summary.Offline++
-			case state.ActivityCrashed:
-				report.Summary.Crashed++
-			default:
-				report.Summary.OtherActivity++
-			}
 		}
 		reports = append(reports, report)
 	}
@@ -314,6 +268,44 @@ func runProjectHealth(cmd *cobra.Command, args []string) error {
 
 	printProjectHealthReports(os.Stdout, reports)
 	return nil
+}
+
+// summarizeAgents counts agents by phase and by activity.
+func summarizeAgents(agents []hubclient.Agent) ProjectHealthSummary {
+	var sum ProjectHealthSummary
+	sum.Total = len(agents)
+	for _, a := range agents {
+		switch state.Phase(a.Phase) {
+		case state.PhaseCreated:
+			sum.Created++
+		case state.PhaseProvisioning:
+			sum.Provisioning++
+		case state.PhaseCloning:
+			sum.Cloning++
+		case state.PhaseStarting:
+			sum.Starting++
+		case state.PhaseRunning:
+			sum.Running++
+		case state.PhaseSuspended:
+			sum.Suspended++
+		case state.PhaseStopping:
+			sum.Stopping++
+		case state.PhaseStopped:
+			sum.Stopped++
+		case state.PhaseError, state.PhaseHalted:
+			sum.Error++
+		default:
+			sum.OtherPhase++
+		}
+
+		// Suspended agents carry a retained pre-suspend activity (e.g. completed,
+		// idle, or harness_error); they are counted under Suspended, not as active
+		// activities.
+		if state.Phase(a.Phase) != state.PhaseSuspended {
+			sum.addActivity(a.Activity)
+		}
+	}
+	return sum
 }
 
 func formatPhaseSummary(s ProjectHealthSummary) string {
@@ -343,6 +335,43 @@ func formatPhaseSummary(s ProjectHealthSummary) string {
 	return strings.Join(parts, " | ")
 }
 
+// addActivity counts one agent's activity. idle is a healthy state: it is
+// counted, never flagged.
+func (s *ProjectHealthSummary) addActivity(activity string) {
+	switch state.Activity(activity) {
+	case "":
+		// No activity set (e.g., when agent is not running)
+	case state.ActivityInitializing:
+		s.Initializing++
+	case state.ActivityWorking:
+		s.Working++
+	case state.ActivityThinking:
+		s.Thinking++
+	case state.ActivityExecuting:
+		s.Executing++
+	case state.ActivityWaitingForInput:
+		s.WaitingForInput++
+	case state.ActivityBlocked:
+		s.Blocked++
+	case state.ActivityIdle:
+		s.Idle++
+	case state.ActivityCompleted:
+		s.Completed++
+	case state.ActivityLimitsExceeded:
+		s.LimitsExceeded++
+	case state.ActivityHarnessError:
+		s.HarnessError++
+	case state.ActivityStalled:
+		s.Stalled++
+	case state.ActivityOffline:
+		s.Offline++
+	case state.ActivityCrashed:
+		s.Crashed++
+	default:
+		s.OtherActivity++
+	}
+}
+
 func formatActivitySummary(s ProjectHealthSummary) string {
 	parts := []string{
 		fmt.Sprintf("Working=%d", s.Working),
@@ -357,6 +386,8 @@ func formatActivitySummary(s ProjectHealthSummary) string {
 		{"Starting", s.Initializing},
 		{"Executing", s.Executing},
 		{"WaitingForInput", s.WaitingForInput},
+		{"Idle", s.Idle},
+		{"HarnessError", s.HarnessError},
 		{"Stalled", s.Stalled},
 		{"LimitsExceeded", s.LimitsExceeded},
 		{"Offline", s.Offline},
@@ -420,13 +451,16 @@ func printProjectHealthReports(w io.Writer, reports []ProjectHealthReport) {
 		_ = tw.Flush()
 
 		// Troubleshooting hints for degraded states
-		if r.Summary.Blocked > 0 || r.Summary.Error > 0 || r.Summary.Stalled > 0 {
+		if r.Summary.Blocked > 0 || r.Summary.Error > 0 || r.Summary.HarnessError > 0 || r.Summary.Stalled > 0 {
 			_, _ = fmt.Fprintln(w)
 			if r.Summary.Blocked > 0 {
 				_, _ = fmt.Fprintf(w, "  ! %d agent(s) are blocked — run 'scion look <agent>' to see the block reason.\n", r.Summary.Blocked)
 			}
 			if r.Summary.Error > 0 {
 				_, _ = fmt.Fprintf(w, "  x %d agent(s) are in error phase. Run 'scion logs <agent>' or 'scion reset-auth <agent>'.\n", r.Summary.Error)
+			}
+			if r.Summary.HarnessError > 0 {
+				_, _ = fmt.Fprintf(w, "  x %d agent(s) have a harness error (harness alive; a new message retries). Run 'scion list' for the reason.\n", r.Summary.HarnessError)
 			}
 			if r.Summary.Stalled > 0 {
 				_, _ = fmt.Fprintf(w, "  ! %d agent(s) are stalled. Run 'scion look <agent>' to check terminal state.\n", r.Summary.Stalled)

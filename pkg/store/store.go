@@ -48,6 +48,18 @@ var (
 	// GetActiveReservation to tell a retry from a conflict.
 	ErrActiveReservationExists = fmt.Errorf("%w: resource holds an active usage reservation for this limit", ErrAlreadyExists)
 
+	// ErrTransferRaced is returned by TransferBrokerReservation when its
+	// release matched no row although the row was read under lock.
+	// Unreachable by construction; returned (after rollback) so the
+	// contract fails closed. Retryable.
+	ErrTransferRaced = errors.New("store: reservation transfer raced")
+
+	// ErrInvalidTransfer is returned by TransferBrokerReservation for a
+	// contradictory request (CreateIfAbsent together with
+	// FromReservationID), before the transaction starts. The hub also wraps
+	// it when it refuses a transfer to an empty broker ID.
+	ErrInvalidTransfer = errors.New("store: invalid reservation transfer request")
+
 	// ErrTransient marks a database conflict that a retry resolves: a
 	// Postgres serialization failure or deadlock, or a busy or locked
 	// SQLite database. The entadapter WithTx wraps such errors with it.
@@ -134,6 +146,11 @@ var (
 	// synchronous send on this error (design §3.4, NB-1); it means a
 	// concurrent write (e.g. a stop) landed first.
 	ErrInvalidPhase = errors.New("agent phase is not eligible for this launch")
+
+	// ErrScheduledExecOverlap is returned by CreateScheduledExecRun when a
+	// recurring schedule already has an unfinished exec run whose DB lease
+	// has not ended (ptone/scion#7884).
+	ErrScheduledExecOverlap = errors.New("scheduled exec run overlap")
 )
 
 // SystemReconcileCreatedBy is the CreatedBy sentinel that identifies the
@@ -190,12 +207,15 @@ type Store interface {
 	// ptone/scion#2483 §2.3), as ONE transaction: it reads the agent
 	// (row-locked where supported), evaluates pred, and when it holds
 	// either applies set (DeletionFinalizeSoft, with UpdateAgentDeletion's
-	// semantics, Derive included) or removes the agent row and its cascade
-	// (DeletionFinalizeHard, as DeleteAgent). Then, still inside the
-	// transaction and just before commit, it calls hook (when non-nil) with
-	// a transaction-scoped Store, the agent (the post-write row for soft,
-	// the pre-delete row for hard) and the mode; a non-nil hook error rolls
-	// the whole finalize back and is returned. Returns affected=0 with a nil
+	// semantics, Derive included, except that soft mode alone also accepts
+	// DeletionFields.SoftFinishRunID and SoftFinishPreviousRunIDs) or
+	// removes the agent row and its cascade (DeletionFinalizeHard, as
+	// DeleteAgent; a set carrying those run fields is refused with
+	// ErrInvalidInput). Then, still inside the transaction and just before
+	// commit, it calls hook (when non-nil) with a transaction-scoped Store,
+	// the agent (the post-write row for soft, the pre-delete row for hard)
+	// and the mode; a non-nil hook error rolls the whole finalize back and
+	// is returned. Returns affected=0 with a nil
 	// error when the predicate did not hold or the agent does not exist.
 	// Must not be called from inside WithTx.
 	FinalizeAgentDeletion(ctx context.Context, id string, pred DeletionPredicate, mode DeletionFinalizeMode, set DeletionFields, hook DeletionFinalizeHook) (affected int, err error)
@@ -410,6 +430,9 @@ type Store interface {
 	// BrokerDispatch operations (multi-node command dispatch)
 	BrokerDispatchStore
 
+	// Hold-until-session re-drive operations (ptone/scion#7881)
+	MessageHoldStore
+
 	// Template operations
 	TemplateStore
 
@@ -431,11 +454,20 @@ type Store interface {
 	// Secret operations
 	SecretStore
 
+	// Pending (agent-written, awaiting owner approval) user secrets
+	PendingSecretStore
+
+	// Secret encryption policy and migration records
+	SecretEncryptionStore
+
 	// Group operations (Hub Permissions System)
 	GroupStore
 
 	// User Access Token operations
 	UserAccessTokenStore
+
+	// Forced user deletion tombstones (ptone/scion#2143)
+	UserDeletionStore
 
 	// Broker Secret operations (Runtime Broker authentication)
 	BrokerSecretStore
@@ -448,6 +480,12 @@ type Store interface {
 
 	// Schedule operations (Recurring Schedules)
 	ScheduleStore
+
+	// Scheduled exec run operations (ptone/scion#7883)
+	ScheduledExecRunStore
+
+	// Trigger and webhook endpoint operations (ptone/scion#7961)
+	TriggerStore
 
 	// GCP Service Account operations (GCP Identity for Agents)
 	GCPServiceAccountStore
@@ -546,6 +584,15 @@ type Store interface {
 
 	// Workload-bound issuer delegations (test identities, ptone/scion#4240)
 	TestIdentityDelegationStore
+
+	// Decision prompt decisions and answers (ptone/scion#7514)
+	DecisionStore
+
+	// System One provider instances (ptone/scion#8044)
+	SystemOneInstanceStore
+
+	// Project-scoped message admission policies and decisions (ptone/scion#8047)
+	MessagePolicyStore
 }
 
 // AgentStore defines agent-related persistence operations.
@@ -695,6 +742,14 @@ type AgentStore interface {
 	// When cred is non-nil it is created in the same transaction as the
 	// run-ID write, with RunID set to runID: either both are recorded or
 	// neither is.
+	//
+	// runID MUST be newly generated for this dispatch (a fresh UUID): the
+	// lifecycle run attribution trusts an observed mint as a fresh run
+	// (WP1 attribution design v2.8, section 6.1). Reusing an older run ID
+	// here is a contract violation; the producer rejects detectable reuse
+	// and fails closed, but an older run whose previous-run record was
+	// cleared by a settle is not detectable. The single production caller
+	// is pinned by pkg/hub TestSetAgentRunIDHasOneFreshMintCaller.
 	SetAgentRunID(ctx context.Context, agentID, runID string, cred *AgentCredential) (previous string, err error)
 
 	// SetAgentSSHHostKey records publicKey (an authorized_keys line) as the
@@ -727,10 +782,11 @@ type AgentStore interface {
 
 	// AdoptAgentRunID is CompareAndSwapAgentRunID (expectedRunID to
 	// newRunID, clearing PreviousRunIDs) for the hub's heartbeat adoption
-	// of a stranded run (ptone/scion#3661) and for the settle of a
-	// succeeded launch report (ptone/scion#2965). It swaps only while
-	// RunIDUpdatedAt is set and no later than unchangedSince, so a run_id
-	// that changed and changed back after the caller's read is not
+	// of a stranded run (ptone/scion#3661) and for the settle of an applied
+	// succeeded launch report (ptone/scion#2965). The adoption is observed
+	// with the adoption_source RunAdoptionSourceFrom(ctx) returns. It swaps
+	// only while RunIDUpdatedAt is set and no later than unchangedSince, so a
+	// run_id that changed and changed back after the caller's read is not
 	// adopted. Like SetAgentRunID, it writes nothing while the row is
 	// soft-deleted or a delete holds it, so a delete's claim snapshot never
 	// misses the adopted run. It reports whether it swapped; a missing
@@ -741,6 +797,19 @@ type AgentStore interface {
 	// value unchanged does not.
 	AdoptAgentRunID(ctx context.Context, agentID, expectedRunID, newRunID string, unchangedSince time.Time) (bool, error)
 
+	// SettleLaunchedRun settles the run of an async launch whose succeeded
+	// report was answered Completed (the launch had already ended, for
+	// example RunningObserved, or the report is a resend after a settle that
+	// failed or never ran): one conditional swap from f.FromRunID to
+	// f.ToRunID, clearing PreviousRunIDs, applied only while the row still
+	// holds f.FromRunID as both run_id and launch_run_id, run_id_updated_at
+	// is set and no later than f.UnchangedSince, launch_id, runtime_broker_id
+	// and generation equal the fence's, and the row is not soft-deleted and
+	// held by no delete (WP1 slice 3b, ptone/scion#5927). It is observed as a
+	// run_adopt with adoption_source cas. It reports whether it swapped; a
+	// missing agent reports false with no error.
+	SettleLaunchedRun(ctx context.Context, agentID string, f LaunchSettleFence) (bool, error)
+
 	// RecordBrokerReportedRuns records that brokerID, which is not the
 	// agent's assigned broker, reported a runtime entry of each listed
 	// agent carrying the listed run (ptone/scion#3661): one row per
@@ -750,6 +819,42 @@ type AgentStore interface {
 	// row was just removed) is skipped and reported in the returned error;
 	// the others are still recorded.
 	RecordBrokerReportedRuns(ctx context.Context, brokerID string, runs []BrokerReportedRun, seenAt, pruneBefore time.Time) error
+
+	// RecordRuntimeOrphans records the instance orphans one complete
+	// heartbeat inventory of brokerID reported (ptone/scion#7930). Each
+	// orphan whose RuntimeTarget is in completeTargets is upserted on its
+	// identity (kind, broker, target, project, slug, agent ID) with
+	// last_seen_at = now and missed_inventories 0; a new row also gets
+	// first_seen_at = now and is returned in created. Every other instance
+	// row of brokerID on a target in completeTargets has missed_inventories
+	// incremented and is deleted once it reaches removeAfter. Orphans on
+	// other targets are ignored, and rows on other targets are untouched.
+	// A failed write does not stop the others; the errors are joined.
+	RecordRuntimeOrphans(ctx context.Context, brokerID string, completeTargets []string, orphans []RuntimeOrphan, now time.Time, removeAfter int) (created []RuntimeOrphan, err error)
+
+	// RecordNFSOrphans records the kind=nfs_tree orphans observed by a hub
+	// scan of shared NFS project storage (ptone/scion#7932). Every row is
+	// recorded with kind=nfs_tree and broker_id="hub" (RuntimeOrphanBrokerHub);
+	// runtime_target identifies the tree kind ("agent-root", "agent-home", or
+	// "agent-secrets", share-qualified as "<share>/<tree>" when the hub's
+	// workspace and shared-dir layouts use separate mounts) so home-<agentID>
+	// and secrets-<agentID> for the same orphaned agent ID do not collide on
+	// the unique index (kind, broker_id, runtime_target, project_id, slug,
+	// agent_id). Each observed orphan is upserted with last_seen_at = now; a
+	// new row also gets first_seen_at = now and is returned in created.
+	// Existing kind=nfs_tree rows absent from orphans are removed ONLY when
+	// complete is true (the scan finished without hitting the per-run
+	// directory bound or skipping projects due to errors). Instance rows are
+	// never touched. A failed write does not stop the others; errors are joined.
+	RecordNFSOrphans(ctx context.Context, orphans []RuntimeOrphan, now time.Time, complete bool) (created []RuntimeOrphan, err error)
+
+	// ListRuntimeOrphans returns the runtime orphans filter selects,
+	// ordered by first_seen_at.
+	ListRuntimeOrphans(ctx context.Context, filter RuntimeOrphanFilter) ([]RuntimeOrphan, error)
+
+	// CountRuntimeOrphans returns the number of runtime orphans per
+	// broker, kind and reason.
+	CountRuntimeOrphans(ctx context.Context) ([]RuntimeOrphanCount, error)
 
 	// AgentRunReportedSince reports whether a broker other than the
 	// agent's assigned broker reported an entry of agentID carrying runID
@@ -790,6 +895,69 @@ type AgentStore interface {
 	// Returns the updated agent records for event publishing.
 	MarkStalledAgents(ctx context.Context, activityThreshold, heartbeatRecency time.Time) ([]Agent, error)
 
+	// ListIdleSuspendCandidates returns non-deleted running agents holding a
+	// suspend-eligible activity (state.SuspendEligibleActivities) whose
+	// activity_since is non-NULL and predates cutoff, whose heartbeat
+	// (last_seen) is at or after heartbeatRecency, and whose
+	// last_live_process_at is NULL or predates liveWorkCutoff, ordered by
+	// activity_since ascending (and id ascending as tiebreaker). When after is
+	// non-nil, only rows strictly after (after.ActivitySince, after.ID) are
+	// returned so sweeps can advance past non-resumable or already-queued rows.
+	// Rows whose idle_suspend_claim_until is at or after backoffCutoff are not
+	// returned: an abandoned idle suspend leaves its stamp (run_intent back to
+	// running) as the backoff marker. A zero backoffCutoff disables that skip.
+	// Offline agents and rows with a NULL activity_since are never returned. A
+	// positive limit bounds the number of rows returned.
+	ListIdleSuspendCandidates(ctx context.Context, cutoff, heartbeatRecency, liveWorkCutoff, backoffCutoff time.Time, after *IdleSuspendCursor, limit int) ([]Agent, error)
+
+	// ClaimIdleSuspend atomically checks that agentID still satisfies cond on
+	// the locked row (phase=running, matching run_id/activity/activity_since
+	// past grace, recent heartbeat when HeartbeatRecency > 0, stale live work,
+	// no start/delete/reincarnation claim, and no delivery since
+	// activity_since), swaps run_intent to stopped, and sets
+	// idle_suspend_claim_until to storeNow+cond.ClaimTTL (returned as
+	// claimUntil). Returns ErrIdleSuspendPrecondition when any guard fails.
+	ClaimIdleSuspend(ctx context.Context, agentID string, cond IdleSuspendCondition) (prior RunIntent, at time.Time, claimUntil time.Time, err error)
+
+	// ListExpiredIdleSuspendClaims returns non-deleted agents whose
+	// idle_suspend_claim_until is set and has expired on the store clock, with
+	// run_intent=stopped and phase stopping, stopped or error: idle suspends
+	// whose stop landed but whose suspended(idle) record did not (commit write
+	// failure, hub restart, unknown stop outcome). Ordered by claim expiry, then
+	// id. A positive limit bounds the rows returned. The caller records each one
+	// with AgentStatusUpdate.IfIdleSuspendRecover.
+	ListExpiredIdleSuspendClaims(ctx context.Context, limit int) ([]Agent, error)
+
+	// ListAbandonedIdleSuspendClaims returns non-deleted agents still in phase
+	// running whose idle_suspend_claim_until expired at least expiredFor ago on
+	// the store clock, with run_intent=stopped: idle suspends whose stop never
+	// landed. Ordered by claim expiry, then id; a positive limit bounds the
+	// rows. Only rows with a heartbeat (last_seen) after the claim stamp are
+	// returned: a heartbeat since proves the container is alive. The caller
+	// abandons each with AbandonIdleSuspend.
+	ListAbandonedIdleSuspendClaims(ctx context.Context, expiredFor time.Duration, limit int) ([]Agent, error)
+
+	// AbandonIdleSuspend gives up an idle suspend whose stop never landed, under
+	// the row lock and the store clock: it requires the exact claimUntil stamp,
+	// expired at least expiredFor ago, the same runID, phase running,
+	// run_intent=stopped written at intentAt (a newer stopped intent, for
+	// example a membership hold's, is not reverted), no start claim,
+	// reincarnation or deletion; then it reverts run_intent to running and
+	// records message on the row. The stamp is KEPT as the backoff marker
+	// (ClaimIdleSuspend and ListIdleSuspendCandidates skip a row whose stamp is
+	// newer than the backoff); any user or hub lifecycle write clears it. Otherwise ErrIdleSuspendPrecondition, nothing written.
+	AbandonIdleSuspend(ctx context.Context, agentID string, claimUntil time.Time, runID string, intentAt time.Time, expiredFor time.Duration, message string) error
+
+	// ClearIdleSuspendClaim clears idle_suspend_claim_until on agentID.
+	ClearIdleSuspendClaim(ctx context.Context, agentID string) error
+
+	// MarkAgentDelivery records last_delivery_at on agentID under the row lock
+	// when no active idle-suspend claim is held (evaluated against the store
+	// clock) and the agent is running or starting, and returns the fresh Agent
+	// snapshot (with IdleSuspendClaimActive populated from the store clock) and
+	// claimActive for delivery/auto-wake classification.
+	MarkAgentDelivery(ctx context.Context, agentID string) (agent *Agent, claimActive bool, err error)
+
 	// MarkAgentContainerMissing moves a running (or stopping) agent whose
 	// container its runtime broker no longer reports to phase=error with exit reason
 	// container_missing. An exit reason that is more specific about why the
@@ -825,30 +993,50 @@ type AgentStore interface {
 
 	// ClearAgentRuntimeTarget removes the runtime target and any runtime
 	// target candidate recorded in an agent's applied config
-	// (AgentAppliedConfig.RuntimeTarget, RuntimeTargetCandidate) and changes
-	// no other applied-config key. When it removes something it bumps
-	// state_version by exactly one, so a writer holding a read from before
-	// the clear gets ErrVersionConflict from UpdateAgent instead of writing
-	// the old target back; it returns cleared=true and the new state_version.
-	// The write is conditional on the stored applied config and state_version
-	// being unchanged since they were read (and the row is locked for the
-	// read where supported); when a concurrent write wins, the row is re-read
-	// and the clear retried a bounded number of times, after which an error
-	// is returned. It is a no-op (cleared=false) when neither key is recorded
-	// or the agent does not exist.
-	ClearAgentRuntimeTarget(ctx context.Context, id string) (cleared bool, newVersion int64, err error)
+	// (AgentAppliedConfig.RuntimeTarget, RuntimeTargetCandidate). With
+	// recordPending it also records the pending target
+	// (AgentAppliedConfig.RuntimeTargetPending): the target it removes, else
+	// the pending target already recorded, else RuntimeTargetPendingDefault.
+	// It changes no other applied-config key. When it removes a target or
+	// candidate it bumps state_version by exactly one, so a writer holding a
+	// read from before the clear gets ErrVersionConflict from UpdateAgent
+	// instead of writing the old target back; it returns cleared=true and the
+	// new state_version. Recording only the pending target does not bump
+	// state_version (cleared=false). The write is conditional on the stored
+	// applied config and state_version being unchanged since they were read
+	// (and the row is locked for the read where supported); when a concurrent
+	// write wins, the row is re-read and the clear retried a bounded number
+	// of times, after which an error is returned. It writes nothing
+	// (cleared=false) when there is nothing to change, when the applied
+	// config is empty, NULL or the JSON literal null, or when the agent does
+	// not exist.
+	ClearAgentRuntimeTarget(ctx context.Context, id string, recordPending bool) (cleared bool, newVersion int64, err error)
 
 	// SetAgentRuntimeTarget sets the runtime target and runtime target
 	// candidate in an agent's applied config (AgentAppliedConfig.RuntimeTarget,
-	// RuntimeTargetCandidate; an empty value removes the key) and changes
-	// nothing else: no other applied-config key, no other column, and not
-	// state_version. The write is conditional on state_version still being
-	// expectedVersion (the version the caller read), so a report based on a
-	// read from before ClearAgentRuntimeTarget, which bumps state_version,
-	// is rejected. It returns written=false, with no error, when the version
-	// no longer matches, the applied config changed concurrently, or the
-	// agent does not exist.
+	// RuntimeTargetCandidate; an empty value removes the key) and, when the
+	// target is not empty, removes the pending target
+	// (RuntimeTargetPending). It changes nothing else: no other applied-config
+	// key, no other column, and not state_version. The write is conditional
+	// on state_version still being expectedVersion (the version the caller
+	// read), so a report based on a read from before ClearAgentRuntimeTarget,
+	// which bumps state_version, is rejected. It returns written=false, with
+	// no error, when the version no longer matches, the applied config
+	// changed concurrently, or the agent does not exist.
 	SetAgentRuntimeTarget(ctx context.Context, id string, expectedVersion int64, target, candidate string) (written bool, err error)
+
+	// SetAgentNativeCloudRun sets (native true) or removes (native false)
+	// AgentAppliedConfig.NativeCloudRun in an agent's applied config and
+	// changes nothing else: no other applied-config key, no other column,
+	// and not state_version, so a dispatch can record it before its broker
+	// call without conflicting with its caller's own later write. The read
+	// and write run in one transaction, retried when the applied config
+	// changes concurrently. Returns ErrNotFound when no live row exists.
+	//
+	// It is the only writer of that key: every other write of the applied
+	// config (UpdateAgent, UpdateAgentConfig, CreateAgent and the rest)
+	// keeps the value the row holds, whatever the caller's copy says.
+	SetAgentNativeCloudRun(ctx context.Context, id string, native bool) error
 
 	// FindOrphanedAgents returns agents whose RuntimeBrokerID references a broker
 	// that is offline or does not exist, and who are not in terminal states
@@ -904,6 +1092,13 @@ type AgentStore interface {
 	// not created or provisioning. Returns ErrNotFound if the agent doesn't
 	// exist.
 	BeginLaunch(ctx context.Context, agentID, kind string, timeout time.Duration) (launchID string, err error)
+
+	// BeginLaunchWithOptions is BeginLaunch with the dispatcher's options:
+	// opts.RunID is the run beginRun minted for this launch, bound as the
+	// launch's launch_run_id only when the row still holds it (otherwise
+	// ""). Only opts.RunID is used for a create launch. BeginLaunch is
+	// BeginLaunchWithOptions with zero options (no binding).
+	BeginLaunchWithOptions(ctx context.Context, agentID, kind string, timeout time.Duration, opts BeginLaunchOptions) (launchID string, err error)
 
 	// BeginStartLaunch starts a new start or restart launch for agentID
 	// (ptone/scion#4669), with BeginLaunch's other rules. kind must be
@@ -985,11 +1180,20 @@ type AgentStore interface {
 
 	// SwapRunIntent is SetRunIntent that also returns the intent the row
 	// held before the write ("" for none), read under the same row lock.
+	// Used for user-initiated lifecycle actions, which preempt any active
+	// idle-suspend claim in the same write.
 	//
 	// SetRunIntent and SwapRunIntent return ErrDeleteInProgress, and write
 	// nothing, for RunIntentRunning on a row a delete holds
 	// (DeletionHoldsRow) or a soft-deleted row (ptone/scion#2550).
 	SwapRunIntent(ctx context.Context, agentID string, intent RunIntent) (prior RunIntent, at time.Time, err error)
+
+	// SwapSystemRunIntent is SwapRunIntent for system-initiated writers (such as
+	// stalled auto-suspend and membership-loss hold): it yields with
+	// ErrIdleSuspendPrecondition, writing nothing and preserving
+	// idle_suspend_claim_until, whenever an unexpired idle-suspend claim is held
+	// on the locked row.
+	SwapSystemRunIntent(ctx context.Context, agentID string, intent RunIntent) (prior RunIntent, at time.Time, err error)
 
 	// RevertRunIntent sets run_intent to `to` only if the row still holds
 	// `from` written at exactly fromAt (the value SetRunIntent returned);
@@ -1137,6 +1341,12 @@ type AgentFilter struct {
 	// empty it filters on run_intent alone. omitempty keeps list cursor
 	// bindings (a hash of the encoded filter) unchanged when it is unset.
 	OrRunIntent string `json:",omitempty"`
+
+	// OrActiveIdleClaim, when true alongside non-empty Phase and OrRunIntent,
+	// also matches agents holding an unexpired idle_suspend_claim_until >
+	// storeNow (used by stop-all when lifecycle.idle_suspend is enabled;
+	// omitted when off so ListAgents incurs zero extra store-clock query).
+	OrActiveIdleClaim bool `json:",omitempty"`
 
 	// MemberOrOwnerProjectIDs, when non-empty, restricts results to agents
 	// whose project_id is in this set OR whose owner_id matches OwnerID.
@@ -1415,6 +1625,10 @@ type AgentStatusUpdate struct {
 	TaskSummary     string            `json:"taskSummary,omitempty"`
 	Heartbeat       bool              `json:"heartbeat,omitempty"`
 	Metadata        map[string]string `json:"metadata,omitempty"`
+	// LiveWork is the live work the container's heartbeat reports
+	// (ptone/scion#7855); nil when there is none. It sets
+	// last_live_process_at, and last_live_work_at when SuppressStall is set.
+	LiveWork *LiveWork `json:"liveWork,omitempty"`
 
 	// Limits tracking (reported by sciontool)
 	CurrentTurns      *int   `json:"currentTurns,omitempty"`
@@ -1469,6 +1683,47 @@ type AgentStatusUpdate struct {
 	// stop dispatched for run X sets it to X, so the stop never marks a
 	// newer run stopped. Internal to the hub — json:"-".
 	IfRunID string `json:"-"`
+	// IfIdleSuspendCommit, when non-nil, guards the post-stop status write of
+	// an idle auto-suspend whose ClaimIdleSuspend already committed: the locked
+	// row must not be soft-deleted, held by a deletion or reincarnation, or
+	// claimed by a start, must still hold the exact unexpired
+	// idle_suspend_claim_until timestamp recorded by ClaimIdleSuspend with
+	// run_intent=stopped (not stop-queued), and must be in phase running,
+	// stopping, stopped, or error (from container/runtime reports for the same
+	// run); otherwise UpdateAgentStatus returns ErrIdleSuspendPrecondition and
+	// writes nothing. Internal to the hub — json:"-".
+	IfIdleSuspendCommit *time.Time `json:"-"`
+	// IfIdleSuspendRecover, when non-nil, guards the sweep's recovery write of
+	// an idle auto-suspend whose claim lease has expired without the commit
+	// landing: the same row conditions as IfIdleSuspendCommit, but the exact
+	// idle_suspend_claim_until must have expired on the store clock, and the
+	// phase must be stopping, stopped or error (never running). The write clears
+	// the claim. Otherwise ErrIdleSuspendPrecondition, nothing written.
+	// Internal to the hub — json:"-".
+	IfIdleSuspendRecover *time.Time `json:"-"`
+	// RetainedActivity, when non-empty on a Phase=suspended update, supplies
+	// the pre-stop retained activity (idle, completed or harness_error) to
+	// preserve if a container or runtime shutdown report already transitioned
+	// the row to stopped or error and cleared or replaced current.Activity
+	// before the hub's post-stop status write ran. Internal to the hub —
+	// json:"-".
+	RetainedActivity string `json:"-"`
+	// IfNoStartClaim, when true, makes the update conditional on no start
+	// claim (or active idle-suspend claim) being held on the locked row;
+	// otherwise UpdateAgentStatus returns ErrClaimPredicate and writes nothing.
+	// Internal to the hub — json:"-".
+	IfNoStartClaim bool `json:"-"`
+	// IfNoActiveIdleClaim, when true, makes the update conditional on no
+	// unexpired idle-suspend claim being held on the locked row (without
+	// rejecting an unconfirmed start claim belonging to the run being stopped);
+	// otherwise UpdateAgentStatus returns ErrClaimPredicate and writes nothing.
+	// Internal to the hub — json:"-".
+	IfNoActiveIdleClaim bool `json:"-"`
+	// IfAutoWakeReason, when true, makes the update conditional on the stored
+	// suspend_reason being an auto-waking reason (idle or stalled); otherwise
+	// UpdateAgentStatus returns ErrPhaseMismatch and writes nothing. Internal
+	// to the hub — json:"-".
+	IfAutoWakeReason bool `json:"-"`
 	// StartWrite marks a start's own post-dispatch status write. Its delete
 	// guard uses the start-block rule (DeletionHoldsRow) instead of the
 	// lease-aware active rule: a finalizing row holds even with its lease
@@ -1491,8 +1746,8 @@ type AgentStatusUpdate struct {
 	// about the agent's run: the broker heartbeat handler (runtime) or the
 	// agent's own status endpoint (agent). Hub-internal writes leave it
 	// empty. Only the handlers set it, never a request body (json:"-"):
-	// the run check, halted's stickiness and the halt rule read it, and
-	// only a runtime report can halt an agent.
+	// the run check, suspended's and halted's stickiness, and the halt rule
+	// read it, and only a runtime report can halt an agent.
 	ReportSource StatusReportSource `json:"-"`
 	// ReportRunID is the run a status report came from: the run of the
 	// broker heartbeat's agent entry, or the run of the agent token that
@@ -1501,12 +1756,26 @@ type AgentStatusUpdate struct {
 	// last-seen and updated timestamps are written. Internal to the hub —
 	// json:"-".
 	ReportRunID string `json:"-"`
+	// ReportAgentToken marks a self-report sent with an agent token (the
+	// agent's own identity), as opposed to a user or service with update
+	// access, whose reports carry no run either. With ReportRunID empty it
+	// is a run-less agent token, and on a row that has a minted run
+	// (RunIDUpdatedAt set) its status fields are dropped: a label-less or
+	// pre-run agent cannot move the phase of a run it does not belong to.
+	// Set only by the agent status handler, never from a body (json:"-").
+	ReportAgentToken bool `json:"-"`
 	// Restore marks a hub write that puts back a phase saved before a
 	// failed start (the start dispatch's rollback). It is the only write
 	// that may store phase halted directly; any other update carrying
 	// Phase "halted" has its phase dropped, and the halt rule does not
 	// apply to it. Internal to the hub — json:"-".
 	Restore bool `json:"-"`
+	// SuspendReason, when non-empty and the update writes phase suspended,
+	// records why (state.SuspendReason). An empty value writes nothing, so
+	// a report that merely repeats the suspended phase keeps the stored
+	// reason. Leaving suspended clears it (entc.ClearSuspendReasonHook).
+	// Internal to the hub — json:"-".
+	SuspendReason string `json:"-"`
 	// Result, when non-nil, is filled by a successful UpdateAgentStatus
 	// with what the write did (see AgentStatusResult). The caller owns it;
 	// it is left as it was on error. Internal to the hub — json:"-".
@@ -1610,13 +1879,14 @@ type ProjectStore interface {
 
 // ProjectFilter defines criteria for filtering projects.
 type ProjectFilter struct {
-	OwnerID         string
-	GitRemotePrefix string
-	GitRemote       string // Filter by exact git remote (case-sensitive)
-	BrokerID        string // Filter by contributing broker
-	Name            string // Filter by exact name (case-insensitive)
-	Slug            string // Filter by exact slug (case-insensitive)
-	Search          string // Substring match on name and slug (case-insensitive)
+	OwnerID              string
+	GitRemotePrefix      string
+	GitRemote            string // Filter by exact git remote (case-sensitive)
+	GitHubInstallationID *int64 // Filter by associated GitHub App installation ID
+	BrokerID             string // Filter by contributing broker
+	Name                 string // Filter by exact name (case-insensitive)
+	Slug                 string // Filter by exact slug (case-insensitive)
+	Search               string // Substring match on name and slug (case-insensitive)
 
 	// MemberOrOwnerIDs, when non-empty, restricts results to projects whose ID
 	// is in this set OR whose owner_id matches OwnerID. OwnerID and this
@@ -1659,6 +1929,14 @@ type RuntimeBrokerStore interface {
 	// CreateRuntimeBroker creates a new runtime broker record.
 	CreateRuntimeBroker(ctx context.Context, broker *RuntimeBroker) error
 
+	// CreateRuntimeBrokerClearingCredentials creates a new runtime broker
+	// record and, in the same transaction, deletes any broker secret and join
+	// token stored for its ID, so a row created with an ID an earlier row had
+	// starts without that row's credential. Used where the ID is fixed or
+	// supplied by the caller (plugin, co-located, flat and registered
+	// brokers).
+	CreateRuntimeBrokerClearingCredentials(ctx context.Context, broker *RuntimeBroker) error
+
 	// GetRuntimeBroker retrieves a runtime broker by ID.
 	// Returns ErrNotFound if the broker doesn't exist.
 	GetRuntimeBroker(ctx context.Context, id string) (*RuntimeBroker, error)
@@ -1694,9 +1972,33 @@ type RuntimeBrokerStore interface {
 	// broker. p must not be nil.
 	SetRuntimeBrokerPresentation(ctx context.Context, brokerID, targetID string, p *api.RuntimeTargetPresentation, hash string, epoch, seq int64, observedAt time.Time) (PresentationOutcome, error)
 
+	// SetRuntimeBrokerConversionPlan stores a legacy Runtime Broker's
+	// reported conversion plan with one conditional update bound to the
+	// row and to its having no runtime target. A flat row is refused
+	// (ErrRuntimeBrokerNotLegacy). When hash differs from the stored hash
+	// it writes p, hash and observed-at (PresentationWritten); when it is
+	// equal it writes only observed-at, and only when that is older than
+	// PresentationObservedRefresh (PresentationConfirmed). hash is computed
+	// by the caller (the Hub) over p. p must not be nil.
+	SetRuntimeBrokerConversionPlan(ctx context.Context, brokerID string, p *api.ConversionPlanPresentation, hash string, observedAt time.Time) (PresentationOutcome, error)
+
 	// UpdateRuntimeBroker updates an existing runtime broker.
 	// Returns ErrNotFound if the broker doesn't exist.
 	UpdateRuntimeBroker(ctx context.Context, broker *RuntimeBroker) error
+
+	// RefreshRuntimeBrokerState is the heartbeat's write. It reads the
+	// broker, calls refresh on that copy and, when refresh reports a
+	// change, writes only Capabilities, WorkspaceStorage, DefaultProfile,
+	// Health, Profiles and Version (the broker's build token), as a
+	// compare-and-set on the row's lock version. A concurrent write
+	// between the read and the write makes it retry with a fresh read, so
+	// refresh may run more than once and must change only those fields;
+	// changes it makes to any other field are not stored.
+	// Every other column keeps whatever a concurrent writer stored. On a
+	// flat row Profiles and DefaultProfile are stored empty, as
+	// UpdateRuntimeBroker does. Returns ErrNotFound if the broker doesn't
+	// exist and ErrVersionConflict when the retries run out.
+	RefreshRuntimeBrokerState(ctx context.Context, id string, refresh func(broker *RuntimeBroker) (changed bool)) error
 
 	// SetRuntimeBrokerCreatedByIfEmpty atomically sets created_by on a runtime
 	// broker, but only if the row's created_by is currently empty. Returns
@@ -1866,8 +2168,42 @@ type BrokerDispatchStore interface {
 	// MarkMessageDispatched CAS-flips a message pending->dispatched (dedupes drains).
 	MarkMessageDispatched(ctx context.Context, id string) (dispatched bool, err error)
 
-	// MarkMessageFailed sets a message's dispatch_state to "failed" with a reason.
+	// MarkMessageFailed sets a message's dispatch_state to "failed" with a
+	// reason. A failed or delivered row is left alone; a delivering row
+	// also gets the stored outcome DeliveryOutcomeUnknownPartial.
 	MarkMessageFailed(ctx context.Context, id string, reason string) error
+
+	// FailUndeliveredMessage is MarkMessageFailed for a broker's async
+	// failure report: only a pending, dispatched, delivering or partial row
+	// is failed, in one conditional write. It reports whether this call
+	// made the transition; a failure notice is sent only then.
+	FailUndeliveredMessage(ctx context.Context, id string, reason string) (bool, error)
+
+	// BindMessageDelivery binds the rows messageIDs, all addressed to agent
+	// recipientID, to one deliver-message flush deliveryID in one
+	// transaction (design v2.22 §2.6): every row in a bindable state moves
+	// to delivering with delivery_id and delivering_at = now, or nothing
+	// changes. A same-id call while the rows are delivering is DeliveryInFlight (another call owns the delivery), a same-id call on final
+	// rows DeliveryReplay; anything else is DeliveryConflict. A missing row,
+	// or one addressed to another agent, is store.ErrNotFound.
+	BindMessageDelivery(ctx context.Context, recipientID, deliveryID string, messageIDs []string, now time.Time) (DeliveryBind, error)
+
+	// UnbindMessageDelivery moves the rows still delivering under
+	// deliveryID back to dispatched (compare-and-set on the id), after the
+	// hub's own call proved nothing was pasted. Rows in any other state are
+	// left alone.
+	UnbindMessageDelivery(ctx context.Context, deliveryID string, messageIDs []string) error
+
+	// FinishMessageDelivery moves the rows still delivering under
+	// deliveryID to state (delivered or partial) and stores outcome
+	// (compare-and-set on delivering and the id, so a late answer never
+	// overwrites the stale sweep). It returns the number of rows changed.
+	FinishMessageDelivery(ctx context.Context, deliveryID string, messageIDs []string, state, outcome string) (int, error)
+
+	// SweepStaleDeliveries moves rows left delivering since before cutoff
+	// to partial with outcome (a hub restart mid-delivery). They are never
+	// moved back to dispatched or re-driven. It returns the rows changed.
+	SweepStaleDeliveries(ctx context.Context, cutoff time.Time, outcome string) (int, error)
 
 	// ListPendingMessages returns pending messages whose target agent is on the broker.
 	ListPendingMessages(ctx context.Context, brokerID string) ([]Message, error)
@@ -1921,9 +2257,133 @@ type BrokerDispatchStore interface {
 	// "pending", or "failed" with reason == expiredReason, by the pre-fix
 	// nc-promote-busy bug (a storeMsg persisted without stamping
 	// DispatchState). The exact complement of ExpireStuckPendingMessages'
-	// and PurgeFailedMessages' agent-only scoping: only an agent recipient
-	// is ever legitimately in either state. Returns the number repaired.
+	// and ChatRetentionStore.SelectFailedMessages' agent-only scoping: only
+	// an agent recipient is ever legitimately in either state. Returns the
+	// number repaired.
 	BackfillNonAgentDispatchState(ctx context.Context, expiredReason string) (int, error)
+}
+
+// MessageHoldStore defines persistence operations for hold-until-session
+// re-drive of conduit-delivered messages (ptone/scion#7881). Kept as its own
+// sub-interface (implemented by BrokerDispatchStore) so test doubles of
+// BrokerDispatchStore alone do not need to stub hold methods.
+type MessageHoldStore interface {
+	// UnbindMessageDeliveryWithProof moves rows still delivering under
+	// deliveryID back to dispatched (compare-and-set on delivering and
+	// deliveryID). When notReached is non-empty (store.MessageNotReachedNoSession),
+	// it stamps not_reached and not_reached_at (on the database clock) in the
+	// same conditional write.
+	UnbindMessageDeliveryWithProof(ctx context.Context, deliveryID string, messageIDs []string, notReached string) error
+
+	// PrepareOrHoldMessage runs before broker dispatch for conduit-delivered
+	// agents: in one transaction under the target agent's row lock it captures
+	// the agent's current run_id into hold_launch_id on messageID, and if the
+	// agent currently has a hold marker (agent_delivery_holds), is eligible
+	// for holding, and is under maxHeld, transitions the row to
+	// awaiting_session with hold_until = COALESCE(hold_until, marker.hold_until)
+	// and updates held_count.
+	PrepareOrHoldMessage(ctx context.Context, agentID, messageID string, maxHeld int) (PrepareOrHoldResult, error)
+
+	// HoldMessageAwaitingSession atomically evaluates the hold preconditions
+	// for a broker awaiting_session report and, when all hold, consumes and
+	// clears the single-use no_session proof stamp, moves the row from
+	// dispatched to awaiting_session with hold_until = COALESCE(hold_until,
+	// now + HoldTTL) (database clock), and creates or updates the agent's hold
+	// marker in the same transaction.
+	HoldMessageAwaitingSession(ctx context.Context, p HoldMessageParams) (bool, error)
+
+	// ClaimHeldMessages atomically claims up to limit unexpired rows in
+	// awaiting_session for agentID, ordered by (created, id), transitioning
+	// each claimed row to dispatched (keeping hold_until and hold_launch_id;
+	// the single-use proof stamp was already consumed on entry to
+	// awaiting_session) and syncing or deleting the agent's hold marker in the
+	// same transaction. When an active re-drive lease is held on agentID's
+	// marker, only the lease owner (passed via WithRedriveLeaseOwner) may
+	// claim rows.
+	ClaimHeldMessages(ctx context.Context, agentID string, limit int) ([]Message, error)
+
+	// AcquireAgentRedriveLease acquires or re-enters an exclusive cross-replica
+	// re-drive lease (claim_owner, claim_until) on agentID's agent_delivery_holds
+	// marker for ttl on the database clock. Returns (false, nil) when no hold
+	// marker exists or another owner holds an unexpired lease.
+	AcquireAgentRedriveLease(ctx context.Context, agentID, ownerID string, ttl time.Duration) (bool, error)
+
+	// RenewAgentRedriveLease extends an active re-drive lease owned by ownerID
+	// for ttl on the database clock. Returns (false, nil) when the marker no
+	// longer exists or claim_owner no longer matches ownerID.
+	RenewAgentRedriveLease(ctx context.Context, agentID, ownerID string, ttl time.Duration) (bool, error)
+
+	// ReleaseAgentRedriveLease clears claim_owner and claim_until when owned by
+	// ownerID and deletes the agent_delivery_holds marker in the same
+	// transaction if zero awaiting_session rows remain.
+	ReleaseAgentRedriveLease(ctx context.Context, agentID, ownerID string) error
+
+	// ReholdClaimedMessage returns a claimed dispatched row back to
+	// awaiting_session under its original hold_until when re-validation hits
+	// a transient store or authz error or the re-drive pass times out before
+	// dispatch (R3), syncing the hold marker in the same transaction.
+	//
+	// Caller invariant: ReholdClaimedMessage does not require a not_reached
+	// proof stamp because it may ONLY be called on rows claimed in the current
+	// re-drive pass that were NEVER handed to the runtime broker. Never call
+	// ReholdClaimedMessage on a row after broker dispatch has been attempted,
+	// as a live broker flush could race with the re-held state.
+	ReholdClaimedMessage(ctx context.Context, agentID, messageID string, maxHeld int) (bool, error)
+
+	// HasAgentDeliveryHold reports whether agentID currently has an
+	// agent_delivery_holds marker row.
+	HasAgentDeliveryHold(ctx context.Context, agentID string) (bool, error)
+
+	// ListAgentDeliveryHoldAgentIDs returns the agent IDs that currently have
+	// an agent_delivery_holds marker row, ordered by marker creation time.
+	ListAgentDeliveryHoldAgentIDs(ctx context.Context) ([]string, error)
+
+	// ExpireHeldMessagesForAgent atomically fails all awaiting_session rows
+	// for agentID with reason, removes the agent's hold marker in the same
+	// transaction, and returns the rows that transitioned so callers can send
+	// sender failure notices.
+	ExpireHeldMessagesForAgent(ctx context.Context, agentID, reason string) ([]Message, error)
+
+	// ExpireHeldMessagesPastDeadline atomically fails up to limit
+	// awaiting_session rows whose hold_until <= database now with reason,
+	// syncs or removes affected agents' hold markers in the same transaction,
+	// and returns the rows that transitioned.
+	ExpireHeldMessagesPastDeadline(ctx context.Context, reason string, limit int) ([]Message, error)
+
+	// ExpireHeldMessagesPastDeadlineForAgent atomically fails all
+	// awaiting_session rows for agentID whose hold_until <= database now with
+	// reason, syncs or removes agentID's hold marker in the same transaction,
+	// and returns the rows that transitioned (RV3-R1).
+	ExpireHeldMessagesPastDeadlineForAgent(ctx context.Context, agentID, reason string) ([]Message, error)
+
+	// RebindHeldMessagesLaunch atomically updates hold_launch_id from
+	// fromLaunchID to toLaunchID on awaiting_session messages for agentID (and
+	// syncs agent_delivery_holds.launch_id) when an idle-suspended agent resumes
+	// into a newly minted run incarnation, preserving each row's hold_until and
+	// FIFO order.
+	RebindHeldMessagesLaunch(ctx context.Context, agentID, fromLaunchID, toLaunchID string) (int, error)
+}
+
+type redriveLeaseOwnerKey struct{}
+
+// WithRedriveLeaseOwner attaches the active re-drive pass's lease owner token
+// to ctx so ClaimHeldMessages fences row claims against cross-replica lease
+// ownership inside the same database transaction.
+func WithRedriveLeaseOwner(ctx context.Context, ownerID string) context.Context {
+	if ownerID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, redriveLeaseOwnerKey{}, ownerID)
+}
+
+// RedriveLeaseOwnerFromContext returns the re-drive lease owner token attached
+// by WithRedriveLeaseOwner, or "" if none is set.
+func RedriveLeaseOwnerFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v, _ := ctx.Value(redriveLeaseOwnerKey{}).(string)
+	return v
 }
 
 // TemplateStore defines template persistence operations.
@@ -1944,11 +2404,12 @@ type TemplateStore interface {
 	//
 	// It does not write the content columns: Files, ContentHash, the
 	// fields derived from the files (Harness, DefaultHarnessConfig,
-	// AgentConfig), and the storage location of the files (Layout,
-	// StoragePath, StorageBucket, StorageURI). Those are written only by
-	// CreateTemplate and UpdateTemplateContent, so a metadata edit can
-	// never revert a concurrent commit or point a blob-layout row back at a
-	// legacy path (ptone/scion#4221).
+	// AgentConfig), the storage location of the files (Layout,
+	// StoragePath, StorageBucket, StorageURI), and the commit's SourceURL
+	// and Status. Those are written only by CreateTemplate and
+	// UpdateTemplateContent, so a metadata edit can never revert a
+	// concurrent commit or point a blob-layout row back at a legacy path
+	// (ptone/scion#4221, ptone/scion#4967).
 	UpdateTemplate(ctx context.Context, template *Template) error
 
 	// UpdateTemplateContent writes the columns a commit owns (Files,
@@ -2042,6 +2503,12 @@ type TemplateFilter struct {
 	// starts with this value (used to find legacy rows nested under a
 	// legacy path, such as pre-blob clones at <slug path>/<clone id>).
 	StoragePathPrefix string
+	// ProjectIDs, when non-nil, narrows the list to project-scoped
+	// templates whose scope ID or (deprecated) project ID is in the set,
+	// applied before COUNT and LIMIT. A non-nil empty set matches nothing;
+	// nil applies no restriction. Only the agent delegated credential's
+	// list sets it (.design/agent-delegation.md §11.8).
+	ProjectIDs []string
 }
 
 // HarnessConfigStore defines harness config persistence operations.
@@ -2058,13 +2525,14 @@ type HarnessConfigStore interface {
 	GetHarnessConfigBySlug(ctx context.Context, slug, scope, scopeID string) (*HarnessConfig, error)
 
 	// UpdateHarnessConfig updates an existing harness config's metadata
-	// (name, slug, display name, description, scope, owner, source URL,
-	// image status and the audit fields). It does not write the content
-	// columns (Files, ContentHash, Harness, Config, Status, Layout,
-	// StorageURI, StorageBucket, StoragePath) nor BuiltImage (ptone/scion#4219): those
-	// change only through UpdateHarnessConfigContent and
-	// UpdateHarnessConfigBuiltImage, so a metadata write from a stale read
-	// cannot revert a commit.
+	// (name, slug, display name, description, scope, owner and the audit
+	// fields). It does not write the content columns (Files, ContentHash,
+	// Harness, Config, Status, SourceURL, Layout, StorageURI, StorageBucket,
+	// StoragePath) nor BuiltImage (ptone/scion#4219), ImageStatus or
+	// ImageStatusCheckedAt (ptone/scion#4967): those change only through
+	// UpdateHarnessConfigContent, UpdateHarnessConfigBuiltImage and
+	// UpdateHarnessConfigImageStatus, so a metadata write from a stale read
+	// cannot revert a commit or an image check.
 	// Returns ErrNotFound if the harness config doesn't exist.
 	UpdateHarnessConfig(ctx context.Context, hc *HarnessConfig) error
 
@@ -2140,7 +2608,10 @@ type UserStore interface {
 	GetUserByEmail(ctx context.Context, email string) (*User, error)
 
 	// UpdateUser updates an existing user.
-	// Returns ErrNotFound if the user doesn't exist.
+	// Returns ErrNotFound if the user doesn't exist, and ErrUserDeleting if
+	// the user's status is UserStatusDeleting or the update would set it
+	// (only MarkUserDeleting writes that status, and only the deletion's
+	// completion ends it).
 	UpdateUser(ctx context.Context, user *User) error
 
 	// UpdateUserLastLogin sets only the last_login timestamp for a user.
@@ -2152,6 +2623,11 @@ type UserStore interface {
 	// DeleteUser removes a user by ID.
 	// Returns ErrNotFound if the user doesn't exist.
 	DeleteUser(ctx context.Context, id string) error
+
+	// MarkUserDeleting sets the status of user id to UserStatusDeleting
+	// (ptone/scion#2143). It is the only write of that status. Returns
+	// ErrNotFound if the user does not exist.
+	MarkUserDeleting(ctx context.Context, id string) error
 
 	// LockUserRow locks the user row until the surrounding transaction ends
 	// (ptone/scion#2769). On PostgreSQL exclusive=true runs
@@ -2431,7 +2907,9 @@ type SecretStore interface {
 	// callers that only need to repoint the ref (such as GCP SM
 	// name-migration tooling) never clobber a concurrent metadata edit the
 	// way a GetSecret-then-UpdateSecret read-modify-write would
-	// (ptone/scion#2152 round-2 review finding 11).
+	// (ptone/scion#2152 round-2 review finding 11). The write is fenced
+	// (see SecretEncryptionStore): under a policy, clearing the ref of a
+	// row with an empty value returns ErrEncryptionPolicyMismatch.
 	UpdateSecretRefIfMatches(ctx context.Context, key, scope, scopeID, expectedRef string, expectedVersion int, newRef string) (applied bool, err error)
 
 	// UpdateSecretValueIfVersion conditionally replaces only the
@@ -2473,6 +2951,85 @@ type SecretStore interface {
 	// whose createdBy is in the given set of ancestor IDs.
 	// Note: EncryptedValue is NOT populated in the returned secrets.
 	ListProgenySecrets(ctx context.Context, ancestorIDs []string) ([]Secret, error)
+
+	// ScanSecretPayloads is the privileged, paginated payload scan of the
+	// encryption migration and the startup audit (ptone/scion#1530 §6).
+	// It returns up to limit rows (1..MaxSecretPayloadScan, otherwise
+	// ErrInvalidInput) of every scope and scope ID with ID > afterID, in
+	// ascending ID order; afterID "" starts at the beginning. Rows carry
+	// EncryptedValue: callers must never log or return it.
+	ScanSecretPayloads(ctx context.Context, afterID string, limit int) ([]SecretPayload, error)
+
+	// ReplaceSecretCiphertext replaces only the EncryptedValue of the row
+	// with this ID, and only while its Version equals expectedVersion and
+	// its EncryptedValue equals expectedCiphertext byte for byte. Version,
+	// timestamps, ID, SecretRef and all other metadata are preserved, so a
+	// re-encryption is never seen as a credential change. It returns
+	// applied=false (no error) when the row is gone or either check fails.
+	// The replacement passes the encryption policy fence like every other
+	// payload write.
+	ReplaceSecretCiphertext(ctx context.Context, id string, expectedVersion int, expectedCiphertext, replacement string) (applied bool, err error)
+
+	// AttributeUserSecretToOwner sets created_by to scope_id on the
+	// user-scope secret row with this ID, and only while its created_by
+	// equals expectedCreatedBy. It is the repair write of the legacy user
+	// secret attribution migration, which moves rows captured by an agent
+	// before ptone/scion#1557 from "agent:<uuid>" to their owner. The
+	// decision depends only on the row's identity, scope, owner and
+	// created_by, never on its payload, so a concurrent value write (for
+	// example a credential refresh) does not defeat it. Version,
+	// timestamps, the payload and every other column are preserved, so the
+	// repair is never seen as a credential change. It returns applied=false
+	// (no error) when the row is gone, is not user-scoped, has an empty
+	// scope_id, or its created_by differs.
+	AttributeUserSecretToOwner(ctx context.Context, id string, expectedCreatedBy string) (applied bool, err error)
+}
+
+// MaxSecretPayloadScan is the largest ScanSecretPayloads page.
+const MaxSecretPayloadScan = 500
+
+// SecretEncryptionStore holds the database encryption policy and the
+// encryption migration records (ptone/scion#1530 §6). Neither table holds
+// key material.
+//
+// Policy fence: once the policy row exists (in any state), every
+// payload-changing secret write (CreateSecret, UpdateSecret, UpsertSecret,
+// UpdateSecretValueIfVersion, ReplaceSecretCiphertext) accepts only an
+// enc:v2: value under one of AllowedWriteKIDs, or an empty value with a
+// non-empty SecretRef, and otherwise returns ErrEncryptionPolicyMismatch
+// without writing. Under a policy no write (UpdateSecretRefIfMatches and
+// unchanged-value writes included) may leave a row with neither a value
+// nor a SecretRef. Metadata-only writes and deletes are not fenced.
+//
+// Transitions (UpdateEncryptionPolicy, CreateEncryptionMigration,
+// UpdateEncryptionMigration) inside a WithTx transaction that has already
+// run a fenced write return ErrPolicyTransitionAfterFencedWrite: run them
+// in their own short transaction, or before any fenced write.
+type SecretEncryptionStore interface {
+	// GetEncryptionPolicy returns the policy, or ErrNotFound when no
+	// policy exists (the fence is off).
+	GetEncryptionPolicy(ctx context.Context) (*EncryptionPolicy, error)
+
+	// UpdateEncryptionPolicy stores next only while the current
+	// generation equals expectedGeneration (0: no policy yet, which
+	// creates it). next.Generation must be expectedGeneration+1 and next
+	// must be valid, otherwise ErrInvalidInput. It returns applied=false
+	// (no error) when the generation has moved on. The transition holds
+	// an exclusive lock on the policy row where the database supports it.
+	UpdateEncryptionPolicy(ctx context.Context, expectedGeneration int64, next EncryptionPolicy) (applied bool, err error)
+
+	// CreateEncryptionMigration stores a new migration record; ErrAlreadyExists
+	// if its ID is taken.
+	CreateEncryptionMigration(ctx context.Context, m *EncryptionMigration) error
+
+	// GetEncryptionMigration returns the migration record, or ErrNotFound.
+	GetEncryptionMigration(ctx context.Context, id string) (*EncryptionMigration, error)
+
+	// UpdateEncryptionMigration replaces the mutable fields of the record
+	// (state, cursor, counts, plaintext admission) only while its state is
+	// expectedState; applied=false otherwise. A verified record never
+	// keeps plaintext admission.
+	UpdateEncryptionMigration(ctx context.Context, m *EncryptionMigration, expectedState EncryptionMigrationState) (applied bool, err error)
 }
 
 // SecretFilter defines criteria for filtering secrets.
@@ -2607,6 +3164,17 @@ type GroupStore interface {
 	// GetGroupsByIDs retrieves groups by a list of IDs.
 	// Returns only groups that exist; missing IDs are silently skipped.
 	GetGroupsByIDs(ctx context.Context, ids []string) ([]Group, error)
+
+	// LockInvitedHubRoleGuard serializes group-mediated invited-user
+	// hub-role checks until the surrounding transaction ends, preventing
+	// READ COMMITTED write skew between granting a built-in system hub role
+	// to a group and adding an invited user or child group to a group
+	// (ptone/scion#8081). Must be called inside WithTx before taking other
+	// transaction locks (returns ErrInvalidInput outside WithTx). On
+	// PostgreSQL it acquires transaction-scoped LockInvitedHubRoleGuard; on
+	// SQLite, which serializes write transactions, it is a no-op once
+	// inside WithTx.
+	LockInvitedHubRoleGuard(ctx context.Context) error
 }
 
 // GroupFilter defines criteria for filtering groups.
@@ -2663,6 +3231,17 @@ type UserAccessTokenStore interface {
 
 	// CountUserAccessTokens returns the number of active (non-revoked) tokens for a user.
 	CountUserAccessTokens(ctx context.Context, userID string) (int, error)
+
+	// RevokeUserAccessTokensForUser revokes every unrevoked token of userID
+	// and returns how many it revoked (ptone/scion#2143).
+	RevokeUserAccessTokensForUser(ctx context.Context, userID string) (int, error)
+
+	// RevokeUserAccessTokensForUserProject revokes every unrevoked token of
+	// userID whose boundary is the project projectID, and returns the IDs
+	// it revoked. Hub-boundary tokens and tokens bounded to other projects
+	// are not touched. Used by a project leave, in its transaction
+	// (ptone/scion#7494).
+	RevokeUserAccessTokensForUserProject(ctx context.Context, userID, projectID string) ([]string, error)
 
 	// DeleteUserAccessTokensByProject permanently removes all "project"-boundary
 	// tokens scoped to projectID. A hub-boundary token belonging to one of the
@@ -2745,6 +3324,12 @@ type BrokerSecretStore interface {
 	// CleanExpiredJoinTokens removes all expired join tokens and returns how
 	// many were removed.
 	CleanExpiredJoinTokens(ctx context.Context) (int, error)
+
+	// DeleteOrphanBrokerCredentials removes, in one transaction, every broker
+	// secret and join token whose broker ID has no runtime broker row, and
+	// returns how many of each were removed. A later row with the same ID
+	// then starts without a credential. Idempotent.
+	DeleteOrphanBrokerCredentials(ctx context.Context) (secrets, joinTokens int, err error)
 }
 
 // =============================================================================
@@ -2806,6 +3391,27 @@ type NotificationStore interface {
 	// Returns ErrNotFound if the notification doesn't exist.
 	AcknowledgeNotification(ctx context.Context, id string) error
 
+	// UpdateNotificationContent replaces a notification's Message and
+	// ResourceID and marks it unacknowledged, so an aggregated
+	// notification shows its latest state again. CreatedAt and everything
+	// else are kept. Returns ErrNotFound if the notification doesn't exist.
+	UpdateNotificationContent(ctx context.Context, id, message, resourceID string) error
+
+	// UpdateNotificationState replaces a notification's Message, ResourceID,
+	// and Acknowledged state in place. When acknowledged is false (resurfacing
+	// an aggregated notification), CreatedAt is refreshed to now so its
+	// relative time reflects the latest resurfacing; when acknowledged is true,
+	// CreatedAt is kept unchanged. Returns ErrNotFound if the notification
+	// doesn't exist.
+	UpdateNotificationState(ctx context.Context, id, message, resourceID string, acknowledged bool) error
+
+	// UpdateNotificationStateIfAcknowledged replaces a notification's Message
+	// and ResourceID in place only when its stored Acknowledged flag equals
+	// observedAcknowledged, leaving Acknowledged and CreatedAt unchanged.
+	// Returns ErrVersionConflict when the row exists with a different
+	// Acknowledged state, and ErrNotFound when the row does not exist.
+	UpdateNotificationStateIfAcknowledged(ctx context.Context, id, message, resourceID string, observedAcknowledged bool) error
+
 	// AcknowledgeAllNotifications marks all notifications for a subscriber as acknowledged.
 	// No error on zero rows affected.
 	AcknowledgeAllNotifications(ctx context.Context, subscriberType, subscriberID string) error
@@ -2820,6 +3426,10 @@ type NotificationStore interface {
 	// GetLastNotificationStatus returns the status of the most recent notification
 	// for a given subscription. Returns ("", nil) if no notifications exist.
 	GetLastNotificationStatus(ctx context.Context, subscriptionID string) (string, error)
+
+	// GetLastNotification returns the most recent notification for a given
+	// subscription, or (nil, nil) if no notifications exist.
+	GetLastNotification(ctx context.Context, subscriptionID string) (*Notification, error)
 
 	// ClaimNotificationForDispatch atomically transitions a notification from
 	// dispatched=false to dispatched=true, returning claimed=true if this caller
@@ -2881,17 +3491,28 @@ type NotificationStore interface {
 	// forever. Returns how many rows it expired.
 	ExpireStaleAgentNotifications(ctx context.Context, cutoff time.Time) (int, error)
 
+	// ListParkedNotificationSubscribers returns the agents that have a
+	// parked notification (agent-targeted, dispatched=false) while they are
+	// suspended with a suspend_reason in reasons and have no active hold,
+	// at most 100, in no particular order, as read in one query. The hub's
+	// auto-wake (ptone/scion#7826) wakes them so the notifications can be
+	// delivered; the wake re-reads each agent before acting.
+	ListParkedNotificationSubscribers(ctx context.Context, reasons []string) ([]Agent, error)
+
 	// GetUndispatchedAgentNotifications returns agent-targeted notifications
 	// with dispatched=false.
 	//
-	// Notifications whose subscriber agent is suspended are never
-	// returned: they stay pending (parked) and become eligible again when
-	// the agent leaves the suspended phase.
+	// Notifications whose subscriber agent is suspended are not returned:
+	// they stay pending (parked) and become eligible again when the agent
+	// leaves the suspended phase. A subscriber with an active hold
+	// (ptone/scion#7145) is the exception: its notifications are returned
+	// whatever its phase, and in sweep mode whatever its RuntimeBrokerID,
+	// so the dispatcher drops them (failed, NotificationReasonSubscriberHeld).
 	//
 	// If brokerID is empty (sweep mode), a 60s grace period is applied so
 	// the sweep does not race with an in-flight primary dispatch, only
-	// notifications whose subscriber agent has a RuntimeBrokerID are
-	// returned, and a notification whose NextAttemptAt is in the future
+	// notifications whose subscriber agent has a RuntimeBrokerID (or is
+	// held) are returned, and a notification whose NextAttemptAt is in the future
 	// (retry backoff) is left out.
 	//
 	// If brokerID is non-empty (broker-connect fast-path), no grace period
@@ -2943,6 +3564,20 @@ type ScheduledEventStore interface {
 	// UpdateScheduledEventStatus updates the status and optional error for an event.
 	UpdateScheduledEventStatus(ctx context.Context, id string, status string, firedAt *time.Time, errMsg string) error
 
+	// CompleteFiringScheduledEvent atomically transitions an event in status
+	// "firing" to status (for example "fired", "expired", or "failed"), setting
+	// fired_at and errMsg, and when scheduleID is non-empty also records the
+	// run on that schedule (as RecordScheduleRun does, ignoring a deleted
+	// schedule) in the same transaction. Returns true when the event was still
+	// in status "firing" and updated, or false (with nil error) when the event
+	// did not exist or was no longer in status "firing".
+	CompleteFiringScheduledEvent(ctx context.Context, id string, status string, firedAt time.Time, errMsg string, scheduleID string, ranAt time.Time) (bool, error)
+
+	// ListFiringScheduledEvents returns up to limit events in status "firing"
+	// whose fired_at (or fire_at when fired_at is nil) is at or before cutoff,
+	// ordered oldest-first.
+	ListFiringScheduledEvents(ctx context.Context, cutoff time.Time, limit int) ([]ScheduledEvent, error)
+
 	// CancelScheduledEvent marks an event as cancelled.
 	// Returns ErrNotFound if the event doesn't exist or is not pending.
 	CancelScheduledEvent(ctx context.Context, id string) error
@@ -2958,10 +3593,104 @@ type ScheduledEventStore interface {
 	// ListScheduledEvents returns events matching the filter criteria.
 	ListScheduledEvents(ctx context.Context, filter ScheduledEventFilter, opts ListOptions) (*ListResult[ScheduledEvent], error)
 
-	// PurgeOldScheduledEvents removes non-pending events that completed
-	// before cutoff: fired_at before cutoff, or, for an event with no
-	// fired_at (a cancelled one), created before cutoff.
+	// PurgeOldScheduledEvents removes completed events (excluding pending and
+	// firing) before cutoff: fired_at before cutoff, or, for an event with no
+	// fired_at (a cancelled one), created before cutoff. The scheduled exec
+	// run of each removed event is removed in the same transaction, first.
 	PurgeOldScheduledEvents(ctx context.Context, cutoff time.Time) (int, error)
+}
+
+// ScheduledExecQuotaSnapshot holds the active exec items of a project read
+// inside a quota-locked transaction (ptone/scion#7883, ptone/scion#7884).
+type ScheduledExecQuotaSnapshot struct {
+	PendingEvents   []ScheduledEvent
+	ActiveSchedules []Schedule
+}
+
+// ScheduledExecRunStore manages the run records of scheduled exec events
+// (ptone/scion#7883, ptone/scion#7884).
+type ScheduledExecRunStore interface {
+	// CreateScheduledExecRun inserts the run record of an admitted exec
+	// event, with Outcome starting (when empty) and FinishedAt nil unless
+	// set. Returns ErrAlreadyExists when the event already has a run, or
+	// ErrScheduledExecOverlap when ScheduleID is set and another unfinished
+	// run of that schedule still holds an unexpired DB lease.
+	CreateScheduledExecRun(ctx context.Context, run *ScheduledExecRun) error
+
+	// GetScheduledExecRun returns the run of an event, or ErrNotFound.
+	GetScheduledExecRun(ctx context.Context, eventID string) (*ScheduledExecRun, error)
+
+	// ListScheduledExecRunsByEvent returns the runs of the given events that
+	// exist, keyed by event ID.
+	ListScheduledExecRunsByEvent(ctx context.Context, eventIDs []string) (map[string]ScheduledExecRun, error)
+
+	// MarkScheduledExecRunRunning moves an unfinished run from starting to
+	// running. It reports whether the row changed; a finished run, or one
+	// already running, is left as is.
+	MarkScheduledExecRunRunning(ctx context.Context, eventID string) (bool, error)
+
+	// FinishScheduledExecRun records a run's final outcome with a
+	// compare-and-set on FinishedAt IS NULL: the first writer wins and
+	// later writers get false with no change. When it wins and
+	// fin.EventStatus is set, the event's status and error are written in the
+	// same transaction, while the event is still fired or expired; when the
+	// run belongs to a recurring schedule, the parent schedule's run counters
+	// and last-run fields are updated in the same transaction.
+	FinishScheduledExecRun(ctx context.Context, fin ScheduledExecRunFinish) (bool, error)
+
+	// ListExpiredScheduledExecRuns returns up to limit unfinished runs whose
+	// lease ended before now, oldest lease first.
+	ListExpiredScheduledExecRuns(ctx context.Context, now time.Time, limit int) ([]ScheduledExecRun, error)
+
+	// ClaimScheduledExecRunsForPoll returns up to limit unfinished runs
+	// whose lease has not ended, least recently polled first, skipping the
+	// runs of excludeEventIDs, and records now as their last poll in the same
+	// transaction, so successive bounded sweeps (on any replica) rotate
+	// through every unfinished run.
+	ClaimScheduledExecRunsForPoll(ctx context.Context, now time.Time, limit int, excludeEventIDs []string) ([]ScheduledExecRun, error)
+
+	// ListUnadmittedScheduledEvents returns up to limit events of eventType
+	// claimed (status fired or expired) before firedBefore that have no exec
+	// run: a hub stopped between the claim and the run insert
+	// (ptone/scion#7883 P2-R1).
+	ListUnadmittedScheduledEvents(ctx context.Context, eventType string, firedBefore time.Time, limit int) ([]ScheduledEvent, error)
+
+	// FailUnadmittedScheduledEvent records event id failed with errMsg only
+	// while it still is such an event (and, for a recurring event, records
+	// the failed run on its schedule in the same transaction). It reports
+	// whether the event changed.
+	FailUnadmittedScheduledEvent(ctx context.Context, id, eventType string, firedBefore time.Time, errMsg string) (bool, error)
+
+	// CompleteUnadmittedExecEvent atomically transitions an exec event in
+	// status "fired" (or "expired") that has NO scheduled_exec_runs row to
+	// status (ScheduledEventSkipped or ScheduledEventFailed) with errMsg, and
+	// when scheduleID is non-empty records the corresponding run status on
+	// that schedule in the same transaction (ignoring a deleted schedule).
+	// Returns true when the event was still unadmitted and updated, or false
+	// (with nil error) when the event was already admitted, already completed,
+	// or missing.
+	CompleteUnadmittedExecEvent(ctx context.Context, id string, status string, errMsg string, scheduleID string, ranAt time.Time) (bool, error)
+
+	// CreateScheduledEventChecked inserts event only after check accepts the
+	// active exec items (pending events + active recurring schedules) of the
+	// same project and event type (at most limit of each), read in the same
+	// transaction under a per-project lock that serializes concurrent authors
+	// across replicas. check's error is returned as is and nothing is inserted.
+	CreateScheduledEventChecked(ctx context.Context, event *ScheduledEvent, limit int, check func(snap ScheduledExecQuotaSnapshot) error) error
+
+	// CreateScheduleChecked inserts schedule only after check accepts the
+	// active exec items (pending events + active recurring schedules) of the
+	// same project and event type (at most limit of each), read in the same
+	// transaction under a per-project lock that serializes concurrent authors
+	// across replicas. check's error is returned as is and nothing is inserted.
+	CreateScheduleChecked(ctx context.Context, schedule *Schedule, limit int, check func(snap ScheduledExecQuotaSnapshot) error) error
+
+	// UpdateScheduleChecked updates schedule (as UpdateSchedule) only after
+	// check accepts the other active exec items (pending events + active
+	// recurring schedules excluding schedule.ID) of the same project and event
+	// type (at most limit of each), read in the same transaction under a
+	// per-project lock that serializes concurrent authors across replicas.
+	UpdateScheduleChecked(ctx context.Context, schedule *Schedule, fields ScheduleFieldMask, prevRevision int, prevRevisionKnown bool, attribution *InitiatorAttribution, limit int, check func(snap ScheduledExecQuotaSnapshot) error) error
 }
 
 // =============================================================================
@@ -2990,12 +3719,12 @@ type ScheduleStore interface {
 	ListActiveZonePrefixedSchedules(ctx context.Context, limit int, excludeIDs []string) ([]Schedule, error)
 
 	// UpdateSchedule writes the schedule's mutable fields named by `fields`
-	// (name, cron_expr, event_type, payload, status, next_run_at) from
-	// `schedule`; the Status field also writes status_reason from
-	// schedule.StatusReason, so a status and its reason are always written
-	// together. A field not named in `fields` is left completely untouched
-	// in the row, so a struct built from a stale read can never revert a
-	// column this call didn't intend to change.
+	// (name, cron_expr, time_zone, event_type, payload, status,
+	// next_run_at) from `schedule`; the Status field also writes
+	// status_reason from schedule.StatusReason, so a status and its reason
+	// are always written together. A field not named in `fields` is left
+	// completely untouched in the row, so a struct built from a stale read
+	// can never revert a column this call didn't intend to change.
 	//
 	// The write is ALWAYS conditioned on the schedule's current
 	// authorization_revision matching prevRevision (or being NULL, when
@@ -3021,6 +3750,22 @@ type ScheduleStore interface {
 	// UpdateScheduleAfterRun updates a schedule after a run completes.
 	// Sets last_run_at, next_run_at, run counters, and error status.
 	UpdateScheduleAfterRun(ctx context.Context, id string, ranAt time.Time, nextRunAt time.Time, errMsg string) error
+
+	// AdvanceScheduleNextRun sets only next_run_at, so a run that takes
+	// longer than an evaluator tick is not selected again as due while it
+	// runs. RecordScheduleRun records the run when it completes, without
+	// changing next_run_at.
+	// Returns ErrNotFound if the schedule doesn't exist.
+	AdvanceScheduleNextRun(ctx context.Context, id string, nextRunAt time.Time) error
+
+	// RecordScheduleRun records the outcome of a run whose next_run_at was
+	// already advanced (AdvanceScheduleNextRun): it never changes
+	// next_run_at. The run and error counters always count the run; the
+	// last-run fields (last_run_at, status, error) are written only when
+	// ranAt is later than the stored last_run_at, so a run that finishes
+	// after a newer one does not overwrite the newer outcome.
+	// Returns ErrNotFound if the schedule doesn't exist.
+	RecordScheduleRun(ctx context.Context, id string, ranAt time.Time, errMsg string) error
 
 	// DeleteSchedule removes a schedule by ID.
 	// Returns ErrNotFound if the schedule doesn't exist.
@@ -3107,6 +3852,7 @@ type GCPServiceAccountFilter struct {
 type GitHubInstallationStore interface {
 	// CreateGitHubInstallation creates a new GitHub App installation record.
 	// Uses installation_id as the natural key — creating an existing one is idempotent (no-op).
+	// Ignores installation.TriggerRouting; use SetGitHubInstallationTriggerRoute to manage trigger routing.
 	CreateGitHubInstallation(ctx context.Context, installation *GitHubInstallation) error
 
 	// GetGitHubInstallation retrieves a GitHub App installation by installation ID.
@@ -3114,6 +3860,8 @@ type GitHubInstallationStore interface {
 	GetGitHubInstallation(ctx context.Context, installationID int64) (*GitHubInstallation, error)
 
 	// UpdateGitHubInstallation updates an existing GitHub App installation.
+	// Never modifies trigger_routing; only SetGitHubInstallationTriggerRoute,
+	// DeleteGitHubInstallationTriggerRoute, and DeleteGitHubTriggerRoutesByProject do.
 	// Returns ErrNotFound if the installation doesn't exist.
 	UpdateGitHubInstallation(ctx context.Context, installation *GitHubInstallation) error
 
@@ -3128,6 +3876,22 @@ type GitHubInstallationStore interface {
 	// that covers the given repository (owner/repo format).
 	// Returns ErrNotFound if no matching active installation exists.
 	GetInstallationForRepository(ctx context.Context, repoFullName string) (*GitHubInstallation, error)
+
+	// SetGitHubInstallationTriggerRoute sets or replaces the primary-project
+	// trigger routing entry for repoFullName (stored under its lowercased key)
+	// on installationID. Returns ErrNotFound if the installation does not exist.
+	SetGitHubInstallationTriggerRoute(ctx context.Context, installationID int64, repoFullName string, route GitHubTriggerRoute) error
+
+	// DeleteGitHubInstallationTriggerRoute removes the primary-project trigger
+	// routing entry for repoFullName (case-insensitive) on installationID.
+	// Returns (true, nil) if an entry was removed, (false, nil) if none was
+	// present, or ErrNotFound if the installation does not exist.
+	DeleteGitHubInstallationTriggerRoute(ctx context.Context, installationID int64, repoFullName string) (bool, error)
+
+	// DeleteGitHubTriggerRoutesByProject removes every trigger_routing entry
+	// whose primary_project_id equals projectID across all installations,
+	// returning the number of removed entries.
+	DeleteGitHubTriggerRoutesByProject(ctx context.Context, projectID string) (int, error)
 }
 
 // GitHubInstallationFilter defines criteria for filtering GitHub App installations.
@@ -3177,17 +3941,6 @@ type MessageStore interface {
 
 	// MarkAllMessagesRead marks all messages for a recipient as read.
 	MarkAllMessagesRead(ctx context.Context, recipientID string) error
-
-	// PurgeOldMessages removes read messages older than readCutoff and
-	// unread messages older than unreadCutoff. Returns count removed.
-	PurgeOldMessages(ctx context.Context, readCutoff time.Time, unreadCutoff time.Time) (int, error)
-
-	// PurgeFailedMessages removes messages with dispatch_state="failed" whose
-	// created timestamp is before cutoff. Returns the number of messages
-	// removed. Unlike PurgeOldMessages (read/unread semantics, which would
-	// also delete successfully delivered history), this filters strictly on
-	// dispatch_state so delivered messages are never touched.
-	PurgeFailedMessages(ctx context.Context, cutoff time.Time) (int, error)
 
 	// SetMessageConversationID updates the conversation_id on an existing
 	// message. Used by the Phase 4 backfill to link legacy messages to
@@ -3250,9 +4003,12 @@ type MaintenanceStore interface {
 	// ListMaintenanceRuns returns runs for a given operation key, ordered by started_at DESC.
 	ListMaintenanceRuns(ctx context.Context, operationKey string, limit int) ([]MaintenanceOperationRun, error)
 
-	// AbortRunningMaintenanceOps transitions any "running" operation runs and
-	// migrations to "failed". Called at server startup to clean up operations
-	// that were interrupted by a restart.
+	// AbortRunningMaintenanceOps transitions any "running" operation runs to
+	// "failed" and resets "running" migrations to "pending". Called at server
+	// startup to clean up operations that were interrupted by a restart. A
+	// run's JSON-object Result keeps its keys and gains "error" and
+	// "aborted": true; any other Result is replaced by the abort error. A
+	// Result written while the abort runs is not overwritten.
 	AbortRunningMaintenanceOps(ctx context.Context) (runs int64, migrations int64, err error)
 }
 
@@ -3351,13 +4107,21 @@ type SkillStore interface {
 	CreateSkillVersion(ctx context.Context, version *SkillVersion) error
 	GetSkillVersion(ctx context.Context, id string) (*SkillVersion, error)
 	GetSkillVersionByNumber(ctx context.Context, skillID, version string) (*SkillVersion, error)
-	ListSkillVersions(ctx context.Context, skillID string, opts ListOptions) (*ListResult[SkillVersion], error)
+	ListSkillVersions(ctx context.Context, skillID string, filter SkillVersionFilter, opts ListOptions) (*ListResult[SkillVersion], error)
 	UpdateSkillVersion(ctx context.Context, version *SkillVersion) error
 	DeleteSkillVersion(ctx context.Context, id string) error
 
 	ResolveSkillVersion(ctx context.Context, skillID, constraint string) (*SkillVersion, error)
 
 	IncrementSkillVersionDownloadCount(ctx context.Context, versionID string) error
+}
+
+// SkillVersionFilter defines criteria for listing a skill's versions.
+type SkillVersionFilter struct {
+	// Statuses, when non-empty, restricts results to versions in one of
+	// these statuses. It is applied in the store query, before LIMIT and
+	// TotalCount. Empty means every status.
+	Statuses []string
 }
 
 // SkillFilter defines criteria for filtering skills.
@@ -3383,16 +4147,24 @@ type SkillFilter struct {
 // SkillAccessScope narrows a skill query to the rows a specific caller may
 // read, mirroring the ptone/scion#1901 and ptone/scion#1903 rulings —
 // creation scope is the only read boundary; visibility does not widen it:
-//   - IncludeHubScope: hub-scoped (global/core) skills are visible to any
+//   - IncludeHubScope: hub-scoped (global) skills are visible to any
 //     authenticated caller.
 //   - CallerID: a user-scoped skill is visible only when its ScopeID equals
 //     CallerID (the owning user; for an agent caller, its creator).
 //   - ProjectIDs: a project-scoped skill is visible only when its ScopeID is
 //     one of these (the caller's project memberships).
+//   - AllProjects: every project-scoped skill matches, in any project.
 type SkillAccessScope struct {
 	IncludeHubScope bool
 	CallerID        string
 	ProjectIDs      []string
+	// AllProjects matches project-scoped skills in every project. It is
+	// for hub-boundary list callers whose project admission is decided per
+	// row after the query: the agent delegated credential's list
+	// (.design/agent-delegation.md §11.8), and bearer lists that reuse it.
+	// It is never set on agent-principal paths (agentSkillAccessScope), and
+	// it adds no hub-scoped or user-scoped skill. The default is false.
+	AllProjects bool
 }
 
 // =============================================================================
@@ -3490,6 +4262,38 @@ type HubSettingRevisionDeleter interface {
 	DeleteHubSettingRevision(ctx context.Context, section string) (int64, error)
 }
 
+// HubSettingWrite is one section write of a guarded batch
+// (HubSettingGuardedBatchWriter). ExpectedRevision has UpsertHubSetting's
+// meaning: -1 unconditional, 0 create-only, >0 the current revision. A
+// Delete write removes the row instead (Value unused): the row must exist,
+// at ExpectedRevision unless that is -1 (a missing row is then
+// ErrNotFound), and its returned HubSetting has only Section and
+// SettingsRevision set.
+type HubSettingWrite struct {
+	Section          string
+	Value            json.RawMessage
+	ExpectedRevision int64
+	Delete           bool
+}
+
+// HubSettingGuardedBatchWriter is an optional HubSettingStore method: write
+// several sections in one transaction, guarded by the revisions of other
+// sections the caller read to validate the write. Guarded batches are
+// serialized against each other (on Postgres by a transaction-scoped
+// advisory lock, which also covers a read section with no row), every
+// existing written and read row is locked, and all are compared inside the
+// transaction: a read section must still be at its given revision (0: it
+// must not exist), and each write's ExpectedRevision must hold. Any
+// mismatch returns ErrRevisionConflict and writes nothing. The
+// operational-settings revision is bumped once for the batch and returned
+// in every row's SettingsRevision. A section may appear once, as a write
+// or as a read; HubSettingsRevisionSection may not appear. The rows are
+// returned in the order of writes.
+type HubSettingGuardedBatchWriter interface {
+	UpsertHubSettingsGuarded(ctx context.Context, writes []HubSettingWrite, reads map[string]int64,
+		updatedBy, origin string) ([]HubSetting, error)
+}
+
 // HubSettingStore defines persistence operations for operational hub settings.
 // Each setting is a section (e.g. "access", "telemetry") with a JSON value.
 type HubSettingStore interface {
@@ -3503,7 +4307,11 @@ type HubSettingStore interface {
 
 	// UpsertHubSetting creates or updates a hub setting with CAS semantics.
 	//   expectedRevision == 0:  create-only; returns ErrRevisionConflict if the section already exists.
-	//   expectedRevision == -1: unconditional upsert (used for seeding); always succeeds.
+	//   expectedRevision == -1: unconditional upsert (used for seeding). A create that loses a
+	//                           concurrent create of the same section is retried a bounded number
+	//                           of times; if every attempt loses, it returns a wrapped
+	//                           ErrRevisionConflict. Other errors (a different constraint
+	//                           error included) are returned as they are.
 	//   expectedRevision > 0:   CAS update; returns ErrRevisionConflict if current revision != expectedRevision.
 	// origin must be "seeded" or "managed" — seed-writes pass "seeded", admin-PUT writes pass "managed".
 	// A write of an operational section bumps the HubSettingsRevisionSection
@@ -4305,6 +5113,9 @@ type AgentDelegationStore interface {
 type AgentDelegationGrantFilter struct {
 	AgentID      string
 	IssuerUserID string
+	// ExceptIssuedRunID, when set, leaves out the grants whose IssuedRunID
+	// equals it. Grants with an empty IssuedRunID are never left out.
+	ExceptIssuedRunID string
 }
 
 // =============================================================================
@@ -4472,6 +5283,131 @@ type QuotaStore interface {
 	// none. At most one exists (the unique active (limit_definition_id,
 	// resource_id) index). Released reservations are never returned.
 	GetActiveReservation(ctx context.Context, limitDefinitionID, resourceID string) (*UsageReservation, error)
+
+	// TransferBrokerReservation leaves req.AgentID with exactly one active
+	// reservation for req.LimitDefinitionID, broker-scoped on req.ToBrokerID,
+	// in one transaction:
+	//  1. Locks the agent row (FOR UPDATE on Postgres; SQLite serializes
+	//     writers). A missing or soft-deleted (DeletedAt set) agent row
+	//     returns ErrNotFound.
+	//  2. RequireAgentOnTo: checks RuntimeBrokerID (TransferAgentElsewhere).
+	//     Cond: evaluates it (TransferStale).
+	//  3. Reads the agent's active reservation for the limit, locked.
+	//     FromReservationID set: the row must exist with that ID
+	//     (TransferStale).
+	//  4. Row is broker-scoped on ToBrokerID: TransferAlreadyOn.
+	//  5. No row and !CreateIfAbsent: TransferAbsent.
+	//  6. Cap > 0: counts active rows with the predicate Reserve uses
+	//     (CountActiveReservations: subject = scope = (broker, ToBrokerID));
+	//     count >= Cap returns ErrQuotaExceeded.
+	//  7. Releases the held row, if any (released_at = now WHERE id AND
+	//     released_at IS NULL); affected rows != 1 rolls back with
+	//     ErrTransferRaced. Never falls through to the insert.
+	//  8. Inserts a new broker-scoped row on ToBrokerID (subject ToBrokerID,
+	//     reserved 1, created_at now). A unique violation returns
+	//     ErrActiveReservationExists.
+	// Every error rolls the whole transaction back: the agent keeps the
+	// reservation it had. CreateIfAbsent together with FromReservationID
+	// returns ErrInvalidTransfer before any read. Must not be called from
+	// inside WithTx.
+	TransferBrokerReservation(ctx context.Context, req BrokerReservationTransfer) (BrokerReservationTransferResult, error)
+}
+
+// BrokerReservationTransfer asks TransferBrokerReservation to leave AgentID
+// with exactly one active reservation for LimitDefinitionID, on ToBrokerID.
+type BrokerReservationTransfer struct {
+	LimitDefinitionID string
+	AgentID           string
+	ToBrokerID        string
+	// Cap > 0 counts the active broker-scoped reservations on ToBrokerID
+	// inside the transaction and refuses with ErrQuotaExceeded, writing
+	// nothing, when count >= Cap. Cap <= 0 is unchecked.
+	Cap int64
+	// CreateIfAbsent inserts the reservation on ToBrokerID when the agent
+	// holds none. When false, an agent holding none reports TransferAbsent
+	// and nothing is written.
+	CreateIfAbsent bool
+	// RequireAgentOnTo requires the locked agent row's RuntimeBrokerID to
+	// equal ToBrokerID, else TransferAgentElsewhere and nothing is written.
+	RequireAgentOnTo bool
+	// FromReservationID, when set, requires the agent's held active row to
+	// be exactly this ID (a caller acting on a row it read never moves a
+	// newer one). A different row, or none, reports TransferStale and
+	// nothing is written. CreateIfAbsent must be false when it is set:
+	// both set returns ErrInvalidTransfer before any read.
+	FromReservationID string
+	// Cond, when non-nil, is evaluated on the locked agent row; if it does
+	// not hold, TransferStale and nothing is written.
+	Cond *TransferAgentCond
+}
+
+// TransferAgentCond holds preconditions on the agent row that
+// TransferBrokerReservation has locked, for callers acting on an earlier
+// read. Every set field must hold. It differs from AgentReleaseCond (the
+// condition of ReleaseReservationIfAgent) on purpose: NoClaim excludes stop
+// claims too, HoldsCapacity is the inverse of NotCounted, and NotInFlight
+// has no release counterpart.
+type TransferAgentCond struct {
+	// CheckRunID: the row's RunID must equal ExpectedRunID (empty included).
+	CheckRunID    bool
+	ExpectedRunID string
+	// NoClaim: StartClaimID must be "" (no claim of any kind, stop included).
+	NoClaim bool
+	// HoldsCapacity: AgentHoldsBrokerCapacity(row) must be true.
+	HoldsCapacity bool
+	// NotInFlight: !ReincarnationInFlight(row.ReincarnationState).
+	NotInFlight bool
+}
+
+// Holds reports whether c holds for the agent row a.
+func (c TransferAgentCond) Holds(a *Agent) bool {
+	if c.CheckRunID && a.RunID != c.ExpectedRunID {
+		return false
+	}
+	if c.NoClaim && a.StartClaimID != "" {
+		return false
+	}
+	if c.HoldsCapacity && !AgentHoldsBrokerCapacity(a) {
+		return false
+	}
+	if c.NotInFlight && ReincarnationInFlight(a.ReincarnationState) {
+		return false
+	}
+	return true
+}
+
+// BrokerReservationTransferOutcome is what TransferBrokerReservation did.
+type BrokerReservationTransferOutcome string
+
+const (
+	// TransferAlreadyOn: the active row was already on ToBrokerID; no write.
+	TransferAlreadyOn BrokerReservationTransferOutcome = "already_on"
+	// TransferMoved: the old row was released and a new row inserted.
+	TransferMoved BrokerReservationTransferOutcome = "moved"
+	// TransferCreated: none was held and CreateIfAbsent inserted one.
+	TransferCreated BrokerReservationTransferOutcome = "created"
+	// TransferAbsent: none was held, !CreateIfAbsent and no
+	// FromReservationID; no write.
+	TransferAbsent BrokerReservationTransferOutcome = "absent"
+	// TransferAgentElsewhere: RequireAgentOnTo failed; no write.
+	TransferAgentElsewhere BrokerReservationTransferOutcome = "agent_elsewhere"
+	// TransferStale: FromReservationID or Cond failed; no write.
+	TransferStale BrokerReservationTransferOutcome = "stale"
+)
+
+// BrokerReservationTransferResult is the result of
+// TransferBrokerReservation.
+type BrokerReservationTransferResult struct {
+	Outcome BrokerReservationTransferOutcome
+	// FromScopeType and FromScopeID are the scope of the released row
+	// (TransferMoved).
+	FromScopeType string
+	FromScopeID   string
+	// ReleasedID is the ID of the released row (TransferMoved).
+	ReleasedID string
+	// ReservationID is the active row on ToBrokerID afterwards (empty when
+	// no row is on it).
+	ReservationID string
 }
 
 // =============================================================================

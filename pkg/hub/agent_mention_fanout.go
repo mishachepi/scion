@@ -181,7 +181,6 @@ func (s *Server) fanOutAgentMentions(ctx context.Context, in agentMentionFanoutI
 	if len(names) == 0 {
 		return nil
 	}
-
 	primarySlug := ""
 	if in.Primary != nil && in.Primary.ProjectID == in.Sender.ProjectID {
 		primarySlug = in.Primary.Slug
@@ -232,6 +231,22 @@ func (s *Server) fanOutAgentMentions(ctx context.Context, in agentMentionFanoutI
 	results = s.dropHumanMentionResults(ctx, in.Sender.ProjectID, results, in.HumanMembers)
 	if len(results) == 0 {
 		return nil
+	}
+
+	// Only explicit mentions can name agents on a message without text. A
+	// copy of such a message (an attachment-only one, ptone/scion#6146) is
+	// still useful when it delivers the parent's artifact attachments
+	// (ParentAttachments); with none, it would reach the agents empty, so
+	// it is not made. Resolution has already dropped the primary, self- and
+	// human mentions and marked unknown names; each mention that would have
+	// been delivered reports why instead.
+	if in.Msg == "" && len(in.ParentAttachments) == 0 {
+		for i := range results {
+			if results[i].Status == "delivered" {
+				results[i].Status, results[i].Error = "error", errMentionCopyNeedsText
+			}
+		}
+		return results
 	}
 
 	// Bound the whole call well under a typical client's own request
@@ -403,18 +418,24 @@ func (s *Server) deliverAgentMentionCopy(ctx, aggregateCtx context.Context, in a
 		Channel:        in.Channel,
 		ThreadID:       threadID,
 		ProjectID:      in.Sender.ProjectID,
-		// A mention must not wake a stopped or suspended agent — that
-		// would be a surprising side effect of merely being mentioned —
-		// but it must also not be silently dropped just because the
-		// recipient isn't running right now: it still gets a persisted
-		// row and a dispatch attempt, the same as any other message to
-		// an agent that isn't currently reachable.
-		SkipPhaseGate: true,
+		// A mention must not wake a stopped or user-suspended agent —
+		// that would be a surprising side effect of merely being
+		// mentioned — but it must also not be silently dropped just
+		// because the recipient isn't running right now: it still gets a
+		// persisted row and a dispatch attempt, the same as any other
+		// message to an agent that isn't currently reachable. An agent
+		// the hub suspended (shouldAutoWake) is woken in the background
+		// and gets the mention once ready (AgentDMWakeQueued).
+		SkipPhaseGate:       true,
+		AttachmentAddressee: addresseeRow,
 	})
 	dispatchCancel()
-	if dmErr != nil {
+	switch {
+	case dmErr != nil:
 		s.finishAttachmentAddressee(context.WithoutCancel(ctx), addresseeRow, errors.New(dmErr.Message))
-	} else {
+	case dmResult.Outcome == AgentDMWakeQueued:
+		// The background wake settles it when it delivers or fails.
+	default:
 		s.finishAttachmentAddressee(context.WithoutCancel(ctx), addresseeRow, nil)
 	}
 	if dmErr != nil {
@@ -439,7 +460,9 @@ func (s *Server) deliverAgentMentionCopy(ctx, aggregateCtx context.Context, in a
 	}
 
 	// The sender must be allowed to add the target under its message
-	// mode (group_message_mode.go).
+	// mode (group_message_mode.go). A wake-queued mention counts as
+	// delivered and is registered before its wake on purpose: a participant
+	// is a listing index, not an ACL.
 	if out.Status == "delivered" && registerAfter {
 		if joinOK, joinReason := s.groupAgentJoinAllowed(aggregateCtx, in.SenderIdent, target); !joinOK {
 			s.messageLog.Info("mention target not registered as group participant: message mode",

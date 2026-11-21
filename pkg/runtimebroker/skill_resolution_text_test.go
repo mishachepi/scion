@@ -25,6 +25,7 @@ import (
 	"testing"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent"
+	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
 )
 
@@ -104,9 +105,9 @@ func TestPublicSkillRef(t *testing.T) {
 		"gh://u:pw-1@owner/repo/skill":                                  "(redacted URL)",
 		"gh://owner/repo/skill@main?token=NAME":                         "(redacted URL)",
 		"gh://owner/repo/https://h.example.test/x":                      "(redacted URL)",
-		"skill://scion/core/scion@^1.0":                                 "skill://scion/core/scion@^1.0",
-		"skill://scion/core/scion?k=qv-1":                               "(redacted URL)",
-		"skill://scion/core/sc ion":                                     "(redacted URL)",
+		"skill://scion/global/scion@^1.0":                               "skill://scion/global/scion@^1.0",
+		"skill://scion/global/scion?k=qv-1":                             "(redacted URL)",
+		"skill://scion/global/sc ion":                                   "(redacted URL)",
 		"gcp-skill://reg/some-skill":                                    "gcp-skill://reg/some-skill",
 		"gcp-skill://reg/some-skill#qv-1":                               "(redacted URL)",
 	}
@@ -347,7 +348,7 @@ func TestSkillResolutionFailed_FixedReasonPhrase(t *testing.T) {
 
 func TestClassifyStartError_SkillResolverError_FixedReasonPhrase(t *testing.T) {
 	e := &agent.SkillResolutionError{URI: "gh://o/r/s@v", Code: agent.SkillErrCodeResolveFailed, Status: 422, Message: resolverTestBody}
-	code, _, msg := classifyStartError(context.Background(), fmt.Errorf("start: %w", e), "", "")
+	code, _, msg := classifyStartError(context.Background(), fmt.Errorf("start: %w", e), "", "", store.LaunchKindCreate)
 	if code != ErrCodeSkillResolution {
 		t.Fatalf("code = %q, want %q", code, ErrCodeSkillResolution)
 	}

@@ -60,6 +60,8 @@ const (
 	FieldRuntimeState = "runtime_state"
 	// FieldStalledFromActivity holds the string denoting the stalled_from_activity field in the database.
 	FieldStalledFromActivity = "stalled_from_activity"
+	// FieldSuspendReason holds the string denoting the suspend_reason field in the database.
+	FieldSuspendReason = "suspend_reason"
 	// FieldCurrentTurns holds the string denoting the current_turns field in the database.
 	FieldCurrentTurns = "current_turns"
 	// FieldCurrentModelCalls holds the string denoting the current_model_calls field in the database.
@@ -90,6 +92,8 @@ const (
 	FieldMessage = "message"
 	// FieldAppliedConfig holds the string denoting the applied_config field in the database.
 	FieldAppliedConfig = "applied_config"
+	// FieldEffectiveConfig holds the string denoting the effective_config field in the database.
+	FieldEffectiveConfig = "effective_config"
 	// FieldPendingConfig holds the string denoting the pending_config field in the database.
 	FieldPendingConfig = "pending_config"
 	// FieldHarnessConfig holds the string denoting the harness_config field in the database.
@@ -104,6 +108,10 @@ const (
 	FieldLastSeen = "last_seen"
 	// FieldLastActivityEvent holds the string denoting the last_activity_event field in the database.
 	FieldLastActivityEvent = "last_activity_event"
+	// FieldLastLiveProcessAt holds the string denoting the last_live_process_at field in the database.
+	FieldLastLiveProcessAt = "last_live_process_at"
+	// FieldLastLiveWorkAt holds the string denoting the last_live_work_at field in the database.
+	FieldLastLiveWorkAt = "last_live_work_at"
 	// FieldStartedAt holds the string denoting the started_at field in the database.
 	FieldStartedAt = "started_at"
 	// FieldDeletedAt holds the string denoting the deleted_at field in the database.
@@ -120,6 +128,8 @@ const (
 	FieldLaunchAsyncOptIn = "launch_async_opt_in"
 	// FieldLaunchID holds the string denoting the launch_id field in the database.
 	FieldLaunchID = "launch_id"
+	// FieldLaunchRunID holds the string denoting the launch_run_id field in the database.
+	FieldLaunchRunID = "launch_run_id"
 	// FieldRunID holds the string denoting the run_id field in the database.
 	FieldRunID = "run_id"
 	// FieldPreviousRunIds holds the string denoting the previous_run_ids field in the database.
@@ -202,6 +212,12 @@ const (
 	FieldStartClaimLaunchID = "start_claim_launch_id"
 	// FieldSoftDeleteOpID holds the string denoting the soft_delete_op_id field in the database.
 	FieldSoftDeleteOpID = "soft_delete_op_id"
+	// FieldActivitySince holds the string denoting the activity_since field in the database.
+	FieldActivitySince = "activity_since"
+	// FieldLastDeliveryAt holds the string denoting the last_delivery_at field in the database.
+	FieldLastDeliveryAt = "last_delivery_at"
+	// FieldIdleSuspendClaimUntil holds the string denoting the idle_suspend_claim_until field in the database.
+	FieldIdleSuspendClaimUntil = "idle_suspend_claim_until"
 	// EdgeProject holds the string denoting the project edge name in mutations.
 	EdgeProject = "project"
 	// EdgeMemberships holds the string denoting the memberships edge name in mutations.
@@ -276,6 +292,7 @@ var Columns = []string{
 	FieldExitReason,
 	FieldRuntimeState,
 	FieldStalledFromActivity,
+	FieldSuspendReason,
 	FieldCurrentTurns,
 	FieldCurrentModelCalls,
 	FieldImage,
@@ -291,6 +308,7 @@ var Columns = []string{
 	FieldTaskSummary,
 	FieldMessage,
 	FieldAppliedConfig,
+	FieldEffectiveConfig,
 	FieldPendingConfig,
 	FieldHarnessConfig,
 	FieldAncestry,
@@ -298,6 +316,8 @@ var Columns = []string{
 	FieldUpdated,
 	FieldLastSeen,
 	FieldLastActivityEvent,
+	FieldLastLiveProcessAt,
+	FieldLastLiveWorkAt,
 	FieldStartedAt,
 	FieldDeletedAt,
 	FieldStateVersion,
@@ -306,6 +326,7 @@ var Columns = []string{
 	FieldReincarnationUpdatedAt,
 	FieldLaunchAsyncOptIn,
 	FieldLaunchID,
+	FieldLaunchRunID,
 	FieldRunID,
 	FieldPreviousRunIds,
 	FieldRunIDUpdatedAt,
@@ -347,6 +368,9 @@ var Columns = []string{
 	FieldStartClaimHoldUntil,
 	FieldStartClaimLaunchID,
 	FieldSoftDeleteOpID,
+	FieldActivitySince,
+	FieldLastDeliveryAt,
+	FieldIdleSuspendClaimUntil,
 }
 
 // ValidColumn reports if the column name is valid (part of the table columns).
@@ -394,6 +418,8 @@ var (
 	DefaultLaunchAsyncOptIn bool
 	// DefaultLaunchID holds the default value on creation for the "launch_id" field.
 	DefaultLaunchID string
+	// DefaultLaunchRunID holds the default value on creation for the "launch_run_id" field.
+	DefaultLaunchRunID string
 	// DefaultRunID holds the default value on creation for the "run_id" field.
 	DefaultRunID string
 	// DefaultLaunchState holds the default value on creation for the "launch_state" field.
@@ -614,6 +640,11 @@ func ByStalledFromActivity(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldStalledFromActivity, opts...).ToFunc()
 }
 
+// BySuspendReason orders the results by the suspend_reason field.
+func BySuspendReason(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldSuspendReason, opts...).ToFunc()
+}
+
 // ByCurrentTurns orders the results by the current_turns field.
 func ByCurrentTurns(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldCurrentTurns, opts...).ToFunc()
@@ -684,6 +715,11 @@ func ByAppliedConfig(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldAppliedConfig, opts...).ToFunc()
 }
 
+// ByEffectiveConfig orders the results by the effective_config field.
+func ByEffectiveConfig(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldEffectiveConfig, opts...).ToFunc()
+}
+
 // ByPendingConfig orders the results by the pending_config field.
 func ByPendingConfig(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldPendingConfig, opts...).ToFunc()
@@ -712,6 +748,16 @@ func ByLastSeen(opts ...sql.OrderTermOption) OrderOption {
 // ByLastActivityEvent orders the results by the last_activity_event field.
 func ByLastActivityEvent(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldLastActivityEvent, opts...).ToFunc()
+}
+
+// ByLastLiveProcessAt orders the results by the last_live_process_at field.
+func ByLastLiveProcessAt(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldLastLiveProcessAt, opts...).ToFunc()
+}
+
+// ByLastLiveWorkAt orders the results by the last_live_work_at field.
+func ByLastLiveWorkAt(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldLastLiveWorkAt, opts...).ToFunc()
 }
 
 // ByStartedAt orders the results by the started_at field.
@@ -752,6 +798,11 @@ func ByLaunchAsyncOptIn(opts ...sql.OrderTermOption) OrderOption {
 // ByLaunchID orders the results by the launch_id field.
 func ByLaunchID(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldLaunchID, opts...).ToFunc()
+}
+
+// ByLaunchRunID orders the results by the launch_run_id field.
+func ByLaunchRunID(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldLaunchRunID, opts...).ToFunc()
 }
 
 // ByRunID orders the results by the run_id field.
@@ -952,6 +1003,21 @@ func ByStartClaimLaunchID(opts ...sql.OrderTermOption) OrderOption {
 // BySoftDeleteOpID orders the results by the soft_delete_op_id field.
 func BySoftDeleteOpID(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldSoftDeleteOpID, opts...).ToFunc()
+}
+
+// ByActivitySince orders the results by the activity_since field.
+func ByActivitySince(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldActivitySince, opts...).ToFunc()
+}
+
+// ByLastDeliveryAt orders the results by the last_delivery_at field.
+func ByLastDeliveryAt(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldLastDeliveryAt, opts...).ToFunc()
+}
+
+// ByIdleSuspendClaimUntil orders the results by the idle_suspend_claim_until field.
+func ByIdleSuspendClaimUntil(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldIdleSuspendClaimUntil, opts...).ToFunc()
 }
 
 // ByProjectField orders the results by project field.

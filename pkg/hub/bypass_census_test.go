@@ -71,6 +71,7 @@ func TestBypassCensus(t *testing.T) {
 		{file: "authorize.go", lineSubstr: "func (s *Server) requireAdmin(", description: "requireAdmin helper definition (DEPRECATED — fallback only)"},
 		{file: "authorize.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(user)", description: "requireAdmin implementation"},
 		{file: "admin_delegation_adoption.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(user)", description: "delegation-provenance adoption admin check: system admin only, no registered permission exists for it"},
+		{file: "handlers_env_secrets.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(userIdent)", description: "hub-scope env and secret access: session credential plus unscoped admin; no registered permission covers hub-level env and secret material"},
 		{file: "route_metadata.go", lineSubstr: "requireAdmin(w, r)", description: "routeGuard fallback for unconverted routes (temporary)"},
 		{file: "internal/principal/identity.go", lineSubstr: "IsUnscopedLocalPlatformAdmin", description: "IsUnscopedLocalPlatformAdmin definition"},
 		{file: "internal/principal/identity.go", lineSubstr: `user.Role() != "admin"`, description: "IsUnscopedLocalPlatformAdmin implementation"},
@@ -78,11 +79,13 @@ func TestBypassCensus(t *testing.T) {
 
 		// ─── AdminModeMiddleware bypass (infrastructure, KEEP) ───────────
 		{file: "admin_mode.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(user)", description: "AdminModeMiddleware admin bypass (infrastructure, KEEP)"},
+		{file: "agent_pending_config_authz.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(user)", description: "held-edit fold mirrors AdminModeMiddleware: an admin saver's keys are not deferred during maintenance (infrastructure, KEEP)"},
 
 		// ─── Messaging authorization engine (permanent, D6/D7) ─────────────
 		{file: "authorize_message.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(user)", description: "authorizeAgentMessage super-admin bypass (D6, KEEP)"},
 		{file: "handlers_agent_message_mode.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(userIdent)", description: "handleSetMessageMode project-admin exclusion (D7, KEEP — super-admins must not be blocked by the project-admin deny gate)"},
 		{file: "project_messaging_policy.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(userIdent)", description: "Messaging policy admin bypass (owner-or-admin check)"},
+		{file: "handlers_message_policies.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(userIdent)", description: "Message policy owner-or-admin governance rule (runs after Decide checks project.manage_message_policies)"},
 
 		// ─── Auth/identity infrastructure (non-bypass references) ────────
 		{file: "handlers_auth.go", lineSubstr: "IsUnscopedLocalPlatformAdmin", description: "admin reconciliation comment reference"},

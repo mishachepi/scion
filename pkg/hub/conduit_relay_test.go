@@ -35,6 +35,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/conduit/registry"
 	"github.com/GoogleCloudPlatform/scion/pkg/conduit/relay"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
+	"github.com/GoogleCloudPlatform/scion/pkg/secret"
 	"github.com/GoogleCloudPlatform/scion/pkg/store/entadapter"
 	"github.com/GoogleCloudPlatform/scion/pkg/store/enttest"
 	conduitv1 "github.com/GoogleCloudPlatform/scion/proto/conduit/v1"
@@ -50,8 +51,7 @@ func TestConduitEndpoint_HTTPGate(t *testing.T) {
 	f := newConduitFixture(t)
 	agentTok, err := f.srv.GenerateAgentToken(f.agent.ID, f.agent.ProjectID, nil, AgentRoleFull, nil)
 	require.NoError(t, err)
-	noScopeTok, err := f.srv.agentTokenService.GenerateAgentToken(f.agent.ID, f.agent.ProjectID, []AgentTokenScope{ScopeAgentStatusUpdate}, nil)
-	require.NoError(t, err)
+	noScopeTok := f.srv.generateRecordedAgentToken(t, f.agent.ID, f.agent.ProjectID, []AgentTokenScope{ScopeAgentStatusUpdate}, nil)
 
 	for _, tc := range []struct {
 		name     string
@@ -151,9 +151,9 @@ func TestStartConduitRelay_StartupChecks(t *testing.T) {
 			srv, _ := testServer(t)
 			setConduitExperiment(t, srv, tc.flag)
 			if tc.noKey {
-				srv.encryptionKey = nil
+				srv.cipher = secret.NewLegacyValueCipher("")
 			} else {
-				srv.encryptionKey = testGrantEncryptionKey
+				srv.cipher = testGrantCipher
 			}
 			assert.Equal(t, !tc.noKey, srv.ConduitGrantRingShared())
 			st := entadapter.NewConduitRegistryStore(enttest.NewClient(t))

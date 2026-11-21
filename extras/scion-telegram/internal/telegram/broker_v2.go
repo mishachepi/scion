@@ -48,11 +48,6 @@ const (
 	askUserExpiry        = 30 * time.Minute
 )
 
-// legacyProjectsRoot is the base path for legacy download directories
-// when no downloads_path override or shared-dir config is available.
-// Extracted as a var to allow tests to redirect to a temp directory.
-var legacyProjectsRoot = "/home/scion/.scion/projects"
-
 // TelegramBrokerV2 implements plugin.MessageBrokerPluginInterface with
 // dynamic group-link routing, inline keyboard support, and persistent
 // SQLite state. It wires together the v2 component handlers (commands,
@@ -108,7 +103,6 @@ type TelegramBrokerV2 struct {
 
 	agentCacheTTL  time.Duration
 	projectSlugMap map[string]string // injected by hub: projectID → slug
-	downloadsPath  string            // override for file download directory; empty = default
 
 	// Webhook mode fields.
 	inboundMode   string // "poll" (default) or "webhook"
@@ -356,9 +350,12 @@ func (b *TelegramBrokerV2) Configure(config map[string]string) error {
 		<-retired.pollDone
 	}
 	if retired != nil {
+		// Read the logger here: the goroutine outlives Configure and must
+		// not read mutable broker fields.
+		log := b.log
 		go func() {
 			defer b.retiring.Done()
-			retired.shutdown(b.log)
+			retired.shutdown(log)
 		}()
 	}
 	return err
@@ -559,9 +556,10 @@ func (b *TelegramBrokerV2) configureLocked(config map[string]string) (*retiredCo
 	}
 	b.sendQueue = NewSendQueue(b.api, b.log, sqSize, sqDelay)
 
-	// Parse optional downloads directory override.
+	// downloads_path is retired: inbound attachments go through the hub.
 	if v, ok := config["downloads_path"]; ok && v != "" {
-		b.downloadsPath = v
+		b.log.Warn("The downloads_path setting is no longer supported and is ignored; " +
+			"inbound attachments are delivered through the hub. Remove it from the plugin configuration.")
 	}
 
 	if !bot.CanReadAllGroupMessages {
@@ -2328,7 +2326,7 @@ func (b *TelegramBrokerV2) handleGroupMessage(g *configGen, tgMsg *TGMessage) {
 
 	// Get project agents (cached per user, refreshed as the sender).
 	agents, agentsErr := b.getProjectAgents(ctx, link.ProjectID, senderLookup)
-	listUnavailable := func(replyTo string) {
+	listUnavailable := func(replyTo int64) {
 		b.replyAgentListUnavailable(ctx, api, chatID, replyTo, agentsErr, senderLookup.email(), link.ProjectSlug)
 	}
 	// replyDenied tells a sender the hub denies why their message was not
@@ -2337,11 +2335,7 @@ func (b *TelegramBrokerV2) handleGroupMessage(g *configGen, tgMsg *TGMessage) {
 		if b.shouldSuppressError(chatID, int(tgMsg.MessageThreadID), agentListSuppressKey(agentsErr, tgMsg.From)) {
 			return
 		}
-		replyTo := ""
-		if tgMsg.MessageID != 0 {
-			replyTo = strconv.FormatInt(tgMsg.MessageID, 10)
-		}
-		listUnavailable(replyTo)
+		listUnavailable(tgMsg.MessageID)
 	}
 
 	// Resolve target agents from @-mentions.
@@ -2411,15 +2405,11 @@ func (b *TelegramBrokerV2) handleGroupMessage(g *configGen, tgMsg *TGMessage) {
 					errorType = agentListSuppressKey(agentsErr, tgMsg.From)
 				}
 				if !b.shouldSuppressError(chatID, threadID, errorType) {
-					replyTo := ""
-					if tgMsg.MessageID != 0 {
-						replyTo = strconv.FormatInt(int64(tgMsg.MessageID), 10)
-					}
 					if agentsErr != nil {
-						listUnavailable(replyTo)
+						listUnavailable(tgMsg.MessageID)
 					} else {
 						errMsg := fmt.Sprintf("Default agent %q is no longer available. Use /agents to see available agents, or /default to change the default.", effectiveDefault)
-						api.SendMessage(ctx, chatID, errMsg, replyTo) //nolint:errcheck
+						api.SendMessageWithKeyboard(ctx, chatID, errMsg, "", nil, tgMsg.MessageID) //nolint:errcheck
 					}
 				}
 				return
@@ -2439,7 +2429,7 @@ func (b *TelegramBrokerV2) handleGroupMessage(g *configGen, tgMsg *TGMessage) {
 					return
 				}
 				if agentsErr != nil {
-					listUnavailable("")
+					listUnavailable(0)
 					return
 				}
 				errMsg := fmt.Sprintf("No agent named %q found in this project. Use /agents to see available agents.", unresolved[0])
@@ -2464,7 +2454,7 @@ func (b *TelegramBrokerV2) handleGroupMessage(g *configGen, tgMsg *TGMessage) {
 				if len(typos) > 0 && isForbiddenHubError(agentsErr) {
 					replyDenied()
 				} else if len(typos) > 0 && agentsErr != nil {
-					listUnavailable("")
+					listUnavailable(0)
 				} else if len(typos) > 0 {
 					errMsg := fmt.Sprintf("Unknown agent(s): %s. Use /agents to see available agents.", strings.Join(typos, ", "))
 					api.SendMessage(ctx, chatID, errMsg, "") //nolint:errcheck
@@ -2578,17 +2568,23 @@ func (b *TelegramBrokerV2) handleGroupMessage(g *configGen, tgMsg *TGMessage) {
 	cleanText := stripMentions(resolvedText, botUsername, stripSlugs)
 	cleanText = strings.TrimSpace(cleanText)
 
-	// Download file attachments (photos/documents/audio/video).
-	var attachmentPath, placeholder string
-	if tgMsg.Photo != nil || tgMsg.Document != nil || tgMsg.Audio != nil || tgMsg.Video != nil {
-		var err error
-		attachmentPath, placeholder, err = b.downloadTelegramFile(ctx, api, tgMsg, link.ProjectSlug, link.ProjectID)
-		if err != nil {
-			b.log.Error("Failed to download telegram file", "error", err)
-			// The error can name host paths; the sender only gets fixed
-			// text, and the full error stays in the plugin log.
-			api.SendMessage(ctx, chatID, attachmentFailureText(telegramAttachmentName(tgMsg), err), "")
+	// File attachments (photos/documents/audio/video): the hub decides,
+	// before anything is downloaded or written, whether and how the file
+	// goes to the recipients (the targets and the body-mentioned agents).
+	var attachment *inboundAttachment
+	var placeholder string
+	if _, ok := telegramAttachmentOf(tgMsg); ok {
+		plan := b.prepareInboundAttachment(ctx, api, tgMsg, link, sender,
+			inboundRecipients(targets, classified, isAll), cleanText != "")
+		if plan.refused {
+			return
 		}
+		attachment = plan.attachment
+		if attachment != nil {
+			placeholder = attachment.att.placeholder()
+		}
+		// A staged entry no recipient accepted is removed after the sends.
+		defer b.finishInboundAttachment(attachment)
 	}
 
 	// Build final message text: clean text + attachment placeholder.
@@ -2660,10 +2656,6 @@ func (b *TelegramBrokerV2) handleGroupMessage(g *configGen, tgMsg *TGMessage) {
 			msg.ThreadID = strconv.FormatInt(tgMsg.MessageThreadID, 10)
 		}
 
-		if attachmentPath != "" {
-			msg.Attachments = []string{attachmentPath}
-		}
-
 		if resolvedMentionsJSON != "" {
 			msg.Metadata["resolved_mentions"] = resolvedMentionsJSON
 		}
@@ -2676,7 +2668,7 @@ func (b *TelegramBrokerV2) handleGroupMessage(g *configGen, tgMsg *TGMessage) {
 		b.log.Debug("Delivering inbound message",
 			"topic", topic, "sender", sender, "agent", agentSlug)
 
-		statusCode, deliveryErr := b.deliverInboundWithFeedback(ctx, topic, msg)
+		statusCode, deliveryErr, _ := b.sendInbound(ctx, api, tgMsg, link.ProjectID, agentSlug, topic, msg, attachment)
 		if statusCode >= 400 && deliveryErr != "" {
 			threadID := 0
 			if tgMsg.MessageThreadID != 0 {
@@ -2689,11 +2681,7 @@ func (b *TelegramBrokerV2) handleGroupMessage(g *configGen, tgMsg *TGMessage) {
 				errorType = "permission_denied"
 			}
 			if !b.shouldSuppressError(chatID, threadID, errorType) {
-				replyTo := ""
-				if tgMsg.MessageID != 0 {
-					replyTo = strconv.FormatInt(int64(tgMsg.MessageID), 10)
-				}
-				api.SendMessage(ctx, chatID, "Message delivery failed: "+deliveryErr, replyTo) //nolint:errcheck
+				api.SendMessageWithKeyboard(ctx, chatID, "Message delivery failed: "+deliveryErr, "", nil, tgMsg.MessageID) //nolint:errcheck
 			}
 		}
 	}
@@ -2752,10 +2740,6 @@ func (b *TelegramBrokerV2) handleGroupMessage(g *configGen, tgMsg *TGMessage) {
 				mentionMsg.ThreadID = strconv.FormatInt(tgMsg.MessageThreadID, 10)
 			}
 
-			if attachmentPath != "" {
-				mentionMsg.Attachments = []string{attachmentPath}
-			}
-
 			if resolvedMentionsJSON != "" {
 				mentionMsg.Metadata["resolved_mentions"] = resolvedMentionsJSON
 			}
@@ -2764,150 +2748,33 @@ func (b *TelegramBrokerV2) handleGroupMessage(g *configGen, tgMsg *TGMessage) {
 				"topic", mentionTopic, "sender", sender, "mentioned_agent", mention.Name,
 				"mention_source", mentionSource)
 
-			b.deliverInboundWithFeedback(ctx, mentionTopic, mentionMsg) //nolint:errcheck
+			b.sendInbound(ctx, api, tgMsg, link.ProjectID, mention.Name, mentionTopic, mentionMsg, attachment) //nolint:errcheck
 		}
 	}
 }
 
+// maxTelegramFileSize is the largest file the Bot API lets a bot download.
 const maxTelegramFileSize = 20 * 1024 * 1024 // 20 MB
 
-// downloadTelegramFile downloads a photo, document, audio, or video from a
-// Telegram message and saves it so the agent can access it. Returns the
-// agent-visible path and a placeholder string for the message body.
-//
-// The function uses a three-tier fallback for the destination directory:
-//  1. downloadsPath config (highest priority)
-//  2. The scratchpad shared dir, resolved through its storage backend (local
-//     or nfs) — makes the file available at /scion-volumes/scratchpad/.attachments/_telegram/.
-//     An unavailable nfs mount is an error, never a local fallback.
-//  3. Legacy /home/scion/.scion/projects/<slug>/downloads/ (last resort)
-func (b *TelegramBrokerV2) downloadTelegramFile(ctx context.Context, api *TelegramAPIClient, tgMsg *TGMessage, projectSlug, projectID string) (agentPath, placeholder string, err error) {
-	var fileID, fileName, fileType string
-	var fileSize int64
-
-	switch {
-	case tgMsg.Document != nil:
-		fileID = tgMsg.Document.FileID
-		fileSize = tgMsg.Document.FileSize
-		fileName = tgMsg.Document.FileName
-		if fileName == "" {
-			fileName = tgMsg.Document.FileUniqueID
+// inboundRecipients returns every agent a group message is sent to: the
+// targets, then the body-mentioned agents that are not targets.
+func inboundRecipients(targets []string, classified ClassifiedMentions, isAll bool) []string {
+	out := append([]string(nil), targets...)
+	if isAll {
+		return out
+	}
+	seen := make(map[string]bool, len(targets))
+	for _, t := range targets {
+		seen[strings.ToLower(t)] = true
+	}
+	for _, m := range classified.BodyMentions {
+		if m.Kind != "agent" || seen[strings.ToLower(m.Name)] {
+			continue
 		}
-		fileType = "Document"
-	case len(tgMsg.Photo) > 0:
-		largest := tgMsg.Photo[len(tgMsg.Photo)-1]
-		fileID = largest.FileID
-		fileSize = largest.FileSize
-		fileName = fmt.Sprintf("photo_%s.jpg", largest.FileUniqueID)
-		fileType = "Photo"
-	case tgMsg.Audio != nil:
-		fileID = tgMsg.Audio.FileID
-		fileSize = tgMsg.Audio.FileSize
-		fileName = tgMsg.Audio.FileName
-		if fileName == "" {
-			// Build a descriptive name from title/performer if available.
-			if tgMsg.Audio.Title != "" {
-				fileName = tgMsg.Audio.Title + ".ogg"
-			} else {
-				fileName = fmt.Sprintf("audio_%s.ogg", tgMsg.Audio.FileUniqueID)
-			}
-		}
-		fileType = "Audio"
-	case tgMsg.Video != nil:
-		fileID = tgMsg.Video.FileID
-		fileSize = tgMsg.Video.FileSize
-		fileName = tgMsg.Video.FileName
-		if fileName == "" {
-			fileName = fmt.Sprintf("video_%s.mp4", tgMsg.Video.FileUniqueID)
-		}
-		fileType = "Video"
-	default:
-		return "", "", fmt.Errorf("message has no downloadable attachment")
+		seen[strings.ToLower(m.Name)] = true
+		out = append(out, m.Name)
 	}
-
-	// Sanitize the filename to prevent path traversal via user-controlled
-	// fields (e.g. Document.FileName, Audio.Title). Replacing backslashes
-	// with forward slashes first ensures that both Windows and Unix path
-	// separators are stripped regardless of the host OS.
-	fileName = filepath.Base(strings.ReplaceAll(fileName, "\\", "/"))
-	if fileName == "." || fileName == "" {
-		fileName = fmt.Sprintf("file_%s", fileID)
-	}
-
-	if fileSize > maxTelegramFileSize {
-		return "", "", fmt.Errorf("file too large (%d bytes, max %d)", fileSize, maxTelegramFileSize)
-	}
-
-	tgFile, err := api.GetFile(ctx, fileID)
-	if err != nil {
-		return "", "", fmt.Errorf("getFile: %w", err)
-	}
-
-	body, err := api.DownloadFile(ctx, tgFile.FilePath)
-	if err != nil {
-		return "", "", fmt.Errorf("download file: %w", err)
-	}
-	defer body.Close()
-
-	timestamp := time.Now().UnixNano()
-	destName := fmt.Sprintf("tg_%d_%s", timestamp, fileName)
-
-	// Route attachments through the shared dir infrastructure so container-based
-	// agents can access them at /scion-volumes/scratchpad/.attachments/_telegram/.
-	var hostDir string
-	var useSharedDir bool
-	if b.downloadsPath != "" {
-		hostDir = b.downloadsPath
-	} else if projectID != "" {
-		home, homeErr := os.UserHomeDir()
-		if homeErr == nil {
-			// The scratchpad dir resolves through its storage backend (local
-			// or nfs). It is not checked against the project's declared
-			// shared dirs: if scratchpad is not configured, the file is
-			// written on the host but no agent container sees it.
-			sharedDirBase, resolveErr := resolveSharedDirHostPath(home, projectSlug, projectID, "scratchpad")
-			if resolveErr != nil {
-				// Never fall back to a local directory for an nfs-backed
-				// scratchpad: no agent mounts it.
-				return "", "", fmt.Errorf("resolve scratchpad shared dir for %q: %w", fileName, resolveErr)
-			}
-			hostDir = filepath.Join(sharedDirBase, ".attachments", "_telegram")
-			useSharedDir = true
-		}
-	}
-	if hostDir == "" {
-		hostDir = filepath.Join(legacyProjectsRoot, projectSlug, "downloads")
-	}
-	if err := os.MkdirAll(hostDir, 0o755); err != nil {
-		return "", "", fmt.Errorf("create downloads dir: %w", err)
-	}
-
-	destPath := filepath.Join(hostDir, destName)
-	f, err := os.Create(destPath)
-	if err != nil {
-		return "", "", fmt.Errorf("create file: %w", err)
-	}
-	defer f.Close()
-
-	if _, err := io.Copy(f, body); err != nil {
-		os.Remove(destPath)
-		return "", "", fmt.Errorf("write file: %w", err)
-	}
-
-	if b.downloadsPath != "" {
-		agentPath = filepath.Join(b.downloadsPath, destName)
-	} else if useSharedDir {
-		agentPath = filepath.Join("/scion-volumes/scratchpad/.attachments/_telegram", destName)
-	} else {
-		agentPath = filepath.Join("/workspace/downloads", destName)
-	}
-	agentPath = filepath.ToSlash(agentPath)
-	placeholder = fmt.Sprintf("📎 [%s attached: %s]", fileType, fileName)
-
-	b.log.Info("Downloaded telegram file",
-		"type", fileType, "file", fileName, "path", destPath, "agent_path", agentPath)
-
-	return agentPath, placeholder, nil
+	return out
 }
 
 // resolveUserMentions extracts @username and text_mention entities from a
@@ -3406,10 +3273,11 @@ func agentListErrorKind(err error) string {
 
 // replyAgentListUnavailable tells the sender why their message could not be
 // routed when no agent list is available, instead of reporting the
-// addressed agent as missing.
-func (b *TelegramBrokerV2) replyAgentListUnavailable(ctx context.Context, api *TelegramAPIClient, chatID int64, replyTo string, listErr error, email, project string) {
+// addressed agent as missing. A nonzero replyTo threads the reply to that
+// message.
+func (b *TelegramBrokerV2) replyAgentListUnavailable(ctx context.Context, api *TelegramAPIClient, chatID int64, replyTo int64, listErr error, email, project string) {
 	text := hubErrorText(listErr, email, project, "Couldn't fetch the agent list for this project. Please try again later.")
-	api.SendMessage(ctx, chatID, text, replyTo) //nolint:errcheck
+	api.SendMessageWithKeyboard(ctx, chatID, text, "", nil, replyTo) //nolint:errcheck
 }
 
 // --- Hub delivery (reuses the same pattern as v1) ---
@@ -3507,6 +3375,23 @@ func (b *TelegramBrokerV2) shouldSuppressError(chatID int64, threadID int, error
 // returns the HTTP status code and parsed error message (if any) so the
 // caller can report delivery failures back to the originating chat.
 func (b *TelegramBrokerV2) deliverInboundWithFeedback(ctx context.Context, topic string, msg *messages.StructuredMessage) (statusCode int, errMsg string) {
+	return b.deliverInboundWithAttachments(ctx, topic, msg, nil)
+}
+
+// deliverInboundWithAttachments is deliverInboundWithFeedback for a
+// message that names the sender's hub uploads by id. A hub that could not
+// be reached answers 502 here.
+func (b *TelegramBrokerV2) deliverInboundWithAttachments(ctx context.Context, topic string, msg *messages.StructuredMessage, attachmentIDs []string) (statusCode int, errMsg string) {
+	statusCode, errMsg, _ = b.deliverInboundOutcome(ctx, topic, msg, attachmentIDs)
+	return statusCode, errMsg
+}
+
+// deliverInboundOutcome is deliverInboundWithAttachments that also reports
+// whether the outcome is known: answered is false when the request may
+// have reached the hub but no answer came back (a transport error, a
+// timeout or a cancellation), so the hub may still deliver the message.
+// It is true for a real hub answer, and for a request that was never sent.
+func (b *TelegramBrokerV2) deliverInboundOutcome(ctx context.Context, topic string, msg *messages.StructuredMessage, attachmentIDs []string) (statusCode int, errMsg string, answered bool) {
 	b.mu.RLock()
 	handler := b.InboundHandler
 	hubURL := b.hubURL
@@ -3517,29 +3402,30 @@ func (b *TelegramBrokerV2) deliverInboundWithFeedback(ctx context.Context, topic
 
 	if handler != nil {
 		handler(topic, msg)
-		return http.StatusOK, ""
+		return http.StatusOK, "", true
 	}
 
 	if hubURL == "" {
 		b.log.Debug("No hub URL configured, dropping inbound message", "topic", topic)
-		return http.StatusOK, ""
+		return http.StatusOK, "", true
 	}
 
 	payload := inboundPayload{
-		Topic:   topic,
-		Message: msg,
+		Topic:         topic,
+		Message:       msg,
+		AttachmentIDs: attachmentIDs,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		b.log.Error("Failed to marshal inbound message", "error", err)
-		return http.StatusInternalServerError, "internal error"
+		return http.StatusInternalServerError, "internal error", true
 	}
 
 	inboundURL := hubURL + "/api/v1/broker/inbound"
 	req, err := http.NewRequestWithContext(ctx, "POST", inboundURL, bytes.NewReader(body))
 	if err != nil {
 		b.log.Error("Failed to create inbound request", "error", err)
-		return http.StatusInternalServerError, "internal error"
+		return http.StatusInternalServerError, "internal error", true
 	}
 	req.ContentLength = int64(len(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -3548,14 +3434,14 @@ func (b *TelegramBrokerV2) deliverInboundWithFeedback(ctx context.Context, topic
 	if brokerID != "" && hmacKey != "" {
 		if err := signInboundRequest(req, brokerID, hmacKey); err != nil {
 			b.log.Error("Failed to sign inbound request", "error", err)
-			return http.StatusInternalServerError, "internal error"
+			return http.StatusInternalServerError, "internal error", true
 		}
 	}
 
 	resp, err := b.httpClient.Do(req)
 	if err != nil {
 		b.log.Error("Failed to deliver inbound message", "error", err, "topic", topic)
-		return http.StatusBadGateway, "delivery failed"
+		return http.StatusBadGateway, "delivery failed", false
 	}
 	defer resp.Body.Close()
 
@@ -3575,13 +3461,13 @@ func (b *TelegramBrokerV2) deliverInboundWithFeedback(ctx context.Context, topic
 			if rem, ok := hubErr.Error.Details["remediation"].(string); ok && rem != "" {
 				errDetail += " " + rem
 			}
-			return resp.StatusCode, errDetail
+			return resp.StatusCode, errDetail, true
 		}
-		return resp.StatusCode, fmt.Sprintf("delivery failed (HTTP %d)", resp.StatusCode)
+		return resp.StatusCode, fmt.Sprintf("delivery failed (HTTP %d)", resp.StatusCode), true
 	}
 
 	io.Copy(io.Discard, resp.Body)
-	return resp.StatusCode, ""
+	return resp.StatusCode, "", true
 }
 
 // signInboundRequest signs an HTTP request with HMAC auth.

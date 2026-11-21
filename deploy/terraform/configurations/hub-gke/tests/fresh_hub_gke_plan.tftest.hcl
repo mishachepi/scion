@@ -14,6 +14,7 @@ mock_provider "google" {}
 mock_provider "kubernetes" {}
 mock_provider "helm" {}
 mock_provider "random" {}
+mock_provider "tls" {}
 
 variables {
   project_id        = "tfha-test-project"
@@ -229,10 +230,11 @@ run "fresh_gke_hub_plans_clean" {
     condition = (
       output.chart_values.serviceAccount.name == "scion-hub" &&
       output.chart_values.runtime.namespace == "tfha-gke-h3" &&
+      output.chart_values.runtime.gke == false &&
       output.hub_namespace == "tfha-gke-h3-system" &&
       output.chart_values.agents.imageRegistry == "us-central1-docker.pkg.dev/tfha-test-project/tfha-scion"
     )
-    error_message = "KSA, namespaces and agent image registry are not as designed."
+    error_message = "KSA, namespaces, runtime.gke and agent image registry are not as designed."
   }
 
   # Workspace share: the hub mounts and advertises exactly the share
@@ -253,6 +255,11 @@ run "fresh_gke_hub_plans_clean" {
   assert {
     condition     = try(output.chart_values.config.extra.server.workspace_storage, null) == null
     error_message = "config.extra must not carry server.workspace_storage."
+  }
+
+  assert {
+    condition     = try(output.chart_values.config.extra.server.project_storage, null) == null
+    error_message = "config.extra must not carry server.project_storage; the chart renders it from workspaceStorage.nfs."
   }
 
   assert {
@@ -299,8 +306,8 @@ run "fresh_gke_hub_plans_clean" {
   }
 
   assert {
-    condition     = !contains(keys(output.chart_values.hub), "testIdentities")
-    error_message = "test_identities_enabled defaults to false and must leave hub.testIdentities out of the chart values."
+    condition     = !contains(keys(output.chart_values.hub), "testIdentities") && !contains(keys(output.chart_values.hub), "hubClass")
+    error_message = "test_identities_enabled defaults to false and must leave hub.testIdentities and hub.hubClass out of the chart values."
   }
 }
 
@@ -705,12 +712,120 @@ run "test_identities_enabled_reaches_the_chart" {
   }
 
   assert {
-    condition     = output.chart_values.hub.testIdentities.enabled == true
-    error_message = "test_identities_enabled = true must set the chart's hub.testIdentities.enabled."
+    condition     = output.chart_values.hub.hubClass == "test" && output.chart_values.hub.testIdentities.enabled == true
+    error_message = "test_identities_enabled = true must set the chart's hub.hubClass and hub.testIdentities.enabled."
   }
 
   assert {
     condition     = length(module.hub_test_runner) == 0
     error_message = "test identities alone must not create test-runner identities."
   }
+}
+
+# --- Multi-replica HA + Separate Conduit Relay ---
+
+run "external_relay_ha_plans_clean_with_least_privilege_identity" {
+  command = plan
+
+  variables {
+    hub_replica_count    = 2
+    conduit_relay_mode   = "external"
+    relay_replica_count  = 2
+    enable_hub_pdb       = true
+    enable_relay_pdb     = true
+    enable_relay_db_user = true
+  }
+
+  assert {
+    condition = (
+      module.hub_identity.relay_workload_identity_member == "serviceAccount:tfha-test-project.svc.id.goog[tfha-gke-h3-system/scion-relay]" &&
+      length(module.hub_identity.relay_iam_grants) == 3 &&
+      module.cloudsql_database.relay_db_user == "tfha-gke-h3-relay" &&
+      output.chart_values.replicaCount == 2 &&
+      output.chart_values.hub.pdb.enabled == true &&
+      output.chart_values.conduit.relayMode == "external" &&
+      output.chart_values.conduit.peerAuth == "hmac" &&
+      output.chart_values.relay.enabled == true &&
+      output.chart_values.relay.replicaCount == 2 &&
+      output.chart_values.relay.pdb.enabled == true &&
+      output.chart_values.relay.database.user == "tfha-gke-h3-relay"
+    )
+    error_message = "external relay HA plan must create <hub>-relay GSA + SQL user and wire hub_replica_count, conduit_relay_mode=external, peerAuth=hmac and relay.database.user."
+  }
+}
+
+# Against the MOCK providers only (Terraform 1.9 has no override_during = plan,
+# so computed GSA emails resolve only at apply time; targeted to exclude
+# google_compute_global_address, whose prevent_destroy blocks test teardown).
+run "external_relay_ha_outputs_pass_through" {
+  command = apply
+
+  plan_options {
+    target = [
+      module.hub_identity,
+      module.cloudsql_database,
+      module.agent_runtime_k8s,
+      module.hub_gke,
+      module.hub_lb.google_compute_backend_service.this,
+    ]
+  }
+
+  variables {
+    hub_replica_count    = 2
+    conduit_relay_mode   = "external"
+    relay_replica_count  = 2
+    enable_hub_pdb       = true
+    enable_relay_pdb     = true
+    enable_relay_db_user = true
+  }
+
+  override_resource {
+    target = module.hub_identity.google_service_account.relay
+    values = {
+      name  = "projects/tfha-test-project/serviceAccounts/tfha-gke-h3-relay@tfha-test-project.iam.gserviceaccount.com"
+      email = "tfha-gke-h3-relay@tfha-test-project.iam.gserviceaccount.com"
+    }
+  }
+
+  assert {
+    condition = (
+      output.relay_sa_email == "tfha-gke-h3-relay@tfha-test-project.iam.gserviceaccount.com" &&
+      output.chart_values.relay.serviceAccount.gcpServiceAccount == "tfha-gke-h3-relay@tfha-test-project.iam.gserviceaccount.com" &&
+      output.chart_values.relay.serviceAccount.name == "scion-relay"
+    )
+    error_message = "external relay HA apply must pass the computed <hub>-relay GSA email through to output.relay_sa_email and relay.serviceAccount.gcpServiceAccount."
+  }
+}
+
+run "relay_db_user_without_external_mode_is_rejected" {
+  command = plan
+
+  variables {
+    conduit_relay_mode   = "in_process"
+    enable_relay_db_user = true
+  }
+
+  expect_failures = [var.enable_relay_db_user]
+}
+
+run "hub_pdb_with_single_replica_is_rejected" {
+  command = plan
+
+  variables {
+    hub_replica_count = 1
+    enable_hub_pdb    = true
+  }
+
+  expect_failures = [var.enable_hub_pdb]
+}
+
+run "relay_pdb_without_external_mode_is_rejected" {
+  command = plan
+
+  variables {
+    conduit_relay_mode = "in_process"
+    enable_relay_pdb   = true
+  }
+
+  expect_failures = [var.enable_relay_pdb]
 }

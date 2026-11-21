@@ -92,6 +92,16 @@ func (s *Server) handleAgentPTY(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, ErrCodeUnauthorized, "Authentication required", nil)
 		return
 	}
+	// A conduit PTY stream keeps this identity: for a hub user token it
+	// carries the session generation the request was authenticated with. A
+	// hub user token request without one is refused, never defaulted
+	// (conduitCaptureSessionGeneration).
+	captured, ok := conduitCaptureSessionGeneration(ctx, identity)
+	if !ok {
+		refuseConduitUncapturedSessionGeneration(w)
+		return
+	}
+	identity = captured
 
 	// Get agent details
 	agent, err := s.store.GetAgent(ctx, agentID)
@@ -336,20 +346,44 @@ func (u *brokerPTYUpstream) Read(ctx context.Context) ([]byte, error) {
 	return u.stream.Read(ctx)
 }
 
+// errPTYStreamNoOwner is returned by brokerPTYUpstream.Write and Resize
+// for a stream with no owning control channel connection.
+var errPTYStreamNoOwner = errors.New("pty: stream has no control channel connection")
+
+// owner returns the control channel connection that owns the stream, or nil.
+// Per-stream writes go to it, never to the broker's current connection: a
+// stream id is valid only on the connection that opened it, and after a
+// reconnect the current connection is a session that never had the stream
+// (ptone/scion#5869). Once the owner is closed its writes fail.
+func (u *brokerPTYUpstream) owner() *BrokerConnection {
+	if u.stream == nil {
+		return nil
+	}
+	return u.stream.owner
+}
+
 func (u *brokerPTYUpstream) Write(data []byte) error {
-	if err := u.cc.SendStreamData(u.brokerID, u.stream.streamID, data); err != nil {
+	owner := u.owner()
+	if owner == nil {
+		return &ptyBrokerWriteError{err: errPTYStreamNoOwner}
+	}
+	if err := owner.SendStreamData(u.stream.streamID, data); err != nil {
 		return &ptyBrokerWriteError{err: err}
 	}
 	return nil
 }
 
 func (u *brokerPTYUpstream) Resize(cols, rows int) error {
-	return u.cc.ResizeStream(u.brokerID, u.stream.streamID, cols, rows)
+	owner := u.owner()
+	if owner == nil {
+		return errPTYStreamNoOwner
+	}
+	return owner.ResizeStream(u.stream.streamID, cols, rows)
 }
 
 func (u *brokerPTYUpstream) Close() {
-	if u.stream != nil {
-		_ = u.cc.CloseStream(u.brokerID, u.stream.streamID, "session closed")
+	if owner := u.owner(); owner != nil {
+		_ = owner.CloseStream(u.stream.streamID, "session closed")
 	}
 }
 

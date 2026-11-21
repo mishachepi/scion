@@ -35,6 +35,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/permissions"
 	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/transfer"
@@ -44,6 +45,8 @@ const (
 	githubAPIBase = "https://api.github.com"
 	githubRawBase = "https://raw.githubusercontent.com"
 )
+
+const retiredSkillScopeCoreMessage = `invalid scope "core": the "core" skill scope is no longer supported; use "global" (skill://scion/global/<name>) instead`
 
 // CreateSkillRequest is the request body for creating a skill.
 type CreateSkillRequest struct {
@@ -61,10 +64,15 @@ type CreateSkillResponse struct {
 
 // ListSkillsResponse is the response for listing skills.
 type ListSkillsResponse struct {
-	Skills       []SkillWithCapabilities `json:"skills"`
-	NextCursor   string                  `json:"nextCursor,omitempty"`
-	TotalCount   int                     `json:"totalCount"`
-	Capabilities *Capabilities           `json:"_capabilities,omitempty"`
+	Skills     []SkillWithCapabilities `json:"skills"`
+	NextCursor string                  `json:"nextCursor,omitempty"`
+	TotalCount int                     `json:"totalCount"`
+	// TotalCountApproximate marks TotalCount as a lower bound: set when a
+	// per-item list's candidate pool crossed authorizedListMaxCandidates
+	// before the count scan finished. Only the agent delegated
+	// credential's list sets it.
+	TotalCountApproximate bool          `json:"totalCountApproximate,omitempty"`
+	Capabilities          *Capabilities `json:"_capabilities,omitempty"`
 }
 
 // SkillWithCapabilities wraps a store.Skill with capability annotations.
@@ -120,6 +128,7 @@ type ResolvedSkillResponse struct {
 	Name               string            `json:"name"`
 	ResolvedVersion    string            `json:"resolvedVersion"`
 	ContentHash        string            `json:"contentHash"`
+	ContentHashV2      string            `json:"contentHashV2,omitempty"` // skill content hash v2 (ptone/scion#5935), set only while hub.skill_content_hash_v2 is on
 	Files              []DownloadURLInfo `json:"files"`
 	Deprecated         bool              `json:"deprecated,omitempty"`
 	DeprecationMessage string            `json:"deprecationMessage,omitempty"`
@@ -247,6 +256,10 @@ func (s *Server) listSkills(w http.ResponseWriter, r *http.Request) {
 		Status:  query.Get("status"),
 		Search:  query.Get("search"),
 	}
+	if filter.Scope == "core" {
+		ValidationError(w, retiredSkillScopeCoreMessage, nil)
+		return
+	}
 	if tagsParam := query.Get("tags"); tagsParam != "" {
 		filter.Tags = strings.Split(tagsParam, ",")
 	}
@@ -256,6 +269,14 @@ func (s *Server) listSkills(w http.ResponseWriter, r *http.Request) {
 	}
 
 	identity := GetIdentityFromContext(ctx)
+
+	// An agent delegated credential takes its scope only from the delegated
+	// list arm; no project.list scope is resolved for it
+	// (.design/agent-delegation.md §11.8).
+	if d, ok := identity.(*DelegatedAgentIdentity); ok && d != nil {
+		s.listSkillsDelegated(w, r, d, filter)
+		return
+	}
 
 	// A user access token lists skills only when its ceiling carries
 	// skill.list and skill.list is eligible for its boundary kind. Without
@@ -291,8 +312,9 @@ func (s *Server) listSkills(w http.ResponseWriter, r *http.Request) {
 		if identity != nil {
 			principalType = identity.Type()
 		}
-		slog.WarnContext(ctx, "listSkills: failed to resolve list scopes; failing closed",
-			"principal_type", principalType, "error", err)
+		logAuthzCheckFault(ctx, nil, "list_skills_scope",
+			"listSkills: failed to resolve list scopes; failing closed", err,
+			"principal_type", principalType)
 	}
 	switch {
 	case identity == nil:
@@ -314,7 +336,7 @@ func (s *Server) listSkills(w http.ResponseWriter, r *http.Request) {
 		filter.AccessScope = &store.SkillAccessScope{}
 	case isAgentIdentity(identity):
 		// ptone/scion#1968: agents read exactly their granted set — the hub
-		// catalog (global/core), their own project's skills, and their
+		// catalog (global), their own project's skills, and their
 		// creator's own user-scoped skills, each gated
 		// by the agent JWT scope restriction and the delegation ceiling. See
 		// agentSkillAccessScope for why per-bucket probes equal the per-row
@@ -451,7 +473,7 @@ func (s *Server) listSkillsForToken(w http.ResponseWriter, r *http.Request, toke
 func (s *Server) skillListCapabilities(ctx context.Context, scopeFilter, scopeIDFilter string, projects ScopeSet) *Capabilities {
 	scopes := []string{scopeFilter}
 	if scopeFilter == "" {
-		scopes = []string{store.SkillScopeUser, store.SkillScopeProject, store.SkillScopeGlobal, store.SkillScopeCore}
+		scopes = []string{store.SkillScopeUser, store.SkillScopeProject, store.SkillScopeGlobal}
 	}
 	for _, scope := range scopes {
 		if s.canCreateSkillInScope(ctx, scope, scopeIDFilter, projects) {
@@ -471,12 +493,12 @@ func (s *Server) canCreateSkillInScope(ctx context.Context, scope, scopeID strin
 		// user scope, so another user's scope is never creatable.
 		userIdent := GetUserIdentityFromContext(ctx)
 		return userIdent != nil && (scopeID == "" || scopeID == userIdent.ID())
-	case store.SkillScopeGlobal, store.SkillScopeCore:
+	case store.SkillScopeGlobal:
 		userIdent := GetUserIdentityFromContext(ctx)
 		if userIdent == nil {
 			return false
 		}
-		return s.authzService.CheckAccess(ctx, userIdent, skillScopeResource(scope, ""), globalWriteAction(scope, ActionCreate)).Allowed
+		return s.authzService.CheckAccess(ctx, userIdent, skillScopeResource(scope, ""), catalogWriteAction(permissions.ResourceSkill, scope, ActionCreate)).Allowed
 	case store.SkillScopeProject:
 		if agentIdent := GetAgentIdentityFromContext(ctx); agentIdent != nil {
 			own := agentIdent.ProjectID()
@@ -510,7 +532,7 @@ func (s *Server) canCreateSkillInScope(ctx context.Context, scope, scopeID strin
 // For an agent principal every term of Decide depends on a skill row only
 // through its bucket: (scope kind, project) for hub and project skills, and
 // (scope kind, owning user) for user skills. The project-scoped JWT binding,
-// the synthetic agent-skill-catalog binding (Step 5b/5b2, global/core only
+// the synthetic agent-skill-catalog binding (Step 5b/5b2, global only
 // after Step 5c), the personal-skill progeny relationship grant (Step 9, user
 // skills owned by the agent's origin user only, with that user's admission to
 // the agent's execution project, a per-agent fact), the JWT scope restriction
@@ -520,8 +542,6 @@ func (s *Server) canCreateSkillInScope(ctx context.Context, scope, scopeID strin
 // that bucket, and the store predicate built from the probes returns exactly
 // the rows the per-row check allows.
 //
-// global and core share one probe: the store predicate groups them
-// (ScopeIn(global, core)) and every Decide input treats them identically.
 // The only user bucket that can be granted is the origin user's, so that is
 // the only one probed; every other user's skills stay out of the predicate.
 func (s *Server) agentSkillAccessScope(ctx context.Context, agent AgentIdentity) *store.SkillAccessScope {
@@ -623,26 +643,29 @@ func (s *Server) createSkill(w http.ResponseWriter, r *http.Request) {
 		scope = store.SkillScopeGlobal
 	}
 	switch scope {
-	case store.SkillScopeGlobal, store.SkillScopeProject, store.SkillScopeUser, store.SkillScopeCore:
+	case store.SkillScopeGlobal, store.SkillScopeProject, store.SkillScopeUser:
+	case "core":
+		ValidationError(w, retiredSkillScopeCoreMessage, nil)
+		return
 	default:
-		ValidationError(w, fmt.Sprintf("invalid scope %q: must be one of global, project, user, core", scope), nil)
+		ValidationError(w, fmt.Sprintf("invalid scope %q: must be one of global, project, user", scope), nil)
 		return
 	}
 
 	// Authorize
 	switch scope {
-	case store.SkillScopeGlobal, store.SkillScopeCore:
+	case store.SkillScopeGlobal:
 		userIdent := GetUserIdentityFromContext(ctx)
 		if userIdent == nil {
 			writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required", nil)
 			return
 		}
-		// A global or core skill is a new record in the hub catalog: the
+		// A global skill is a new record in the hub catalog: the
 		// check is skill.create_global on a collection-level request at the
 		// hub scope, so a user access token needs skill:create_global on a
 		// hub boundary.
 		decision := s.authzService.CheckAccessWithEvidence(ctx, userIdent, skillScopeResource(scope, ""),
-			globalWriteAction(scope, ActionCreate), hubCollectionEvidence("skill.create_global"))
+			catalogWriteAction(permissions.ResourceSkill, scope, ActionCreate), hubCollectionEvidence("skill.create_global"))
 		if !decision.Allowed {
 			writeError(w, http.StatusForbidden, ErrCodeForbidden, "You do not have permission to create global skills", nil)
 			return
@@ -783,7 +806,7 @@ func (s *Server) updateSkill(w http.ResponseWriter, r *http.Request, id string) 
 	if !requireSkillProfileWriter(w, r, existing) {
 		return
 	}
-	decision := s.authzService.CheckAccess(ctx, identity, skillResource(existing), ActionUpdate)
+	decision := s.authzService.CheckAccess(ctx, identity, skillResource(existing), catalogWriteAction(permissions.ResourceSkill, existing.Scope, ActionUpdate))
 	if !decision.Allowed {
 		writeError(w, http.StatusForbidden, ErrCodeForbidden, "You do not have permission to update this skill", nil)
 		return
@@ -836,7 +859,7 @@ func (s *Server) deleteSkill(w http.ResponseWriter, r *http.Request, id string) 
 	if !requireSkillProfileWriter(w, r, existing) {
 		return
 	}
-	decision := s.authzService.CheckAccess(ctx, identity, skillResource(existing), ActionDelete)
+	decision := s.authzService.CheckAccess(ctx, identity, skillResource(existing), catalogWriteAction(permissions.ResourceSkill, existing.Scope, ActionDelete))
 	if !decision.Allowed {
 		writeError(w, http.StatusForbidden, ErrCodeForbidden, "You do not have permission to delete this skill", nil)
 		return
@@ -897,12 +920,21 @@ func (s *Server) listSkillVersions(w http.ResponseWriter, r *http.Request, skill
 		return
 	}
 
-	result, err := s.store.ListSkillVersions(ctx, skillID, store.ListOptions{
+	// Version status filter (skill_version_status.go), applied in the store
+	// so the page and totalCount agree.
+	var filter store.SkillVersionFilter
+	if !s.skillVersionsAllStatuses(ctx, identity, skill) {
+		filter.Statuses = skillVersionListedStatuses
+	}
+	result, err := s.store.ListSkillVersions(ctx, skillID, filter, store.ListOptions{
 		Limit: 100,
 	})
 	if err != nil {
 		writeErrorFromErr(w, err, "")
 		return
+	}
+	for i := range result.Items {
+		s.withSkillContentHashV2(&result.Items[i])
 	}
 
 	writeJSON(w, http.StatusOK, result)
@@ -935,12 +967,15 @@ func (s *Server) getSkillVersion(w http.ResponseWriter, r *http.Request, skillID
 		return
 	}
 
-	if sv.SkillID != skillID {
-		NotFound(w, "SkillVersion")
+	// A version of another skill, and a version outside the status filter
+	// (skill_version_status.go), get the same response as a missing
+	// version ID.
+	if sv.SkillID != skillID || !s.skillVersionVisible(ctx, identity, skill, sv) {
+		writeErrorFromErr(w, store.ErrNotFound, "")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, sv)
+	writeJSON(w, http.StatusOK, s.withSkillContentHashV2(sv))
 }
 
 // deprecateSkillVersion marks a published skill version as deprecated.
@@ -966,7 +1001,7 @@ func (s *Server) deprecateSkillVersion(w http.ResponseWriter, r *http.Request, s
 	if !requireSkillProfileWriter(w, r, skill) {
 		return
 	}
-	decision := s.authzService.CheckAccess(ctx, identity, skillResource(skill), ActionUpdate)
+	decision := s.authzService.CheckAccess(ctx, identity, skillResource(skill), catalogWriteAction(permissions.ResourceSkill, skill.Scope, ActionUpdate))
 	if !decision.Allowed {
 		writeError(w, http.StatusForbidden, ErrCodeForbidden, "You do not have permission to deprecate versions of this skill", nil)
 		return
@@ -1006,7 +1041,7 @@ func (s *Server) deprecateSkillVersion(w http.ResponseWriter, r *http.Request, s
 		return
 	}
 
-	writeJSON(w, http.StatusOK, sv)
+	writeJSON(w, http.StatusOK, s.withSkillContentHashV2(sv))
 }
 
 // publishSkillVersion creates a new draft version and returns upload URLs.
@@ -1028,7 +1063,7 @@ func (s *Server) publishSkillVersion(w http.ResponseWriter, r *http.Request, ski
 	if !requireSkillProfileWriter(w, r, skill) {
 		return
 	}
-	decision := s.authzService.CheckAccess(ctx, identity, skillResource(skill), ActionUpdate)
+	decision := s.authzService.CheckAccess(ctx, identity, skillResource(skill), catalogWriteAction(permissions.ResourceSkill, skill.Scope, ActionUpdate))
 	if !decision.Allowed {
 		writeError(w, http.StatusForbidden, ErrCodeForbidden, "You do not have permission to publish versions for this skill", nil)
 		return
@@ -1125,7 +1160,7 @@ func (s *Server) publishSkillVersion(w http.ResponseWriter, r *http.Request, ski
 			uploadURLs, _, err := generateUploadURLs(ctx, stor, versionPath, req.Files)
 			if err == nil && len(uploadURLs) > 0 {
 				if stor.Provider() == storage.ProviderLocal {
-					hubURL := requestBaseURL(r)
+					hubURL := s.requestBaseURL(r)
 					uploadURLs = rewriteLocalUploadURLs(uploadURLs, hubURL, "skills", skillID)
 					uploadURLs = withSkillVersionUploadQuery(uploadURLs, req.Version)
 				}
@@ -1307,7 +1342,8 @@ func (s *Server) publishSkillVersionMultipart(w http.ResponseWriter, r *http.Req
 	}
 	if err := g.Wait(); err != nil {
 		_ = s.store.DeleteSkillVersion(ctx, sv.ID)
-		RuntimeError(w, "Failed to upload files: "+err.Error())
+		slog.ErrorContext(ctx, "skill file upload failed", "skill_id", skill.ID, "version", version, "error", upstreamText(err.Error()))
+		RuntimeError(w, "Failed to upload files")
 		return
 	}
 
@@ -1331,7 +1367,7 @@ func (s *Server) publishSkillVersionMultipart(w http.ResponseWriter, r *http.Req
 	}
 
 	// k) Return response.
-	writeJSON(w, http.StatusCreated, PublishVersionResponse{Version: sv})
+	writeJSON(w, http.StatusCreated, PublishVersionResponse{Version: s.withSkillContentHashV2(sv)})
 }
 
 // handleSkillUpload handles requests for upload URLs for a skill.
@@ -1358,7 +1394,7 @@ func (s *Server) handleSkillUpload(w http.ResponseWriter, r *http.Request, skill
 	if !requireSkillProfileWriter(w, r, skill) {
 		return
 	}
-	decision := s.authzService.CheckAccess(ctx, identity, skillResource(skill), ActionUpdate)
+	decision := s.authzService.CheckAccess(ctx, identity, skillResource(skill), catalogWriteAction(permissions.ResourceSkill, skill.Scope, ActionUpdate))
 	if !decision.Allowed {
 		writeError(w, http.StatusForbidden, ErrCodeForbidden, "You do not have permission to upload files for this skill", nil)
 		return
@@ -1398,12 +1434,13 @@ func (s *Server) handleSkillUpload(w http.ResponseWriter, r *http.Request, skill
 		if writeInvalidFilePathError(w, err) {
 			return
 		}
-		RuntimeError(w, "Failed to generate upload URLs: "+err.Error())
+		slog.ErrorContext(ctx, "skill upload URLs failed", "skill_id", skill.ID, "version", req.Version, "error", upstreamText(err.Error()))
+		RuntimeError(w, "Failed to generate upload URLs")
 		return
 	}
 
 	if stor.Provider() == storage.ProviderLocal {
-		hubURL := requestBaseURL(r)
+		hubURL := s.requestBaseURL(r)
 		uploadURLs = rewriteLocalUploadURLs(uploadURLs, hubURL, "skills", skillID)
 		uploadURLs = withSkillVersionUploadQuery(uploadURLs, req.Version)
 	}
@@ -1438,7 +1475,7 @@ func (s *Server) handleSkillFinalize(w http.ResponseWriter, r *http.Request, ski
 	if !requireSkillProfileWriter(w, r, skill) {
 		return
 	}
-	decision := s.authzService.CheckAccess(ctx, identity, skillResource(skill), ActionUpdate)
+	decision := s.authzService.CheckAccess(ctx, identity, skillResource(skill), catalogWriteAction(permissions.ResourceSkill, skill.Scope, ActionUpdate))
 	if !decision.Allowed {
 		writeError(w, http.StatusForbidden, ErrCodeForbidden, "You do not have permission to finalize versions for this skill", nil)
 		return
@@ -1521,7 +1558,12 @@ func (s *Server) handleSkillFinalize(w http.ResponseWriter, r *http.Request, ski
 		if writeInvalidFilePathError(w, err) {
 			return
 		}
-		ValidationError(w, err.Error(), nil)
+		var notFound *fileNotFoundError
+		if errors.As(err, &notFound) {
+			ValidationError(w, err.Error(), nil)
+			return
+		}
+		writeErrorFromErr(w, err, "")
 		return
 	}
 
@@ -1535,7 +1577,7 @@ func (s *Server) handleSkillFinalize(w http.ResponseWriter, r *http.Request, ski
 		return
 	}
 
-	writeJSON(w, http.StatusOK, sv)
+	writeJSON(w, http.StatusOK, s.withSkillContentHashV2(sv))
 }
 
 // handleSkillDownload returns signed URLs for downloading skill version files.
@@ -1576,7 +1618,7 @@ func (s *Server) handleSkillDownload(w http.ResponseWriter, r *http.Request, ski
 	}
 
 	// Resolve version
-	sv, err := s.store.ResolveSkillVersion(ctx, skillID, version)
+	sv, err := s.resolveSkillVersion(ctx, skillID, version)
 	if err != nil {
 		writeErrorFromErr(w, err, "")
 		return
@@ -1590,12 +1632,13 @@ func (s *Server) handleSkillDownload(w http.ResponseWriter, r *http.Request, ski
 	versionPath := skill.StoragePath + "/" + sv.Version
 	downloadURLs, manifestURL, expires, err := generateDownloadURLs(ctx, stor, versionPath, s.legacyFallbackPath(versionPath), sv.Files)
 	if err != nil {
-		RuntimeError(w, fmt.Sprintf("skill %q version %q: %s", skill.Name, sv.Version, err))
+		slog.ErrorContext(ctx, "skill download URLs failed", "skill_id", skill.ID, "version", sv.Version, "error", upstreamText(err.Error()))
+		RuntimeError(w, fmt.Sprintf("skill %q version %q: failed to generate download URLs", skill.Name, sv.Version))
 		return
 	}
 
 	if stor.Provider() == storage.ProviderLocal {
-		hubURL := requestBaseURL(r)
+		hubURL := s.requestBaseURL(r)
 		downloadURLs = rewriteLocalDownloadURLs(downloadURLs, hubURL, "skills", skillID)
 		downloadURLs = withSkillVersionDownloadQuery(downloadURLs, sv.Version)
 	}
@@ -1638,13 +1681,13 @@ func (s *Server) handleSkillResolveSingle(w http.ResponseWriter, r *http.Request
 		version = "latest"
 	}
 
-	sv, err := s.store.ResolveSkillVersion(ctx, skillID, version)
+	sv, err := s.resolveSkillVersion(ctx, skillID, version)
 	if err != nil {
 		writeErrorFromErr(w, err, "")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, sv)
+	writeJSON(w, http.StatusOK, s.withSkillContentHashV2(sv))
 }
 
 // handleSkillsResolve handles batch skill resolution: POST /api/v1/skills/resolve.
@@ -1719,10 +1762,19 @@ func (s *Server) handleSkillsResolve(w http.ResponseWriter, r *http.Request) {
 					code = agent.GitHubRateLimitedCode
 				} else if isGHNotFound(err) {
 					code = agent.SkillErrCodeNotFound
+				} else if agent.IsGitHubSkillTreeError(err) {
+					code = agent.SkillErrCodeUnsupportedContent
 				}
 				resolveErrors = append(resolveErrors, *newSkillResolveError(ctx, skillResolveSourceGitHub,
 					skillRef.URI, code, ghErrorStatus(err), err.Error()))
 			} else {
+				if s.skillContentHashV2Enabled() {
+					// v2 over the git blob IDs and the git tree modes, the
+					// metadata the broker installs and verifies from.
+					if _, v2, ok := resolvedSkillContentHashes(ghResolved.Files); ok {
+						ghResolved.ContentHashV2 = v2
+					}
+				}
 				resolved = append(resolved, *ghResolved)
 			}
 			continue
@@ -1748,7 +1800,7 @@ func (s *Server) handleSkillsResolve(w http.ResponseWriter, r *http.Request) {
 
 		baseURL := ""
 		if stor != nil && stor.Provider() == storage.ProviderLocal {
-			baseURL = requestBaseURL(r)
+			baseURL = s.requestBaseURL(r)
 		}
 		entry, resolveErr := s.resolveRegistrySkillRef(ctx, GetIdentityFromContext(ctx), skillRef.URI, uri,
 			req.ProjectID, req.UserID, baseURL)
@@ -1806,7 +1858,7 @@ func (s *Server) resolveSkill(ctx context.Context, identity Identity, uri *api.S
 			continue
 		}
 
-		sv, err := s.store.ResolveSkillVersion(ctx, skill.ID, uri.Version)
+		sv, err := s.resolveSkillVersion(ctx, skill.ID, uri.Version)
 		if err != nil {
 			versionErr = err
 			continue
@@ -1832,7 +1884,7 @@ func determineScopeSearchOrder(uri *api.SkillURI, projectID string) []scopeEntry
 		return []scopeEntry{{scope: uri.Scope, scopeID: uri.ScopeID}}
 	}
 
-	// Default search order: user > project > global > core
+	// Default search order: user > project > global
 	var order []scopeEntry
 	if uri.ScopeID != "" {
 		order = append(order, scopeEntry{scope: store.SkillScopeUser, scopeID: uri.ScopeID})
@@ -1840,10 +1892,7 @@ func determineScopeSearchOrder(uri *api.SkillURI, projectID string) []scopeEntry
 	if projectID != "" {
 		order = append(order, scopeEntry{scope: store.SkillScopeProject, scopeID: projectID})
 	}
-	order = append(order,
-		scopeEntry{scope: store.SkillScopeGlobal},
-		scopeEntry{scope: store.SkillScopeCore},
-	)
+	order = append(order, scopeEntry{scope: store.SkillScopeGlobal})
 	return order
 }
 
@@ -1855,21 +1904,6 @@ func expandScopeAliases(uri *api.SkillURI, projectID, userID string) {
 	if uri.Scope == store.SkillScopeUser && uri.ScopeID == "" && userID != "" {
 		uri.ScopeID = userID
 	}
-}
-
-// globalWriteAction maps a CRUD action to its global-catalog twin for records
-// that live in the hub catalog. Project- and user-scoped records are unchanged.
-// Key off the record's stored scope, not parentlessness — user-scoped records
-// are also parentless but must NOT require global permissions. See design §3.1.
-func globalWriteAction(scope string, a Action) Action {
-	switch scope {
-	case store.SkillScopeGlobal, store.SkillScopeCore:
-		switch a {
-		case ActionCreate:
-			return ActionCreateGlobal
-		}
-	}
-	return a
 }
 
 // skillResource constructs a Resource from a store.Skill for capability computation.
@@ -1907,7 +1941,7 @@ func writeSkillLookupError(w http.ResponseWriter, err error) {
 // (e.g. minting a project's GitHub App token before any specific skill is
 // resolved — see canUseProjectGitHubToken). scope should be one of the
 // store.SkillScope* constants; scopeID is the owning user or project ID and
-// is ignored for global/core scope.
+// is ignored for global scope.
 //
 // ptone/scion#1901 finding F3/F4: every ad hoc skill Resource literal must
 // set ScopeKind through this constructor (or skillResource, for a real
@@ -2265,18 +2299,36 @@ func (s *Server) resolveGitHubSkill(ctx context.Context, rawURI, projectID strin
 		}
 	}
 
+	// A row written before file modes were recorded is a miss above, so
+	// the ref is resolved again with its modes. If that re-resolve fails
+	// (a rate-limit cooldown, a network error), the row is served as it
+	// was before rather than failing the agent start over it, though its
+	// files may then lack exec bits (ptone/scion#5781).
+	modelessFallback := func(err error) (*ResolvedSkillResponse, error) {
+		if s.ghResolutionStore == nil || ctx.Err() != nil {
+			return nil, err
+		}
+		legacy, ok, lerr := s.ghResolutionStore.GetModeless(ctx, cacheKey, isBranchRef, agent.DefaultResolutionCacheTTL, agent.MaxResolutionStaleAge)
+		if lerr != nil || !ok {
+			return nil, err
+		}
+		slog.WarnContext(ctx, "github_resolution_cache: re-resolve failed; serving an entry from before file modes were recorded, so its files may lack executable bits",
+			"uri", rawURI, "commit_sha", safeShortSHA(legacy.CommitSHA), "error", err)
+		return buildResolvedSkillResponse(ghRef, legacy), nil
+	}
+
 	// A ref GitHub reported as not found for this cache key within the last
 	// agent.FailureMemoTTL fails again now, without asking GitHub. A fresh or
 	// stale entry above still wins.
 	if ferr := s.ghFailures.Recent(cacheKey); ferr != nil {
 		slog.DebugContext(ctx, "github_resolution_cache: returning remembered not found", "uri", rawURI)
-		return nil, ferr
+		return modelessFallback(ferr)
 	}
 
 	// A miss during a rate-limit cooldown fails now, without starting a
 	// flight: no request could be sent for this identity anyway.
 	if retryAt, cooling := s.githubCooldown().Active(cooldownID); cooling {
-		return nil, &agent.GitHubRateLimitError{Ref: rawURI, RetryAt: retryAt, Unauthenticated: agent.GitHubCooldownIdentityIsAnonymous(cooldownID)}
+		return modelessFallback(&agent.GitHubRateLimitError{Ref: rawURI, RetryAt: retryAt, Unauthenticated: agent.GitHubCooldownIdentityIsAnonymous(cooldownID)})
 	}
 
 	// 5. Cache miss, with no usable stale entry: coalesce concurrent misses
@@ -2345,9 +2397,9 @@ func (s *Server) resolveGitHubSkill(ctx context.Context, rawURI, projectID strin
 		if res.Err != nil {
 			var rl *agent.GitHubRateLimitError
 			if errors.As(res.Err, &rl) {
-				return nil, rl.WithRef(rawURI)
+				return modelessFallback(rl.WithRef(rawURI))
 			}
-			return nil, res.Err
+			return modelessFallback(res.Err)
 		}
 		// Build the response from this caller's own ghRef, not whichever
 		// caller happened to lead or already have the result cached: the
@@ -2407,7 +2459,7 @@ func (s *Server) refreshGitHubSkillInBackground(cacheKey, rawURI string, ghRef *
 }
 
 // fetchAndCacheGitHubSkill resolves ghRef against the GitHub API (commit SHA,
-// then directory contents), stores the result in the resolution cache under
+// then the skill directory tree), stores the result in the resolution cache under
 // cacheKey, and returns the stored entry. installID is recorded on the cache
 // entry's TokenScope and must be the same value the triggering request
 // resolved via resolveGitHubToken — both the synchronous path and a
@@ -2467,7 +2519,7 @@ func (s *Server) fetchAndCacheGitHubSkill(
 		refSHAMemo.set(memoKey, commitSHA)
 	}
 
-	fileEntries, err := ghListContents(ctx, cooldown, cooldownID, apiBase, rawBase, ghRef.Owner, ghRef.Repo, ghRef.SkillPath, commitSHA, token)
+	fileEntries, err := ghListTree(ctx, cooldown, cooldownID, apiBase, rawBase, ghRef.Owner, ghRef.Repo, ghRef.SkillPath, commitSHA, token)
 	if err != nil {
 		err = fmt.Errorf("failed to list contents: %w", err)
 		s.rememberGHNotFound(cacheKey, err)
@@ -2534,6 +2586,10 @@ func buildResolvedSkillResponse(ghRef *agent.GitHubSkillRef, entry *GitHubCacheE
 			URL:  f.URL,
 			Size: f.Size,
 			Hash: f.Hash,
+			// Empty only on a row written before modes were recorded,
+			// which is served only when a re-resolve failed; the client
+			// writes such a file 0644, as before (ptone/scion#5781).
+			Mode: f.Mode,
 		}
 	}
 

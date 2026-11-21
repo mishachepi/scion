@@ -176,6 +176,10 @@ var routeMetadataTable = map[string]RouteMetadata{
 		Pattern: "GET /api/v1/test-infra/status", RouteID: "testInfra.status",
 		Classification: RoutePublic,
 	},
+	"POST /api/v1/csp-reports": {
+		Pattern: "POST /api/v1/csp-reports", RouteID: "cspReports.create",
+		Classification: RoutePublic,
+	},
 	"/github-app/setup": {
 		Pattern: "/github-app/setup", RouteID: "github-app.setup",
 		Classification: RoutePublic,
@@ -278,8 +282,16 @@ var routeMetadataTable = map[string]RouteMetadata{
 		Pattern: "/api/v1/users/me/delegations", RouteID: "users.me.delegations",
 		Classification: RouteAuthenticated,
 	},
+	"/api/v1/users/me/delegations/revoke-all": {
+		Pattern: "/api/v1/users/me/delegations/revoke-all", RouteID: "users.me.delegations.revokeAll",
+		Classification: RouteAuthenticated,
+	},
 	"/api/v1/users/me/terminal-workspace": {
 		Pattern: "/api/v1/users/me/terminal-workspace", RouteID: "users.me.terminalWorkspace",
+		Classification: RouteAuthenticated,
+	},
+	"/api/v1/users/me/decisions": {
+		Pattern: "/api/v1/users/me/decisions", RouteID: "users.me.decisions",
 		Classification: RouteAuthenticated,
 	},
 	"/api/v1/users/me/templates": {
@@ -495,6 +507,16 @@ var routeMetadataTable = map[string]RouteMetadata{
 		Pattern: "/api/v1/conduit/grant-keys", RouteID: "conduit.grant_keys",
 		Classification: RouteAuthenticated,
 	},
+	// Trigger rule preset schemas and stateless form compiler, behind
+	// hub.github_triggers. Reads no tenant rows and mutates no state.
+	"GET /api/v1/trigger-presets": {
+		Pattern: "GET /api/v1/trigger-presets", RouteID: "triggerPresets.list",
+		Classification: RouteAuthenticated,
+	},
+	"POST /api/v1/trigger-presets/compile": {
+		Pattern: "POST /api/v1/trigger-presets/compile", RouteID: "triggerPresets.compile",
+		Classification: RouteAuthenticated,
+	},
 	// Conduit sessions (WebSocket), behind hub.conduit. Agent principals
 	// authenticate with an agent token carrying agent:port:forward (the
 	// handler reads the agent row); runtime broker principals authenticate
@@ -529,6 +551,16 @@ var routeMetadataTable = map[string]RouteMetadata{
 	// verifies it on every request).
 	"/api/v1/artifacts/view/": {
 		Pattern: "/api/v1/artifacts/view/", RouteID: "artifacts.view",
+		Classification: RoutePublic,
+	},
+
+	// -------------------------------------------------------------------------
+	// Port page view (behind the hub.port_view experiment). The route serves
+	// an agent's exposed port on the page link in its path only (the handler
+	// checks it, and the user's port access, on every request).
+	// -------------------------------------------------------------------------
+	"/api/v1/portview/": {
+		Pattern: "/api/v1/portview/", RouteID: "ports.view",
 		Classification: RoutePublic,
 	},
 
@@ -689,8 +721,43 @@ var routeMetadataTable = map[string]RouteMetadata{
 		Classification: RoutePolicy,
 		Permission:     "project.read", Resource: "project", Action: "read",
 	},
+	// decisions.byId reads and answers a decision prompt decision; the
+	// handler authorizes per conversation (read or send rights on the
+	// prompt's thread or DM). 404 while web.decisions is off.
+	"/api/v1/decisions/": {
+		Pattern: "/api/v1/decisions/", RouteID: "decisions.byId",
+		Classification: RoutePolicy,
+		Permission:     "project.read", Resource: "project", Action: "read",
+	},
+	"/api/v1/decision-prompts/": {
+		Pattern: "/api/v1/decision-prompts/", RouteID: "decisionprompts.byId",
+		Classification: RoutePolicy,
+		Permission:     "project.read", Resource: "project", Action: "read",
+	},
 	"/api/v1/chat/search": {
 		Pattern: "/api/v1/chat/search", RouteID: "chat.search",
+		Classification: RoutePolicy,
+		Permission:     "project.read", Resource: "project", Action: "read",
+	},
+	// chat.stars and chat.stars.byId serve the caller's own starred
+	// messages; every read and add also needs read access to the message's
+	// thread (project.read), checked per conversation by the handler.
+	"/api/v1/chat/stars": {
+		Pattern: "/api/v1/chat/stars", RouteID: "chat.stars",
+		Classification: RoutePolicy,
+		Permission:     "project.read", Resource: "project", Action: "read",
+	},
+	"/api/v1/chat/stars/": {
+		Pattern: "/api/v1/chat/stars/", RouteID: "chat.stars.byId",
+		Classification: RoutePolicy,
+		Permission:     "project.read", Resource: "project", Action: "read",
+	},
+	// chat.starredConversations is the Starred rail: the caller's own
+	// conversations with stars, each kept only while the caller can read
+	// it (project.read for a thread), checked per conversation by the
+	// handler.
+	"/api/v1/chat/starred-conversations": {
+		Pattern: "/api/v1/chat/starred-conversations", RouteID: "chat.starredConversations",
 		Classification: RoutePolicy,
 		Permission:     "project.read", Resource: "project", Action: "read",
 	},
@@ -794,6 +861,16 @@ var routeMetadataTable = map[string]RouteMetadata{
 		Classification: RouteHubAdmin,
 		Permission:     "hub.maintenance.execute", Resource: "hub", Action: "execute",
 	},
+	"/api/v1/admin/maintenance/update-status": {
+		Pattern: "/api/v1/admin/maintenance/update-status", RouteID: "admin.maintenance.updateStatus",
+		Classification: RouteHubAdmin,
+		Permission:     "hub.maintenance.execute", Resource: "hub", Action: "execute",
+	},
+	"/api/v1/admin/maintenance/releases": {
+		Pattern: "/api/v1/admin/maintenance/releases", RouteID: "admin.maintenance.releases",
+		Classification: RouteHubAdmin,
+		Permission:     "hub.maintenance.execute", Resource: "hub", Action: "execute",
+	},
 	"/api/v1/admin/scheduler": {
 		Pattern: "/api/v1/admin/scheduler", RouteID: "admin.scheduler",
 		Classification: RouteHubAdmin,
@@ -871,6 +948,15 @@ var routeMetadataTable = map[string]RouteMetadata{
 		Permission:     "hub.config.update", Resource: "hub", Action: "update",
 		SessionOnly: authzop.ReasonHostOperations,
 	},
+	// Chat message retention settings (DB-only "chat_retention" section,
+	// behind hub.chat_retention). Session only: the window decides what is
+	// deleted, irreversibly, across every user's history.
+	"/api/v1/admin/chat-retention": {
+		Pattern: "/api/v1/admin/chat-retention", RouteID: "admin.chatRetention",
+		Classification: RouteHubAdmin,
+		Permission:     "hub.config.update", Resource: "hub", Action: "update",
+		SessionOnly: authzop.ReasonIrreversibleCascade,
+	},
 	// Conduit grant key rotation, behind hub.conduit. Returns kids and
 	// timestamps only.
 	"/api/v1/admin/conduit/grant-keys/rotate": {
@@ -886,6 +972,14 @@ var routeMetadataTable = map[string]RouteMetadata{
 		Classification: RouteHubAdmin,
 		Permission:     "hub.conduit_grant_keys.execute", Resource: "hub", Action: "execute",
 		SessionOnly: authzop.ReasonCredentialManagement,
+	},
+	// Server key status, behind
+	// server.secret_rotation. Deliberately no registered permission: the
+	// guard falls back to requireAdmin, so only an unscoped platform admin
+	// on a session or dev credential reads it, and it cannot be delegated.
+	"/api/v1/admin/keys/status": {
+		Pattern: "/api/v1/admin/keys/status", RouteID: "admin.keys.status",
+		Classification: RouteHubAdmin,
 	},
 	// Bulk agent auth reset. Session only: a session-recovery route, like
 	// revoke-sessions.
@@ -959,6 +1053,39 @@ var routeMetadataTable = map[string]RouteMetadata{
 		Pattern: "/api/v1/admin/health/summary", RouteID: "admin.health.summary",
 		Classification: RouteHubAdmin,
 		Permission:     "hub.health.read", Resource: "hub", Action: "read",
+	},
+	// Orphaned and revoked agents, an operator diagnostic under the
+	// permission of the health summary. Session only (GOV_PENDING): its
+	// token admission waits for its governance batch.
+	"/api/v1/admin/orphaned-agents": {
+		Pattern: "/api/v1/admin/orphaned-agents", RouteID: "admin.orphanedAgents",
+		Classification: RouteHubAdmin,
+		Permission:     "hub.health.read", Resource: "hub", Action: "read",
+		SessionOnly: authzop.ReasonGovernancePending,
+	},
+	// Runtime objects no hub agent owns (ptone/scion#7930), an operator
+	// diagnostic under the permission of the health summary. Session only
+	// (GOV_PENDING).
+	"/api/v1/admin/runtime-orphans": {
+		Pattern: "/api/v1/admin/runtime-orphans", RouteID: "admin.runtimeOrphans",
+		Classification: RouteHubAdmin,
+		Permission:     "hub.health.read", Resource: "hub", Action: "read",
+		SessionOnly: authzop.ReasonGovernancePending,
+	},
+	// System One provider instances (ptone/scion#8044; 404 while hub.system_one
+	// is off). Session only (CREDENTIAL_MANAGEMENT): instances store and
+	// exercise hub-scoped internal API keys.
+	"/api/v1/admin/system-one/instances": {
+		Pattern: "/api/v1/admin/system-one/instances", RouteID: "admin.systemOne.instances",
+		Classification: RouteHubAdmin,
+		Permission:     "system_one_instance.read", Resource: "system_one_instance", Action: "read",
+		SessionOnly: authzop.ReasonCredentialManagement,
+	},
+	"/api/v1/admin/system-one/instances/": {
+		Pattern: "/api/v1/admin/system-one/instances/", RouteID: "admin.systemOne.instances.byName",
+		Classification: RouteHubAdmin,
+		Permission:     "system_one_instance.read", Resource: "system_one_instance", Action: "read",
+		SessionOnly: authzop.ReasonCredentialManagement,
 	},
 	"/api/v1/admin/messaging/divergence": {
 		Pattern: "/api/v1/admin/messaging/divergence", RouteID: "admin.messaging.divergence",
@@ -1113,6 +1240,24 @@ var routeMetadataTable = map[string]RouteMetadata{
 		Classification: RouteAuthenticated,
 		Permission:     "hub.audit.read", Resource: "hub", Action: "read",
 	},
+	"/api/v1/admin/effective-permissions": {
+		Pattern: "/api/v1/admin/effective-permissions", RouteID: "admin.effectivePermissions",
+		Classification: RouteHubAdmin,
+		Permission:     "role_binding.read", Resource: "role_binding", Action: "read",
+		BearerTarget: "hub_instance",
+	},
+
+	// -------------------------------------------------------------------------
+	// Authenticated: the caller's own pending secrets
+	// -------------------------------------------------------------------------
+	"/api/v1/pending-secrets": {
+		Pattern: "/api/v1/pending-secrets", RouteID: "pendingSecrets.list",
+		Classification: RouteAuthenticated,
+	},
+	"/api/v1/pending-secrets/": {
+		Pattern: "/api/v1/pending-secrets/", RouteID: "pendingSecrets.decide",
+		Classification: RouteAuthenticated,
+	},
 
 	// -------------------------------------------------------------------------
 	// Authenticated: Usage self-service
@@ -1168,6 +1313,21 @@ var routeMetadataTable = map[string]RouteMetadata{
 	},
 	"POST /api/v1/github-app/sync-permissions": {
 		Pattern: "POST /api/v1/github-app/sync-permissions", RouteID: "githubApp.syncPermissions",
+		Classification: RouteHubAdmin,
+		Permission:     "hub.github_app.update", Resource: "hub", Action: "update",
+	},
+	"GET /api/v1/github-app/repo-routing": {
+		Pattern: "GET /api/v1/github-app/repo-routing", RouteID: "githubApp.repoRouting.list",
+		Classification: RouteHubAdmin,
+		Permission:     "hub.github_app.read", Resource: "hub", Action: "read",
+	},
+	"PUT /api/v1/github-app/repo-routing/{owner}/{repo}": {
+		Pattern: "PUT /api/v1/github-app/repo-routing/{owner}/{repo}", RouteID: "githubApp.repoRouting.set",
+		Classification: RouteHubAdmin,
+		Permission:     "hub.github_app.update", Resource: "hub", Action: "update",
+	},
+	"DELETE /api/v1/github-app/repo-routing/{owner}/{repo}": {
+		Pattern: "DELETE /api/v1/github-app/repo-routing/{owner}/{repo}", RouteID: "githubApp.repoRouting.delete",
 		Classification: RouteHubAdmin,
 		Permission:     "hub.github_app.update", Resource: "hub", Action: "update",
 	},
@@ -1340,6 +1500,14 @@ var routeMetadataTable = map[string]RouteMetadata{
 		Pattern: "/api/v1/broker/inbound/routed", RouteID: "broker.inbound.routed",
 		Classification: RouteBrokerHMAC,
 	},
+	"/api/v1/broker/inbound/attachments": {
+		Pattern: "/api/v1/broker/inbound/attachments", RouteID: "broker.inbound.attachments",
+		Classification: RouteBrokerHMAC,
+	},
+	"/api/v1/broker/inbound/attachments/check": {
+		Pattern: "/api/v1/broker/inbound/attachments/check", RouteID: "broker.inbound.attachments.check",
+		Classification: RouteBrokerHMAC,
+	},
 	"/api/v1/broker/callback": {
 		Pattern: "/api/v1/broker/callback", RouteID: "broker.callback",
 		Classification: RouteBrokerHMAC,
@@ -1377,6 +1545,14 @@ var routeMetadataTable = map[string]RouteMetadata{
 	},
 	"POST /api/v1/agent/secrets": {
 		Pattern: "POST /api/v1/agent/secrets", RouteID: "agent.secretFetch",
+		Classification: RouteAgentToken,
+	},
+	"/api/v1/agent/decisions": {
+		Pattern: "/api/v1/agent/decisions", RouteID: "agent.decisions",
+		Classification: RouteAgentToken,
+	},
+	"/api/v1/agent/decisions/": {
+		Pattern: "/api/v1/agent/decisions/", RouteID: "agent.decisionsByKey",
 		Classification: RouteAgentToken,
 	},
 
@@ -1425,6 +1601,21 @@ var routeMetadataTable = map[string]RouteMetadata{
 		Classification: RouteWorkstation,
 		Permission:     "hub.config.update", Resource: "hub", Action: "update",
 	},
+	"/api/v1/system/welcome/preview": {
+		Pattern: "/api/v1/system/welcome/preview", RouteID: "system.welcome.preview",
+		Classification: RouteWorkstation,
+		Permission:     "hub.config.update", Resource: "hub", Action: "update",
+	},
+	"/api/v1/system/welcome/install": {
+		Pattern: "/api/v1/system/welcome/install", RouteID: "system.welcome.install",
+		Classification: RouteWorkstation,
+		Permission:     "hub.config.update", Resource: "hub", Action: "update",
+	},
+	"/api/v1/system/welcome/skip": {
+		Pattern: "/api/v1/system/welcome/skip", RouteID: "system.welcome.skip",
+		Classification: RouteWorkstation,
+		Permission:     "hub.config.update", Resource: "hub", Action: "update",
+	},
 	"/api/v1/system/fs/list": {
 		Pattern: "/api/v1/system/fs/list", RouteID: "system.fs.list",
 		Classification: RouteWorkstation,
@@ -1439,10 +1630,14 @@ var routeMetadataTable = map[string]RouteMetadata{
 	},
 
 	// -------------------------------------------------------------------------
-	// Webhook: GitHub webhook
+	// Webhook: GitHub webhook & generic trigger webhook ingress
 	// -------------------------------------------------------------------------
 	"/api/v1/webhooks/github": {
 		Pattern: "/api/v1/webhooks/github", RouteID: "webhooks.github",
+		Classification: RouteWebhook,
+	},
+	"/api/v1/hooks/{id}": {
+		Pattern: "/api/v1/hooks/{id}", RouteID: "hooks.receive",
 		Classification: RouteWebhook,
 	},
 }
@@ -1616,6 +1811,12 @@ func (s *Server) routeGuard(meta RouteMetadata, next http.HandlerFunc) http.Hand
 				return
 			}
 			r = admitted
+			// A list route's item filter writes one aggregated record
+			// when the request ends, including on a panic or a
+			// cancelled request (.design/agent-delegation.md §14.2).
+			if c := listFilterCollectorFromContext(r.Context()); c != nil {
+				defer s.flushListFilter(r.Context(), c)
+			}
 		}
 		switch meta.Classification {
 		case RoutePublic:

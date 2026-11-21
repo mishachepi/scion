@@ -42,11 +42,15 @@ Scion provides two ways to authenticate with GitHub for your projects:
 
 :::caution
 Do not put a token in the repository URL. The Hub stores a project's git remote without credentials, and refuses a `scion.dev/clone-url` label that contains a username, password, token, query string, or fragment (`400`). If an existing project relied on a token embedded in its clone URL, move that token to a `GITHUB_TOKEN` project secret or use the GitHub App.
+
+An agent's clone uses the git token only for the project's own git remote. When a `scion.dev/clone-url` label names another host or repository (a mirror, for example), the agent clones it without the token, so the mirror must allow anonymous HTTPS clones. Likewise, an agent in a shared workspace gets a git credential helper for the host of the project's git remote only.
+
+A `scion.dev/clone-url` label must use `https`, `ssh` or `git`. Agents of a project whose clone URL is a local path, a `file://` or `http://` URL, or another form are not started: a create request answers HTTP 422, and a start fails with the same message.
 :::
 
 ### Option A: GitHub App Integration
 
-When creating a project, Scion automatically associates it with the corresponding GitHub App installation. The system maintains a background refresh loop for installation tokens, and the `sciontool` credential helper provides fresh tokens to `git` on-demand inside the agent container. No manual setup is required.
+When creating a project, Scion associates it with a matching GitHub App installation when the association is authorized: the project's git remote must be on the configured GitHub host (`github.com`, or the host of `github_app.api_base_url` for GitHub Enterprise), the installation must be active and its account must match the remote's owner, and either a Hub admin binds the installation to the project (`PUT /api/v1/projects/{id}/github-installation`) or your user-scope `GITHUB_TOKEN` secret has at least `pull` access to that repository on GitHub (`pull`-only proof yields a read-only installation token; `push` access is required for write permissions). This authorization is checked both when the association is recorded and at every token mint. The system maintains a background refresh loop for installation tokens, and the `sciontool` credential helper provides fresh tokens to `git` on-demand inside the agent container.
 
 ### Option B: Personal Access Tokens
 
@@ -151,6 +155,10 @@ scion hub secret set GITHUB_TOKEN github_pat_xxxxxxxx
 
 User-scoped secrets take priority over project-scoped ones with the same name (see [Secret Management](/scion/hosted/user/secrets/) for the full resolution hierarchy).
 
+A personal token (a user-scoped `GITHUB_TOKEN`, a token from the agent's own environment, or one collected from your shell) is offered to git only when the project's git remote is on the GitHub host: `github.com`, or the host of `github_app.api_base_url` when it is set for GitHub Enterprise.
+
+For a private repository on any other host, set `GITHUB_TOKEN` as a project secret: the Hub and Runtime Broker then clone and fetch the project's recorded HTTPS remote with that secret, and without a project secret they run unauthenticated (never falling back to the host's git credential helpers, TLS client certificates, askpass, Kerberos credentials, `~/.netrc`, or SSH keys). Hub-host clones and pulls refuse an SSH repository URL (`ssh://`, `git+ssh://`, `ssh+git://`, or `git@host:path`), with or without a project secret, because a project git secret authenticates HTTPS only; use the repository's HTTPS URL (see [Git that Scion runs on the host](/scion/local/workspace/#git-that-scion-runs-on-the-host)).
+
 ### Web Dashboard Alternative
 
 You can also upload secrets through the Web Dashboard:
@@ -236,7 +244,7 @@ Or create a Pull Request directly from the branch on GitHub.
 
 If you link a local checkout to a **remote** Hub, the workspace strategy changes: even if the broker machine has the repository on disk, agents use clone-based provisioning, unless the project was created with worktree-per-agent mode (requires git 2.48+ on the broker). This means you need a `GITHUB_TOKEN` secret set on the project for private repositories, just like a project created from a URL.
 
-On the local workstation Hub, a git project that `scion hub link` (or the automatic link) creates gets workspace mode `worktree-per-agent`, so new agents get a git worktree of your checkout. A project that already existed on the Hub keeps its mode. This needs git 2.48 or later. If git is older, or the checkout's `origin` does not match the project's repository, agent creation fails with an error instead of falling back to a clone. Agents on a Kubernetes runtime do not use the checkout. A repository linked there before local worktrees existed keeps cloning until it is re-linked. See [Linked git projects](/scion/local/workspace/#linked-git-projects).
+On the local workstation Hub, a git project that `scion hub link` (or the automatic link) creates gets workspace mode `worktree-per-agent`, so new agents get a git worktree of your checkout. A project that already existed on the Hub keeps its mode. This needs git 2.48 or later. If git is older, or the checkout's `origin` does not match the project's repository, agent creation fails with an error instead of falling back to a clone. Agents on a Kubernetes runtime do not use the checkout, and Cloud Run Instances refuses `worktree-per-agent` (`412 Precondition Failed`). A repository linked there before local worktrees existed keeps cloning until it is re-linked. See [Linked git projects](/scion/local/workspace/#linked-git-projects).
 
 ---
 

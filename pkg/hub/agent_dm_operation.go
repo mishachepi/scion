@@ -16,6 +16,7 @@ package hub
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -171,6 +172,12 @@ type AgentDMInput struct {
 	// exactly as unable to see the mention right now as a stopped one.
 	SkipPhaseGate bool
 
+	// AttachmentAddressee is the attachment addressee row the caller
+	// recorded for this delivery (recordAttachmentAddressee), or "". The
+	// caller settles it from the result, except on AgentDMWakeQueued:
+	// then the background wake settles it when it delivers or fails.
+	AttachmentAddressee string
+
 	// RecordLogged reports that the adapter already wrote this message's
 	// record to the message log (handleAgentMessage does so before it
 	// reaches here). When set, the operation does not write another.
@@ -188,6 +195,12 @@ const (
 	// API wording is "dispatched" — does not promise harness consumption.
 	AgentDMAccepted AgentDMOutcome = "accepted"
 
+	// AgentDMWakeQueued: the target is auto-wake eligible (auto_wake.go)
+	// and the message was persisted as pending; it is dispatched after a
+	// background wake, or marked failed if the wake fails. Only a mention
+	// from the fan-out (SkipPhaseGate) gets it.
+	AgentDMWakeQueued AgentDMOutcome = "wake_queued"
+
 	// AgentDMFailed: a pre-flight check failed (rate limit, authorization,
 	// validation, attachment rejection), persistence failed, or dispatch
 	// was definitively rejected. Pre-flight failures produce no side
@@ -196,11 +209,11 @@ const (
 	AgentDMFailed AgentDMOutcome = "failed"
 
 	// AgentDMAmbiguous: message was persisted and dispatch may or may not
-	// have succeeded — e.g. the broker accepted the message but the
-	// MarkMessageDispatched CAS failed, or context was cancelled mid-flight.
-	// The message row may be in "pending" or "dispatched" state. Callers
-	// must NOT assume delivery and must NOT automatically replay.
-	// No blind retry guidance is returned.
+	// have succeeded — e.g. a dispatch deadline expired mid-flight (row
+	// finalized as "failed" unless already "delivered", ptone/scion#5111),
+	// or the broker accepted the message and the MarkMessageDispatched CAS
+	// failed (row still "pending"). Callers must NOT assume delivery and
+	// must NOT automatically replay. No blind retry guidance is returned.
 	AgentDMAmbiguous AgentDMOutcome = "ambiguous"
 
 	// AgentDMDeferred: the target agent is mid-`scion reincarnate` (design
@@ -226,6 +239,10 @@ type AgentDMResult struct {
 
 	// RecipientID is the target agent's UUID.
 	RecipientID string
+
+	// ConversationID is the conversation the message was persisted in.
+	// Empty when conversation resolution was skipped or failed.
+	ConversationID string
 
 	// DispatchErr is non-nil when Outcome is AgentDMAmbiguous. It
 	// captures the dispatch failure reason for logging/diagnostics.
@@ -265,6 +282,10 @@ type AgentDMError struct {
 	// RetryAfter is set when the error is a rate-limit rejection.
 	// Adapters should set the Retry-After header to this duration.
 	RetryAfter time.Duration
+
+	// StandingRefused reports whether a startGate standing check (a held
+	// agent, held ancestor, or root user out of standing) refused a wake.
+	StandingRefused bool
 }
 
 func (e *AgentDMError) Error() string { return e.Message }
@@ -284,6 +305,15 @@ func (s *Server) ExecuteAgentDM(ctx context.Context, input *AgentDMInput) (*Agen
 			Message:    "ExecuteAgentDM: required input fields (input, SenderAgent, TargetAgent, SenderIdentity) must not be nil",
 			HTTPStatus: http.StatusBadRequest,
 		}
+	}
+	if isReservedSchedulerChannel(input.Channel) {
+		dmErr := &AgentDMError{
+			Code:       ErrCodeValidationError,
+			Message:    fmt.Sprintf("channel %q is reserved for internal use", input.Channel),
+			HTTPStatus: http.StatusBadRequest,
+		}
+		LogDMAdmission(DMAuditEntryForDenial(input, ErrCodeValidationError, "reserved channel"))
+		return nil, dmErr
 	}
 
 	// ── Phase 1: Admission checks (no side effects) ─────────────────────
@@ -396,19 +426,68 @@ func (s *Server) ExecuteAgentDM(ctx context.Context, input *AgentDMInput) (*Agen
 	// phase-conflict error below, in favor of the deferred outcome.
 	deferred := reincarnationInFlight(input.TargetAgent)
 
-	// ── Phase 1b: Wake handling (#1691) ─────────────────────────────────
+	// ── Phase 1b: Hold check, then wake handling (#1691) ────────────────
+	// A held target (ptone/scion#3433) is never dispatched to, whether or
+	// not wake was requested (ptone/scion#6859): a mention is kept,
+	// undispatched, like a migrating target; any other send is refused like
+	// a suspended target, and is never woken. A lookup fault refuses.
+	//
 	// Wake runs after all admission checks so that denied, oversized, or
 	// unauthorized requests cannot resume an agent (AC-2). Resume failure
 	// or readiness timeout returns an explicit error and no message is
 	// dispatched (AC-4).
+	//
+	// Auto-wake (ptone/scion#7826, auto_wake.go): a target the hub suspended
+	// (shouldAutoWake) is woken as if Wake were set, without the lifecycle
+	// permission check: the delivery authorization above suffices. A mention
+	// from the fan-out cannot wait for a resume inside its budget, so it is
+	// stored now and dispatched after a background wake (wakeQueued).
+	// A target whose hub wake is already in flight (autoWakeAwait) is
+	// waited for, then delivered to; a mention to it keeps today's
+	// buffered dispatch, which a starting agent receives once up.
+	autoWake := false
+	wakeQueued := false
 	if !deferred {
-		if input.Wake {
-			if denial := s.wakeResumeDenial(ctx, input.SenderIdentity, input.TargetAgent); denial != nil {
-				LogDMAdmission(DMAuditEntryForDenial(input, denial.Code, denial.Message))
-				return nil, denial
+		held, holdErr := s.agentHeld(ctx, input.TargetAgent.ID)
+		mode := autoWakeNone
+		if !held && holdErr == nil {
+			mode = s.autoWakeModeOf(input.TargetAgent)
+		}
+		isFanoutMention := input.SkipPhaseGate && input.Type == messages.TypeMention
+		claimActive := input.TargetAgent.IdleSuspendClaimActive
+		autoWake = mode == autoWakeResume || (mode == autoWakeAwait && (!isFanoutMention || claimActive))
+		switch {
+		case holdErr != nil:
+			return nil, heldLookupFaultDMError()
+		case held && input.SkipPhaseGate && input.Type == messages.TypeMention:
+			deferred = true
+		case held:
+			return nil, heldTargetDMError(input.TargetAgent)
+		case autoWake && isFanoutMention:
+			wakeQueued = true
+		case input.Wake || autoWake:
+			if !autoWake {
+				if denial := s.wakeResumeDenial(ctx, input.SenderIdentity, input.TargetAgent); denial != nil {
+					LogDMAdmission(DMAuditEntryForDenial(input, denial.Code, denial.Message))
+					return nil, denial
+				}
 			}
 			if input.BeforeWake != nil {
 				input.BeforeWake()
+			}
+			if autoWake {
+				// The hub's own wakes (other new work for this agent) are
+				// routine and the sender cannot know about them: wait for
+				// a start already in progress and deliver to it, instead
+				// of keeping the message deferred (wakeOrAwaitStart).
+				dmErr, awaitErr := s.wakeOrAwaitStart(ctx, input.TargetAgent)
+				if dmErr != nil {
+					return nil, dmErr
+				}
+				if awaitErr != nil {
+					return nil, startInProgressDMError(input.TargetAgent, awaitErr)
+				}
+				break
 			}
 			wakeResult, wakeErr := s.wakeAgentForDM(ctx, input.TargetAgent)
 			if wakeErr != nil {
@@ -418,30 +497,25 @@ func (s *Server) ExecuteAgentDM(ctx context.Context, input *AgentDMInput) (*Agen
 				// Another start is in progress: keep the message, deferred.
 				deferred = true
 			}
-		} else if held, holdErr := s.agentHeld(ctx, input.TargetAgent.ID); holdErr != nil || held {
-			// A held target (ptone/scion#3433) is never dispatched to: a
-			// mention is kept, undispatched, like a migrating target; any
-			// other send is refused like a suspended target. A lookup
-			// fault refuses.
-			if holdErr != nil {
-				return nil, heldLookupFaultDMError()
-			}
-			if input.SkipPhaseGate && input.Type == messages.TypeMention {
-				deferred = true
-			} else {
-				return nil, heldTargetDMError(input.TargetAgent)
-			}
-		} else if !input.SkipPhaseGate || input.Type != messages.TypeMention {
+		case !input.SkipPhaseGate || input.Type != messages.TypeMention:
 			// SkipPhaseGate applies only to mention deliveries — a non-mention
 			// send always gets the phase gate, regardless of the flag, so a
 			// caller cannot use it to bypass phase checks for a primary send.
-			if phaseErr := validateAgentDeliverable(input.TargetAgent); phaseErr != nil {
+			if phaseErr := s.validateAgentDeliverable(input.TargetAgent); phaseErr != nil {
 				return nil, phaseErr
 			}
 		}
 	}
 
 	// ── Phase 2: Side effects ───────────────────────────────────────────
+
+	// Re-check shutdown after Phase 1b (which may have waited on a wake):
+	// refuse with retryable 503 before ingesting attachments or persisting a
+	// pending row that dispatchShutdownGate would immediately reject
+	// (ptone/scion#7405).
+	if s.ShuttingDown() {
+		return nil, shuttingDownDMError("")
+	}
 
 	// 6. Attachment ingestion.
 	attachmentRefs, attachmentWarnings := s.ingestAgentAttachments(ctx, input.ProjectID, input.SenderAgent.ID, input.Attachments)
@@ -612,6 +686,7 @@ func (s *Server) ExecuteAgentDM(ctx context.Context, input *AgentDMInput) (*Agen
 			MessageID:          msgID,
 			Recipient:          storeMsg.Recipient,
 			RecipientID:        storeMsg.RecipientID,
+			ConversationID:     storeMsg.ConversationID,
 			AttachmentWarnings: attachmentWarnings,
 			ArtifactWarning:    artifactWarning,
 			BoundAttachments:   boundAttachments,
@@ -660,10 +735,28 @@ func (s *Server) ExecuteAgentDM(ctx context.Context, input *AgentDMInput) (*Agen
 		}
 	}
 
+	// Auto-wake of a mention target (see Phase 1b): the row stays pending
+	// and the dispatch runs after the background wake. A hub that is
+	// shutting down cannot start the wake; the mention then takes the
+	// dispatch below, as it would without auto-wake.
+	isFanoutMention := input.SkipPhaseGate && input.Type == messages.TypeMention
+	if wakeQueued && s.queueAutoWake(input.TargetAgent, s.agentDMAutoWakeItem(input, storeMsg, structuredMsg, dispatchMsg)) {
+		return &AgentDMResult{
+			Outcome:            AgentDMWakeQueued,
+			MessageID:          msgID,
+			Recipient:          storeMsg.Recipient,
+			RecipientID:        storeMsg.RecipientID,
+			ConversationID:     storeMsg.ConversationID,
+			AttachmentWarnings: attachmentWarnings,
+			ArtifactWarning:    artifactWarning,
+			BoundAttachments:   boundAttachments,
+		}, nil
+	}
+
 	// Dispatch outcome determines the final message state:
 	//   - Success → CAS pending→dispatched (AC-1)
 	//   - Definite failure → persist failed state, return non-2xx (AC-2)
-	//   - Ambiguous (dispatch deadline) → leave pending, return ambiguous (AC-4)
+	//   - Ambiguous (dispatch deadline) → finalize failed unless delivered, return ambiguous (AC-4, ptone/scion#5111)
 	//
 	// The dispatch runs on dispatchContext: detached from the caller's
 	// cancellation, so a caller that goes away (a client that disconnects,
@@ -674,23 +767,72 @@ func (s *Server) ExecuteAgentDM(ctx context.Context, input *AgentDMInput) (*Agen
 	dctx, dcancel := dispatchContext(ctx, agentDMDispatchTimeout)
 	defer dcancel()
 	var dispatchErr error
+	var held bool
 	if isManagedAgentRuntime(input.TargetAgent.Runtime) {
 		// D4: managed runtimes stay unconverted — a managed agent may not
 		// have the scion CLI to fetch with. Unchanged: input.Msg, full body.
 		dispatchErr = s.managedAgentMessage(dctx, input.TargetAgent, input.Msg, input.Urgent || input.Interrupt)
 	} else if dispatcher := s.GetDispatcher(); dispatcher != nil && input.TargetAgent.RuntimeBrokerID != "" {
-		dispatchErr = dispatchWithBrokerRetry(withDispatchMessageID(dctx, msgID), nil, dispatcher, input.TargetAgent, dispatchMsg.Msg, input.Urgent || input.Interrupt, dispatchMsg)
+		var retryOpts []dispatchRetryOption
+		if !isFanoutMention {
+			retryOpts = append(retryOpts, withSyncAutoWakeHook(func(_ context.Context, target *store.Agent) (context.Context, context.CancelFunc, error) {
+				if input.BeforeWake != nil {
+					input.BeforeWake()
+				}
+				wctx, wcancel := dispatchContext(ctx, scheduledWakeBudget)
+				defer wcancel()
+				if err := s.syncAutoWakeForDM(wctx, target); err != nil {
+					return nil, nil, err
+				}
+				freshCtx, freshCancel := dispatchContext(ctx, agentDMDispatchTimeout)
+				freshCtx = withDispatchMessageID(freshCtx, msgID)
+				if err := s.refreshHoldLaunchAfterWake(freshCtx, target, msgID, storeMsg); err != nil {
+					freshCancel()
+					return nil, nil, err
+				}
+				return freshCtx, freshCancel, nil
+			}))
+		}
+		held, dispatchErr = s.holdOrDispatch(dctx, input.TargetAgent, msgID, storeMsg, func() error {
+			return dispatchWithBrokerRetry(withDispatchMessageID(dctx, msgID), s.deliveryMarker(), nil, dispatcher, input.TargetAgent, dispatchMsg.Msg, input.Urgent || input.Interrupt, dispatchMsg, retryOpts...)
+		})
 	}
 
 	// 12. Finalize dispatch state (#1689).
 	if dispatchErr != nil {
+		var idleErr *errAgentIdleSuspending
+		if isFanoutMention && errors.As(dispatchErr, &idleErr) &&
+			s.shouldQueueAutoWake(input.TargetAgent) &&
+			!s.agentHeldOrUnknown(ctx, input.TargetAgent.ID) &&
+			s.queueAutoWake(input.TargetAgent, s.agentDMAutoWakeItem(input, storeMsg, structuredMsg, dispatchMsg)) {
+			return &AgentDMResult{
+				Outcome:            AgentDMWakeQueued,
+				MessageID:          msgID,
+				Recipient:          storeMsg.Recipient,
+				RecipientID:        storeMsg.RecipientID,
+				ConversationID:     storeMsg.ConversationID,
+				AttachmentWarnings: attachmentWarnings,
+				ArtifactWarning:    artifactWarning,
+				BoundAttachments:   boundAttachments,
+			}, nil
+		}
+		var wakeRefused *errAutoWakeRefused
+		if errors.As(dispatchErr, &wakeRefused) && wakeRefused.dmErr != nil {
+			s.finishAttachmentAddressee(dctx, input.AttachmentAddressee, errors.New(wakeRefused.dmErr.Message))
+			_ = s.markFailed(dctx, msgID, wakeRefused.dmErr.Message)
+			LogDMDispatchOutcome(input.SenderAgent, input.TargetAgent, msgID, DispatchFailed, errors.New(wakeRefused.dmErr.Message))
+			return nil, wakeRefused.dmErr
+		}
 		if isAmbiguousDispatchError(dispatchErr) {
 			// Ambiguous: dispatch may have succeeded but confirmation was
 			// lost (a dispatch deadline expired mid-flight; the caller's
 			// cancellation no longer reaches the dispatch, see dispatchContext).
-			// Leave the row in pending state for inspection; return
-			// ambiguous outcome (AC-4).
-			s.messageLog.Warn("agent DM: dispatch ambiguous (message persisted as pending)",
+			// Finalize the row as failed straight away with
+			// dispatchOutcomeUnknownReason instead of leaving it pending for
+			// the 24h TTL; MarkMessageFailed leaves a row already marked
+			// delivered untouched (ptone/scion#5111). Return ambiguous outcome
+			// so callers do not blindly retry (AC-4).
+			s.messageLog.Warn("agent DM: dispatch ambiguous (message finalized as failed)",
 				"sender_id", input.SenderAgent.ID,
 				"target_agent_id", input.TargetAgent.ID,
 				"message_id", msgID,
@@ -698,11 +840,16 @@ func (s *Server) ExecuteAgentDM(ctx context.Context, input *AgentDMInput) (*Agen
 			)
 			// Audit: dispatch outcome (#1690).
 			LogDMDispatchOutcome(input.SenderAgent, input.TargetAgent, msgID, DispatchFailed, dispatchErr)
+			if markErr := s.markFailed(ctx, msgID, dispatchOutcomeUnknownReason); markErr != nil {
+				s.messageLog.Error("agent DM: failed to mark message failed",
+					"message_id", msgID, "error", markErr)
+			}
 			return &AgentDMResult{
 				Outcome:            AgentDMAmbiguous,
 				MessageID:          msgID,
 				Recipient:          storeMsg.Recipient,
 				RecipientID:        storeMsg.RecipientID,
+				ConversationID:     storeMsg.ConversationID,
 				DispatchErr:        dispatchErr,
 				AttachmentWarnings: attachmentWarnings,
 				ArtifactWarning:    artifactWarning,
@@ -724,63 +871,52 @@ func (s *Server) ExecuteAgentDM(ctx context.Context, input *AgentDMInput) (*Agen
 			s.messageLog.Error("agent DM: failed to mark message failed",
 				"message_id", msgID, "error", markErr)
 		}
+		if errors.Is(dispatchErr, ErrHubShuttingDown) {
+			return nil, shuttingDownDMError(msgID)
+		}
 		if isBrokerAgentNotFound(dispatchErr) {
 			return nil, agentNotRunningDispatchError(msgID)
 		}
 		return nil, dispatchFailedError(msgID)
 	}
 
-	// Dispatch succeeded — CAS pending→dispatched (AC-1).
-	dispatched, casErr := s.markDispatched(ctx, msgID)
-	if casErr != nil {
-		// Store failure after broker acceptance: the message IS dispatched
-		// but our state tracking is uncertain (AC-3). Return ambiguous
-		// with the stable message ID so the caller can correlate.
-		s.messageLog.Error("agent DM: MarkMessageDispatched store error (message dispatched)",
-			"message_id", msgID, "error", casErr)
-		// Audit: dispatch outcome (#1690) — dispatch succeeded but state tracking failed.
-		LogDMDispatchOutcome(input.SenderAgent, input.TargetAgent, msgID, DispatchSucceeded, casErr)
-		return &AgentDMResult{
-			Outcome:            AgentDMAmbiguous,
-			MessageID:          msgID,
-			Recipient:          storeMsg.Recipient,
-			RecipientID:        storeMsg.RecipientID,
-			DispatchErr:        fmt.Errorf("dispatch succeeded but state transition failed: %w", casErr),
-			AttachmentWarnings: attachmentWarnings,
-			ArtifactWarning:    artifactWarning,
-			BoundAttachments:   boundAttachments,
-		}, nil
-	}
-	if !dispatched {
-		// CAS miss — already transitioned by concurrent process.
-		// The dispatch itself succeeded; log for visibility but not an error.
-		s.messageLog.Warn("agent DM: MarkMessageDispatched CAS miss (already transitioned)",
-			"message_id", msgID)
+	// Dispatch succeeded — CAS pending→dispatched (AC-1), unless holdOrDispatch
+	// already moved the row directly to awaiting_session (ptone/scion#7881).
+	if !held {
+		dispatched, casErr := s.markDispatched(ctx, msgID)
+		if casErr != nil {
+			// Store failure after broker acceptance: the message IS dispatched
+			// but our state tracking is uncertain (AC-3). Return ambiguous
+			// with the stable message ID so the caller can correlate.
+			s.messageLog.Error("agent DM: MarkMessageDispatched store error (message dispatched)",
+				"message_id", msgID, "error", casErr)
+			// Audit: dispatch outcome (#1690) — dispatch succeeded but state tracking failed.
+			LogDMDispatchOutcome(input.SenderAgent, input.TargetAgent, msgID, DispatchSucceeded, casErr)
+			return &AgentDMResult{
+				Outcome:            AgentDMAmbiguous,
+				MessageID:          msgID,
+				Recipient:          storeMsg.Recipient,
+				RecipientID:        storeMsg.RecipientID,
+				ConversationID:     storeMsg.ConversationID,
+				DispatchErr:        fmt.Errorf("dispatch succeeded but state transition failed: %w", casErr),
+				AttachmentWarnings: attachmentWarnings,
+				ArtifactWarning:    artifactWarning,
+				BoundAttachments:   boundAttachments,
+			}, nil
+		}
+		if !dispatched {
+			// CAS miss — already transitioned by concurrent process.
+			// The dispatch itself succeeded; log for visibility but not an error.
+			s.messageLog.Warn("agent DM: MarkMessageDispatched CAS miss (already transitioned)",
+				"message_id", msgID)
+		}
 	}
 
 	// Audit: dispatch outcome (#1690).
 	LogDMDispatchOutcome(input.SenderAgent, input.TargetAgent, msgID, DispatchSucceeded, nil)
 
 	// 13. Observer publication.
-	// Publish observer-only message for agent-to-agent visibility.
-	// ConversationAsserted is forced false on the observer copy to
-	// preserve the pre-refactor observer envelope shape.
-	// Cross-project DMs strip body and attachment metadata from the
-	// observer message (#1687).
-	if bp := s.GetMessageBrokerProxy(); bp != nil {
-		observerMsg := *structuredMsg
-		observerMsg.ObserverOnly = true
-		observerMsg.AttachmentDeliveries = nil
-		observerMsg.AttachmentPlan = nil
-		observerMsg.ConversationAsserted = false
-		if input.SenderAgent.ProjectID != input.TargetAgent.ProjectID {
-			sanitizeCrossProjectObserver(&observerMsg)
-		}
-		if err := bp.PublishMessage(ctx, input.TargetAgent.ProjectID, &observerMsg); err != nil {
-			s.messageLog.Error("agent DM: observer publish failed",
-				"target_agent_id", input.TargetAgent.ID, "error", err)
-		}
-	}
+	s.publishAgentDMObserver(ctx, input, structuredMsg)
 
 	// 14. Log delivery. The message record was written at 8c (or by the
 	// adapter), so this outcome line is a lifecycle entry.
@@ -806,10 +942,142 @@ func (s *Server) ExecuteAgentDM(ctx context.Context, input *AgentDMInput) (*Agen
 		MessageID:          msgID,
 		Recipient:          storeMsg.Recipient,
 		RecipientID:        storeMsg.RecipientID,
+		ConversationID:     storeMsg.ConversationID,
 		AttachmentWarnings: attachmentWarnings,
 		ArtifactWarning:    artifactWarning,
 		BoundAttachments:   boundAttachments,
 	}, nil
+}
+
+// publishAgentDMObserver publishes the observer-only copy of an agent DM for
+// agent-to-agent visibility. ConversationAsserted is forced false on the
+// observer copy to preserve the pre-refactor observer envelope shape.
+// Cross-project DMs strip body and attachment metadata from the observer
+// message (#1687).
+func (s *Server) publishAgentDMObserver(ctx context.Context, input *AgentDMInput, structuredMsg *messages.StructuredMessage) {
+	bp := s.GetMessageBrokerProxy()
+	if bp == nil {
+		return
+	}
+	observerMsg := *structuredMsg
+	observerMsg.ObserverOnly = true
+	observerMsg.AttachmentDeliveries = nil
+	observerMsg.AttachmentPlan = nil
+	observerMsg.ConversationAsserted = false
+	if input.SenderAgent.ProjectID != input.TargetAgent.ProjectID {
+		sanitizeCrossProjectObserver(&observerMsg)
+	}
+	if err := bp.PublishMessage(ctx, input.TargetAgent.ProjectID, &observerMsg); err != nil {
+		s.messageLog.Error("agent DM: observer publish failed",
+			"target_agent_id", input.TargetAgent.ID, "error", err)
+	}
+}
+
+// agentDMAutoWakeItem is the work queued behind the background wake of an
+// agent DM's target (a mention from the fan-out): once the target is
+// ready, dispatch the stored message (pending) to the woken run and record
+// the outcome as the synchronous path does; if the wake fails, mark the
+// message failed with the reason, so the sender's conversation shows it.
+func (s *Server) agentDMAutoWakeItem(input *AgentDMInput, storeMsg *store.Message, structuredMsg, dispatchMsg *messages.StructuredMessage) autoWakeItem {
+	msgID := storeMsg.ID
+	return autoWakeItem{
+		deliver: func(ctx context.Context, woken *store.Agent) {
+			// Re-check that the persisted row is still in dispatch_state='pending'
+			// before dispatching (ptone/scion#7405): if a long serial auto-wake
+			// queue kept this item in flight past stuckMessageExpireTTL (or the
+			// recipient sweep already failed the row), do not deliver it late
+			// after the sender has already been notified.
+			var curMsg *store.Message
+			rerr := retryFinalization(ctx, func(finCtx context.Context) error {
+				var err error
+				curMsg, err = s.store.GetMessage(finCtx, msgID)
+				return err
+			})
+			if rerr != nil {
+				fctx, fcancel := finalizationContext(ctx)
+				defer fcancel()
+				s.finishAttachmentAddressee(fctx, input.AttachmentAddressee, rerr)
+				LogDMDispatchOutcome(input.SenderAgent, woken, msgID, DispatchFailed, rerr)
+				if !errors.Is(rerr, store.ErrNotFound) {
+					if markErr := s.markFailed(fctx, msgID, rerr.Error()); markErr != nil {
+						s.messageLog.Error("agent DM: failed to mark message failed",
+							"message_id", msgID, "error", markErr)
+					}
+				}
+				return
+			}
+			if curMsg == nil || curMsg.DispatchState != store.MessageDispatchPending {
+				fctx, fcancel := finalizationContext(ctx)
+				defer fcancel()
+				s.finishAttachmentAddressee(fctx, input.AttachmentAddressee, errors.New("message no longer pending before auto-wake dispatch"))
+				return
+			}
+
+			dctx, cancel := context.WithTimeout(ctx, agentDMDispatchTimeout)
+			defer cancel()
+			var err error
+			var held bool
+			if isManagedAgentRuntime(woken.Runtime) {
+				err = s.managedAgentMessage(dctx, woken, input.Msg, input.Urgent || input.Interrupt)
+			} else if dispatcher := s.GetDispatcher(); dispatcher != nil && woken.RuntimeBrokerID != "" {
+				held, err = s.holdOrDispatch(dctx, woken, msgID, nil, func() error {
+					return dispatchWithBrokerRetry(withDispatchMessageID(dctx, msgID), s.deliveryMarker(), nil, dispatcher, woken, dispatchMsg.Msg, input.Urgent || input.Interrupt, dispatchMsg)
+				})
+			} else {
+				// No pre-check ran this late (the sync path's
+				// checkDispatchAvailability did, before the wake): nothing
+				// can be dispatched, so it is a definite failure.
+				err = errors.New("dispatch not available")
+			}
+			// The settle writes run on a short detached context, so a wake
+			// cut short at shutdown still records its outcome.
+			fctx, fcancel := finalizationContext(ctx)
+			defer fcancel()
+			// As the synchronous fan-out settles it: an ambiguous dispatch
+			// counts as delivered, a definite failure as failed.
+			if err != nil && !isAmbiguousDispatchError(err) {
+				s.finishAttachmentAddressee(fctx, input.AttachmentAddressee, err)
+			} else {
+				s.finishAttachmentAddressee(fctx, input.AttachmentAddressee, nil)
+			}
+			if err != nil {
+				LogDMDispatchOutcome(input.SenderAgent, woken, msgID, DispatchFailed, err)
+				reason := err.Error()
+				if isAmbiguousDispatchError(err) {
+					reason = dispatchOutcomeUnknownReason
+				}
+				if markErr := s.markFailed(fctx, msgID, reason); markErr != nil {
+					s.messageLog.Error("agent DM: failed to mark message failed",
+						"message_id", msgID, "error", markErr)
+				}
+				return
+			}
+			if !held {
+				if _, casErr := s.markDispatched(fctx, msgID); casErr != nil {
+					s.messageLog.Error("agent DM: MarkMessageDispatched store error (message dispatched)",
+						"message_id", msgID, "error", casErr)
+				}
+			}
+			LogDMDispatchOutcome(input.SenderAgent, woken, msgID, DispatchSucceeded, nil)
+			s.publishAgentDMObserver(fctx, input, structuredMsg)
+			s.logMessage("agent DM: message dispatched after auto-wake",
+				"sender_agent_id", input.SenderAgent.ID,
+				"target_agent_id", woken.ID,
+				"message_id", msgID,
+				logging.AttrLogKind, logging.LogKindEvent)
+		},
+		fail: func(ctx context.Context, dmErr *AgentDMError) {
+			fctx, fcancel := finalizationContext(ctx)
+			defer fcancel()
+			err := fmt.Errorf("auto-wake failed: %s", dmErr.Message)
+			s.finishAttachmentAddressee(fctx, input.AttachmentAddressee, err)
+			LogDMDispatchOutcome(input.SenderAgent, input.TargetAgent, msgID, DispatchFailed, err)
+			if markErr := s.markFailed(fctx, msgID, err.Error()); markErr != nil {
+				s.messageLog.Error("agent DM: failed to mark message failed",
+					"message_id", msgID, "error", markErr)
+			}
+		},
+	}
 }
 
 // wakeResumeDenial applies the rule that resuming a suspended agent to
@@ -875,6 +1143,9 @@ func WriteAgentDMResult(w http.ResponseWriter, result *AgentDMResult, mentionRes
 		"status":       status,
 		"recipient":    result.Recipient,
 		"recipient_id": result.RecipientID,
+	}
+	if result.ConversationID != "" {
+		body["conversation_id"] = result.ConversationID
 	}
 	if deferredNote != "" {
 		body["deferred"] = deferredNote

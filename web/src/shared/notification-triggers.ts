@@ -27,34 +27,46 @@
  */
 export const DEFAULT_TRIGGERS: readonly string[] = [
   'COMPLETED',
+  'IDLE',
   'WAITING_FOR_INPUT',
   'LIMITS_EXCEEDED',
   'STALLED',
   'ERROR',
+  'HARNESS_ERROR',
   'HALTED',
+  'SUSPENDED',
 ];
 
 /** Every trigger a subscription can select. */
 export const ALL_TRIGGERS: readonly string[] = [
   'COMPLETED',
+  'IDLE',
   'WAITING_FOR_INPUT',
   'LIMITS_EXCEEDED',
   'STALLED',
   'ERROR',
+  'HARNESS_ERROR',
   'HALTED',
+  'SUSPENDED',
   'DELETED',
 ];
 
 const TRIGGER_LABELS: Record<string, string> = {
   COMPLETED: 'Completed',
+  // The agent has nothing to do until new work arrives (ptone/scion#7826).
+  IDLE: 'Idle',
   // Display only: pairs with 'blocked' shown as 'waiting on others'
   // (ptone/scion#3301, ptone/scion#1571).
   WAITING_FOR_INPUT: 'Waiting on Parent',
   LIMITS_EXCEEDED: 'Limits Exceeded',
   STALLED: 'Stalled',
   ERROR: 'Error',
+  // A live harness reported a model, API or auth error (ptone/scion#7858).
+  HARNESS_ERROR: 'Harness Error',
   // The platform ended a run that should still be running (ptone/scion#4853).
   HALTED: 'Halted',
+  // The agent was suspended manually or by auto-suspend (ptone/scion#8304).
+  SUSPENDED: 'Suspended',
   DELETED: 'Deleted',
 };
 

@@ -21,7 +21,7 @@
  * Supports invite-based user creation and status filtering (invited/active/suspended).
  */
 
-import { LitElement, html, css, nothing } from 'lit';
+import { LitElement, html, css, nothing, type TemplateResult } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import { keyed } from 'lit/directives/keyed.js';
 
@@ -34,9 +34,21 @@ import {
 import '../shared/status-badge.js';
 import '../shared/effective-role-provenance.js';
 import '../shared/effective-access-boundary-notice.js';
+import '../shared/effective-permissions-view.js';
+import type { ScionEffectivePermissionsView } from '../shared/effective-permissions-view.js';
 import '../shared/security-review-dialog.js';
+import { invitedStatusTagStyles } from '../shared/styles.js';
 import { formatRelative } from '../../utils/time.js';
 import { apiFetch, extractApiError, parseApiError } from '../../client/api.js';
+import { loadAdminStatus } from '../../client/admin-status.js';
+import { stateManager } from '../../client/state.js';
+import { hasAnyPermission } from '../../lib/admin-permissions.js';
+import {
+  EFFECTIVE_PERMISSIONS_FLAG,
+  isFeatureEnabled,
+  USER_DELETE_FORCE_CASCADE_FLAG,
+} from '../../utils/feature-flags.js';
+import { copyToClipboard, showCopyFailedToast } from '../../utils/clipboard.js';
 
 type SortField = 'name' | 'created';
 type SortDir = 'asc' | 'desc';
@@ -50,7 +62,185 @@ interface ConfirmAction {
   variant: 'primary' | 'danger' | 'warning';
   confirmLabel: string;
   user: AdminUser;
+  /**
+   * Runs on confirm. The dialog closes afterwards, unless the action
+   * replaced confirmAction with a new dialog state (kept open to show it).
+   */
   action: () => Promise<void>;
+  /** Delete dialogs only: what blocks the delete, once known. */
+  blockers?: UserDeleteBlockers;
+  /** Delete dialogs only: Force delete was clicked once and awaits confirmation. */
+  forceConfirm?: boolean;
+}
+
+/** An agent of the user that blocks the delete. */
+export interface UserDeleteBlockingAgent {
+  id: string;
+  slug: string;
+  projectId: string;
+  /** '' when no delete was asked for, otherwise deleting, finalizing or failed. */
+  deletionState: string;
+}
+
+/** An active delegation from the user that blocks the delete. */
+export interface UserDeleteBlockingEdge {
+  id: string;
+  delegateType: string;
+  delegateId: string;
+  scopeType: string;
+  scopeId: string;
+}
+
+/**
+ * What blocks deleting a user: the body of
+ * GET /api/v1/users/{id}/delete-blockers and the details of a 409
+ * user_delete_blocked refusal. Each list holds at most 50 entries.
+ */
+export interface UserDeleteBlockers {
+  agents: UserDeleteBlockingAgent[];
+  edges: UserDeleteBlockingEdge[];
+  truncated: boolean;
+}
+
+/**
+ * Reads blocker lists from a delete-blockers body or 409 details. Returns
+ * null for anything that is not that shape.
+ */
+export function parseUserDeleteBlockers(value: unknown): UserDeleteBlockers | null {
+  if (!value || typeof value !== 'object') return null;
+  const v = value as Record<string, unknown>;
+  if (!Array.isArray(v.agents) && !Array.isArray(v.edges)) return null;
+  const str = (x: unknown): string => (typeof x === 'string' ? x : '');
+  const agents = (Array.isArray(v.agents) ? v.agents : []).map((a) => {
+    const r = (a ?? {}) as Record<string, unknown>;
+    return {
+      id: str(r.id),
+      slug: str(r.slug),
+      projectId: str(r.projectId),
+      deletionState: str(r.deletionState),
+    };
+  });
+  const edges = (Array.isArray(v.edges) ? v.edges : []).map((e) => {
+    const r = (e ?? {}) as Record<string, unknown>;
+    return {
+      id: str(r.id),
+      delegateType: str(r.delegateType),
+      delegateId: str(r.delegateId),
+      scopeType: str(r.scopeType),
+      scopeId: str(r.scopeId),
+    };
+  });
+  return { agents, edges, truncated: v.truncated === true };
+}
+
+function hasDeleteBlockers(b: UserDeleteBlockers | undefined): b is UserDeleteBlockers {
+  return !!b && (b.agents.length > 0 || b.edges.length > 0);
+}
+
+/** The confirming label of the Force delete button, naming the agents stopped. */
+function forceDeleteConfirmLabel(b: UserDeleteBlockers | undefined): string {
+  const n = b?.agents.length ?? 0;
+  if (n === 0) return 'Confirm force delete';
+  return `Stop ${n} ${n === 1 ? 'agent' : 'agents'} and delete`;
+}
+
+/**
+ * One agent of a forced user deletion. outcome is pending, stopping,
+ * failed, stopped (the agent delete confirmed its teardown) or removed
+ * (its record is gone without that confirmation).
+ */
+export interface UserDeletionAgent {
+  id: string;
+  slug: string;
+  projectId: string;
+  outcome: string;
+  attempts: number;
+  lastError: string;
+}
+
+/** Agent counts of a forced user deletion, by outcome. */
+export interface UserDeletionCounts {
+  pending: number;
+  stopping: number;
+  failed: number;
+  stopped: number;
+  removed: number;
+}
+
+/**
+ * A forced user deletion: the body of GET /api/v1/users/{id}/deletion and
+ * of the 202 answer to DELETE /api/v1/users/{id}?force=true. state is
+ * stopping until every agent is stopped or removed, then completed.
+ */
+export interface UserDeletion {
+  deletionId: string;
+  userId: string;
+  state: string;
+  requestedAt: string;
+  completedAt: string | null;
+  lastError: string;
+  agents: UserDeletionAgent[];
+  counts: UserDeletionCounts;
+}
+
+/** Display labels for deletion agent outcomes. */
+export const USER_DELETION_OUTCOME_LABELS: Record<string, string> = {
+  pending: 'Waiting',
+  stopping: 'Stopping',
+  failed: 'Failed',
+  stopped: 'Stopped',
+  removed: 'Removed (stop not confirmed)',
+};
+
+/** Reads a deletion resource. Returns null for anything that is not one. */
+export function parseUserDeletion(value: unknown): UserDeletion | null {
+  if (!value || typeof value !== 'object') return null;
+  const v = value as Record<string, unknown>;
+  if (typeof v.deletionId !== 'string' || typeof v.state !== 'string') return null;
+  const str = (x: unknown): string => (typeof x === 'string' ? x : '');
+  const num = (x: unknown): number => (typeof x === 'number' ? x : 0);
+  const c = (v.counts ?? {}) as Record<string, unknown>;
+  return {
+    deletionId: str(v.deletionId),
+    userId: str(v.userId),
+    state: str(v.state),
+    requestedAt: str(v.requestedAt),
+    completedAt: typeof v.completedAt === 'string' ? v.completedAt : null,
+    lastError: str(v.lastError),
+    agents: (Array.isArray(v.agents) ? v.agents : []).map((a) => {
+      const r = (a ?? {}) as Record<string, unknown>;
+      return {
+        id: str(r.id),
+        slug: str(r.slug),
+        projectId: str(r.projectId),
+        outcome: str(r.outcome),
+        attempts: num(r.attempts),
+        lastError: str(r.lastError),
+      };
+    }),
+    counts: {
+      pending: num(c.pending),
+      stopping: num(c.stopping),
+      failed: num(c.failed),
+      stopped: num(c.stopped),
+      removed: num(c.removed),
+    },
+  };
+}
+
+/** How often an open deletion panel reloads a deletion in state stopping. */
+export const DELETION_POLL_INTERVAL_MS = 5000;
+
+/** The deletion panel's error when its deletion cannot be loaded. */
+const DELETION_STATUS_UNAVAILABLE =
+  'The deletion status is not available. Use Refresh to try again.';
+
+/** The deletion panel's state. */
+interface DeletionPanel {
+  user: AdminUser;
+  deletion: UserDeletion | null;
+  loading: boolean;
+  error: string | null;
 }
 
 interface InviteCodeEntry {
@@ -163,6 +353,9 @@ export class ScionPageAdminUsers extends LitElement {
   private currentUserId: string | null = null;
 
   @state()
+  private canReadRoleBindings = false;
+
+  @state()
   private confirmAction: ConfirmAction | null = null;
 
   @state()
@@ -247,6 +440,10 @@ export class ScionPageAdminUsers extends LitElement {
   @state()
   private viewRolesUser: AdminUser | null = null;
 
+  /** Active tab inside the Roles dialog. */
+  @state()
+  private viewRolesActiveTab: 'roles' | 'permissions' = 'roles';
+
   // Security review dialog state
   @state()
   private securityReviewDetail: SecurityReviewDetail | null = null;
@@ -254,560 +451,620 @@ export class ScionPageAdminUsers extends LitElement {
   @state()
   private showSecurityReview = false;
 
-  static override styles = css`
-    :host {
-      display: block;
-    }
-
-    .header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      margin-bottom: 1.5rem;
-    }
-
-    .header h1 {
-      font-size: 1.5rem;
-      font-weight: 700;
-      color: var(--scion-text, #1e293b);
-      margin: 0;
-    }
-
-    .user-count {
-      font-size: 0.875rem;
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    .table-container {
-      background: var(--scion-surface, #ffffff);
-      border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: var(--scion-radius-lg, 0.75rem);
-      overflow: hidden;
-    }
-
-    table {
-      width: 100%;
-      border-collapse: collapse;
-    }
-
-    th {
-      text-align: left;
-      padding: 0.75rem 1rem;
-      font-size: 0.75rem;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--scion-text-muted, #64748b);
-      background: var(--scion-bg-subtle, #f1f5f9);
-      border-bottom: 1px solid var(--scion-border, #e2e8f0);
-    }
-
-    th.sortable {
-      cursor: pointer;
-      user-select: none;
-    }
-
-    th.sortable:hover {
-      color: var(--scion-text, #1e293b);
-    }
-
-    .sort-indicator {
-      display: inline-block;
-      margin-left: 0.25rem;
-      font-size: 0.625rem;
-      vertical-align: middle;
-      opacity: 0.4;
-    }
-
-    th.sorted .sort-indicator {
-      opacity: 1;
-    }
-
-    td {
-      padding: 0.75rem 1rem;
-      font-size: 0.875rem;
-      color: var(--scion-text, #1e293b);
-      border-bottom: 1px solid var(--scion-border, #e2e8f0);
-      vertical-align: middle;
-    }
-
-    tr:last-child td {
-      border-bottom: none;
-    }
-
-    tr:hover td {
-      background: var(--scion-bg-subtle, #f1f5f9);
-    }
-
-    .user-identity {
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
-    }
-
-    .user-avatar {
-      width: 2rem;
-      height: 2rem;
-      border-radius: 50%;
-      background: var(--scion-primary, #3b82f6);
-      color: white;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 0.75rem;
-      font-weight: 600;
-      flex-shrink: 0;
-      overflow: hidden;
-    }
-
-    .user-avatar img {
-      width: 100%;
-      height: 100%;
-      object-fit: cover;
-    }
-
-    .user-avatar.invited {
-      background: var(--sl-color-primary-200, #bfdbfe);
-      color: var(--sl-color-primary-700, #1d4ed8);
-    }
-
-    .user-info {
-      display: flex;
-      flex-direction: column;
-      min-width: 0;
-    }
-
-    .user-name {
-      font-weight: 500;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
-    .user-email {
-      font-size: 0.75rem;
-      color: var(--scion-text-muted, #64748b);
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
-    .user-invited-by {
-      font-size: 0.6875rem;
-      color: var(--scion-text-muted, #64748b);
-      font-style: italic;
-    }
-
-    .role-badge {
-      display: inline-flex;
-      align-items: center;
-      padding: 0.125rem 0.5rem;
-      border-radius: 9999px;
-      font-size: 0.75rem;
-      font-weight: 500;
-    }
-
-    .role-badge.admin {
-      background: var(--sl-color-warning-100, #fef3c7);
-      color: var(--sl-color-warning-700, #a16207);
-    }
-
-    .role-badge.member {
-      background: var(--sl-color-primary-100, #dbeafe);
-      color: var(--sl-color-primary-700, #1d4ed8);
-    }
-
-    .role-badge.viewer {
-      background: var(--scion-bg-subtle, #f1f5f9);
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    .status-badge {
-      display: inline-flex;
-      align-items: center;
-      padding: 0.125rem 0.5rem;
-      border-radius: 9999px;
-      font-size: 0.75rem;
-      font-weight: 500;
-    }
-
-    .status-badge.active {
-      background: var(--sl-color-success-100, #dcfce7);
-      color: var(--sl-color-success-700, #15803d);
-    }
-
-    .status-badge.invited {
-      background: var(--sl-color-primary-100, #dbeafe);
-      color: var(--sl-color-primary-700, #1d4ed8);
-      border: 1px solid var(--sl-color-primary-200, #bfdbfe);
-    }
-
-    .status-badge.suspended {
-      background: var(--sl-color-danger-100, #fee2e2);
-      color: var(--sl-color-danger-700, #b91c1c);
-    }
-
-    .status-cell {
-      display: flex;
-      flex-direction: column;
-      gap: 0.125rem;
-    }
-
-    .status-dot {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.375rem;
-      font-size: 0.8125rem;
-    }
-
-    .status-dot::before {
-      content: '';
-      width: 0.5rem;
-      height: 0.5rem;
-      border-radius: 50%;
-      flex-shrink: 0;
-    }
-
-    .status-dot.active::before {
-      background: var(--sl-color-success-500, #22c55e);
-    }
-
-    .status-dot.suspended::before {
-      background: var(--sl-color-danger-500, #ef4444);
-    }
-
-    .last-seen-text {
-      font-size: 0.6875rem;
-      color: var(--scion-text-muted, #64748b);
-      padding-left: 0.875rem;
-    }
-
-    .meta-text {
-      font-size: 0.8125rem;
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    .role-pending {
-      font-size: 0.75rem;
-      font-style: italic;
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    .invite-role-hint {
-      margin: 0;
-      font-size: 0.8125rem;
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    .id-text {
-      font-family: var(--scion-font-mono, monospace);
-      font-size: 0.75rem;
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    .empty-state {
-      text-align: center;
-      padding: 4rem 2rem;
-      background: var(--scion-surface, #ffffff);
-      border: 1px dashed var(--scion-border, #e2e8f0);
-      border-radius: var(--scion-radius-lg, 0.75rem);
-    }
-
-    .empty-state > sl-icon {
-      font-size: 4rem;
-      color: var(--scion-text-muted, #64748b);
-      opacity: 0.5;
-      margin-bottom: 1rem;
-    }
-
-    .empty-state h2 {
-      font-size: 1.25rem;
-      font-weight: 600;
-      color: var(--scion-text, #1e293b);
-      margin: 0 0 0.5rem 0;
-    }
-
-    .empty-state p {
-      color: var(--scion-text-muted, #64748b);
-      margin: 0;
-    }
-
-    .loading-state {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      padding: 4rem 2rem;
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    .loading-state sl-spinner {
-      font-size: 2rem;
-      margin-bottom: 1rem;
-    }
-
-    .error-state {
-      text-align: center;
-      padding: 3rem 2rem;
-      background: var(--scion-surface, #ffffff);
-      border: 1px solid var(--sl-color-danger-200, #fecaca);
-      border-radius: var(--scion-radius-lg, 0.75rem);
-    }
-
-    .error-state sl-icon {
-      font-size: 3rem;
-      color: var(--sl-color-danger-500, #ef4444);
-      margin-bottom: 1rem;
-    }
-
-    .error-state h2 {
-      font-size: 1.25rem;
-      font-weight: 600;
-      color: var(--scion-text, #1e293b);
-      margin: 0 0 0.5rem 0;
-    }
-
-    .error-state p {
-      color: var(--scion-text-muted, #64748b);
-      margin: 0 0 1rem 0;
-    }
-
-    .error-details {
-      font-family: var(--scion-font-mono, monospace);
-      font-size: 0.875rem;
-      background: var(--scion-bg-subtle, #f1f5f9);
-      padding: 0.75rem 1rem;
-      border-radius: var(--scion-radius, 0.5rem);
-      color: var(--sl-color-danger-700, #b91c1c);
-      margin-bottom: 1rem;
-    }
-
-    .pagination {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0.75rem 1rem;
-      border-top: 1px solid var(--scion-border, #e2e8f0);
-      background: var(--scion-bg-subtle, #f1f5f9);
-    }
-
-    .pagination-info {
-      font-size: 0.8125rem;
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    .pagination-controls {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-    }
-
-    .pagination-controls sl-button::part(base) {
-      font-size: 0.8125rem;
-    }
-
-    .page-indicator {
-      font-size: 0.8125rem;
-      color: var(--scion-text-muted, #64748b);
-      padding: 0 0.5rem;
-    }
-
-    .actions-cell {
-      text-align: right;
-      width: 3rem;
-    }
-
-    sl-dropdown sl-button::part(base) {
-      padding: 0.25rem;
-      min-height: unset;
-    }
-
-    sl-menu-item::part(base) {
-      font-size: 0.8125rem;
-    }
-
-    sl-menu-item sl-icon {
-      font-size: 1rem;
-    }
-
-    .menu-item-danger::part(base) {
-      color: var(--sl-color-danger-600, #dc2626);
-    }
-
-    .menu-item-danger::part(base):hover {
-      background: var(--sl-color-danger-50, #fef2f2);
-    }
-
-    .confirm-body {
-      font-size: 0.875rem;
-      line-height: 1.5;
-      color: var(--scion-text, #1e293b);
-    }
-
-    .confirm-user {
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
-      padding: 0.75rem;
-      margin: 0.75rem 0;
-      background: var(--scion-bg-subtle, #f1f5f9);
-      border-radius: var(--scion-radius, 0.5rem);
-    }
-
-    .feedback-alert {
-      margin-bottom: 1rem;
-    }
-
-    .tabs {
-      display: flex;
-      gap: 0;
-      border-bottom: 1px solid var(--scion-border, #e2e8f0);
-      margin-bottom: 1.5rem;
-    }
-
-    .tab-btn {
-      padding: 0.625rem 1.25rem;
-      font-size: 0.875rem;
-      font-weight: 500;
-      color: var(--scion-text-muted, #64748b);
-      background: none;
-      border: none;
-      border-bottom: 2px solid transparent;
-      cursor: pointer;
-      transition:
-        color 0.15s,
-        border-color 0.15s;
-    }
-
-    .tab-btn:hover {
-      color: var(--scion-text, #1e293b);
-    }
-
-    .tab-btn.active {
-      color: var(--scion-primary, #3b82f6);
-      border-bottom-color: var(--scion-primary, #3b82f6);
-    }
-
-    .users-toolbar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      margin-bottom: 1rem;
-      flex-wrap: wrap;
-      gap: 0.5rem;
-    }
-
-    .users-toolbar-left {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-    }
-
-    .users-toolbar-right {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-    }
-
-    .invite-form {
-      display: flex;
-      flex-direction: column;
-      gap: 1rem;
-    }
-
-    .invite-status {
-      display: inline-flex;
-      align-items: center;
-      padding: 0.125rem 0.5rem;
-      border-radius: 9999px;
-      font-size: 0.75rem;
-      font-weight: 500;
-    }
-
-    .invite-status.active {
-      background: var(--sl-color-success-100, #dcfce7);
-      color: var(--sl-color-success-700, #15803d);
-    }
-
-    .invite-status.expired {
-      background: var(--scion-bg-subtle, #f1f5f9);
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    .invite-status.revoked {
-      background: var(--sl-color-danger-100, #fee2e2);
-      color: var(--sl-color-danger-700, #b91c1c);
-    }
-
-    .invite-status.exhausted {
-      background: var(--sl-color-warning-100, #fef3c7);
-      color: var(--sl-color-warning-700, #a16207);
-    }
-
-    .create-invite-form {
-      display: flex;
-      flex-direction: column;
-      gap: 1rem;
-    }
-
-    .reveal-code {
-      display: flex;
-      flex-direction: column;
-      gap: 1rem;
-    }
-
-    .reveal-code .code-display {
-      font-family: var(--scion-font-mono, monospace);
-      font-size: 0.8125rem;
-      background: var(--scion-bg-subtle, #f1f5f9);
-      padding: 0.75rem 1rem;
-      border-radius: var(--scion-radius, 0.5rem);
-      word-break: break-all;
-      user-select: all;
-    }
-
-    .reveal-code .link-display {
-      font-family: var(--scion-font-mono, monospace);
-      font-size: 0.75rem;
-      background: var(--scion-bg-subtle, #f1f5f9);
-      padding: 0.75rem 1rem;
-      border-radius: var(--scion-radius, 0.5rem);
-      word-break: break-all;
-      user-select: all;
-    }
-
-    .reveal-warning {
-      font-size: 0.8125rem;
-      color: var(--sl-color-warning-700, #a16207);
-      background: var(--sl-color-warning-50, #fffbeb);
-      padding: 0.5rem 0.75rem;
-      border-radius: var(--scion-radius, 0.5rem);
-      border: 1px solid var(--sl-color-warning-200, #fde68a);
-    }
-
-    .invites-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      margin-bottom: 1rem;
-    }
-
-    .invites-header span {
-      font-size: 0.875rem;
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    @media (max-width: 768px) {
-      .hide-mobile {
-        display: none;
+  /** The forced deletion panel, when open. */
+  @state()
+  private deletionPanel: DeletionPanel | null = null;
+
+  /** The next reload of an open deletion panel in state stopping. */
+  private deletionPollTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Counts deletion panel sessions: each open, close and page removal starts a new one. */
+  private deletionPanelSession = 0;
+
+  static override styles = [
+    invitedStatusTagStyles,
+    css`
+      :host {
+        display: block;
       }
-    }
-  `;
+
+      .header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 1.5rem;
+      }
+
+      .header h1 {
+        font-size: 1.5rem;
+        font-weight: 700;
+        color: var(--scion-text, #1e293b);
+        margin: 0;
+      }
+
+      .user-count {
+        font-size: 0.875rem;
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .table-container {
+        background: var(--scion-surface, #ffffff);
+        border: 1px solid var(--scion-border, #e2e8f0);
+        border-radius: var(--scion-radius-lg, 0.75rem);
+        overflow: hidden;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+
+      th {
+        text-align: left;
+        padding: 0.75rem 1rem;
+        font-size: 0.75rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--scion-text-muted, #64748b);
+        background: var(--scion-bg-subtle, #f1f5f9);
+        border-bottom: 1px solid var(--scion-border, #e2e8f0);
+      }
+
+      th.sortable {
+        cursor: pointer;
+        user-select: none;
+      }
+
+      th.sortable:hover {
+        color: var(--scion-text, #1e293b);
+      }
+
+      .sort-indicator {
+        display: inline-block;
+        margin-left: 0.25rem;
+        font-size: 0.625rem;
+        vertical-align: middle;
+        opacity: 0.4;
+      }
+
+      th.sorted .sort-indicator {
+        opacity: 1;
+      }
+
+      td {
+        padding: 0.75rem 1rem;
+        font-size: 0.875rem;
+        color: var(--scion-text, #1e293b);
+        border-bottom: 1px solid var(--scion-border, #e2e8f0);
+        vertical-align: middle;
+      }
+
+      tr:last-child td {
+        border-bottom: none;
+      }
+
+      tr:hover td {
+        background: var(--scion-bg-subtle, #f1f5f9);
+      }
+
+      .user-identity {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+      }
+
+      .user-avatar {
+        width: 2rem;
+        height: 2rem;
+        border-radius: 50%;
+        background: var(--scion-primary, #3b82f6);
+        color: white;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 0.75rem;
+        font-weight: 600;
+        flex-shrink: 0;
+        overflow: hidden;
+      }
+
+      .user-avatar img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+
+      .user-avatar.invited {
+        background: var(--sl-color-primary-200, #bfdbfe);
+        color: var(--sl-color-primary-700, #1d4ed8);
+      }
+
+      .user-info {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+      }
+
+      .user-name {
+        font-weight: 500;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .user-email {
+        font-size: 0.75rem;
+        color: var(--scion-text-muted, #64748b);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .user-invited-by {
+        font-size: 0.6875rem;
+        color: var(--scion-text-muted, #64748b);
+        font-style: italic;
+      }
+
+      .role-badge {
+        display: inline-flex;
+        align-items: center;
+        padding: 0.125rem 0.5rem;
+        border-radius: 9999px;
+        font-size: 0.75rem;
+        font-weight: 500;
+      }
+
+      .role-badge.admin {
+        background: var(--sl-color-warning-100, #fef3c7);
+        color: var(--sl-color-warning-700, #a16207);
+      }
+
+      .role-badge.member {
+        background: var(--sl-color-primary-100, #dbeafe);
+        color: var(--sl-color-primary-700, #1d4ed8);
+      }
+
+      .role-badge.viewer {
+        background: var(--scion-bg-subtle, #f1f5f9);
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .status-badge {
+        display: inline-flex;
+        align-items: center;
+        padding: 0.125rem 0.5rem;
+        border-radius: 9999px;
+        font-size: 0.75rem;
+        font-weight: 500;
+      }
+
+      .status-badge.active {
+        background: var(--sl-color-success-100, #dcfce7);
+        color: var(--sl-color-success-700, #15803d);
+      }
+
+      .status-badge.suspended {
+        background: var(--sl-color-danger-100, #fee2e2);
+        color: var(--sl-color-danger-700, #b91c1c);
+      }
+
+      .status-badge.deleting {
+        background: var(--sl-color-warning-100, #fef3c7);
+        color: var(--sl-color-warning-700, #b45309);
+      }
+
+      .deletion-summary {
+        margin: 0 0 0.75rem;
+      }
+
+      .deletion-agents {
+        margin: 0.25rem 0 0.75rem;
+        padding-left: 1.25rem;
+      }
+
+      .deletion-outcome,
+      .deletion-error {
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .deletion-outcome.failed,
+      .deletion-error.failed {
+        color: var(--sl-color-danger-700, #b91c1c);
+      }
+
+      .status-cell {
+        display: flex;
+        flex-direction: column;
+        gap: 0.125rem;
+      }
+
+      .status-dot {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.375rem;
+        font-size: 0.8125rem;
+      }
+
+      .status-dot::before {
+        content: '';
+        width: 0.5rem;
+        height: 0.5rem;
+        border-radius: 50%;
+        flex-shrink: 0;
+      }
+
+      .status-dot.active::before {
+        background: var(--sl-color-success-500, #22c55e);
+      }
+
+      .status-dot.suspended::before {
+        background: var(--sl-color-danger-500, #ef4444);
+      }
+
+      .last-seen-text {
+        font-size: 0.6875rem;
+        color: var(--scion-text-muted, #64748b);
+        padding-left: 0.875rem;
+      }
+
+      .meta-text {
+        font-size: 0.8125rem;
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .role-pending {
+        font-size: 0.75rem;
+        font-style: italic;
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .invite-role-hint {
+        margin: 0;
+        font-size: 0.8125rem;
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .id-text {
+        font-family: var(--scion-font-mono, monospace);
+        font-size: 0.75rem;
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .empty-state {
+        text-align: center;
+        padding: 4rem 2rem;
+        background: var(--scion-surface, #ffffff);
+        border: 1px dashed var(--scion-border, #e2e8f0);
+        border-radius: var(--scion-radius-lg, 0.75rem);
+      }
+
+      .empty-state > sl-icon {
+        font-size: 4rem;
+        color: var(--scion-text-muted, #64748b);
+        opacity: 0.5;
+        margin-bottom: 1rem;
+      }
+
+      .empty-state h2 {
+        font-size: 1.25rem;
+        font-weight: 600;
+        color: var(--scion-text, #1e293b);
+        margin: 0 0 0.5rem 0;
+      }
+
+      .empty-state p {
+        color: var(--scion-text-muted, #64748b);
+        margin: 0;
+      }
+
+      .loading-state {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        padding: 4rem 2rem;
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .loading-state sl-spinner {
+        font-size: 2rem;
+        margin-bottom: 1rem;
+      }
+
+      .error-state {
+        text-align: center;
+        padding: 3rem 2rem;
+        background: var(--scion-surface, #ffffff);
+        border: 1px solid var(--sl-color-danger-200, #fecaca);
+        border-radius: var(--scion-radius-lg, 0.75rem);
+      }
+
+      .error-state sl-icon {
+        font-size: 3rem;
+        color: var(--sl-color-danger-500, #ef4444);
+        margin-bottom: 1rem;
+      }
+
+      .error-state h2 {
+        font-size: 1.25rem;
+        font-weight: 600;
+        color: var(--scion-text, #1e293b);
+        margin: 0 0 0.5rem 0;
+      }
+
+      .error-state p {
+        color: var(--scion-text-muted, #64748b);
+        margin: 0 0 1rem 0;
+      }
+
+      .error-details {
+        font-family: var(--scion-font-mono, monospace);
+        font-size: 0.875rem;
+        background: var(--scion-bg-subtle, #f1f5f9);
+        padding: 0.75rem 1rem;
+        border-radius: var(--scion-radius, 0.5rem);
+        color: var(--sl-color-danger-700, #b91c1c);
+        margin-bottom: 1rem;
+      }
+
+      .pagination {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0.75rem 1rem;
+        border-top: 1px solid var(--scion-border, #e2e8f0);
+        background: var(--scion-bg-subtle, #f1f5f9);
+      }
+
+      .pagination-info {
+        font-size: 0.8125rem;
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .pagination-controls {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+      }
+
+      .pagination-controls sl-button::part(base) {
+        font-size: 0.8125rem;
+      }
+
+      .page-indicator {
+        font-size: 0.8125rem;
+        color: var(--scion-text-muted, #64748b);
+        padding: 0 0.5rem;
+      }
+
+      .actions-cell {
+        text-align: right;
+        width: 3rem;
+      }
+
+      sl-dropdown sl-button::part(base) {
+        padding: 0.25rem;
+        min-height: unset;
+      }
+
+      sl-menu-item::part(base) {
+        font-size: 0.8125rem;
+      }
+
+      sl-menu-item sl-icon {
+        font-size: 1rem;
+      }
+
+      .menu-item-danger::part(base) {
+        color: var(--sl-color-danger-600, #dc2626);
+      }
+
+      .menu-item-danger::part(base):hover {
+        background: var(--sl-color-danger-50, #fef2f2);
+      }
+
+      .confirm-body {
+        font-size: 0.875rem;
+        line-height: 1.5;
+        color: var(--scion-text, #1e293b);
+      }
+
+      .delete-blockers ul {
+        margin: 0.25rem 0 0.75rem;
+        padding-left: 1.25rem;
+      }
+
+      .delete-blockers-heading {
+        font-weight: 600;
+      }
+
+      .delete-blockers-state,
+      .delete-blockers-more {
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .confirm-user {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 0.75rem;
+        margin: 0.75rem 0;
+        background: var(--scion-bg-subtle, #f1f5f9);
+        border-radius: var(--scion-radius, 0.5rem);
+      }
+
+      .feedback-alert {
+        margin-bottom: 1rem;
+      }
+
+      .tabs {
+        display: flex;
+        gap: 0;
+        border-bottom: 1px solid var(--scion-border, #e2e8f0);
+        margin-bottom: 1.5rem;
+      }
+
+      .tab-btn {
+        padding: 0.625rem 1.25rem;
+        font-size: 0.875rem;
+        font-weight: 500;
+        color: var(--scion-text-muted, #64748b);
+        background: none;
+        border: none;
+        border-bottom: 2px solid transparent;
+        cursor: pointer;
+        transition:
+          color 0.15s,
+          border-color 0.15s;
+      }
+
+      .tab-btn:hover {
+        color: var(--scion-text, #1e293b);
+      }
+
+      .tab-btn.active {
+        color: var(--scion-primary, #3b82f6);
+        border-bottom-color: var(--scion-primary, #3b82f6);
+      }
+
+      .users-toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 1rem;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+      }
+
+      .users-toolbar-left {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+      }
+
+      .users-toolbar-right {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+      }
+
+      .invite-form {
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
+      }
+
+      .invite-status {
+        display: inline-flex;
+        align-items: center;
+        padding: 0.125rem 0.5rem;
+        border-radius: 9999px;
+        font-size: 0.75rem;
+        font-weight: 500;
+      }
+
+      .invite-status.active {
+        background: var(--sl-color-success-100, #dcfce7);
+        color: var(--sl-color-success-700, #15803d);
+      }
+
+      .invite-status.expired {
+        background: var(--scion-bg-subtle, #f1f5f9);
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .invite-status.revoked {
+        background: var(--sl-color-danger-100, #fee2e2);
+        color: var(--sl-color-danger-700, #b91c1c);
+      }
+
+      .invite-status.exhausted {
+        background: var(--sl-color-warning-100, #fef3c7);
+        color: var(--sl-color-warning-700, #a16207);
+      }
+
+      .create-invite-form {
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
+      }
+
+      .reveal-code {
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
+      }
+
+      .reveal-code .code-display {
+        font-family: var(--scion-font-mono, monospace);
+        font-size: 0.8125rem;
+        background: var(--scion-bg-subtle, #f1f5f9);
+        padding: 0.75rem 1rem;
+        border-radius: var(--scion-radius, 0.5rem);
+        word-break: break-all;
+        user-select: all;
+      }
+
+      .reveal-code .link-display {
+        font-family: var(--scion-font-mono, monospace);
+        font-size: 0.75rem;
+        background: var(--scion-bg-subtle, #f1f5f9);
+        padding: 0.75rem 1rem;
+        border-radius: var(--scion-radius, 0.5rem);
+        word-break: break-all;
+        user-select: all;
+      }
+
+      .reveal-warning {
+        font-size: 0.8125rem;
+        color: var(--sl-color-warning-700, #a16207);
+        background: var(--sl-color-warning-50, #fffbeb);
+        padding: 0.5rem 0.75rem;
+        border-radius: var(--scion-radius, 0.5rem);
+        border: 1px solid var(--sl-color-warning-200, #fde68a);
+      }
+
+      .invites-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 1rem;
+      }
+
+      .invites-header span {
+        font-size: 0.875rem;
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .roles-dialog sl-tab-group {
+        --indicator-color: var(--scion-primary, #3b82f6);
+      }
+
+      .roles-dialog sl-tab-group::part(body) {
+        padding-top: 1rem;
+      }
+
+      @media (max-width: 768px) {
+        .hide-mobile {
+          display: none;
+        }
+      }
+    `,
+  ];
 
   override connectedCallback(): void {
     super.connectedCallback();
     void this.loadCurrentUser();
     void this.loadUsers();
+  }
+
+  override disconnectedCallback(): void {
+    super.disconnectedCallback();
+    // Ends the panel session too, so a request in flight that answers
+    // after the page is removed neither changes the panel nor polls again.
+    this.closeDeletionPanel();
   }
 
   private async loadCurrentUser(): Promise<void> {
@@ -819,6 +1076,12 @@ export class ScionPageAdminUsers extends LitElement {
       }
     } catch {
       // Non-critical — actions will still work, just can't prevent self-actions
+    }
+    try {
+      const status = await loadAdminStatus(stateManager.getCurrentUserId() || this.currentUserId);
+      this.canReadRoleBindings = hasAnyPermission(status, ['role_binding.read']);
+    } catch {
+      this.canReadRoleBindings = false;
     }
   }
 
@@ -940,7 +1203,7 @@ export class ScionPageAdminUsers extends LitElement {
   private async deleteUser(
     userId: string,
     userLabel?: string
-  ): Promise<{ securityReview: boolean }> {
+  ): Promise<{ securityReview: boolean; blockers?: UserDeleteBlockers; inProgress?: boolean }> {
     const response = await apiFetch(`/api/v1/users/${userId}`, {
       method: 'DELETE',
     });
@@ -948,6 +1211,15 @@ export class ScionPageAdminUsers extends LitElement {
       const errorBody = (await response.json().catch(() => null)) as Record<string, unknown> | null;
       if (errorBody) {
         const label = userLabel ?? userId;
+
+        const apiError = errorBody.error as Record<string, unknown> | undefined;
+        if (response.status === 409 && apiError?.code === 'user_delete_blocked') {
+          const blockers = parseUserDeleteBlockers(apiError.details);
+          if (blockers) return { securityReview: false, blockers };
+        }
+        if (response.status === 409 && apiError?.code === 'user_deletion_in_progress') {
+          return { securityReview: false, inProgress: true };
+        }
 
         const lockout = parseLockoutResponse(errorBody);
         if (lockout) {
@@ -1097,7 +1369,7 @@ export class ScionPageAdminUsers extends LitElement {
       user.status === 'invited'
         ? 'This will remove the invitation. The user will no longer be able to sign in.'
         : 'This action is permanent and cannot be undone. All data associated with this user will be removed.';
-    this.confirmAction = {
+    const confirm: ConfirmAction = {
       title: label,
       message,
       variant: 'danger',
@@ -1105,6 +1377,14 @@ export class ScionPageAdminUsers extends LitElement {
       user,
       action: async () => {
         const result = await this.deleteUser(user.id, user.displayName || user.email);
+        if (result.blockers) {
+          this.confirmAction = { ...confirm, blockers: result.blockers };
+          return;
+        }
+        if (result.inProgress) {
+          void this.openDeletionPanel(user);
+          return;
+        }
         if (result.securityReview) return;
         this.showFeedback(
           'success',
@@ -1115,18 +1395,277 @@ export class ScionPageAdminUsers extends LitElement {
         );
       },
     };
+    this.confirmAction = confirm;
+    void this.loadDeleteBlockers(confirm);
+  }
+
+  /** Whether the hub offers the forced delete (presentation only). */
+  private forceDeleteEnabled(): boolean {
+    return isFeatureEnabled(USER_DELETE_FORCE_CASCADE_FLAG);
+  }
+
+  /** Whether the hub offers the Effective permissions tab (presentation only). */
+  private effectivePermissionsEnabled(): boolean {
+    return isFeatureEnabled(EFFECTIVE_PERMISSIONS_FLAG);
+  }
+
+  /**
+   * Sends DELETE /api/v1/users/{id}?force=true. Returns the deletion in
+   * progress (202), or null when the user was deleted at once (204).
+   * Throws with the hub's message otherwise; a 403
+   * user_delete_force_forbidden names the agents the caller may not delete,
+   * by slug when slugs knows it. The caller shows the error inline, so the
+   * global access-denied toast is suppressed.
+   */
+  private async requestForceDelete(
+    user: AdminUser,
+    slugs?: Map<string, string>
+  ): Promise<UserDeletion | null> {
+    const response = await apiFetch(`/api/v1/users/${user.id}?force=true`, {
+      method: 'DELETE',
+      suppressAccessDeniedToast: true,
+    });
+    if (response.status === 204) return null;
+    const body = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+    if (response.ok) {
+      const deletion = parseUserDeletion(body);
+      if (!deletion) throw new Error('Unexpected response to the force delete');
+      return deletion;
+    }
+    const apiError = (body?.error ?? {}) as Record<string, unknown>;
+    if (apiError.code === 'user_delete_force_forbidden') {
+      const details = (apiError.details ?? {}) as Record<string, unknown>;
+      const names = (Array.isArray(details.agents) ? details.agents : [])
+        .map((a) => ((a ?? {}) as Record<string, unknown>).id)
+        .filter((id): id is string => typeof id === 'string')
+        .map((id) => slugs?.get(id) || id);
+      const list = names.length ? `: ${names.join(', ')}` : '';
+      throw new Error(`You may not delete some of this user's agents${list}.`);
+    }
+    const msg = typeof apiError.message === 'string' ? apiError.message : undefined;
+    throw new Error(msg ?? `HTTP ${response.status}`);
+  }
+
+  /** Reloads the users list at the current page. */
+  private reloadUsersPage(): void {
+    void this.loadUsers(
+      this.currentPage > 1 ? this.cursorHistory[this.cursorHistory.length - 1] : undefined
+    );
+  }
+
+  /**
+   * The Force delete button of the delete dialog: the first click asks for
+   * confirmation, naming how many agents are stopped; the second runs the
+   * forced delete.
+   */
+  private onForceDeleteClick(): void {
+    const current = this.confirmAction;
+    if (!current) return;
+    if (!current.forceConfirm) {
+      this.confirmAction = { ...current, forceConfirm: true };
+      return;
+    }
+    void this.executeForceDelete();
+  }
+
+  /** Runs the forced delete from the delete dialog. */
+  private async executeForceDelete(): Promise<void> {
+    const current = this.confirmAction;
+    if (!current) return;
+    const user = current.user;
+    const label = user.displayName || user.email;
+    const slugs = new Map<string, string>(
+      (current.blockers?.agents ?? []).map((a): [string, string] => [a.id, a.slug])
+    );
+    this.actionInProgress = true;
+    let failed = false;
+    try {
+      const deletion = await this.requestForceDelete(user, slugs);
+      if (this.confirmAction === current) this.confirmAction = null;
+      if (deletion) {
+        this.showDeletionPanel({ user, deletion, loading: false, error: null });
+        this.scheduleDeletionPoll();
+        this.showFeedback('primary', `Deleting ${label}: stopping the user's agents.`);
+      } else {
+        this.showFeedback('success', `${label} has been deleted.`);
+      }
+      this.reloadUsersPage();
+    } catch (err) {
+      failed = true;
+      this.showFeedback('danger', err instanceof Error ? err.message : 'Force delete failed');
+    } finally {
+      this.actionInProgress = false;
+    }
+    if (failed && this.confirmAction === current) {
+      // The confirmation named the agents as they were; ask again, with
+      // the blockers reloaded, before another force request.
+      const reset: ConfirmAction = { ...current, forceConfirm: false };
+      this.confirmAction = reset;
+      void this.loadDeleteBlockers(reset);
+    }
+  }
+
+  /**
+   * Shows a deletion panel, starting a new panel session: a request of an
+   * earlier session that answers late changes nothing.
+   */
+  private showDeletionPanel(panel: DeletionPanel): void {
+    this.stopDeletionPoll();
+    this.deletionPanelSession += 1;
+    this.deletionPanel = panel;
+  }
+
+  /**
+   * Whether the panel of session is the one shown on a connected page. Every
+   * step that resumes after a request checks it before changing the panel
+   * or arming the poll.
+   */
+  private deletionPanelCurrent(session: number): boolean {
+    return this.isConnected && this.deletionPanel !== null && this.deletionPanelSession === session;
+  }
+
+  /** Opens the deletion panel of a user and loads its deletion. */
+  private async openDeletionPanel(user: AdminUser): Promise<void> {
+    this.showDeletionPanel({ user, deletion: null, loading: true, error: null });
+    await this.refreshDeletionPanel();
+  }
+
+  /** Closes the deletion panel and stops reloading it. */
+  private closeDeletionPanel(): void {
+    this.stopDeletionPoll();
+    this.deletionPanelSession += 1;
+    this.deletionPanel = null;
+  }
+
+  private stopDeletionPoll(): void {
+    if (this.deletionPollTimer !== null) {
+      clearTimeout(this.deletionPollTimer);
+      this.deletionPollTimer = null;
+    }
+  }
+
+  /**
+   * Reloads the open panel after DELETION_POLL_INTERVAL_MS while its
+   * deletion is stopping. Stops on a terminal state, when the panel closes
+   * and when the page is removed.
+   */
+  private scheduleDeletionPoll(): void {
+    this.stopDeletionPoll();
+    const session = this.deletionPanelSession;
+    if (!this.deletionPanelCurrent(session)) return;
+    if (this.deletionPanel?.deletion?.state !== 'stopping') return;
+    this.deletionPollTimer = setTimeout(() => {
+      this.deletionPollTimer = null;
+      if (this.deletionPanelCurrent(session)) void this.refreshDeletionPanel(true);
+    }, DELETION_POLL_INTERVAL_MS);
+  }
+
+  /**
+   * Reloads the open deletion panel from GET /api/v1/users/{id}/deletion.
+   * quiet (a poll) keeps the buttons as they are. When the deletion turns
+   * completed, the users list is reloaded. A failed load shows the error
+   * and stops the poll; Refresh tries again and resumes it.
+   */
+  private async refreshDeletionPanel(quiet = false): Promise<void> {
+    const panel = this.deletionPanel;
+    if (!panel) return;
+    const session = this.deletionPanelSession;
+    if (!quiet) this.deletionPanel = { ...panel, loading: true, error: null };
+    let next: DeletionPanel;
+    let loaded = false;
+    try {
+      const res = await apiFetch(`/api/v1/users/${panel.user.id}/deletion`, {
+        suppressAccessDeniedToast: true,
+      });
+      const body: unknown = await res.json().catch(() => null);
+      const deletion = res.ok ? parseUserDeletion(body) : null;
+      loaded = deletion !== null;
+      next = deletion
+        ? { ...panel, deletion, loading: false, error: null }
+        : { ...panel, loading: false, error: DELETION_STATUS_UNAVAILABLE };
+    } catch {
+      next = { ...panel, loading: false, error: DELETION_STATUS_UNAVAILABLE };
+    }
+    if (!this.deletionPanelCurrent(session)) return;
+    this.deletionPanel = next;
+    if (panel.deletion?.state !== 'completed' && next.deletion?.state === 'completed') {
+      this.reloadUsersPage();
+    }
+    if (loaded) {
+      this.scheduleDeletionPoll();
+    } else {
+      this.stopDeletionPoll();
+    }
+  }
+
+  /**
+   * Asks the hub to retry the deletion: a repeated force request joins
+   * the deletion in progress and retries its agents. A 204, or an error
+   * (a deletion that completed since the panel loaded answers 404), is
+   * followed by a reload of the panel, which then shows what the hub
+   * reports; the error stays shown unless the deletion is completed.
+   */
+  private async retryDeletion(): Promise<void> {
+    const panel = this.deletionPanel;
+    if (!panel) return;
+    const session = this.deletionPanelSession;
+    this.deletionPanel = { ...panel, loading: true, error: null };
+    const slugs = new Map<string, string>(
+      (panel.deletion?.agents ?? []).map((a): [string, string] => [a.id, a.slug])
+    );
+    let retryError: string | null = null;
+    try {
+      const deletion = await this.requestForceDelete(panel.user, slugs);
+      if (!this.deletionPanelCurrent(session)) return;
+      if (deletion) {
+        this.deletionPanel = { ...panel, deletion, loading: false, error: null };
+        this.scheduleDeletionPoll();
+        return;
+      }
+    } catch (err) {
+      retryError = err instanceof Error ? err.message : 'Retry failed';
+    }
+    if (!this.deletionPanelCurrent(session)) return;
+    await this.refreshDeletionPanel(true);
+    const latest = this.deletionPanel;
+    if (
+      retryError &&
+      latest &&
+      this.deletionPanelCurrent(session) &&
+      latest.deletion?.state !== 'completed'
+    ) {
+      this.deletionPanel = { ...latest, error: retryError };
+    }
+  }
+
+  /**
+   * Fetches what blocks deleting the dialog's user and shows it in the
+   * dialog, if that same dialog is open. A failed lookup shows nothing:
+   * the delete itself refuses and lists the blockers.
+   */
+  private async loadDeleteBlockers(confirm: ConfirmAction): Promise<void> {
+    let blockers: UserDeleteBlockers | null = null;
+    try {
+      const res = await apiFetch(`/api/v1/users/${confirm.user.id}/delete-blockers`);
+      if (res.ok) blockers = parseUserDeleteBlockers(await res.json());
+    } catch {
+      blockers = null;
+    }
+    if (!blockers || this.confirmAction !== confirm || this.actionInProgress) return;
+    this.confirmAction = { ...confirm, blockers };
   }
 
   private async executeConfirmedAction(): Promise<void> {
-    if (!this.confirmAction) return;
+    const current = this.confirmAction;
+    if (!current) return;
     this.actionInProgress = true;
     try {
-      await this.confirmAction.action();
+      await current.action();
     } catch (err) {
       this.showFeedback('danger', err instanceof Error ? err.message : 'Action failed');
     } finally {
       this.actionInProgress = false;
-      this.confirmAction = null;
+      if (this.confirmAction === current) this.confirmAction = null;
     }
   }
 
@@ -1516,24 +2055,34 @@ export class ScionPageAdminUsers extends LitElement {
 
   private async copyInviteLink(): Promise<void> {
     if (!this.createdInviteResult) return;
-    try {
-      await navigator.clipboard.writeText(this.createdInviteResult.inviteUrl);
-      this.inviteCopied = true;
-      setTimeout(() => {
-        this.inviteCopied = false;
-      }, 2000);
-    } catch {
-      const input = document.createElement('input');
-      input.value = this.createdInviteResult.inviteUrl;
-      document.body.appendChild(input);
-      input.select();
-      document.execCommand('copy');
-      document.body.removeChild(input);
-      this.inviteCopied = true;
-      setTimeout(() => {
-        this.inviteCopied = false;
-      }, 2000);
+    const url = this.createdInviteResult.inviteUrl;
+    if (!(await copyToClipboard(url)) && !this.copyViaSelection(url)) {
+      showCopyFailedToast();
+      return;
     }
+    this.inviteCopied = true;
+    setTimeout(() => {
+      this.inviteCopied = false;
+    }, 2000);
+  }
+
+  /**
+   * Fallback copy through a temporary input and execCommand, for browsers
+   * without the Clipboard API. Returns whether the browser reported a copy.
+   */
+  private copyViaSelection(text: string): boolean {
+    const input = document.createElement('input');
+    input.value = text;
+    document.body.appendChild(input);
+    input.select();
+    let ok: boolean;
+    try {
+      ok = typeof document.execCommand === 'function' && document.execCommand('copy');
+    } catch {
+      ok = false;
+    }
+    document.body.removeChild(input);
+    return ok;
   }
 
   // ==================== Render Methods ====================
@@ -1579,9 +2128,9 @@ export class ScionPageAdminUsers extends LitElement {
             ? this.renderError()
             : this.renderUsers()
         : this.renderInvitesTab()}
-      ${this.renderConfirmDialog()} ${this.renderInviteUserDialog()} ${this.renderImportDialog()}
-      ${this.renderCreateInviteDialog()} ${this.renderInviteRevealDialog()}
-      ${this.renderViewRolesDialog()}
+      ${this.renderConfirmDialog()} ${this.renderDeletionPanel()} ${this.renderInviteUserDialog()}
+      ${this.renderImportDialog()} ${this.renderCreateInviteDialog()}
+      ${this.renderInviteRevealDialog()} ${this.renderViewRolesDialog()}
       <scion-security-review-dialog
         ?open=${this.showSecurityReview}
         .detail=${this.securityReviewDetail}
@@ -1855,45 +2404,104 @@ export class ScionPageAdminUsers extends LitElement {
         <td class="hide-mobile">
           <span class="meta-text">${this.formatRelativeTime(user.created)}</span>
         </td>
-        <td class="actions-cell">${self ? nothing : this.renderUserActions(user)}</td>
+        <td class="actions-cell">${this.renderUserActions(user, self)}</td>
       </tr>
     `;
   }
 
-  private renderUserActions(user: AdminUser) {
+  private renderRolesMenuItem(user: AdminUser) {
+    return html`
+      <sl-menu-item
+        @click=${() => {
+          this.viewRolesActiveTab = 'roles';
+          this.viewRolesUser = user;
+        }}
+      >
+        <sl-icon slot="prefix" name="shield"></sl-icon>
+        Roles
+      </sl-menu-item>
+    `;
+  }
+
+  private renderUserActions(user: AdminUser, self = false) {
+    const canViewRoles = this.canReadRoleBindings;
+
+    if (self) {
+      if (!canViewRoles) return nothing;
+      return html`
+        <sl-dropdown placement="bottom-end" hoist>
+          <sl-button slot="trigger" size="small" variant="text" caret>
+            <sl-icon name="three-dots-vertical"></sl-icon>
+          </sl-button>
+          <sl-menu> ${this.renderRolesMenuItem(user)} </sl-menu>
+        </sl-dropdown>
+      `;
+    }
+
     const caps = user._capabilities;
     const canPromote = can(caps, 'promote');
     const canSuspend = can(caps, 'suspend');
     const canDelete = can(caps, 'delete');
 
     if (user.status === 'invited') {
-      // Invited users: only Remove action (requires delete capability). No
-      // Change role: the role is assigned at first sign-in (PATCH role → 409).
-      if (!canDelete) return nothing;
+      // Invited users: Roles (when role_binding.read) and Remove (requires delete
+      // capability). No Change role: the role is assigned at first sign-in (PATCH role → 409).
+      if (!canViewRoles && !canDelete) return nothing;
       return html`
         <sl-dropdown placement="bottom-end" hoist>
           <sl-button slot="trigger" size="small" variant="text" caret>
             <sl-icon name="three-dots-vertical"></sl-icon>
           </sl-button>
           <sl-menu>
-            <sl-menu-item class="menu-item-danger" @click=${() => this.promptDelete(user)}>
-              <sl-icon slot="prefix" name="trash"></sl-icon>
-              Remove
-            </sl-menu-item>
+            ${canViewRoles ? this.renderRolesMenuItem(user) : nothing}
+            ${canViewRoles && canDelete ? html`<sl-divider></sl-divider>` : nothing}
+            ${canDelete
+              ? html`<sl-menu-item class="menu-item-danger" @click=${() => this.promptDelete(user)}>
+                  <sl-icon slot="prefix" name="trash"></sl-icon>
+                  Remove
+                </sl-menu-item>`
+              : nothing}
+          </sl-menu>
+        </sl-dropdown>
+      `;
+    }
+
+    if (user.status === 'deleting') {
+      // A forced deletion is in progress: Roles (when role_binding.read) and deletion status (requires delete).
+      if (!canViewRoles && !canDelete) return nothing;
+      return html`
+        <sl-dropdown placement="bottom-end" hoist>
+          <sl-button slot="trigger" size="small" variant="text" caret>
+            <sl-icon name="three-dots-vertical"></sl-icon>
+          </sl-button>
+          <sl-menu>
+            ${canViewRoles ? this.renderRolesMenuItem(user) : nothing}
+            ${canViewRoles && canDelete ? html`<sl-divider></sl-divider>` : nothing}
+            ${canDelete
+              ? html`<sl-menu-item
+                  class="menu-item-deletion"
+                  @click=${() => void this.openDeletionPanel(user)}
+                >
+                  <sl-icon slot="prefix" name="hourglass-split"></sl-icon>
+                  Deletion status
+                </sl-menu-item>`
+              : nothing}
           </sl-menu>
         </sl-dropdown>
       `;
     }
 
     if (user.status === 'suspended') {
-      // Suspended users: Reactivate (requires suspend), Delete (requires delete)
-      if (!canSuspend && !canDelete) return nothing;
+      // Suspended users: Roles (when role_binding.read), Reactivate (requires suspend), Delete (requires delete)
+      if (!canViewRoles && !canSuspend && !canDelete) return nothing;
       return html`
         <sl-dropdown placement="bottom-end" hoist>
           <sl-button slot="trigger" size="small" variant="text" caret>
             <sl-icon name="three-dots-vertical"></sl-icon>
           </sl-button>
           <sl-menu>
+            ${canViewRoles ? this.renderRolesMenuItem(user) : nothing}
+            ${canViewRoles && (canSuspend || canDelete) ? html`<sl-divider></sl-divider>` : nothing}
             ${canSuspend
               ? html`<sl-menu-item @click=${() => this.promptToggleSuspend(user)}>
                   <sl-icon slot="prefix" name="check-circle"></sl-icon>
@@ -1912,28 +2520,18 @@ export class ScionPageAdminUsers extends LitElement {
       `;
     }
 
-    // Active users: View Roles, Change role, Suspend, Delete
-    // — each action gated by its capability. View Roles requires at least
-    // one admin-level capability since the role-bindings endpoint requires
-    // admin access (R4-R1: don't show dead controls to regular members).
-    const canUpdate = can(caps, 'update');
-    const hasAnyAdminAction = canPromote || canSuspend || canDelete || canUpdate;
-    if (!hasAnyAdminAction) return nothing;
+    // Active users: Roles (gated on role_binding.read independently of user.*),
+    // Change role, Suspend, Delete — each gated by its capability.
+    const hasOtherActions = canPromote || canSuspend || canDelete;
+    if (!canViewRoles && !hasOtherActions) return nothing;
     return html`
       <sl-dropdown placement="bottom-end" hoist>
         <sl-button slot="trigger" size="small" variant="text" caret>
           <sl-icon name="three-dots-vertical"></sl-icon>
         </sl-button>
         <sl-menu>
-          <sl-menu-item
-            @click=${() => {
-              this.viewRolesUser = user;
-            }}
-          >
-            <sl-icon slot="prefix" name="shield"></sl-icon>
-            View Roles
-          </sl-menu-item>
-          ${canPromote || canSuspend || canDelete ? html`<sl-divider></sl-divider>` : nothing}
+          ${canViewRoles ? this.renderRolesMenuItem(user) : nothing}
+          ${canViewRoles && hasOtherActions ? html`<sl-divider></sl-divider>` : nothing}
           ${canPromote ? this.renderChangeRoleMenu(user) : nothing}
           ${canSuspend
             ? html`${canPromote ? html`<sl-divider></sl-divider>` : nothing}
@@ -1961,6 +2559,11 @@ export class ScionPageAdminUsers extends LitElement {
   private renderConfirmDialog() {
     const action = this.confirmAction;
     if (!action) return nothing;
+    const forceLabel = action.forceConfirm
+      ? forceDeleteConfirmLabel(action.blockers)
+      : 'Force delete';
+    const forceAgents = action.blockers?.agents.length ?? 0;
+    const userLabel = action.user.displayName || action.user.email;
     return html`
       <sl-dialog
         label=${action.title}
@@ -1988,7 +2591,15 @@ export class ScionPageAdminUsers extends LitElement {
               <span class="user-email">${action.user.email}</span>
             </div>
           </div>
-          <p>${action.message}</p>
+          ${hasDeleteBlockers(action.blockers)
+            ? this.renderDeleteBlockers(action.blockers)
+            : html`<p>${action.message}</p>`}
+          ${action.forceConfirm
+            ? html`<sl-alert class="force-delete-confirm" variant="danger" open>
+                Force delete ends the access of ${userLabel} at once, stops ${forceAgents} of their
+                agents, then deletes the user. This cannot be undone.
+              </sl-alert>`
+            : nothing}
         </div>
         <sl-button
           slot="footer"
@@ -1999,14 +2610,181 @@ export class ScionPageAdminUsers extends LitElement {
           }}
           >Cancel</sl-button
         >
+        ${hasDeleteBlockers(action.blockers) && this.forceDeleteEnabled()
+          ? html`<sl-button
+              slot="footer"
+              class="force-delete-button"
+              variant="danger"
+              ?outline=${!action.forceConfirm}
+              ?loading=${this.actionInProgress}
+              @click=${() => this.onForceDeleteClick()}
+              >${forceLabel}</sl-button
+            >`
+          : nothing}
         <sl-button
           slot="footer"
           variant=${action.variant}
           ?loading=${this.actionInProgress}
+          ?disabled=${hasDeleteBlockers(action.blockers)}
           @click=${() => this.executeConfirmedAction()}
           >${action.confirmLabel}</sl-button
         >
       </sl-dialog>
+    `;
+  }
+
+  /** The forced deletion panel: state, counts and each agent's outcome. */
+  private renderDeletionPanel() {
+    const panel = this.deletionPanel;
+    if (!panel) return nothing;
+    const d = panel.deletion;
+    const stopping = d?.state === 'stopping';
+    return html`
+      <sl-dialog
+        label="User deletion"
+        class="deletion-panel"
+        open
+        @sl-request-close=${() => {
+          this.closeDeletionPanel();
+        }}
+      >
+        <div class="confirm-body">
+          <div class="user-info">
+            <span class="user-name">${panel.user.displayName || panel.user.email}</span>
+            <span class="user-email">${panel.user.email}</span>
+          </div>
+          ${panel.error
+            ? html`<p class="deletion-error failed" role="alert">${panel.error}</p>`
+            : nothing}
+          ${d
+            ? html`
+                <p class="deletion-summary">
+                  ${stopping
+                    ? 'Deleting: the user cannot sign in, and is removed once every agent below has stopped or been removed.'
+                    : 'Deleted.'}
+                </p>
+                <p class="deletion-counts">
+                  Stopped ${d.counts.stopped} · Removed (stop not confirmed) ${d.counts.removed} ·
+                  Failed ${d.counts.failed} · Stopping ${d.counts.stopping} · Waiting
+                  ${d.counts.pending}
+                </p>
+                ${d.lastError
+                  ? html`<p class="deletion-error failed" role="alert">${d.lastError}</p>`
+                  : nothing}
+                ${d.agents.length > 0
+                  ? html`<ul class="deletion-agents">
+                      ${d.agents.map(
+                        (a) => html`
+                          <li>
+                            <a href="/agents/${a.id}">${a.slug || a.id}</a>
+                            <span class="deletion-outcome ${a.outcome}"
+                              >${USER_DELETION_OUTCOME_LABELS[a.outcome] ?? a.outcome}</span
+                            >
+                            ${a.lastError
+                              ? html`<span class="deletion-error ${a.outcome}"
+                                  >— ${a.lastError}</span
+                                >`
+                              : nothing}
+                          </li>
+                        `
+                      )}
+                    </ul>`
+                  : nothing}
+                ${stopping && d.counts.failed > 0
+                  ? html`<p class="deletion-help">
+                      An agent whose Runtime Broker is gone stays failed until you delete it with
+                      force from its page; it is then reported as removed.
+                    </p>`
+                  : nothing}
+              `
+            : nothing}
+        </div>
+        <sl-button
+          slot="footer"
+          variant="default"
+          @click=${() => {
+            this.closeDeletionPanel();
+          }}
+          >Close</sl-button
+        >
+        <sl-button
+          slot="footer"
+          variant="default"
+          ?loading=${panel.loading}
+          @click=${() => void this.refreshDeletionPanel()}
+          >Refresh</sl-button
+        >
+        ${stopping
+          ? html`<sl-button
+              slot="footer"
+              class="retry-deletion-button"
+              variant="primary"
+              ?loading=${panel.loading}
+              @click=${() => void this.retryDeletion()}
+            >
+              <sl-icon slot="prefix" name="arrow-clockwise"></sl-icon>
+              Retry
+            </sl-button>`
+          : nothing}
+      </sl-dialog>
+    `;
+  }
+
+  /** Lists what blocks a user delete inside the confirm dialog. */
+  private renderDeleteBlockers(blockers: UserDeleteBlockers): TemplateResult {
+    return html`
+      <div class="delete-blockers">
+        <p>
+          This user cannot be deleted while these exist. Delete these agents first, including agents
+          started by them; the user's delegations end with them.
+        </p>
+        ${this.forceDeleteEnabled()
+          ? html`<p class="force-delete-help">
+              Force delete ends this user's access at once (sign-in, roles, tokens, delegations),
+              stops these agents, and removes the user once every agent has stopped. It needs
+              permission to delete each of these agents.
+            </p>`
+          : nothing}
+        ${blockers.agents.length > 0
+          ? html`
+              <div class="delete-blockers-heading">Agents</div>
+              <ul class="delete-blockers-agents">
+                ${blockers.agents.map(
+                  (a) => html`
+                    <li>
+                      <a href="/agents/${a.id}">${a.slug || a.id}</a>
+                      ${a.deletionState
+                        ? html`<span class="delete-blockers-state"
+                            >(delete ${a.deletionState})</span
+                          >`
+                        : nothing}
+                    </li>
+                  `
+                )}
+              </ul>
+            `
+          : nothing}
+        ${blockers.edges.length > 0
+          ? html`
+              <div class="delete-blockers-heading">Active delegations</div>
+              <ul class="delete-blockers-edges">
+                ${blockers.edges.map(
+                  (e) => html`
+                    <li>
+                      ${e.delegateType === 'agent'
+                        ? html`to agent <a href="/agents/${e.delegateId}">${e.delegateId}</a>`
+                        : html`to ${e.delegateType} ${e.delegateId}`}
+                      ${e.scopeId ? html`in ${e.scopeType} ${e.scopeId}` : nothing}
+                    </li>
+                  `
+                )}
+              </ul>
+            `
+          : nothing}
+        ${blockers.truncated
+          ? html`<p class="delete-blockers-more">More are not shown.</p>`
+          : nothing}
+      </div>
     `;
   }
 
@@ -2323,29 +3101,99 @@ export class ScionPageAdminUsers extends LitElement {
   private renderViewRolesDialog() {
     if (!this.viewRolesUser) return nothing;
     const user = this.viewRolesUser;
+    const showEffectivePermissions = this.effectivePermissionsEnabled();
     return html`
       <sl-dialog
-        label="Effective Roles — ${user.displayName || user.email}"
+        class="roles-dialog"
+        label="Roles — ${user.displayName || user.email}"
         open
-        style="--width: 36rem;"
-        @sl-request-close=${() => {
+        style="--width: 48rem;"
+        @sl-request-close=${(e: Event) => {
+          if (e.target !== e.currentTarget) return;
           this.viewRolesUser = null;
+          this.viewRolesActiveTab = 'roles';
         }}
       >
-        <scion-effective-role-provenance
-          principalType="user"
-          principalId=${user.id}
-          sectionTitle="Effective Roles"
-        ></scion-effective-role-provenance>
-        <scion-effective-access-boundary-notice
-          contextType="user"
-          contextId=${user.id}
-        ></scion-effective-access-boundary-notice>
+        ${showEffectivePermissions
+          ? html`
+              <sl-tab-group
+                @sl-tab-show=${(e: CustomEvent<{ name: string }>) => {
+                  const name = e.detail?.name;
+                  if (name === 'roles' || name === 'permissions') {
+                    this.viewRolesActiveTab = name;
+                  }
+                }}
+              >
+                <sl-tab
+                  slot="nav"
+                  panel="roles"
+                  ?active=${this.viewRolesActiveTab === 'roles'}
+                  @click=${() => {
+                    this.viewRolesActiveTab = 'roles';
+                  }}
+                >
+                  Effective roles
+                </sl-tab>
+                <sl-tab
+                  slot="nav"
+                  panel="permissions"
+                  ?active=${this.viewRolesActiveTab === 'permissions'}
+                  @click=${() => {
+                    this.viewRolesActiveTab = 'permissions';
+                  }}
+                >
+                  Effective permissions
+                </sl-tab>
+
+                <sl-tab-panel name="roles" ?active=${this.viewRolesActiveTab === 'roles'}>
+                  <scion-effective-role-provenance
+                    principalType="user"
+                    principalId=${user.id}
+                    sectionTitle="Effective Roles"
+                    @role-bindings-changed=${(e: Event) => {
+                      if (e.target !== e.currentTarget) return;
+                      this.shadowRoot
+                        ?.querySelector<ScionEffectivePermissionsView>(
+                          'scion-effective-permissions-view'
+                        )
+                        ?.invalidate();
+                    }}
+                  ></scion-effective-role-provenance>
+                  <scion-effective-access-boundary-notice
+                    contextType="user"
+                    contextId=${user.id}
+                  ></scion-effective-access-boundary-notice>
+                </sl-tab-panel>
+
+                <sl-tab-panel
+                  name="permissions"
+                  ?active=${this.viewRolesActiveTab === 'permissions'}
+                >
+                  <scion-effective-permissions-view
+                    principalType="user"
+                    principalId=${user.id}
+                    ?active=${this.viewRolesActiveTab === 'permissions'}
+                  ></scion-effective-permissions-view>
+                </sl-tab-panel>
+              </sl-tab-group>
+            `
+          : html`
+              <scion-effective-role-provenance
+                principalType="user"
+                principalId=${user.id}
+                sectionTitle="Effective Roles"
+              ></scion-effective-role-provenance>
+              <scion-effective-access-boundary-notice
+                contextType="user"
+                contextId=${user.id}
+              ></scion-effective-access-boundary-notice>
+            `}
         <sl-button
           slot="footer"
           variant="default"
           @click=${() => {
             this.viewRolesUser = null;
+            this.viewRolesActiveTab = 'roles';
           }}
           >Close</sl-button
         >

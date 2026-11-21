@@ -46,6 +46,8 @@
 # Usage: verify-base-contract.sh
 #   GO_MIN_VERSION   minimum acceptable Go (default 1.26.1; see go.mod)
 #   NODE_MIN_VERSION minimum acceptable Node major (default 24)
+#   HELM_VERSION     exact helm version the build pinned (unset: presence and
+#                    a working binary are checked, the version is not)
 #   TARGETARCH       BuildKit automatic arg — the arch being built (e.g. arm64)
 #   BUILDARCH        BuildKit automatic arg — the arch doing the building
 #
@@ -442,6 +444,147 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Playwright WebKit/Firefox system libraries — installed by
+# install-core-toolchain.sh playwright-deps on the suites it has a list for
+# (keyed on ID/VERSION_ID; keep this case in step with playwright_deps_for_os).
+# Three sentinels, one per heavy group, catch the step being dropped; the full
+# list is not re-checked here.
+# ---------------------------------------------------------------------------
+# shellcheck source=/dev/null
+pw_os="$(. /etc/os-release 2>/dev/null && printf '%s%s' "${ID:-}" "${VERSION_ID:-}")"
+case "$pw_os" in
+debian13)
+  for pw_pkg in libgtk-4-1 gstreamer1.0-plugins-bad libavcodec61; do
+    # shellcheck disable=SC2016 # ${Status} is a dpkg-query field, not a shell variable
+    if dpkg-query -W -f='${Status}' "$pw_pkg" 2>/dev/null | grep -q 'install ok installed'; then
+      ok "Playwright library package $pw_pkg installed"
+    else
+      fail "$pw_pkg not installed — run install-core-toolchain.sh playwright-deps;
+      without it Playwright's WebKit and Firefox cannot start for non-root agents"
+    fi
+  done
+  ;;
+*)
+  note "no Playwright WebKit/Firefox library list for '${pw_os:-unknown}'; not checked"
+  ;;
+esac
+
+# ---------------------------------------------------------------------------
+# ffmpeg and Playwright video-recording seed tree — Playwright's VideoRecorder
+# (recordVideo / `playwright-cli video-start`) encodes screencast frames to
+# WebM via libvpx (Playwright <=1.64, revision 1011) or libvpx-vp9 (1.65+,
+# revision 1013), and agents also run ffmpeg directly for MP4/GIF/voice-over
+# conversion. PLAYWRIGHT_BROWSERS_PATH stays unset in the image so runtime
+# browser downloads (`npx playwright install webkit firefox`) persist in
+# ~/.cache/ms-playwright across restarts; the base image bakes an immutable
+# 0755 seed tree at /usr/local/share/scion-playwright-ffmpeg that `sciontool
+# init` symlinks into ~/.cache/ms-playwright at container start.
+# ---------------------------------------------------------------------------
+if command -v ffmpeg >/dev/null 2>&1; then
+  ffmpeg_bin="$(command -v ffmpeg)"
+  ffmpeg_payload="$(readlink -f "$ffmpeg_bin")"
+
+  if is_elf "$ffmpeg_payload"; then
+    ffmpeg_arch="$(elf_arch "$ffmpeg_payload")"
+    if [ -z "$EXPECTED_ARCH" ] || [ "$ffmpeg_arch" = "$EXPECTED_ARCH" ]; then
+      ok "ffmpeg payload is $ffmpeg_arch ($ffmpeg_payload)"
+    else
+      fail "ffmpeg payload $ffmpeg_payload is $ffmpeg_arch but this image
+      targets $EXPECTED_ARCH"
+    fi
+    if command -v ldd >/dev/null 2>&1; then
+      ffmpeg_missing="$(ldd "$ffmpeg_payload" 2>/dev/null | grep 'not found' || true)"
+      if [ -z "$ffmpeg_missing" ]; then
+        ok "ffmpeg shared libraries all resolve"
+      else
+        fail "ffmpeg is missing shared libraries:
+${ffmpeg_missing}"
+      fi
+    fi
+  fi
+
+  if ffmpeg_ver="$(ffmpeg -version 2>&1)"; then
+    ok "ffmpeg executes (${ffmpeg_ver%%$'\n'*})"
+    ffmpeg_encoders="$(ffmpeg -hide_banner -encoders 2>/dev/null || true)"
+    for _enc in libvpx libvpx-vp9; do
+      if printf '%s\n' "$ffmpeg_encoders" | grep -Eq "[[:space:]]${_enc}([[:space:]]|\$)"; then
+        ok "ffmpeg encoder ${_enc} available"
+      else
+        fail "ffmpeg lacks the ${_enc} encoder — Playwright video recording
+      encodes WebM with libvpx (<=1.64) and libvpx-vp9 (1.65+)"
+      fi
+    done
+  else
+    fail "ffmpeg is on PATH but 'ffmpeg -version' failed:
+${ffmpeg_ver:-(no output)}"
+  fi
+else
+  fail "ffmpeg missing from PATH — required by Playwright video recording and
+      media post-processing (install via install-core-toolchain.sh apt-common)"
+fi
+
+if [ -z "${PLAYWRIGHT_BROWSERS_PATH+set}" ]; then
+  ok "PLAYWRIGHT_BROWSERS_PATH unset in the image environment"
+elif [ -n "$BUILD_ARCH" ]; then
+  fail "PLAYWRIGHT_BROWSERS_PATH is set to '${PLAYWRIGHT_BROWSERS_PATH}' during
+      the image build — remove ENV PLAYWRIGHT_BROWSERS_PATH so runtime browser
+      downloads stay in persistent ~/.cache/ms-playwright"
+else
+  note "PLAYWRIGHT_BROWSERS_PATH is set to '${PLAYWRIGHT_BROWSERS_PATH}'; not a
+      build (BUILDARCH unset), so this is taken to be a running container's env"
+fi
+
+PW_SEED_EXPECTED="${SCION_PLAYWRIGHT_FFMPEG_SEED_DIR:-/usr/local/share/scion-playwright-ffmpeg}"
+if [ -d "$PW_SEED_EXPECTED" ]; then
+  _pw_mode="$(stat -c '%a' "$PW_SEED_EXPECTED" 2>/dev/null || true)"
+  if [ "$_pw_mode" = "755" ]; then
+    ok "$PW_SEED_EXPECTED present (mode 755)"
+  else
+    fail "$PW_SEED_EXPECTED has mode '${_pw_mode:-<unknown>}', expected 755"
+  fi
+else
+  fail "$PW_SEED_EXPECTED missing — run install-core-toolchain.sh playwright-ffmpeg"
+fi
+
+_pw_cli_browsers="${NPM_PREFIX_EXPECTED}/lib/node_modules/@playwright/cli/node_modules/playwright-core/browsers.json"
+_pw_cli_rev=""
+if [ -f "$_pw_cli_browsers" ] && command -v jq >/dev/null 2>&1; then
+  _pw_cli_rev="$(jq -r '.browsers[]? | select(.name == "ffmpeg") | .revision // empty' "$_pw_cli_browsers" 2>/dev/null || true)"
+fi
+
+_pw_seeded_revs=""
+for _pw_entry in "${PW_SEED_EXPECTED}"/ffmpeg-*; do
+  [ -d "$_pw_entry" ] || continue
+  _pw_rev="${_pw_entry##*/ffmpeg-}"
+  case "$_pw_rev" in '' | *[!0-9]*) continue ;; esac
+  _pw_seeded_revs="${_pw_seeded_revs} ${_pw_rev}"
+  _pw_entry_mode="$(stat -c '%a' "$_pw_entry" 2>/dev/null || true)"
+  _pw_bin="${_pw_entry}/ffmpeg-linux"
+  _pw_marker="${_pw_entry}/INSTALLATION_COMPLETE"
+  _pw_deps="${_pw_entry}/DEPENDENCIES_VALIDATED"
+  _pw_desc="${_pw_entry}/browsers.json"
+  _pw_pkg="${_pw_entry}/package.json"
+  if [ "$_pw_entry_mode" = "755" ] && [ -x "$_pw_bin" ] && [ -f "$_pw_marker" ] && [ -f "$_pw_deps" ] && [ -f "$_pw_desc" ] && [ -f "$_pw_pkg" ] && "$_pw_bin" -version >/dev/null 2>&1; then
+    ok "Playwright seed ffmpeg-${_pw_rev}/ffmpeg-linux wired and runnable"
+  else
+    fail "Playwright seed ffmpeg-${_pw_rev} incomplete under $PW_SEED_EXPECTED
+      (need mode 755, runnable ffmpeg-linux, INSTALLATION_COMPLETE,
+      DEPENDENCIES_VALIDATED, browsers.json, and package.json)"
+  fi
+done
+
+for _pw_req in 1011 1013 $_pw_cli_rev; do
+  case "$_pw_req" in '' | *[!0-9]*) continue ;; esac
+  case " $_pw_seeded_revs " in
+  *" $_pw_req "*) ;;
+  *)
+    fail "Playwright seed under $PW_SEED_EXPECTED is missing required revision
+      ffmpeg-${_pw_req} (run install-core-toolchain.sh playwright-ffmpeg)"
+    ;;
+  esac
+done
+
+# ---------------------------------------------------------------------------
 # Timezone data — the agent TZ (defaulted to UTC by sciontool's harness
 # provisioning, cmd/sciontool/commands/harness.go) only takes effect if the
 # zone files exist. glibc treats an unknown zone as UTC without any error, so
@@ -508,6 +651,35 @@ else
 fi
 
 need_cmd npm "global harness installs (chrome-devtools-mcp, @playwright/cli)"
+
+# helm — an exact pin, not a floor (install-core-toolchain.sh step_helm): chart
+# work on deploy/helm/scion-hub regenerates golden output, and two helm
+# versions can render different manifests. The Dockerfiles forward the pin as
+# HELM_VERSION; a running container re-checked without it gets presence and a
+# working binary only, with a note.
+if command -v helm >/dev/null 2>&1; then
+  helm_path="$(command -v helm)"
+  helm_ver="$(helm version --template '{{.Version}}' 2>/dev/null | sed 's/^v//')"
+  helm_want="${HELM_VERSION:-}"
+  helm_want="${helm_want#v}"
+  if [ -z "$helm_ver" ]; then
+    fail "helm at $helm_path does not run ('helm version' failed) — chart
+      rendering (deploy/helm/scion-hub) needs a working helm"
+  elif [ -z "$helm_want" ]; then
+    ok "helm $helm_ver present ($helm_path)"
+    note "HELM_VERSION unset, so the pinned helm version is not checked"
+  elif [ "$helm_ver" = "$helm_want" ]; then
+    ok "helm $helm_ver = pinned $helm_want ($helm_path)"
+  else
+    fail "helm at $helm_path is $helm_ver, expected the pinned $helm_want —
+      another copy is earlier on PATH, or the pin and the install disagree;
+      two helm versions can render different manifests for
+      deploy/helm/scion-hub"
+  fi
+else
+  fail "helm missing — chart work on deploy/helm/scion-hub (pinned to match
+      .github/workflows/chart-ci.yml)"
+fi
 
 echo "--- end base contract ---"
 

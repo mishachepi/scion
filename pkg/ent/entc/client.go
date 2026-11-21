@@ -19,6 +19,7 @@ package entc
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -38,6 +39,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/migrate"
+	"github.com/GoogleCloudPlatform/scion/pkg/observability/txdiag"
 )
 
 // PoolConfig holds connection pool settings applied to the underlying
@@ -58,6 +60,11 @@ type PoolConfig struct {
 	// request after an idle period stalls waiting for a dead connection to time
 	// out. A zero value leaves the database/sql default (no idle limit).
 	ConnMaxIdleTime time.Duration
+	// Diag, when set, wraps the connection pool with transaction-hold and
+	// lock-wait diagnostics (package txdiag). The opener creates one
+	// Monitor per opened DB from it; the DB's Close closes the Monitor. Nil
+	// leaves the open path exactly as without diagnostics.
+	Diag *txdiag.Config
 }
 
 // apply sets the pool parameters on db, skipping any unset (non-positive) field.
@@ -168,6 +175,57 @@ func sqlitePragmaName(v string) string {
 // closed when a pragma did not take effect.
 var sqliteDSNPragmas = withSQLitePragmas
 
+// setSQLiteJournalModeWAL runs PRAGMA journal_mode = WAL and returns the
+// resulting mode SQLite reports. It is a variable only so a test can stub it
+// to check that OpenSQLite fails closed when SQLite stays in another mode
+// without returning an error.
+var setSQLiteJournalModeWAL = func(db *sql.DB) (string, error) {
+	var mode string
+	if err := db.QueryRow("PRAGMA journal_mode = WAL").Scan(&mode); err != nil {
+		return "", err
+	}
+	return mode, nil
+}
+
+// enableSQLiteWAL switches db to WAL journal mode and verifies that a
+// file-backed database actually entered "wal" mode. PRAGMA journal_mode = WAL
+// returns the resulting mode as a row without raising an error when SQLite
+// stays in another mode (for example "memory" on an in-memory database, or
+// "delete" on an immutable file or a VFS without WAL support). Non-file-backed
+// databases (in-memory and temporary databases, whose main entry in
+// pragma_database_list has an empty file) legitimately stay out of WAL mode;
+// any file-backed database must report "wal".
+func enableSQLiteWAL(db *sql.DB) error {
+	mode, err := setSQLiteJournalModeWAL(db)
+	if err != nil {
+		return err
+	}
+	if strings.EqualFold(mode, "wal") {
+		return nil
+	}
+	fileBacked, err := sqliteMainIsFileBacked(db)
+	if err != nil {
+		return err
+	}
+	if fileBacked {
+		return fmt.Errorf("journal_mode is %q after PRAGMA journal_mode = WAL, want \"wal\"", mode)
+	}
+	return nil
+}
+
+// sqliteMainIsFileBacked reports whether SQLite's main database on db is
+// backed by a filesystem path. sqlite3_db_filename (exposed in SQL through
+// pragma_database_list) is empty for ":memory:", "file::memory:", URI
+// databases with mode=memory, memdb VFS databases, and anonymous temporary
+// databases, and non-empty for every file-backed database.
+func sqliteMainIsFileBacked(db *sql.DB) (bool, error) {
+	var file sql.NullString
+	if err := db.QueryRow("SELECT file FROM pragma_database_list WHERE name = 'main'").Scan(&file); err != nil {
+		return false, fmt.Errorf("reading main database filename: %w", err)
+	}
+	return file.Valid && file.String != "", nil
+}
+
 // requireSQLitePragmaOn returns an error unless PRAGMA name reads 1 on a
 // connection from db. The openers set their pragmas through the DSN
 // (withSQLitePragmas); this makes the open fail rather than return a
@@ -255,6 +313,12 @@ func UTCTimeHook(next ent.Mutator) ent.Mutator {
 // (entadapter.newTxClient), which every launch writer uses. A new
 // *ent.Client constructor that writes agents must register it too
 // (TestEntClientConstructorsRegisterResumeHook checks this).
+//
+// The same choke point also clears activity_since on an update that sets
+// a phase other than running and does not itself set or clear
+// activity_since: the column is NULL whenever the agent is not running,
+// whichever writer moves the phase (the store's activity writers maintain
+// it explicitly, see entadapter.stampActivitySince).
 func ClearLaunchResumePhaseHook(next ent.Mutator) ent.Mutator {
 	return ent.MutateFunc(func(ctx context.Context, m ent.Mutation) (ent.Value, error) {
 		am, ok := m.(*ent.AgentMutation)
@@ -264,6 +328,10 @@ func ClearLaunchResumePhaseHook(next ent.Mutator) ent.Mutator {
 		phase, set := am.Phase()
 		if !set {
 			return next.Mutate(ctx, m)
+		}
+		if _, explicit := am.ActivitySince(); !explicit && !am.ActivitySinceCleared() &&
+			state.Phase(phase) != state.PhaseRunning {
+			am.ClearActivitySince()
 		}
 		if _, explicit := am.LaunchResumePhase(); explicit {
 			return next.Mutate(ctx, m)
@@ -277,14 +345,59 @@ func ClearLaunchResumePhaseHook(next ent.Mutator) ent.Mutator {
 	})
 }
 
+// ClearSuspendReasonHook is an Ent mutation hook that ends an agent's
+// suspend_reason (state.SuspendReason) at one choke point: an Agent update
+// (UpdateOne or bulk Update) that sets phase to a value other than
+// suspended or starting, and does not itself set suspend_reason, clears
+// it. A resume, stop, delete or failed start therefore clears the reason
+// whichever writer makes it. starting (a resume dispatch) keeps it, so the
+// rollback of a failed resume, which restores suspended, keeps the reason
+// too. An explicit suspend_reason in the same mutation wins.
+//
+// Registered with ClearLaunchResumePhaseHook wherever that hook is (see
+// its comment), so the same constructors carry both.
+func ClearSuspendReasonHook(next ent.Mutator) ent.Mutator {
+	return ent.MutateFunc(func(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+		am, ok := m.(*ent.AgentMutation)
+		if !ok || (!am.Op().Is(ent.OpUpdate) && !am.Op().Is(ent.OpUpdateOne)) {
+			return next.Mutate(ctx, m)
+		}
+		phase, set := am.Phase()
+		if !set {
+			return next.Mutate(ctx, m)
+		}
+		if _, explicit := am.SuspendReason(); explicit || am.SuspendReasonCleared() {
+			return next.Mutate(ctx, m)
+		}
+		switch state.Phase(phase) {
+		case state.PhaseSuspended, state.PhaseStarting:
+		default:
+			am.ClearSuspendReason()
+		}
+		return next.Mutate(ctx, m)
+	})
+}
+
 // OpenSQLite creates an Ent client backed by SQLite.
 // The dsn should be a SQLite connection string (e.g. "file:ent?mode=memory&cache=shared").
-// Foreign keys and WAL journal mode are enabled automatically. Foreign keys
-// are a per-connection setting, so they are set through the DSN and apply to
-// every connection in the pool.
+// Foreign keys and WAL journal mode are enabled automatically (and verified:
+// foreign keys on every connection, and "wal" journal mode on file-backed
+// databases; in-memory databases stay in "memory" mode). Foreign keys are a
+// per-connection setting, so they are set through the DSN and apply to every
+// connection in the pool.
 // This uses the modernc.org/sqlite pure-Go driver which registers as "sqlite".
 func OpenSQLite(dsn string, pool PoolConfig, opts ...ent.Option) (*ent.Client, error) {
-	db, err := sql.Open("sqlite", sqliteDSNPragmas(withUTCTimezone(dsn), "foreign_keys(1)"))
+	fullDSN := sqliteDSNPragmas(withUTCTimezone(dsn), "foreign_keys(1)")
+	var (
+		db  *sql.DB
+		mon *txdiag.Monitor
+		err error
+	)
+	if pool.Diag != nil {
+		db, mon, err = openSQLiteDiag(fullDSN, *pool.Diag)
+	} else {
+		db, err = sql.Open("sqlite", fullDSN)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("opening sqlite connection: %w", err)
 	}
@@ -294,15 +407,87 @@ func OpenSQLite(dsn string, pool PoolConfig, opts ...ent.Option) (*ent.Client, e
 	}
 	// journal_mode=WAL is stored in the database file, so setting it once
 	// covers every connection.
-	if _, err := db.Exec("PRAGMA journal_mode = WAL"); err != nil {
+	if err := enableSQLiteWAL(db); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("enabling WAL mode: %w", err)
 	}
 	pool.apply(db)
 	drv := entsql.OpenDB(dialect.SQLite, db)
-	client := ent.NewClient(append(opts, ent.Driver(drv))...)
-	client.Use(UTCTimeHook, ClearLaunchResumePhaseHook)
+	client := ent.NewClient(append(opts, ent.Driver(diagDriver(drv, mon)))...)
+	client.Use(UTCTimeHook, ClearLaunchResumePhaseHook, ClearSuspendReasonHook)
 	return client, nil
+}
+
+// openSQLiteDiag opens dsn through the registered modernc driver instance,
+// wrapped with diagnostics. The registered instance (not a fresh
+// sqlite.Driver) carries the driver's process-wide registrations
+// (functions, collations, connection hooks, modules), so connections open
+// exactly as sql.Open("sqlite", dsn) would open them.
+func openSQLiteDiag(dsn string, cfg txdiag.Config) (*sql.DB, *txdiag.Monitor, error) {
+	db0, err := sql.Open("sqlite", "")
+	if err != nil {
+		return nil, nil, err
+	}
+	base := db0.Driver()
+	_ = db0.Close()
+	var conn driver.Connector = txdiag.DSNConnector{DSN: dsn, Drv: base}
+	if dc, ok := base.(driver.DriverContext); ok {
+		if conn, err = dc.OpenConnector(dsn); err != nil {
+			return nil, nil, err
+		}
+	}
+	cfg.Dialect = dialect.SQLite
+	mon := txdiag.NewMonitor(cfg)
+	return sql.OpenDB(txdiag.WrapConnector(conn, mon)), mon, nil
+}
+
+// diagDriver returns drv wrapped with lock-wait probes when mon is set, and
+// drv itself otherwise.
+func diagDriver(drv *entsql.Driver, mon *txdiag.Monitor) dialect.Driver {
+	if mon == nil {
+		return drv
+	}
+	return txdiag.WrapEntDriver(drv, mon)
+}
+
+// SQLDriver returns the *entsql.Driver behind d, unwrapping a diagnostics
+// wrapper. Code that needs the *sql.DB of an ent client goes through this
+// rather than a type assertion to *entsql.Driver, which fails on a wrapped driver
+// (hack/check-entsql-driver-assert.sh enforces this).
+func SQLDriver(d dialect.Driver) (*entsql.Driver, bool) {
+	for d != nil {
+		if sd, ok := d.(*entsql.Driver); ok {
+			return sd, true
+		}
+		u, ok := d.(interface{ Unwrap() dialect.Driver })
+		if !ok {
+			return nil, false
+		}
+		d = u.Unwrap()
+	}
+	return nil, false
+}
+
+// SQLDB returns the *sql.DB behind d (see SQLDriver), or nil when d is not
+// backed by one.
+func SQLDB(d dialect.Driver) *sql.DB {
+	if sd, ok := SQLDriver(d); ok {
+		return sd.DB()
+	}
+	return nil
+}
+
+// DiagMonitor returns the diagnostics Monitor of client, if its driver was
+// opened with PoolConfig.Diag.
+func DiagMonitor(client *ent.Client) (*txdiag.Monitor, bool) {
+	if client == nil {
+		return nil, false
+	}
+	d, ok := client.Driver().(interface{ Monitor() *txdiag.Monitor })
+	if !ok {
+		return nil, false
+	}
+	return d.Monitor(), true
 }
 
 // OpenSQLiteReadOnly creates an Ent client backed by a read-only SQLite
@@ -334,8 +519,92 @@ func OpenSQLiteReadOnly(dsn string, opts ...ent.Option) (*ent.Client, error) {
 	}
 	drv := entsql.OpenDB(dialect.SQLite, db)
 	client := ent.NewClient(append(opts, ent.Driver(drv))...)
-	client.Use(UTCTimeHook, ClearLaunchResumePhaseHook)
+	client.Use(UTCTimeHook, ClearLaunchResumePhaseHook, ClearSuspendReasonHook)
 	return client, nil
+}
+
+// SQLiteSearchReaderMaxOpen is the default connection cap of the search
+// reader. It matches the default hub-wide search cap on SQLite.
+const SQLiteSearchReaderMaxOpen = 2
+
+// SQLiteSearchReaderIdleTime is how long the search reader keeps an idle
+// connection open.
+const SQLiteSearchReaderIdleTime = 30 * time.Second
+
+// OpenSQLiteSearchReader opens a separate read-only *sql.DB on the hub's
+// SQLite file for chat search (ptone/scion#7586). A search reads through its
+// own pool, so a slow search cannot hold the main handle's connection that
+// every other request needs.
+//
+// The connections are opened with mode=ro and cache=private, and with
+// query_only(1) as a second guard against writes. busy_timeout(2000) makes a
+// read wait briefly for a writer's lock instead of failing at once. Times are
+// read as UTC, the same as the main handle. The pool opens at most
+// SQLiteSearchReaderMaxOpen connections, keeps one idle and drops it after
+// SQLiteSearchReaderIdleTime. A caller with a different hub-wide search cap
+// calls SetMaxOpenConns with that cap, so a search never queues for a
+// connection. Like OpenSQLiteReadOnly, it does not switch the journal mode:
+// the hub's main handle has already put the database in WAL mode.
+//
+// An in-memory DSN cannot be shared by a second pool. For one, the caller
+// keeps using the main handle (see SQLiteDSNIsMemory).
+func OpenSQLiteSearchReader(dsn string) (*sql.DB, error) {
+	if SQLiteDSNIsMemory(dsn) {
+		return nil, fmt.Errorf("opening sqlite search reader: in-memory DSN has no separate reader")
+	}
+	ro, err := withSQLiteURIParams(withUTCTimezone(dsn), map[string]string{"mode": "ro", "cache": "private"})
+	if err != nil {
+		return nil, fmt.Errorf("opening sqlite search reader: %w", err)
+	}
+	db, err := sql.Open("sqlite", sqliteDSNPragmas(ro, "query_only(1)", "busy_timeout(2000)"))
+	if err != nil {
+		return nil, fmt.Errorf("opening sqlite search reader: %w", err)
+	}
+	db.SetMaxOpenConns(SQLiteSearchReaderMaxOpen)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxIdleTime(SQLiteSearchReaderIdleTime)
+	if err := requireSQLitePragmaOn(db, "query_only"); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("enabling query_only mode on search reader: %w", err)
+	}
+	return db, nil
+}
+
+// SQLiteDSNIsMemory reports whether dsn names an in-memory SQLite database
+// (":memory:", "file::memory:..." or a URI with mode=memory). Such a database
+// lives inside one pool, so a second pool on the same DSN would see a
+// different, empty database.
+func SQLiteDSNIsMemory(dsn string) bool {
+	base, rawQuery, _ := strings.Cut(dsn, "?")
+	base = strings.TrimPrefix(base, "file:")
+	if base == "" || base == ":memory:" {
+		return true
+	}
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(values.Get("mode"), "memory")
+}
+
+// withSQLiteURIParams returns dsn as a "file:" URI with each of params set,
+// replacing a caller value for the same key. modernc opens the name with
+// SQLITE_OPEN_URI, so mode and cache are honoured only on a "file:" name.
+// A query that cannot be parsed is an error, never the DSN unchanged: that
+// would drop the params silently (round-3 item R3-03).
+func withSQLiteURIParams(dsn string, params map[string]string) (string, error) {
+	base, rawQuery, _ := strings.Cut(dsn, "?")
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return "", fmt.Errorf("parse sqlite DSN query: %w", err)
+	}
+	if !strings.HasPrefix(base, "file:") {
+		base = "file:" + base
+	}
+	for k, v := range params {
+		values.Set(k, v)
+	}
+	return base + "?" + values.Encode(), nil
 }
 
 // OpenPostgres creates an Ent client backed by PostgreSQL.
@@ -406,17 +675,31 @@ func openPostgres(dsn string, pool PoolConfig, readOnly bool, opts ...ent.Option
 	// that sends OID 25 (text). Without this, raw queries comparing uuid columns
 	// against Go uuid.UUID parameters fail with SQLSTATE 42883 ("operator does
 	// not exist: uuid = text"). See https://github.com/ptone/scion/issues/1634.
-	db := stdlib.OpenDB(*connConfig, stdlib.OptionAfterConnect(
+	afterConnect := stdlib.OptionAfterConnect(
 		func(ctx context.Context, conn *pgx.Conn) error {
 			conn.TypeMap().RegisterDefaultPgType(uuid.UUID{}, "uuid")
 			conn.TypeMap().RegisterDefaultPgType([]uuid.UUID{}, "_uuid")
 			return nil
 		},
-	))
+	)
+	var (
+		db  *sql.DB
+		mon *txdiag.Monitor
+	)
+	if pool.Diag != nil {
+		// stdlib.OpenDB is sql.OpenDB(stdlib.GetConnector(...)); the
+		// diagnostics path wraps that same connector.
+		cfg := *pool.Diag
+		cfg.Dialect = dialect.Postgres
+		mon = txdiag.NewMonitor(cfg)
+		db = sql.OpenDB(txdiag.WrapConnector(stdlib.GetConnector(*connConfig, afterConnect), mon))
+	} else {
+		db = stdlib.OpenDB(*connConfig, afterConnect)
+	}
 	pool.apply(db)
 	drv := entsql.OpenDB(dialect.Postgres, db)
-	client := ent.NewClient(append(opts, ent.Driver(drv))...)
-	client.Use(UTCTimeHook, ClearLaunchResumePhaseHook)
+	client := ent.NewClient(append(opts, ent.Driver(diagDriver(drv, mon)))...)
+	client.Use(UTCTimeHook, ClearLaunchResumePhaseHook, ClearSuspendReasonHook)
 	return client, nil
 }
 
@@ -493,7 +776,7 @@ func AutoMigrate(ctx context.Context, client *ent.Client, opts ...AutoMigrateOpt
 	// foreign keys were not enforced; see reconcileSQLiteForeignKeys.
 	var fkResult fkReconcileResult
 	if client.Driver().Dialect() == dialect.SQLite {
-		if drv, ok := client.Driver().(*entsql.Driver); ok {
+		if drv, ok := SQLDriver(client.Driver()); ok {
 			if err := runBeforeFKReconcile(ctx, drv.DB(), cfg.beforeFKReconcile); err != nil {
 				return err
 			}
@@ -509,10 +792,20 @@ func AutoMigrate(ctx context.Context, client *ent.Client, opts ...AutoMigrateOpt
 		}
 		return err
 	}
+	// Downgrade floor rule: a change here that drops a table or column, or
+	// any other migration an older binary cannot ignore (a new NOT NULL
+	// column without a default, a narrowed enum, rewritten values), must
+	// bump pkg/version.DowngradeFloor in the same PR to the first release
+	// that contains it. The hub refuses to install a release older than
+	// the floor (below_downgrade_floor), because that binary would run on a
+	// schema it does not understand.
 	if err := dropDecisionAuditTable(ctx, client); err != nil {
 		return err
 	}
-	return dropTemplateLegacyColumns(ctx, client)
+	if err := dropTemplateLegacyColumns(ctx, client); err != nil {
+		return err
+	}
+	return MigrateSkillCoreScope(ctx, client)
 }
 
 // AutoMigrateOption configures AutoMigrate.

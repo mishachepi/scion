@@ -27,11 +27,20 @@ type AgentDelegatedCredential func(*sql.Selector)
 // AgentDelegationGrant is the predicate function for agentdelegationgrant builders.
 type AgentDelegationGrant func(*sql.Selector)
 
+// AgentDeliveryHold is the predicate function for agentdeliveryhold builders.
+type AgentDeliveryHold func(*sql.Selector)
+
 // AgentHold is the predicate function for agenthold builders.
 type AgentHold func(*sql.Selector)
 
 // AgentIdentityKey is the predicate function for agentidentitykey builders.
 type AgentIdentityKey func(*sql.Selector)
+
+// AgentLifecycleCursor is the predicate function for agentlifecyclecursor builders.
+type AgentLifecycleCursor func(*sql.Selector)
+
+// AgentLifecycleOutbox is the predicate function for agentlifecycleoutbox builders.
+type AgentLifecycleOutbox func(*sql.Selector)
 
 // AgentRecovery is the predicate function for agentrecovery builders.
 type AgentRecovery func(*sql.Selector)
@@ -72,6 +81,12 @@ type BrokerTargetInventory func(*sql.Selector)
 // ChatLinkCode is the predicate function for chatlinkcode builders.
 type ChatLinkCode func(*sql.Selector)
 
+// ChatRetentionCursor is the predicate function for chatretentioncursor builders.
+type ChatRetentionCursor func(*sql.Selector)
+
+// ChatRetentionRun is the predicate function for chatretentionrun builders.
+type ChatRetentionRun func(*sql.Selector)
+
 // ConduitPrincipalEpoch is the predicate function for conduitprincipalepoch builders.
 type ConduitPrincipalEpoch func(*sql.Selector)
 
@@ -84,11 +99,23 @@ type Conversation func(*sql.Selector)
 // ConversationParticipant is the predicate function for conversationparticipant builders.
 type ConversationParticipant func(*sql.Selector)
 
+// Decision is the predicate function for decision builders.
+type Decision func(*sql.Selector)
+
+// DecisionAnswer is the predicate function for decisionanswer builders.
+type DecisionAnswer func(*sql.Selector)
+
+// DecisionKeyCounter is the predicate function for decisionkeycounter builders.
+type DecisionKeyCounter func(*sql.Selector)
+
 // DelegationAdoption is the predicate function for delegationadoption builders.
 type DelegationAdoption func(*sql.Selector)
 
 // DelegationEdge is the predicate function for delegationedge builders.
 type DelegationEdge func(*sql.Selector)
+
+// DurableQueueItem is the predicate function for durablequeueitem builders.
+type DurableQueueItem func(*sql.Selector)
 
 // EntitlementBinding is the predicate function for entitlementbinding builders.
 type EntitlementBinding func(*sql.Selector)
@@ -116,6 +143,12 @@ type GroupMembership func(*sql.Selector)
 
 // HarnessConfig is the predicate function for harnessconfig builders.
 type HarnessConfig func(*sql.Selector)
+
+// HubEncryptionMigration is the predicate function for hubencryptionmigration builders.
+type HubEncryptionMigration func(*sql.Selector)
+
+// HubEncryptionPolicy is the predicate function for hubencryptionpolicy builders.
+type HubEncryptionPolicy func(*sql.Selector)
 
 // HubInstance is the predicate function for hubinstance builders.
 type HubInstance func(*sql.Selector)
@@ -159,6 +192,12 @@ type Message func(*sql.Selector)
 // MessageAddressee is the predicate function for messageaddressee builders.
 type MessageAddressee func(*sql.Selector)
 
+// MessagePolicy is the predicate function for messagepolicy builders.
+type MessagePolicy func(*sql.Selector)
+
+// MessagePolicyDecision is the predicate function for messagepolicydecision builders.
+type MessagePolicyDecision func(*sql.Selector)
+
 // MutationAudit is the predicate function for mutationaudit builders.
 type MutationAudit func(*sql.Selector)
 
@@ -170,6 +209,9 @@ type Notification func(*sql.Selector)
 
 // NotificationSubscription is the predicate function for notificationsubscription builders.
 type NotificationSubscription func(*sql.Selector)
+
+// PendingSecret is the predicate function for pendingsecret builders.
+type PendingSecret func(*sql.Selector)
 
 // PolicyBinding is the predicate function for policybinding builders.
 type PolicyBinding func(*sql.Selector)
@@ -204,11 +246,20 @@ type RoleDefinition func(*sql.Selector)
 // RuntimeBroker is the predicate function for runtimebroker builders.
 type RuntimeBroker func(*sql.Selector)
 
+// RuntimeOrphan is the predicate function for runtimeorphan builders.
+type RuntimeOrphan func(*sql.Selector)
+
 // Schedule is the predicate function for schedule builders.
 type Schedule func(*sql.Selector)
 
 // ScheduledEvent is the predicate function for scheduledevent builders.
 type ScheduledEvent func(*sql.Selector)
+
+// ScheduledExecPollCursor is the predicate function for scheduledexecpollcursor builders.
+type ScheduledExecPollCursor func(*sql.Selector)
+
+// ScheduledExecRun is the predicate function for scheduledexecrun builders.
+type ScheduledExecRun func(*sql.Selector)
 
 // Secret is the predicate function for secret builders.
 type Secret func(*sql.Selector)
@@ -228,6 +279,9 @@ type SkillVersion func(*sql.Selector)
 // SubscriptionTemplate is the predicate function for subscriptiontemplate builders.
 type SubscriptionTemplate func(*sql.Selector)
 
+// SystemOneInstance is the predicate function for systemoneinstance builders.
+type SystemOneInstance func(*sql.Selector)
+
 // Template is the predicate function for template builders.
 type Template func(*sql.Selector)
 
@@ -246,6 +300,15 @@ type ThreadGroup func(*sql.Selector)
 // ThreadGroupMember is the predicate function for threadgroupmember builders.
 type ThreadGroupMember func(*sql.Selector)
 
+// Trigger is the predicate function for trigger builders.
+type Trigger func(*sql.Selector)
+
+// TriggerEvent is the predicate function for triggerevent builders.
+type TriggerEvent func(*sql.Selector)
+
+// TriggerFire is the predicate function for triggerfire builders.
+type TriggerFire func(*sql.Selector)
+
 // UsageReservation is the predicate function for usagereservation builders.
 type UsageReservation func(*sql.Selector)
 
@@ -255,5 +318,14 @@ type User func(*sql.Selector)
 // UserAccessToken is the predicate function for useraccesstoken builders.
 type UserAccessToken func(*sql.Selector)
 
+// UserDeletion is the predicate function for userdeletion builders.
+type UserDeletion func(*sql.Selector)
+
+// UserDeletionAgent is the predicate function for userdeletionagent builders.
+type UserDeletionAgent func(*sql.Selector)
+
 // UserTerminalWorkspace is the predicate function for userterminalworkspace builders.
 type UserTerminalWorkspace func(*sql.Selector)
+
+// WebhookEndpoint is the predicate function for webhookendpoint builders.
+type WebhookEndpoint func(*sql.Selector)

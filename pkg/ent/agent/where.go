@@ -146,6 +146,11 @@ func StalledFromActivity(v string) predicate.Agent {
 	return predicate.Agent(sql.FieldEQ(FieldStalledFromActivity, v))
 }
 
+// SuspendReason applies equality check predicate on the "suspend_reason" field. It's identical to SuspendReasonEQ.
+func SuspendReason(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldEQ(FieldSuspendReason, v))
+}
+
 // CurrentTurns applies equality check predicate on the "current_turns" field. It's identical to CurrentTurnsEQ.
 func CurrentTurns(v int) predicate.Agent {
 	return predicate.Agent(sql.FieldEQ(FieldCurrentTurns, v))
@@ -216,6 +221,11 @@ func AppliedConfig(v string) predicate.Agent {
 	return predicate.Agent(sql.FieldEQ(FieldAppliedConfig, v))
 }
 
+// EffectiveConfig applies equality check predicate on the "effective_config" field. It's identical to EffectiveConfigEQ.
+func EffectiveConfig(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldEQ(FieldEffectiveConfig, v))
+}
+
 // PendingConfig applies equality check predicate on the "pending_config" field. It's identical to PendingConfigEQ.
 func PendingConfig(v string) predicate.Agent {
 	return predicate.Agent(sql.FieldEQ(FieldPendingConfig, v))
@@ -244,6 +254,16 @@ func LastSeen(v time.Time) predicate.Agent {
 // LastActivityEvent applies equality check predicate on the "last_activity_event" field. It's identical to LastActivityEventEQ.
 func LastActivityEvent(v time.Time) predicate.Agent {
 	return predicate.Agent(sql.FieldEQ(FieldLastActivityEvent, v))
+}
+
+// LastLiveProcessAt applies equality check predicate on the "last_live_process_at" field. It's identical to LastLiveProcessAtEQ.
+func LastLiveProcessAt(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldEQ(FieldLastLiveProcessAt, v))
+}
+
+// LastLiveWorkAt applies equality check predicate on the "last_live_work_at" field. It's identical to LastLiveWorkAtEQ.
+func LastLiveWorkAt(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldEQ(FieldLastLiveWorkAt, v))
 }
 
 // StartedAt applies equality check predicate on the "started_at" field. It's identical to StartedAtEQ.
@@ -284,6 +304,11 @@ func LaunchAsyncOptIn(v bool) predicate.Agent {
 // LaunchID applies equality check predicate on the "launch_id" field. It's identical to LaunchIDEQ.
 func LaunchID(v string) predicate.Agent {
 	return predicate.Agent(sql.FieldEQ(FieldLaunchID, v))
+}
+
+// LaunchRunID applies equality check predicate on the "launch_run_id" field. It's identical to LaunchRunIDEQ.
+func LaunchRunID(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldEQ(FieldLaunchRunID, v))
 }
 
 // RunID applies equality check predicate on the "run_id" field. It's identical to RunIDEQ.
@@ -484,6 +509,21 @@ func StartClaimLaunchID(v string) predicate.Agent {
 // SoftDeleteOpID applies equality check predicate on the "soft_delete_op_id" field. It's identical to SoftDeleteOpIDEQ.
 func SoftDeleteOpID(v string) predicate.Agent {
 	return predicate.Agent(sql.FieldEQ(FieldSoftDeleteOpID, v))
+}
+
+// ActivitySince applies equality check predicate on the "activity_since" field. It's identical to ActivitySinceEQ.
+func ActivitySince(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldEQ(FieldActivitySince, v))
+}
+
+// LastDeliveryAt applies equality check predicate on the "last_delivery_at" field. It's identical to LastDeliveryAtEQ.
+func LastDeliveryAt(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldEQ(FieldLastDeliveryAt, v))
+}
+
+// IdleSuspendClaimUntil applies equality check predicate on the "idle_suspend_claim_until" field. It's identical to IdleSuspendClaimUntilEQ.
+func IdleSuspendClaimUntil(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldEQ(FieldIdleSuspendClaimUntil, v))
 }
 
 // FixtureRootIDEQ applies the EQ predicate on the "fixture_root_id" field.
@@ -1631,6 +1671,81 @@ func StalledFromActivityContainsFold(v string) predicate.Agent {
 	return predicate.Agent(sql.FieldContainsFold(FieldStalledFromActivity, v))
 }
 
+// SuspendReasonEQ applies the EQ predicate on the "suspend_reason" field.
+func SuspendReasonEQ(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldEQ(FieldSuspendReason, v))
+}
+
+// SuspendReasonNEQ applies the NEQ predicate on the "suspend_reason" field.
+func SuspendReasonNEQ(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldNEQ(FieldSuspendReason, v))
+}
+
+// SuspendReasonIn applies the In predicate on the "suspend_reason" field.
+func SuspendReasonIn(vs ...string) predicate.Agent {
+	return predicate.Agent(sql.FieldIn(FieldSuspendReason, vs...))
+}
+
+// SuspendReasonNotIn applies the NotIn predicate on the "suspend_reason" field.
+func SuspendReasonNotIn(vs ...string) predicate.Agent {
+	return predicate.Agent(sql.FieldNotIn(FieldSuspendReason, vs...))
+}
+
+// SuspendReasonGT applies the GT predicate on the "suspend_reason" field.
+func SuspendReasonGT(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldGT(FieldSuspendReason, v))
+}
+
+// SuspendReasonGTE applies the GTE predicate on the "suspend_reason" field.
+func SuspendReasonGTE(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldGTE(FieldSuspendReason, v))
+}
+
+// SuspendReasonLT applies the LT predicate on the "suspend_reason" field.
+func SuspendReasonLT(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldLT(FieldSuspendReason, v))
+}
+
+// SuspendReasonLTE applies the LTE predicate on the "suspend_reason" field.
+func SuspendReasonLTE(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldLTE(FieldSuspendReason, v))
+}
+
+// SuspendReasonContains applies the Contains predicate on the "suspend_reason" field.
+func SuspendReasonContains(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldContains(FieldSuspendReason, v))
+}
+
+// SuspendReasonHasPrefix applies the HasPrefix predicate on the "suspend_reason" field.
+func SuspendReasonHasPrefix(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldHasPrefix(FieldSuspendReason, v))
+}
+
+// SuspendReasonHasSuffix applies the HasSuffix predicate on the "suspend_reason" field.
+func SuspendReasonHasSuffix(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldHasSuffix(FieldSuspendReason, v))
+}
+
+// SuspendReasonIsNil applies the IsNil predicate on the "suspend_reason" field.
+func SuspendReasonIsNil() predicate.Agent {
+	return predicate.Agent(sql.FieldIsNull(FieldSuspendReason))
+}
+
+// SuspendReasonNotNil applies the NotNil predicate on the "suspend_reason" field.
+func SuspendReasonNotNil() predicate.Agent {
+	return predicate.Agent(sql.FieldNotNull(FieldSuspendReason))
+}
+
+// SuspendReasonEqualFold applies the EqualFold predicate on the "suspend_reason" field.
+func SuspendReasonEqualFold(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldEqualFold(FieldSuspendReason, v))
+}
+
+// SuspendReasonContainsFold applies the ContainsFold predicate on the "suspend_reason" field.
+func SuspendReasonContainsFold(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldContainsFold(FieldSuspendReason, v))
+}
+
 // CurrentTurnsEQ applies the EQ predicate on the "current_turns" field.
 func CurrentTurnsEQ(v int) predicate.Agent {
 	return predicate.Agent(sql.FieldEQ(FieldCurrentTurns, v))
@@ -2491,6 +2606,81 @@ func AppliedConfigContainsFold(v string) predicate.Agent {
 	return predicate.Agent(sql.FieldContainsFold(FieldAppliedConfig, v))
 }
 
+// EffectiveConfigEQ applies the EQ predicate on the "effective_config" field.
+func EffectiveConfigEQ(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldEQ(FieldEffectiveConfig, v))
+}
+
+// EffectiveConfigNEQ applies the NEQ predicate on the "effective_config" field.
+func EffectiveConfigNEQ(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldNEQ(FieldEffectiveConfig, v))
+}
+
+// EffectiveConfigIn applies the In predicate on the "effective_config" field.
+func EffectiveConfigIn(vs ...string) predicate.Agent {
+	return predicate.Agent(sql.FieldIn(FieldEffectiveConfig, vs...))
+}
+
+// EffectiveConfigNotIn applies the NotIn predicate on the "effective_config" field.
+func EffectiveConfigNotIn(vs ...string) predicate.Agent {
+	return predicate.Agent(sql.FieldNotIn(FieldEffectiveConfig, vs...))
+}
+
+// EffectiveConfigGT applies the GT predicate on the "effective_config" field.
+func EffectiveConfigGT(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldGT(FieldEffectiveConfig, v))
+}
+
+// EffectiveConfigGTE applies the GTE predicate on the "effective_config" field.
+func EffectiveConfigGTE(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldGTE(FieldEffectiveConfig, v))
+}
+
+// EffectiveConfigLT applies the LT predicate on the "effective_config" field.
+func EffectiveConfigLT(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldLT(FieldEffectiveConfig, v))
+}
+
+// EffectiveConfigLTE applies the LTE predicate on the "effective_config" field.
+func EffectiveConfigLTE(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldLTE(FieldEffectiveConfig, v))
+}
+
+// EffectiveConfigContains applies the Contains predicate on the "effective_config" field.
+func EffectiveConfigContains(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldContains(FieldEffectiveConfig, v))
+}
+
+// EffectiveConfigHasPrefix applies the HasPrefix predicate on the "effective_config" field.
+func EffectiveConfigHasPrefix(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldHasPrefix(FieldEffectiveConfig, v))
+}
+
+// EffectiveConfigHasSuffix applies the HasSuffix predicate on the "effective_config" field.
+func EffectiveConfigHasSuffix(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldHasSuffix(FieldEffectiveConfig, v))
+}
+
+// EffectiveConfigIsNil applies the IsNil predicate on the "effective_config" field.
+func EffectiveConfigIsNil() predicate.Agent {
+	return predicate.Agent(sql.FieldIsNull(FieldEffectiveConfig))
+}
+
+// EffectiveConfigNotNil applies the NotNil predicate on the "effective_config" field.
+func EffectiveConfigNotNil() predicate.Agent {
+	return predicate.Agent(sql.FieldNotNull(FieldEffectiveConfig))
+}
+
+// EffectiveConfigEqualFold applies the EqualFold predicate on the "effective_config" field.
+func EffectiveConfigEqualFold(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldEqualFold(FieldEffectiveConfig, v))
+}
+
+// EffectiveConfigContainsFold applies the ContainsFold predicate on the "effective_config" field.
+func EffectiveConfigContainsFold(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldContainsFold(FieldEffectiveConfig, v))
+}
+
 // PendingConfigEQ applies the EQ predicate on the "pending_config" field.
 func PendingConfigEQ(v string) predicate.Agent {
 	return predicate.Agent(sql.FieldEQ(FieldPendingConfig, v))
@@ -2829,6 +3019,106 @@ func LastActivityEventIsNil() predicate.Agent {
 // LastActivityEventNotNil applies the NotNil predicate on the "last_activity_event" field.
 func LastActivityEventNotNil() predicate.Agent {
 	return predicate.Agent(sql.FieldNotNull(FieldLastActivityEvent))
+}
+
+// LastLiveProcessAtEQ applies the EQ predicate on the "last_live_process_at" field.
+func LastLiveProcessAtEQ(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldEQ(FieldLastLiveProcessAt, v))
+}
+
+// LastLiveProcessAtNEQ applies the NEQ predicate on the "last_live_process_at" field.
+func LastLiveProcessAtNEQ(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldNEQ(FieldLastLiveProcessAt, v))
+}
+
+// LastLiveProcessAtIn applies the In predicate on the "last_live_process_at" field.
+func LastLiveProcessAtIn(vs ...time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldIn(FieldLastLiveProcessAt, vs...))
+}
+
+// LastLiveProcessAtNotIn applies the NotIn predicate on the "last_live_process_at" field.
+func LastLiveProcessAtNotIn(vs ...time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldNotIn(FieldLastLiveProcessAt, vs...))
+}
+
+// LastLiveProcessAtGT applies the GT predicate on the "last_live_process_at" field.
+func LastLiveProcessAtGT(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldGT(FieldLastLiveProcessAt, v))
+}
+
+// LastLiveProcessAtGTE applies the GTE predicate on the "last_live_process_at" field.
+func LastLiveProcessAtGTE(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldGTE(FieldLastLiveProcessAt, v))
+}
+
+// LastLiveProcessAtLT applies the LT predicate on the "last_live_process_at" field.
+func LastLiveProcessAtLT(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldLT(FieldLastLiveProcessAt, v))
+}
+
+// LastLiveProcessAtLTE applies the LTE predicate on the "last_live_process_at" field.
+func LastLiveProcessAtLTE(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldLTE(FieldLastLiveProcessAt, v))
+}
+
+// LastLiveProcessAtIsNil applies the IsNil predicate on the "last_live_process_at" field.
+func LastLiveProcessAtIsNil() predicate.Agent {
+	return predicate.Agent(sql.FieldIsNull(FieldLastLiveProcessAt))
+}
+
+// LastLiveProcessAtNotNil applies the NotNil predicate on the "last_live_process_at" field.
+func LastLiveProcessAtNotNil() predicate.Agent {
+	return predicate.Agent(sql.FieldNotNull(FieldLastLiveProcessAt))
+}
+
+// LastLiveWorkAtEQ applies the EQ predicate on the "last_live_work_at" field.
+func LastLiveWorkAtEQ(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldEQ(FieldLastLiveWorkAt, v))
+}
+
+// LastLiveWorkAtNEQ applies the NEQ predicate on the "last_live_work_at" field.
+func LastLiveWorkAtNEQ(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldNEQ(FieldLastLiveWorkAt, v))
+}
+
+// LastLiveWorkAtIn applies the In predicate on the "last_live_work_at" field.
+func LastLiveWorkAtIn(vs ...time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldIn(FieldLastLiveWorkAt, vs...))
+}
+
+// LastLiveWorkAtNotIn applies the NotIn predicate on the "last_live_work_at" field.
+func LastLiveWorkAtNotIn(vs ...time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldNotIn(FieldLastLiveWorkAt, vs...))
+}
+
+// LastLiveWorkAtGT applies the GT predicate on the "last_live_work_at" field.
+func LastLiveWorkAtGT(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldGT(FieldLastLiveWorkAt, v))
+}
+
+// LastLiveWorkAtGTE applies the GTE predicate on the "last_live_work_at" field.
+func LastLiveWorkAtGTE(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldGTE(FieldLastLiveWorkAt, v))
+}
+
+// LastLiveWorkAtLT applies the LT predicate on the "last_live_work_at" field.
+func LastLiveWorkAtLT(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldLT(FieldLastLiveWorkAt, v))
+}
+
+// LastLiveWorkAtLTE applies the LTE predicate on the "last_live_work_at" field.
+func LastLiveWorkAtLTE(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldLTE(FieldLastLiveWorkAt, v))
+}
+
+// LastLiveWorkAtIsNil applies the IsNil predicate on the "last_live_work_at" field.
+func LastLiveWorkAtIsNil() predicate.Agent {
+	return predicate.Agent(sql.FieldIsNull(FieldLastLiveWorkAt))
+}
+
+// LastLiveWorkAtNotNil applies the NotNil predicate on the "last_live_work_at" field.
+func LastLiveWorkAtNotNil() predicate.Agent {
+	return predicate.Agent(sql.FieldNotNull(FieldLastLiveWorkAt))
 }
 
 // StartedAtEQ applies the EQ predicate on the "started_at" field.
@@ -3219,6 +3509,81 @@ func LaunchIDEqualFold(v string) predicate.Agent {
 // LaunchIDContainsFold applies the ContainsFold predicate on the "launch_id" field.
 func LaunchIDContainsFold(v string) predicate.Agent {
 	return predicate.Agent(sql.FieldContainsFold(FieldLaunchID, v))
+}
+
+// LaunchRunIDEQ applies the EQ predicate on the "launch_run_id" field.
+func LaunchRunIDEQ(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldEQ(FieldLaunchRunID, v))
+}
+
+// LaunchRunIDNEQ applies the NEQ predicate on the "launch_run_id" field.
+func LaunchRunIDNEQ(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldNEQ(FieldLaunchRunID, v))
+}
+
+// LaunchRunIDIn applies the In predicate on the "launch_run_id" field.
+func LaunchRunIDIn(vs ...string) predicate.Agent {
+	return predicate.Agent(sql.FieldIn(FieldLaunchRunID, vs...))
+}
+
+// LaunchRunIDNotIn applies the NotIn predicate on the "launch_run_id" field.
+func LaunchRunIDNotIn(vs ...string) predicate.Agent {
+	return predicate.Agent(sql.FieldNotIn(FieldLaunchRunID, vs...))
+}
+
+// LaunchRunIDGT applies the GT predicate on the "launch_run_id" field.
+func LaunchRunIDGT(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldGT(FieldLaunchRunID, v))
+}
+
+// LaunchRunIDGTE applies the GTE predicate on the "launch_run_id" field.
+func LaunchRunIDGTE(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldGTE(FieldLaunchRunID, v))
+}
+
+// LaunchRunIDLT applies the LT predicate on the "launch_run_id" field.
+func LaunchRunIDLT(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldLT(FieldLaunchRunID, v))
+}
+
+// LaunchRunIDLTE applies the LTE predicate on the "launch_run_id" field.
+func LaunchRunIDLTE(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldLTE(FieldLaunchRunID, v))
+}
+
+// LaunchRunIDContains applies the Contains predicate on the "launch_run_id" field.
+func LaunchRunIDContains(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldContains(FieldLaunchRunID, v))
+}
+
+// LaunchRunIDHasPrefix applies the HasPrefix predicate on the "launch_run_id" field.
+func LaunchRunIDHasPrefix(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldHasPrefix(FieldLaunchRunID, v))
+}
+
+// LaunchRunIDHasSuffix applies the HasSuffix predicate on the "launch_run_id" field.
+func LaunchRunIDHasSuffix(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldHasSuffix(FieldLaunchRunID, v))
+}
+
+// LaunchRunIDIsNil applies the IsNil predicate on the "launch_run_id" field.
+func LaunchRunIDIsNil() predicate.Agent {
+	return predicate.Agent(sql.FieldIsNull(FieldLaunchRunID))
+}
+
+// LaunchRunIDNotNil applies the NotNil predicate on the "launch_run_id" field.
+func LaunchRunIDNotNil() predicate.Agent {
+	return predicate.Agent(sql.FieldNotNull(FieldLaunchRunID))
+}
+
+// LaunchRunIDEqualFold applies the EqualFold predicate on the "launch_run_id" field.
+func LaunchRunIDEqualFold(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldEqualFold(FieldLaunchRunID, v))
+}
+
+// LaunchRunIDContainsFold applies the ContainsFold predicate on the "launch_run_id" field.
+func LaunchRunIDContainsFold(v string) predicate.Agent {
+	return predicate.Agent(sql.FieldContainsFold(FieldLaunchRunID, v))
 }
 
 // RunIDEQ applies the EQ predicate on the "run_id" field.
@@ -5794,6 +6159,156 @@ func SoftDeleteOpIDEqualFold(v string) predicate.Agent {
 // SoftDeleteOpIDContainsFold applies the ContainsFold predicate on the "soft_delete_op_id" field.
 func SoftDeleteOpIDContainsFold(v string) predicate.Agent {
 	return predicate.Agent(sql.FieldContainsFold(FieldSoftDeleteOpID, v))
+}
+
+// ActivitySinceEQ applies the EQ predicate on the "activity_since" field.
+func ActivitySinceEQ(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldEQ(FieldActivitySince, v))
+}
+
+// ActivitySinceNEQ applies the NEQ predicate on the "activity_since" field.
+func ActivitySinceNEQ(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldNEQ(FieldActivitySince, v))
+}
+
+// ActivitySinceIn applies the In predicate on the "activity_since" field.
+func ActivitySinceIn(vs ...time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldIn(FieldActivitySince, vs...))
+}
+
+// ActivitySinceNotIn applies the NotIn predicate on the "activity_since" field.
+func ActivitySinceNotIn(vs ...time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldNotIn(FieldActivitySince, vs...))
+}
+
+// ActivitySinceGT applies the GT predicate on the "activity_since" field.
+func ActivitySinceGT(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldGT(FieldActivitySince, v))
+}
+
+// ActivitySinceGTE applies the GTE predicate on the "activity_since" field.
+func ActivitySinceGTE(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldGTE(FieldActivitySince, v))
+}
+
+// ActivitySinceLT applies the LT predicate on the "activity_since" field.
+func ActivitySinceLT(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldLT(FieldActivitySince, v))
+}
+
+// ActivitySinceLTE applies the LTE predicate on the "activity_since" field.
+func ActivitySinceLTE(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldLTE(FieldActivitySince, v))
+}
+
+// ActivitySinceIsNil applies the IsNil predicate on the "activity_since" field.
+func ActivitySinceIsNil() predicate.Agent {
+	return predicate.Agent(sql.FieldIsNull(FieldActivitySince))
+}
+
+// ActivitySinceNotNil applies the NotNil predicate on the "activity_since" field.
+func ActivitySinceNotNil() predicate.Agent {
+	return predicate.Agent(sql.FieldNotNull(FieldActivitySince))
+}
+
+// LastDeliveryAtEQ applies the EQ predicate on the "last_delivery_at" field.
+func LastDeliveryAtEQ(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldEQ(FieldLastDeliveryAt, v))
+}
+
+// LastDeliveryAtNEQ applies the NEQ predicate on the "last_delivery_at" field.
+func LastDeliveryAtNEQ(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldNEQ(FieldLastDeliveryAt, v))
+}
+
+// LastDeliveryAtIn applies the In predicate on the "last_delivery_at" field.
+func LastDeliveryAtIn(vs ...time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldIn(FieldLastDeliveryAt, vs...))
+}
+
+// LastDeliveryAtNotIn applies the NotIn predicate on the "last_delivery_at" field.
+func LastDeliveryAtNotIn(vs ...time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldNotIn(FieldLastDeliveryAt, vs...))
+}
+
+// LastDeliveryAtGT applies the GT predicate on the "last_delivery_at" field.
+func LastDeliveryAtGT(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldGT(FieldLastDeliveryAt, v))
+}
+
+// LastDeliveryAtGTE applies the GTE predicate on the "last_delivery_at" field.
+func LastDeliveryAtGTE(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldGTE(FieldLastDeliveryAt, v))
+}
+
+// LastDeliveryAtLT applies the LT predicate on the "last_delivery_at" field.
+func LastDeliveryAtLT(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldLT(FieldLastDeliveryAt, v))
+}
+
+// LastDeliveryAtLTE applies the LTE predicate on the "last_delivery_at" field.
+func LastDeliveryAtLTE(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldLTE(FieldLastDeliveryAt, v))
+}
+
+// LastDeliveryAtIsNil applies the IsNil predicate on the "last_delivery_at" field.
+func LastDeliveryAtIsNil() predicate.Agent {
+	return predicate.Agent(sql.FieldIsNull(FieldLastDeliveryAt))
+}
+
+// LastDeliveryAtNotNil applies the NotNil predicate on the "last_delivery_at" field.
+func LastDeliveryAtNotNil() predicate.Agent {
+	return predicate.Agent(sql.FieldNotNull(FieldLastDeliveryAt))
+}
+
+// IdleSuspendClaimUntilEQ applies the EQ predicate on the "idle_suspend_claim_until" field.
+func IdleSuspendClaimUntilEQ(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldEQ(FieldIdleSuspendClaimUntil, v))
+}
+
+// IdleSuspendClaimUntilNEQ applies the NEQ predicate on the "idle_suspend_claim_until" field.
+func IdleSuspendClaimUntilNEQ(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldNEQ(FieldIdleSuspendClaimUntil, v))
+}
+
+// IdleSuspendClaimUntilIn applies the In predicate on the "idle_suspend_claim_until" field.
+func IdleSuspendClaimUntilIn(vs ...time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldIn(FieldIdleSuspendClaimUntil, vs...))
+}
+
+// IdleSuspendClaimUntilNotIn applies the NotIn predicate on the "idle_suspend_claim_until" field.
+func IdleSuspendClaimUntilNotIn(vs ...time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldNotIn(FieldIdleSuspendClaimUntil, vs...))
+}
+
+// IdleSuspendClaimUntilGT applies the GT predicate on the "idle_suspend_claim_until" field.
+func IdleSuspendClaimUntilGT(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldGT(FieldIdleSuspendClaimUntil, v))
+}
+
+// IdleSuspendClaimUntilGTE applies the GTE predicate on the "idle_suspend_claim_until" field.
+func IdleSuspendClaimUntilGTE(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldGTE(FieldIdleSuspendClaimUntil, v))
+}
+
+// IdleSuspendClaimUntilLT applies the LT predicate on the "idle_suspend_claim_until" field.
+func IdleSuspendClaimUntilLT(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldLT(FieldIdleSuspendClaimUntil, v))
+}
+
+// IdleSuspendClaimUntilLTE applies the LTE predicate on the "idle_suspend_claim_until" field.
+func IdleSuspendClaimUntilLTE(v time.Time) predicate.Agent {
+	return predicate.Agent(sql.FieldLTE(FieldIdleSuspendClaimUntil, v))
+}
+
+// IdleSuspendClaimUntilIsNil applies the IsNil predicate on the "idle_suspend_claim_until" field.
+func IdleSuspendClaimUntilIsNil() predicate.Agent {
+	return predicate.Agent(sql.FieldIsNull(FieldIdleSuspendClaimUntil))
+}
+
+// IdleSuspendClaimUntilNotNil applies the NotNil predicate on the "idle_suspend_claim_until" field.
+func IdleSuspendClaimUntilNotNil() predicate.Agent {
+	return predicate.Agent(sql.FieldNotNull(FieldIdleSuspendClaimUntil))
 }
 
 // HasProject applies the HasEdge predicate on the "project" edge.

@@ -46,7 +46,23 @@ declare global {
  * Go-side consistency test extracts this set with a regex that only sees
  * literals.
  */
-const DEFAULT_ON_FLAGS = new Set(['web.native_chat', 'web.agent_edit']);
+const DEFAULT_ON_FLAGS = new Set([
+  'web.native_chat',
+  'web.agent_edit',
+  'web.chat_starred_messages',
+]);
+
+/**
+ * The window event sent after the flag bag changes (server flags applied, or
+ * a flag set), so mounted components can re-read flags they depend on.
+ */
+export const FEATURE_FLAGS_CHANGED_EVENT = 'scion-feature-flags-changed';
+
+function announceFlagsChanged(): void {
+  if (typeof window.dispatchEvent === 'function') {
+    window.dispatchEvent(new Event(FEATURE_FLAGS_CHANGED_EVENT));
+  }
+}
 
 /**
  * Snapshot of `window.__SCION_FEATURES__` taken the first time
@@ -79,6 +95,7 @@ export function setServerFlags(flags: Record<string, boolean>): void {
     next[name] = value;
   }
   window.__SCION_FEATURES__ = next;
+  announceFlagsChanged();
 }
 
 /**
@@ -158,6 +175,7 @@ function warnIfShadowed(name: string): void {
 export function setFeatureFlag(name: string, enabled: boolean): void {
   if (typeof window === 'undefined') return;
   window.__SCION_FEATURES__ = { ...window.__SCION_FEATURES__, [name]: enabled };
+  announceFlagsChanged();
 }
 
 /**
@@ -189,3 +207,124 @@ export const AGENT_BADGES_FLAG = 'web.agent_badges';
  * the hub behaves the same either way. Default OFF.
  */
 export const SSE_HIDDEN_TAB_CLOSE_FLAG = 'web.sse_hidden_tab_close';
+
+/**
+ * Graphical review editor (ptone/scion#5913): a Markdown artifact review
+ * opens in a graphical editor with marks inline, where typing is recorded
+ * as suggestions, with a Graphical and Source toggle. Presentation only:
+ * every save goes through the unchanged review publish, which the hub
+ * checks. Default OFF.
+ */
+export const ARTIFACT_REVIEW_EDITOR_FLAG = 'web.artifact_review_editor';
+
+/**
+ * Manage access dialog (ptone/scion#7107): one Manage access button and
+ * dialog on the artifact page instead of Share, Grant review access and
+ * Retention…. Presentation only: every change goes through the existing
+ * routes, which the hub decides. Default OFF.
+ */
+export const ARTIFACT_MANAGE_ACCESS_FLAG = 'web.artifact_manage_access';
+
+/**
+ * Open review check (ptone/scion#6849): Review mode on the artifact page
+ * reports that a review is open, and an edit publish the hub refuses with
+ * 409 review_open shows a dialog with Wait and Publish anyway. Presentation
+ * only: the hub checks the experiment on the review-session routes and on
+ * each publish that adds a version to an artifact with a published version.
+ * Default OFF.
+ */
+export const ARTIFACTS_OPEN_REVIEW_CHECK_FLAG = 'hub.artifacts_open_review_check';
+
+/**
+ * Force user delete (ptone/scion#2143): the admin users page offers to
+ * force-delete a user who has agents and shows a deletion in
+ * progress. Presentation only: the hub checks the experiment on the force
+ * request and on the deletion resource. Default OFF.
+ */
+export const USER_DELETE_FORCE_CASCADE_FLAG = 'hub.user_delete_force_cascade';
+
+/**
+ * Chat message retention (hub.chat_retention): the Chat retention panel in
+ * Admin > Server Config and the history divider at the top of a thread
+ * whose older messages the retention policy removed. Presentation only: the
+ * hub checks the experiment in the settings API, the sweep and the history
+ * marker. Default OFF.
+ */
+export const CHAT_RETENTION_FLAG = 'hub.chat_retention';
+
+/**
+ * Welcome project (hub.welcome_project): the Welcome project step of the
+ * workstation setup wizard. Presentation only: the hub checks the
+ * experiment on the welcome preview, install and skip routes. Default OFF.
+ */
+export const WELCOME_PROJECT_FLAG = 'hub.welcome_project';
+
+/**
+ * Decisions (web.decisions, ptone/scion#8223): interactive decision cards in
+ * chat conversations, inline answering, the project and profile Decisions
+ * pages, the Decisions header and profile-nav badges, the Profile Settings
+ * Decisions card, and the coalesced decisions_waiting bell notification.
+ * Presentation only: every hub check is server-side. Default OFF.
+ */
+export const DECISIONS_FLAG = 'web.decisions';
+
+/**
+ * Whether Decisions surfaces (chat cards, project and profile Decisions pages,
+ * header/nav badges, Profile Settings card, and bell notifications) are
+ * enabled in this browser session.
+ */
+export function decisionsEnabled(): boolean {
+  return isFeatureEnabled(DECISIONS_FLAG);
+}
+
+/**
+ * Scheduled command execution (hub.exec_schedules, ptone/scion#7886):
+ * offers the `exec` event type in the recurring schedule and one-shot
+ * scheduled event create dialogs. Presentation only: the hub checks
+ * `hub.exec_schedules` (and conduit exec control) on create, PATCH, and
+ * resume. Default OFF.
+ */
+export const EXEC_SCHEDULES_FLAG = 'hub.exec_schedules';
+
+/** Whether authoring `exec` schedules and events is offered in this session. */
+export function execSchedulesEnabled(): boolean {
+  return isFeatureEnabled(EXEC_SCHEDULES_FLAG);
+}
+
+/**
+ * Workload Identity setup for minted service accounts
+ * (hub.k8s_workload_identity_setup, ptone/scion#3329 phase 5): shows the
+ * per-target Workload Identity binding lines in the service account mint
+ * dialog and the Workload Identity binding column and per-target details in
+ * the service account status view. Presentation only: the hub checks the
+ * experiment server-side before making any IAM grant or reading IAM policy.
+ * Default OFF.
+ */
+export const K8S_WORKLOAD_IDENTITY_SETUP_FLAG = 'hub.k8s_workload_identity_setup';
+
+/** Whether Workload Identity setup UI surfaces are enabled in this session. */
+export function k8sWorkloadIdentitySetupEnabled(): boolean {
+  return isFeatureEnabled(K8S_WORKLOAD_IDENTITY_SETUP_FLAG);
+}
+
+/**
+ * Idle suspend and auto-wake (lifecycle.idle_suspend, ptone/scion#7826):
+ * offers "Keep suspended" on an agent the hub suspended (reason idle or
+ * stalled), which converts it to a user suspension. Presentation only: the
+ * hub checks the experiment before converting. Default OFF.
+ */
+export const IDLE_SUSPEND_FLAG = 'lifecycle.idle_suspend';
+
+/** Whether idle-suspend UI surfaces are enabled in this session. */
+export function idleSuspendEnabled(): boolean {
+  return isFeatureEnabled(IDLE_SUSPEND_FLAG);
+}
+
+/**
+ * Effective permissions viewer (hub.effective_permissions, ptone/scion#8439):
+ * shows the two-tab Roles dialog (Effective roles + Effective permissions) on
+ * the admin Users page. Presentation only: the hub gates GET/HEAD
+ * /api/v1/admin/effective-permissions with requireExperiment (404 while off).
+ * Default OFF.
+ */
+export const EFFECTIVE_PERMISSIONS_FLAG = 'hub.effective_permissions';

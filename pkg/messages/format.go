@@ -16,6 +16,7 @@ package messages
 
 import (
 	"encoding/json"
+	"strings"
 )
 
 const (
@@ -41,6 +42,33 @@ const (
 	// MetadataSenderDisplay is the visitor's display label, as in
 	// "alice@corp.example (visitor via idp.example)".
 	MetadataSenderDisplay = "sender_display"
+)
+
+// MetadataSenderTimezone is the IANA time zone name from a human sender's
+// user profile, as stored, so the recipient agent can read times the
+// sender mentions in the sender's own zone. Only the hub sets it: the hub
+// strips any client-supplied value (messaging.StripReservedMetadata) and
+// sets it on a message from a human user whose profile has a time zone.
+// It is absent when the profile has none and when the sender is not a
+// human user.
+const MetadataSenderTimezone = "sender_timezone"
+
+// Decision response metadata (design choices v4, 4.4): the hub sets these on
+// the decision-response message it delivers to the asking agent and strips
+// any client-supplied value (messaging.StripReservedMetadata).
+const (
+	MetadataDecisionKey        = "decision_key"
+	MetadataDecisionVersion    = "decision_version"
+	MetadataChoiceID           = "choice_id"
+	MetadataDecisionProvenance = "decision_provenance"
+	MetadataDecisionOtherText  = "decision_other_text"
+	// MetadataDecisionBatch and MetadataDecisionAnswers are set instead of the
+	// five keys above on the response of a set submit (design choices v5,
+	// 5.1): the batch id and a compact key@version=choiceId list (or JSON
+	// entries on a dismissal, alongside MetadataDecisionDismissReason).
+	MetadataDecisionBatch         = "decision_batch"
+	MetadataDecisionAnswers       = "decision_answers"
+	MetadataDecisionDismissReason = "decision_dismiss_reason"
 )
 
 // deliveryMetadataAllowlist defines the metadata keys that are forwarded to
@@ -70,6 +98,17 @@ var deliveryMetadataAllowlist = map[string]bool{
 	MetadataSenderEmail:   true,
 	MetadataSenderIssuer:  true,
 	MetadataSenderDisplay: true,
+	// Hub-set only (see MetadataSenderTimezone).
+	MetadataSenderTimezone: true,
+	// Hub-set only (see MetadataDecisionKey).
+	MetadataDecisionKey:           true,
+	MetadataDecisionVersion:       true,
+	MetadataChoiceID:              true,
+	MetadataDecisionProvenance:    true,
+	MetadataDecisionOtherText:     true,
+	MetadataDecisionBatch:         true,
+	MetadataDecisionAnswers:       true,
+	MetadataDecisionDismissReason: true,
 }
 
 // deliveryMessage is the subset of StructuredMessage fields delivered to the agent.
@@ -96,6 +135,7 @@ func FormatForDelivery(msg *StructuredMessage) string {
 		return msg.Msg
 	}
 
+	allowTriggerCategory := msg.Type == TypeSystem && msg.Sender == "trigger" && msg.SenderID == "TRIGGER"
 	dm := deliveryMessage{
 		Timestamp:   msg.Timestamp,
 		Sender:      msg.Sender,
@@ -107,7 +147,7 @@ func FormatForDelivery(msg *StructuredMessage) string {
 		Attachments: msg.Attachments,
 		Channel:     msg.Channel,
 		ThreadID:    msg.ThreadID,
-		Metadata:    filterMetadata(msg.Metadata),
+		Metadata:    filterMetadataForDelivery(msg.Metadata, allowTriggerCategory),
 	}
 
 	jsonBytes, err := json.MarshalIndent(dm, "", "  ")
@@ -120,16 +160,25 @@ func FormatForDelivery(msg *StructuredMessage) string {
 }
 
 // filterMetadata returns a copy of m containing only the keys in
-// deliveryMetadataAllowlist. Returns nil when no keys match.
+// deliveryMetadataAllowlist (excluding hub-minted system_category="trigger").
+// Returns nil when no keys match.
 func filterMetadata(m map[string]string) map[string]string {
+	return filterMetadataForDelivery(m, false)
+}
+
+func filterMetadataForDelivery(m map[string]string, allowTriggerCategory bool) map[string]string {
 	var filtered map[string]string
 	for k, v := range m {
-		if deliveryMetadataAllowlist[k] {
-			if filtered == nil {
-				filtered = make(map[string]string)
-			}
-			filtered[k] = v
+		if !deliveryMetadataAllowlist[k] {
+			continue
 		}
+		if k == "system_category" && strings.EqualFold(strings.TrimSpace(v), SystemCategoryTrigger) && !allowTriggerCategory {
+			continue
+		}
+		if filtered == nil {
+			filtered = make(map[string]string)
+		}
+		filtered[k] = v
 	}
 	return filtered
 }

@@ -131,9 +131,10 @@ func (s *Server) drainBrokerDispatch(ctx context.Context, brokerID string, only 
 		result, execErr := s.execDispatch(dispatchCtx, d)
 		if execErr != nil {
 			s.agentLifecycleLog.Warn("reconcile: dispatch op failed", append(initiatorLogArgs, "error", execErr)...)
-			// The error text stays execErr.Error(): nodes that predate the
-			// result envelope read only that column.
-			if err := s.store.FailBrokerDispatch(ctx, d.ID, execErr.Error(), dispatchFailureResult(execErr)); err != nil {
+			// The error text is execErr's text with a broker answer's code
+			// and filtered message (dispatchFailureText), never its body:
+			// nodes that predate the result envelope read only that column.
+			if err := s.store.FailBrokerDispatch(ctx, d.ID, dispatchFailureText(execErr), dispatchFailureResult(execErr)); err != nil {
 				s.agentLifecycleLog.Error("reconcile: fail dispatch failed", "id", d.ID, "error", err)
 			}
 			if rec := s.dispatchMetrics; rec != nil {
@@ -263,6 +264,9 @@ func (s *Server) execDispatchStart(ctx context.Context, d store.BrokerDispatch) 
 		opts.Kind = args.Kind
 		opts.PriorPhase = args.PriorPhase
 	}
+	// The warning for secrets the start goes without is worded for the
+	// requester, recorded on the row as its initiator (skippedSecretAudienceIsOwner).
+	ctx = withDispatchRowInitiator(ctx, &d)
 	ctx, warns := withDispatchWarnings(ctx)
 	// A dispatcher that takes start options gets the intent's options (and
 	// may return an accepted launch); any other runs the synchronous start
@@ -379,7 +383,7 @@ func (s *Server) execDispatchStop(ctx context.Context, d store.BrokerDispatch) (
 	}
 	if intentAt != nil {
 		// The queued stop has now been applied: release the per-broker
-		// reservation as a direct stop does, and replace the stop_queued
+		// and per-project reservations as a direct stop does, and replace the stop_queued
 		// container status and the queued-stop notice the offline stop set.
 		// Both only while the row still holds the run the stop was queued
 		// for (agent.RunID, the intent's run): a newer run keeps its state
@@ -395,11 +399,13 @@ func (s *Server) execDispatchStop(ctx context.Context, d store.BrokerDispatch) (
 			}
 			if recorded {
 				s.releaseBrokerQuota(ctx, agent)
+				s.releaseProjectQuota(ctx, agent)
 			}
 		} else if s.stopRunStillCurrent(ctx, agent.ID, agent.RunID, "queued stop") {
 			// A check, not a lock: a run minted between this read and the
 			// release loses its reservation until the backfill restores it.
 			s.releaseBrokerQuota(ctx, agent)
+			s.releaseProjectQuota(ctx, agent)
 		}
 		// The start claim held when the stop was recorded is superseded
 		// (compare-and-set on the stop's intent time, whatever the run). It
@@ -423,6 +429,9 @@ func (s *Server) execDispatchRestart(ctx context.Context, d store.BrokerDispatch
 	if dispatcher == nil {
 		return "", fmt.Errorf("no dispatcher available")
 	}
+	// The warning for secrets the restart goes without is worded for the
+	// requester, recorded on the row as its initiator (skippedSecretAudienceIsOwner).
+	ctx = withDispatchRowInitiator(ctx, &d)
 	ctx, warns := withDispatchWarnings(ctx)
 	if err := dispatcher.DispatchAgentRestart(ctx, agent); err != nil {
 		return "", fmt.Errorf("dispatch restart: %w", err)
@@ -444,7 +453,18 @@ func (s *Server) execDispatchDelete(ctx context.Context, d store.BrokerDispatch)
 		// that records its target is still sent from the intent alone
 		// (ptone/scion#3665); any other intent fails, as before.
 		if target, ok := deleteIntentTargetAgent(d, args); ok {
-			s.pinRowlessDeleteTarget(ctx, target)
+			if pin := args.Target.Pin; pin != nil {
+				// The pin the intent recorded: the dispatcher's
+				// placement check compares it with the Runtime Broker
+				// row as it is now (ptone/scion#4957).
+				target.PinnedRuntimeBrokerID = pin.RuntimeBrokerID
+				target.PinnedRuntimeTargetID = pin.RuntimeTargetID
+				target.PinnedRuntimeTargetType = pin.RuntimeTargetType
+			} else {
+				// No pin recorded (an unpinned agent, or an intent
+				// written by an older hub): inferred from the row.
+				s.pinRowlessDeleteTarget(ctx, target)
+			}
 			agent, err = target, nil
 		}
 	}
@@ -547,9 +567,23 @@ func deleteIntentTargetAgent(d store.BrokerDispatch, args *DeleteDispatchArgs) (
 	}, true
 }
 
+// deleteIntentPinOf is the pin a delete intent records for agent
+// (DeleteIntentTarget.Pin): nil when the agent is not pinned.
+func deleteIntentPinOf(agent *store.Agent) *DeleteIntentPin {
+	if !agent.IsPinned() {
+		return nil
+	}
+	return &DeleteIntentPin{
+		RuntimeBrokerID:   agent.PinnedRuntimeBrokerID,
+		RuntimeTargetID:   agent.PinnedRuntimeTargetID,
+		RuntimeTargetType: agent.PinnedRuntimeTargetType,
+	}
+}
+
 // pinRowlessDeleteTarget gives a rowless delete target
-// (deleteIntentTargetAgent) the pin of its Runtime Broker when that row is
-// flat. The intent names exactly that Runtime Broker (d.BrokerID), and a
+// (deleteIntentTargetAgent) whose intent recorded no pin (an unpinned
+// agent, or an intent written by an older hub) the pin of its Runtime
+// Broker when that row is flat. The intent names exactly that Runtime Broker (d.BrokerID), and a
 // flat Runtime Broker serves one runtime target that never changes, so
 // this is the agent's saved placement, not a guess; without it the
 // dispatcher's placement backstop would read the target as an unpinned
@@ -630,6 +664,9 @@ func (s *Server) execDispatchFinalizeEnv(ctx context.Context, d store.BrokerDisp
 			return "", fmt.Errorf("unmarshal finalize_env args: %w", err)
 		}
 		env = args.Env
+		if len(args.HomeFiles) > 0 {
+			ctx = WithCreateHomeFiles(ctx, args.HomeFiles)
+		}
 	}
 	ctx, warns := withDispatchWarnings(ctx)
 	// The requesting node keeps the agent when its wait for this
@@ -655,6 +692,15 @@ func (s *Server) execDispatchCreate(ctx context.Context, d store.BrokerDispatch)
 	dispatcher := s.GetDispatcher()
 	if dispatcher == nil {
 		return "", fmt.Errorf("no dispatcher available")
+	}
+	if d.Args != "" {
+		args, err := UnmarshalCreateArgs(d.Args)
+		if err != nil {
+			return "", fmt.Errorf("unmarshal create args: %w", err)
+		}
+		if len(args.HomeFiles) > 0 {
+			ctx = WithCreateHomeFiles(ctx, args.HomeFiles)
+		}
 	}
 	ctx, warns := withDispatchWarnings(ctx)
 	// The requesting node keeps the agent when its wait for this
@@ -714,5 +760,5 @@ func (s *Server) deliverMessage(ctx context.Context, m *store.Message) error {
 	if dispatcher == nil {
 		return fmt.Errorf("no dispatcher available for message delivery")
 	}
-	return dispatcher.DispatchAgentMessage(ctx, agent, m.Msg, effectiveInterrupt(agent, m.Urgent), nil)
+	return dispatchMarkedAgentMessage(ctx, s.deliveryMarker(), nil, nil, dispatcher, agent, m.Msg, m.Urgent, nil)
 }

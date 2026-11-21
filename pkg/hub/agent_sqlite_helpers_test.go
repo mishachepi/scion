@@ -244,8 +244,7 @@ func compactSetup(t *testing.T) *compactFixture {
 	superAdmin, err := s.GetUser(ctx, superAdminID)
 	require.NoError(t, err)
 
-	agentTok, err := srv.GetAgentTokenService().GenerateAgentToken(f.agents[0].ID, f.project.ID, []AgentTokenScope{ScopeProjectRead}, nil)
-	require.NoError(t, err)
+	agentTok := srv.generateRecordedAgentToken(t, f.agents[0].ID, f.project.ID, []AgentTokenScope{ScopeProjectRead}, nil)
 	uatKey := mintScopedUAT(t, srv, f.owner.ID, f.project.ID, []string{"agent:manage"})
 
 	asUser := func(u *store.User) func(t *testing.T, path string) *httptest.ResponseRecorder {
@@ -306,20 +305,6 @@ func dropParam(query, name string) string {
 	return strings.Join(kept, "&")
 }
 
-func decodeObject(t *testing.T, body []byte) map[string]json.RawMessage {
-	t.Helper()
-	var m map[string]json.RawMessage
-	require.NoError(t, json.Unmarshal(body, &m), string(body))
-	return m
-}
-
-func decodeItems(t *testing.T, raw json.RawMessage) []map[string]json.RawMessage {
-	t.Helper()
-	var items []map[string]json.RawMessage
-	require.NoError(t, json.Unmarshal(raw, &items))
-	return items
-}
-
 // createFixtureAgent stores an agent in the fixture project with the given
 // ancestry and applied role.
 func createFixtureAgent(t *testing.T, f *bypassAgentsFixture, name string, ancestry []string, role AgentRole) *store.Agent {
@@ -338,14 +323,11 @@ func createFixtureAgent(t *testing.T, f *bypassAgentsFixture, name string, ances
 // ScopeAgentCreate.
 func createAsAgent(t *testing.T, f *bypassAgentsFixture, agentID string, req CreateAgentRequest) *httptest.ResponseRecorder {
 	t.Helper()
-	svc := f.srv.GetAgentTokenService()
-	require.NotNil(t, svc)
 	stored, err := f.store.GetAgent(context.Background(), agentID)
 	require.NoError(t, err)
 	role, _ := agentRoleAndScopes(stored)
 	scopes := append([]AgentTokenScope{ScopeProjectRead, ScopeAgentCreate}, ScopesForRole(role)...)
-	tok, err := svc.GenerateAgentToken(agentID, f.proj.ID, scopes, nil)
-	require.NoError(t, err)
+	tok := f.srv.generateRecordedAgentToken(t, agentID, f.proj.ID, scopes, nil)
 	return doRequestWithAgentToken(t, f.srv, http.MethodPost, "/api/v1/projects/"+f.proj.ID+"/agents", req, tok)
 }
 
@@ -713,37 +695,17 @@ type revokeFailingCredentialStore struct {
 	failWith error
 }
 
-// apiErrorBody mirrors the JSON shape written by writeError, for assertions
-// on the error code and message returned to the client.
-type apiErrorBody struct {
-	Error struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
-	} `json:"error"`
-}
-
-func decodeAPIError(t *testing.T, body []byte) apiErrorBody {
-	t.Helper()
-	var resp apiErrorBody
-	require.NoError(t, json.Unmarshal(body, &resp))
-	return resp
-}
-
 // buildAgentRefreshRequest constructs a POST .../token/refresh request whose
-// context carries the given agent identity and optional credential markers,
+// context carries the given agent identity and optional credential ID marker,
 // without routing it through UnifiedAuthMiddleware, so the refresh handler's
-// own status evaluation (including the "marker absent" fallback) can be
-// exercised directly and deterministically.
-func buildAgentRefreshRequest(agentID string, claims *AgentTokenClaims, credentialID string, legacy bool) *http.Request {
+// own status evaluation can be exercised directly and deterministically.
+func buildAgentRefreshRequest(agentID string, claims *AgentTokenClaims, credentialID string) *http.Request {
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+agentID+"/token/refresh", nil)
 	ctx := req.Context()
 	identity := &agentIdentityWrapper{claims}
 	ctx = contextWithIdentity(ctx, identity)
 	if credentialID != "" {
 		ctx = context.WithValue(ctx, agentCredentialIDContextKey{}, credentialID)
-	}
-	if legacy {
-		ctx = context.WithValue(ctx, legacyTokenContextKey{}, true)
 	}
 	return req.WithContext(ctx)
 }
@@ -944,28 +906,6 @@ func waitDelete(t *testing.T, ch <-chan deleteResult, within time.Duration) dele
 		t.Fatalf("DELETE did not answer within %s", within)
 		return deleteResult{}
 	}
-}
-
-func waitClosed(t *testing.T, ch <-chan struct{}, within time.Duration, what string) {
-	t.Helper()
-	select {
-	case <-ch:
-	case <-time.After(within):
-		t.Fatalf("timed out waiting for %s", what)
-	}
-}
-
-// errorBody decodes the standard error envelope.
-func errorBody(t *testing.T, rec *httptest.ResponseRecorder) (string, map[string]interface{}) {
-	t.Helper()
-	var body struct {
-		Error struct {
-			Code    string                 `json:"code"`
-			Details map[string]interface{} `json:"details"`
-		} `json:"error"`
-	}
-	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body), rec.Body.String())
-	return body.Error.Code, body.Error.Details
 }
 
 // agentGone reports whether the row is hard-deleted.
@@ -1364,17 +1304,6 @@ func sendViaStructured(t *testing.T, srv *Server, sender, target *store.Agent, m
 	rr := httptest.NewRecorder()
 	srv.handleAgentMessage(rr, req, target.ID)
 	return rr
-}
-
-// captureSlogDefault swaps slog's default logger for a text handler writing
-// to the returned buffer, and restores the previous default on test cleanup.
-func captureSlogDefault(t *testing.T) *bytes.Buffer {
-	t.Helper()
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
-	t.Cleanup(func() { slog.SetDefault(prev) })
-	return &buf
 }
 
 var errInjectedLookup = errors.New("injected lookup fault")
@@ -1967,10 +1896,6 @@ func sessionProv(userID string) store.AuthorityProvenance {
 	}
 }
 
-func withCursor(query, cursor string) string {
-	return query + "&cursor=" + url.QueryEscape(cursor)
-}
-
 // globalCallSpyStore counts every store read the global sorted path can make.
 type globalCallSpyStore struct {
 	store.Store
@@ -2054,17 +1979,6 @@ func globalSortedSetup(t *testing.T) *globalSortedFixture {
 	createTestUserWithProjectRole(t, s, adminID, "sg-admin@test.com", project.ID, store.ProjectRoleAdmin)
 
 	return &globalSortedFixture{srv: srv, store: s, admin: admin, project: project}
-}
-
-func decodeErrorMessage(t *testing.T, body []byte) string {
-	t.Helper()
-	var e struct {
-		Error struct {
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	require.NoError(t, json.Unmarshal(body, &e))
-	return e.Error.Message
 }
 
 // assertResponsesEqualIgnoringServerTime compares two ListAgentsResponse
@@ -2740,6 +2654,10 @@ func (runIntentErrStore) SwapRunIntent(context.Context, string, store.RunIntent)
 	return "", time.Time{}, errors.New("injected run intent fault")
 }
 
+func (runIntentErrStore) SwapSystemRunIntent(context.Context, string, store.RunIntent) (store.RunIntent, time.Time, error) {
+	return "", time.Time{}, errors.New("injected run intent fault")
+}
+
 // ClaimAgentStart fails too: a create-and-start records its run intent with
 // its start claim.
 func (runIntentErrStore) ClaimAgentStart(context.Context, string, string, store.StartClaimKind, string, time.Duration) (store.StartClaim, error) {
@@ -3374,11 +3292,7 @@ func (o *ownerChangingAfterMembersStore) ListAgentMembers(ctx context.Context, f
 // the sortedListFixture's project.
 func (f *sortedListFixture) agentJWTFor(t *testing.T, agentID string) string {
 	t.Helper()
-	svc := f.srv.GetAgentTokenService()
-	require.NotNil(t, svc)
-	tok, err := svc.GenerateAgentToken(agentID, f.project.ID, []AgentTokenScope{ScopeProjectRead}, nil)
-	require.NoError(t, err)
-	return tok
+	return f.srv.generateRecordedAgentToken(t, agentID, f.project.ID, []AgentTokenScope{ScopeProjectRead}, nil)
 }
 
 func (f *sortedListFixture) listPath(query string) string {
@@ -3555,12 +3469,11 @@ func (f *mintFixture) tokenClaims(t *testing.T, token string) *AgentTokenClaims 
 // given presented ancestry.
 func (f *mintFixture) refresh(t *testing.T, agent *store.Agent, presentedAncestry []string) *httptest.ResponseRecorder {
 	t.Helper()
-	presented, err := f.srv.agentTokenService.GenerateAgentToken(agent.ID, f.projectID,
+	presented := f.srv.generateRecordedAgentToken(t, agent.ID, f.projectID,
 		[]AgentTokenScope{ScopeAgentStatusUpdate, ScopeAgentTokenRefresh}, presentedAncestry)
-	require.NoError(t, err)
 	claims := f.tokenClaims(t, presented)
 	rec := httptest.NewRecorder()
-	f.srv.handleAgentTokenRefresh(rec, buildAgentRefreshRequest(agent.ID, claims, "", false), agent.ID)
+	f.srv.handleAgentTokenRefresh(rec, buildAgentRefreshRequest(agent.ID, claims, ""), agent.ID)
 	return rec
 }
 
@@ -3694,7 +3607,7 @@ type viewPair struct {
 // item when every field is populated.
 var compactItemAllowlist = []string{
 	"id", "slug", "name", "template", "projectId", "project", "projectSlug", "labels",
-	"phase", "activity", "containerStatus", "message", "messageMode", "ancestry",
+	"phase", "activity", "suspendReason", "containerStatus", "message", "messageMode", "ancestry",
 	"createdBy", "creatorName", "created", "updated", "lastActivityEvent",
 	"_capabilities", "_messageability", "deletion", "harnessVendor", "modelSize",
 }

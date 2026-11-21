@@ -43,10 +43,19 @@ var fc4aRows = map[string]map[string]string{
 		"type": fc4AsIs, "display_name": fc4AsIs, "namespace": fc4AsIs,
 		"context": fc4Never, "kubeconfig": fc4Never,
 		"kubernetes_service_account_mappings": fc4Never, "kubernetes_block_service_account": fc4Never,
+		"workload_identity_pool": fc4Never, "create_service_accounts": fc4Never,
 		"gke": fc4AsIs, "priority_class_name": fc4AsIs, "shared_dir_storage_class": fc4AsIs,
 		"shared_dir_size": fc4AsIs, "safe_to_evict": fc4AsIs,
 		"shared_dir_storage_backend": fc4AsIs, "shared_dir_storage_backends": fc4AsIs,
 		"home_storage_backend": fc4AsIs, "home_storage_leaf": fc4Never,
+		"node_selector": fc4AsIs, "tolerations": fc4AsIs, "runtime_class_name": fc4AsIs,
+		// Cloud Run (contract amendment P5-CR, CR8; Identity Part B). region is
+		// published as is; project_id, service_account, block_service_account,
+		// assignable_service_accounts, network, subnetwork and credentials_file
+		// are never published.
+		"project_id": fc4Never, "region": fc4AsIs, "service_account": fc4Never,
+		"block_service_account": fc4Never, "assignable_service_accounts": fc4Never,
+		"network": fc4Never, "subnetwork": fc4Never, "credentials_file": fc4Never,
 	},
 	"agent_defaults": {
 		"default_harness_config": fc4AsIs, "image_registry": fc4AsIs, "clone_depth": fc4AsIs,
@@ -65,6 +74,13 @@ var fc4aRows = map[string]map[string]string{
 		"image": fc4AsIs, "image_pull_policy": fc4AsIs, "auth_selected_type": fc4AsIs, "user": fc4AsIs,
 		"env": fc4KeysOnly, "volumes": fc4Partial, "resources": fc4AsIs,
 	},
+}
+
+// fc4aMarkers are presentation fields that publish no source field: the
+// placement_reported marker, which says whether the instance reports
+// placement at all (FC4-a amendment).
+var fc4aMarkers = map[string][]string{
+	"runtime_target": {"placement_reported"},
 }
 
 // fc4aSources and fc4aPresentations name the source struct of each row
@@ -125,6 +141,7 @@ func TestPresentInstance_EveryFieldHasAnFC4aRow(t *testing.T) {
 				published = append(published, name)
 			}
 		}
+		published = append(published, fc4aMarkers[group]...)
 		sort.Strings(published)
 		if got := tagNames(fc4aPresentations[group], "json"); !reflect.DeepEqual(got, published) {
 			t.Errorf("%s: presentation fields %v, published rows %v", group, got, published)
@@ -149,10 +166,21 @@ func fullyPopulatedInstance() V1RuntimeBrokerInstanceConfig {
 			Context: "NEVER-context", Kubeconfig: "/NEVER-kubeconfig",
 			KubernetesBlockServiceAccount:    "NEVER-block-sa",
 			KubernetesServiceAccountMappings: map[string]string{"NEVER-gsa@example.iam.gserviceaccount.com": "NEVER-ksa"},
+			CreateServiceAccounts:            true,
 			GKE:                              true, PriorityClassName: "agents-high",
 			SharedDirStorageClass: "standard-rwx", SharedDirSize: "40Gi", SafeToEvict: &evict,
 			SharedDirStorageBackend: "nfs", SharedDirStorageBackends: map[string]string{"data": "local"},
 			HomeStorageBackend: "nfs", HomeStorageLeaf: "NEVER-leaf",
+			NodeSelector:              map[string]string{"scion.dev/pool": "agents"},
+			Tolerations:               []api.K8sToleration{{Key: "scion.dev/pool", Operator: "Equal", Value: "agents", Effect: "NoSchedule"}},
+			RuntimeClassName:          "gvisor",
+			ProjectID:                 "NEVER-project-id",
+			ServiceAccount:            "NEVER-sa@example.iam.gserviceaccount.com",
+			BlockServiceAccount:       "NEVER-block-sa@example.iam.gserviceaccount.com",
+			AssignableServiceAccounts: []string{"NEVER-assign-sa@example.iam.gserviceaccount.com"},
+			Network:                   "NEVER-network",
+			Subnetwork:                "NEVER-subnetwork",
+			CredentialsFile:           "/NEVER-credentials.json",
 		},
 		AgentDefaults: &V1InstanceAgentDefaults{
 			DefaultHarnessConfig: "claude", ImageRegistry: "registry.example/team", CloneDepth: "full",
@@ -185,6 +213,9 @@ func TestPresentInstance_RedactsEveryFC4aRow(t *testing.T) {
 			PriorityClassName: "agents-high", SharedDirStorageClass: "standard-rwx", SharedDirSize: "40Gi",
 			SafeToEvict: &evict, SharedDirStorageBackend: "nfs", SharedDirStorageBackends: map[string]string{"data": "local"},
 			HomeStorageBackend: "nfs",
+			NodeSelector:       map[string]string{"scion.dev/pool": "agents"},
+			Tolerations:        []api.K8sToleration{{Key: "scion.dev/pool", Operator: "Equal", Value: "agents", Effect: "NoSchedule"}},
+			RuntimeClassName:   "gvisor", PlacementReported: true,
 		},
 		AgentDefaults: &FlatAgentDefaultsPresentation{
 			DefaultHarnessConfig: "claude", ImageRegistry: "registry.example/team", CloneDepth: "full",
@@ -214,8 +245,8 @@ func TestPresentInstance_RedactsEveryFC4aRow(t *testing.T) {
 	// The source really holds every never-published value, so the check
 	// above is not vacuous.
 	src, _ := json.Marshal(inst)
-	if n := strings.Count(string(src), "NEVER-"); n != 21 {
-		t.Fatalf("the source holds %d never-published values, want 21: %s", n, src)
+	if n := strings.Count(string(src), "NEVER-"); n != 28 {
+		t.Fatalf("the source holds %d never-published values, want 28: %s", n, src)
 	}
 }
 
@@ -243,6 +274,8 @@ func TestPresentInstance_SharesNothingWithSource(t *testing.T) {
 	before, _ := json.Marshal(got)
 	inst.RuntimeTarget.SharedDirStorageBackends["data"] = "nfs"
 	*inst.RuntimeTarget.SafeToEvict = true
+	inst.RuntimeTarget.NodeSelector["scion.dev/pool"] = "changed"
+	inst.RuntimeTarget.Tolerations[0].Value = "changed"
 	inst.AgentDefaults.Resources.Requests.CPU = "9"
 	inst.AgentDefaults.Volumes[0].Target = "/changed"
 	ho := inst.AgentDefaults.HarnessOverrides["claude"]
@@ -253,5 +286,99 @@ func TestPresentInstance_SharesNothingWithSource(t *testing.T) {
 	}
 	if p := PresentInstance(V1RuntimeBrokerInstanceConfig{Key: "a", Name: "b"}); p.RuntimeTarget != nil || p.AgentDefaults != nil {
 		t.Fatalf("got %+v", p)
+	}
+}
+
+// TestPresentInstance_CloudRunRedaction verifies CR8 and Identity Part B: for a
+// cloudrun target, region is published as is (both in PresentInstance and on
+// the wire via API), while the seven "never" fields (project_id,
+// service_account, block_service_account, assignable_service_accounts,
+// credentials_file, network, subnetwork) are absent. For non-cloudrun targets,
+// region is never populated.
+func TestPresentInstance_CloudRunRedaction(t *testing.T) {
+	inst := V1RuntimeBrokerInstanceConfig{
+		Key:  "cr-us-central1",
+		Name: "cr us-central1",
+		RuntimeTarget: &V1RuntimeTargetConfig{
+			Type:                      RuntimeTargetTypeCloudRun,
+			DisplayName:               "Cloud Run",
+			Region:                    "us-central1",
+			ProjectID:                 "NEVER-project-id",
+			ServiceAccount:            "NEVER-sa@example.iam.gserviceaccount.com",
+			BlockServiceAccount:       "NEVER-block-sa@example.iam.gserviceaccount.com",
+			AssignableServiceAccounts: []string{"NEVER-assign-sa@example.iam.gserviceaccount.com"},
+			Network:                   "NEVER-network",
+			Subnetwork:                "NEVER-subnetwork",
+			CredentialsFile:           "/NEVER-credentials.json",
+		},
+	}
+
+	got := PresentInstance(inst)
+	want := FlatInstancePresentation{
+		Key:  "cr-us-central1",
+		Name: "cr us-central1",
+		RuntimeTarget: &FlatRuntimeTargetPresentation{
+			Type:              RuntimeTargetTypeCloudRun,
+			DisplayName:       "Cloud Run",
+			Region:            "us-central1",
+			PlacementReported: false,
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		gj, _ := json.MarshalIndent(got, "", "  ")
+		t.Fatalf("cloudrun presentation:\n%s", gj)
+	}
+
+	wire := got.API()
+	if wire.Target == nil || wire.Target.Region != "us-central1" {
+		t.Fatalf("wire Target = %+v, want Region = us-central1", wire.Target)
+	}
+	for label, v := range map[string]any{"config": got, "wire": wire} {
+		raw, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("%s marshal: %v", label, err)
+		}
+		if !strings.Contains(string(raw), `"region":"us-central1"`) {
+			t.Errorf("%s JSON missing region: %s", label, raw)
+		}
+		if strings.Contains(string(raw), "NEVER-") {
+			t.Errorf("%s JSON leaked a CR8 never-published value: %s", label, raw)
+		}
+		var decoded any
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			t.Fatalf("%s unmarshal: %v", label, err)
+		}
+		keys, secretKeys := map[string]bool{}, map[string]bool{}
+		collectKeys(decoded, "", keys, secretKeys)
+		for _, k := range []string{
+			"project_id", "projectId",
+			"service_account", "serviceAccount",
+			"block_service_account", "blockServiceAccount",
+			"assignable_service_accounts", "assignableServiceAccounts",
+			"credentials_file", "credentialsFile",
+			"network", "subnetwork",
+		} {
+			if keys[k] {
+				t.Errorf("%s JSON contains CR8 never-published key %q: %s", label, k, raw)
+			}
+		}
+	}
+
+	// Non-cloudrun targets never populate Region in PresentInstance or API().
+	for _, typ := range []string{RuntimeTargetTypeDocker, RuntimeTargetTypeKubernetes} {
+		nonCR := PresentInstance(V1RuntimeBrokerInstanceConfig{
+			Key: "k", Name: "k",
+			RuntimeTarget: &V1RuntimeTargetConfig{Type: typ, Region: "us-central1"},
+		})
+		if nonCR.RuntimeTarget.Region != "" {
+			t.Errorf("%s PresentInstance Region = %q, want empty", typ, nonCR.RuntimeTarget.Region)
+		}
+		manual := FlatInstancePresentation{
+			Key: "k", Name: "k",
+			RuntimeTarget: &FlatRuntimeTargetPresentation{Type: typ, Region: "us-central1"},
+		}.API()
+		if manual.Target.Region != "" {
+			t.Errorf("%s API() Region = %q, want empty", typ, manual.Target.Region)
+		}
 	}
 }

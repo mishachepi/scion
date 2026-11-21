@@ -403,6 +403,20 @@ func TestIsWorkspaceEmpty(t *testing.T) {
 		}
 	})
 
+	// A workspace whose only entry is an exact-name ".agents" SYMLINK is
+	// not empty: a symlink is never a marker, even one that points at a
+	// directory.
+	t.Run("directory with only an exact-name .agents symlink", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		target := t.TempDir()
+		if err := os.Symlink(target, filepath.Join(tmpDir, ".agents")); err != nil {
+			t.Skipf("cannot create symlink: %v", err)
+		}
+		if isWorkspaceEmpty(tmpDir) {
+			t.Error("expected false when the workspace's only entry is a .agents symlink")
+		}
+	})
+
 	t.Run("directory with only .scion-volumes", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		_ = os.MkdirAll(filepath.Join(tmpDir, ".scion-volumes"), 0755)
@@ -417,6 +431,23 @@ func TestIsWorkspaceEmpty(t *testing.T) {
 		_ = os.MkdirAll(filepath.Join(tmpDir, ".scion-volumes"), 0755)
 		if !isWorkspaceEmpty(tmpDir) {
 			t.Error("expected true when workspace contains only .scion and .scion-volumes")
+		}
+	})
+
+	t.Run("cased marker name on a case-sensitive filesystem is content", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		probe := filepath.Join(tmpDir, "case-probe")
+		if err := os.Mkdir(probe, 0755); err != nil {
+			t.Fatal(err)
+		}
+		_, statErr := os.Lstat(filepath.Join(tmpDir, "CASE-PROBE"))
+		_ = os.Remove(probe)
+		if statErr == nil {
+			t.Skip("the temp filesystem is case-insensitive")
+		}
+		_ = os.MkdirAll(filepath.Join(tmpDir, ".SCION"), 0755)
+		if isWorkspaceEmpty(tmpDir) {
+			t.Error("expected false: .SCION is a different entry on a case-sensitive filesystem")
 		}
 	})
 
@@ -1772,21 +1803,17 @@ func TestGitCloneWorkspace_LateFailureCleansUpWholeWorkspace_RetrySucceeds(t *te
 	}
 
 	// A local, offline "origin" repo with one commit on main.
-	originDir := t.TempDir()
-	runGitForTest(t, originDir, "init", "-b", "main")
-	runGitForTest(t, originDir, "config", "user.email", "test@example.com")
-	runGitForTest(t, originDir, "config", "user.name", "Test")
-	if err := os.WriteFile(filepath.Join(originDir, "README.md"), []byte("hello"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	runGitForTest(t, originDir, "add", "README.md")
-	runGitForTest(t, originDir, "commit", "-m", "init")
+	// An https origin (a public repository) whose URL names the recorded
+	// remote, so the clone reaches the credential-helper step (a clone URL
+	// that does not name it, such as file://, gets no helper at all).
+	origin := newTokenGitServer(t, tokenRemoteBareRepo(t, t.TempDir()), false)
+	t.Setenv(api.EnvGitTokenRemote, origin.remote)
 
 	workspacePath := t.TempDir()
 
-	t.Setenv("SCION_GIT_CLONE_URL", "file://"+originDir)
+	t.Setenv("SCION_GIT_CLONE_URL", origin.url)
 	t.Setenv("SCION_GIT_BRANCH", "main")
-	t.Setenv("SCION_GIT_DEPTH", "")
+	t.Setenv("SCION_GIT_DEPTH", "0") // the dumb-http fixture cannot serve a shallow fetch
 	t.Setenv("SCION_AGENT_NAME", "test-agent")
 	t.Setenv("GITHUB_TOKEN", "")
 	t.Setenv("SCION_WORKSPACE_PATH", workspacePath)
@@ -1898,15 +1925,11 @@ func TestGitCloneWorkspace_FailedCloneKeepsWorkspaceDir(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
-	originDir := t.TempDir()
-	runGitForTest(t, originDir, "init", "-b", "main")
-	runGitForTest(t, originDir, "config", "user.email", "test@example.com")
-	runGitForTest(t, originDir, "config", "user.name", "Test")
-	if err := os.WriteFile(filepath.Join(originDir, "README.md"), []byte("hello"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	runGitForTest(t, originDir, "add", "README.md")
-	runGitForTest(t, originDir, "commit", "-m", "init")
+	// An https origin (a public repository) whose URL names the recorded
+	// remote, so the clone reaches the credential-helper step (a clone URL
+	// that does not name it, such as file://, gets no helper at all).
+	origin := newTokenGitServer(t, tokenRemoteBareRepo(t, t.TempDir()), false)
+	t.Setenv(api.EnvGitTokenRemote, origin.remote)
 
 	// The workspace directory exists before the clone, with a marker
 	// directory in it, as the mount and the runtime leave it.
@@ -1926,9 +1949,9 @@ func TestGitCloneWorkspace_FailedCloneKeepsWorkspaceDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Setenv("SCION_GIT_CLONE_URL", "file://"+originDir)
+	t.Setenv("SCION_GIT_CLONE_URL", origin.url)
 	t.Setenv("SCION_GIT_BRANCH", "main")
-	t.Setenv("SCION_GIT_DEPTH", "")
+	t.Setenv("SCION_GIT_DEPTH", "0") // the dumb-http fixture cannot serve a shallow fetch
 	t.Setenv("SCION_AGENT_NAME", "test-agent")
 	t.Setenv("GITHUB_TOKEN", "")
 	t.Setenv("SCION_WORKSPACE_PATH", workspacePath)
@@ -3468,12 +3491,13 @@ func TestConfigureSharedWorkspaceGit_WithoutRunScionAvailable(t *testing.T) {
 		t.Skip("/run/scion exists in this environment; this test wants to prove it is not needed, not that it is absent")
 	}
 	agentHome := t.TempDir()
+	t.Setenv(api.EnvGitTokenRemote, "github.com/org/shared")
 	if err := configureSharedWorkspaceGit(agentHome, 0, 0, false); err != nil {
 		t.Fatalf("configureSharedWorkspaceGit: %v", err)
 	}
 	gitconfigPath := filepath.Join(agentHome, ".gitconfig")
-	if got := gitConfigGet(t, gitconfigPath, "credential.helper"); got == "" {
-		t.Error("credential.helper is empty; expected it to be configured without /run/scion available")
+	if got := gitConfigGet(t, gitconfigPath, "credential.https://github.com.helper"); got == "" {
+		t.Error("credential helper is empty; expected it to be configured without /run/scion available")
 	}
 }
 
@@ -3584,8 +3608,9 @@ func TestConfigureSharedWorkspaceGit_EnforcedRefusesWithoutUsableUID(t *testing.
 //
 // On the supervisor side, "drop" is only inferred from that expected failure
 // (EPERM or EINVAL at start as non-root, or a nonzero exit as root); any
-// other outcome fails the test. On the git side, init only logs git
-// failures, so "drop" is inferred from a missing .gitconfig. That cannot tell a dropped write from a skipped
+// other outcome fails the test. On the git side, "drop" is inferred from a
+// missing .gitconfig, with or without the fail-closed error of the first
+// (unscoped-helper removal) git call. That cannot tell a dropped write from a skipped
 // one; TestConfigureSharedWorkspaceGit_UsablePairWritesConfig and
 // TestConfigureGitCommand_RootInitSetsWorkloadCredential cover that half.
 func TestConfigureSharedWorkspaceGit_FollowsSupervisorDropDecision(t *testing.T) {
@@ -3652,6 +3677,12 @@ func TestConfigureSharedWorkspaceGit_FollowsSupervisorDropDecision(t *testing.T)
 			switch {
 			case errors.Is(gitErr, errSharedWorkspaceGitPrivilegeDropRequired):
 				gitGot = refuse
+			case gitErr != nil && strings.Contains(gitErr.Error(), "failed to remove an unscoped git credential helper") &&
+				!fileExists(filepath.Join(agentHome, ".gitconfig")):
+				// The dropped git cannot start (non-root) or cannot write
+				// (root), so the unscoped-helper removal fails and init
+				// fails closed before writing anything.
+				gitGot = drop
 			case gitErr != nil:
 				t.Fatalf("configureSharedWorkspaceGit: unexpected error %v", gitErr)
 			case !fileExists(filepath.Join(agentHome, ".gitconfig")):
@@ -3684,6 +3715,7 @@ func TestConfigureSharedWorkspaceGit_UsablePairWritesConfig(t *testing.T) {
 	if uid <= 0 || gid <= 0 {
 		t.Skipf("test process uid/gid %d/%d is not a usable pair", uid, gid)
 	}
+	t.Setenv(api.EnvGitTokenRemote, "github.com/org/shared")
 	for _, enforced := range []bool{false, true} {
 		t.Run(fmt.Sprintf("enforced=%v", enforced), func(t *testing.T) {
 			agentHome := t.TempDir()
@@ -3694,8 +3726,8 @@ func TestConfigureSharedWorkspaceGit_UsablePairWritesConfig(t *testing.T) {
 			if got := gitConfigGet(t, gitconfig, "user.email"); got != "agent@scion.dev" {
 				t.Errorf("user.email = %q, want agent@scion.dev", got)
 			}
-			if got := gitConfigGet(t, gitconfig, "credential.helper"); got == "" {
-				t.Error("credential.helper not written")
+			if got := gitConfigGet(t, gitconfig, "credential.https://github.com.helper"); got == "" {
+				t.Error("credential helper not written")
 			}
 		})
 	}
@@ -4014,6 +4046,8 @@ func TestGitCloneWorkspace_FetchUsesHostScopedCredential(t *testing.T) {
 	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(root, "gc"))
 	t.Setenv("GIT_CONFIG_SYSTEM", os.DevNull)
 	t.Setenv("SCION_GIT_CLONE_URL", "https://github.com/org/repo.git")
+	// The recorded remote the clone URL names: the fetch gets the helper.
+	t.Setenv(api.EnvGitTokenRemote, "github.com/org/repo")
 	t.Setenv("SCION_WORKSPACE_PATH", workspace)
 	t.Setenv("SCION_GIT_BRANCH", "main")
 	t.Setenv("SCION_GIT_DEPTH", "0")

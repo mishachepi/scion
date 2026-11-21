@@ -9,7 +9,7 @@ Scion supports running agents as Pods in a Kubernetes cluster. This enables remo
 - A running Kubernetes cluster (GKE, EKS, AKS, or self-managed).
 - Kubeconfig file configured with access to the target cluster (or running within the cluster using In-Cluster Authentication).
 - Scion agent images available to the cluster (pushed to a container registry accessible by the cluster).
-- Appropriate RBAC permissions for pod creation, execution, and secret management.
+- The [Runtime Broker permissions](#runtime-broker-permissions) for pod creation, execution, and secret management, granted to the identity the Runtime Broker runs as.
 
 :::note
 Scion utilizes the native Kubernetes Go client API for operations like `exec` and `attach`. The `kubectl` binary is **not** required on the host machine.
@@ -30,6 +30,14 @@ runtimes:
     gke: false                     # enable GKE-specific features
     list_all_namespaces: false     # list agents across all namespaces
     priority_class_name: scion-agent-priority  # default PriorityClass for agent pods (optional)
+    # node_selector:               # operator-owned pod nodeSelector (optional)
+    #   scion.dev/pool: agents
+    # tolerations:                 # operator-owned pod tolerations (optional)
+    #   - key: scion.dev/pool
+    #     operator: Equal
+    #     value: agents
+    #     effect: NoSchedule
+    # runtime_class_name: gvisor   # operator-owned RuntimeClass (optional)
     # shared_dir_storage_class: standard-rwx  # RWX class for shared-dir PVCs (see below)
     # shared_dir_size: 10Gi                    # size per shared-dir PVC
     kubernetes_service_account_mappings:  # GCP identity mode "assign" — see below
@@ -38,6 +46,9 @@ runtimes:
 profiles:
   default:
     runtime: k8s
+    # node_selector, tolerations, and runtime_class_name can also be set per
+    # profile (at the profile level, not under resources) to layer over the
+    # runtime entry's placement.
     # kubernetes_service_account_mappings can also be set per profile, to
     # override the runtime-level mapping above for a given GSA email.
 ```
@@ -84,13 +95,21 @@ kubernetes:
       nvidia.com/gpu: "1"
 ```
 
+Pod placement (`node_selector`, `tolerations`, and `runtime_class_name`) is owned by the operator rather than the agent—both on a flat Kubernetes Runtime Broker instance (`server.broker.instances[].runtime_target`) and on a regular Kubernetes Runtime Broker (`runtimes.<name>` and `profiles.<name>`, where `profiles.<name>` layers over `runtimes.<name>` and all Kubernetes runtime entries targeting the same cluster and namespace must agree). Even when the operator leaves placement unset, the empty policy is still operator-owned:
+
+- An agent's `kubernetes.nodeSelector` may add keys the operator policy does not set, but cannot change the value of any key the operator sets (including `scion.dev/pool`).
+- Each of an agent's `kubernetes.tolerations` must match one of the operator policy's tolerations (`key`, `operator` with empty treated as `Equal`, `value`, `effect`), and an empty-key `Exists` toleration on an agent is always refused while placement is enforced. When the operator policy sets no tolerations, any agent toleration is refused.
+- An agent's `kubernetes.runtimeClassName` must be empty or equal to the operator policy's `runtime_class_name`.
+
+Any mismatch is refused with HTTP `400 validation_error` before any pod, volume, or running workload is touched; running pods keep their current placement until their next start or restart. On a regular Kubernetes Runtime Broker, a restart that arrives without a project path (so project settings cannot be checked) is also refused before stopping the pod. Before upgrading, run [`scion doctor`](/scion/reference/cli/#scion-doctor) (`legacy-placement-preflight` on a regular Runtime Broker host, `flat-placement-preflight` on a flat instance host) and check `placement_preflight` on `GET /api/v1/admin/server-config`. See [Flat instance placement](/scion/reference/server-config/#flat-instance-placement) and [Legacy host placement check](/scion/reference/server-config/#legacy-host-placement-check).
+
 ### Shared Directory PVCs
 
 Each project [shared directory](/scion/local/workspace/#5-project-shared-directories) gets its own `ReadWriteMany` PersistentVolumeClaim, created on first use and reused by later agents in the same project. Two keys control these claims:
 
 | Key | Default | Description |
 |---|---|---|
-| `shared_dir_storage_class` | cluster default class | StorageClass for new shared-dir PVCs. It must support `ReadWriteMany`. |
+| `shared_dir_storage_class` | none (required to create a claim) | StorageClass for new shared-dir PVCs. It must support `ReadWriteMany`. |
 | `shared_dir_size` | `10Gi` | Requested size for each new shared-dir PVC. |
 
 You can set them in three places. Each key is resolved separately, and the first source that sets it wins:
@@ -99,15 +118,15 @@ You can set them in three places. Each key is resolved separately, and the first
 2. The profile entry in `settings.yaml`.
 3. The profile's runtime entry in `settings.yaml`.
 
-If none of them sets a key, the cluster's default StorageClass and `10Gi` are used.
+If none of them sets `shared_dir_size`, `10Gi` is used. If none of them sets `shared_dir_storage_class`, Scion does not create shared-dir claims (see [Starts that need a new claim](#starts-that-need-a-new-claim)).
 
 An empty value means "not set", so it does not override a lower source. Once a runtime entry or profile sets a class, an agent cannot reset it to the cluster default; name the class explicitly instead.
 
-`shared_dir_size` must be a positive Kubernetes quantity such as `10Gi` or `1Ti`. Settings validation and the admin settings API reject other values, and an agent start fails with an error naming the key that holds the bad value.
+`shared_dir_size` must be a positive Kubernetes quantity such as `10Gi` or `1Ti`. Settings validation and the admin settings API reject other values, and an agent start fails with an error naming the key that holds the bad value. In the Web Dashboard under **Admin → Server Config → Runtimes & Profiles**, **Shared dir storage class** (`shared_dir_storage_class`) and **Shared dir size** (`shared_dir_size`) are editable on `kubernetes` entries under `runtimes` and on entries under `profiles` whose runtime is not `docker`, `podman`, `container`, or `cloudrun`, with inline validation ("shared_dir_size must be a positive Kubernetes quantity, such as 10Gi or 1Ti.") that blocks **Save & Reload** until corrected.
 
 The settings values are read every time an agent starts. They apply only on the Kubernetes runtime.
 
-On GKE Autopilot the default class (`standard-rwo`) cannot provision `ReadWriteMany` volumes. The claim stays unbound and the agent pod stays `Pending`. To avoid this, set an RWX class such as `standard-rwx` (Filestore CSI) on the runtime or the profile:
+On GKE Autopilot the default class (`standard-rwo`) cannot provision `ReadWriteMany` volumes, so set an RWX class such as `standard-rwx` (Filestore CSI) on the runtime or the profile:
 
 ```yaml
 runtimes:
@@ -133,13 +152,44 @@ kubernetes:
   shared_dir_size: 10Gi
 ```
 
+#### Starts that need a new claim
+
+When a shared directory's claim does not exist yet and no `shared_dir_storage_class` is set, the agent start fails before its pod is created, and no claim is created. The cluster's default class usually cannot provide `ReadWriteMany` volumes, so such a claim would stay `Pending`, and the agent pod with it. The error names the shared directory and the claim, and the fixes:
+
+- configure [`server.project_storage`](/scion/reference/server-config/#project-storage-serverproject_storage) with `backend: nfs` (one share for all projects; recommended), or
+- set `shared_dir_storage_class` to a `ReadWriteMany` class, in any of the places listed above.
+
+This applies only when a claim must be created. Existing claims, including claims you made by hand, are reused as they are, with no class needed.
+
+#### Claims of another project
+
+A shared-dir claim is named `scion-shared-<project>-<dir>`, so two projects with the same name can collide in one namespace. If an existing claim's `scion.project_id` label names a different project, the start fails with an error naming both projects, and the claim is left unchanged. Delete or rename that claim if the other project no longer uses it. A claim without a `scion.project_id` label (for example one you made by hand) is reused, and Scion logs a warning.
+
+#### Upgrading
+
+Earlier versions created shared-dir claims in the cluster's default class when no class was set. If your cluster's default class already supports `ReadWriteMany`, starts that need a new claim now fail until you set `shared_dir_storage_class` to that class, or configure `server.project_storage` backend `nfs`. Existing claims keep working unchanged.
+
 :::note
 Existing PVCs are reused as they are and never changed. A new class or size only applies to claims created after the change. To move an existing shared directory to a new class, delete its PVC (`scion-shared-…`, labelled `scion.shared-dir=<name>`) after copying out its data. When an agent reuses a claim whose class differs from the requested one, Scion logs a warning naming the claim and both classes.
 :::
 
 :::caution[Cost with many projects]
-Each dynamically provisioned RWX PVC can be its own backing volume. On GKE, every `standard-rwx` claim is a separate Filestore instance, with that tier's minimum capacity. With many projects or shared directories this adds up quickly. For larger fleets, use the NFS backend instead: one pre-provisioned RWX export, mounted by every pod with a `subPath` per project and directory, and no per-directory PVCs. See [`server.shared_dir_storage`](/scion/reference/server-config/#shared-directory-storage-servershared_dir_storage) (`backend: nfs`) or the NFS [`server.workspace_storage`](/scion/reference/server-config/#workspace-storage-serverworkspace_storage) backend, which serves shared directories from the workspace export.
+Each dynamically provisioned RWX PVC can be its own backing volume. On GKE, every `standard-rwx` claim is a separate Filestore instance, with that tier's minimum capacity. With many projects or shared directories this adds up quickly. For larger fleets, use the NFS backend instead: one pre-provisioned RWX export, mounted by every pod with a `subPath` per project and directory, and no per-directory PVCs. See [`server.project_storage`](/scion/reference/server-config/#project-storage-serverproject_storage) (`backend: nfs`), which serves shared directories from the workspace export.
 :::
+
+### Claim Check Before the Pod
+
+Before it creates an agent pod, the Kubernetes runtime checks every PersistentVolumeClaim the pod mounts: the shared-dir claims, the claim of the NFS share (`server.project_storage` `nfs.shares[0].pv_name`), and any other claim in the pod spec. The check only reads.
+
+| Claim state | Result |
+|---|---|
+| Does not exist | The start fails at once. The error names the claim and, where known, the setting that names it. |
+| `Bound` | The start continues. |
+| Newest event is `ProvisioningFailed` | The start fails at once. The error quotes the event. A newer event after a `ProvisioningFailed` one means the provisioner is retrying, and the claim is treated as `Pending`. |
+| A `WaitForFirstConsumer` event | The start continues: the claim is bound once the pod is scheduled. |
+| Other (`Pending`, `Lost`) | The runtime re-reads the claim every 2 seconds, for up to 30 seconds in total across all the pod's claims. If it is still not bound, the runtime logs a warning and creates the pod anyway. |
+
+The events need `list` on `events` in the agent namespace. Without them, the check uses the claim phase only and logs that once: a provisioning failure is then not detected early, and the first start that uses a new claim of a `WaitForFirstConsumer` class waits the full 30 seconds before its pod is created. Without `get` on `persistentvolumeclaims`, the check is skipped, and that is logged once too.
 
 ### Resource Configuration
 
@@ -177,8 +227,8 @@ profiles:
 :::note[What counts against ephemeral storage]
 Where the agent's files live depends on the storage backends:
 
-- `/workspace`: with the default local [`server.workspace_storage`](/scion/reference/server-config/#workspace-storage-serverworkspace_storage) backend it is an `emptyDir` volume, which counts against the pod's ephemeral storage. With the `nfs` backend it is on the NFS export and does not.
-- `HOME`, including build caches under it (for example the Go module and build caches in `~/go/pkg/mod` and `~/.cache/go-build`): without NFS [`server.home_storage`](/scion/reference/server-config/#agent-home-storage-serverhome_storage) it is in the container's writable layer, which counts against ephemeral storage. With the `nfs` home backend it is on the NFS export and does not.
+- `/workspace`: with the default local [`server.project_storage`](/scion/reference/server-config/#project-storage-serverproject_storage) backend it is an `emptyDir` volume, which counts against the pod's ephemeral storage. With the `nfs` backend it is on the NFS export and does not.
+- `HOME`, including build caches under it (for example the Go module and build caches in `~/go/pkg/mod` and `~/.cache/go-build`): without NFS homes ([`server.project_storage.homes`](/scion/reference/server-config/#project-storage-serverproject_storage)) it is in the container's writable layer, which counts against ephemeral storage. With `homes: nfs` it is on the NFS export and does not.
 
 With a `disk` limit set, a pod whose ephemeral storage use goes over that limit is evicted. Size `disk` for the repository, its dependencies, caches and build output, not just the source tree.
 :::
@@ -240,13 +290,13 @@ Stopping an agent deletes its Pod. What survives depends on the workspace volume
 
 | Agent workspace volume | After `scion stop` and a later start or restart |
 |---|---|
-| `emptyDir` (the default local [`server.workspace_storage`](/scion/reference/server-config/#workspace-storage-serverworkspace_storage) backend, and today also `gke-shared-volume`; see the note below) | The workspace is discarded with the Pod. **Changes that were not committed and pushed are lost.** For a git-backed workspace, the new Pod clones the repository again from the agent's git clone settings and branch. |
-| Persistent (`workspace_storage.backend: nfs`) | The workspace is kept on the volume and mounted again as it was. It is not cloned again. |
+| `emptyDir` (the default local [`server.project_storage`](/scion/reference/server-config/#project-storage-serverproject_storage) backend, and today also `gke-shared-volume`; see the note below) | The workspace is discarded with the Pod. **Changes that were not committed and pushed are lost.** For a git-backed workspace, the new Pod clones the repository again from the agent's git clone settings and branch. |
+| Persistent (`project_storage.backend: nfs`) | The workspace is kept on the volume and mounted again as it was. It is not cloned again. |
 
 With an `emptyDir` workspace, push work you want to keep before stopping or restarting the agent, or use a persistent backend. The same distinction decides the phase an agent gets when its Pod is preempted or evicted; see [Preempted and evicted status](#preempted-and-evicted-status).
 
 :::caution[`gke-shared-volume` is not mounted into agent pods]
-With `workspace_storage.backend: gke-shared-volume`, the Hub keeps project files on the shared volume, but the Kubernetes runtime does not mount that volume into agent pods yet. In every workspace mode the agent's workspace is an `emptyDir` and is lost when the Pod is deleted. The agent runtime logs a warning the first time an agent starts this way in each of its processes. Use `backend: nfs` for agent workspaces that persist. See [ptone/scion#1075](https://github.com/ptone/scion/issues/1075).
+With `project_storage.backend: gke-shared-volume` (or the deprecated `workspace_storage.backend: gke-shared-volume`), the Hub keeps project files on the shared volume, but the Kubernetes runtime does not mount that volume into agent pods yet. In every workspace mode the agent's workspace is an `emptyDir` and is lost when the Pod is deleted. The agent runtime logs a warning the first time an agent starts this way in each of its processes. Use `backend: nfs` for agent workspaces that persist. See [ptone/scion#1075](https://github.com/ptone/scion/issues/1075).
 :::
 
 A start or restart sends the agent's git clone settings, branch, workspace mode and template. If the broker no longer has the agent's own state (for example after the broker itself was replaced), it provisions the agent again; an agent created from a Hub template gets that template again rather than the default one.
@@ -310,7 +360,7 @@ The home backend does not change this: with a pod-local home the harness session
 
 **Resume without a saved session.** When you resume or wake an agent whose home is pod-local, the harness has no saved session to continue. If the resume attempt exits with an error status (1 to 127; a harness stopped by a signal does not count) within 30 seconds, the agent prints `scion: no resumable session; starting fresh` and starts the harness fresh instead of exiting. With the `nfs` home backend the session survives, so a failed resume is reported as an error and is not retried fresh.
 
-If the pod disappears between polls before either signal is observed, the Runtime Broker reads the pod's Kubernetes Events and classifies a preemption or eviction recorded there the same way. Only when the Events show neither does the agent fall back to the missing-container reconcile: after `missing_agent_grace` it moves to `error` with exit reason `container_missing` (see [server configuration](/scion/reference/server-config/)). One known gap: an agent preempted within about two broker heartbeats of its start, before the Hub has confirmed which runtime target lists it, is not covered by that fallback.
+If the pod disappears between polls before either signal is observed, the Runtime Broker reads the pod's Kubernetes Events and classifies a preemption or eviction recorded there the same way. Only when the Events show neither does the agent fall back to the missing-container reconcile: after `missing_agent_grace` it moves to `error` with exit reason `container_missing` (see [server configuration](/scion/reference/server-config/)). On a flat Runtime Broker (`scion.io/broker-role=flat`), the Hub records the broker's sole runtime target as pending (`runtimeTargetPending`) when it accepts a create, start, or restart, and the missing-container reconcile checks the agent against that pending target whenever the heartbeat lists its sole runtime target completely, so an agent preempted immediately after start is covered before the first heartbeat confirms it. On a legacy multi-profile Runtime Broker, an agent preempted within about two broker heartbeats of its start — before the Hub has confirmed which runtime target lists it — is not covered by that fallback.
 
 #### Out-of-memory kills
 
@@ -419,13 +469,13 @@ Windows and exclusions don't stop Compute Engine maintenance, and most control p
 
 ### GCP Identity Modes on Kubernetes
 
-An agent's GCP identity mode decides which Google identity, if any, GCP client libraries in the agent pod use. The mode is resolved by the Hub (the create request, then the project's per-profile default service account, then the project default, then the hub default; see [Hub-Default GCP Identity](/scion/hosted/ha/permissions/#hub-default-gcp-identity)) and applied by the Runtime Broker for the runtime the agent is dispatched to. On the Kubernetes runtime the three modes behave as follows:
+An agent's GCP identity mode decides which Google identity, if any, GCP client libraries in the agent pod use. The mode is resolved by the Hub (the create request, then the project's per-profile default service account, then the project default, then the hub default; see [Hub-Default GCP Identity](/scion/hosted/ha/permissions/#hub-default-gcp-identity)) and applied by the Runtime Broker for the runtime the agent is dispatched to. On the Kubernetes runtime, every agent pod is created with `automountServiceAccountToken: false`, in all three modes (see [Agent pod identity](#agent-pod-identity)). The three modes behave as follows:
 
 | Mode | On the Kubernetes runtime |
 | :--- | :--- |
 | `block` | The pod runs as a zero-privilege identity: the operator's block KSA, or the namespace's `default` KSA when none is configured, with no Kubernetes API token mounted and only on Workload Identity nodes. See **block** below. |
-| `passthrough` | The pod uses whatever identity the cluster gives it, configured outside Scion. The default when no identity is configured (see **No identity configured** below). |
-| `assign` | Uses GKE Workload Identity: the pod runs as a Kubernetes ServiceAccount (KSA) that the operator has bound to the assigned Google service account (GSA). Requires a GSA-to-KSA mapping in the broker's settings. |
+| `passthrough` | The pod uses whatever identity the cluster gives it, configured outside Scion. No Kubernetes API token is mounted. The default when no identity is configured (see **No identity configured** below). |
+| `assign` | Uses GKE Workload Identity: the pod runs as a Kubernetes ServiceAccount (KSA) that the operator has bound to the assigned Google service account (GSA). No Kubernetes API token is mounted. Requires a GSA-to-KSA mapping in the broker's settings. |
 
 #### Setup checklist: give agents a GCP identity
 
@@ -442,10 +492,10 @@ An agent on the Kubernetes runtime gets a GSA only when all of the links below a
 
    Registration checks this once. If you grant the role afterwards, re-run the check with `scion project service-accounts verify <id>` (or `scion service-accounts verify <id> --global`). See [GCP Identity & Hub-Minted Service Accounts](/scion/hosted/single-node/hub-server/#gcp-identity--hub-minted-service-accounts).
 3. **Map the GSA to a KSA on the broker** (broker operator). Add `<email>: <ksa>` to `kubernetes_service_account_mappings` on a `kubernetes`-type runtime entry (its key can be any name) or on a profile, in the broker's global settings. For a broker in the same process as a database-backed Hub, a hub admin sets it through the server config (`PUT /api/v1/admin/server-config`, or the Hub's Settings admin page) instead. The mapping can be skipped when exactly one KSA in the namespace carries the GSA's Workload Identity annotation and the broker may list ServiceAccounts there. See [the mapping setting](#gcp-identity-mode-assign-workload-identity-mapping) and [GKE Workload Identity for GCP Identity Mode Assign](/scion/hosted/ha/setup-gcp/#2i-gke-workload-identity-for-gcp-identity-mode-assign).
-4. **Create the Workload Identity binding for the KSA** (cluster and GCP project admin). Create the KSA in the namespace the runtime entry resolves to, annotate it with `iam.gke.io/gcp-service-account: <email>`, and grant `roles/iam.workloadIdentityUser` on the GSA to that namespace and KSA. Scion does not do this step or check the IAM binding; the broker only reads the annotation, to find the KSA when there is no mapping. See the [`gcloud` and `kubectl` steps](/scion/hosted/ha/setup-gcp/#2i-gke-workload-identity-for-gcp-identity-mode-assign).
+4. **Create the Workload Identity binding for the KSA** (cluster and GCP project admin). Create the KSA in the namespace the runtime entry resolves to, annotate it with `iam.gke.io/gcp-service-account: <email>`, and grant `roles/iam.workloadIdentityUser` on the GSA to that namespace and KSA. Scion does not check the IAM binding; the broker reads the annotation to find the KSA when there is no mapping. For a GSA the Hub mints while [`hub.k8s_workload_identity_setup`](#workload-identity-binding-at-mint) is on, the Hub can make the IAM grant at mint (`workload_identity_pool` on the runtime entry or flat `runtime_target`) and the broker can create and annotate the conventional `<account ID>` KSA on first `assign` start when `create_service_accounts: true` is set on the runtime entry or flat `runtime_target` (see **Opt-in broker KSA creation** below); for bring-your-own GSAs, or when `create_service_accounts` is off, create and annotate the KSA yourself. See the [`gcloud` and `kubectl` steps](/scion/hosted/ha/setup-gcp/#2i-gke-workload-identity-for-gcp-identity-mode-assign).
 5. **Optional: set a default** (project admin, or hub admin for the hub default). Without a default, assign the GSA per agent with `--service-account <id|email|name>`. A project can set a project default or, for projects that also use other runtimes, a default per Kubernetes profile; a hub admin can set a hub default, which must name a hub-scoped account. See [Per-Profile Default Service Accounts](/scion/hosted/ha/permissions/#per-profile-default-service-accounts) and [Hub-Default GCP Identity](/scion/hosted/ha/permissions/#hub-default-gcp-identity).
 
-To check step 2, run `scion service-accounts show <id>` (add `--global` for a hub-scoped account). It shows whether the Hub's token-creator check passed and, if not, why. For step 3 on a project-scoped account, the `add`, `mint`, `verify` and `list` subcommands of `scion project service-accounts`, and the `gcp-sa-mappings` check of `scion doctor`, warn when no Kubernetes profile of the project maps it (see **Early warning for unmapped service accounts** below); hub-scoped accounts get no such warning. The Hub cannot see the KSA annotation or the IAM binding, so step 4 is confirmed only by a successful dispatch.
+To check step 2, run `scion service-accounts show <id>` (add `--global` for a hub-scoped account). It shows whether the Hub's token-creator check passed and, if not, why. For step 3 on a project-scoped account, the `add`, `mint`, `verify` and `list` subcommands of `scion project service-accounts`, and the `gcp-sa-mappings` check of `scion doctor`, warn when no Kubernetes profile of the project maps it (see **Early warning for unmapped service accounts** below); hub-scoped accounts get no such warning. While [`hub.k8s_workload_identity_setup`](#workload-identity-binding-at-mint) is on, `scion project service-accounts show <id>` (and the web account status view) also checks the `roles/iam.workloadIdentityUser` IAM policy binding for accounts minted by this Hub; it still cannot see the KSA annotation on the cluster, and bring-your-own accounts are not checked.
 
 For agents whose identity resolves to `block`, none of the steps above apply. Instead, the broker operator names a block KSA with `kubernetes_block_service_account`; without one, the pod runs as the namespace's `default` KSA. Either way, the KSA is zero-privilege only while the IAM preconditions under [block](#block) hold.
 
@@ -454,7 +504,7 @@ For agents whose identity resolves to `block`, none of the steps above apply. In
 GKE cannot give a single pod no Google identity: on a node pool with Workload Identity, every Kubernetes ServiceAccount (KSA) receives a federated token, with or without a Google service account annotation. On Kubernetes, `block` therefore means a zero-privilege identity. When the mode resolved for a Kubernetes dispatch is `block`, from the request, a project default, a hub default, or an agent's own stored identity, the broker starts the pod with:
 
 - `spec.serviceAccountName` set to the **block KSA** named by `kubernetes_block_service_account`, or, when none is configured, left unset so the pod runs as the namespace's `default` KSA. Either way this replaces any `serviceAccountName` from the agent's saved config.
-- `automountServiceAccountToken: false`, so no Kubernetes API token is mounted. This does not remove the federated Google token.
+- `automountServiceAccountToken: false`, so no Kubernetes API token is mounted. This does not remove the federated Google token. Agent pods in the other modes get the same setting.
 - The node selector `iam.gke.io/gke-metadata-server-enabled: "true"`, merged into any existing node selector, so the pod only schedules on Workload Identity nodes. On a node pool without Workload Identity a pod can use the node's own service account. If no node carries the label, the pod stays `Pending`.
 
 `block` is never replaced by `passthrough`. The agent environment is the same as `block` on other runtimes (`SCION_METADATA_MODE=block`), and no service account email or project ID is set.
@@ -502,13 +552,78 @@ Restricting the pod's outbound access with an egress NetworkPolicy would give a 
 | The request names a `kubernetes.serviceAccountName` other than the block KSA | 400 | `explicit Kubernetes ServiceAccount "<name>" conflicts with GCP identity mode "block"` |
 | On start or restart, the agent now resolves to another runtime, profile, or runtime entry than its `block` identity was resolved for | 409 | `GCP identity mode "block" was resolved for ...` |
 
+#### Workload Identity binding at mint
+
+This is experimental: it needs the [`hub.k8s_workload_identity_setup`](/scion/reference/experiments/#server-experiments-with-notes) experiment, which is off by default. With the experiment off, minting is unchanged.
+
+When a GSA is minted — either for a project (`scion project service-accounts mint` or `POST /api/v1/projects/{id}/gcp-service-accounts/mint`) or at Hub scope (`POST /api/v1/gcp-service-accounts/mint?scope=hub`, or **Mint Service Account** in the web UI) — the Hub also grants `roles/iam.workloadIdentityUser` on the new GSA to the Workload Identity member of the conventional KSA, for every serving Kubernetes runtime target that reports a Workload Identity pool (the project's Runtime Brokers for a project-scoped mint, and every Runtime Broker on the Hub for a Hub-scoped mint, since any project can assign a Hub-scoped GSA):
+
+```text
+serviceAccount:<pool>[<namespace>/<account ID>]
+```
+
+**KSA naming convention.** The conventional KSA name is the GSA's **account ID**: the part of its email before `@`. A minted GSA's account ID is `scion-<slug>` or a generated `scion-xxxxxxxx`, always a valid KSA name. This is a stable contract: the binding names this KSA, so a KSA with any other name does not get the grant. The binding alone is not enough: a KSA with that name must exist in the namespace, annotated `iam.gke.io/gcp-service-account: <GSA email>`, either pre-provisioned (mapped or [discovered by annotation](#gcp-identity-mode-assign-workload-identity-mapping)) or created on first start when `create_service_accounts: true` is enabled on the broker (`runtimes.<entry>.create_service_accounts` or flat `server.broker.instances[].runtime_target.create_service_accounts`). Do not create KSAs named `scion-*` in agent namespaces for any other purpose: Scion never modifies an existing KSA, and a colliding KSA with a different or missing annotation (or lacking `app.kubernetes.io/managed-by: scion` on a flat instance) fails the start with `identity_ksa_conflict`.
+
+**The pool setting.** Set `workload_identity_pool` on each `kubernetes` runtime entry (or on a flat Runtime Broker instance's `runtime_target`) in the broker's global settings:
+
+```yaml
+# Legacy (profile-resolving) Runtime Broker:
+runtimes:
+  gke-prod:
+    type: kubernetes
+    namespace: agents
+    workload_identity_pool: my-cluster-project.svc.id.goog
+
+# Flat Runtime Broker instance:
+server:
+  broker:
+    instances:
+      - key: gke-prod
+        name: gke-prod
+        runtime_target:
+          type: kubernetes
+          namespace: agents
+          workload_identity_pool: my-cluster-project.svc.id.goog
+```
+
+- The value is the pool of the cluster's GCP project, `<cluster-project-id>.svc.id.goog`. It is validated in that form. The cluster's project need not be the Hub's project.
+- On a legacy broker it is read only from the broker's global settings, or from the Hub database for a Runtime Broker in the same process as a database-backed Hub (the same source as the namespace); on a flat instance it is read from the global `settings.yaml` startup snapshot (`server.broker.instances[].runtime_target`). It is never read from a project's `settings.yaml`; a value there is ignored, and an `assign` dispatch logs a warning.
+- On a legacy broker it applies to every profile on that runtime entry, using the namespace an `assign` dispatch on the profile resolves (the entry's `namespace`, else the runtime default); a Runtime Broker started with a forced runtime reports no targets. On a flat instance it uses the instance's activated namespace (`profile` empty).
+- Both broker kinds report their targets on every heartbeat (`workloadIdentityTargets`, with the capability `wiTargetsV1`), whether the experiment is on or off. The Hub stores only entries whose pool has the form above and whose namespace is a valid Kubernetes namespace name (at most 64 per broker), and drops the rest with a warning. On Runtime Broker API read responses, `workloadIdentityTargets` is redacted unless the viewer holds `hub.config.read` (or is the broker reading its own record).
+
+**What the mint does.** After the grants the mint needs (token creator for the Hub, and the optional self `serviceAccountUser`), the Hub adds every member to `roles/iam.workloadIdentityUser` on the new GSA in one update of the GSA's IAM policy. Equal pool and namespace pairs are granted once. The Hub only changes the minted GSA's own policy: it never edits a project IAM policy and never calls Kubernetes. Its existing `roles/iam.serviceAccountAdmin` on the Hub project covers the change.
+
+The grant is best effort. **A failed grant never fails the mint**: the GSA is stored as verified either way. The mint response lists each target in `workloadIdentityBindings`, and both the CLI and the web mint dialog show one line per entry:
+
+| `state` | `reason` | Meaning |
+| :--- | :--- | :--- |
+| `bound` | | The member was added. |
+| `skipped` | `permission_denied` | The Hub may not change the GSA's IAM policy. |
+| `skipped` | `pool_not_found` | IAM does not know the pool: Workload Identity is not enabled in that project, or `workload_identity_pool` is misspelt. The other targets are still granted. |
+| `skipped` | `no_workload_identity_pool` | A serving Kubernetes profile or flat instance reports no pool: none is configured, or the broker is too old to report one (`detail` says which). |
+| `failed` | `iam_error` | Any other IAM error. |
+
+Each entry that is not `bound` carries a `manualStep`, the command that makes the grant by hand, with its arguments in single quotes. For a `no_workload_identity_pool` entry, fill in the cluster project and namespace:
+
+```bash
+gcloud iam service-accounts add-iam-policy-binding '<GSA email>' \
+  --role roles/iam.workloadIdentityUser \
+  --member 'serviceAccount:<CLUSTER_PROJECT>.svc.id.goog[<NAMESPACE>/<account ID>]'
+```
+
+A new binding can take a few minutes to take effect, so the first token request of an agent started right after the mint can fail. Runtime Brokers added after the mint, and GSAs minted before the experiment was on, get no binding: use the manual command.
+
+**Checking the binding in the status view.** While `hub.k8s_workload_identity_setup` is on, `scion project service-accounts show <id|email|name>` (`GET /api/v1/projects/{id}/gcp-service-accounts/{ref}/status`) and the web service-account status page read the GSA's resource-level IAM policy for GSAs minted by this Hub and report `bound` or `not_bound` per dispatch target (checking a profile's mapped or discovered KSA when mapped and the conventional `<account ID>` otherwise, in both the target list, the summary/next step, and the **Binding** column per Kubernetes broker profile in the web view). The policy read uses `iam.serviceAccounts.getIamPolicy` (already included in `roles/iam.serviceAccountAdmin`), is cached on the Hub for 60 seconds per email, and runs only on the per-account status view — never on list endpoints. Bring-your-own GSAs stay `unknown` (`not minted by this hub`). Because targets come from each Runtime Broker's last stored heartbeat report (`workloadIdentityTargets`), a target from a broker downgraded below `wiTargetsV1` or with a stale heartbeat is marked stale rather than presented as current.
+
+**Who can act as the GSA.** Workload Identity authorises by member, not by annotation: anyone who can create a KSA with the conventional name in that namespace, or run a pod as it, can act as the GSA. For a Hub-scoped mint, every Runtime Broker on the Hub that reports a Workload Identity pool receives a binding on the minted GSA. This is the same as a binding made by hand. Use a namespace dedicated to Scion agents, where only the broker's identity can create ServiceAccounts and pods.
+
 #### GCP Identity Mode "assign" (Workload Identity mapping)
 
 On every other runtime, `assign` runs the sciontool metadata server emulator inside the agent. On Kubernetes it does not: the broker sets the pod's `spec.serviceAccountName` to the KSA mapped to (or discovered for) the assigned GSA, and GCP client libraries in the container reach the GKE metadata server directly. The emulator environment is not set for these pods: `SCION_METADATA_MODE` is `passthrough`, and `GCE_METADATA_HOST`, `GCE_METADATA_ROOT`, and `SCION_METADATA_PORT` are absent. `SCION_METADATA_SA_EMAIL` and `SCION_METADATA_PROJECT_ID` are still set. Some harnesses read them (for example the project ID for Vertex AI), but they do not change the pod's identity.
 
 The Hub-side checks on who may assign a GSA (`actAs` and hub-scoped service accounts) are the same on every runtime.
 
-**Operator prerequisites.** Scion never creates, annotates, or binds KSAs. Apart from reading the annotation for discovery (below), it does not check that these steps were done. For each GSA you assign to agents on a cluster:
+**Operator prerequisites.** By default, Scion does not create or annotate KSAs: the operator pre-provisions each KSA and its IAM binding out of band. When [`hub.k8s_workload_identity_setup`](#workload-identity-binding-at-mint) is on, the Hub can grant `roles/iam.workloadIdentityUser` at mint for Hub-minted GSAs (step 4), and a broker whose runtime entry or flat `runtime_target` sets `create_service_accounts: true` creates and annotates the conventional `<account ID>` KSA on first `assign` start of a Hub-minted GSA (steps 2 and 3; see **Opt-in broker KSA creation** below). Bring-your-own GSAs are never created or bound by Scion. For each GSA you assign to agents on a cluster:
 
 1. Workload Identity Federation is enabled on the cluster, and every node pool that runs agent pods uses the `GKE_METADATA` metadata server. GKE Autopilot clusters have both by default.
 2. A KSA exists in the namespace the agent pods run in (see **Namespace** below).
@@ -531,6 +646,7 @@ The broker resolves the KSA for the GSA in this order:
 1. The effective profile's own mapping. The effective profile is the profile named in the request, or else the active profile.
 2. The mapping on the runtime entry that profile selects.
 3. If neither maps the GSA, discovery by annotation in the namespace the pod runs in.
+4. If discovery finds no annotated KSA, and both `runtimes.<entry>.create_service_accounts: true` on the broker and the Hub's per-dispatch `CreateKSA` flag (set only for Hub-minted GSAs while `hub.k8s_workload_identity_setup` is on) are true, opt-in creation of the conventional `<account ID>` KSA in that namespace.
 
 A profile entry for a GSA overrides the runtime entry for that GSA only; other GSAs still fall through to the runtime entry. On a broker started with a forced runtime, no profile is consulted, and the mapping is read from the runtime entry whose key is the forced runtime's type name (for example `runtimes.kubernetes`).
 
@@ -576,6 +692,36 @@ subjects:
     namespace: scion-system
 ```
 
+**Opt-in broker KSA creation.** When [`hub.k8s_workload_identity_setup`](#workload-identity-binding-at-mint) is enabled on the Hub and `create_service_accounts: true` (default `false`) is set on the broker — either `runtimes.<entry>.create_service_accounts: true` in global settings (or the Hub database on a co-located server; never read from a project's `settings.yaml`, which logs a warning) or `server.broker.instances[].runtime_target.create_service_accounts: true` on a flat Runtime Broker instance — the broker can create the conventional KSA on first `assign` start:
+
+```yaml
+# Legacy (profile-resolving) Runtime Broker:
+runtimes:
+  gke-prod:
+    type: kubernetes
+    namespace: agents
+    workload_identity_pool: my-cluster-project.svc.id.goog
+    create_service_accounts: true
+
+# Flat Runtime Broker instance:
+server:
+  broker:
+    instances:
+      - key: gke-prod
+        name: gke-prod
+        runtime_target:
+          type: kubernetes
+          namespace: agents
+          workload_identity_pool: my-cluster-project.svc.id.goog
+          create_service_accounts: true
+```
+
+- **Hub-minted GSAs only:** the Hub sets `HubAgentDefaults.CreateKSA = true` on create, start, and restart dispatches only when `hub.k8s_workload_identity_setup` is on and the assigned GSA was minted by the Hub (`managed: true`). Bring-your-own GSAs never receive `CreateKSA`.
+- **Precedence and created object:** on a legacy broker, explicit mappings and annotation discovery run first, and only when discovery succeeds with zero matches does the broker create a KSA named `<account ID>` in the resolved namespace. On a flat instance (which never runs annotation discovery or lists `serviceaccounts`), `runtime_target.kubernetes_service_account_mappings` runs first, and on a miss the instance performs a single `get` by `<account ID>` in its activated namespace and creates the KSA on `NotFound`. In both modes, the created KSA carries `iam.gke.io/gcp-service-account: <GSA email>`, `scion.dev/created-for-gsa: <GSA email>`, `app.kubernetes.io/managed-by: scion`, and `automountServiceAccountToken: false`.
+- **Existing KSAs are never modified or deleted:** on a legacy broker, if `Create` returns `AlreadyExists`, the broker reads the KSA via `Get` and reuses it if it carries `iam.gke.io/gcp-service-account: <GSA email>`; on a flat instance, an existing `<account ID>` KSA is reused **only** when it carries both `app.kubernetes.io/managed-by: scion` and `iam.gke.io/gcp-service-account: <GSA email>` (an operator-annotated KSA without the Scion label is never adopted without an explicit mapping). Any other existing KSA fails the start with HTTP 400 and code `identity_ksa_conflict`, naming the KSA and namespace. KSAs are left in place when a minted GSA is later deleted.
+- **RBAC:** grant `get`, `list`, and `create` on `serviceaccounts` (core API group) in the agent namespace to a legacy broker's Kubernetes identity (replace `verbs: ["list"]` in the Role above with `verbs: ["get", "list", "create"]`; `scion doctor` verifies all three verbs when `create_service_accounts` is enabled on the active runtime entry in file-based global settings `~/.scion/settings.yaml`, though it cannot see a value set only through the Hub database overlay), or `get` and `create` (no `list`) to a flat instance's Kubernetes identity. If `create` or `get` returns `403 Forbidden`, the dispatch fails with `400 identity_not_mapped` and `details.missingPermission` (`"create serviceaccounts"` or `"get serviceaccounts"`).
+- **Propagation delay and namespace control:** a newly created KSA works only where the GSA's IAM policy grants `roles/iam.workloadIdentityUser` to `serviceAccount:<pool>[<namespace>/<account ID>]`. IAM bindings added at mint can take up to a few minutes to propagate in GKE Workload Identity, so the first token fetch of a pod started immediately after mint can fail transiently. Because Workload Identity authorizes by `(pool, namespace, KSA)` member rather than by annotation, use a namespace dedicated to Scion agents where only the broker identity can create ServiceAccounts and pods, and do not create `scion-*` ServiceAccounts for non-Scion workloads.
+
 **Report to the Hub (mapped, not ready).** For each Kubernetes profile, the broker reports to the Hub the GSAs the profile can serve. Each entry names the GSA, the KSA the pod would run as, the namespace, and whether the KSA comes from a mapping (`mapped`) or from an annotation (`discovered`). The Hub stores the report on the broker's profile (`serviceAccountMappings`) with the time it was last reported or confirmed (`mappingsReportedAt`).
 
 - An entry means the GSA is mapped on that profile, not that it is ready. The broker cannot see whether the Workload Identity IAM binding exists, so a mapped GSA can still fail to get credentials.
@@ -591,14 +737,16 @@ subjects:
 - the profile's runtime type is Kubernetes (a profile switched to another runtime is never checked, even if an old report is still stored);
 - the report is complete and was reported or confirmed in the last 15 minutes (three times the 5-minute interval at which the Hub records confirmations);
 - the report carries the current report version (`mappingsReportVersion`), which a broker sets once it also reports `force_runtime`. A complete report from an older broker is treated as unknown;
-- the GSA is in no entry and is not in `ambiguousGSAs`.
+- the GSA is in no entry and is not in `ambiguousGSAs`;
+- the GSA is not `creatable` on the profile (that is, it is not the case that `hub.k8s_workload_identity_setup` is on, the GSA is Hub-minted, and the broker's stored `workloadIdentityTargets` entry for the profile reports `ksaCreation: true`).
 
 The message names the GSA, the profile and the broker, and gives the two fixes: add the GSA to `kubernetes_service_account_mappings` in that broker's settings, or annotate a KSA in the profile's namespace with `iam.gke.io/gcp-service-account`. In every other case the Hub dispatches and the broker decides: an agent whose profile the Hub has not recorded, a missing, stale or incomplete report, an ambiguous GSA, a broker with no report, a non-Kubernetes runtime, or no GSA. Discovery runs every 5 minutes, so a KSA annotated in the last few minutes can still be refused by the Hub until the broker reports it.
 
 **Mapping status in the service account picker.** The project service account lists can show, for each account, whether it is mapped on one broker profile. The Hub uses the same rules as the dispatch check above, so the picker and the dispatch give the same answer. In the API, add `profile=<name>` and optionally `broker=<id, name or slug>` to `GET /api/v1/projects/<id>/gcp-service-accounts` or to `GET /api/v1/gcp-service-accounts?scope=project&scopeId=<id>`. A profile is needed: without one, every account reads `unknown` with reason `no_profile`. Each item then carries `assignStatus` with a `state`, a `reason`, a `message`, and the `brokerId`, `brokerName`, `profile` and `namespace` it describes. Asking for it needs the same project read access as the per-account status view. On the CLI, pass `--profile` and optionally `--broker` to `scion service-accounts list --assignable` or `scion project service-accounts list` to add an ASSIGN column. Without a broker, the Hub uses the broker agent creation would pick, not counting whether it is online: the project's default broker, else the hub's default broker if it serves the project, else the project's only provider. A project default that is not one of its providers gives `unknown` with reason `no_broker`. The state is one of:
 
 - `mapped`: a recent, complete report lists a KSA for the GSA. This does not mean the account is ready, because the Workload Identity IAM binding is not checked.
-- `not_mapped`: a recent, complete report does not list it. The dispatch check refuses this case.
+- `creatable`: a recent, complete report does not list a KSA yet, `hub.k8s_workload_identity_setup` is on, the GSA is Hub-minted, and the profile's runtime entry reports `ksaCreation: true` (`create_service_accounts: true`). Shown as `KSA created at start` in the CLI and web UI; the dispatch check lets it proceed so the broker creates the conventional KSA on start.
+- `not_mapped`: a recent, complete report does not list it (and it is not `creatable`). The dispatch check refuses this case.
 - `not_required`: the profile's runtime is `docker`, `podman` or `container`, so no mapping is needed.
 - `unknown`: the Hub cannot tell. The `reason` is one of `no_broker`, `no_profile`, `no_account`, `profile_not_on_broker`, `runtime_unrecognized` (a runtime key the Hub does not recognise as Kubernetes or local, such as a custom entry key), `report_missing`, `report_incomplete`, `report_old_version`, `report_stale` or `ambiguous_mapping`.
 
@@ -613,30 +761,33 @@ The check uses the report, which the broker builds from its global settings. A p
 | Condition | Status | Code | Message begins with |
 | :--- | :--- | :--- | :--- |
 | No GSA was resolved for the agent | 400 | `validation_error` | `GCP identity mode "assign" requires a service account email` |
-| The GSA has no mapping, and discovery found no annotated KSA or could not list | 400 | `identity_not_mapped` | `GCP identity mode "assign" on the Kubernetes runtime has no Kubernetes ServiceAccount mapped for "<gsa>"; add it to kubernetes_service_account_mappings in the broker's kubernetes runtime or profile settings`, followed by the discovery result in parentheses |
+| The GSA has no mapping, and discovery found no annotated KSA or could not list (or opt-in KSA creation lacked RBAC permission) | 400 | `identity_not_mapped` | `GCP identity mode "assign" on the Kubernetes runtime has no Kubernetes ServiceAccount mapped for "<gsa>"...` or `... could not provision the conventional ServiceAccount ...` (`details.missingPermission` names `create serviceaccounts` or `get serviceaccounts`) |
+| Opt-in KSA creation found an existing KSA at `<account ID>` whose annotation does not match the GSA | 400 | `identity_ksa_conflict` | `Kubernetes ServiceAccount "<ksa>" in namespace "<ns>" already exists and is not annotated with iam.gke.io/gcp-service-account: <gsa>` |
 | The GSA has no mapping, and more than one KSA in the namespace carries its annotation | 400 | `validation_error` | `GCP identity mode "assign" on the Kubernetes runtime: more than one Kubernetes ServiceAccount in namespace "<ns>" is annotated with iam.gke.io/gcp-service-account: <gsa> (<ksa>, <ksa>)` |
 | The mapping entry is malformed | 400 | `validation_error` | `kubernetes_service_account_mappings: ...` or `kubernetes_service_account_mappings[<gsa>]: ...` |
-| The request names a different KSA | 400 | `identity_ksa_mismatch` | `explicit Kubernetes ServiceAccount "<name>" does not match the ServiceAccount "<ksa>" mapped to "<gsa>"`, or `... discovered for "<gsa>" by its iam.gke.io/gcp-service-account annotation ...` |
+| The request names a different KSA | 400 | `identity_ksa_mismatch` | `explicit Kubernetes ServiceAccount "<name>" does not match the ServiceAccount "<ksa>" mapped to "<gsa>"`, `... discovered for "<gsa>" ...`, or `... conventional ServiceAccount "<ksa>" ...` |
 | The request names a different namespace | 400 | `validation_error` | `explicit Kubernetes namespace "<ns>" does not match the namespace "<ns>" from the broker's runtime settings` |
 | The project's `settings.yaml` overrides the entry's `namespace` or `context` | 400 | `validation_error` | `GCP identity mode "assign": runtime entry "<entry>" resolves namespace ...` or `... sets context ...` |
 | A forced runtime places pods in a different namespace than the entry resolves | 400 | `validation_error` | `GCP identity mode "assign": the broker's runtime "<name>" places pods in namespace ...` |
 | On start or restart, the agent now resolves to another runtime, profile, or runtime entry than its identity was resolved for | 409 | `validation_error` | `GCP identity mode "assign" was resolved for ...` |
 
-The messages above are the broker's own text, written for its operator log. For the two mapping rows the Hub does not pass that text on. It answers 400 with the same code (`identity_not_mapped` or `identity_ksa_mismatch`) and its own message, which names the GSA, the profile (or runtime entry) and the broker, says who can fix it, and links this section:
+The messages above are the broker's own text, written for its operator log. For `identity_not_mapped`, `identity_ksa_conflict`, and `identity_ksa_mismatch` the Hub does not pass that text on. It answers 400 with the same code and its own message, which names the GSA, the profile (or runtime entry) and the broker, says who can fix it, and links this section:
 
-- `identity_not_mapped`: `GCP service account "<gsa>" has no Kubernetes service account mapping on profile "<profile>" of broker "<broker>". A broker operator must add it to kubernetes_service_account_mappings in that broker's settings; see ...`. When the broker looked for an annotated KSA, one sentence about the result comes before `A broker operator`:
+- `identity_not_mapped`: `GCP service account "<gsa>" has no Kubernetes service account mapping on profile "<profile>" of broker "<broker>". A broker operator must add it to kubernetes_service_account_mappings in that broker's settings; see ...`. When the broker looked for an annotated KSA or attempted opt-in creation, fixed sentences come before `A broker operator`:
   - no match: `No Kubernetes service account in namespace "<ns>" carries the iam.gke.io/gcp-service-account annotation for it.`
   - the list failed: `The broker could not list Kubernetes service accounts in namespace "<ns>" to find an annotated one; it needs read-only list access to serviceaccounts there.`
   - the lookup could not run: `The broker could not look for a Kubernetes service account by its iam.gke.io/gcp-service-account annotation.`
+  - missing KSA creation permission (`details.missingPermission`): `Opt-in ServiceAccount creation could not proceed because the broker lacks create serviceaccounts (or get serviceaccounts) permission in namespace "<ns>".`
 
   The Hub never passes on the API server's error text. The broker logs it at warning level, with the agent, GSA and namespace.
-- `identity_ksa_mismatch`: `The requested Kubernetes service account "<name>" does not match "<ksa>", the one mapped to GCP service account "<gsa>" on profile "<profile>" of broker "<broker>". Remove the explicit Kubernetes service account from the request, or ask a broker operator to change kubernetes_service_account_mappings in that broker's settings; see ...`. When the KSA was found by annotation, the message reads `"<ksa>", the one found by its iam.gke.io/gcp-service-account annotation for GCP service account "<gsa>"` and asks the operator to `add an entry to kubernetes_service_account_mappings`.
+- `identity_ksa_conflict`: `Kubernetes service account "<ksa>" in namespace "<ns>" already exists and is not annotated for GCP service account "<gsa>" on profile "<profile>" of broker "<broker>"; Scion never modifies an existing ServiceAccount. A broker operator must annotate it with iam.gke.io/gcp-service-account, map GCP service account "<gsa>" to another ServiceAccount in kubernetes_service_account_mappings, or remove the conflicting ServiceAccount; see ...`.
+- `identity_ksa_mismatch`: `The requested Kubernetes service account "<name>" does not match "<ksa>", the one mapped to GCP service account "<gsa>" on profile "<profile>" of broker "<broker>". Remove the explicit Kubernetes service account from the request, or ask a broker operator to change kubernetes_service_account_mappings in that broker's settings; see ...`. When the KSA was found by annotation (or would be created at the conventional name), the message reads `"<ksa>", the one found by its iam.gke.io/gcp-service-account annotation` (or `the conventional one that would be created`) `for GCP service account "<gsa>"` and asks the operator to `add an entry to kubernetes_service_account_mappings`.
 
 The error details carry the same values as separate fields: `serviceAccount`, `profile`, `runtimeEntry` and `broker`, plus `requestedKubernetesServiceAccount` and `mappedKubernetesServiceAccount` for a mismatch (and `kubernetesServiceAccountSource: discovered` when the KSA was found by annotation), `kubernetesServiceAccountDiscovery` (`no_match`, `list_failed` or `unavailable`) and `namespace` for a missing mapping after an annotation lookup, and `docs`. This applies to create, start, restart, and to resuming an existing agent. A provision-only create, which stays successful when provisioning fails, carries the same message in its warning, and a reincarnation that fails for either reason records it. Through the Hub, the other 400 `validation_error` rows are relayed as 400 `validation_error` with the broker's text. The 409 row still surfaces as a failed dispatch (502 `runtime_error`) that includes the broker's text.
 
 There is no fallback: a failed mapping or discovery never runs the pod with the emulator or with the pod's default identity.
 
-**Per-profile default service account.** A project that runs agents on both Kubernetes and other profiles can set a default service account for each Kubernetes profile (`defaultGCPIdentityServiceAccountIDByProfile` in the project settings API). Pick a GSA that has a mapping on that profile. Agents created on that profile with no explicit identity then default to it, instead of a broader project default that has no Workload Identity binding. See [Per-Profile Default Service Accounts](/scion/hosted/ha/permissions/#per-profile-default-service-accounts).
+**Per-profile default service account.** A project that runs agents on both Kubernetes and other profiles can set a default service account for each Kubernetes profile (**Project Settings > Configuration > Auth & Security > Per-profile default service accounts**, or `defaultGCPIdentityServiceAccountIDByProfile` in the project settings API). Pick a GSA that has a mapping on that profile. Agents created on that profile with no explicit identity then default to it, instead of a broader project default that has no Workload Identity binding. See [Per-Profile Default Service Accounts](/scion/hosted/ha/permissions/#per-profile-default-service-accounts).
 
 **Early warning for unmapped service accounts.** The Hub warns, before any dispatch, about a GSA a project's agents can be assigned that no Kubernetes broker profile of the project maps. That covers the project's own service accounts and the hub-scoped ones. The warning appears on:
 
@@ -658,6 +809,8 @@ The warning says a profile maps the GSA, not that the Workload Identity binding 
 #### passthrough
 
 `passthrough` is unchanged on Kubernetes. Scion sets no metadata override, and the pod uses whatever identity the cluster provides: the node's service account, or a KSA bound through Workload Identity that you set up yourself (for example with `serviceAccountName`, as in [GKE Workload Identity](#gke-workload-identity)). Identity is assigned out of band, so Scion does not check which GSA the pod ends up with. An explicit per-agent `passthrough` request goes through the Hub's [passthrough authorization checks](/scion/hosted/ha/permissions/#hub-default-gcp-identity). Use `assign` when you want the Hub to control which GSA an agent gets.
+
+The pod is created with `automountServiceAccountToken: false`, so no Kubernetes API token is mounted. GCP identity through Workload Identity does not depend on that token. See [Agent pod identity](#agent-pod-identity).
 
 #### Example: assign on GKE
 
@@ -715,7 +868,7 @@ Each KSA must exist in its namespace, carry the `iam.gke.io/gcp-service-account`
 
 Starting an agent pod can take several minutes when the cluster has to add a node first, for example a GKE Autopilot cold start followed by a multi-minute image pull. A synchronous Hub create is bounded by the CLI's 30-second HTTP timeout and the Hub's `write_timeout`, so it is not suited to these starts.
 
-Turn on asynchronous create on the Hub, the `hub.async_agent_launch` [experiment](/scion/reference/experiments/) in **Admin → Server Config → Experiments** (no restart needed), and raise the launch budget above your slowest expected start:
+Use asynchronous create, the `hub.async_agent_launch` [experiment](/scion/reference/experiments/). It is on by default; check that it has not been turned off in **Admin → Server Config → Experiments** (no restart needed to change it). Then raise the launch budget above your slowest expected start:
 
 ```yaml
 server:
@@ -723,9 +876,9 @@ server:
     launch_timeout: "15m"   # default 5m
 ```
 
-`launch_timeout` is read only at Hub startup, so restart the Hub after changing it. The Hub, the Runtime Broker, and the CLI must all run a version that includes asynchronous create. With an older broker the Hub falls back to the synchronous create. `scion start` waits for the agent by default; if the wait ends first, the agent still comes up unless the launch reaches `launch_timeout`. While the agent's Pod is `Pending` (waiting for a node, pulling its image or running init containers), the Runtime Broker reports the agent as `starting`, not `running`, so the launch stays active until the container starts and `launch_timeout` still applies. An image pull failure (`ErrImagePull` or `ImagePullBackOff`) still ends the launch at once with `image_pull_failed`. See [Asynchronous agent create](/scion/reference/server-config/#asynchronous-agent-create) for the details.
+`launch_timeout` is read only at Hub startup, so restart the Hub after changing it. It also bounds asynchronous starts of existing agents, which are the separate `hub.async_agent_start` experiment (on by default; see [Asynchronous agent start](/scion/reference/server-config/#asynchronous-agent-start)). The Hub, the Runtime Broker, and the CLI must all run a version that includes asynchronous create. With an older broker the Hub falls back to the synchronous create. `scion start` waits for the agent by default; if the wait ends first, the agent still comes up unless the launch reaches `launch_timeout`. While the agent's Pod is `Pending` (waiting for a node, pulling its image or running init containers), the Runtime Broker reports the agent as `starting`, not `running`, so the launch stays active until the container starts and `launch_timeout` still applies. An image pull failure (`ErrImagePull` or `ImagePullBackOff`) still ends the launch at once with `image_pull_failed`. An NFS volume that cannot be mounted ends it with `volume_mount_failed` (see [NFS volume mount failures](#nfs-volume-mount-failures)). An NFS volume that is mounted but not usable from the agent container ends it with `volume_unhealthy` (see [NFS volume health check](#nfs-volume-health-check)). See [Asynchronous agent create](/scion/reference/server-config/#asynchronous-agent-create) for the details.
 
-A broker pod that stops during a launch reports it failed with `broker_restarted`. Give broker and combined Hub and broker pods `terminationGracePeriodSeconds: 45` so that report fits in the shutdown. To also recover launches after a crash or a pod replacement, point `server.broker.state_dir` at a persistent local volume. See [Broker restarts during a launch](/scion/reference/server-config/#asynchronous-agent-create).
+A broker pod that stops during a launch reports it failed with `broker_restarted`. The [Hub chart](/scion/hosted/ha/helm/) sets `terminationGracePeriodSeconds: 45` on its combined Hub and broker pod so that report fits in the shutdown; set the same on broker pods you deploy another way. The chart keeps the broker home on an `emptyDir`, so after a crash or a pod replacement the Hub ends the launches in progress as `broker_lost` (or `launch_timeout`), and `scion delete` removes what they left behind. To recover those launches instead, point `server.broker.state_dir` at a persistent local volume. See [Broker restarts during a launch](/scion/reference/server-config/#asynchronous-agent-create).
 
 ## Architecture & Security
 
@@ -734,8 +887,26 @@ Scion communicates directly with the Kubernetes API using the native Go client, 
 
 ### Pod Security Hardening
 To ensure secure execution, Scion enforces the following pod security policies automatically:
-- **Non-Root Execution**: Agent pods run as the unprivileged `scion` user (UID `1000`). `workspace_storage.nfs.uid` is ignored on Kubernetes; when it is set to a value other than `1000`, the broker logs a warning.
+- **Non-Root Execution**: Agent pods run as the unprivileged `scion` user (UID `1000`). `project_storage.nfs.uid` is ignored on Kubernetes; when it is set to a value other than `1000`, the broker logs a warning.
 - **Environment Injection**: Standard environmental variables like `HOME` (`/home/scion`), `USER` (`scion`), and `LOGNAME` (`scion`) are explicitly injected to prevent sandbox escapes and ensure consistent toolchain behavior.
+- **No Kubernetes API Token**: Agent pods are created with `automountServiceAccountToken: false` in every GCP identity mode. See [Agent pod identity](#agent-pod-identity).
+
+### Agent pod identity
+
+Agent pods are created with `automountServiceAccountToken: false` in every GCP identity mode, so no Kubernetes API token is mounted in the pod. Nothing in Scion uses that token from inside the pod. The pod keeps its ServiceAccount, and GCP identity through Workload Identity does not depend on the token.
+
+The agent's Google service account should hold no `container.*` IAM roles. Agent pods in GCP identity mode `passthrough` should run on Workload Identity node pools.
+
+Pods are immutable, so the setting applies from each agent's next start. An agent that was already running when the Runtime Broker was upgraded keeps its current pod until it is restarted. Restart running agents to apply the setting to them.
+
+To list agent pods that do not have `automountServiceAccountToken: false` across all namespaces, run this with your own cluster credentials:
+
+```bash
+kubectl get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\t"}{.spec.automountServiceAccountToken}{"\t"}{.spec.containers[*].name}{"\n"}{end}' \
+  | awk -F'\t' '$3 ~ /(^| )agent( |$)/ && $2 != "false"'
+```
+
+It selects pods by their container name, `agent`, not by label. An empty second column means the field is unset. It can also list pods outside Scion that have a container named `agent`, so check each one by name.
 
 ## Reliability & Auto-Recovery
 
@@ -757,37 +928,86 @@ On a node that has just scaled up from zero, such as on GKE Autopilot, the API s
 | EmptyDir (workspace) | Supported | Default workspace volume, always created. Contents are lost when the Pod stops (see [Empty-per-agent workspaces](#empty-per-agent-workspaces)) |
 | GCS FUSE CSI | Supported | Requires `gcsfuse.csi.storage.gke.io` CSI driver; GKE only |
 | Local/bind-mount | Not supported | Logged as warning, skipped. Use tar sync instead |
-| PersistentVolumeClaim | Supported | Used for the NFS-backed shared `workspace_storage` backend; requires a pre-provisioned PV/PVC (for example, Filestore-backed) and `workspace_storage.backend: nfs` in `settings.yaml`. See [NFS workspace export requirements](#nfs-workspace-export-requirements) |
+| PersistentVolumeClaim | Supported | Used for the NFS-backed shared `project_storage` backend when `nfs.shares[0].pv_name` names a pre-provisioned PV/PVC (for example, Filestore-backed). See [NFS workspace export requirements](#nfs-workspace-export-requirements) |
+| NFS (inline) | Supported | Used for the NFS-backed shared `project_storage` backend when the share has no `pv_name`: one inline `nfs` volume per directory, with no NFS mount options. See [Inline NFS volumes](#inline-nfs-volumes-no-pv_name) |
 
 ### NFS Workspace Export Requirements
 
-With `workspace_storage.backend: nfs`, each project's workspace is mounted into the agent Pod from the shared volume at the subPath `<subpath_root>/<project-id>/workspace` (`subpath_root` defaults to `projects`). When `shared_dir_storage` is unset or `local`, the project's shared directories are mounted from the same volume at `<subpath_root>/<project-id>/shared-dirs/<name>`. In shared-plain and worktree-per-agent modes, the workspace provisioning init container (and only that container) also mounts the project's provisioning state directory, `<subpath_root>/<project-id>/provision`, at `/scion-provision`. It holds the provisioning sentinel (`.scion-provisioned`) and the per-project provisioning lock, so neither is visible in the workspace. These directories have to exist before the Pod starts. How they get created depends on whether the Runtime Broker that creates the Pod has the export mounted at `workspace_storage.nfs.mount_root/<share id>`:
+With `project_storage.backend: nfs` (or the deprecated `workspace_storage.backend: nfs`) and a `pv_name` on the share, each project's workspace is mounted into the agent Pod from the shared volume at the subPath `<subpath_root>/<project-id>/workspace` (`subpath_root` defaults to `projects`). The project's shared directories are mounted from the same volume at `<subpath_root>/<project-id>/shared-dirs/<name>`. In shared-plain and worktree-per-agent modes, the workspace provisioning init container (and only that container) also mounts the project's provisioning state directory, `<subpath_root>/<project-id>/provision`, at `/scion-provision`. It holds the provisioning sentinel (`.scion-provisioned`) and the per-project provisioning lock, so neither is visible in the workspace. These directories have to exist before the Pod starts. How they get created depends on whether the Runtime Broker that creates the Pod has the export mounted at `project_storage.nfs.mount_root/<share id>`:
 
-- **Runtime Broker has the export mounted (recommended).** Before it creates the Pod, the Runtime Broker creates the workspace directory, the provisioning state directory and each of those shared directories itself, the same way it creates shared-directory leaves: missing parent directories get mode `2755`, and each new directory gets mode `2775` (setgid) with a default ACL that gives the group write access. Existing directories and their contents are left as they are. For this to help on exports that map root or all users to an anonymous user, the Runtime Broker's writes must not be mapped to an anonymous user that cannot write in `<subpath_root>/<project-id>`. If the Runtime Broker is not allowed to create a directory (permission denied or a read-only mount, for example a Runtime Broker that does not run as root where `<subpath_root>/<project-id>` is owned by root), it logs a warning and leaves that directory to the kubelet, as described in the next item. If the path cannot be used at all (a symlink or a regular file where a directory should be, or an export mount path that is not a directory), agent create fails straight away with an error that names the export requirement, rather than timing out while the Pod waits.
+- **Runtime Broker has the export mounted (recommended).** Before it creates the Pod, the Runtime Broker creates the workspace directory, the provisioning state directory and each of those shared directories itself, the same way it creates shared-directory leaves: missing parent directories get mode `2755`, and each new leaf directory gets mode `2775` (setgid) with a default ACL that gives the group write access. When the Hub or Runtime Broker runs as root and creates a new workspace or shared-directory leaf on the shared export, it `fchown`s that newly created leaf to `project_storage.nfs.uid` and `project_storage.nfs.gid` before applying `2775` and the default ACL (intermediate directories, `<subpath_root>/<project-id>/.scion`, and `<subpath_root>/<project-id>/provision` remain owned by the creator). Existing directories and their contents are left as they are. For this to help on exports that map root or all users to an anonymous user, the Runtime Broker's writes must not be mapped to an anonymous user that cannot write in `<subpath_root>/<project-id>`. If the Runtime Broker is not allowed to create a directory (permission denied or a read-only mount, for example a Runtime Broker that does not run as root where `<subpath_root>/<project-id>` is owned by root), it logs a warning and leaves that directory to the kubelet, as described in the next item. If the path cannot be used at all (a symlink or a regular file where a directory should be, or an export mount path that is not a directory), agent create fails straight away with an error that names the export requirement, rather than timing out while the Pod waits.
 - **Runtime Broker does not have the export mounted.** The kubelet creates the directories when the Pod starts. This only works on exports that let root create directories (`no_root_squash`, the Filestore default). On exports that map root to an anonymous user (`root_squash` or `all_squash`), the kubelet's mkdir is denied and the Pod stays in `CreateContainerConfigError` ("failed to create subPath directory for volumeMount workspace"). Mount the export on the Runtime Broker host, or use `no_root_squash`.
 
-When the kubelet created the provisioning state directory, the provisioning init container gives it to the agent runtime uid and `workspace_storage.nfs.gid` with mode `2775`. It does the same to a directory the Runtime Broker created whenever any other directory of the Pod was left to the kubelet. A Runtime Broker outside that group can still see whether the sentinel exists. If it cannot write there, it removes a deleted agent's worktree under the legacy workspace-root lock only (see below).
+When the kubelet created the provisioning state directory, the provisioning init container gives it to the agent runtime uid and `project_storage.nfs.gid` with mode `2775`. It does the same to a directory the Runtime Broker created whenever any other directory of the Pod was left to the kubelet. A Runtime Broker outside that group can still see whether the sentinel exists. A Runtime Broker that cannot write there cannot take the provisioning lock, so it leaves a deleted agent's worktree in place and logs why.
 
-Workspaces provisioned before the provisioning state directory existed have `.scion-provisioned` in the workspace root. It is still honoured, so those workspaces are not provisioned again, and provisioning adds it to the checkout's `.git/info/exclude`. While Pods of a project may still run images with an older `sciontool`, the init container also takes the provisioning lock in the workspace root (`.scion-provision.lock`) before the one in the state directory. That lock is transient and excluded from git, and leftover lock entries are cleaned up on a later provisioning run.
+**Root-squashed exports.** The provisioning init container runs as root and chowns what it creates or clones to uid `1000` (the agent runtime uid) and `project_storage.nfs.gid`. On an export that maps root to an anonymous user (`root_squash` or `all_squash`), the server refuses these chowns with `EPERM`. A refused chown is not an error when the entry already has that owner, so such an export works when it maps root to `anonuid=1000` and `anongid=<project_storage.nfs.gid>`. Leave `project_storage.nfs.uid` unset or set it to `1000`: a Hub or Runtime Broker that runs as root gives each new leaf it creates to `project_storage.nfs.uid`, and on such an export the init container cannot change that owner. With the default `anonuid=65534`, new entries are owned by `65534`, the chown check fails and the agent does not start. The Runtime Broker still has to mount the export, as described above.
 
-The provisioning init container runs the agent's own image, so an older `sciontool` keeps running for as long as any agent of the project runs an older image, not just during an upgrade. Each start of such a Pod, after a newer one has provisioned the project:
+The provisioning state directory is the only place the sentinel and the provisioning lock are kept. Nothing reads, writes or locks `.scion-provisioned` or `.scion-provision.lock` in the workspace root. Every open of the state directory removes old lock entries left there (never the live lock).
 
-- runs the full provisioning step again: an existing clone is reused, but the whole workspace is chowned recursively on every start;
-- writes `.scion-provisioned` back into the workspace root (newer images add it to the git excludes);
-- if it only waits for another Pod's provisioning, times out, because the newer image writes the sentinel in the state directory.
+#### Upgrading from releases that kept the sentinel in the workspace
 
-No data is lost in these cases, but to keep the workspace free of provisioning files, make sure every agent of the project runs an image from a release that includes the provisioning state directory.
+Releases before the provisioning state directory kept `.scion-provisioned` and the provisioning lock in the workspace root. When you upgrade:
 
-`mount_root/<share id>` must be the mounted export itself, not a parent of the mount point or an ordinary directory. The Runtime Broker treats it as the export once it exists: if the export is not actually mounted there, the directories are created on the Runtime Broker host's local disk, and the Pod still depends on the kubelet creating them on the export.
+- **Existing workspaces are promoted at Hub start.** The Hub mounts the share, so on every start it checks each project tree. For a workspace whose only sentinel is `.scion-provisioned` in the workspace root, it creates the sentinel in the state directory under the project's provisioning lock, removes the workspace-root file and its `/.scion-provisioned` line from `.git/info/exclude`, and removes workspace-root lock entries older than twice the lock's stale threshold. A live workspace-root lock is never removed. Each project it changes gets one log line (`provisioning state promotion`). The step does nothing for a project with nothing to promote, so it is safe on every start. After it, the next agent start of a promoted project does no clone and no recursive chown, including worktree-per-agent projects whose agents already have worktrees.
+  - A workspace brought in by the project storage migration is promoted right after the migration run, for every project whose workspace the run moved or copied, so no Hub restart is needed before its agents start. The run's log shows one `provisioning state promotion` line per such project.
+  - The promotion runs at every Hub start, not only at the first one after the upgrade. A regular `.scion-provisioned` file in a workspace root whose state directory has no sentinel is promoted whenever it is found, including one created after the upgrade.
+  - The lock-entry cleanup removes only entries whose names start with `.scion-provision.lock.`, never the live `.scion-provision.lock` and nothing else in the workspace. Each such entry is removed as a whole (a directory together with its contents), and a symbolic link is removed itself, never its target.
+- **Agent images from before the provisioning state directory must be rebuilt.** The provisioning init container runs the agent's own image. An older `sciontool` looks for the sentinel and takes its lock in the workspace root only, so it treats every workspace as unprovisioned: it provisions again on every Pod start (an existing clone is reused, but the whole workspace is chowned recursively each time), writes `.scion-provisioned` back into the workspace root, and does not wait for a newer Pod's provisioning. Make sure every agent of the project runs an image from a release that includes the provisioning state directory.
+- **Pods built by an older Runtime Broker fail provisioning until the broker is upgraded.** Such a Pod has no provisioning state directory mount (`SCION_PROVISION_STATE_DIR` is not set). In shared-plain and worktree-per-agent modes, a current `sciontool` then fails the init container with "this pod has no provisioning state directory; the runtime broker must be upgraded" and creates nothing. Upgrade the Runtime Broker. Clone-per-agent and empty-per-agent keep their sentinel in the agent directory and are not affected.
+- **Workspace-root entries the promotion does not remove** (a live lock, or entries a still-running older image writes again) count as workspace content. A workspace that is not yet cloned and holds one of them is refused at its first provisioning, with the entries named. Remove them, and start the agent again.
 
-On exports that map root or all users to an anonymous user, the workspace provisioning init container cannot change file ownership, because the NFS server decides ownership changes. When the Runtime Broker created all of these directories, or found them already in place with setgid and group write (for example `2775`), the provisioning step tries to set ownership to the agent runtime uid (`1000`) and `workspace_storage.nfs.gid`, logs a warning if that is not allowed, and continues. If any of them already exists without setgid and group write (for example a root-owned `0755` directory left by an earlier kubelet mkdir), or was left to the kubelet, a failed ownership change still stops the Pod; fix that directory's group and mode on the export. Agents get access through the directories' group: set `workspace_storage.nfs.gid` to the group that owns `<subpath_root>/<project-id>` on the export (the agent Pod uses it as its `fsGroup`), so files created under the setgid directories stay writable by the agent.
+`mount_root/<share id>` must be the mounted export itself, not a parent of the mount point or an ordinary directory. The Runtime Broker treats it as the export once it exists: if the export is not actually mounted there, the directories are created on the Runtime Broker host's local disk, and the Pod still depends on the kubelet creating them on the export. On a verify-only Runtime Broker (whose default runtime is Kubernetes or Cloud Run, so the platform mounts the export into agent pods), an exact `/proc/mounts` `server:export` string match is advisory (logged as a warning and reported in health when the container's mount source differs in form, such as hostname vs IP or a trailing slash), and Kubernetes and Cloud Run agent dispatches are not gated on host `nosuid,nodev` flags (unlike local-container runtimes such as Docker, Podman and Apple `container`, which require `nosuid,nodev` on the host NFS mount and any submounts before create, start and restart and return `503 nfs_unavailable` when either flag is missing; see [NFS mounts on the Runtime Broker](/scion/reference/server-config/#nfs-mounts-on-the-runtime-broker)). On a verify-only Runtime Broker, shared-storage dispatches are admitted when `<mount_root>/<share id>/<subpath_root>` is a visible directory (`503 project_storage_unavailable` when absent) and `<subpath_root>/<project-id>/.scion/project-id` matches the dispatched project (`409` on mismatch).
+
+#### Inline NFS volumes (no pv_name)
+
+When `nfs.shares[0].pv_name` is not set, agent Pods mount the share inline instead of through a PersistentVolumeClaim. Each directory the Pod uses (the workspace or the agent's own directory, the provisioning state directory, each shared directory, and in worktree-per-agent mode the `.git` directory and the worktree) is its own `nfs` volume of that directory's server path, `<export>/<subpath_root>/<project-id>/...`, mounted with no subPath. The workspace's `.scion` entry is mounted read-only from the workspace volume by the subPath `.scion`, so the node resolves it within that volume. No container gets the whole export or the project directory. The containers see the same paths as with a claim. The agent runtime logs `k8s NFS volumes: inline, by server path; no mount options` at startup.
+
+Inline volumes carry **no NFS mount options**: there is no `nconnect`, and the NFS version is negotiated between the node and the server. `project_storage.nfs.mount_options` applies only to host mounts. Inline volumes take no NFS mount options at all (for example `sec=krb5`, `sec=krb5i` or `sec=krb5p`, `xprtsec=tls`, `nosuid` or `nodev`); to get mount options in agent Pods, create a PersistentVolume with the options you need in its `mountOptions`, create a corresponding PersistentVolumeClaim, and set `pv_name` to the claim's name.
+
+**Requirement: the Runtime Broker mounts the export, writable.** An inline volume names a directory that must exist before the Pod starts, and the kubelet does not create it. The Runtime Broker creates every one of these directories itself, so:
+
+- Mount the share's export (`<server>:<export>`) on the Runtime Broker at `project_storage.nfs.mount_root/<share id>`, the path the storage layout uses. In the Helm chart, the hub Pod (which runs the Runtime Broker) already mounts it there.
+- The Runtime Broker's writes must not be mapped to an anonymous user that cannot write in `<subpath_root>/<project-id>` (check the export's `root_squash`/`all_squash` settings against the user the Runtime Broker runs as).
+- Directory modes are as described above: missing parents get `2755`, and new directories get `2775` (setgid) with a default ACL that gives the group write access.
+- The export holds only regular files and directories (no device files); to specify mount options, use `pv_name` with a PersistentVolume.
+
+If the export is not mounted on the Runtime Broker, or the Runtime Broker is not allowed to create a directory, the agent start is refused before the Pod is created. A missing export mount is refused as a project storage share the Runtime Broker cannot see: the client gets a fixed text that says to make the share available, writable, in the Runtime Broker's container at its configured mount point, and the Runtime Broker log names the path. For a directory the Runtime Broker may not create, the Runtime Broker log names the directory and says to mount the export writably. With a `pv_name`, a directory the Runtime Broker is not allowed to create is still left to the kubelet, as described above. `scion doctor` reports a missing export mount as a failure when the default runtime is Kubernetes and the share has no `pv_name`.
+
+Also refused in inline mode, with a message that says what to change:
+
+- agents with NFS homes (`project_storage.homes: nfs`). Set `pv_name` to use them.
+- shared directories on the deprecated split `shared_dir_storage` export, which still need that share's `pv_name`.
+
+On exports that map root or all users to an anonymous user, the workspace provisioning init container cannot change file ownership, because the NFS server decides ownership changes. When the Runtime Broker created all of these directories, or found them already in place with setgid and group write (for example `2775`), the provisioning step tries to set ownership to the agent runtime uid (`1000`) and `project_storage.nfs.gid`, logs a warning if that is not allowed, and continues. If any of them already exists without setgid and group write (for example a root-owned `0755` directory left by an earlier kubelet mkdir), or was left to the kubelet, a failed ownership change still stops the Pod; fix that directory's group and mode on the export. Agents get access through the directories' group: set `project_storage.nfs.gid` to the group that owns `<subpath_root>/<project-id>` on the export (the agent Pod uses it as its `fsGroup`), so files created under the setgid directories stay writable by the agent.
+
+#### NFS volume mount failures
+
+If an NFS volume of the agent Pod cannot be mounted (a wrong or unreachable server, an export the nodes may not mount, or a path that does not exist), the start fails with `volume_mount_failed` in the `container_create` step instead of waiting for `launch_timeout`. While the Pod waits for its volumes, the Runtime Broker reads the Pod's Kubernetes Events (`FailedMount`, `FailedAttachVolume`) at most every 10 seconds. It fails the start once a failure on an inline NFS volume, or a configured NFS share claim (workspace, home or shared directory), has been seen for 60 seconds and has recurred. A failure that clears within that time does not fail the start. An inline volume is usually reported after about a minute; a claim-backed volume is reported when the kubelet gives up waiting for the Pod's volumes, after about two to four minutes. The Runtime Broker log names the volume, the share's server and path (or the claim) and a short cause; clients see only the code and the reason, for example `an agent volume could not be mounted (FailedMount)`. Without `list` on `events`, the start waits for `launch_timeout` as before, and that is logged once.
+
+#### NFS volume health check
+
+After the agent Pod is running, and before the agent starts, the Runtime Broker checks each NFS volume of the agent container from inside the container: the same volumes the mount failure check watches (inline NFS volumes and the configured NFS share claims). For each mount of such a volume it reads the container's mount table and checks that the volume is mounted, and that it is not mounted read-only where the Pod mounts it read-write. Then it opens the mount directory and checks that the agent's user can read it and, for a read-write mount, write to it, with each step answering within 10 seconds. The check runs `cd`, `test -r` and `test -w`; it reads no file contents and writes nothing to the share.
+
+A volume mounted read-only by configuration (a `readOnly` volume mount, or a read-only NFS volume or claim source, such as a read-only shared directory) is checked only for being mounted and readable, never for writing.
+
+A volume that fails three consecutive checks, 5 seconds apart, fails the start with `volume_unhealthy` in the `container_start` step, whatever the fault on each check; the reason reported is the one from the last check. A volume that passes any check is accepted. The Runtime Broker log names the volume, the share's server and path (or the claim) and a short remedy; clients see only the code and the reason, for example `an agent volume is mounted but not usable (ShareNotWritable)`. The reasons are `ShareNotMounted`, `ShareReadOnly`, `ShareNotVisible`, `ShareNotReadable`, `ShareNotWritable` and `ShareUnresponsive`. If the check itself cannot run (for example an exec error), the Runtime Broker logs a warning and the start continues. Starts, restarts, resumes and wakes all run the check.
+
+The write check uses the NFS server's answer to an access check, so it does not catch:
+
+- a server that answers the access check optimistically and refuses the write itself;
+- a refusal that happens only when data is written, such as a full export or an exceeded quota;
+- a stale file handle that appears only on a write.
 
 #### Sharing Modes on the NFS Workspace
 
+:::caution[Git projects sharing one repository are refused on Kubernetes]
+The Kubernetes runtime refuses to start agents for git projects that share one repository across agents (`worktree-per-agent` or git-backed `shared-plain` on NFS) before creating a Pod, because it cannot give each agent a private, redacted `.git/config` on the shared export. Use `clone-per-agent` on Kubernetes (where each agent gets its own clone under `agents/<agent-name>/workspace`), or run `worktree-per-agent` and git-backed `shared-plain` projects on a local or Docker Runtime Broker; see [Git that Scion runs on the host](/scion/local/workspace/#git-that-scion-runs-on-the-host). Non-git `shared-plain` projects and `empty-per-agent` projects on NFS continue to work on Kubernetes. The Runtime Broker marks a `shared-plain` workspace non-git at each start only when the Hub records no git remote for the project and the workspace directory on the share is there and is not a git repository; otherwise the start is refused. The Runtime Broker computes `SCION_WORKSPACE_GIT` itself; a value set in settings, harness-config or project env is no longer honoured. Running `git init` in a non-git project's shared workspace therefore makes later Kubernetes starts of its agents refuse.
+:::
+
 How agents of a git-backed project use `<subpath_root>/<project-id>/workspace` depends on the project's sharing mode:
 
-- **Worktree-per-agent.** The workspace directory holds the project's shared checkout, and each agent gets its own git worktree at `<subpath_root>/<project-id>/workspace/worktrees/<agent-name>`, on the agent's branch: the branch given at create, used exactly as given (for example `feature/login`), otherwise the agent name. The provisioning init container clones the shared checkout on the project's first start, detaches its HEAD so that no branch is held by the shared checkout, and adds the agent's worktree with relative paths. It also sets `gc.auto 0` in the shared checkout and adds `worktrees/` to its `.git/info/exclude`. A shared checkout provisioned earlier in another mode keeps its files and current branch. The agent container mounts the shared `.git` at `/repo-root/.git` and its worktree at `/repo-root/worktrees/<agent-name>`, and starts in the worktree, the same layout as worktree-per-agent on Docker. When the shared checkout has already been provisioned, the broker creates the agent's empty worktree directory before the Pod starts, as described above for the workspace directory. Every agent Pod in this mode runs the provisioning init container; a per-project file lock in the provisioning state directory runs them one at a time, and a Pod waits up to the init container's provisioning timeout (5 minutes) for it, as long as a Pod that waits for the first clone to finish.
-- **Shared-plain.** Every agent mounts the workspace directory at `/workspace`. For a git-backed project, the provisioning init container clones the repository into it on the project's first start, so agents no longer start in an empty workspace; later agents reuse that checkout.
+- **Worktree-per-agent.** Refused at start on Kubernetes today (see the caution above); the layout below is kept for reference. The workspace directory holds the project's shared checkout, and each agent gets its own git worktree at `<subpath_root>/<project-id>/workspace/worktrees/<agent-name>`, on the agent's branch: the branch given at create, used exactly as given (for example `feature/login`), otherwise the agent name. The provisioning init container clones the shared checkout on the project's first start, detaches its HEAD so that no branch is held by the shared checkout, and adds the agent's worktree with relative paths. It also sets `gc.auto 0` in the shared checkout and adds `worktrees/` to its `.git/info/exclude`. A shared checkout provisioned earlier in another mode keeps its files and current branch. The agent container mounts the shared `.git` at `/repo-root/.git` and its worktree at `/repo-root/worktrees/<agent-name>`, and starts in the worktree, the same layout as worktree-per-agent on Docker. When the shared checkout has already been provisioned, the broker creates the agent's empty worktree directory before the Pod starts, as described above for the workspace directory. Every agent Pod in this mode runs the provisioning init container; a per-project file lock in the provisioning state directory runs them one at a time, and a Pod waits up to the init container's provisioning timeout (5 minutes) for it, as long as a Pod that waits for the first clone to finish.
+- **Shared-plain.** Refused at start on Kubernetes today (see the caution above); the layout below is kept for reference. Every agent mounts the workspace directory at `/workspace`. For a git-backed project, the provisioning init container clones the repository into it on the project's first start, so agents no longer start in an empty workspace; later agents reuse that checkout.
 - **Clone-per-agent.** Each agent gets its own directory next to the workspace directory, `<subpath_root>/<project-id>/agents/<agent-name>`, and its own clone of the repository in `agents/<agent-name>/workspace`, described below. The project's workspace directory is not used.
 
 Hub-managed projects without git that use **Empty-per-agent** (each agent gets its own private directory that starts empty) use the same agent directory as clone-per-agent, `<subpath_root>/<project-id>/agents/<agent-name>/workspace`, described below, but nothing is cloned into it. The project's workspace directory is not used. Without NFS workspace storage (including `gke-shared-volume`), see [Empty-per-agent workspaces](#empty-per-agent-workspaces) below.
@@ -825,8 +1045,8 @@ Older agent images behave in one of two ways. With an image whose `sciontool` pr
 In Empty-per-agent mode the agent's directory works the same way as in clone-per-agent mode, without the branch and the clone. The broker creates `agents/<agent-name>` and the empty `workspace` directory in it before the Pod starts, with the same modes, and creates nothing else in `agents/<agent-name>`. The agent container mounts `agents/<agent-name>/workspace` at `/workspace`. No container in the Pod mounts the project's workspace directory. The provisioning init container mounts `agents/<agent-name>`, creates `workspace` if it is missing, sets the ownership of the `workspace` directory while it is empty, prepares the shared directories and writes its sentinel. It records no branch and runs no git. The workspace's files are kept across restarts and suspend/resume, and deleting the agent together with its files removes its workspace as described above for clone-per-agent. Starting such an agent stops with an error, so it never falls back to the project's workspace directory, when:
 
 - the agent name is not an agent slug (lower-case letters, digits and dashes).
-- the NFS share has no `pv_name`, so the Pod cannot mount the agent's directory.
-- the agent runs on a runtime other than Kubernetes on a broker with `workspace_storage.backend: nfs`. Use a broker with local workspace storage for those runtimes.
+- the NFS share has neither a `pv_name` nor a server and export, so the Pod cannot mount the agent's directory.
+- the agent runs on a runtime other than Kubernetes on a broker with `project_storage.backend: nfs`. Use a broker with local workspace storage for those runtimes.
 
 An agent image whose `sciontool` predates `SCION_WORKSPACE_MODE` prepares `agents/<agent-name>` as a plain workspace, and the agent still gets the empty `workspace` directory the broker created. An image whose `sciontool` knows Empty-per-agent but not this NFS support stops the provisioning init container with an error; use an agent image with this version of `sciontool`.
 
@@ -853,19 +1073,19 @@ To keep the work, push it before stopping the agent, or use [NFS workspace stora
 
 ### Persistent Agent Home (NFS)
 
-With [`server.home_storage`](/scion/reference/server-config/#agent-home-storage-serverhome_storage) (or a profile's `home_storage_backend: nfs`) and the `hub.k8s_nfs_home` experiment, a Kubernetes agent keeps its home directory on the NFS export of its profile's shared-dir storage. Files, harness sessions and credentials the harness writes into the home then survive stops, restarts and pod replacements. The feature is in development and also needs `server.home_storage.allow_incomplete_phases`.
+With [`server.project_storage.homes: nfs`](/scion/reference/server-config/#project-storage-serverproject_storage) and the `hub.k8s_nfs_home` experiment, a Kubernetes agent keeps its Agent home on the NFS export of `server.project_storage` (which needs `backend: nfs` and a bound PVC via `nfs.shares[0].pv_name`; inline NFS mode without `pv_name` is refused when `homes: nfs` is set). Files, harness sessions and credentials the harness writes into the Agent home then survive stops, restarts and pod replacements. The feature is in development and also needs `server.project_storage.homes_options.allow_incomplete_phases`. Agent homes are placed for the whole deployment; the former per-profile and per-runtime `home_storage_backend`, `home_storage_leaf`, `shared_dir_storage_backend` and `shared_dir_storage_backends` keys are removed, flagged as `storage_overrides` at startup (`storage_override_errors` on `GET /api/v1/admin/server-config`), and refused at agent start with `422 storage_migration_required`.
 
-- **Layout**: each agent's home is `<subpath_root>/<project id>/agents/<agent slug>/home-<agent id>` on the export, mounted by `subPath` at the agent's home directory. It is named after the hub agent ID, so a new agent with the same name gets a new, empty home.
+- **Layout**: each agent's home is `<subpath_root>/<project id>/agents/<agent slug>/home-<agent id>` on the export (the same unified path shape used on Cloud Run), mounted by `subPath` at the agent's home directory. It is named after the hub agent ID, so a new agent with the same name gets a new, empty home.
 - **Export requirements**: the export's group must be the pod group, gid 1000. The home directory is mode 2771 and owned by that group, and the agent writes through the group. A start whose home is not writable by uid 1000 fails with `home_storage_unavailable` and names the requirement.
-- **Creating the home directory** (`home_storage_leaf`):
-  - `pod` (default): a `home-leaf` init container in the agent's pod creates it. The container runs as root with only the `CHOWN`, `FOWNER` and `DAC_OVERRIDE` capabilities and mounts only the agent's directory. This needs an export without root squashing; on a squashed export the start fails with `home_leaf_failed`. The broker does nothing on its host.
-  - `broker`: the broker creates it through its own mount of the export at the shared-dir storage `mount_root` (for example an fstab entry with `nofail`). This works on root-squashed and all-squashed exports. The mount is checked only when an agent using it starts; a missing mount fails that start with `home_storage_unavailable` and never affects broker startup or agents on other runtimes.
-- **Each start**: a `home-prepare` init container (uid 1000) checks the home and its sentinel file `.scion-home-seed.json`. A new home is seeded once: the image's own home directory is copied if it is smaller than `skeleton_max_bytes`, then the broker's copy of the agent home is transferred. Later starts transfer the broker's copy over the existing home and clear `.scion/hooks` first. A home with content but no sentinel, or one belonging to another agent, fails the start without changes.
+- **Creating the home directory** (`homes_options.leaf`):
+  - `pod` (default): a `home-leaf` init container in the agent's pod creates it. The container runs as root with only the `CHOWN`, `FOWNER` and `DAC_OVERRIDE` capabilities and mounts only the agent's directory. This needs an export without root squashing; on a squashed export the start fails with `home_leaf_failed`. The Runtime Broker does nothing on its host.
+  - `broker`: the Runtime Broker creates it through its own mount of the export at `nfs.mount_root` (for example an fstab entry with `nosuid,nodev,nofail`). This works on root-squashed and all-squashed exports. The mount is checked only when an agent using it starts; a missing mount fails that start with `home_storage_unavailable` and never affects Runtime Broker startup or agents on other runtimes.
+- **Each start**: a `home-prepare` init container (uid 1000) checks the home and its sentinel file `.scion-home-seed.json`. A new home is seeded once: the image's own home directory is copied if it is smaller than `skeleton_max_bytes`, then the Runtime Broker's copy of the agent home is transferred. Later starts transfer the Runtime Broker's copy over the existing home and clear `.scion/hooks` first. A home with content but no sentinel, or one belonging to another agent, fails the start without changes.
 - **Secrets**: staged secret and auth files stay in memory or read-only volumes under `/run/scion`. In the home they appear as symbolic links, so their content is never written to the export. A file, link or directory the user put at a link target that scion never linked, or a symbolic link in its parent path, is kept and the link is skipped with a warning. If `.scion` or `.scion/hooks` in the home is a symbolic link, the start fails rather than transferring through it. `SCION_SECRETS_FILE` points at the staged `secrets.json`. The harness's own staged secrets are copied into memory only (`SCION_HARNESS_SECRETS_DIR`), never into the home, and its generated outputs are written to memory too.
 - **Images**: the image's sciontool must support NFS homes (`sciontool version --features` lists `home-v1`); older images fail with a message saying so.
-- **One pod at a time**: pods with an NFS home are never force-deleted. Stop and delete use the pod's grace period (`stop_grace_seconds`, default 30) and return at once. A start waits for the previous pod to stop, for at most the grace period plus `termination_wait_seconds` (default 15). It is refused with the retryable `previous_pod_unconfirmed` when the previous pod cannot be read, its node is unreachable, or the bound runs out. The previous pod's secrets are removed only once it has stopped. The pod name is unique per agent and a start waits for the previous pod's confirmed termination, so two pods do not write to the same home; a per-agent advisory lock is also taken when the broker is given a store locker. Keep `stop_grace_seconds` plus `termination_wait_seconds` below the hub's 90 second start window; the server warns at startup when it is not.
+- **One pod at a time**: pods with an NFS home are never force-deleted. Stop and delete use the pod's grace period (`stop_grace_seconds`, default 30) and return at once. A start waits for the previous pod to stop, for at most the grace period plus `termination_wait_seconds` (default 15). It is refused with the retryable `previous_pod_unconfirmed` when the previous pod cannot be read, its node is unreachable, or the bound runs out. The previous pod's secrets are removed only once it has stopped. The pod name is unique per agent and a start waits for the previous pod's confirmed termination, so two pods do not write to the same home; a per-agent advisory lock is also taken when the Runtime Broker is given a store locker. Keep `stop_grace_seconds` plus `termination_wait_seconds` below the hub's 90 second start window; the server warns at startup when it is not.
 - **Sync**: `scion sync to|from <agent>` copies the agent workspace only; the home stays on the export.
-- **Delete**: deleting an agent does not remove its home from the export in this version.
+- **Delete**: deleting an agent removes its `home-<agent-id>` and `secrets-<agent-id>` from the export (and `agents/<slug>` once empty) when the delete removes the agent's files or when a soft-deleted agent's retained files are purged; see [Cleanup on project delete](/scion/reference/server-config/#cleanup-on-project-delete).
 - **Credentials at rest**: the agent's hub token and environment files (`.scion/scion-token`, `.scion/scion-env`), credentials that harness scripts copy into native home files (for example API-key auth files), and harness OAuth tokens are stored on the export while the home exists.
 
 ### Secret Modes
@@ -896,7 +1116,7 @@ When the Hub uses transport auth (see [Auth Proxy (IAP)](/scion/hosted/ha/auth-p
 
 The per-agent Secret is created even when the agent has no other secrets. It is rebuilt on every start, resume, and restart, so the new Pod always reads the value the Hub sent for that dispatch. In GKE mode the value is stored in this Kubernetes Secret, not in the SecretProviderClass. If a user or project secret also targets `SCION_TRANSPORT_TOKEN`, the value from the Hub is used and the other secret is skipped, with a warning in the broker log. A secret named `scion-transport-credential` is also skipped, because that key is reserved. `SCION_TRANSPORT_TOKEN_EXPIRY` and `SCION_TRANSPORT_AUDIENCE` stay plain environment values. Docker and the other runtimes are unchanged.
 
-No extra RBAC is needed: this uses the same `secrets` create, list, and delete permissions the runtime already needs for agent Secrets (see [Required Permissions](#required-permissions)).
+No extra RBAC is needed: this uses the same `secrets` create, list, and delete permissions the runtime already needs for agent Secrets (see [Runtime Broker permissions](#runtime-broker-permissions)).
 
 ### Git Credential
 
@@ -937,33 +1157,89 @@ Tar sync includes retry with exponential backoff (1s, 2s, 4s — up to 3 retries
 | Namespace/pod ID format | Supported (`namespace/podname` for all operations) |
 | Namespace annotation | Supported (`scion.namespace` persisted on pod) |
 
-## Required Permissions
+## Runtime Broker permissions
 
-The user or service account running scion needs the following RBAC permissions in the target namespace:
+The Runtime Broker creates and manages agent pods with its own Kubernetes identity. Bind the permissions below to that identity, in each namespace agents run in, with a namespaced `Role` and `RoleBinding`:
+
+- **Runtime Broker running in the cluster without a kubeconfig:** the broker pod's own ServiceAccount. To find it, run `kubectl get pod <broker-pod> -n <broker-namespace> -o jsonpath='{.spec.serviceAccountName}'`.
+- **Runtime Broker using a kubeconfig:** the user of the runtime entry's `context` (or of the current context). `kubectl config view --minify -o jsonpath='{.contexts[0].context.user}'` shows the user. With the same credentials, `kubectl auth whoami` shows the name the cluster sees.
 
 When Scion runs on GCE or GKE and the kubeconfig's exec credential plugin fails (for example, `gke-gcloud-auth-plugin` is not on the process `PATH`), it falls back to Application Default Credentials and requests the `cloud-platform` and `userinfo.email` scopes. The `userinfo.email` scope makes GKE see the caller as its service account email rather than its numeric ID, so RBAC bindings whose subject is the email match. On a plain GCE VM, the instance's access scopes must already include `userinfo.email` for this to work.
 
-### Minimum RBAC
+| API group | Resource | Verbs | Used for |
+|---|---|---|---|
+| `""` | pods | create, get, list, delete | Creating agent pods, reading their status, listing agents, stopping and deleting them |
+| `""` | pods/exec | create | Attach, exec, home and workspace sync, readiness checks |
+| `""` | pods/log | get | Agent logs |
+| `""` | secrets | create, get, list, delete | Per-agent Secrets and their cleanup |
+| `""` | persistentvolumeclaims | create, get, list, delete | The [claim check before the pod](#claim-check-before-the-pod), creating shared-dir claims on the local backend, and releasing a deleted project's shared-dir claims (list and delete; `scion doctor`'s claim check also uses list) |
+| `""` | events | list | The reason shown for a claim that is not ready, for a pod that disappeared, and for an NFS volume that cannot be mounted |
+| `""` | serviceaccounts | list (legacy discovery); get, list, create (legacy `create_service_accounts: true`); get, create (flat `runtime_target.create_service_accounts: true`) | Optional: [Workload Identity annotation discovery and opt-in conventional KSA creation](#gcp-identity-mode-assign-workload-identity-mapping) |
+| `secrets-store.csi.x-k8s.io` | secretproviderclasses | create, get, list, delete | GKE mode only: Secret Manager mounts |
 
-| Resource | Verbs |
-|---|---|
-| pods | create, get, list, delete |
-| pods/exec | create |
-| pods/log | get |
-| secrets | create, list, delete |
+Without `get` on persistentvolumeclaims or `list` on events, agents still start: the claim check is skipped or uses the claim phase only, a vanished pod gets a generic reason, and an NFS volume that cannot be mounted ends the start at `launch_timeout`. `create` on persistentvolumeclaims is needed only to create shared-dir claims. Without `list` and `delete` on persistentvolumeclaims, a deleted project's shared-dir claims are not released: the failure is logged, and the project delete still succeeds.
 
-### Additional for GKE Mode
+The names below are examples. Replace the namespace and the subject:
 
-| Resource | Verbs |
-|---|---|
-| secretproviderclasses (secrets-store.csi.x-k8s.io) | create, list, delete |
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: scion-runtime-broker
+  namespace: scion-agents          # a namespace agents run in
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["create", "get", "list", "delete"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["create", "get", "list", "delete"]
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims"]
+  verbs: ["create", "get", "list", "delete"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["list"]
+# Optional — annotation discovery ("list") and create_service_accounts ("get", "list", "create"):
+# - apiGroups: [""]
+#   resources: ["serviceaccounts"]
+#   verbs: ["get", "list", "create"]
+# GKE mode only:
+- apiGroups: ["secrets-store.csi.x-k8s.io"]
+  resources: ["secretproviderclasses"]
+  verbs: ["create", "get", "list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: scion-runtime-broker
+  namespace: scion-agents
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: scion-runtime-broker
+subjects:
+# A Runtime Broker running in the cluster: its own ServiceAccount.
+- kind: ServiceAccount
+  name: scion-broker
+  namespace: scion-system
+# A Runtime Broker using a kubeconfig: that user instead, for example
+# - kind: User
+#   name: broker@example.com
+#   apiGroup: rbac.authorization.k8s.io
+```
+
+GCP identity mode `assign` can also list ServiceAccounts to discover mappings; see [Granting discovery access](#gcp-identity-mode-assign-workload-identity-mapping). `scion doctor` checks the pod, pods/exec and secret permissions in the runtime's namespace, and its remediation points to this section. Its namespace check works with this namespaced Role: when the Namespace object itself is not readable, it verifies access within the namespace instead.
 
 ### Additional for Multi-Namespace
 
-| Resource | Verbs |
-|---|---|
-| namespaces | get, list |
-| pods (cluster-wide) | list |
+With `list_all_namespaces: true`, the Runtime Broker lists agent pods and Secrets (and, in GKE mode, SecretProviderClasses) in all namespaces, so it needs `list` on them across the cluster, in addition to the permissions above in each namespace agents run in. The [Helm chart](/scion/hosted/ha/helm/) grants this when `runtime.listAllNamespaces` is `true`.
 
 ### Additional for Flat Kubernetes Runtime Broker Instances
 
@@ -1010,33 +1286,11 @@ Cannot identify Kubernetes execution scope: access denied reading Namespace kube
 
 Other instances in the same process are not affected. If the Namespace object is missing, the request fails, or the UID is empty, the instance is also not activated, with a message that names the cause. Losing the permission after activation does not change the running instance; the next restart refuses to activate it.
 
-### Example ClusterRole
-
-```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: scion-agent-manager
-rules:
-- apiGroups: [""]
-  resources: ["pods"]
-  verbs: ["create", "get", "list", "delete"]
-- apiGroups: [""]
-  resources: ["pods/exec", "pods/log"]
-  verbs: ["create", "get"]
-- apiGroups: [""]
-  resources: ["secrets"]
-  verbs: ["create", "list", "delete"]
-- apiGroups: [""]
-  resources: ["namespaces"]
-  verbs: ["get", "list"]
-```
-
 ## Execution Flow
 
-1. **Start**: `scion start` creates a Pod with the configured image, resources, and secrets. Pods don't keep a workspace across a stop, so when the Hub starts an existing agent it sends the same git clone config, branch, and workspace mode that it sends on create. This lets the agent's workspace be recreated on the new Pod.
-2. **Sync**: Workspace and agent home are transferred to the Pod via tar streaming over `pods/exec`.
-3. **Ready**: Pod readiness is polled with detailed error classification (image pull, scheduling, config errors).
+1. **Start**: `scion start` creates a Pod with the configured image, resources, and secrets. Pods don't keep a workspace across a stop, so when the Hub starts or restarts an existing agent it sends the same git clone config, branch, workspace mode and template identity that it sends on create (see [Stopping, Starting and Restarting Agents](#stopping-starting-and-restarting-agents)). This lets the agent's workspace be recreated on the new Pod. Because the Runtime Broker copies the agent home into the Pod after creation, it writes the agent's local phase in `agent-info.json` as `starting` before `Run` and advances it to `running` (via compare-and-set so a concurrent phase change is not overwritten) only after `Run` returns.
+2. **Sync**: Workspace and agent home are transferred to the Pod via tar streaming over `pods/exec`. When placing individual files in the container, the placement script re-verifies each path component immediately after `mkdir` and aborts before writing any file if a component is a symlink or not a directory.
+3. **Ready**: Pod readiness is polled with detailed error classification (image pull, scheduling, config errors). If the Pod is preempted or evicted while waiting to become ready, the start error names whether it was preempted or evicted along with the Kubernetes disruption reason (`: it was preempted (<reason>)` or `: it was evicted (<reason>)`).
 4. **Attach**: `scion attach` connects to the tmux session inside the Pod via `pods/exec`.
 5. **Sync back**: the Kubernetes runtime copies files only to the Pod, never back from it. With the default (emptyDir) workspace, an agent's changes reach the host only when the agent commits and pushes them to the remote. The CLI's `scion sync from <agent>` does not read the Pod: it goes through the Hub, which returns the broker's copy of the workspace.
 6. **Delete**: `scion rm <agent>` deletes the Pod and associated Secrets/SecretProviderClasses. `scion stop` uses the same deletion path, so the per-agent Secret and, in GKE mode, the SecretProviderClass are deleted when the agent is stopped or deleted. If the Pod is removed outside scion, the objects are removed on the next stop/delete or start of that agent.
@@ -1048,7 +1302,7 @@ Deleting an agent that is still in the `created` phase also sends the delete to 
 
 ### What remains after a project delete
 
-When a project is deleted, the Hub tells the project's providers to remove their project directories. A standalone Runtime Broker (not the embedded broker of the Hub) that still holds a non-NFS project directory for the project (under `~/.scion/projects/` on that host) but is not a provider, for example after it was [withdrawn](/scion/hosted/ha/runtime-broker/#sharing-a-broker-with-a-project), keeps that directory, and an operator can remove it by hand.
+When a project is deleted, the Hub tells the project's providers to remove their project directories, and each standalone provider releases the project's per-directory shared-directory claims in its runtimes' default namespaces: only claims with the deleted project's project-ID label that no existing pod references (see [cleanup on project delete](/scion/reference/server-config/#cleanup-on-project-delete), with its known limitations). A claim without that label, or still in use, is kept and named in the Runtime Broker's log. A standalone Runtime Broker (not the embedded broker of the Hub) that still holds a non-NFS project directory for the project (under `~/.scion/projects/` on that host) but is not a provider, for example after it was [withdrawn](/scion/hosted/ha/runtime-broker/#sharing-a-broker-with-a-project), keeps that directory, and an operator can remove it by hand.
 
 ## Diagnostics
 
@@ -1063,6 +1317,8 @@ This checks:
 - Namespace existence and access
 - Pod CRUD and exec permissions
 - Secret management permissions
+- That the StorageClass named by `shared_dir_storage_class` in the settings exists. When the Runtime Broker cannot read StorageClasses, which are cluster-scoped, this is only a warning. Whether the class supports `ReadWriteMany` is not checked. With no class set, an information line says that starts needing a new claim are refused.
+- Existing shared-dir claims in the namespace whose storage class differs from `shared_dir_storage_class`, as a warning (existing claims are never changed). Without `list` on persistentvolumeclaims in the namespace, this check is a warning that it could not list the claims.
 - (GKE mode) SecretProviderClass CRD availability
 - (GKE mode) Secrets Store CSI driver installation
 - (GKE mode) GCS FUSE CSI driver installation
@@ -1085,6 +1341,10 @@ The Kubernetes runtime provides structured error messages with remediation hints
 | CrashLoopBackOff | Check container logs with `scion logs` |
 | Unschedulable | Check node selectors, tolerations, and resource availability |
 | Invalid resource values | Error includes the field name and invalid value |
+| Shared dir claim does not exist and no `shared_dir_storage_class` is set | Configure `server.project_storage` backend `nfs`, or set `shared_dir_storage_class` to a `ReadWriteMany` class. See [Starts that need a new claim](#starts-that-need-a-new-claim) |
+| Claim is labelled for another project | Delete or rename that claim if the other project no longer uses it |
+| Claim does not exist (before the pod) | Create the claim in the agent namespace, or correct the setting the error names |
+| Claim cannot be provisioned (`ProvisioningFailed`) | Fix the cause the event names, for example the claim's StorageClass |
 
 When an agent create fails on Kubernetes, the Runtime Broker's answer stays generic (`500 runtime_error`), but it keeps the cause: when the Kubernetes API refused the Runtime Broker's own credentials, `error.details.cause` is `runtime_forbidden` (its credentials may not perform the operation) or `runtime_unauthorized` (its credentials were rejected). The Hub relays it as `502 runtime_error` with the same `error.details.cause`. The Runtime Broker's server log records the full cause, with `k8s_reason` (the Kubernetes status reason) and `cause_code` fields. Namespace, ServiceAccount and object names appear only in the log, never in the answer.
 

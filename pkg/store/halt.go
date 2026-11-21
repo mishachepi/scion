@@ -42,6 +42,11 @@ type AgentStatusResult struct {
 	// (stopped or error); otherwise "". Callers use it to keep firing the
 	// stopped/error notifications and hooks that write would have fired.
 	HaltedFrom string
+	// Unstalled is true when this write cleared the stalled marker because
+	// the container reported stall-suppressing live work
+	// (ptone/scion#7855). The activity changed, so the caller publishes it
+	// even for a heartbeat-only report.
+	Unstalled bool
 }
 
 // IsHaltEvidence reports whether an exit reason shows that the platform,
@@ -77,4 +82,13 @@ func IsTerminalPhase(phase string) bool {
 		return true
 	}
 	return false
+}
+
+// PhaseAtRest reports whether phase has no live container: a terminal phase
+// (IsTerminalPhase) or suspended. The hub does not store a heartbeat's live
+// container status for an agent at rest, and the store clears the container
+// status of a phase write that crosses between at rest and live
+// (ptone/scion#3607); both use this one definition.
+func PhaseAtRest(phase string) bool {
+	return IsTerminalPhase(phase) || state.Phase(phase) == state.PhaseSuspended
 }

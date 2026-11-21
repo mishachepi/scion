@@ -58,12 +58,22 @@ type SetEnvVarResponse struct {
 // success, or writes an HTTP error and returns false on failure.
 //
 // For user scope: extracts the authenticated user's ID as scopeID (ignoring
-// any client-supplied value). No CheckAccess call needed — identity enforcement
-// is the access control.
+// any client-supplied value). The caller must use an interactive session or
+// dev credential; a user access token is refused (session-only,
+// CREDENTIAL_MANAGEMENT). A federated caller may read (never write) its own
+// user-level material, as before (federatedOwnUserRead).
+//
+// For hub scope: agents may read. A user must be an unscoped local platform
+// admin on an interactive session or dev credential; a user access token is
+// refused whatever its boundary or scopes (session-only,
+// CREDENTIAL_MANAGEMENT).
 //
 // For project scope: verifies the project exists, then checks authorization. Users
 // must pass CheckAccess (with owner bypass). Agents get read-only access to
-// their own project only.
+// their own project only; project-scoped secret metadata endpoints additionally
+// require ScopeProjectSecretRead (checkAgentProjectSecretReadScope), and
+// project-scoped env read endpoints omit environment-secret metadata unless the
+// agent holds ScopeProjectSecretRead (agentLacksProjectSecretReadScope).
 //
 // For broker scope: verifies the broker exists. Brokers get self-access via
 // BrokerIdentity. Users must pass CheckAccess.
@@ -81,7 +91,21 @@ func (s *Server) resolveEnvSecretAccess(w http.ResponseWriter, r *http.Request, 
 			Unauthorized(w)
 			return "", false
 		}
+		// A federated caller is never a profile writer: its writes are
+		// refused here, before the credential check, with the profile
+		// write refusal.
 		if isWrite && !requireProfileWriter(w, r) {
+			return "", false
+		}
+		// User-level variables and secrets need an interactive session or
+		// dev credential; every user access token is refused. The one
+		// exception is a federated caller's READ of its own user-level
+		// material, kept deliberately as it was before session-only: it is
+		// read-only (writes were refused above), limited to the caller's own
+		// ID (returned below, never a client-supplied one), and gives no hub
+		// scope (the hub branch requires an unscoped local admin).
+		if !sessionCredentialAllowed(ctx) && !federatedOwnUserRead(ctx, isWrite) {
+			writeEnvSecretSessionRequired(w)
 			return "", false
 		}
 		return userIdent.ID(), true
@@ -181,7 +205,14 @@ func (s *Server) resolveEnvSecretAccess(w http.ResponseWriter, r *http.Request, 
 			Forbidden(w)
 			return "", false
 		}
-		if userIdent.Role() != store.UserRoleAdmin {
+		// Hub-level variables and secrets need an unscoped admin on an
+		// interactive session or dev credential; every user access token is
+		// refused, whatever its boundary or scopes.
+		if !sessionCredentialAllowed(ctx) {
+			writeEnvSecretSessionRequired(w)
+			return "", false
+		}
+		if !IsUnscopedLocalPlatformAdmin(userIdent) {
 			Forbidden(w)
 			return "", false
 		}
@@ -197,6 +228,26 @@ func (s *Server) resolveEnvSecretAccess(w http.ResponseWriter, r *http.Request, 
 		BadRequest(w, "invalid scope: "+scope)
 		return "", false
 	}
+}
+
+// envSecretSessionRequiredMessage is the refusal message for a user access
+// token on user- or hub-level env and secret operations.
+const envSecretSessionRequiredMessage = "user- and hub-level environment variables and secrets require an interactive login (run 'scion hub auth login'); access tokens are not accepted"
+
+// federatedOwnUserRead reports whether the request is a federated caller's
+// read of its own user-level env or secret material: a read (not a write),
+// on a federation credential, by a federated identity. It admits nothing
+// else; in particular a user access token never matches.
+func federatedOwnUserRead(ctx context.Context, isWrite bool) bool {
+	return !isWrite &&
+		GetCredentialContextFromContext(ctx).Kind == CredentialKindFederation &&
+		isFederatedCaller(ctx)
+}
+
+// writeEnvSecretSessionRequired writes the session-only refusal for user-
+// and hub-level env and secret operations.
+func writeEnvSecretSessionRequired(w http.ResponseWriter) {
+	writeSessionOnlyDenial(w, ErrCodeForbidden, envSecretSessionRequiredMessage, authzop.ReasonCredentialManagement)
 }
 
 // authorizeHubEnvVarList decides read-only access to the hub-level
@@ -220,6 +271,13 @@ func (s *Server) authorizeHubEnvVarList(w http.ResponseWriter, r *http.Request, 
 	ctx := r.Context()
 	identity := GetIdentityFromContext(ctx)
 	userIdent, isUser := identity.(UserIdentity)
+	// The hub-level list is session-only like the other hub-level env and
+	// secret operations: a user access token is refused here, before any
+	// role or permission check.
+	if isUser && !isNilIdentity(userIdent) && !sessionCredentialAllowed(ctx) {
+		writeEnvSecretSessionRequired(w)
+		return true, false, false
+	}
 	if !isUser || isNilIdentity(userIdent) || userIdent.Role() == store.UserRoleAdmin {
 		// Test identities with admin roles do not read hub environment
 		// variables (test-admin policy).
@@ -311,8 +369,12 @@ func (s *Server) listEnvVars(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if includeSecretMeta {
-		envVars = s.mergeEnvironmentSecrets(ctx, envVars, filter,
+		var ok bool
+		envVars, ok = s.applyEnvironmentSecretsToEnvVarList(w, ctx, envVars, filter,
 			"failed to list environment secrets for env var merge")
+		if !ok {
+			return
+		}
 	} else {
 		envVars = withoutSecretEnvVars(envVars)
 	}
@@ -360,17 +422,30 @@ func (s *Server) getEnvVar(w http.ResponseWriter, r *http.Request, key string) {
 		scope = store.ScopeUser
 	}
 
+	if query.Has("includePending") {
+		BadRequest(w, "includePending is only valid on the secret list (GET /api/v1/secrets)")
+		return
+	}
+
 	scopeID, ok := s.resolveEnvSecretAccess(w, r, scope, query.Get("scopeId"), false)
 	if !ok {
 		return
 	}
 
+	s.serveEnvVarByKey(w, ctx, key, scope, scopeID)
+}
+
+func (s *Server) serveEnvVarByKey(w http.ResponseWriter, ctx context.Context, key, scope, scopeID string) {
+	hideProjectSecretMeta := agentLacksProjectSecretReadScope(ctx, scope)
+
 	envVar, err := s.store.GetEnvVar(ctx, key, scope, scopeID)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) && s.secretBackend != nil {
-			// Fallback: check if this key exists as an environment secret
+		if !hideProjectSecretMeta && errors.Is(err, store.ErrNotFound) && s.secretBackend != nil && !isSystemOneReservedSecretKey(key) {
+			// Fallback: check if this key exists as an environment secret.
+			// Defence in depth: agentHiddenHubSecret is checked regardless of
+			// which route reached this helper.
 			meta, metaErr := s.secretBackend.GetMeta(ctx, key, scope, scopeID)
-			if metaErr == nil && meta.SecretType == "environment" {
+			if metaErr == nil && meta.SecretType == store.SecretTypeEnvironment && !agentHiddenHubSecret(ctx, scope, *meta) {
 				ev := secretMetaToEnvVar(*meta)
 				writeJSON(w, http.StatusOK, &ev)
 				return
@@ -378,6 +453,25 @@ func (s *Server) getEnvVar(w http.ResponseWriter, r *http.Request, key string) {
 		}
 		writeErrorFromErr(w, err, "")
 		return
+	}
+
+	if hideProjectSecretMeta {
+		if envVar.Secret {
+			writeErrorFromErr(w, store.ErrNotFound, "")
+			return
+		}
+		if s.secretBackend != nil && !isSystemOneReservedSecretKey(key) {
+			meta, metaErr := s.secretBackend.GetMeta(ctx, key, scope, scopeID)
+			if metaErr != nil && !errors.Is(metaErr, store.ErrNotFound) {
+				s.envSecretLog.Warn("failed to check environment secret shadow for env var read", "key", key, "error", metaErr)
+				writeErrorFromErr(w, metaErr, "")
+				return
+			}
+			if metaErr == nil && meta.SecretType == store.SecretTypeEnvironment {
+				writeErrorFromErr(w, store.ErrNotFound, "")
+				return
+			}
+		}
 	}
 
 	// Mask sensitive values
@@ -416,6 +510,9 @@ func (s *Server) setEnvVar(w http.ResponseWriter, r *http.Request, key string) {
 
 	scopeID, ok := s.resolveEnvSecretAccess(w, r, scope, req.ScopeID, true)
 	if !ok {
+		return
+	}
+	if rejectSystemOneReservedSecretWrite(w, key) {
 		return
 	}
 
@@ -459,6 +556,12 @@ func (s *Server) setEnvVar(w http.ResponseWriter, r *http.Request, key string) {
 			})
 			return
 		}
+		if s.refuseInternalSecretMutation(w, ctx, key, scope, scopeID) {
+			return
+		}
+		if rejectWebhookEndpointReservedSecretWrite(w, key) {
+			return
+		}
 
 		input := &secret.SetSecretInput{
 			Name:          key,
@@ -497,6 +600,9 @@ func (s *Server) setEnvVar(w http.ResponseWriter, r *http.Request, key string) {
 	}
 
 	// Plain env var write
+	if rejectWebhookEndpointReservedSecretWrite(w, key) {
+		return
+	}
 	injectionMode := req.InjectionMode
 	if injectionMode == "" {
 		injectionMode = store.InjectionModeAsNeeded
@@ -522,9 +628,12 @@ func (s *Server) setEnvVar(w http.ResponseWriter, r *http.Request, key string) {
 		return
 	}
 
-	// Clean up any existing secret with same key (demotion from secret to plain)
+	// Clean up any existing secret with same key (demotion from secret to plain),
+	// except internal secrets which are never managed through env/secrets APIs.
 	if s.secretBackend != nil {
-		_ = s.secretBackend.Delete(ctx, key, scope, scopeID)
+		if isInternal, err := s.isStoredSecretInternal(ctx, key, scope, scopeID); err == nil && !isInternal {
+			_ = s.secretBackend.Delete(ctx, key, scope, scopeID)
+		}
 	}
 
 	// Mask sensitive values in response
@@ -551,22 +660,30 @@ func (s *Server) deleteEnvVar(w http.ResponseWriter, r *http.Request, key string
 	if !ok {
 		return
 	}
+	if isSystemOneReservedSecretKey(key) {
+		writeErrorFromErr(w, store.ErrNotFound, "")
+		return
+	}
 
 	if err := s.store.DeleteEnvVar(ctx, key, scope, scopeID); err != nil {
 		if errors.Is(err, store.ErrNotFound) && s.secretBackend != nil {
-			// Fallback: try deleting from the secret backend
-			if secErr := s.secretBackend.Delete(ctx, key, scope, scopeID); secErr == nil {
-				w.WriteHeader(http.StatusNoContent)
-				return
+			if isInternal, intErr := s.isStoredSecretInternal(ctx, key, scope, scopeID); intErr == nil && !isInternal {
+				// Fallback: try deleting from the secret backend
+				if secErr := s.secretBackend.Delete(ctx, key, scope, scopeID); secErr == nil {
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
 			}
 		}
 		writeErrorFromErr(w, err, "")
 		return
 	}
 
-	// Also clean up any secret with the same key
+	// Also clean up any non-internal secret with the same key
 	if s.secretBackend != nil {
-		_ = s.secretBackend.Delete(ctx, key, scope, scopeID)
+		if isInternal, err := s.isStoredSecretInternal(ctx, key, scope, scopeID); err == nil && !isInternal {
+			_ = s.secretBackend.Delete(ctx, key, scope, scopeID)
+		}
 	}
 
 	w.WriteHeader(http.StatusNoContent)
@@ -576,6 +693,10 @@ type ListSecretsResponse struct {
 	Secrets []store.Secret `json:"secrets"`
 	Scope   string         `json:"scope"`
 	ScopeID string         `json:"scopeId"`
+	// Items is the merged view of approved and pending user secrets,
+	// present only for scope=user&includePending=true
+	// (listSecretsWithPending).
+	Items []SecretListItem `json:"items,omitempty"`
 }
 
 type SetSecretRequest struct {
@@ -660,11 +781,149 @@ func (s *Server) mergeEnvironmentSecrets(ctx context.Context, envVars []store.En
 		s.envSecretLog.Warn(warning, "error", err)
 		return envVars
 	}
-	return mergeEnvironmentSecretMetadata(envVars, metas)
+	return mergeEnvironmentSecretMetadata(envVars, withoutSystemOneReservedSecrets(withoutAgentHiddenHubSecrets(ctx, filter.Scope, metas)))
 }
 
-func mergeEnvironmentSecretMetadata(envVars []store.EnvVar, metas []secret.SecretMeta) []store.EnvVar {
-	if len(metas) == 0 {
+// rejectSystemOneReservedSecretWrite rejects writes to the reserved
+// "systemone.instance." secret namespace through generic secret and env
+// endpoints so provider credentials are managed exclusively through the System
+// One instance admin endpoints.
+func rejectSystemOneReservedSecretWrite(w http.ResponseWriter, key string) bool {
+	if !isSystemOneReservedSecretKey(key) {
+		return false
+	}
+	ValidationError(w, "secret key prefix \"systemone.instance.\" is reserved for System One provider credentials", map[string]interface{}{
+		"field": "key",
+		"value": key,
+	})
+	return true
+}
+
+// agentHiddenHubSecret reports whether a hub-scope secret is hidden from the
+// caller: the caller is an agent and the secret is not one agents may see
+// (secret.HubSecretAgentVisible). Names, values and metadata of a hidden
+// secret are never returned to an agent. Other scopes and non-agent callers
+// are unaffected.
+func agentHiddenHubSecret(ctx context.Context, scope string, m secret.SecretMeta) bool {
+	if scope != store.ScopeHub {
+		return false
+	}
+	if _, isAgent := GetIdentityFromContext(ctx).(AgentIdentity); !isAgent {
+		return false
+	}
+	m.Scope = store.ScopeHub
+	return !secret.HubSecretAgentVisible(m)
+}
+
+// withoutInternalSecrets drops rows whose SecretType is SecretTypeInternal.
+// Internal secrets (such as conduit grant signing keys and webhook endpoint
+// HMAC secrets) are never visible through user- or agent-facing secrets APIs
+// at any scope.
+func withoutInternalSecrets(metas []secret.SecretMeta) []secret.SecretMeta {
+	out := make([]secret.SecretMeta, 0, len(metas))
+	for _, m := range metas {
+		if m.SecretType == store.SecretTypeInternal {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// isStoredSecretInternal reports whether an existing secret at (key, scope,
+// scopeID) has SecretType == store.SecretTypeInternal. Both the Hub store and
+// the configured secret backend are consulted so hub-resident internal secrets
+// are guarded regardless of backend mode.
+func (s *Server) isStoredSecretInternal(ctx context.Context, key, scope, scopeID string) (bool, error) {
+	if s.store != nil {
+		sec, err := s.store.GetSecret(ctx, key, scope, scopeID)
+		switch {
+		case err == nil:
+			if sec.SecretType == store.SecretTypeInternal {
+				return true, nil
+			}
+		case errors.Is(err, store.ErrNotFound):
+		default:
+			return false, err
+		}
+	}
+	if s.secretBackend != nil {
+		meta, err := s.secretBackend.GetMeta(ctx, key, scope, scopeID)
+		switch {
+		case err == nil:
+			if meta.SecretType == store.SecretTypeInternal {
+				return true, nil
+			}
+		case errors.Is(err, store.ErrNotFound):
+		default:
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+// refuseInternalSecretMutation writes a 409 internal_secret error and returns
+// true when an existing secret at (key, scope, scopeID) has SecretTypeInternal.
+func (s *Server) refuseInternalSecretMutation(w http.ResponseWriter, ctx context.Context, key, scope, scopeID string) bool {
+	isInternal, err := s.isStoredSecretInternal(ctx, key, scope, scopeID)
+	if err != nil {
+		writeErrorFromErr(w, err, "")
+		return true
+	}
+	if isInternal {
+		writeError(w, http.StatusConflict, ErrCodeInternalSecret,
+			"internal secrets cannot be modified or deleted through the secrets API", nil)
+		return true
+	}
+	return false
+}
+
+// withoutAgentHiddenHubSecrets drops the secrets agentHiddenHubSecret hides.
+func withoutAgentHiddenHubSecrets(ctx context.Context, scope string, metas []secret.SecretMeta) []secret.SecretMeta {
+	out := make([]secret.SecretMeta, 0, len(metas))
+	for _, m := range metas {
+		if agentHiddenHubSecret(ctx, scope, m) {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// applyEnvironmentSecretsToEnvVarList merges environment-type secret metadata
+// into envVars for callers authorized to read secret metadata, or strips
+// secret-flagged and secret-shadowed rows when an agent caller lacks
+// ScopeProjectSecretRead (ptone/scion#8211). Returns false after writing an
+// error response if shadow-check lookup fails closed.
+func (s *Server) applyEnvironmentSecretsToEnvVarList(w http.ResponseWriter, ctx context.Context, envVars []store.EnvVar, filter store.EnvVarFilter, warning string) ([]store.EnvVar, bool) {
+	if !agentLacksProjectSecretReadScope(ctx, filter.Scope) {
+		return s.mergeEnvironmentSecrets(ctx, envVars, filter, warning), true
+	}
+
+	envVars = withoutSecretEnvVars(envVars)
+	if len(envVars) == 0 || s.secretBackend == nil {
+		return envVars, true
+	}
+
+	metas, err := s.secretBackend.List(ctx, secret.Filter{
+		Scope:   filter.Scope,
+		ScopeID: filter.ScopeID,
+		Type:    store.SecretTypeEnvironment,
+		Name:    filter.Key,
+	})
+	if err != nil {
+		s.envSecretLog.Warn(warning, "error", err)
+		writeErrorFromErr(w, err, "")
+		return nil, false
+	}
+	return suppressShadowedEnvVars(envVars, withoutSystemOneReservedSecrets(metas)), true
+}
+
+// suppressShadowedEnvVars drops env vars whose key matches an environment-type
+// secret without appending secret metadata, so callers without
+// ScopeProjectSecretRead see neither secret metadata nor shadowed plain values.
+func suppressShadowedEnvVars(envVars []store.EnvVar, metas []secret.SecretMeta) []store.EnvVar {
+	if len(envVars) == 0 || len(metas) == 0 {
 		return envVars
 	}
 
@@ -673,13 +932,24 @@ func mergeEnvironmentSecretMetadata(envVars []store.EnvVar, metas []secret.Secre
 		secretKeys[meta.Name] = struct{}{}
 	}
 
-	merged := make([]store.EnvVar, 0, len(envVars)+len(metas))
+	filtered := make([]store.EnvVar, 0, len(envVars))
 	for _, envVar := range envVars {
 		if _, shadowed := secretKeys[envVar.Key]; shadowed {
 			continue
 		}
-		merged = append(merged, envVar)
+		filtered = append(filtered, envVar)
 	}
+	return filtered
+}
+
+func mergeEnvironmentSecretMetadata(envVars []store.EnvVar, metas []secret.SecretMeta) []store.EnvVar {
+	if len(metas) == 0 {
+		return envVars
+	}
+
+	filtered := suppressShadowedEnvVars(envVars, metas)
+	merged := make([]store.EnvVar, 0, len(filtered)+len(metas))
+	merged = append(merged, filtered...)
 	for _, meta := range metas {
 		merged = append(merged, secretMetaToEnvVar(meta))
 	}
@@ -695,6 +965,30 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// agentLacksProjectSecretReadScope reports whether the caller is an agent
+// reading project-scoped material without ScopeProjectSecretRead
+// (ptone/scion#8211). Non-project scopes (e.g. scope=hub) and user callers
+// return false.
+func agentLacksProjectSecretReadScope(ctx context.Context, scope string) bool {
+	if scope != store.ScopeProject {
+		return false
+	}
+	agentIdent := GetAgentIdentityFromContext(ctx)
+	return agentIdent != nil && !agentIdent.HasScope(ScopeProjectSecretRead)
+}
+
+// checkAgentProjectSecretReadScope verifies that agent callers reading
+// project-scoped secret metadata hold ScopeProjectSecretRead (ptone/scion#1331).
+// Non-project scopes (e.g. scope=hub) and user callers are unaffected.
+func checkAgentProjectSecretReadScope(w http.ResponseWriter, r *http.Request, scope string) bool {
+	if agentLacksProjectSecretReadScope(r.Context(), scope) {
+		writeError(w, http.StatusForbidden, ErrCodeForbidden,
+			"Missing required scope: "+string(ScopeProjectSecretRead), nil)
+		return false
+	}
+	return true
+}
+
 func (s *Server) listSecrets(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	query := r.URL.Query()
@@ -704,8 +998,15 @@ func (s *Server) listSecrets(w http.ResponseWriter, r *http.Request) {
 		scope = store.ScopeUser
 	}
 
+	if s.serveSecretListWithPending(w, r, scope) {
+		return
+	}
+
 	scopeID, ok := s.resolveEnvSecretAccess(w, r, scope, query.Get("scopeId"), false)
 	if !ok {
+		return
+	}
+	if !checkAgentProjectSecretReadScope(w, r, scope) {
 		return
 	}
 
@@ -719,6 +1020,7 @@ func (s *Server) listSecrets(w http.ResponseWriter, r *http.Request) {
 		writeErrorFromErr(w, err, "")
 		return
 	}
+	metas = withoutInternalSecrets(withoutSystemOneReservedSecrets(withoutAgentHiddenHubSecrets(ctx, scope, metas)))
 	// Convert to store.Secret for response compatibility
 	secrets := make([]store.Secret, len(metas))
 	for i, m := range metas {
@@ -762,12 +1064,28 @@ func (s *Server) getSecret(w http.ResponseWriter, r *http.Request, key string) {
 		scope = store.ScopeUser
 	}
 
+	if query.Has("includePending") {
+		BadRequest(w, "includePending is only valid on the secret list (GET /api/v1/secrets)")
+		return
+	}
+
 	scopeID, ok := s.resolveEnvSecretAccess(w, r, scope, query.Get("scopeId"), false)
 	if !ok {
 		return
 	}
+	if !checkAgentProjectSecretReadScope(w, r, scope) {
+		return
+	}
+	if isSystemOneReservedSecretKey(key) {
+		writeErrorFromErr(w, store.ErrNotFound, "")
+		return
+	}
 
 	meta, err := s.secretBackend.GetMeta(ctx, key, scope, scopeID)
+	if err == nil && (meta.SecretType == store.SecretTypeInternal || agentHiddenHubSecret(ctx, scope, *meta)) {
+		// The same response as a key that does not exist.
+		err = store.ErrNotFound
+	}
 	if err != nil {
 		writeErrorFromErr(w, err, "")
 		return
@@ -889,6 +1207,15 @@ func (s *Server) setSecret(w http.ResponseWriter, r *http.Request, key string) {
 	if !ok {
 		return
 	}
+	if rejectSystemOneReservedSecretWrite(w, key) {
+		return
+	}
+	if s.refuseInternalSecretMutation(w, ctx, key, scope, scopeID) {
+		return
+	}
+	if rejectWebhookEndpointReservedSecretWrite(w, key) {
+		return
+	}
 
 	// allowProgeny is only valid on user-scoped secrets.
 	// Unlike env vars, secrets do NOT require injectionMode=always when
@@ -940,6 +1267,9 @@ func (s *Server) setSecret(w http.ResponseWriter, r *http.Request, key string) {
 // handlers. It decodes and validates the PatchSecretRequest, applies the
 // metadata update, and writes the response.
 func (s *Server) patchSecretValidateAndUpdate(w http.ResponseWriter, r *http.Request, key, scope, scopeID string) {
+	if rejectSystemOneReservedSecretWrite(w, key) {
+		return
+	}
 	ctx := r.Context()
 
 	r.Body = http.MaxBytesReader(w, r.Body, 128*1024)
@@ -977,6 +1307,13 @@ func (s *Server) patchSecretValidateAndUpdate(w http.ResponseWriter, r *http.Req
 			})
 			return
 		}
+	}
+
+	if s.refuseInternalSecretMutation(w, ctx, key, scope, scopeID) {
+		return
+	}
+	if rejectWebhookEndpointReservedSecretWrite(w, key) {
+		return
 	}
 
 	// Determine the effective secret type for target validation
@@ -1084,6 +1421,13 @@ func (s *Server) deleteSecret(w http.ResponseWriter, r *http.Request, key string
 	if !ok {
 		return
 	}
+	if isSystemOneReservedSecretKey(key) {
+		writeErrorFromErr(w, store.ErrNotFound, "")
+		return
+	}
+	if s.refuseInternalSecretMutation(w, ctx, key, scope, scopeID) {
+		return
+	}
 
 	if err := s.secretBackend.Delete(ctx, key, scope, scopeID); err != nil {
 		writeErrorFromErr(w, err, "")
@@ -1177,6 +1521,9 @@ func (s *Server) handleAgentSecrets(w http.ResponseWriter, r *http.Request, agen
 			"field": "key",
 			"value": key,
 		})
+		return
+	}
+	if rejectSystemOneReservedSecretWrite(w, key) {
 		return
 	}
 
@@ -1341,6 +1688,23 @@ func (s *Server) handleAgentSecrets(w http.ResponseWriter, r *http.Request, agen
 		}
 	}
 
+	// A user-scope write by an agent waits for the owning user's approval:
+	// it is recorded as a pending secret and never written to the secrets
+	// table here, so force does not apply. An approved secret of the same
+	// name stays in effect until the owner approves the replacement.
+	if scope == store.ScopeUser {
+		allowProgeny := req.AllowProgeny != nil && *req.AllowProgeny
+		s.agentWritePendingUserSecret(w, r, agentID, projectID, scopeID, key, decoded, secretType, target, allowProgeny)
+		return
+	}
+
+	if s.refuseInternalSecretMutation(w, ctx, key, scope, scopeID) {
+		return
+	}
+	if rejectWebhookEndpointReservedSecretWrite(w, key) {
+		return
+	}
+
 	// Check for existing secret when force is not set.
 	// Note: the backend's UpsertSecret has the same check-then-write pattern
 	// internally, so this is consistent with the existing TOCTOU window.
@@ -1364,22 +1728,9 @@ func (s *Server) handleAgentSecrets(w http.ResponseWriter, r *http.Request, agen
 		allowProgeny = *req.AllowProgeny
 	}
 
-	// Attribution. A user-scoped secret belongs to the user whose scope it
-	// lives in, even when an agent is what wrote it — which is the normal case
-	// for harness credential capture.
-	//
-	// Two things go wrong if the writing agent is recorded instead. Progeny
-	// lookup matches created_by against the agent's ancestry chain
-	// (ListProgenySecrets -> CreatedByIn), and ancestry entries are bare UUIDs,
-	// so an "agent:<uuid>" value can never match and a captured credential can
-	// never be inherited. Even unprefixed it would only reach descendants of
-	// the one agent that captured it, rather than the owning user's agents.
-	//
-	// The agent is still recorded as the updater, so provenance is not lost.
+	// Attribution: only project-scope writes reach this point. A user-scope
+	// write is attributed when its owner approves it (approvePendingSecret).
 	createdBy := fmt.Sprintf("agent:%s", agentID)
-	if scope == store.ScopeUser && scopeID != "" {
-		createdBy = scopeID
-	}
 
 	input := &secret.SetSecretInput{
 		Name:         key,
@@ -1635,56 +1986,12 @@ func (s *Server) agentListSecrets(w http.ResponseWriter, r *http.Request, agentI
 	}
 
 	if includeUser {
-		eligible, err := s.progenyEligibleSecretIDs(ctx, facts.Agent)
-		if err != nil {
+		var userOK bool
+		secrets, items, userOK = s.agentListUserSecrets(ctx, agentID, ident, facts, secrets, items)
+		if !userOK {
 			emitListExitItem(store.ScopeUser, facts.Root.ID, GrantProgeny, "")
 			writeError(w, http.StatusInternalServerError, ErrCodeRuntimeError, "failed to list secrets", nil)
 			return
-		}
-		metas, err := s.secretBackend.List(ctx, secret.Filter{
-			Scope:   store.ScopeUser,
-			ScopeID: facts.Root.ID,
-		})
-		if err != nil {
-			emitListExitItem(store.ScopeUser, facts.Root.ID, GrantProgeny, "")
-			writeError(w, http.StatusInternalServerError, ErrCodeRuntimeError, "failed to list secrets", nil)
-			return
-		}
-		for _, m := range metas {
-			if m.SecretType == store.SecretTypeInternal {
-				continue
-			}
-			if !m.AllowProgeny || !eligible[m.ID] {
-				continue
-			}
-			live, kind, _, lerr := s.progenySourceLive(ctx, m)
-			if lerr != nil {
-				// A liveness-check error is not the same as "not shared":
-				// logged distinctly so an operator is not left to guess
-				// which one occurred, and recorded as a per-row item so the
-				// audit event shows the row was skipped rather than simply
-				// absent.
-				slog.Error("agent list secrets: progeny source liveness check failed",
-					"agent_id", agentID, "key", m.Name, "err", lerr)
-				items = append(items, materialSelectionItem(ItemResult{
-					Candidate: Candidate{Kind: MaterialKindSecret, Key: m.Name, Scope: store.ScopeUser, ScopeID: facts.Root.ID, Grant: GrantProgeny, Meta: m},
-					Reason:    ReasonBackendError,
-				}, "", ""))
-				continue
-			}
-			if !live {
-				continue
-			}
-			var src *SourceRef
-			if kind != "" {
-				src = &SourceRef{Kind: kind, ID: m.CreatedBy}
-			}
-			secrets = append(secrets, AgentSecretMeta{Key: m.Name, Type: m.SecretType, Target: m.Target})
-			items = append(items, materialSelectionItem(ItemResult{
-				Candidate: Candidate{Kind: MaterialKindSecret, Key: m.Name, Scope: store.ScopeUser, ScopeID: facts.Root.ID, Grant: GrantProgeny, SharingSource: src, Meta: m},
-				Allowed:   true,
-				Reason:    ReasonAllowed,
-			}, "", ""))
 		}
 	}
 
@@ -1754,8 +2061,12 @@ func (s *Server) handleProjectEnvVars(w http.ResponseWriter, r *http.Request, pr
 			writeErrorFromErr(w, err, "")
 			return
 		}
-		envVars = s.mergeEnvironmentSecrets(ctx, envVars, filter,
+		var ok bool
+		envVars, ok = s.applyEnvironmentSecretsToEnvVarList(w, ctx, envVars, filter,
 			"failed to list environment secrets for project env var merge")
+		if !ok {
+			return
+		}
 		// Mask sensitive values
 		for i := range envVars {
 			if envVars[i].Sensitive {
@@ -1779,23 +2090,7 @@ func (s *Server) handleScopedEnvVarByKey(w http.ResponseWriter, r *http.Request,
 
 	switch r.Method {
 	case http.MethodGet:
-		envVar, err := s.store.GetEnvVar(ctx, key, scope, scopeID)
-		if err != nil {
-			if errors.Is(err, store.ErrNotFound) && s.secretBackend != nil {
-				meta, metaErr := s.secretBackend.GetMeta(ctx, key, scope, scopeID)
-				if metaErr == nil && meta.SecretType == "environment" {
-					ev := secretMetaToEnvVar(*meta)
-					writeJSON(w, http.StatusOK, &ev)
-					return
-				}
-			}
-			writeErrorFromErr(w, err, "")
-			return
-		}
-		if envVar.Sensitive {
-			envVar.Value = "********"
-		}
-		writeJSON(w, http.StatusOK, envVar)
+		s.serveEnvVarByKey(w, ctx, key, scope, scopeID)
 
 	case http.MethodPut:
 		var req SetEnvVarRequest
@@ -1812,6 +2107,9 @@ func (s *Server) handleScopedEnvVarByKey(w http.ResponseWriter, r *http.Request,
 		if !validateEnvSecretTarget(w, store.SecretTypeEnvironment, key) {
 			return
 		}
+		if rejectSystemOneReservedSecretWrite(w, key) {
+			return
+		}
 
 		var createdBy string
 		if userIdent := GetUserIdentityFromContext(ctx); userIdent != nil {
@@ -1823,6 +2121,12 @@ func (s *Server) handleScopedEnvVarByKey(w http.ResponseWriter, r *http.Request,
 				writeJSON(w, http.StatusNotImplemented, map[string]string{
 					"error": "secret storage requires a configured secrets backend",
 				})
+				return
+			}
+			if s.refuseInternalSecretMutation(w, ctx, key, scope, scopeID) {
+				return
+			}
+			if rejectWebhookEndpointReservedSecretWrite(w, key) {
 				return
 			}
 			input := &secret.SetSecretInput{
@@ -1854,6 +2158,9 @@ func (s *Server) handleScopedEnvVarByKey(w http.ResponseWriter, r *http.Request,
 			return
 		}
 
+		if rejectWebhookEndpointReservedSecretWrite(w, key) {
+			return
+		}
 		injectionMode := req.InjectionMode
 		if injectionMode == "" {
 			injectionMode = store.InjectionModeAsNeeded
@@ -1876,7 +2183,9 @@ func (s *Server) handleScopedEnvVarByKey(w http.ResponseWriter, r *http.Request,
 			return
 		}
 		if s.secretBackend != nil {
-			_ = s.secretBackend.Delete(ctx, key, scope, scopeID)
+			if isInternal, err := s.isStoredSecretInternal(ctx, key, scope, scopeID); err == nil && !isInternal {
+				_ = s.secretBackend.Delete(ctx, key, scope, scopeID)
+			}
 		}
 		if envVar.Sensitive {
 			envVar.Value = "********"
@@ -1884,18 +2193,26 @@ func (s *Server) handleScopedEnvVarByKey(w http.ResponseWriter, r *http.Request,
 		writeJSON(w, http.StatusOK, SetEnvVarResponse{EnvVar: envVar, Created: created})
 
 	case http.MethodDelete:
+		if isSystemOneReservedSecretKey(key) {
+			writeErrorFromErr(w, store.ErrNotFound, "")
+			return
+		}
 		if err := s.store.DeleteEnvVar(ctx, key, scope, scopeID); err != nil {
 			if errors.Is(err, store.ErrNotFound) && s.secretBackend != nil {
-				if secErr := s.secretBackend.Delete(ctx, key, scope, scopeID); secErr == nil {
-					w.WriteHeader(http.StatusNoContent)
-					return
+				if isInternal, intErr := s.isStoredSecretInternal(ctx, key, scope, scopeID); intErr == nil && !isInternal {
+					if secErr := s.secretBackend.Delete(ctx, key, scope, scopeID); secErr == nil {
+						w.WriteHeader(http.StatusNoContent)
+						return
+					}
 				}
 			}
 			writeErrorFromErr(w, err, "")
 			return
 		}
 		if s.secretBackend != nil {
-			_ = s.secretBackend.Delete(ctx, key, scope, scopeID)
+			if isInternal, err := s.isStoredSecretInternal(ctx, key, scope, scopeID); err == nil && !isInternal {
+				_ = s.secretBackend.Delete(ctx, key, scope, scopeID)
+			}
 		}
 		w.WriteHeader(http.StatusNoContent)
 
@@ -1991,6 +2308,9 @@ func (s *Server) handleProjectSecrets(w http.ResponseWriter, r *http.Request, pr
 		if s.agentStandingForbidden(ctx, w, agentIdent.ID()) {
 			return
 		}
+		if !checkAgentProjectSecretReadScope(w, r, store.ScopeProject) {
+			return
+		}
 		// Agents only get read access
 	} else if userIdent, ok := identity.(UserIdentity); ok {
 		decision := s.authzService.CheckAccess(ctx, userIdent, Resource{
@@ -2017,6 +2337,7 @@ func (s *Server) handleProjectSecrets(w http.ResponseWriter, r *http.Request, pr
 			writeErrorFromErr(w, err, "")
 			return
 		}
+		metas = withoutInternalSecrets(withoutSystemOneReservedSecrets(metas))
 		secrets := make([]store.Secret, len(metas))
 		for i, m := range metas {
 			secrets[i] = metaToStoreSecret(m)
@@ -2038,7 +2359,14 @@ func (s *Server) handleScopedSecretByKey(w http.ResponseWriter, r *http.Request,
 
 	switch r.Method {
 	case http.MethodGet:
+		if isSystemOneReservedSecretKey(key) {
+			writeErrorFromErr(w, store.ErrNotFound, "")
+			return
+		}
 		meta, err := s.secretBackend.GetMeta(ctx, key, scope, scopeID)
+		if err == nil && meta.SecretType == store.SecretTypeInternal {
+			err = store.ErrNotFound
+		}
 		if err != nil {
 			writeErrorFromErr(w, err, "")
 			return
@@ -2046,6 +2374,9 @@ func (s *Server) handleScopedSecretByKey(w http.ResponseWriter, r *http.Request,
 		writeJSON(w, http.StatusOK, metaToStoreSecret(*meta))
 
 	case http.MethodPut:
+		if rejectSystemOneReservedSecretWrite(w, key) {
+			return
+		}
 		r.Body = http.MaxBytesReader(w, r.Body, 128*1024)
 		var req SetSecretRequest
 		if err := readJSON(r, &req); err != nil {
@@ -2108,6 +2439,12 @@ func (s *Server) handleScopedSecretByKey(w http.ResponseWriter, r *http.Request,
 				return
 			}
 		}
+		if s.refuseInternalSecretMutation(w, ctx, key, scope, scopeID) {
+			return
+		}
+		if rejectWebhookEndpointReservedSecretWrite(w, key) {
+			return
+		}
 		input := &secret.SetSecretInput{
 			Name:          key,
 			Value:         string(decoded),
@@ -2134,6 +2471,13 @@ func (s *Server) handleScopedSecretByKey(w http.ResponseWriter, r *http.Request,
 		s.patchSecretValidateAndUpdate(w, r, key, scope, scopeID)
 
 	case http.MethodDelete:
+		if isSystemOneReservedSecretKey(key) {
+			writeErrorFromErr(w, store.ErrNotFound, "")
+			return
+		}
+		if s.refuseInternalSecretMutation(w, ctx, key, scope, scopeID) {
+			return
+		}
 		if err := s.secretBackend.Delete(ctx, key, scope, scopeID); err != nil {
 			writeErrorFromErr(w, err, "")
 			return
@@ -2178,6 +2522,9 @@ func (s *Server) handleProjectSecretByKey(w http.ResponseWriter, r *http.Request
 		if s.agentStandingForbidden(ctx, w, agentIdent.ID()) {
 			return
 		}
+		if !checkAgentProjectSecretReadScope(w, r, store.ScopeProject) {
+			return
+		}
 	} else if userIdent, ok := identity.(UserIdentity); ok {
 		action := ActionRead
 		if isWrite {
@@ -2206,19 +2553,48 @@ func (s *Server) handleProjectSecretByKey(w http.ResponseWriter, r *http.Request
 // this way.
 const autoProvideLinkedBy = "auto-provide"
 
+// autoProvideBrokersPageSize is the page size autoLinkProviders lists
+// auto-provide brokers with; it follows the cursor through every page.
+const autoProvideBrokersPageSize = 100
+
+// listAutoProvideBrokers returns every broker with auto_provide enabled,
+// newest first, following the list cursor through all pages so a hub with
+// more brokers than one page links them all (ptone/scion#1998). A cursor
+// the store has already returned is an error rather than an endless loop.
+func (s *Server) listAutoProvideBrokers(ctx context.Context) ([]store.RuntimeBroker, error) {
+	autoProvideTrue := true
+	var all []store.RuntimeBroker
+	cursor := ""
+	seen := make(map[string]struct{})
+	for {
+		page, err := s.store.ListRuntimeBrokers(ctx, store.RuntimeBrokerFilter{
+			AutoProvide: &autoProvideTrue,
+		}, store.ListOptions{Limit: autoProvideBrokersPageSize, Cursor: cursor, SkipTotalCount: true})
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, page.Items...)
+		if page.NextCursor == "" {
+			return all, nil
+		}
+		if _, ok := seen[page.NextCursor]; ok {
+			return nil, fmt.Errorf("listing auto-provide brokers: pagination returned repeated cursor %q", page.NextCursor)
+		}
+		seen[page.NextCursor] = struct{}{}
+		cursor = page.NextCursor
+	}
+}
+
 // autoLinkProviders links brokers with auto_provide enabled as providers for a project.
 // If the project has no default runtime broker, the first auto-provided broker is set as default.
 func (s *Server) autoLinkProviders(ctx context.Context, project *store.Project) {
-	autoProvideTrue := true
-	autoProviders, err := s.store.ListRuntimeBrokers(ctx, store.RuntimeBrokerFilter{
-		AutoProvide: &autoProvideTrue,
-	}, store.ListOptions{})
+	autoProviders, err := s.listAutoProvideBrokers(ctx)
 	if err != nil {
 		s.envSecretLog.Warn("Failed to query auto-provide brokers", "project_id", project.ID, "error", err)
 		return
 	}
 
-	for _, autoBroker := range autoProviders.Items {
+	for _, autoBroker := range autoProviders {
 		// A flat Runtime Broker never receives an automatic link or
 		// default, whatever the experiment state: it is linked only by an
 		// explicit link action.
@@ -2790,6 +3166,7 @@ func (s *Server) handleBrokerSecrets(w http.ResponseWriter, r *http.Request, bro
 			writeErrorFromErr(w, err, "")
 			return
 		}
+		metas = withoutInternalSecrets(withoutSystemOneReservedSecrets(metas))
 		secrets := make([]store.Secret, len(metas))
 		for i, m := range metas {
 			secrets[i] = metaToStoreSecret(m)

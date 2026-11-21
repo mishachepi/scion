@@ -112,6 +112,14 @@ func (Agent) Fields() []ent.Field {
 			Optional(),
 		field.String("stalled_from_activity").
 			Optional(),
+		// suspend_reason records why the agent was suspended
+		// (state.SuspendReason: user, idle, stalled). NULL when not
+		// suspended, and on rows suspended before it existed.
+		// entc.ClearSuspendReasonHook clears it on any write of a phase
+		// other than suspended or starting.
+		field.String("suspend_reason").
+			Optional().
+			Nillable(),
 
 		// --- Limits tracking ---
 		field.Int("current_turns").
@@ -167,6 +175,13 @@ func (Agent) Fields() []ent.Field {
 		// Ent schema decoupled from the store package's struct definition.
 		field.Text("applied_config").
 			Optional(),
+		// effective_config is the broker's verified effective configuration
+		// echo for one run (store.AgentEffectiveConfig as JSON): written
+		// only by SetAgentEffectiveConfig, fenced on the row's run, broker
+		// and liveness; never by UpdateAgent (WP1 slice 3 addendum v12).
+		field.Text("effective_config").
+			Optional().
+			Nillable(),
 
 		// pending_config holds the agent's pending config edits
 		// (store.AgentPendingConfig, ptone/scion#3976) as a JSON document:
@@ -229,6 +244,18 @@ func (Agent) Fields() []ent.Field {
 		field.Time("last_activity_event").
 			Optional().
 			Nillable(),
+		// last_live_process_at is the last time the agent's container
+		// reported live work of any kind (ptone/scion#7855). The
+		// auto-suspend guard reads it (store.Agent.HasRecentLiveWork).
+		field.Time("last_live_process_at").
+			Optional().
+			Nillable(),
+		// last_live_work_at is the last time the container reported live
+		// work that suppresses STALLED (LiveWork.SuppressStall). The
+		// stall sweep (MarkStalledAgents) reads it.
+		field.Time("last_live_work_at").
+			Optional().
+			Nillable(),
 		field.Time("started_at").
 			Optional().
 			Nillable(),
@@ -285,6 +312,15 @@ func (Agent) Fields() []ent.Field {
 		// superseded launch and every reader has a stable ID to correlate
 		// against, even once launch_state has moved to "ended".
 		field.String("launch_id").
+			Optional().
+			Default(""),
+		// launch_run_id is the run the current launch dispatched: the run
+		// beginRun minted, bound by BeginLaunch/BeginStartLaunch in the same
+		// update that writes launch_id, and only when the row still holds
+		// it ("" otherwise, and for launches begun by older binaries). It
+		// is replaced by the next launch and never written by UpdateAgent
+		// (WP1 slice 3 addendum v12 section 1; slice 3b design section 3b).
+		field.String("launch_run_id").
 			Optional().
 			Default(""),
 		// run_id is the identity of the agent's current or most recent run
@@ -537,6 +573,40 @@ func (Agent) Fields() []ent.Field {
 		// an agent soft-deleted before the column existed. Lifecycle
 		// bookkeeping only: no authorization decision reads it.
 		field.String("soft_delete_op_id").
+			Optional().
+			Nillable(),
+
+		// activity_since is when the stored activity last changed value
+		// (an agent status report, a stall mark or un-stall, an offline
+		// sweep). It is store-managed, never written from a caller's
+		// struct, and NULL whenever phase is not running. Unlike
+		// last_activity_event, later hook traffic on an unchanged (sticky)
+		// activity does not refresh it, so the idle-suspend grace is
+		// measured from it.
+		field.Time("activity_since").
+			Optional().
+			Nillable(),
+
+		// last_delivery_at is the store-clock time of the most recent
+		// hub-side delivery mark written before handing an item (DM,
+		// mention, chat send, notification, scheduled fire) to a running
+		// agent (ptone/scion#7947). The idle auto-suspend CAS checks it so
+		// an item dispatched just before the Container's prompt-submit hook
+		// changes activity is never stopped mid-turn. Written only by
+		// AgentStore.MarkAgentDelivery, never by CreateAgent or UpdateAgent.
+		field.Time("last_delivery_at").
+			Optional().
+			Nillable(),
+
+		// idle_suspend_claim_until is the store-clock lease expiry of an
+		// in-flight idle auto-suspend stop dispatch (ptone/scion#7947).
+		// Written atomically with run_intent=stopped by
+		// AgentStore.ClaimIdleSuspend before DispatchAgentStop and cleared
+		// once the suspension (and its credential/quota settlement) finishes
+		// or aborts. Delivery paths that observe an unexpired claim wait for
+		// the suspension to settle and then auto-wake, rather than
+		// dispatching into the dying container.
+		field.Time("idle_suspend_claim_until").
 			Optional().
 			Nillable(),
 	}

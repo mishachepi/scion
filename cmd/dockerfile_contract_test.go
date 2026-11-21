@@ -179,6 +179,48 @@ func checkRootDockerfileContract(t *testing.T, content string) []string {
 		errs = append(errs, "final stage must be a bare, empty `FROM runtime` so the default build target is the runtime image; got FROM "+last.base+" AS "+last.name)
 	}
 
+	builder := findStage(stages, "builder")
+	if builder == nil {
+		errs = append(errs, "no stage named builder")
+	} else {
+		builderArgs := map[string]bool{}
+		foundGoBuild := false
+		for _, in := range builder.instrs {
+			switch in.cmd {
+			case "ARG":
+				for _, k := range envOrArgKeys(in.args) {
+					builderArgs[k] = true
+				}
+			case "RUN":
+				norm := strings.Join(strings.Fields(in.args), " ")
+				if !strings.Contains(norm, "go build") {
+					continue
+				}
+				foundGoBuild = true
+				for _, argName := range []string{"GIT_COMMIT", "VERSION", "BUILD_TIME"} {
+					if !builderArgs[argName] {
+						errs = append(errs, "builder stage must declare ARG "+argName+" before `go build`")
+					}
+				}
+				if !strings.Contains(norm, "-buildvcs=false") {
+					errs = append(errs, "builder stage `go build` must pass -buildvcs=false (.git is excluded from build context)")
+				}
+				for _, sym := range []string{
+					"-X github.com/GoogleCloudPlatform/scion/pkg/version.Version=${VERSION}",
+					"-X github.com/GoogleCloudPlatform/scion/pkg/version.Commit=${GIT_COMMIT}",
+					"-X github.com/GoogleCloudPlatform/scion/pkg/version.BuildTime=${BUILD_TIME}",
+				} {
+					if !strings.Contains(norm, sym) {
+						errs = append(errs, "builder stage `go build` must pass ldflags `"+sym+"`")
+					}
+				}
+			}
+		}
+		if !foundGoBuild {
+			errs = append(errs, "builder stage must run `go build`")
+		}
+	}
+
 	runtime := findStage(stages, "runtime")
 	if runtime == nil {
 		errs = append(errs, "no stage named runtime")
@@ -205,8 +247,15 @@ func checkRootDockerfileContract(t *testing.T, content string) []string {
 	if gke.base != "runtime" {
 		errs = append(errs, "hub-gke must be FROM runtime; got FROM "+gke.base)
 	}
+	labelArg := map[string]string{
+		"org.opencontainers.image.revision": "GIT_COMMIT",
+		"org.opencontainers.image.version":  "VERSION",
+	}
 	var user string
 	var runs []string
+	gkeArgs := map[string]bool{}
+	gkeLabels := map[string]string{}
+	gkeLabelArgInScope := map[string]bool{}
 	for _, in := range gke.instrs {
 		switch in.cmd {
 		case "USER":
@@ -217,6 +266,27 @@ func checkRootDockerfileContract(t *testing.T, content string) []string {
 			errs = append(errs, "hub-gke must inherit ENTRYPOINT from runtime: ENTRYPOINT "+in.args)
 		case "RUN":
 			runs = append(runs, strings.Join(strings.Fields(in.args), " "))
+		case "ARG":
+			for _, k := range envOrArgKeys(in.args) {
+				gkeArgs[k] = true
+			}
+		case "LABEL":
+			recordLabel := func(k, raw string) {
+				gkeLabels[k] = strings.Trim(raw, `"'`)
+				if arg, ok := labelArg[k]; ok {
+					gkeLabelArgInScope[k] = gkeArgs[arg]
+				}
+			}
+			fields := strings.Fields(in.args)
+			if len(fields) >= 2 && !strings.Contains(fields[0], "=") {
+				recordLabel(fields[0], strings.Join(fields[1:], " "))
+			} else {
+				for _, f := range fields {
+					if k, v, ok := strings.Cut(f, "="); ok {
+						recordLabel(k, v)
+					}
+				}
+			}
 		}
 	}
 	if user != "1000:1000" {
@@ -224,6 +294,15 @@ func checkRootDockerfileContract(t *testing.T, content string) []string {
 	}
 	if home, ok := envValue(gke, "HOME"); !ok || home != "/home/scion" {
 		errs = append(errs, "hub-gke must set ENV HOME=/home/scion; got "+home)
+	}
+	for _, k := range []string{"org.opencontainers.image.revision", "org.opencontainers.image.version"} {
+		arg := labelArg[k]
+		want := "${" + arg + "}"
+		if got := gkeLabels[k]; got != want {
+			errs = append(errs, "hub-gke must set LABEL "+k+`="`+want+`"; got `+got)
+		} else if !gkeLabelArgInScope[k] {
+			errs = append(errs, "hub-gke must declare ARG "+arg+" before LABEL "+k)
+		}
 	}
 	allRuns := strings.Join(runs, "\n")
 	for _, want := range []string{
@@ -287,6 +366,14 @@ func checkHubGKECloudBuildContract(content string) []string {
 			errs = append(errs, "cloudbuild-hub-gke.yaml substitution "+k+" must not mention latest: "+v)
 		}
 	}
+	for _, sub := range []string{"_VERSION", "_COMMIT_SHA", "_BUILD_TIME"} {
+		v, ok := cb.Substitutions[sub]
+		if !ok {
+			errs = append(errs, "cloudbuild-hub-gke.yaml must define substitution "+sub)
+		} else if v != "" {
+			errs = append(errs, "cloudbuild-hub-gke.yaml substitution "+sub+" must default to empty string; got "+v)
+		}
+	}
 
 	buildIdx, shaIdx := -1, -1
 	for i, s := range cb.Steps {
@@ -330,7 +417,7 @@ func checkHubGKECloudBuildContract(content string) []string {
 		case "--push":
 			push = true
 			continue
-		case "-t", "--tag", "-f", "--file", "--platform", "--target":
+		case "-t", "--tag", "-f", "--file", "--platform", "--target", "--build-arg":
 		default:
 			continue
 		}
@@ -360,6 +447,15 @@ func checkHubGKECloudBuildContract(content string) []string {
 	for flag, want := range map[string]string{"-f": "Dockerfile", "--platform": "linux/amd64", "--target": "hub-gke"} {
 		if got := flags[flag]; len(got) != 1 || got[0] != want {
 			errs = append(errs, "cloudbuild-hub-gke.yaml build step must pass "+flag+" "+want+"; got "+strings.Join(got, ", "))
+		}
+	}
+	buildArgs := map[string]int{}
+	for _, ba := range flags["--build-arg"] {
+		buildArgs[ba]++
+	}
+	for _, want := range []string{"VERSION=$_VERSION", "GIT_COMMIT=$_COMMIT_SHA", "BUILD_TIME=$_BUILD_TIME"} {
+		if buildArgs[want] != 1 {
+			errs = append(errs, "cloudbuild-hub-gke.yaml build step must pass --build-arg "+want+" once; got ["+strings.Join(flags["--build-arg"], ", ")+"]")
 		}
 	}
 
@@ -399,6 +495,39 @@ func TestDockerfileContractHubGKEIgnoreFile(t *testing.T) {
 	readme := readRepoFile(t, "image-build/README.md")
 	if !strings.Contains(readme, "--ignore-file="+hubGKEIgnoreFile) {
 		t.Error("image-build/README.md must pass --ignore-file=" + hubGKEIgnoreFile + " for the hub-gke build")
+	}
+}
+
+// TestDockerfileContractHubGKEDocs checks that the operator-facing build
+// instructions in image-build/README.md and docs-site helm.md pass _COMMIT_SHA
+// in their gcloud builds submit invocation and document _VERSION for release
+// builds, so following the published commands produces a version-stamped image.
+func TestDockerfileContractHubGKEDocs(t *testing.T) {
+	cases := []struct {
+		file    string
+		heading string
+	}{
+		{"image-build/README.md", "## GKE Hub Image (`cloudbuild-hub-gke.yaml`)"},
+		{"docs-site/src/content/docs/hosted/ha/helm.md", "## 2. Build the hub image"},
+	}
+	for _, tc := range cases {
+		doc := readRepoFile(t, tc.file)
+		_, rest, ok := strings.Cut(doc, tc.heading)
+		if !ok {
+			t.Fatalf("%s: section %q not found", tc.file, tc.heading)
+		}
+		section, _, _ := strings.Cut(rest, "\n## ")
+		for _, want := range []string{
+			"--config=image-build/cloudbuild-hub-gke.yaml",
+			"--ignore-file=" + hubGKEIgnoreFile,
+			"_SHORT_SHA=$(git rev-parse --short HEAD)",
+			"_COMMIT_SHA=$(git rev-parse HEAD)",
+			",_VERSION=",
+		} {
+			if !strings.Contains(section, want) {
+				t.Errorf("%s (%s): hub-gke build instructions must include %q", tc.file, tc.heading, want)
+			}
+		}
 	}
 }
 
@@ -451,6 +580,18 @@ func TestDockerfileContractCheckerDetectsViolations(t *testing.T) {
 		{"runtime ENV KUBECONFIG legacy form", mustReplace(t, good, "EXPOSE 8080\n", "EXPOSE 8080\nENV KUBECONFIG /k\n"), "must not set ENV KUBECONFIG"},
 		{"runtime ARG KUBECONFIG", mustReplace(t, good, "EXPOSE 8080\n", "EXPOSE 8080\nARG KUBECONFIG=/k\n"), "must not set ARG KUBECONFIG"},
 		{"KUBECONFIG after a comment in a continuation", mustReplace(t, good, homeLine, "ENV HOME=/home/scion \\\n# note\n    KUBECONFIG=/k\n"), "must not set ENV KUBECONFIG"},
+		{"builder missing ARG VERSION", mustReplace(t, good, "ARG VERSION=\"\"\n", ""), "builder stage must declare ARG VERSION before `go build`"},
+		{"builder missing ARG GIT_COMMIT", mustReplace(t, good, "ARG GIT_COMMIT=\"\"\n", ""), "builder stage must declare ARG GIT_COMMIT before `go build`"},
+		{"builder missing ARG BUILD_TIME", mustReplace(t, good, "ARG BUILD_TIME=\"\"\n", ""), "builder stage must declare ARG BUILD_TIME before `go build`"},
+		{"builder missing -buildvcs=false", mustReplace(t, good, "-buildvcs=false ", ""), "must pass -buildvcs=false"},
+		{"builder missing Version ldflag", mustReplace(t, good, "pkg/version.Version=${VERSION}", "pkg/version.Ver=${VERSION}"), "pkg/version.Version=${VERSION}"},
+		{"builder missing Commit ldflag", mustReplace(t, good, "pkg/version.Commit=${GIT_COMMIT}", "pkg/version.GitCommit=${GIT_COMMIT}"), "pkg/version.Commit=${GIT_COMMIT}"},
+		{"builder missing BuildTime ldflag", mustReplace(t, good, "pkg/version.BuildTime=${BUILD_TIME}", "pkg/version.Time=${BUILD_TIME}"), "pkg/version.BuildTime=${BUILD_TIME}"},
+		{"hub-gke missing OCI revision label", mustReplace(t, good, "LABEL org.opencontainers.image.revision=\"${GIT_COMMIT}\"\n", ""), "hub-gke must set LABEL org.opencontainers.image.revision"},
+		{"hub-gke missing OCI version label", mustReplace(t, good, "LABEL org.opencontainers.image.version=\"${VERSION}\"\n", ""), "hub-gke must set LABEL org.opencontainers.image.version"},
+		{"hub-gke missing stage ARG GIT_COMMIT", mustReplace(t, good, "ARG GIT_COMMIT=\"\"\nARG VERSION=\"\"\nLABEL org.opencontainers.image.revision", "ARG VERSION=\"\"\nLABEL org.opencontainers.image.revision"), "hub-gke must declare ARG GIT_COMMIT before LABEL org.opencontainers.image.revision"},
+		{"hub-gke missing stage ARG VERSION", mustReplace(t, good, "ARG GIT_COMMIT=\"\"\nARG VERSION=\"\"\nLABEL org.opencontainers.image.revision", "ARG GIT_COMMIT=\"\"\nLABEL org.opencontainers.image.revision"), "hub-gke must declare ARG VERSION before LABEL org.opencontainers.image.version"},
+		{"hub-gke OCI label before stage ARG", mustReplace(t, good, "ARG GIT_COMMIT=\"\"\nARG VERSION=\"\"\nLABEL org.opencontainers.image.revision=\"${GIT_COMMIT}\"\nLABEL org.opencontainers.image.version=\"${VERSION}\"\n", "LABEL org.opencontainers.image.revision=\"${GIT_COMMIT}\"\nLABEL org.opencontainers.image.version=\"${VERSION}\"\nARG GIT_COMMIT=\"\"\nARG VERSION=\"\"\n"), "hub-gke must declare ARG GIT_COMMIT before LABEL org.opencontainers.image.revision"},
 	}
 	for _, m := range dockerMutations {
 		expectViolation(t, m.name, checkRootDockerfileContract(t, m.src), m.want)
@@ -481,11 +622,360 @@ func TestDockerfileContractCheckerDetectsViolations(t *testing.T) {
 		{"-f swapped", mustReplace(t, cb, "      - 'Dockerfile'\n", "      - 'image-build/hub/Dockerfile'\n"), "-f Dockerfile"},
 		{"require-short-sha neutered", mustReplace(t, cb, `'test -n "$_SHORT_SHA" || { echo "ERROR: pass --substitutions=_SHORT_SHA=<git short sha>" >&2; exit 1; }'`, "'true'"), "require-short-sha step"},
 		{"ignore file reverted to default", mustReplace(t, cb, "--ignore-file="+hubGKEIgnoreFile, "--ignore-file=.gcloudignore"), "--ignore-file=" + hubGKEIgnoreFile},
+		{"missing _VERSION substitution", mustReplace(t, cb, "  _VERSION: ''\n", ""), "must define substitution _VERSION"},
+		{"non-empty _VERSION substitution", mustReplace(t, cb, "  _VERSION: ''\n", "  _VERSION: 'dev'\n"), "substitution _VERSION must default to empty string"},
+		{"missing _COMMIT_SHA substitution", mustReplace(t, cb, "  _COMMIT_SHA: ''\n", ""), "must define substitution _COMMIT_SHA"},
+		{"missing _BUILD_TIME substitution", mustReplace(t, cb, "  _BUILD_TIME: ''\n", ""), "must define substitution _BUILD_TIME"},
+		{"missing VERSION build-arg", mustReplace(t, cb, "      - '--build-arg'\n      - 'VERSION=$_VERSION'\n", ""), "--build-arg VERSION=$_VERSION once"},
+		{"missing GIT_COMMIT build-arg", mustReplace(t, cb, "      - '--build-arg'\n      - 'GIT_COMMIT=$_COMMIT_SHA'\n", ""), "--build-arg GIT_COMMIT=$_COMMIT_SHA once"},
+		{"missing BUILD_TIME build-arg", mustReplace(t, cb, "      - '--build-arg'\n      - 'BUILD_TIME=$_BUILD_TIME'\n", ""), "--build-arg BUILD_TIME=$_BUILD_TIME once"},
 	}
 	for _, m := range cbMutations {
 		expectViolation(t, m.name, checkHubGKECloudBuildContract(m.src), m.want)
 	}
 	if errs := checkHubGKECloudBuildContract("# never latest\n" + cb); len(errs) != 0 {
 		t.Errorf("latest in a comment: valid file reported violations: %q", errs)
+	}
+}
+
+// agentImageDockerfiles returns the tracked Dockerfiles of agent images: the
+// image-build/ chain (core-base, thick-prep, scion-base, hub, omni) and the
+// harness images under harnesses/.
+func agentImageDockerfiles(t *testing.T) []string {
+	t.Helper()
+	var out []string
+	for _, f := range repoTrackedFiles(t) {
+		if !strings.HasPrefix(filepath.Base(f), "Dockerfile") {
+			continue
+		}
+		if strings.HasPrefix(f, "image-build/") || strings.HasPrefix(f, "harnesses/") {
+			out = append(out, f)
+		}
+	}
+	if len(out) == 0 {
+		t.Fatal("no agent image Dockerfiles found under image-build/ or harnesses/")
+	}
+	return out
+}
+
+// checkNoImageTZ returns a violation for each ENV or ARG TZ in a Dockerfile's
+// stages. Agent images must not pin a timezone: the agent zone is set per
+// agent when the container starts (the hub is the TZ authority for
+// hub-dispatched agents), and an image-level TZ, even an empty one baked from
+// an unset build arg, sits outside that chain. A non-empty build arg would
+// silently pin every container built from the image. verify-base-contract.sh
+// asserts the same for the base images at build time; this static check also
+// covers the harness images, which do not run that script.
+func checkNoImageTZ(t *testing.T, name, content string) []string {
+	t.Helper()
+	var errs []string
+	for _, st := range parseDockerfileStages(t, content) {
+		for _, in := range st.instrs {
+			if in.cmd != "ENV" && in.cmd != "ARG" {
+				continue
+			}
+			for _, k := range envOrArgKeys(in.args) {
+				if k == "TZ" {
+					errs = append(errs, name+": "+in.cmd+" "+in.args+": agent images must not set TZ; the agent zone is set per agent at container start")
+				}
+			}
+		}
+	}
+	return errs
+}
+
+func TestAgentImageDockerfilesDoNotSetTZ(t *testing.T) {
+	for _, f := range agentImageDockerfiles(t) {
+		for _, e := range checkNoImageTZ(t, f, readRepoFile(t, f)) {
+			t.Error(e)
+		}
+	}
+}
+
+func TestNoImageTZCheckDetectsViolations(t *testing.T) {
+	base := "ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\nRUN true\n"
+	for name, src := range map[string]string{
+		"ARG TZ":          base + "ARG TZ\n",
+		"ENV TZ quoted":   base + "ENV TZ=\"$TZ\"\n",
+		"ENV TZ legacy":   base + "ENV TZ UTC\n",
+		"ENV TZ in a set": base + "ENV LANG=C.UTF-8 TZ=UTC\n",
+		"ARG TZ default":  base + "ARG TZ=Etc/UTC\n",
+	} {
+		expectViolation(t, name, checkNoImageTZ(t, "x/Dockerfile", src), "must not set TZ")
+	}
+	if errs := checkNoImageTZ(t, "x/Dockerfile", base+"ENV TZDIR=/usr/share/zoneinfo\nARG TZ_NOTE\n"); len(errs) != 0 {
+		t.Errorf("TZ-prefixed names reported as TZ: %q", errs)
+	}
+}
+
+const antigravityInstallerURL = "https://antigravity.google/cli/install.sh"
+
+func hasShellPipe(s string) bool {
+	return strings.Contains(strings.ReplaceAll(s, "||", ""), "|")
+}
+
+// checkAntigravityDockerfileContract checks that harnesses/antigravity/Dockerfile
+// installs agy via the upstream installer script without a manual AGY_VERSION
+// pin, downloads the script to a file instead of piping curl into bash under
+// Docker's non-pipefail /bin/sh, installs into /usr/local/bin, and verifies the
+// binary with `agy --version`.
+func checkAntigravityDockerfileContract(t *testing.T, content string) []string {
+	t.Helper()
+	stages := parseDockerfileStages(t, content)
+	if len(stages) == 0 {
+		return []string{"no stages found"}
+	}
+	var errs []string
+
+	// Check global ARGs before FROM as well as stage-level ARG/ENV instructions.
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		fields := strings.Fields(trimmed)
+		kw := strings.ToUpper(fields[0])
+		if kw != "ARG" && kw != "ENV" {
+			continue
+		}
+		rest := strings.TrimSpace(strings.TrimPrefix(trimmed, fields[0]))
+		for _, k := range envOrArgKeys(rest) {
+			if strings.EqualFold(k, "AGY_VERSION") {
+				errs = append(errs, "harnesses/antigravity/Dockerfile must not set "+kw+" AGY_VERSION (version comes from upstream installer)")
+			}
+		}
+	}
+
+	var runs []string
+	for _, st := range stages {
+		for _, in := range st.instrs {
+			if in.cmd == "RUN" {
+				runs = append(runs, strings.Join(strings.Fields(in.args), " "))
+			}
+		}
+	}
+	allRuns := strings.Join(runs, "\n")
+
+	if strings.Contains(allRuns, "github.com/google-antigravity/antigravity-cli/releases") {
+		errs = append(errs, "harnesses/antigravity/Dockerfile must not download pinned GitHub release tarballs directly")
+	}
+	if !strings.Contains(allRuns, antigravityInstallerURL) {
+		errs = append(errs, "harnesses/antigravity/Dockerfile must fetch "+antigravityInstallerURL)
+	}
+
+	var hasBashDirInstall, hasVersionCheck bool
+	for _, run := range runs {
+		for _, andClause := range strings.Split(run, "&&") {
+			for _, clause := range strings.Split(andClause, ";") {
+				c := strings.TrimSpace(clause)
+				if (strings.Contains(c, "curl ") || strings.Contains(c, antigravityInstallerURL)) && hasShellPipe(c) {
+					errs = append(errs, "harnesses/antigravity/Dockerfile must download install.sh to a file rather than piping curl into bash/sh (Docker /bin/sh lacks pipefail)")
+				}
+				if !hasShellPipe(c) && strings.Contains(c, "bash ") &&
+					(strings.Contains(c, "--dir /usr/local/bin") || strings.Contains(c, "--dir=/usr/local/bin") || strings.Contains(c, "-d /usr/local/bin")) {
+					hasBashDirInstall = true
+				}
+				if c == "agy --version" || c == "/usr/local/bin/agy --version" {
+					hasVersionCheck = true
+				}
+			}
+		}
+	}
+	if !hasBashDirInstall {
+		errs = append(errs, "harnesses/antigravity/Dockerfile must invoke install.sh via bash with --dir /usr/local/bin")
+	}
+	if !hasVersionCheck {
+		errs = append(errs, "harnesses/antigravity/Dockerfile must run `agy --version` (without `|| true`) to log the installed version and fail on a broken install")
+	}
+	return errs
+}
+
+func TestAntigravityDockerfileUsesInstaller(t *testing.T) {
+	for _, e := range checkAntigravityDockerfileContract(t, readRepoFile(t, "harnesses/antigravity/Dockerfile")) {
+		t.Error(e)
+	}
+}
+
+func TestAntigravityDockerfileContractDetectsViolations(t *testing.T) {
+	good := "ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\nUSER root\n" +
+		"RUN rm -f /usr/local/bin/agy \\\n" +
+		"  && tmp_home=\"$(mktemp -d)\" \\\n" +
+		"  && curl -fsSL -o /tmp/agy-install.sh https://antigravity.google/cli/install.sh \\\n" +
+		"  && HOME=\"${tmp_home}\" bash /tmp/agy-install.sh --dir /usr/local/bin \\\n" +
+		"  && rm -rf /tmp/agy-install.sh \"${tmp_home}\" \\\n" +
+		"  && /usr/local/bin/agy --version\n"
+
+	if errs := checkAntigravityDockerfileContract(t, good); len(errs) != 0 {
+		t.Fatalf("valid Dockerfile reported violations: %q", errs)
+	}
+
+	mutations := []struct{ name, src, want string }{
+		{"stage ARG AGY_VERSION", good + "ARG AGY_VERSION=1.5.8\n", "must not set ARG AGY_VERSION"},
+		{"global ARG AGY_VERSION", "ARG AGY_VERSION=1.5.8\n" + good, "must not set ARG AGY_VERSION"},
+		{"ENV AGY_VERSION", good + "ENV AGY_VERSION=1.5.8\n", "must not set ENV AGY_VERSION"},
+		{"curl piped to bash", "ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\nRUN curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin && /usr/local/bin/agy --version\n", "rather than piping curl"},
+		{"missing --dir /usr/local/bin", mustReplace(t, good, " --dir /usr/local/bin", ""), "with --dir /usr/local/bin"},
+		{"missing agy --version", mustReplace(t, good, "  && /usr/local/bin/agy --version\n", "\n"), "must run `agy --version`"},
+		{"agy --version masked with || true", mustReplace(t, good, "/usr/local/bin/agy --version", "/usr/local/bin/agy --version || true"), "must run `agy --version`"},
+	}
+	for _, m := range mutations {
+		expectViolation(t, m.name, checkAntigravityDockerfileContract(t, m.src), m.want)
+	}
+}
+
+// checkNoImagePlaywrightBrowsersPath returns a violation for each ENV or ARG
+// PLAYWRIGHT_BROWSERS_PATH in an agent image Dockerfile. Setting an image-wide
+// PLAYWRIGHT_BROWSERS_PATH relocates runtime browser downloads (`npx playwright
+// install webkit firefox`) out of the persistent agent home (~/.cache/ms-playwright)
+// into the ephemeral container layer and orphans existing home caches; system
+// ffmpeg is seeded into the persistent home registry by sciontool init instead.
+func checkNoImagePlaywrightBrowsersPath(t *testing.T, name, content string) []string {
+	t.Helper()
+	var errs []string
+	for _, st := range parseDockerfileStages(t, content) {
+		for _, in := range st.instrs {
+			if in.cmd != "ENV" && in.cmd != "ARG" {
+				continue
+			}
+			for _, k := range envOrArgKeys(in.args) {
+				if k == "PLAYWRIGHT_BROWSERS_PATH" {
+					errs = append(errs, name+": "+in.cmd+" "+in.args+": agent images must not set PLAYWRIGHT_BROWSERS_PATH; keep Playwright's persistent ~/.cache/ms-playwright registry")
+				}
+			}
+		}
+	}
+	return errs
+}
+
+func TestAgentImageDockerfilesDoNotSetPlaywrightBrowsersPath(t *testing.T) {
+	for _, f := range agentImageDockerfiles(t) {
+		for _, e := range checkNoImagePlaywrightBrowsersPath(t, f, readRepoFile(t, f)) {
+			t.Error(e)
+		}
+	}
+}
+
+func TestNoImagePlaywrightBrowsersPathCheckDetectsViolations(t *testing.T) {
+	base := "ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\nRUN true\n"
+	for name, src := range map[string]string{
+		"ARG PLAYWRIGHT_BROWSERS_PATH":         base + "ARG PLAYWRIGHT_BROWSERS_PATH\n",
+		"ENV PLAYWRIGHT_BROWSERS_PATH":         base + "ENV PLAYWRIGHT_BROWSERS_PATH=/usr/local/share/ms-playwright\n",
+		"ENV PLAYWRIGHT_BROWSERS_PATH legacy":  base + "ENV PLAYWRIGHT_BROWSERS_PATH /usr/local/share/ms-playwright\n",
+		"ENV PLAYWRIGHT_BROWSERS_PATH in list": base + "ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global PLAYWRIGHT_BROWSERS_PATH=/opt/pw\n",
+	} {
+		expectViolation(t, name, checkNoImagePlaywrightBrowsersPath(t, "x/Dockerfile", src), "must not set PLAYWRIGHT_BROWSERS_PATH")
+	}
+	if errs := checkNoImagePlaywrightBrowsersPath(t, "x/Dockerfile", base+"ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1\n"); len(errs) != 0 {
+		t.Errorf("other PLAYWRIGHT_* env vars reported as PLAYWRIGHT_BROWSERS_PATH: %q", errs)
+	}
+}
+
+// checkBaseImagePlaywrightFfmpegContract verifies that a foundation Dockerfile
+// (core-base or thick-prep) leaves PLAYWRIGHT_BROWSERS_PATH unset and runs
+// install-core-toolchain.sh playwright-ffmpeg after npm-tools and before
+// verify-base-contract.sh.
+func checkBaseImagePlaywrightFfmpegContract(t *testing.T, name, content string) []string {
+	t.Helper()
+	errs := checkNoImagePlaywrightBrowsersPath(t, name, content)
+	stages := parseDockerfileStages(t, content)
+	if len(stages) == 0 {
+		return append(errs, name+": no stages found")
+	}
+	final := &stages[len(stages)-1]
+
+	npmToolsStep, ffmpegStep, verifyStep := -1, -1, -1
+	seq := 0
+	for _, in := range final.instrs {
+		if in.cmd != "RUN" {
+			continue
+		}
+		for _, andClause := range strings.Split(in.args, "&&") {
+			for _, clause := range strings.Split(andClause, ";") {
+				c := strings.Join(strings.Fields(clause), " ")
+				switch {
+				case strings.Contains(c, "install-core-toolchain.sh npm-tools"):
+					seq++
+					npmToolsStep = seq
+				case strings.Contains(c, "install-core-toolchain.sh playwright-ffmpeg"):
+					seq++
+					ffmpegStep = seq
+				case strings.Contains(c, "verify-base-contract.sh"):
+					seq++
+					verifyStep = seq
+				}
+			}
+		}
+	}
+
+	if ffmpegStep < 0 {
+		errs = append(errs, name+": final stage must run `install-core-toolchain.sh playwright-ffmpeg`")
+		return errs
+	}
+	if npmToolsStep >= 0 && ffmpegStep < npmToolsStep {
+		errs = append(errs, name+": `install-core-toolchain.sh playwright-ffmpeg` must run after `install-core-toolchain.sh npm-tools`")
+	}
+	if verifyStep >= 0 && ffmpegStep > verifyStep {
+		errs = append(errs, name+": `install-core-toolchain.sh playwright-ffmpeg` must run before `verify-base-contract.sh`")
+	}
+	return errs
+}
+
+func TestBaseImageDockerfilesConfigurePlaywrightFfmpeg(t *testing.T) {
+	for _, f := range []string{
+		"image-build/core-base/Dockerfile",
+		"image-build/thick-prep/Dockerfile",
+	} {
+		for _, e := range checkBaseImagePlaywrightFfmpegContract(t, f, readRepoFile(t, f)) {
+			t.Error(e)
+		}
+	}
+}
+
+func TestBaseImagePlaywrightFfmpegContractDetectsViolations(t *testing.T) {
+	good := "FROM node:24-trixie-slim\n" +
+		"ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global\n" +
+		"RUN /opt/scion-image-build/lib/install-core-toolchain.sh npm-tools \\\n" +
+		"    && /opt/scion-image-build/lib/install-core-toolchain.sh playwright-ffmpeg\n" +
+		"RUN /opt/scion-image-build/lib/verify-base-contract.sh\n"
+
+	if errs := checkBaseImagePlaywrightFfmpegContract(t, "test/Dockerfile", good); len(errs) != 0 {
+		t.Fatalf("valid Dockerfile reported violations: %q", errs)
+	}
+
+	mutations := []struct{ name, src, want string }{
+		{
+			"sets PLAYWRIGHT_BROWSERS_PATH",
+			mustReplace(t, good,
+				"ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global\n",
+				"ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global\nENV PLAYWRIGHT_BROWSERS_PATH=/usr/local/share/ms-playwright\n",
+			),
+			"must not set PLAYWRIGHT_BROWSERS_PATH",
+		},
+		{
+			"missing playwright-ffmpeg step",
+			mustReplace(t, good, " \\\n    && /opt/scion-image-build/lib/install-core-toolchain.sh playwright-ffmpeg", ""),
+			"must run `install-core-toolchain.sh playwright-ffmpeg`",
+		},
+		{
+			"playwright-ffmpeg before npm-tools",
+			"FROM node:24-trixie-slim\n" +
+				"RUN /opt/scion-image-build/lib/install-core-toolchain.sh playwright-ffmpeg\n" +
+				"RUN /opt/scion-image-build/lib/install-core-toolchain.sh npm-tools\n" +
+				"RUN /opt/scion-image-build/lib/verify-base-contract.sh\n",
+			"must run after `install-core-toolchain.sh npm-tools`",
+		},
+		{
+			"playwright-ffmpeg after verify-base-contract.sh",
+			mustReplace(
+				t,
+				mustReplace(t, good, " \\\n    && /opt/scion-image-build/lib/install-core-toolchain.sh playwright-ffmpeg", ""),
+				"RUN /opt/scion-image-build/lib/verify-base-contract.sh\n",
+				"RUN /opt/scion-image-build/lib/verify-base-contract.sh\nRUN /opt/scion-image-build/lib/install-core-toolchain.sh playwright-ffmpeg\n",
+			),
+			"must run before `verify-base-contract.sh`",
+		},
+	}
+	for _, m := range mutations {
+		expectViolation(t, m.name, checkBaseImagePlaywrightFfmpegContract(t, "test/Dockerfile", m.src), m.want)
 	}
 }

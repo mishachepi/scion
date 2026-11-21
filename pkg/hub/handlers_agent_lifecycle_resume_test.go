@@ -151,10 +151,10 @@ func TestAgentLifecycle_Start_SuspendedPhase_AlwaysResumes(t *testing.T) {
 }
 
 // TestHarnessSupportsResume_InstalledConfig verifies that the suspend
-// capability check consults installed harness-configs (hub store) before the
-// compiled-in embeds. Without this, a user-installed harness-config such as
+// capability check resolves an installed harness-config (hub store) to the
+// harness it names. Without this, a user-installed harness-config such as
 // claude-tmux silently resolves to Generic (resume unsupported) and suspend
-// is rejected even though the config declares resume support.
+// is rejected although its harness supports resume.
 func TestHarnessSupportsResume_InstalledConfig(t *testing.T) {
 	srv, _, _ := testTemplateBootstrapServer(t)
 	ctx := context.Background()
@@ -172,30 +172,18 @@ func TestHarnessSupportsResume_InstalledConfig(t *testing.T) {
 		}
 	}
 
-	install(t, "hc-resume-yes",
-		"harness: claude\ncommand:\n  resume_flag: \"--continue\"\ncapabilities:\n  resume: { support: \"yes\" }\n")
-	install(t, "hc-resume-no",
-		"harness: claude\ncapabilities:\n  resume: { support: \"no\", reason: \"no session store\" }\n")
-	install(t, "hc-resume-undeclared", "harness: claude\n")
+	install(t, "hc-claude-custom", "harness: claude\n")
 
 	agentWith := func(hc string) *store.Agent {
 		return &store.Agent{AppliedConfig: &store.AgentAppliedConfig{HarnessConfig: hc}}
 	}
 
-	if ok, _ := srv.harnessSupportsResume(ctx, agentWith("hc-resume-yes")); !ok {
-		t.Error("installed config declaring resume support=yes must be resumable")
-	}
-	if ok, reason := srv.harnessSupportsResume(ctx, agentWith("hc-resume-no")); ok {
-		t.Error("installed config declaring resume support=no must not be resumable")
-	} else if reason != "no session store" {
-		t.Errorf("reason = %q, want the declared reason", reason)
-	}
-	if ok, _ := srv.harnessSupportsResume(ctx, agentWith("hc-resume-undeclared")); !ok {
-		t.Error("installed config without a capability matrix must default to resumable")
+	if ok, harnessType, _ := srv.harnessSupportsResume(ctx, agentWith("hc-claude-custom")); !ok {
+		t.Errorf("installed claude harness-config must be resumable (judged harness %q)", harnessType)
 	}
 	// Not installed and not an embedded harness: falls back to Generic,
 	// which does not support resume.
-	if ok, _ := srv.harnessSupportsResume(ctx, agentWith("hc-not-installed")); ok {
+	if ok, _, _ := srv.harnessSupportsResume(ctx, agentWith("hc-not-installed")); ok {
 		t.Error("unknown harness must fall back to Generic (no resume)")
 	}
 }

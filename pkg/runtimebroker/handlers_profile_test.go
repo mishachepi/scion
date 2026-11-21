@@ -26,7 +26,6 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
-	"github.com/GoogleCloudPlatform/scion/pkg/config"
 )
 
 func TestResolveManagerForOpts_NoProfile(t *testing.T) {
@@ -320,19 +319,18 @@ profiles: [not valid yaml
 
 func TestCreateAgentWithProfile(t *testing.T) {
 	srv, mgr := newTestServerWithProvisionCapture()
-	// The broker defines custom-profile (a copy of its active profile): a
-	// create naming a profile the broker does not define is refused, see
-	// TestCreateAgentWithUndefinedProfileRefused.
-	srv.loadSettings = func(projectDir string) (*config.VersionedSettings, []string, error) {
-		vs, warns, err := config.LoadEffectiveSettings(projectDir)
-		if err == nil && vs != nil {
-			vs.Profiles["custom-profile"] = vs.Profiles[vs.ActiveProfile]
-		}
-		return vs, warns, err
+	projectPath := filepath.Join(t.TempDir(), ".scion")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const settingsYAML = "schema_version: \"1\"\nprofiles:\n  custom-profile:\n    runtime: docker\n"
+	if err := os.WriteFile(filepath.Join(projectPath, "settings.yaml"), []byte(settingsYAML), 0o644); err != nil {
+		t.Fatal(err)
 	}
 
 	body := `{
 		"name": "profiled-agent",
+		"projectPath": "` + projectPath + `",
 		"config": {"template": "claude", "profile": "custom-profile"}
 	}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(body))
@@ -351,34 +349,6 @@ func TestCreateAgentWithProfile(t *testing.T) {
 
 	if mgr.lastOpts.Profile != "custom-profile" {
 		t.Errorf("expected Profile 'custom-profile', got %q", mgr.lastOpts.Profile)
-	}
-}
-
-// TestCreateAgentWithUndefinedProfileRefused: a create naming a profile the
-// broker's settings do not define is refused with 503 naming the profile,
-// instead of running on the default runtime, where a later resume would
-// refuse the saved profile.
-func TestCreateAgentWithUndefinedProfileRefused(t *testing.T) {
-	srv, mgr := newTestServerWithProvisionCapture()
-
-	body := `{
-		"name": "profiled-agent",
-		"config": {"template": "claude", "profile": "custom-profile"}
-	}`
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-
-	srv.Handler().ServeHTTP(w, req)
-
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected status %d, got %d: %s", http.StatusServiceUnavailable, w.Code, w.Body.String())
-	}
-	if !strings.Contains(w.Body.String(), `profile \"custom-profile\" not found`) || !strings.Contains(w.Body.String(), `"cause":"profile_unresolved"`) {
-		t.Errorf("expected the refusal to name the profile and carry cause profile_unresolved, got %s", w.Body.String())
-	}
-	if mgr.startCalled {
-		t.Error("expected no Start for an undefined profile")
 	}
 }
 

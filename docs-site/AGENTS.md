@@ -121,21 +121,32 @@ writes YAML by default. The JSON schema lives at
 2. **Source of Truth**:
    - `GLOSSARY.md` (root) for terminology and the mode spine.
    - `.design/` for architectural intent.
-   - `pkg/` for implementation details; verify CLI flags in `cmd/`.
+   - `pkg/` for implementation details; verify CLI flags in `cmd/` and HTTP status / wire error codes in `pkg/hub/` handlers. User-facing feature release notes go at the top of `src/content/docs/release-notes.md` (not generated `changelog/` pages); when curating per-tag release notes under `src/content/docs/release-notes/<slug>.md`, compare PR numbers against the git tag range (`scripts/release/select-previous-release-tag.sh`) rather than date-grouped `changelog/*.md` files alone, and verify experiment gates (`pkg/experiments/registry.go`) and required configuration fields at the tag.
 3. **Mode-Specific Placement**: Put a page in the mode it belongs to. When a topic
    spans modes, place it in the most logical one and cross-link — do not duplicate.
 4. **Tone**: *User docs* are practical and task-oriented; *admin docs* are technical
    and detail-oriented; *reference docs* are exhaustive and dry.
 5. **Diagrams**: Use **D2** in `d2` code blocks within Markdown files.
 6. **Cross-Linking**: Link from high-level guides to specific references to avoid
-   duplication. Internal links use the absolute form `/scion/<slug>/`.
+   duplication. Internal links use the absolute form `/scion/<slug>/`. During versioned
+   tag snapshot builds (`DOCS_BASE=/scion/<tag>`), `scionRewriteBaseIntegration`
+   (`src/plugins/rewrite-scion-base.mjs`) automatically rewrites internal `/scion/<slug>/`
+   links and assets to `/scion/<tag>/<slug>/` while leaving `/scion/versions.json` and
+   non-site paths (such as `/scion-volumes/...`) untouched.
 
 ## 6. Verification
 
 - **Sidebar**: Register new pages in `docs-site/astro.config.mjs` under the correct
   mode group.
 - **Redirects**: When moving or renaming a page, add a redirect in the
-  `redirects` map in `astro.config.mjs` so old URLs do not 404.
+  `legacyRedirectTargets` map in `docs-site/astro.config.mjs` so old URLs do not 404 on
+  either `main` or versioned snapshots.
+- **Tests & Type Checks**: Run `npm test` and `npm run check` (`astro check`) before
+  committing changes to `docs-site/` scripts, plugins, or Astro components. Unit tests in
+  `test/` must be hermetic and must not depend on git refs or tags beyond `HEAD` (check
+  historical inputs into `test/fixtures/`). When changing versioning or link-rewriting
+  code, also verify a subpath snapshot build:
+  `DOCS_BASE=/scion/v0.3.0 DOCS_CHANNEL=stable DOCS_VERSION=v0.3.0 npm run build && DOCS_BASE=/scion/v0.3.0 npm run verify-snapshot`.
 - **Link Check**: `starlight-links-validator` runs during `npm run build` (Node ≥ 22).
   Fix every reported broken link.
 - **Formatting**: Standard Markdown. Starlight supports
@@ -144,9 +155,11 @@ writes YAML by default. The JSON schema lives at
 
 **Note on D2**: `npm run build` and `npm run dev` render every `d2` block with the
 `astro-d2` integration, so the `d2` CLI must be installed to build the site locally (see
-`docs-site/README.md` for the install command; CI pins d2 v0.9.0 in
-`.github/workflows/docs.yml`). The rendered SVGs in `public/d2/` are gitignored and
-regenerated on every build. To check diagram syntax on its own, run `./check-d2.sh`. If
-`d2` is not available in your environment, check your D2 syntax against the
-[D2 documentation](https://d2lang.com/tour/intro) and say in your PR that the diagrams
-were not rendered locally.
+`docs-site/README.md` for workstation install; in agent containers, unpack the pinned
+checksummed release tarball into `/tmp` and add its `bin/` directory to `PATH` following
+the `Install D2` step in `.github/workflows/docs.yml`, since `d2lang.com/install.sh` uses
+`sudo` and hits unauthenticated GitHub API 403 rate limits). The rendered SVGs in
+`public/d2/` are gitignored and regenerated on every build. To check diagram syntax on its
+own, run `./check-d2.sh`. If network policy blocks fetching `d2`, check your D2 syntax
+against the [D2 documentation](https://d2lang.com/tour/intro) and say in your PR that
+`npm run build` (including `starlight-links-validator`) was not run locally.

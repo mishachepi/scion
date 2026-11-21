@@ -56,8 +56,7 @@ install, refresh, publish, and delete. Manage them with the `scion harness-confi
 ### The `name` field
 
 A harness-config's identifier defaults to its **directory name** (e.g. `claude`,
-`gemini-experimental`). A `config.yaml` may set an explicit `name:` field to override this; path
-separators (`.`, `..`, `/`, `\`) are rejected. On the Hub, each config also has a URL-safe
+`gemini-experimental`). A `config.yaml` may set an explicit `name:` field to override this. Every harness-config name must be a single path component — non-empty, not `.` or `..`, and containing no `/`, `\`, leading `:`, or `://`. A name in any other form is refused on local disk lookup, on `scion harness-config pull` without `--to`, on every Hub and store write (`CreateHarnessConfig`, `UpdateHarnessConfig`, create, rename, clone, or import) with `name must be a single path component`, and on agent create requests (`harness config must be a harness-config name`). A project default, template default, Hub default, or recorded harness-config in another form is ignored with a dispatch warning (`the <tier> harness config was ignored: it is not a harness-config name`). On the Hub, each config also has a URL-safe
 `slug`, and lookups match either the name or the slug.
 
 ### Installing from a source
@@ -78,7 +77,7 @@ scion harness-config install file:///path/to/my-harness
 When a Hub is available, `install` registers the config **on the Hub** (project scope by default,
 or global with `--global`); otherwise it installs it locally. The output shows the Hub scope the
 config was created or updated in. A project-scoped config and a global config with the same name
-are separate configs, so check the printed scope to see which one you changed.
+are separate configs, so check the printed scope to see which one you changed. When the Hub bootstraps or imports a harness-config directory, it opens the collected directory as a root, reads only the regular files recorded during collection without following symlinks or replaced directories, verifies each file's size and SHA-256 digest on every read (`config.yaml` and uploaded files), and requires any config whose name was taken from `config.yaml` during discovery to carry that same `name` in the collected `config.yaml`.
 
 ### Source-URL tracking and "Refresh from Source"
 
@@ -190,7 +189,7 @@ not edit the bundled scripts in place.
 ### Changing a harness config affects new agents only
 
 By design, an agent keeps the harness setup it was created with. Its home directory is composed
-once, when the agent is created (see [Seeding from Harness-Configs &
+when the agent is provisioned, including reincarnation (see [Seeding from Harness-Configs &
 Templates](#seeding-from-harness-configs--templates)). That directory holds the harness-config's
 `home/` dotfiles, such as Claude's `.claude/settings.json` with its hook registrations, and the
 agent's skills. The skills come from the template chain (including skill references it declares)
@@ -199,9 +198,9 @@ copy them again. For a harness that uses container-script provisioning, each sta
 provisioner bundle (for example `config.yaml`, `provision.py`, `scion_harness.py`,
 `dialect.yaml` and the capture-auth assets) and the hook wrapper script, and then runs
 `provision.py`. Changes to `home/` dotfiles, including hook registrations kept there, therefore
-reach new agents only. Harnesses whose provisioner writes its hook configuration at start (for
-example Copilot, Antigravity and Grok Build) pick up changes to the provisioner on the agent's
-next start.
+reach new agents and agents that are reincarnated. Harnesses whose provisioner writes its hook
+configuration at start (for example Copilot, Antigravity and Grok Build) pick up changes to the
+provisioner on the agent's next start.
 
 To give an existing agent the new setup:
 
@@ -218,6 +217,7 @@ To give an existing agent the new setup:
      It keeps the agent's identity and workspace and copies the harness-config's home files, the
      skills from the template chain (including skill references it declares) and the platform
      skills in again. It overlays files: files that the new version no longer has stay in place.
+   - To select another harness-config, use [`scion reincarnate <agent> --harness <harness-config>`](/scion/local/agent-lifecycle/#switching-harness-config) with the `hub.reincarnate_harness_switch` experiment enabled. Unlike a plain reincarnation's overlay, this deletes and rebuilds the home, even when the named harness-config is unchanged. Run `--dry-run` first to review the HOME RESET warning; there is no rollback.
    - **In a worktree-per-agent project** (where reincarnate is not available):
      save the agent's work, then delete the agent with `scion delete` and start it again.
 
@@ -387,18 +387,26 @@ file, and both readers use those values: `sciontool init`, which reports the age
 when it is ready, and the broker, which waits before pasting a held message. A
 `SCION_HARNESS_READY` value in a caller's `env` cannot override it (a template cannot set `SCION_*` keys).
 
-The built-in bundles use `hook` (settle 1.5s, timeout 90s) for claude, gemini-cli, copilot and
-grok-build, and `delay` 8s for every other harness. A harness-config without the block (for
-example one installed before the block existed) uses the block of the built-in bundle for its
-`harness` type, so an older claude config keeps `hook`; a harness with no built-in bundle uses
-`delay` 8s.
+The built-in bundles use `hook` (settle 1.5s, timeout 90s) for claude, gemini-cli and
+grok-build, and `delay` 8s for every other harness. Copilot uses `delay`: its `sessionStart`
+hook fires only when the first prompt is submitted, not at startup. A harness-config without
+the block (for example one installed before the block existed) uses the block of the built-in
+bundle for its `harness` type, so an older claude config keeps `hook`; a harness with no
+built-in bundle uses `delay` 8s.
 
 A harness-config without a provisioner that declares a `ready` or `delivery` block, in
 `config.yaml` or in an override, is treated like a harness-config with `command` or
 `config_dir`: its `ready` block is used, its `instructions_file`, `system_prompt_file` and
 `system_prompt_mode` (or the declarative defaults for instructions and system prompts) apply when
 the agent is provisioned, and the harness reports its `harness` type as its name instead of
-`generic`. A `ready` block taken from the built-in bundle does not have this effect. Message
+`generic`. In `config.yaml`, `system_prompt_file`, `instructions_file`, `skills_dir`, and
+`config_dir` must each be empty or a relative path inside the Agent home (not absolute, no `..`
+component, and not `.`). When a declarative harness reads or writes `instructions_file` (default
+`agents.md`, reads bounded to 4 MiB) or `system_prompt_file` (default `.scion/system_prompt.md`),
+every access goes through a handle confined to the Agent home (`pkg/agenthome`): a path that
+leaves the home or traverses a linked directory component is refused, a linked or non-regular file
+is not read, and a symlink at the target file is replaced rather than written through. A `ready`
+block taken from the built-in bundle does not have this effect. Message
 delivery and interrupts still use the built-in bundle for the `harness` type (the defaults for a
 type with no bundle), so a custom `delivery` block, `interrupt_key` and `interrupt_sequence` do
 not yet change how messages are submitted or interrupted.
@@ -424,6 +432,15 @@ The `command` block defines how the agent's primary LLM tool is invoked.
 *   `task_flag`: CLI flag used to pass the task (e.g., `--prompt`).
 *   `resume_flag`: CLI flag to resume a previous session (e.g., `--session`).
 *   `system_prompt_flag`: CLI flag for the system prompt.
+
+#### Launcher harnesses and live-work detection
+
+The Hub's live-work detection treats the process `command.base` starts as the harness itself, never as work, because a TUI keeps redrawing while it waits (see [Agent Lifecycle](/scion/local/agent-lifecycle/#auto-suspend-of-stalled-agents)). Some tools start through a launcher that keeps running and spawns the real TUI as a child. Codex's npm launcher (`node bin/codex.js`) is one. For a harness like that, set `SCION_LIVENESS_HARNESS_ROOT_DEPTH` in the config's `env` map. The value is the number of process levels counted as the harness, so the launcher and its TUI make 2. The default is 1 and the maximum is 4. Without it, a hung agent's animated status can keep it from ever being marked stalled.
+
+```yaml
+env:
+  SCION_LIVENESS_HARNESS_ROOT_DEPTH: "2"
+```
 
 ### Environment Templates (`env_template`)
 

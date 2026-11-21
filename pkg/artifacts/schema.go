@@ -446,3 +446,17 @@ CREATE TABLE IF NOT EXISTS artifact_delivery_redemption (
 CREATE INDEX IF NOT EXISTS idx_artifact_delivery_redemption_at
     ON artifact_delivery_redemption (redeemed_at);
 `
+
+// migrationSponsorBackfill is the ledger name the sponsor backfill
+// (BackfillSponsors, ptone/scion#6028) records in artifact_migrations when
+// it completes. It is NOT a schema step and is not in migrations: Init
+// never runs or records it, because the backfill needs the host's
+// delegation lookup and runs from the hub's maintenance pass. It shares
+// the ledger's numbering, so the next DDL migration is 0013, never 0012.
+const migrationSponsorBackfill = "0012_sponsor_backfill"
+
+// migrationReviewLadder converts the legacy write grants of the removed
+// review-only path to review (ptone/scion#5145). It is a data step with no
+// DDL; see applyReviewLadder. It follows 0013, the review sessions step
+// of ptone/scion#6849.
+const migrationReviewLadder = "0014_review_ladder"

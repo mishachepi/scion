@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
 
 	"github.com/GoogleCloudPlatform/scion/cmd/internal/cliutil"
@@ -133,6 +134,14 @@ return an error instead of blocking.`,
 			return errNoHubRemoved
 		}
 
+		// Windows build: a gated command refuses here, in the root pre-run
+		// hook, before the command runs or does any invocation-target,
+		// project or migration work of its own (cmd/platform_gate.go). The
+		// CLI mode resolved above may already have read the settings.
+		if err := windowsRefusal(cmd); err != nil {
+			return err
+		}
+
 		// A hub config file (--hub-config, SCION_HUB_CONFIG) selects the
 		// hub, project and token before anything resolves them.
 		if err := applyHubConfig(); err != nil {
@@ -204,7 +213,7 @@ return an error instead of blocking.`,
 
 		// Hub-only commands never read local project settings: for them
 		// --project names a hub project, not a directory.
-		hubOnly := hubOnlyCommands[topLevelName(cmd)]
+		hubOnly := hubOnlyCommands[topLevelName(cmd)] || isAllProjectsDecisionsList(cmd)
 
 		if !hubOnly {
 			// Load settings to get cli.autohelp
@@ -302,8 +311,9 @@ func Execute() {
 		}
 	}
 	// Hub-only commands skip it: their --project is not a directory. So do
-	// hub profile invocations, which never read local project settings.
-	if !hubOnlyCommands[topLevelName(target)] && !hubProfileRequested() {
+	// hub profile invocations and "decisions list --all-projects", which
+	// never read local project settings.
+	if !hubOnlyCommands[topLevelName(target)] && !hubProfileRequested() && !isAllProjectsDecisionsListArgs(target, cliArgs) {
 		settings, _ := config.LoadSettings(tempProjectPath)
 		if settings != nil && settings.CLI != nil && settings.CLI.AutoHelp != nil {
 			autoHelp = *settings.CLI.AutoHelp
@@ -311,6 +321,12 @@ func Execute() {
 	}
 
 	applyModeRestrictions(rootCmd, mode)
+	applyPlatformRestrictions(rootCmd, runtime.GOOS)
+	// Shell completion of a command the Windows gate refused: no
+	// completion function of the command runs (cmd/platform_gate.go).
+	if completeGated(rootCmd, cliArgs, os.Stdout) {
+		return
+	}
 
 	// Suppress ASCII banner in agent mode. This runs in Execute rather
 	// than init(), where the mode cannot yet be resolved safely.
@@ -491,7 +507,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&projectPath, "project", "g", "", "Project identifier: path, slug (with Hub), or git URL (with Hub)")
 
 	rootCmd.PersistentFlags().BoolVar(&globalMode, "global", false, "Use the global project (equivalent to --project global)")
-	rootCmd.PersistentFlags().StringVarP(&profile, "profile", "p", "", "Configuration profile to use")
+	rootCmd.PersistentFlags().StringVarP(&profile, "profile", "p", "", "Configuration profile to use (for legacy profile-based Runtime Brokers; select flat Runtime Brokers with --broker)")
 	rootCmd.PersistentFlags().StringVar(&outputFormat, "format", "", "Output format (e.g., json)")
 
 	// Hub integration flags

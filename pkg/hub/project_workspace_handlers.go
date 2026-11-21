@@ -37,6 +37,8 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectfs"
+	"github.com/GoogleCloudPlatform/scion/pkg/projectfs/provisioner"
+	"github.com/GoogleCloudPlatform/scion/pkg/provision"
 	"github.com/GoogleCloudPlatform/scion/pkg/shareddirs"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
@@ -70,7 +72,65 @@ const maxPreviewFileSize = 50 * 1024 * 1024
 // responses. allow-same-origin must never be added: it would undo exactly
 // that isolation. The header has no effect when the response is loaded as a
 // subresource such as an <img>, so inline image previews are unaffected.
-const untrustedContentSandboxCSP = "sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox allow-downloads"
+//
+// frame-ancestors 'none': these pages are never embedded in other pages,
+// with or without the web frontend in front of the hub.
+//
+// allow-modals lets a document call print() (a report's Print button) and
+// show alert/confirm/prompt dialogs. A dialog gives the document no reach
+// beyond its own opaque origin: it is UI the document could draw itself.
+//
+// Never add allow-top-navigation-to-custom-protocols either: it would let the
+// content launch desktop protocol handlers (mailto:, ms-word:, vscode:)
+// without a click.
+const untrustedContentSandboxCSP = "sandbox " + untrustedContentSandboxTokens + sandboxCSPSuffix
+
+// agentServedPageSandboxCSP is the same policy with the tokens interactive
+// apps need added to its sandbox directive. It is sent on pages an agent
+// serves live through the port-forward and conduit proxies, which are apps
+// (dashboards with search boxes and filters, 3D and map viewers) rather than
+// stored files.
+const agentServedPageSandboxCSP = "sandbox " + untrustedContentSandboxTokens + " " + agentServedPageSandboxTokens + sandboxCSPSuffix
+
+// untrustedContentSandboxTokens are the sandbox tokens for every response
+// whose bytes are written by users or agents. allow-same-origin must never
+// be added.
+const untrustedContentSandboxTokens = "allow-scripts allow-popups allow-popups-to-escape-sandbox allow-downloads allow-modals"
+
+// agentServedPageSandboxTokens are added on agent-served pages only. None of
+// them reaches past the page's opaque origin:
+//   - allow-forms: a POST form the page submits is a cross-site request and
+//     carries no SameSite=Lax session cookie; a GET form is a top-level
+//     navigation a script can already make.
+//   - allow-pointer-lock: needs a user gesture and is always released by Esc.
+//   - allow-orientation-lock: locks screen rotation, normally only in
+//     fullscreen.
+//   - allow-presentation: the browser always asks which screen to use.
+const agentServedPageSandboxTokens = "allow-forms allow-pointer-lock allow-orientation-lock allow-presentation"
+
+// sandboxCSPSuffix follows the sandbox directive in every sandbox policy, so
+// tokens are added to the token lists above, never appended to a finished
+// policy string.
+const sandboxCSPSuffix = "; frame-ancestors 'none'"
+
+// untrustedContentPermissionsPolicy turns off the powerful browser features
+// for user- and agent-written content. Browsers already deny most of them to
+// an opaque origin; the header makes that hold independently of browser
+// behaviour. It replaces webPermissionsPolicy on these responses, so it
+// denies everything that one does. clipboard-read is off so a page cannot
+// read what the viewer copied elsewhere; writing to the clipboard stays
+// allowed.
+const untrustedContentPermissionsPolicy = "accelerometer=(), gyroscope=(), magnetometer=(), " +
+	"camera=(), microphone=(), geolocation=(), display-capture=(), " +
+	"usb=(), serial=(), hid=(), bluetooth=(), payment=(), " +
+	"publickey-credentials-get=(), publickey-credentials-create=(), clipboard-read=()"
+
+// setUntrustedContentHeaders sets the sandbox csp and the Permissions-Policy
+// on a hub response whose bytes are written by users or agents.
+func setUntrustedContentHeaders(h http.Header, csp string) {
+	h.Set("Content-Security-Policy", csp)
+	h.Set("Permissions-Policy", untrustedContentPermissionsPolicy)
+}
 
 // contentDisposition builds a Content-Disposition header value with
 // mime.FormatMediaType, as the skill and template handlers do, so non-ASCII
@@ -122,7 +182,7 @@ func (s *Server) workspaceWriteBlocked() bool {
 // errSharedDirWritesUnavailable is returned when a shared-dir write is
 // refused because the shared dir resolved to storage that is not durable on
 // this hub (Cloud Run Service with shared dirs on instance-local disk).
-const errSharedDirWritesUnavailable = "Shared directory writes are not available: shared directories are not on durable storage on this hub. Configure server.shared_dir_storage or server.workspace_storage with the nfs backend."
+const errSharedDirWritesUnavailable = "Shared directory writes are not available: shared directories are not on durable storage on this hub. Configure server.project_storage with a shared backend (nfs, cloudrun-volume or gke-shared-volume)."
 
 // writeGate is the Cloud Run durability gate for one write target. The zero
 // value allows writes.
@@ -250,6 +310,9 @@ func (walkDirSearcher) Search(root *os.Root, query string, limit int) (FileSearc
 			// permission on, a name os.Root refuses to resolve) must not fail
 			// the whole listing — skip it and keep walking.
 			return nil
+		}
+		if skip, err := skipDotGitEntry(d); skip {
+			return err
 		}
 		if path == "." || d.IsDir() {
 			return nil
@@ -445,9 +508,15 @@ func (s *Server) resolveProjectWorkspace(ctx context.Context, project *store.Pro
 
 	for _, p := range providers {
 		if s.isEmbeddedBroker(p.BrokerID) && p.LocalPath != "" {
+			workspaceRoot := filepath.Clean(p.LocalPath)
+			// Providers may register either the checkout or its .scion directory.
+			// Keep the global project confined to its existing root.
+			if !isGlobalHubProject(project.Slug) && filepath.Base(workspaceRoot) == config.DotScion {
+				workspaceRoot = filepath.Dir(workspaceRoot)
+			}
 			return projectfs.Resolved{
 				Backend:  projectfs.BackendLocal,
-				HostPath: p.LocalPath,
+				HostPath: workspaceRoot,
 				Target:   projectfs.DefaultContainerWorkspace,
 				Kind:     projectfs.KindWorkspace,
 				Name:     "workspace",
@@ -638,14 +707,13 @@ func (s *Server) handleProjectWorkspaceUpload(w http.ResponseWriter, r *http.Req
 	}
 
 	// Apply total request body size limit
-	r.Body = http.MaxBytesReader(w, r.Body, maxUploadTotalSize)
+	r.Body = http.MaxBytesReader(w, r.Body, s.workspaceBodyLimit())
 
 	// Parse multipart form
 	cleanup, err := parseMultipartUpload(r, s.uploadFormMaxMemory())
 	defer cleanup()
 	if err != nil {
-		if err.Error() == "http: request body too large" {
-			BadRequest(w, "Request body exceeds 100MB limit")
+		if writeWorkspaceBodyTooLarge(w, err) {
 			return
 		}
 		BadRequest(w, "Invalid multipart form: "+err.Error())
@@ -657,24 +725,27 @@ func (s *Server) handleProjectWorkspaceUpload(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	// Validate every file (the field name is its relative path) before
+	// writing any, so a refused file leaves the workspace unchanged.
+	for relPath, fileHeaders := range r.MultipartForm.File {
+		if err := validateWorkspaceWritePath(relPath); err != nil {
+			BadRequest(w, fmt.Sprintf("Invalid file path %q: %s", relPath, err.Error()))
+			return
+		}
+		for _, fh := range fileHeaders {
+			if fh.Size > maxUploadFileSize {
+				BadRequest(w, fmt.Sprintf("File %q exceeds 50MB limit", relPath))
+				return
+			}
+		}
+	}
+
 	var uploaded []ProjectWorkspaceFile
 
 	for fieldName, fileHeaders := range r.MultipartForm.File {
 		for _, fh := range fileHeaders {
 			// The field name is the relative file path
 			relPath := fieldName
-
-			// Validate the file path
-			if err := validateWorkspaceFilePath(relPath); err != nil {
-				BadRequest(w, fmt.Sprintf("Invalid file path %q: %s", relPath, err.Error()))
-				return
-			}
-
-			// Check per-file size limit
-			if fh.Size > maxUploadFileSize {
-				BadRequest(w, fmt.Sprintf("File %q exceeds 50MB limit", relPath))
-				return
-			}
 
 			// Open the uploaded file
 			src, err := fh.Open()
@@ -683,38 +754,13 @@ func (s *Server) handleProjectWorkspaceUpload(w http.ResponseWriter, r *http.Req
 				return
 			}
 
-			// Create parent directories, confined to the root: a component
-			// that is, or leads through, a symlink out of the workspace is
-			// refused by root.MkdirAll rather than followed.
-			if dir := filepath.Dir(relPath); dir != "." {
-				if err := root.MkdirAll(dir, 0755); err != nil {
-					_ = src.Close()
-					notAccessible(w, "upload-mkdir", relPath, err)
-					return
-				}
-			}
-
-			// Write file to disk
-			dst, err := root.Create(relPath)
-			if err != nil {
-				_ = src.Close()
-				notAccessible(w, "upload", relPath, err)
-				return
-			}
-
-			written, err := io.Copy(dst, src)
+			// Write through the opened parent directory: a .git directory
+			// on the way, a symlink as the target, or a path out of the
+			// workspace is refused rather than followed.
+			written, info, err := writeWorkspaceFile(root, relPath, src)
 			_ = src.Close()
-			_ = dst.Close()
-
 			if err != nil {
-				InternalError(w)
-				return
-			}
-
-			// Get file info for response
-			info, err := root.Stat(relPath)
-			if err != nil {
-				InternalError(w)
+				writeWorkspaceFileError(w, "upload", relPath, err)
 				return
 			}
 
@@ -738,26 +784,46 @@ func (s *Server) handleProjectWorkspaceUpload(w http.ResponseWriter, r *http.Req
 // When "format=json" is set, the file content is returned as a JSON object
 // with metadata, suitable for the inline file editor.
 func (s *Server) handleProjectWorkspaceDownload(w http.ResponseWriter, r *http.Request, root *os.Root, filePath string) {
-	// Validate the file path. This lexical check is kept as defence in depth:
-	// it rejects the obvious shapes early, but it cannot see symlinks, so the
-	// confinement that actually matters is the Root below.
-	if err := validateWorkspaceFilePath(filePath); err != nil {
+	// Validate the file path. This lexical check rejects the obvious shapes,
+	// including a path with a .git component (as for writes); it cannot see
+	// symlinks, which the walk below handles.
+	if err := validateWorkspaceReadPath(filePath); err != nil {
 		BadRequest(w, fmt.Sprintf("Invalid file path %q: %s", filePath, err.Error()))
 		return
 	}
 
-	// Check file exists and is not a directory
-	info, err := root.Stat(filePath)
+	// Open the parent one directory at a time (as for writes, creating
+	// nothing) and refuse a symlink as the target (see writeWorkspaceWalkError).
+	parent, base, linfo, err := openWorkspaceReadTarget(root, filePath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			NotFound(w, "File")
-			return
-		}
-		notAccessible(w, "download", filePath, err)
+		writeWorkspaceWalkError(w, "download", filePath, err)
 		return
 	}
-	if info.IsDir() {
+	defer parent.Close()
+	if linfo.IsDir() {
 		BadRequest(w, "Cannot download a directory")
+		return
+	}
+	if !linfo.Mode().IsRegular() {
+		notAccessible(w, "download", filePath, fmt.Errorf("not a regular file (%v)", linfo.Mode().Type()))
+		return
+	}
+
+	// Open once and serve every mode from this handle: it must be the entry
+	// Lstat saw, so an entry swapped for a symlink in between is refused.
+	f, err := parent.Dir().Open(base)
+	if err != nil {
+		writeWorkspaceWalkError(w, "download", filePath, err)
+		return
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		InternalError(w)
+		return
+	}
+	if !os.SameFile(info, linfo) {
+		writeWorkspaceWalkError(w, "download", filePath, fmt.Errorf("%w: target changed while opening it", errWorkspaceWriteRefused))
 		return
 	}
 
@@ -780,7 +846,7 @@ func (s *Server) handleProjectWorkspaceDownload(w http.ResponseWriter, r *http.R
 			return
 		}
 
-		data, readErr := root.ReadFile(filePath)
+		data, readErr := io.ReadAll(f)
 		if readErr != nil {
 			InternalError(w)
 			return
@@ -806,14 +872,6 @@ func (s *Server) handleProjectWorkspaceDownload(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Open the file
-	f, err := root.Open(filePath)
-	if err != nil {
-		InternalError(w)
-		return
-	}
-	defer func() { _ = f.Close() }()
-
 	// Determine content type from extension, default to octet-stream
 	fileName := filepath.Base(filePath)
 	contentType := mime.TypeByExtension(filepath.Ext(fileName))
@@ -825,7 +883,7 @@ func (s *Server) handleProjectWorkspaceDownload(w http.ResponseWriter, r *http.R
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	// Set on attachments too, so the file stays sandboxed if a browser ever
 	// renders one instead of downloading it.
-	w.Header().Set("Content-Security-Policy", untrustedContentSandboxCSP)
+	setUntrustedContentHeaders(w.Header(), untrustedContentSandboxCSP)
 	disposition := "attachment"
 	if r.URL.Query().Get("view") == "true" {
 		disposition = "inline"
@@ -852,6 +910,10 @@ func writeDirectoryToZip(zw *zip.Writer, root *os.Root) error {
 		if err != nil {
 			// One unreadable entry should not truncate the whole archive.
 			return nil
+		}
+
+		if skip, err := skipDotGitEntry(d); skip {
+			return err
 		}
 
 		if path == "." || d.IsDir() {
@@ -1033,13 +1095,17 @@ func (s *Server) handleProjectWorkspaceWrite(w http.ResponseWriter, r *http.Requ
 	}
 
 	// Validate the file path
-	if err := validateWorkspaceFilePath(filePath); err != nil {
+	if err := validateWorkspaceWritePath(filePath); err != nil {
 		BadRequest(w, fmt.Sprintf("Invalid file path %q: %s", filePath, err.Error()))
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, s.workspaceBodyLimit())
 	var req ProjectWorkspaceWriteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if writeWorkspaceBodyTooLarge(w, err) {
+			return
+		}
 		BadRequest(w, "Invalid request body: "+err.Error())
 		return
 	}
@@ -1065,24 +1131,11 @@ func (s *Server) handleProjectWorkspaceWrite(w http.ResponseWriter, r *http.Requ
 		// If file doesn't exist (new file creation), skip the check
 	}
 
-	// Create parent directories if needed, confined to the root.
-	if dir := filepath.Dir(filePath); dir != "." {
-		if err := root.MkdirAll(dir, 0755); err != nil {
-			notAccessible(w, "write-mkdir", filePath, err)
-			return
-		}
-	}
-
-	// Write the file
-	if err := root.WriteFile(filePath, []byte(req.Content), 0644); err != nil {
-		notAccessible(w, "write", filePath, err)
-		return
-	}
-
-	// Read back file info for the response
-	info, err := root.Stat(filePath)
+	// Write through the opened parent directory, creating missing parents
+	// (see writeWorkspaceFile).
+	_, info, err := writeWorkspaceFile(root, filePath, strings.NewReader(req.Content))
 	if err != nil {
-		InternalError(w)
+		writeWorkspaceFileError(w, "write", filePath, err)
 		return
 	}
 
@@ -1096,9 +1149,10 @@ func (s *Server) handleProjectWorkspaceWrite(w http.ResponseWriter, r *http.Requ
 
 // handleProjectWorkspaceDelete deletes a file from a project workspace.
 //
-// Existence is checked with Lstat and the removal is a Root.Remove, both of
-// which act on the named entry itself rather than on what it points to. A
-// symlink is therefore deletable — it shows up in the listing, so refusing to
+// The parent is opened through the per-directory walk
+// (openWorkspaceDeleteTarget), then existence is checked with Lstat and the
+// removal is a Root.Remove in that parent, both of which act on the named
+// entry itself rather than on what it points to. A symlink is therefore deletable — it shows up in the listing, so refusing to
 // delete it would strand it — and deleting it unlinks the link and never the
 // file at the other end, inside or outside the workspace.
 func (s *Server) handleProjectWorkspaceDelete(w http.ResponseWriter, root *os.Root, filePath string, gate writeGate) {
@@ -1109,14 +1163,23 @@ func (s *Server) handleProjectWorkspaceDelete(w http.ResponseWriter, root *os.Ro
 	}
 
 	// Validate the file path
-	if err := validateWorkspaceFilePath(filePath); err != nil {
+	if err := validateWorkspaceWritePath(filePath); err != nil {
 		BadRequest(w, fmt.Sprintf("Invalid file path %q: %s", filePath, err.Error()))
 		return
 	}
 
+	// Open the parent one directory at a time (as for downloads, creating
+	// nothing), so a directory link on the way into .git is refused.
+	dir, base, closeDir, err := openWorkspaceDeleteTarget(root, filePath)
+	if err != nil {
+		writeWorkspaceWalkError(w, "delete", filePath, err)
+		return
+	}
+	defer closeDir()
+
 	// Check the entry exists. Lstat, not Stat: a dangling or outward-pointing
 	// symlink still exists as an entry and is still removable.
-	if _, err := root.Lstat(filePath); err != nil {
+	if _, err := dir.Lstat(base); err != nil {
 		if os.IsNotExist(err) {
 			NotFound(w, "File")
 			return
@@ -1125,8 +1188,8 @@ func (s *Server) handleProjectWorkspaceDelete(w http.ResponseWriter, root *os.Ro
 		return
 	}
 
-	// Remove the file
-	if err := root.Remove(filePath); err != nil {
+	// Remove the entry through the opened parent
+	if err := dir.Remove(base); err != nil {
 		notAccessible(w, "delete", filePath, err)
 		return
 	}
@@ -1253,99 +1316,70 @@ type sharedDirResolution struct {
 	Source sharedDirLayoutSource
 }
 
-// onSharedBackend reports whether the shared dir is on the shared (nfs)
-// tree, <subpath_root>/<project UUID>/shared-dirs/<name>.
+// onSharedBackend reports whether the shared dir is on the shared tree
+// (nfs or a shared volume), <subpath_root>/<project UUID>/shared-dirs/<name>.
 func (r *sharedDirResolution) onSharedBackend() bool {
-	return r.Resolved.Backend == projectfs.BackendNFS
+	return r.Resolved.Backend.Shared()
 }
 
 // openSharedDirRoot opens the resolved shared dir through the layout
 // authority (projectfs.Resolved.Open): on NFS, pkg/shareddirs' anchored
-// O_NOFOLLOW walk (and, with createIfMissing, shareddirs.EnsureLeaf first);
-// on local disk, a root that refuses a symlinked directory. No caller joins
-// paths and opens them itself.
+// O_NOFOLLOW walk; on local disk, a root that refuses a symlinked
+// directory. With createIfMissing a missing leaf is first created by the
+// layout authority's Provisioner (provisioner.Provisioner.EnsureLeaf, the
+// brokers' leaf contract). No caller joins paths and opens them itself.
 func (s *Server) openSharedDirRoot(resolution *sharedDirResolution, createIfMissing bool) (*os.Root, error) {
-	return resolution.Resolved.Open(createIfMissing)
+	if createIfMissing {
+		if _, err := (provisioner.Provisioner{}).EnsureLeaf(resolution.Resolved); err != nil {
+			return nil, err
+		}
+	}
+	return resolution.Resolved.Open(false)
 }
 
-// sharedDirLayoutSource names the server block a shared-dir Layout came from.
+// sharedDirLayoutSource names where a shared-dir Layout came from.
 type sharedDirLayoutSource string
 
 const (
-	sharedDirLayoutFromSharedDirStorage sharedDirLayoutSource = "server.shared_dir_storage"
-	sharedDirLayoutFromWorkspaceStorage sharedDirLayoutSource = "server.workspace_storage"
-	sharedDirLayoutLocal                sharedDirLayoutSource = "local"
+	sharedDirLayoutFromProjectStorage sharedDirLayoutSource = "server.project_storage"
+	sharedDirLayoutLocal              sharedDirLayoutSource = "local"
 )
 
-// sharedDirLayout returns the Layout the hub resolves shared-dir Mounts on,
-// synthesized from its in-memory server config (design fs-cleanup M1 form
-// for phase 1; never from a per-request settings-file read, the DB or
-// project settings).
-//
-// T3 precedence, matching what brokers do today: server.shared_dir_storage
-// when its backend is nfs, else server.workspace_storage when its backend is
-// nfs, else local. P3 replaces this with server.project_storage.
-//
-// cloudrun-volume and gke-shared-volume workspaces leave shared dirs local,
-// as on the brokers (Kubernetes gives those per-dir RWX claims); the Cloud
-// Run write gate then refuses shared-dir writes there.
+// sharedDirLayout returns the Layout the hub resolves shared-dir Mounts on:
+// projectStorageLayout, labelled for logs.
 func (s *Server) sharedDirLayout() (projectfs.Layout, sharedDirLayoutSource, error) {
-	if err := s.config.SharedDirStorageError; err != nil {
-		return projectfs.Layout{}, sharedDirLayoutFromSharedDirStorage, err
+	full, err := s.projectStorageLayout()
+	if err != nil {
+		return projectfs.Layout{}, sharedDirLayoutFromProjectStorage, err
 	}
-	if sd := s.config.SharedDirStorageConfig; sd != nil && sd.Backend != "" && sd.Backend != config.WorkspaceStorageBackendLocal {
-		if err := sd.Validate(); err != nil {
-			return projectfs.Layout{}, sharedDirLayoutFromSharedDirStorage, fmt.Errorf("server.shared_dir_storage: %w", err)
-		}
-		layout, err := hubNFSLayout(sd.NFS)
-		if err != nil {
-			return projectfs.Layout{}, sharedDirLayoutFromSharedDirStorage, fmt.Errorf("server.shared_dir_storage: %w", err)
-		}
-		return layout, sharedDirLayoutFromSharedDirStorage, nil
+	layout := full.SharedDirLayout()
+	if layout.Backend.Shared() {
+		return layout, sharedDirLayoutFromProjectStorage, nil
 	}
-	if ws := s.config.WorkspaceStorageConfig; ws != nil && ws.Backend == config.WorkspaceStorageBackendNFS {
-		layout, err := hubNFSLayout(ws.NFS)
-		if err != nil {
-			return projectfs.Layout{}, sharedDirLayoutFromWorkspaceStorage, fmt.Errorf("server.workspace_storage: %w", err)
-		}
-		return layout, sharedDirLayoutFromWorkspaceStorage, nil
-	}
-	return projectfs.Layout{Backend: projectfs.BackendLocal}, sharedDirLayoutLocal, nil
+	return layout, sharedDirLayoutLocal, nil
 }
 
-// hubNFSLayout builds an nfs Layout for the hub, which serves files from its
-// own mount of the share and so needs an absolute mount_root.
-func hubNFSLayout(nfs *config.V1NFSConfig) (projectfs.Layout, error) {
-	layout, err := config.NFSLayout(nfs)
+// projectStorageLayout returns the hub's projectfs Layout, built from its
+// in-memory server.project_storage (ServerConfig.ProjectStorageConfig, as
+// resolved at startup; design fs-cleanup §P2) through
+// config.ProjectStorageLayout, the translation the brokers use too. It is
+// never built from a per-request settings-file read, the DB or project
+// settings. One backend places the workspace and the shared dirs: nfs, or
+// the cloudrun-volume / gke-shared-volume volume mounted at
+// <volumeMountBase>/<volume_name>, gives the UUID-keyed tree; local (and no
+// block) gives today's slug-keyed layout. The hub serves files from its own
+// mount of the share, so a shared Layout's host base must be absolute.
+func (s *Server) projectStorageLayout() (projectfs.Layout, error) {
+	layout, err := config.ProjectStorageLayout(s.config.ProjectStorageConfig, volumeMountBase)
 	if err != nil {
 		return projectfs.Layout{}, err
 	}
-	if !filepath.IsAbs(layout.HostBase) {
-		return projectfs.Layout{}, fmt.Errorf("nfs.mount_root must be an absolute path on the hub (host base %q)", layout.HostBase)
+	for _, l := range []projectfs.Layout{layout, layout.SharedDirLayout()} {
+		if l.Backend.Shared() && !filepath.IsAbs(l.HostBase) {
+			return projectfs.Layout{}, fmt.Errorf("%s: the share must be mounted at an absolute path on the hub (host base %q)", config.ProjectStorageKey, l.HostBase)
+		}
 	}
 	return layout, nil
-}
-
-// sharedDirLayoutWarnings reports a disagreement between the two nfs blocks
-// when both are configured, naming which block each Mount kind follows.
-func sharedDirLayoutWarnings(ws *config.V1WorkspaceStorageConfig, sd *config.V1SharedDirStorageConfig) []string {
-	if ws == nil || ws.Backend != config.WorkspaceStorageBackendNFS || sd == nil || sd.Backend != config.WorkspaceStorageBackendNFS {
-		return nil
-	}
-	wsLayout, wsErr := config.NFSLayout(ws.NFS)
-	sdLayout, sdErr := config.NFSLayout(sd.NFS)
-	if wsErr != nil || sdErr != nil {
-		return nil // reported where each block is validated
-	}
-	if wsLayout.HostBase == sdLayout.HostBase && wsLayout.SubPathRoot == sdLayout.SubPathRoot && wsLayout.Share == sdLayout.Share {
-		return nil
-	}
-	return []string{fmt.Sprintf(
-		"server.workspace_storage and server.shared_dir_storage are both nfs but disagree "+
-			"(workspace: host base %q, subpath_root %q, share %q; shared dirs: host base %q, subpath_root %q, share %q): "+
-			"the hub serves shared dirs from server.shared_dir_storage and workspaces from server.workspace_storage",
-		wsLayout.HostBase, wsLayout.SubPathRoot, wsLayout.Share.ID,
-		sdLayout.HostBase, sdLayout.SubPathRoot, sdLayout.Share.ID)}
 }
 
 // errSharedDirNotDeclared is returned for a shared dir the project does not
@@ -1356,12 +1390,10 @@ var errSharedDirNotDeclared = errors.New("shared directory is not declared on th
 // through the layout authority (pkg/projectfs) on the Layout from
 // sharedDirLayout.
 //
-// On a shared (nfs) Layout the shared dir is the one agents mount:
+// On a shared Layout the shared dir is the one agents mount, on every
+// runtime that can mount the shared tree:
 // <subpath_root>/<project UUID>/shared-dirs/<name>, for every project,
-// whether or not it has a co-located broker (design Q1, applied exactly).
-// Known gap until P3 (findings D9): a co-located Docker broker with only
-// server.workspace_storage nfs still keeps its agents' shared dirs on its
-// node's local disk.
+// whether or not it has a co-located broker.
 //
 // On the local Layout the path is today's slug-keyed layout: for a git
 // project with a co-located provider that has a LocalPath, the project's own
@@ -1386,7 +1418,7 @@ func (s *Server) resolveSharedDirMount(ctx context.Context, project *store.Proje
 		return nil, &sharedDirStorageResolveError{err: err}
 	}
 
-	if layout.Backend == projectfs.BackendNFS {
+	if layout.Backend.Shared() {
 		resolution, err := resolveNFSSharedDir(layout, source, project, mount)
 		if err != nil {
 			// Every error here is marked as a storage resolution failure:
@@ -1619,6 +1651,109 @@ func validateWorkspaceFilePath(path string) error {
 	return nil
 }
 
+// validateWorkspaceWritePath is validateWorkspaceFilePath for the handlers
+// that create, change, remove or download workspace files (write, upload,
+// delete, download). It also refuses a path with a .git component under
+// util.IsDotGitComponent.
+func validateWorkspaceWritePath(path string) error {
+	if err := validateWorkspaceFilePath(path); err != nil {
+		return err
+	}
+	for _, c := range strings.FieldsFunc(path, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if util.IsDotGitComponent(c) {
+			return errDotGitComponent
+		}
+	}
+	return nil
+}
+
+// writeWorkspaceRefusal answers a policy refusal (err wraps
+// errWorkspaceWriteRefused): the .git refusal when the path reaches a .git
+// directory, otherwise a neutral text that neither states the reason nor
+// echoes the path.
+func writeWorkspaceRefusal(w http.ResponseWriter, relPath string, err error) {
+	if errors.Is(err, errWorkspaceThroughDotGit) {
+		BadRequest(w, fmt.Sprintf("Invalid file path %q: %s", relPath, errDotGitComponent.Error()))
+		return
+	}
+	BadRequest(w, "Invalid file path: path is not accessible")
+}
+
+// writeWorkspaceWalkError answers a failed download or delete walk: the .git
+// refusal (400) when the path reaches a .git directory, a neutral 400 that
+// does not echo the path for every other refusal (a symlink target, a
+// non-directory on the way, an entry that changed), 404 for a missing entry,
+// and notAccessible otherwise.
+func writeWorkspaceWalkError(w http.ResponseWriter, kind, relPath string, err error) {
+	switch {
+	case errors.Is(err, errWorkspaceWriteRefused):
+		writeWorkspaceRefusal(w, relPath, err)
+	case errors.Is(err, fs.ErrNotExist):
+		NotFound(w, "File")
+	default:
+		notAccessible(w, kind, relPath, err)
+	}
+}
+
+// errDotGitComponent is the refusal of a path with a .git component, also
+// given to a download or delete whose walk reaches a .git directory.
+var errDotGitComponent = errors.New("paths with a .git component are not allowed")
+
+// validateWorkspaceReadPath is validateWorkspaceWritePath for downloads.
+func validateWorkspaceReadPath(path string) error { return validateWorkspaceWritePath(path) }
+
+// skipDotGitEntry reports whether a listing or archive walk leaves out d, an
+// entry named .git under util.IsDotGitComponent (a directory or a gitfile),
+// and the error that tells fs.WalkDir to skip it.
+func skipDotGitEntry(d fs.DirEntry) (bool, error) {
+	if !util.IsDotGitComponent(d.Name()) {
+		return false, nil
+	}
+	if d.IsDir() {
+		return true, fs.SkipDir
+	}
+	return true, nil
+}
+
+// writeWorkspaceFileError answers a failed writeWorkspaceFile with the same
+// split as writeWorkspaceWalkError: the .git refusal when the path reaches a
+// .git directory, the neutral 400 for every other refusal, notAccessible for a
+// path os.Root would not resolve, and 500 otherwise.
+func writeWorkspaceFileError(w http.ResponseWriter, kind, relPath string, err error) {
+	var pathErr *fs.PathError
+	switch {
+	case errors.Is(err, errWorkspaceWriteRefused):
+		writeWorkspaceRefusal(w, relPath, err)
+	case errors.As(err, &pathErr):
+		notAccessible(w, kind, relPath, err)
+	default:
+		InternalError(w)
+	}
+}
+
+// workspaceBodyLimit returns the request body cap for workspace file writes
+// and uploads: maxUploadTotalSize, unless a test lowered it through
+// workspaceBodyLimitForTest.
+func (s *Server) workspaceBodyLimit() int64 {
+	if s.workspaceBodyLimitForTest > 0 {
+		return s.workspaceBodyLimitForTest
+	}
+	return maxUploadTotalSize
+}
+
+// writeWorkspaceBodyTooLarge answers 413 when err is, or wraps, the error
+// http.MaxBytesReader returns past the workspace body limit, and reports
+// whether it did.
+func writeWorkspaceBodyTooLarge(w http.ResponseWriter, err error) bool {
+	var tooLarge *http.MaxBytesError
+	if !errors.As(err, &tooLarge) {
+		return false
+	}
+	writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large",
+		fmt.Sprintf("Request body exceeds the %d byte limit", tooLarge.Limit), nil)
+	return true
+}
+
 // handleProjectWorkspacePull performs a `git pull --ff-only` on a shared-workspace project.
 func (s *Server) handleProjectWorkspacePull(w http.ResponseWriter, r *http.Request, project *store.Project) {
 	if r.Method != http.MethodPost {
@@ -1639,6 +1774,22 @@ func (s *Server) handleProjectWorkspacePull(w http.ResponseWriter, r *http.Reque
 	if !project.IsSharedWorkspace() {
 		Conflict(w, "Pull is only available for shared-workspace git projects")
 		return
+	}
+
+	// Pull from the project's clone URL as the hub knows it, not from the
+	// remote configured in the workspace, which agents can change. The
+	// fetch runs on the hub host: the URL is checked before any workspace
+	// or git work and refused (never rewritten) unless it is an https, ssh
+	// or git URL, as for the clone.
+	cloneURL := resolveCloneURL(project.Labels[store.LabelCloneURL], project.GitRemote)
+	localFixture := localCloneFixtureAllowed(cloneURL)
+	if !localFixture {
+		if err := provision.CheckHostCloneURL(cloneURL); err != nil {
+			if !writeSharedCloneSourceRefused(w, err) {
+				InternalError(w)
+			}
+			return
+		}
 	}
 
 	resolved, err := s.resolveProjectWorkspace(ctx, project)
@@ -1666,12 +1817,19 @@ func (s *Server) handleProjectWorkspacePull(w http.ResponseWriter, r *http.Reque
 	_ = root.Close()
 	workspacePath := resolved.HostPath
 
-	token := s.resolveCloneToken(ctx, project)
-
-	// Pull from the project's clone URL as the hub knows it, not from the
-	// remote configured in the workspace, which agents can change.
-	cloneURL := resolveCloneURL(project.Labels[store.LabelCloneURL], project.GitRemote)
-	pullResult, err := util.PullSharedWorkspace(workspacePath, cloneURL, token)
+	// The fetch runs hardened, and the project's token goes only to its own
+	// recorded remote (hostGitAccess).
+	var pullResult *util.PullResult
+	if localFixture {
+		pullResult, err = util.PullSharedWorkspace(workspacePath, cloneURL, "")
+	} else {
+		if refuseErr := s.refuseSSHCloneURL(ctx, project, cloneURL); refuseErr != nil {
+			writeError(w, http.StatusUnprocessableEntity, ErrCodeInvalidRequest, refuseErr.Error(), nil)
+			return
+		}
+		token, hardening := s.hostGitAccess(ctx, project, cloneURL)
+		pullResult, err = util.PullSharedWorkspaceHardened(workspacePath, cloneURL, token, hardening)
+	}
 	if err != nil {
 		slog.Warn("shared workspace pull failed",
 			"project_id", project.ID, "error", err.Error())

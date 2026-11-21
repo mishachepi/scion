@@ -97,6 +97,13 @@ type startContext struct {
 	// nil when the dispatch is not one. Compared the same way as
 	// AssignSelection.
 	BlockSelection *dispatchProfileSelection
+
+	// CloudRunSelection is the profile and runtime entry a Cloud Run
+	// dispatch with the hub.cloudrun_native_identity experiment read its
+	// allow-list from, or nil when no Cloud Run identity was resolved.
+	// Compared the same way as AssignSelection
+	// (rejectCloudRunIdentityRuntimeChange).
+	CloudRunSelection *dispatchProfileSelection
 }
 
 // startContextInputs captures the handler-specific fields that vary across
@@ -147,6 +154,10 @@ type startContextInputs struct {
 
 	// Config from CreateAgentConfig (nil for startAgent/restartAgent)
 	Config *CreateAgentConfig
+
+	// Persistence is the hub's stamped persistence for this dispatch
+	// (StartOptions.Persistence); see ephemeralPersistenceRefusal.
+	Persistence api.Persistence
 
 	// TelemetryPolicy is the project's enforced telemetry on/off sent on a
 	// start or restart body (create carries it as Config.TelemetryPolicy).
@@ -234,6 +245,10 @@ type startContextInputs struct {
 	// reserved, so a failure response can release it. Nil for start and
 	// restart, whose runs are never released this way.
 	OwnedAbandon *ownedCreateAbandon
+
+	// HomeFiles are create-only files written under .scion/ in the agent home
+	// directory during fresh provisioning.
+	HomeFiles []api.HomeFile
 }
 
 // prehydratedBundle records hub hydration already performed for a dispatch.
@@ -269,6 +284,22 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 			Message: fmt.Sprintf("buildStartContext: Operation not set or unrecognized: %q", in.Operation),
 		}
 	}
+	// A flat cloudrun instance checks its GCP identity decision here, ahead
+	// of every side effect below: the ownership record, the project files
+	// and the identity resolution (E-10, ptone/scion#8182).
+	if _, sce := s.flatCloudRunIdentityDecision(in); sce != nil {
+		return nil, sce
+	}
+	// A flat cloudrun instance likewise refuses worktree-per-agent ahead of
+	// every ownership, project-file or worktree side effect (ptone/scion#7865).
+	if sce := s.flatCloudRunWorktreePerAgentRefusal(in); sce != nil {
+		return nil, sce
+	}
+	// An ephemeral start is refused, before any side effect, unless the hub
+	// sent its experiment with this dispatch.
+	if sce := ephemeralPersistenceRefusal(ctx, in); sce != nil {
+		return nil, sce
+	}
 
 	ctx, span := tracer.Start(ctx, "broker.agent.provision")
 	defer span.End()
@@ -276,41 +307,70 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 
 	// A flat instance records the run in its durable ownership record
 	// before any agent file or runtime object exists (ptone/scion#3274).
-	// The run gets an ID here when the request carried none, so the same ID
-	// labels every object the start creates.
-	var ownedProjectID, ownedAgentID string
+	// On a shared-workspace start, a project re-link first carries this
+	// instance's active ownership record from the earlier project ID to the
+	// current one before beginOwnedRunInfo checks it (ptone/scion#4764,
+	// ptone/scion#4765); an unowned !create is refused here before any
+	// workspace path or lock is touched.
+	sharedWorkspace := in.SharedWorkspace || (in.Config != nil && in.Config.SharedWorkspace)
+	var ownedProjectID, ownedAgentID, ownedSlug, candidateAgentID string
+	var recordOwnedRun func() *startContextError
 	if s.ownership != nil {
 		if in.RunID == "" {
 			in.RunID = uuid.NewString()
 		}
-		slug := in.Slug
-		if slug == "" {
-			slug = api.Slugify(in.Name)
+		ownedSlug = in.Slug
+		if ownedSlug == "" {
+			ownedSlug = api.Slugify(in.Name)
 		}
-		agentID := in.AgentID
-		if agentID == "" {
-			agentID = in.OwnershipAgentID
+		candidateAgentID = in.AgentID
+		if candidateAgentID == "" {
+			candidateAgentID = in.OwnershipAgentID
 		}
-		ab := in.OwnedAbandon
-		if in.Operation != opCreate {
-			ab = nil
+		recorded := false
+		recordOwnedRun = func() *startContextError {
+			if recorded {
+				return nil
+			}
+			ab := in.OwnedAbandon
+			if in.Operation != opCreate {
+				ab = nil
+			}
+			key := ownedRunKey{projectID: in.ProjectID, agentID: candidateAgentID, runID: in.RunID}
+			var hold *ownedHold
+			if ab != nil {
+				hold = s.holdOwnedRun(key)
+			}
+			began, err := s.beginOwnedRunInfo(in.ProjectID, candidateAgentID, ownedSlug, in.RunID, in.Operation == opCreate)
+			if err != nil {
+				hold.release()
+				span.SetStatus(codes.Error, err.Error())
+				return s.ownershipStartContextError(err, ownedSlug)
+			}
+			if ab != nil {
+				*ab = ownedCreateAbandon{armed: true, key: key, slug: ownedSlug, name: in.Name,
+					projectPath: in.ProjectPath, hubProjectID: in.ProjectID, began: began, hold: hold}
+			}
+			ownedProjectID, ownedAgentID = in.ProjectID, candidateAgentID
+			recorded = true
+			return nil
 		}
-		key := ownedRunKey{projectID: in.ProjectID, agentID: agentID, runID: in.RunID}
-		var hold *ownedHold
-		if ab != nil {
-			hold = s.holdOwnedRun(key)
+		switch {
+		case !sharedWorkspace:
+			if sce := recordOwnedRun(); sce != nil {
+				return nil, sce
+			}
+		case in.ProjectID == "" || candidateAgentID == "":
+			if sce := recordOwnedRun(); sce != nil {
+				return nil, sce
+			}
+		case in.Operation != opCreate:
+			if has, err := s.ownership.HasActiveAgent(candidateAgentID); err != nil || !has {
+				if sce := recordOwnedRun(); sce != nil {
+					return nil, sce
+				}
+			}
 		}
-		began, err := s.beginOwnedRunInfo(in.ProjectID, agentID, slug, in.RunID, in.Operation == opCreate)
-		if err != nil {
-			hold.release()
-			span.SetStatus(codes.Error, err.Error())
-			return nil, s.ownershipStartContextError(err, slug)
-		}
-		if ab != nil {
-			*ab = ownedCreateAbandon{armed: true, key: key, slug: slug, name: in.Name,
-				projectPath: in.ProjectPath, hubProjectID: in.ProjectID, began: began, hold: hold}
-		}
-		ownedProjectID, ownedAgentID = in.ProjectID, agentID
 	}
 
 	// --- Hub-managed project path resolution ---
@@ -321,6 +381,18 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 			in.OwnedAbandon.projectPath = in.ProjectPath
 		}
 	}()
+	// On a shared storage backend: the Layout's project root
+	// (sharedHubProjectPath), checked, never written.
+	if in.ProjectSlug != "" && in.ProjectPath == "" {
+		sharedPath, shared, sce := s.sharedHubProjectPath(ctx, in.ProjectID)
+		if sce != nil {
+			span.SetStatus(codes.Error, startContextSpanText(sce))
+			return nil, sce
+		}
+		if shared {
+			in.ProjectPath = sharedPath
+		}
+	}
 	if in.ProjectSlug != "" && in.ProjectPath == "" {
 		globalDir, err := config.GetGlobalDir()
 		if err != nil {
@@ -366,10 +438,17 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 	// project settings, before the marker handling below and before the
 	// recorded profile is computed (ptone/scion#1799): see
 	// verifySharedProjectIdentity.
-	if in.SharedWorkspace || (in.Config != nil && in.Config.SharedWorkspace) {
+	if sharedWorkspace {
 		// A marker naming an earlier ID of the same project (a re-link) is
-		// carried over to the current ID first (ptone/scion#4440).
-		lockErr, checkErr, err := s.relinkSharedProjectIdentityChecked(ctx, in.ProjectPath, in.ProjectSlug, in.ProjectID, in.Name, in.PreviousProjectIDs, s.unrecordedRelinkAllowed(ctx, in.HTTPRequest))
+		// carried over to the current ID first (ptone/scion#4440), moving this
+		// flat instance's ownership record before beginOwnedRunInfo checks it
+		// (ptone/scion#4764, ptone/scion#4765).
+		lockErr, checkErr, err := s.relinkSharedProjectIdentityCheckedWithOwnership(ctx, in.ProjectPath, in.ProjectSlug, in.ProjectID, in.Name, in.PreviousProjectIDs, s.unrecordedRelinkAllowed(ctx, in.HTTPRequest), relinkOwnership{
+			agentID:      candidateAgentID,
+			slug:         ownedSlug,
+			requireOwned: in.Operation != opCreate,
+			enabled:      s.ownership != nil,
+		})
 		if lockErr != nil {
 			return nil, fmt.Errorf("project workspace lock: %w", lockErr)
 		}
@@ -383,6 +462,11 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 		if err != nil {
 			span.SetStatus(codes.Error, "shared-workspace project re-link failed")
 			return nil, projectRelinkStartContextError(err)
+		}
+		if recordOwnedRun != nil {
+			if sce := recordOwnedRun(); sce != nil {
+				return nil, sce
+			}
 		}
 		if err := verifySharedProjectIdentity(in.ProjectPath, in.ProjectID); err != nil {
 			span.SetStatus(codes.Error, "shared-workspace project identity check failed")
@@ -480,7 +564,9 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 	// profile resolution for it), so profileMode stays lenient. The start and
 	// restart handlers' image-provenance integrity read
 	// (runtimeSelectionOpts) still runs for it.
-	if gcpIdentityProfile == "" && in.Operation != opCreate && !s.isFlat() {
+	if in.Operation == opCreate && !s.isFlat() {
+		profileMode = profileCreate
+	} else if gcpIdentityProfile == "" && in.Operation != opCreate && !s.isFlat() {
 		profile, provisioned, err := classificationProfile(in)
 		if err != nil {
 			var pe *agent.ImageProvenanceError
@@ -496,15 +582,14 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 		gcpIdentityProfile = profile
 		profileMode = existingAgentProfileResolution(gcpIdentityProfile, provisioned)
 	}
-	if in.Operation == opCreate && gcpIdentityProfile != "" && !s.isFlat() {
-		profileMode = profileRequested
-	}
 	// A saved profile that no longer resolves fails here, with the same
 	// 503 as start/restart's own later resolution, rather than classifying
 	// the dispatch against the default runtime first (ptone/scion#2709).
-	// Create and a start without a saved profile stay non-strict, except
-	// that, on a co-located broker, a profile missing from the Hub's stored
-	// profiles is refused (errProfileUnresolved / errDefaultProfileUnresolved).
+	// Create/provision/reprovision (profileCreate, ptone/scion#3817) and
+	// co-located stored-profile dispatches refuse unresolvable profiles
+	// (errProfileUnresolved / errDefaultProfileUnresolved /
+	// errProfileRuntimeUnresolved); a zero-profile create or a start without a
+	// saved profile stays non-strict.
 	res, err := s.resolveExistingAgentManager(api.StartOptions{
 		Name:        in.Name,
 		ProjectPath: in.ProjectPath,
@@ -519,6 +604,15 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 		res = res.forCreate(in.Name)
 	} else {
 		res = res.forExistingAgent(in.Name)
+	}
+	if isCloudRunRuntimeName(dispatchRuntimeType) && effectiveWorktreePerAgentDispatch(in.WorkspaceMode, in.ResolvedEnv, in.Config) {
+		return nil, cloudRunWorktreePerAgentRefusalError(in.Name)
+	}
+	// Ephemeral persistence on the runtime this dispatch resolved (the
+	// profile's, not only the broker default the capability describes),
+	// refused before any agent file is provisioned.
+	if sce := persistenceRuntimeRefusal(in.Name, in.Persistence, res.Runtime); sce != nil {
+		return nil, sce
 	}
 	isKubernetes := isKubernetesRuntimeName(dispatchRuntimeType)
 
@@ -551,9 +645,11 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 
 	// GCP identity mode "assign" on the Kubernetes runtime uses Workload
 	// Identity instead of the sciontool metadata emulator: the pod runs as a
-	// Kubernetes ServiceAccount (KSA) the operator has already bound to the
-	// requested GSA via Workload Identity, out of band. Scion never creates,
-	// annotates, or binds KSAs itself (see docs-site/.../ha/setup-gcp.md).
+	// Kubernetes ServiceAccount (KSA) bound to the requested GSA via Workload
+	// Identity (from kubernetes_service_account_mappings, annotation
+	// discovery, or — when runtimes.<entry>.create_service_accounts and the
+	// Hub's per-dispatch CreateKSA flag are both on — opt-in creation of the
+	// conventional <gsa-account-id> KSA; see docs-site/.../ha/setup-gcp.md).
 	// Resolved here, alongside the block rejection above and before any env
 	// or pod work, for the same reason: it can reject the dispatch outright.
 	// It rewrites gcpMetadataMode to "passthrough" so the env-emission switch
@@ -568,6 +664,36 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 	resolvedKSAName := assignIdentity.KSAName
 	if resolvedKSAName != "" {
 		gcpMetadataMode = store.GCPMetadataModePassthrough
+	}
+
+	// Cloud Run Instances with the hub.cloudrun_native_identity experiment
+	// on: the instance itself runs as the identity (gcp_identity_cloudrun.go),
+	// or the dispatch is refused here, before any provisioning. "assign"
+	// uses the instance's own metadata server instead of the sciontool
+	// metadata emulator, so, as for Kubernetes Workload Identity above, the
+	// mode is rewritten to "passthrough" and the account and project are
+	// set as informational env in the passthrough arm below. "block" keeps
+	// the emulator in block mode as a second layer: the mode is set to
+	// "block", which also covers a hub-default or confined project-default
+	// passthrough the resolver mapped to block. The emulator and its env
+	// plumbing stay in place for every other dispatch.
+	// requireLocalRuntime marks a passthrough granted by the hub's default
+	// rung or a confined project-default grant. hubDefaultPassthrough is its
+	// only reading (the create request's GCPIdentity, else the resolved env
+	// overlaid by the config env); the Cloud Run resolver and the env
+	// re-stamp below both use this value.
+	requireLocalRuntime := hubDefaultPassthrough(in)
+	crIdentity, sce := s.resolveCloudRunIdentity(ctx, in, dispatchRuntimeType, gcpMetadataMode, gcpIdentityProfile, requireLocalRuntime)
+	if sce != nil {
+		return nil, sce
+	}
+	if crIdentity.Identity != nil {
+		switch crIdentity.Identity.Mode {
+		case store.GCPMetadataModeAssign, store.GCPMetadataModePassthrough:
+			gcpMetadataMode = store.GCPMetadataModePassthrough
+		case store.GCPMetadataModeBlock:
+			gcpMetadataMode = store.GCPMetadataModeBlock
+		}
 	}
 
 	// --- Build merged environment ---
@@ -602,11 +728,34 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 	for k, v := range in.ResolvedEnv {
 		env[k] = v
 	}
+	// An agent without credentials: the hub leaves secret material out, and
+	// this is the broker's own check. An entry the hub classified
+	// secret-fetchable (a value from the secret store or a stored setting
+	// marked secret) is not copied, except the git token. Without
+	// classifications (an older hub, which never sends the intent on start
+	// or restart) secret entries cannot be told apart, and the env is
+	// copied as sent.
+	if in.NoAuth {
+		if envCls != nil {
+			for k := range env {
+				if envCls[k] == api.EnvKindSecretFetchable && k != noAuthGitTokenEnvKey {
+					delete(env, k)
+					delete(envCls, k)
+				}
+			}
+		} else if len(env) > 0 {
+			s.agentLifecycleLog.Info("no-credential start without env classifications; resolved env copied as sent", "agent_id", in.AgentID, "count", len(env))
+		}
+	}
 
-	// 2. Config.Env (takes precedence)
+	// 2. Config.Env (takes precedence). The native Cloud Run marker is never
+	// taken from it: only the hub sets that key (cloudRunNativeMarked).
 	if in.Config != nil {
 		for _, e := range in.Config.Env {
 			parts := strings.SplitN(e, "=", 2)
+			if len(parts) == 2 && parts[0] == cloudRunNativeMarkerEnv {
+				continue
+			}
 			if len(parts) == 2 {
 				env[parts[0]] = parts[1]
 				classifyBrokerEnv(parts[0], api.EnvKindPlain)
@@ -614,32 +763,48 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 		}
 	}
 
-	// 3. Hub auth token. Precedence (highest first):
-	//   1. in.AgentToken — the explicit hub-provided dedicated field (create path).
-	//   2. an existing env["SCION_AUTH_TOKEN"] already populated from in.ResolvedEnv
-	//      above — on the start/resume path the hub mints the agent JWT into
-	//      resolvedEnv, so it is already present here and must be kept.
-	//   3. the broker's own dev SCION_AUTH_TOKEN — last resort only, and only
-	//      for the co-located hub: decided after the hub endpoint below (see
-	//      colocatedHubDevToken) and passed to the agent manager outside env.
-	// The dev-token fallback must NOT clobber a token resolved from the hub:
-	// resume mints a valid JWT into resolvedEnv, and overwriting it with the
-	// broker's dev token caused 401s ("compact JWS format must have three parts").
-	if in.AgentToken != "" {
-		env["SCION_AUTH_TOKEN"] = in.AgentToken
-		// Bootstrap: NOT in argv. Diverted to ~/.scion/scion-token by
-		// pkg/agent/run.go:761-777; read by pkg/hubsync/sync.go:1329.
-		classifyBrokerEnv("SCION_AUTH_TOKEN", api.EnvKindSecretBootstrap)
-		if s.config.Debug {
-			s.agentLifecycleLog.Debug("SCION_AUTH_TOKEN set from agent token", "agent_id", in.AgentID, "length", len(in.AgentToken))
-		}
-	} else if env["SCION_AUTH_TOKEN"] != "" {
-		// Token already resolved from the hub via resolvedEnv (start/resume path); keep it.
-		if s.config.Debug {
-			s.agentLifecycleLog.Debug("SCION_AUTH_TOKEN kept from resolved env", "agent_id", in.AgentID, "length", len(env["SCION_AUTH_TOKEN"]))
-		}
+	// The git token remote is set only from the hub's GitClone (below), never
+	// from the request's env, so an env entry cannot bind the git token to
+	// another remote. Likewise the in-container clone URL and depth are set
+	// only from GitClone (after refusedCloneURL for the URL), so an env entry
+	// cannot start an unchecked clone or leak SCION_GIT_DEPTH into a non-clone
+	// workspace.
+	// Their classifications go too: a value set below is classified again
+	// there, and one that is not set leaves no stale entry.
+	for _, key := range []string{api.EnvGitTokenRemote, "SCION_GIT_CLONE_URL", "SCION_GIT_DEPTH"} {
+		delete(env, key)
+		delete(envCls, key)
 	}
-	hubIssuedToken := env["SCION_AUTH_TOKEN"] != ""
+
+	// 3. Hub auth token. The agent's hub credential is only the token the
+	// hub issued for this start (opts.HubIssuedToken below):
+	//   - in.AgentToken, the dedicated field of a create request; or
+	//   - on start and restart, the resolved env SCION_AUTH_TOKEN, but only
+	//     when the hub classified it secret-bootstrap, which the hub does
+	//     only for the token it issued (setStartEnvToken). The resolved env
+	//     also carries the agent's config env (AppliedConfig.Env), so an
+	//     unclassified value there is not hub-issued.
+	// A SCION_AUTH_TOKEN from any other source (Config.Env, a config env
+	// value in the resolved env) is dropped from env and never reaches the
+	// agent. This process's own SCION_AUTH_TOKEN is never given to an agent,
+	// co-located hub or not. A hub-dispatched start without a hub-issued
+	// token fails in the agent manager with agent.ErrNoHubToken
+	// (pkg/agent/run.go), relayed to the hub as the start's error message.
+	hubIssuedToken := in.AgentToken
+	if hubIssuedToken == "" && in.EnvClassifications["SCION_AUTH_TOKEN"] == api.EnvKindSecretBootstrap {
+		hubIssuedToken = in.ResolvedEnv["SCION_AUTH_TOKEN"]
+	}
+	if v, ok := env["SCION_AUTH_TOKEN"]; ok && v != hubIssuedToken {
+		// Names no value.
+		s.agentLifecycleLog.Info("SCION_AUTH_TOKEN in the start env is not the hub-issued token; dropped", "agent_id", in.AgentID)
+	}
+	delete(env, "SCION_AUTH_TOKEN")
+	if envCls != nil {
+		delete(envCls, "SCION_AUTH_TOKEN")
+	}
+	if hubIssuedToken != "" && s.config.Debug {
+		s.agentLifecycleLog.Debug("hub-issued agent token present", "agent_id", in.AgentID, "length", len(hubIssuedToken))
+	}
 
 	// 4. Hub endpoint
 	// The hub endpoint (its container-bridge rewrite and the cloudrun-family
@@ -663,17 +828,19 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 	}
 
 	hubEndpoint, hubEndpointTrusted, err := resolveEffectiveHubEndpoint(ctx, hubEndpointInputs{
-		Op:                           in.Operation,
-		ReqHubEndpoint:               in.HubEndpoint,
-		ConnectionHubEndpoint:        connectionHubEndpoint,
-		BrokerHubEndpoint:            s.config.HubEndpoint,
-		ResolvedEnv:                  in.ResolvedEnv,
-		ProjectPath:                  in.ProjectPath,
-		ContainerHubEndpoint:         s.config.ContainerHubEndpoint,
-		ColocatedPublicHubEndpoint:   s.config.ColocatedPublicHubEndpoint,
-		ColocatedRuntimeHubEndpoints: s.config.ColocatedRuntimeHubEndpoints,
-		RuntimeName:                  runtimeName,
-		HubListenPort:                s.config.HubListenPort,
+		Op:                             in.Operation,
+		ReqHubEndpoint:                 in.HubEndpoint,
+		ConnectionHubEndpoint:          connectionHubEndpoint,
+		BrokerHubEndpoint:              s.config.HubEndpoint,
+		ResolvedEnv:                    in.ResolvedEnv,
+		ProjectPath:                    in.ProjectPath,
+		ContainerHubEndpoint:           s.config.ContainerHubEndpoint,
+		ContainerHubEndpointConfigured: s.config.ContainerHubEndpointConfigured,
+		ColocatedPublicHubEndpoint:     s.config.ColocatedPublicHubEndpoint,
+		ColocatedRuntimeHubEndpoints:   s.config.ColocatedRuntimeHubEndpoints,
+		RuntimeName:                    runtimeName,
+		HubListenPort:                  s.config.HubListenPort,
+		FlatCloudRun:                   s.flatCloudRunTarget(),
 	})
 	if err != nil {
 		return nil, &startContextError{
@@ -701,24 +868,6 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 	var trustedHubEndpoint string
 	if hubEndpointTrusted {
 		trustedHubEndpoint = hubEndpoint
-	}
-
-	// The broker's own dev token (step 3's last resort) is offered only to an
-	// agent with no hub-issued token whose dispatch is bound to the
-	// co-located hub and whose endpoint is operator-derived. It does not go
-	// into env: the agent manager applies it only if the agent's final
-	// endpoint is still trustedHubEndpoint (pkg/agent/run.go).
-	var colocatedDevToken string
-	if !hubIssuedToken {
-		colocatedDevToken = s.colocatedHubDevToken(ctx, in.HTTPRequest, hubConn, trustedHubEndpoint)
-		if colocatedDevToken != "" && s.config.Debug {
-			s.agentLifecycleLog.Debug("co-located hub dev token offered", "agent_id", in.AgentID)
-		}
-		if colocatedDevToken == "" && trustedHubEndpoint != "" && os.Getenv("SCION_AUTH_TOKEN") != "" {
-			// Names no value. Tells an operator why an agent that would once
-			// have received this process's token starts without a hub credential.
-			s.agentLifecycleLog.Info("broker token not passed to agent: dispatch is not from the co-located hub", "agent_id", in.AgentID)
-		}
 	}
 
 	// Colocated bridge override: when the hub and broker are on the same
@@ -796,16 +945,10 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 	//
 	// gcpMetadataMode itself was already resolved earlier in this function
 	// (effectiveGCPMetadataMode) and validated against the Kubernetes/"block"
-	// check above. requireLocalRuntime follows the identical struct-or-env
-	// precedence — see downgradeUnverifiedHubDefaultPassthrough's doc comment
-	// for what it means and how it's used below and in
-	// recheckHubDefaultPassthrough.
-	requireLocalRuntime := false
-	if in.Config != nil && in.Config.GCPIdentity != nil {
-		requireLocalRuntime = in.Config.GCPIdentity.RequireLocalRuntime
-	} else if v := env["SCION_METADATA_REQUIRE_LOCAL_RUNTIME"]; v != "" {
-		requireLocalRuntime = v == "true"
-	}
+	// check above. requireLocalRuntime (set above, from hubDefaultPassthrough)
+	// follows the identical struct-or-env precedence — see
+	// downgradeUnverifiedHubDefaultPassthrough's doc comment for what it means
+	// and how it's used below and in recheckHubDefaultPassthrough.
 	// Allow-list, not a deny-list. The previous form tested for the two modes
 	// that need the redirect and let everything else fall through untouched,
 	// which meant an unrecognised mode — a typo, a value from a newer hub, an
@@ -868,6 +1011,14 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 			env["SCION_METADATA_PROJECT_ID"] = assignIdentity.ProjectID
 			classifyBrokerEnv("SCION_METADATA_PROJECT_ID", api.EnvKindPlain)
 		}
+		// The same informational env for a Cloud Run "assign" dispatch that
+		// was rewritten to passthrough above.
+		if crIdentity.SAEmail != "" {
+			env["SCION_METADATA_SA_EMAIL"] = crIdentity.SAEmail
+			classifyBrokerEnv("SCION_METADATA_SA_EMAIL", api.EnvKindPlain)
+			env["SCION_METADATA_PROJECT_ID"] = crIdentity.ProjectID
+			classifyBrokerEnv("SCION_METADATA_PROJECT_ID", api.EnvKindPlain)
+		}
 	default:
 		return nil, &startContextError{
 			Status: http.StatusBadRequest,
@@ -883,6 +1034,17 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 		classifyBrokerEnv("SCION_METADATA_REQUIRE_LOCAL_RUNTIME", api.EnvKindPlain)
 	}
 
+	// The init firewall on a native Cloud Run "assign" dispatch, an
+	// unsupported combination, checked on the merged env: the hub's
+	// resolved env and the config env (steps 1 and 2) are both in it, and
+	// the identity above is resolved. No later step writes
+	// SCION_INIT_FIREWALL. The settings, harness-config and harness env
+	// sources are refused by the Cloud Run runtime check
+	// (checkCloudRunInitFirewall).
+	if refusal := refuseCloudRunInitFirewall(in.Name, crIdentity.Identity, env); refusal != nil {
+		return nil, refusal
+	}
+
 	// Debug log final env
 	if s.config.Debug {
 		s.agentLifecycleLog.Debug("Final environment count", "agent_id", in.AgentID, "count", len(env))
@@ -894,17 +1056,20 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 	// --- Build StartOptions ---
 	opts := api.StartOptions{
 		Name:               in.Name,
+		Persistence:        in.Persistence,
 		BrokerMode:         true,
 		ProjectPath:        in.ProjectPath,
 		NoAuth:             in.NoAuth,
 		TrustedHubEndpoint: trustedHubEndpoint,
-		// Applied by the agent manager only for an unchanged endpoint.
-		ColocatedHubDevToken: colocatedDevToken,
+		HubIssuedToken:     hubIssuedToken,
 		// FreshProvision is true only for a create dispatch: GetAgent wipes
 		// and re-clones an existing populated workspace only in that case,
 		// never on start or restart (GoogleCloudPlatform/scion#1931).
 		FreshProvision: in.Operation == opCreate,
 		RunID:          in.RunID,
+	}
+	if in.Operation == opCreate && len(in.HomeFiles) > 0 {
+		opts.HomeFiles = api.CloneHomeFiles(in.HomeFiles)
 	}
 
 	if in.Attach {
@@ -953,6 +1118,9 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 	// Recomputed on every dispatch and never persisted, like the field
 	// above; see api.StartOptions.KubernetesBlockIdentity.
 	opts.KubernetesBlockIdentity = blockIdentity.Identity
+	// Recomputed on every dispatch and never persisted; see
+	// api.StartOptions.CloudRunIdentity.
+	opts.CloudRunIdentity = crIdentity.Identity
 
 	if len(in.SharedDirs) > 0 {
 		opts.SharedDirs = in.SharedDirs
@@ -1074,8 +1242,37 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 		// cloned per agent. Ignored when GitClone is set: that request asks
 		// for a per-agent clone instead.
 		if gc := in.Config.SharedWorkspaceClone; gc != nil && gc.URL != "" && in.Config.GitClone == nil {
+			// A clone URL that provisioning refuses fails the dispatch, as on
+			// every other path that clones the project's URL.
+			if sce := refusedCloneURL(in.AgentID, "shared-workspace", gc.URL); sce != nil {
+				span.SetStatus(codes.Error, sce.Message)
+				return nil, sce
+			}
 			gcCopy := *gc
 			opts.SharedWorkspaceClone = &gcCopy
+			// The project's recorded remote, as the hub sent it: the agent's
+			// git credential helper is scoped to its host (sciontool init,
+			// configureSharedWorkspaceGit), never to the clone URL's.
+			if gc.TokenRemote != "" {
+				env[api.EnvGitTokenRemote] = gc.TokenRemote
+				classifyBrokerEnv(api.EnvGitTokenRemote, api.EnvKindPlain)
+			}
+		}
+	}
+
+	// --- Project clone URL check ---
+	// A clone URL that provisioning refuses fails the dispatch before any
+	// route that uses it: the linked-checkout decision, the broker's
+	// host-side worktree-per-agent clone and the in-container clone all
+	// come after this. There is no fallback to another workspace mode.
+	if in.Config != nil && in.Config.GitClone != nil {
+		mode := "clone-per-agent"
+		if in.WorkspaceMode == store.WorkspaceModeWorktreePerAgent {
+			mode = "worktree-per-agent"
+		}
+		if sce := refusedCloneURL(in.AgentID, mode, in.Config.GitClone.URL); sce != nil {
+			span.SetStatus(codes.Error, sce.Message)
+			return nil, sce
 		}
 	}
 
@@ -1118,6 +1315,14 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 		case decision.Route:
 			linkedCheckout = true
 			opts.Workspace = ""
+			// Capture the recorded origin (the hub project's repository) from the
+			// requested clone config, so worktree creation can pin the git-lfs
+			// endpoint from it rather than the live, agent-writable
+			// remote.origin.url. opts.GitClone is not populated until later in this
+			// function, so read the source (in.Config.GitClone) here.
+			if in.Config != nil && in.Config.GitClone != nil {
+				opts.RecordedOriginURL = in.Config.GitClone.URL
+			}
 			opts.GitClone = nil
 			s.agentLifecycleLog.Info("Worktree-per-agent: using a local worktree of the linked checkout",
 				"agent_id", in.AgentID, "repo_root", decision.RepoRoot)
@@ -1135,7 +1340,9 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 	// the host BEFORE the container starts, then dual-mount it. This avoids
 	// the full in-container clone. Falls through to clone-per-agent on error
 	// or if git is too old (< 2.48) — but only when this call has not yet
-	// created the agent's own worktree; see tryProvisionWorktree.
+	// created the agent's own worktree, and never when provisioning refuses
+	// the clone URL; see tryProvisionWorktree. (A refused URL is normally
+	// refused before this, by the project clone URL check above.)
 	worktreeProvisioned := false
 	var provisionedWorktreeRoot string
 	if !linkedCheckout && in.Config != nil && in.Config.GitClone != nil && in.WorkspaceMode == store.WorkspaceModeWorktreePerAgent {
@@ -1148,9 +1355,29 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 		}
 	}
 
+	// --- Shared-plain provisioning backstop (shared storage) ---
+	// A git project's shared workspace on the broker's shared Layout is
+	// provisioned by the broker before a local container starts (reuse when
+	// already provisioned, clone otherwise), and the in-container clone is
+	// then not requested (provisionSharedPlainWorkspace).
+	sharedPlainProvisioned := false
+	if !worktreeProvisioned && !linkedCheckout && in.Config != nil && in.Config.GitClone != nil &&
+		(in.Config.SharedWorkspace || in.WorkspaceMode == store.WorkspaceModeShared) && localContainerRuntime(dispatchRuntimeType) {
+		provisioned, err := s.provisionSharedPlainWorkspace(ctx, in, env)
+		if err != nil {
+			s.agentLifecycleLog.Error("Shared workspace provisioning failed", "agent_id", in.AgentID, "project_id", in.ProjectID,
+				"error", sanitizeCloneErrorText(err.Error(), in.Config.GitClone.URL))
+			span.SetStatus(codes.Error, "shared workspace provisioning failed")
+			return nil, &startContextError{Status: http.StatusInternalServerError, Message: "the project's shared workspace could not be provisioned"}
+		}
+		sharedPlainProvisioned = provisioned
+	}
+
 	// --- Git clone mode ---
-	if !worktreeProvisioned && !linkedCheckout && in.Config != nil && in.Config.GitClone != nil {
+	if !worktreeProvisioned && !linkedCheckout && !sharedPlainProvisioned && in.Config != nil && in.Config.GitClone != nil {
 		gc := in.Config.GitClone
+		// The clone URL passed the project clone URL check above, before the
+		// worktree and linked-checkout routes.
 		env["SCION_GIT_CLONE_URL"] = gc.URL
 		// Clone URL may embed credentials — the original #127 bug.
 		classifyBrokerEnv("SCION_GIT_CLONE_URL", api.EnvKindSecretInjected)
@@ -1158,13 +1385,38 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 			env["SCION_GIT_BRANCH"] = gc.Branch
 			classifyBrokerEnv("SCION_GIT_BRANCH", api.EnvKindPlain)
 		}
+		depth := 1
 		if gc.Depth != nil {
-			env["SCION_GIT_DEPTH"] = strconv.Itoa(*gc.Depth)
-			classifyBrokerEnv("SCION_GIT_DEPTH", api.EnvKindPlain)
+			depth = *gc.Depth
+		}
+		env["SCION_GIT_DEPTH"] = strconv.Itoa(depth)
+		classifyBrokerEnv("SCION_GIT_DEPTH", api.EnvKindPlain)
+		// The project's recorded remote, as the hub sent it: sciontool init
+		// offers the git token to the clone only when the clone URL names it.
+		// Relayed unchanged; without it the clone gets no token.
+		if gc.TokenRemote != "" {
+			env[api.EnvGitTokenRemote] = gc.TokenRemote
+			classifyBrokerEnv(api.EnvGitTokenRemote, api.EnvKindPlain)
 		}
 		if in.Config.Branch != "" {
 			env["SCION_AGENT_BRANCH"] = in.Config.Branch
 			classifyBrokerEnv("SCION_AGENT_BRANCH", api.EnvKindPlain)
+		}
+		// A worktree-per-agent dispatch to a local container runtime that
+		// fell back here gets a clone-per-agent workspace (an in-container
+		// clone, possibly shallow), so it is labelled as one: guidance keyed
+		// on the mode would otherwise promise worktree semantics and full
+		// history (ptone/scion#7906). Kubernetes keeps the label here:
+		// pkg/agent Start selects an NFS worktree from it
+		// (nfsWorktreeSelection) and relabels the start clone-per-agent
+		// when there is none (k8sWorktreeCloneFallback). Cloud Run keeps
+		// it too (ptone/scion#7865). substrate and cloudrun-sandbox always
+		// get this clone (hostWorkspaceUnmountedRuntimeName), so they are
+		// labelled like a local container runtime (ptone/scion#7913).
+		if in.WorkspaceMode == store.WorkspaceModeWorktreePerAgent &&
+			(localContainerRuntime(dispatchRuntimeType) || hostWorkspaceUnmountedRuntimeName(dispatchRuntimeType)) {
+			env["SCION_WORKSPACE_MODE"] = string(store.SharingModeClonePerAgent)
+			classifyBrokerEnv("SCION_WORKSPACE_MODE", api.EnvKindPlain)
 		}
 		opts.Workspace = ""
 		// Keep opts.ProjectPath so that ProvisionAgent can resolve the correct
@@ -1218,14 +1470,26 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 	if emptyPerAgent {
 		// Never git, whatever a stale resolvedEnv claims.
 		isGitWorkspace = false
-		delete(env, "SCION_WORKSPACE_GIT")
-		delete(envCls, "SCION_WORKSPACE_GIT")
 	}
-	if isGitWorkspace {
+	// The broker owns this key: a value from the hub's resolved env (project
+	// env included), the request's env or anywhere else is replaced by the
+	// value computed here. The Kubernetes runtime's shared-repository guard
+	// trusts it, and pkg/agent keeps it as computed here (Manager.Start).
+	delete(env, "SCION_WORKSPACE_GIT")
+	delete(envCls, "SCION_WORKSPACE_GIT")
+	switch {
+	case isGitWorkspace:
 		env["SCION_WORKSPACE_GIT"] = "true"
 		classifyBrokerEnv("SCION_WORKSPACE_GIT", api.EnvKindPlain)
+	case !emptyPerAgent && s.sharedWorkspaceKnownNotGit(ctx, in, &opts, worktreeProvisioned, linkedCheckout):
+		// Explicit only when the broker positively knows the shared
+		// workspace is not a git repository (sharedWorkspaceKnownNotGit).
+		env["SCION_WORKSPACE_GIT"] = "false"
+		classifyBrokerEnv("SCION_WORKSPACE_GIT", api.EnvKindPlain)
 	}
-	// Absent when false — avoids encoding a "false" string agents must parse.
+	// Otherwise absent: git-ness is not known, and readers treat absent as
+	// "not git" except the Kubernetes guard, which then refuses (fail
+	// closed). An empty-per-agent workspace is never git and stays absent.
 
 	// --- Env + telemetry + secrets ---
 	opts.Env = env
@@ -1259,7 +1523,8 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 	// gcloud-adc file secret so agents can authenticate with GCP without requiring
 	// the user to manually upload the credential file.
 	// Only inject if the user has explicitly opted in via settings.
-	if isColocated {
+	// Never for an agent without credentials.
+	if isColocated && !in.NoAuth {
 		if adcGlobalDir, gErr := config.GetGlobalDir(); gErr == nil {
 			if vs, loadErr := config.LoadSingleFileVersioned(adcGlobalDir); loadErr == nil &&
 				vs != nil && vs.AutoInjectGcloudADC {
@@ -1338,6 +1603,10 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 		sel := blockIdentity.Selection
 		sc.BlockSelection = &sel
 	}
+	if crIdentity.Identity != nil {
+		sel := crIdentity.Selection
+		sc.CloudRunSelection = &sel
+	}
 	return sc, nil
 }
 
@@ -1372,13 +1641,14 @@ var hubDefaultPassthroughRuntimeTypes = map[string]bool{
 // can disagree with what this broker resolves for the same dispatch against
 // its own, current project-effective settings (in-repo overrides, a DB
 // settings overlay, or just registration drift). requireLocalRuntime is the
-// signal that a passthrough grant came from that rung specifically —
+// signal that a passthrough grant came from that rung (or the hub's
+// project-default rung, which is confined the same way) —
 // store.GCPIdentityConfig.RequireLocalRuntime on the create path, or the
 // SCION_METADATA_REQUIRE_LOCAL_RUNTIME env var buildStartContext re-stamps
 // for the start/restart paths, which never receive that struct at all (see
 // its call sites for why each path needs its own call to this function).
-// Explicit and project-level passthrough are never flagged, so this is a
-// no-op for them by construction — this is strictly a second line of
+// Explicit passthrough is never flagged, so this is a no-op for it by
+// construction — this is strictly a second line of
 // defense behind the hub-side gate (hubDefaultRuntimeAllowed,
 // pkg/hub/default_gcp_identity.go), not a replacement for it.
 //
@@ -1458,6 +1728,76 @@ func (e *startContextError) Error() string {
 // the two functions keep classifying identically if that ever changes.
 func isKubernetesRuntimeName(name string) bool {
 	return name == "kubernetes" || name == "k8s" || name == "remote"
+}
+
+// hostWorkspaceUnmountedRuntimeName reports whether name identifies a
+// runtime that cannot run an agent in a host-side worktree: substrate never
+// mounts RunConfig.Workspace, and cloudrun-sandbox copies it into the
+// sandbox, where the worktree's .git file names the shared base on the
+// read-only rootfs. A worktree-per-agent dispatch there gets the in-container
+// clone, labelled clone-per-agent (ptone/scion#7913).
+func hostWorkspaceUnmountedRuntimeName(name string) bool {
+	return name == "substrate" || name == "cloudrun-sandbox"
+}
+
+// isCloudRunRuntimeName reports whether name identifies the Cloud Run
+// Instances runtime: "cloudrun" (CloudRunRuntime.Name()) or the
+// "cloudrun-instances" settings.yaml runtime-type spelling that
+// resolveRuntimeNameForOpts can return raw. "cloudrun-sandbox" is a separate
+// local gVisor runtime and is not included.
+func isCloudRunRuntimeName(name string) bool {
+	return name == cloudRunRuntimeType || name == cloudRunInstancesRuntimeType
+}
+
+const cloudRunWorktreePerAgentRefusalText = `"Worktree per agent" (worktree-per-agent) workspaces are not supported on the Cloud Run runtime: ` +
+	`Cloud Run supports "Clone per agent" (clone-per-agent) and "Shared workspace" (shared-plain) modes; ` +
+	`recreate the project in one of those modes or pick a Docker, Podman or Apple broker`
+
+func effectiveWorktreePerAgentDispatch(workspaceMode string, resolvedEnv map[string]string, cfg *CreateAgentConfig) bool {
+	if workspaceMode != "" {
+		return store.ResolveWorkspaceSharingMode(workspaceMode) == store.SharingModeWorktreePerAgent
+	}
+	raw := resolvedEnv["SCION_WORKSPACE_MODE"]
+	if cfg != nil {
+		for i := len(cfg.Env) - 1; i >= 0; i-- {
+			k, v, ok := strings.Cut(cfg.Env[i], "=")
+			if ok && k == "SCION_WORKSPACE_MODE" {
+				raw = v
+				break
+			}
+		}
+	}
+	return raw != "" && store.ResolveWorkspaceSharingMode(raw) == store.SharingModeWorktreePerAgent
+}
+
+func cloudRunWorktreePerAgentRefusalError(agentName string) *startContextError {
+	return &startContextError{
+		Status:  http.StatusPreconditionFailed,
+		Code:    ErrCodeUnsupportedCapability,
+		Message: fmt.Sprintf("agent %q: %s", agentName, cloudRunWorktreePerAgentRefusalText),
+	}
+}
+
+func (s *Server) flatCloudRunWorktreePerAgentRefusal(in startContextInputs) *startContextError {
+	if !s.flatCloudRunTarget() || !effectiveWorktreePerAgentDispatch(in.WorkspaceMode, in.ResolvedEnv, in.Config) {
+		return nil
+	}
+	return cloudRunWorktreePerAgentRefusalError(in.Name)
+}
+
+func (s *Server) createCloudRunWorktreePerAgentRefusal(req CreateAgentRequest) *startContextError {
+	if !effectiveWorktreePerAgentDispatch(req.WorkspaceMode, req.ResolvedEnv, req.Config) {
+		return nil
+	}
+	rtName, perr := s.resolveRuntimeNameForOpts(api.StartOptions{
+		Name:        req.Name,
+		ProjectPath: req.ProjectPath,
+		Profile:     createRequestProfile(req),
+	})
+	if perr == nil && isCloudRunRuntimeName(rtName) {
+		return cloudRunWorktreePerAgentRefusalError(req.Name)
+	}
+	return nil
 }
 
 // effectiveGCPMetadataMode resolves the GCP identity mode that applies for a
@@ -1543,6 +1883,10 @@ func redactCloneURL(rawURL string) string {
 // unparseableCloneURL is what redactCloneURL shows for a URL it cannot
 // show any part of.
 const unparseableCloneURL = "<unparseable>"
+
+// noAuthGitTokenEnvKey is the one secret-store value an agent without
+// credentials still receives: the git token (the hub's noAuthGitTokenKey).
+const noAuthGitTokenEnvKey = "GITHUB_TOKEN"
 
 // sanitizeCloneErrorText strips a clone URL's credentials, query string, and
 // fragment from errText. provision.ProvisionShared's own clone errors embed
@@ -1736,8 +2080,8 @@ func validateMountedWorktree(workspacePath, base string) error {
 // worktree can exist yet under the shared base.
 //
 // The sentinel is looked for in exactly the directories ProvisionShared
-// checks (in.SentinelDirs: the sentinel directory, the base's parent by
-// default, and LegacyDir when set), so the two never disagree.
+// checks (in.SentinelDirs: the sentinel directory alone, the base's parent
+// by default), so the two never disagree.
 func worktreeBaseIsProvisioned(in provision.ProvisionInput) bool {
 	if !provision.SentinelPresent(in.SentinelDirs()...) {
 		return false
@@ -1748,6 +2092,11 @@ func worktreeBaseIsProvisioned(in provision.ProvisionInput) bool {
 	return true
 }
 
+// provisionSharedWorktree runs the broker's host-side shared-base
+// provisioning (provision.ProvisionShared). A variable so tests can observe
+// the input.
+var provisionSharedWorktree = provision.ProvisionShared
+
 // tryProvisionWorktree attempts to provision a per-agent worktree on the host
 // for worktree-per-agent mode. On success it sets opts.Workspace to the
 // worktree path and returns (true, repoRoot, nil), where repoRoot is the
@@ -1756,9 +2105,10 @@ func worktreeBaseIsProvisioned(in provision.ProvisionInput) bool {
 // ordinary fallback condition (git too old, no valid worktree-per-agent
 // input) it logs a warning and returns (false, "", nil) so the caller falls
 // through to clone-per-agent. On a condition that must not silently fall
-// back (missing agent identity on a start dispatch, or a pre-existing
-// worktree this call must not touch or replace), it returns a non-nil error
-// instead so the caller fails the dispatch.
+// back (missing agent identity on a start dispatch, a pre-existing
+// worktree this call must not touch or replace, or a clone URL that
+// provisioning refuses), it returns a non-nil error instead so the caller
+// fails the dispatch.
 //
 // The caller threads repoRoot onto ctx via
 // api.ContextWithProvisionedWorktreeRepoRoot; see that function's doc for why.
@@ -1887,7 +2237,16 @@ func (s *Server) tryProvisionWorktree(ctx context.Context, in startContextInputs
 		return false, "", fmt.Errorf("worktree-per-agent: the existing worktree for agent %q is missing its provisioning marker or the shared base's .git; refusing to provision to avoid replacing it", in.AgentID)
 	}
 
-	if err := provision.ProvisionShared(result.ProvisionInput); err != nil {
+	if err := provisionSharedWorktree(result.ProvisionInput); err != nil {
+		// A clone URL that provisioning refuses fails the dispatch, with
+		// the refusal as its error. It never falls back to the in-container
+		// clone: the agent would start in another workspace mode than the
+		// project's, from the same URL.
+		if errors.Is(err, provision.ErrHostCloneURLRefused) {
+			slog.Warn("worktree-per-agent: the project's clone URL is not accepted for a host-side clone; failing the dispatch",
+				"agent_id", in.AgentID)
+			return false, "", fmt.Errorf("worktree-per-agent: %w", provision.ErrHostCloneURLRefused)
+		}
 		cloneURL := ""
 		rawCloneURL := ""
 		if result.ProvisionInput.GitClone != nil {
@@ -2024,7 +2383,8 @@ type worktreeProvisionInput struct {
 	// RuntimeName is the name of the container runtime ("kubernetes", "docker",
 	// etc.) this dispatch resolved to. Used to reject host-side worktree provisioning
 	// on Kubernetes where pods cannot bind-mount host worktrees — worktree-per-agent
-	// on K8s requires the NFS backend (init-container path).
+	// on K8s requires the NFS backend (init-container path) — and on substrate
+	// and cloudrun-sandbox, which never run the agent in a host worktree.
 	RuntimeName string
 
 	// eligibilityOverride, when non-nil, replaces the runtime.WorktreeModeEligible
@@ -2102,6 +2462,14 @@ func resolveWorktreeProvision(in worktreeProvisionInput) worktreeProvisionResult
 				"node-local host-side provisioning is not supported (pods cannot bind-mount host worktrees)",
 		}
 	}
+	// substrate and cloudrun-sandbox cannot run the agent in a host
+	// worktree either; they always get the in-container clone.
+	if hostWorkspaceUnmountedRuntimeName(in.RuntimeName) {
+		return worktreeProvisionResult{
+			Reason: "worktree-per-agent on " + in.RuntimeName + " uses the in-container clone; " +
+				"the runtime does not mount a host-side worktree",
+		}
+	}
 
 	mode := store.SharingModeWorktreePerAgent
 	backend := runtime.SelectWorkspaceBackend(nil, mode)
@@ -2141,9 +2509,28 @@ func resolveWorktreeProvision(in worktreeProvisionInput) worktreeProvisionResult
 			ProjectID: in.ProjectID,
 			AgentID:   in.AgentID,
 			AgentName: agentName,
+			// The clone runs on the broker host from a project-supplied
+			// URL: https, ssh and git transports only.
+			HostGitHardened: true,
 		},
 		WorktreePath: worktreePath,
 		ProjectRoot:  resolved.HostPath,
+	}
+}
+
+// refusedCloneURL returns the dispatch failure for a project clone URL that
+// provisioning refuses (provision.CheckDispatchCloneURL), or nil for an
+// accepted or empty URL: HTTP 422 with the refusal's fixed text after mode, naming no
+// URL, the same shape as the worktree-per-agent refusal. The dispatch does
+// not fall back to another workspace mode.
+func refusedCloneURL(agentID, mode, cloneURL string) *startContextError {
+	if provision.CheckDispatchCloneURL(cloneURL) == nil {
+		return nil
+	}
+	slog.Warn(mode+": the project's clone URL is not accepted; failing the dispatch", "agent_id", agentID)
+	return &startContextError{
+		Status:  http.StatusUnprocessableEntity,
+		Message: fmt.Errorf("%s: %w", mode, provision.ErrHostCloneURLRefused).Error(),
 	}
 }
 
@@ -2349,7 +2736,8 @@ func ambiguousNonGitWorkspace(in startContextInputs, worktreeProvisioned bool) s
 	// from the slug before buildStartContext) is checked; a linked
 	// project's own ProjectPath keeps its existing resolution.
 	globalDir, err := config.GetGlobalDir()
-	if err != nil || filepath.Clean(in.ProjectPath) != filepath.Join(globalDir, "projects", in.ProjectSlug) {
+	hubManagedPath := err == nil && filepath.Clean(in.ProjectPath) == filepath.Join(globalDir, "projects", in.ProjectSlug)
+	if !hubManagedPath && !isSharedHubProjectRoot(in.ProjectPath) {
 		return ""
 	}
 	if in.WorkspaceStoragePath != "" {
@@ -2366,6 +2754,16 @@ func ambiguousNonGitWorkspace(in startContextInputs, worktreeProvisioned bool) s
 // project directory and creates its split storage directories. The caller
 // holds the workspace lock on in.ProjectPath.
 func (s *Server) recordHubProjectFiles(ctx context.Context, in startContextInputs) {
+	// A shared-backend project root's configuration is hub-seeded and
+	// never written by a broker (sharedHubProjectPath checked it). Only the
+	// broker-local external agents root is created.
+	if isSharedHubProjectRoot(in.ProjectPath) {
+		scionDir := filepath.Join(in.ProjectPath, config.DotScion)
+		if root, err := config.AgentsRootForProject(scionDir, false, in.ProjectID); err == nil {
+			_ = os.MkdirAll(root, 0755)
+		}
+		return
+	}
 	// A broker copy of a hub workspace (~/.scion/projects/<slug>)
 	// records the hub project ID as its identity; see
 	// recordHubProjectIdentity. Done before the checks below, which
@@ -2598,19 +2996,6 @@ func (s *Server) colocatedHostCredentials(ctx context.Context, r *http.Request, 
 		return false
 	}
 	return config.UseHostCredentials(globalDir)
-}
-
-// colocatedHubDevToken returns the dev token this broker process holds
-// (SCION_AUTH_TOKEN, which the workstation server sets to its dev token) when
-// the dispatch is bound to the co-located hub (dispatchFromColocatedHub) and
-// trustedHubEndpoint, the operator-derived endpoint the agent is given, is
-// set. Otherwise it returns "": a dispatch from any other hub, an unbound
-// request, or a creator-supplied endpoint never gets the host's dev token.
-func (s *Server) colocatedHubDevToken(ctx context.Context, r *http.Request, hubConn *HubConnection, trustedHubEndpoint string) string {
-	if trustedHubEndpoint == "" || !s.dispatchFromColocatedHub(ctx, r, hubConn) {
-		return ""
-	}
-	return os.Getenv("SCION_AUTH_TOKEN")
 }
 
 // dispatchFromColocatedHub reports whether this dispatch is bound to the hub

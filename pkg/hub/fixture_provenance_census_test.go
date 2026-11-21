@@ -106,33 +106,42 @@ func (m fixtureCensusMatch) enclosingFunc() string {
 }
 
 // TestFixtureProvenanceCensus_RawCreateBuilders: the only raw ent create
-// builders for agents, projects, schedules and groups are the four store
-// create methods, which write the stamp the model carries (and nothing
-// else can write it: the columns are Immutable). There is no CreateBulk or
-// MapCreateBulk for them anywhere.
+// builders for agents, projects, schedules, triggers, webhook endpoints and
+// groups are the store create methods, which write the stamp the model carries
+// (and nothing else can write it: the columns are Immutable). There is no
+// CreateBulk or MapCreateBulk for them anywhere.
 func TestFixtureProvenanceCensus_RawCreateBuilders(t *testing.T) {
-	re := regexp.MustCompile(`\.(Agent|Project|Schedule|Group)\.(Create|CreateBulk|MapCreateBulk)\(`)
-	allowed := map[string]string{
-		"pkg/store/entadapter/agent_store.go":    "s.client.Agent.Create()",
-		"pkg/store/entadapter/project_store.go":  "s.client.Project.Create()",
-		"pkg/store/entadapter/schedule_store.go": "s.client.Schedule.Create()",
-		"pkg/store/entadapter/group_store.go":    "s.client.Group.Create()",
+	re := regexp.MustCompile(`\.(Agent|Project|Schedule|Trigger|WebhookEndpoint|Group)\.(Create|CreateBulk|MapCreateBulk)\(`)
+	allowed := map[string][]string{
+		"pkg/store/entadapter/agent_store.go":    {"s.client.Agent.Create()"},
+		"pkg/store/entadapter/project_store.go":  {"s.client.Project.Create()"},
+		"pkg/store/entadapter/schedule_store.go": {"s.client.Schedule.Create()"},
+		"pkg/store/entadapter/trigger_store.go":  {"s.client.WebhookEndpoint.Create()", "s.client.Trigger.Create()"},
+		"pkg/store/entadapter/group_store.go":    {"s.client.Group.Create()"},
 	}
 	seen := map[string]int{}
 	for _, m := range fixtureCensusScan(t, re) {
-		want, ok := allowed[m.file]
-		if !ok || !strings.Contains(m.text, want) {
+		matched := ""
+		for _, want := range allowed[m.file] {
+			if strings.Contains(m.text, want) {
+				matched = want
+				break
+			}
+		}
+		if matched == "" {
 			t.Errorf("unclassified raw create builder at %s:%d: %s\n"+
-				"An agent/project/schedule/group row must be created through the store's create method, "+
+				"An agent/project/schedule/trigger/webhook_endpoint/group row must be created through the store's create method, "+
 				"which writes the fixture provenance stamp; see pkg/hub/fixture_provenance.go.",
 				m.file, m.line, strings.TrimSpace(m.text))
 			continue
 		}
-		seen[m.file]++
+		seen[m.file+":"+matched]++
 	}
-	for f := range allowed {
-		if seen[f] != 1 {
-			t.Errorf("%s: want exactly one raw create builder, found %d", f, seen[f])
+	for f, wants := range allowed {
+		for _, want := range wants {
+			if got := seen[f+":"+want]; got != 1 {
+				t.Errorf("%s (%s): want exactly one raw create builder, found %d", f, want, got)
+			}
 		}
 	}
 }
@@ -166,6 +175,16 @@ var fixtureCreateSites = []fixtureCreateSite{
 		"group API create; stampGroup from the request principal, before the create transaction"},
 	{"pkg/hub/handlers_schedules.go", "s.store.CreateSchedule(r.Context(), &schedule)", true,
 		"schedule API create; stampSchedule from the request principal"},
+	{"pkg/hub/handlers_scheduled_exec.go", "s.store.CreateScheduleChecked(r.Context(), &schedule", true,
+		"exec schedule API create; stampSchedule from the request principal"},
+	{"pkg/store/entadapter/scheduled_exec_run_store.go", "return tx.CreateSchedule(ctx, sc)", false,
+		"CreateScheduleChecked: store quota-checked wrapper delegating to tx.CreateSchedule; every non-test caller is classified in fixtureCreateSites and stamps sc"},
+	{"pkg/hub/handlers_triggers.go", "tx.CreateTrigger(ctx, &trigger)", true,
+		"trigger API create; stampTrigger from the request principal, in the create transaction"},
+	{"pkg/hub/handlers_webhook_endpoints.go", "tx.CreateWebhookEndpoint(ctx, &ep)", true,
+		"webhook endpoint API create; stampWebhookEndpoint from the request principal, in the create transaction"},
+	{"pkg/hub/handlers_webhook_endpoints.go", "tx.CreateTrigger(ctx, defaultTr)", true,
+		"webhook endpoint API one-call defaultTrigger create; stampTrigger from the request principal, in the create transaction"},
 
 	// ── System paths: no principal, so never fixture-rooted ───────────
 	{"pkg/hub/flat_runtime_brokers.go", "s.store.CreateProject(ctx, p)", false,
@@ -179,11 +198,14 @@ var fixtureCreateSites = []fixtureCreateSite{
 	{"perf/bench/seed/main.go", "s.CreateAgent(ctx, agent)", false,
 		"benchmark seeding tool writing a store directly; no hub principal exists"},
 
+	// ── Test support outside _test.go files ───────────────────────────
+	{"pkg/hub/internal/hubtestutil/authz_sqlite.go", "s.CreateProject(ctx, &store.Project{", false,
+		"CreateDelegateTestProject: test fixture helper writing a store directly; hubtestutil is imported only by _test.go files (TestOnlyTestCodeImportsHubtestutil)"},
+
 	// ── Not store creates (broker / hub client RPCs of the same name) ─
 	{"pkg/hub/brokerclient.go", "c.transport.CreateAgent(", false, "broker RPC: starts an agent already created by commitAgentCreate"},
 	{"pkg/hub/httpdispatcher.go", "c.transport.CreateAgent(", false, "broker RPC"},
-	{"pkg/hub/httpdispatcher.go", "d.client.CreateAgent(", false, "broker RPC"},
-	{"pkg/hub/httpdispatcher.go", "d.client.CreateAgent(", false, "broker RPC (retry)"},
+	{"pkg/hub/dispatch_metadata_seal.go", "d.client.CreateAgent(", false, "broker RPC (sealed send wrapper; the dispatcher's create and its retry both call it)"},
 	{"pkg/hub/controlchannel_client.go", "c.controlChannel.CreateAgent(", false, "broker RPC over the control channel"},
 	{"pkg/hub/controlchannel_client.go", "c.httpClient.CreateAgent(", false, "broker RPC (HTTP fallback)"},
 	{"pkg/hub/controlchannel_client.go", "c.httpClient.CreateAgent(", false, "broker RPC (HTTP)"},
@@ -198,8 +220,8 @@ var fixtureCreateSites = []fixtureCreateSite{
 // classified. pkg/store/storetest is the store conformance suite (test
 // support code writing a raw store) and is not a hub path.
 func TestFixtureProvenanceCensus_CreateCallSites(t *testing.T) {
-	re := regexp.MustCompile(`\.(CreateAgent|CreateProject|CreateGroup|CreateSchedule)\(`)
-	stampCall := regexp.MustCompile(`\bstamp(Agent|Project|Group|ProjectGroup|Schedule)\(`)
+	re := regexp.MustCompile(`\.(CreateAgent|CreateProject|CreateGroup|CreateSchedule|CreateScheduleChecked|CreateTrigger|CreateWebhookEndpoint)\(`)
+	stampCall := regexp.MustCompile(`\bstamp(Agent|Project|Group|ProjectGroup|Schedule|Trigger|WebhookEndpoint)\(`)
 	used := make([]bool, len(fixtureCreateSites))
 	for _, m := range fixtureCensusScan(t, re) {
 		if strings.HasPrefix(m.file, "pkg/store/storetest/") {
@@ -244,6 +266,7 @@ func TestFixtureProvenanceCensus_StampWriters(t *testing.T) {
 		"pkg/store/entadapter/agent_store.go":    true, // read mapping
 		"pkg/store/entadapter/project_store.go":  true, // read mapping
 		"pkg/store/entadapter/schedule_store.go": true, // read mapping
+		"pkg/store/entadapter/trigger_store.go":  true, // read mapping
 		"pkg/store/entadapter/group_store.go":    true, // read mapping
 	}
 	for _, m := range fixtureCensusScan(t, re) {

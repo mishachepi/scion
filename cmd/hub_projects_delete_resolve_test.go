@@ -153,7 +153,7 @@ func TestRunHubProjectsDelete_Resolve(t *testing.T) {
 			if tt.wantErr == "" {
 				client, cerr := hubclient.New(os.Getenv("SCION_HUB_ENDPOINT"))
 				require.NoError(t, cerr)
-				got, rerr := resolveProjectNameOrID(t.Context(), client, tt.arg)
+				got, rerr := resolveProjectNameOrID(t.Context(), client, tt.arg, false)
 				require.NoError(t, rerr)
 				assert.Equal(t, tt.wantDelete, []string{got.ID})
 			}
@@ -280,5 +280,40 @@ func TestRunHubProjectsDelete_AgentsRemain(t *testing.T) {
 		reqs := hub.recorded()
 		require.NotEmpty(t, reqs)
 		assert.Equal(t, "/api/v1/projects/"+deleteTestIDA+"?force=true", reqs[len(reqs)-1])
+	})
+}
+
+// TestRunHubProjectsDelete_StorageKept200Succeeds verifies `scion hub projects
+// delete` succeeds cleanly in both human and JSON output modes when the Hub
+// answers 200 OK with storageKept (ptone/scion#4474).
+func TestRunHubProjectsDelete_StorageKept200Succeeds(t *testing.T) {
+	kept := []hubclient.StorageKeptItem{{
+		Code:    "runtime-broker-project-directory",
+		Message: "One or more Runtime Brokers kept their local project directory.",
+	}}
+
+	t.Run("text", func(t *testing.T) {
+		hub := setupProjectsDeleteTest(t, true)
+		hub.storageKept = kept
+
+		out := captureStdout(t, func() {
+			require.NoError(t, runHubProjectsDelete(hubProjectsDeleteCmd, []string{deleteTestIDA}))
+		})
+		assert.Equal(t, []string{deleteTestIDA}, hub.deletes)
+		assert.Contains(t, out, "Project 'My Project' deleted successfully.")
+	})
+
+	t.Run("json", func(t *testing.T) {
+		hub := setupProjectsDeleteTest(t, true)
+		hub.storageKept = kept
+		outputFormat = "json"
+
+		out := captureStdout(t, func() {
+			require.NoError(t, runHubProjectsDelete(hubProjectsDeleteCmd, []string{deleteTestIDA}))
+		})
+		var got ActionResult
+		require.NoError(t, json.Unmarshal([]byte(out), &got), out)
+		assert.Equal(t, "success", got.Status)
+		assert.Equal(t, deleteTestIDA, got.Details["projectId"])
 	})
 }

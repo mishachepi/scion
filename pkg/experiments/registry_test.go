@@ -20,6 +20,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 )
@@ -374,6 +375,65 @@ func TestFlatRuntimeBrokersExperimentRegistered(t *testing.T) {
 	}
 }
 
+// TestFlatCloudRunTargetExperimentRegistered pins the hub.flat_cloudrun_target
+// entry: a server-only alpha experiment that ships off, whose description
+// names its GA gate.
+func TestFlatCloudRunTargetExperimentRegistered(t *testing.T) {
+	e, ok := Default().Lookup(FlatCloudRunTarget)
+	if !ok {
+		t.Fatalf("%s is not registered", FlatCloudRunTarget)
+	}
+	if FlatCloudRunTarget != "hub.flat_cloudrun_target" {
+		t.Fatalf("frozen name changed: %q", FlatCloudRunTarget)
+	}
+	if e.Default {
+		t.Fatal("the flat Cloud Run target must default to off")
+	}
+	if e.Stage != StageAlpha {
+		t.Fatalf("must stay alpha until its GA gate is met, got %q", e.Stage)
+	}
+	if len(e.Layers) != 1 || !e.HasLayer(LayerServer) {
+		t.Fatalf("must be a server-only experiment, got %v", e.Layers)
+	}
+	if !strings.Contains(e.Description, "ptone/scion#7309") {
+		t.Fatalf("description must name the GA gate issue: %q", e.Description)
+	}
+	if e.Title == "" || e.Issue != "ptone/scion#7308" || e.Owner != "runtime-broker" {
+		t.Fatalf("incomplete registration: %+v", e)
+	}
+}
+
+// TestConduitDeliverExperimentRegistered pins the hub.conduit_deliver entry:
+// a server-only alpha experiment, off by default, that names its dependency
+// on hub.conduit.
+func TestConduitDeliverExperimentRegistered(t *testing.T) {
+	e, ok := Default().Lookup(ConduitDeliver)
+	if !ok {
+		t.Fatalf("%s is not registered", ConduitDeliver)
+	}
+	if ConduitDeliver != "hub.conduit_deliver" {
+		t.Fatalf("frozen name changed: %q", ConduitDeliver)
+	}
+	if e.Default {
+		t.Fatal("hub.conduit_deliver must default to off")
+	}
+	if e.Stage != StageAlpha {
+		t.Fatalf("must be alpha, got %q", e.Stage)
+	}
+	if len(e.Layers) != 1 || !e.HasLayer(LayerServer) {
+		t.Fatalf("must be a server-only experiment, got %v", e.Layers)
+	}
+	if !strings.Contains(e.Description, "Requires hub.conduit") {
+		t.Fatalf("description must name the hub.conduit dependency: %q", e.Description)
+	}
+	if _, ok := Default().Lookup("hub.conduit"); !ok {
+		t.Fatal("hub.conduit, its dependency, is not registered")
+	}
+	if e.Title == "" || e.Issue != "ptone/scion#7353" || e.Owner != "conduit" {
+		t.Fatalf("incomplete registration: %+v", e)
+	}
+}
+
 // TestArtifactsExperiment_Registered pins the hub.artifacts entry: it gates
 // both the web surfaces and the hub routes, so it needs both layers, and it
 // ships off.
@@ -420,15 +480,20 @@ func TestAgentDelegation_RegisteredDefaultOff(t *testing.T) {
 }
 
 // TestFederationProjectVisitors_RegisteredDefaultOff pins
-// federation.project_visitors as a server-layer experiment that is off
-// unless an operator turns it on.
+// federation.project_visitors as an experiment that is off unless an
+// operator turns it on. It gates the web Visitors tab and admin switch and
+// the hub routes, so it needs both layers: GET /api/v1/experiments carries
+// only web-layer experiments.
 func TestFederationProjectVisitors_RegisteredDefaultOff(t *testing.T) {
 	entry, ok := Default().Lookup(FederationProjectVisitors)
 	if !ok {
 		t.Fatalf("compiled registry entry %q absent", FederationProjectVisitors)
 	}
-	if entry.Name != "federation.project_visitors" || entry.Default || len(entry.Layers) != 1 || entry.Layers[0] != LayerServer || entry.Stage != StageAlpha || entry.Issue != "ptone/scion#4603" {
+	if entry.Name != "federation.project_visitors" || entry.Default || entry.Stage != StageAlpha || entry.Issue != "ptone/scion#4603" {
 		t.Errorf("project visitors experiment metadata mismatch: %+v", entry)
+	}
+	if len(entry.Layers) != 2 || !entry.HasLayer(LayerWeb) || !entry.HasLayer(LayerServer) {
+		t.Errorf("Layers = %v, want exactly LayerWeb and LayerServer", entry.Layers)
 	}
 }
 
@@ -476,9 +541,41 @@ func TestAttachmentArtifacts_RegisteredDefaultOff(t *testing.T) {
 	}
 }
 
+// TestDecisions_RegisteredDefaultOff pins web.decisions (ptone/scion#7514,
+// ptone/scion#8223): the hub enforces it on sends, routes, history and the
+// bell, the web toggles cards, pages and settings, it ships off, and the two
+// retired names are in Retired().
+func TestDecisions_RegisteredDefaultOff(t *testing.T) {
+	reg := Default()
+	entry, ok := reg.Lookup(Decisions)
+	if !ok {
+		t.Fatalf("compiled registry entry %q absent", Decisions)
+	}
+	if entry.Name != "web.decisions" {
+		t.Errorf("Name = %q, want web.decisions", entry.Name)
+	}
+	if entry.Default {
+		t.Error("Default = true, want false")
+	}
+	if len(entry.Layers) != 2 || !entry.HasLayer(LayerWeb) || !entry.HasLayer(LayerServer) {
+		t.Errorf("Layers = %v, want exactly LayerWeb and LayerServer", entry.Layers)
+	}
+	if entry.Stage != StageAlpha || entry.Owner != "native-chat" || entry.Issue != "ptone/scion#7514" || entry.ReviewBy != "2027-02-13" {
+		t.Errorf("decisions experiment metadata mismatch: %+v", entry)
+	}
+	for _, retired := range []string{"web.chat_choices", "web.project_decisions"} {
+		if _, found := reg.Lookup(retired); found {
+			t.Errorf("retired experiment %q still active in Default()", retired)
+		}
+		if !reg.IsRetired(retired) {
+			t.Errorf("retired experiment %q missing from Default().IsRetired", retired)
+		}
+	}
+}
+
 // TestAsyncAgentLaunchExperimentRegistered pins hub.async_agent_launch: it
 // changes what the hub sends to brokers, so it is server-layer only (the
-// web form opts in unconditionally), and it ships off.
+// web form opts in unconditionally), and it ships on (ptone/scion#6640).
 func TestAsyncAgentLaunchExperimentRegistered(t *testing.T) {
 	e, ok := Default().Lookup(AsyncAgentLaunch)
 	if !ok {
@@ -487,8 +584,8 @@ func TestAsyncAgentLaunchExperimentRegistered(t *testing.T) {
 	if AsyncAgentLaunch != "hub.async_agent_launch" {
 		t.Fatalf("frozen name changed: %q", AsyncAgentLaunch)
 	}
-	if e.Default {
-		t.Fatal("async agent launch must default to off")
+	if !e.Default {
+		t.Fatal("async agent launch must default to on")
 	}
 	if !e.HasLayer(LayerServer) || e.HasLayer(LayerWeb) {
 		t.Fatalf("must be a server-layer (only) experiment, got %v", e.Layers)
@@ -500,7 +597,7 @@ func TestAsyncAgentLaunchExperimentRegistered(t *testing.T) {
 
 // TestAsyncAgentStartExperimentRegistered pins hub.async_agent_start
 // (ptone/scion#4669): it gates hub behaviour only, so it is server-layer
-// only, and it ships off.
+// only, and it ships on (ptone/scion#7250).
 func TestAsyncAgentStartExperimentRegistered(t *testing.T) {
 	e, ok := Default().Lookup(AsyncAgentStart)
 	if !ok {
@@ -509,8 +606,8 @@ func TestAsyncAgentStartExperimentRegistered(t *testing.T) {
 	if AsyncAgentStart != "hub.async_agent_start" {
 		t.Fatalf("frozen name changed: %q", AsyncAgentStart)
 	}
-	if e.Default {
-		t.Fatal("async agent start must default to off")
+	if !e.Default {
+		t.Fatal("async agent start must default to on")
 	}
 	if !e.HasLayer(LayerServer) || e.HasLayer(LayerWeb) {
 		t.Fatalf("must be a server-layer (only) experiment, got %v", e.Layers)
@@ -561,6 +658,239 @@ func TestSecretRotationExperimentRegistered(t *testing.T) {
 		t.Fatalf("must be a server-layer (only) experiment, got %v", e.Layers)
 	}
 	if e.Issue != "ptone/scion#1530" || e.Stage != StageAlpha {
+		t.Fatalf("unexpected registration: %+v", e)
+	}
+}
+
+// TestLifecycleEventsExperimentRegistered pins hub.lifecycle_events (WP1
+// slice 2): it gates hub behaviour only, so it is server-layer only, and
+// it ships off.
+func TestLifecycleEventsExperimentRegistered(t *testing.T) {
+	e, ok := Default().Lookup(LifecycleEvents)
+	if !ok {
+		t.Fatalf("%s is not registered", LifecycleEvents)
+	}
+	if LifecycleEvents != "hub.lifecycle_events" {
+		t.Fatalf("frozen name changed: %q", LifecycleEvents)
+	}
+	if e.Default {
+		t.Fatal("lifecycle events must default to off")
+	}
+	if !e.HasLayer(LayerServer) || e.HasLayer(LayerWeb) {
+		t.Fatalf("must be a server-layer (only) experiment, got %v", e.Layers)
+	}
+	if e.Issue != "ptone/scion#5900" || e.Stage != StageAlpha || e.Owner != "telemetry" {
+		t.Fatalf("unexpected registration: %+v", e)
+	}
+}
+
+// TestImageTagVersionDefaultExperimentRegistered pins
+// hub.image_tag_version_default (ptone/scion#6625): server-layer only, and
+// it ships on, so a release build pulls its own version's images.
+func TestImageTagVersionDefaultExperimentRegistered(t *testing.T) {
+	e, ok := Default().Lookup(ImageTagVersionDefault)
+	if !ok {
+		t.Fatalf("%s is not registered", ImageTagVersionDefault)
+	}
+	if ImageTagVersionDefault != "hub.image_tag_version_default" {
+		t.Fatalf("frozen name changed: %q", ImageTagVersionDefault)
+	}
+	if !e.Default {
+		t.Fatal("the image tag version default must default to on")
+	}
+	if !e.HasLayer(LayerServer) || e.HasLayer(LayerWeb) {
+		t.Fatalf("must be a server-layer (only) experiment, got %v", e.Layers)
+	}
+	if e.Issue != "ptone/scion#6625" || e.Stage != StageAlpha || e.Owner != "hub" {
+		t.Fatalf("unexpected registration: %+v", e)
+	}
+}
+
+// TestImageTagSettingExperimentRegistered pins hub.image_tag_setting
+// (ptone/scion#6625): the hub decides whether image_tag applies, so it is
+// server-layer only, and it ships off.
+func TestImageTagSettingExperimentRegistered(t *testing.T) {
+	e, ok := Default().Lookup(ImageTagSetting)
+	if !ok {
+		t.Fatalf("%s is not registered", ImageTagSetting)
+	}
+	if ImageTagSetting != "hub.image_tag_setting" {
+		t.Fatalf("frozen name changed: %q", ImageTagSetting)
+	}
+	if e.Default {
+		t.Fatal("the image tag setting must default to off")
+	}
+	if !e.HasLayer(LayerServer) || e.HasLayer(LayerWeb) {
+		t.Fatalf("must be a server-layer (only) experiment, got %v", e.Layers)
+	}
+	if e.Issue != "ptone/scion#6625" || e.Stage != StageAlpha || e.Owner != "hub" {
+		t.Fatalf("unexpected registration: %+v", e)
+	}
+}
+
+// TestReincarnateHarnessSwitchExperimentRegistered pins
+// hub.reincarnate_harness_switch (ptone/scion#7757): the hub handler is the
+// only gate, so it is server-layer only, and it ships off.
+func TestReincarnateHarnessSwitchExperimentRegistered(t *testing.T) {
+	e, ok := Default().Lookup(ReincarnateHarnessSwitch)
+	if !ok {
+		t.Fatalf("%s is not registered", ReincarnateHarnessSwitch)
+	}
+	if ReincarnateHarnessSwitch != "hub.reincarnate_harness_switch" {
+		t.Fatalf("frozen name changed: %q", ReincarnateHarnessSwitch)
+	}
+	if e.Default {
+		t.Fatal("the reincarnate harness switch must default to off")
+	}
+	if !e.HasLayer(LayerServer) || e.HasLayer(LayerWeb) {
+		t.Fatalf("must be a server-layer (only) experiment, got %v", e.Layers)
+	}
+	if e.Issue != "ptone/scion#7757" || e.Stage != StageAlpha {
+		t.Fatalf("unexpected registration: %+v", e)
+	}
+	if strings.Contains(e.Description, "docker, podman") {
+		t.Fatalf("Description still hard-codes the Phase 1 local runtime list: %q", e.Description)
+	}
+	if !strings.Contains(e.Description, "Runtime Broker advertises") {
+		t.Fatalf("Description should refer to the runtimes the Runtime Broker advertises: %q", e.Description)
+	}
+}
+
+// TestExecSchedulesExperimentRegistered pins the hub.exec_schedules entry
+// (design D8): an alpha experiment, off by default, with both server and web
+// layers (so GET /api/v1/experiments carries it to the web authoring gate),
+// that names its dependency on hub.conduit and covers one-shot and recurring
+// exec schedules.
+func TestExecSchedulesExperimentRegistered(t *testing.T) {
+	e, ok := Default().Lookup(ExecSchedules)
+	if !ok {
+		t.Fatalf("%s is not registered", ExecSchedules)
+	}
+	if ExecSchedules != "hub.exec_schedules" {
+		t.Fatalf("frozen name changed: %q", ExecSchedules)
+	}
+	if e.Default {
+		t.Fatal("hub.exec_schedules must default to off")
+	}
+	if e.Stage != StageAlpha {
+		t.Fatalf("must be alpha, got %q", e.Stage)
+	}
+	if len(e.Layers) != 2 || !e.HasLayer(LayerServer) || !e.HasLayer(LayerWeb) {
+		t.Fatalf("must gate both server and web layers, got %v", e.Layers)
+	}
+	if !strings.Contains(e.Description, "Requires hub.conduit") {
+		t.Fatalf("description must name the hub.conduit dependency: %q", e.Description)
+	}
+	if strings.Contains(e.Description, "One-shot exec events only") {
+		t.Fatalf("description must cover one-shot and recurring exec, got: %q", e.Description)
+	}
+}
+
+// TestSystemOneExperimentRegistered pins hub.system_one (ptone/scion#8044):
+// server-layer only and ships off by default.
+func TestSystemOneExperimentRegistered(t *testing.T) {
+	e, ok := Default().Lookup(SystemOne)
+	if !ok {
+		t.Fatalf("%s is not registered", SystemOne)
+	}
+	if SystemOne != "hub.system_one" {
+		t.Fatalf("frozen name changed: %q", SystemOne)
+	}
+	if e.Default {
+		t.Fatal("hub.system_one must default to off")
+	}
+	if !e.HasLayer(LayerServer) || e.HasLayer(LayerWeb) {
+		t.Fatalf("must be a server-layer (only) experiment, got %v", e.Layers)
+	}
+	if e.Issue != "ptone/scion#8044" || e.Stage != StageAlpha || e.Owner != "system-one" {
+		t.Fatalf("unexpected registration: %+v", e)
+	}
+}
+
+// TestGitHubTriggersExperimentRegistered pins hub.github_triggers
+// (ptone/scion#836, Stage 3 §8.2): server+web layers, alpha, default off,
+// naming its requirement on hub.triggers.
+func TestGitHubTriggersExperimentRegistered(t *testing.T) {
+	e, ok := Default().Lookup(GitHubTriggers)
+	if !ok {
+		t.Fatalf("%s is not registered", GitHubTriggers)
+	}
+	if GitHubTriggers != "hub.github_triggers" {
+		t.Fatalf("frozen name changed: %q", GitHubTriggers)
+	}
+	if e.Default {
+		t.Fatal("hub.github_triggers must default to off")
+	}
+	if !e.HasLayer(LayerServer) || !e.HasLayer(LayerWeb) {
+		t.Fatalf("must have both LayerServer and LayerWeb, got %v", e.Layers)
+	}
+	if e.Title != "GitHub App events as triggers" || e.Issue != "ptone/scion#836" || e.Stage != StageAlpha || e.Owner != "triggers" || e.ReviewBy != "2027-05-31" {
+		t.Fatalf("unexpected registration: %+v", e)
+	}
+	if !strings.Contains(e.Description, "hub.triggers") {
+		t.Fatalf("description must name the requirement on hub.triggers: %q", e.Description)
+	}
+}
+
+// TestTriggersExperimentRegistered pins hub.triggers (ptone/scion#7961):
+// default-off alpha experiment gating both server routes/workers and web UI.
+func TestTriggersExperimentRegistered(t *testing.T) {
+	e, ok := Default().Lookup(Triggers)
+	if !ok {
+		t.Fatalf("%s is not registered", Triggers)
+	}
+	if Triggers != "hub.triggers" {
+		t.Fatalf("frozen name changed: %q", Triggers)
+	}
+	if e.Default {
+		t.Fatal("hub.triggers must default to off")
+	}
+	if !e.HasLayer(LayerServer) || !e.HasLayer(LayerWeb) {
+		t.Fatalf("must have both LayerServer and LayerWeb, got %v", e.Layers)
+	}
+	if e.Issue != "ptone/scion#7961" || e.Stage != StageAlpha || e.Owner != "triggers" || e.ReviewBy != "2027-05-31" {
+		t.Fatalf("unexpected registration: %+v", e)
+	}
+}
+
+// TestMessagePoliciesExperimentRegistered pins hub.message_policies
+// (ptone/scion#8047): server-layer only and ships off by default.
+func TestMessagePoliciesExperimentRegistered(t *testing.T) {
+	e, ok := Default().Lookup(MessagePolicies)
+	if !ok {
+		t.Fatalf("%s is not registered", MessagePolicies)
+	}
+	if MessagePolicies != "hub.message_policies" {
+		t.Fatalf("frozen name changed: %q", MessagePolicies)
+	}
+	if e.Default {
+		t.Fatal("hub.message_policies must default to off")
+	}
+	if !e.HasLayer(LayerServer) || e.HasLayer(LayerWeb) {
+		t.Fatalf("must be a server-layer (only) experiment, got %v", e.Layers)
+	}
+	if e.Issue != "ptone/scion#8047" || e.Stage != StageAlpha || e.Owner != "system-one" {
+		t.Fatalf("unexpected registration: %+v", e)
+	}
+}
+
+// TestEffectivePermissionsExperimentRegistered pins hub.effective_permissions
+// (ptone/scion#8439, D6): server+web layers, alpha, default off, owned by authz.
+func TestEffectivePermissionsExperimentRegistered(t *testing.T) {
+	e, ok := Default().Lookup(EffectivePermissions)
+	if !ok {
+		t.Fatalf("%s is not registered", EffectivePermissions)
+	}
+	if EffectivePermissions != "hub.effective_permissions" {
+		t.Fatalf("frozen name changed: %q", EffectivePermissions)
+	}
+	if e.Default {
+		t.Fatal("hub.effective_permissions must default to off")
+	}
+	if !e.HasLayer(LayerServer) || !e.HasLayer(LayerWeb) {
+		t.Fatalf("must have both LayerServer and LayerWeb, got %v", e.Layers)
+	}
+	if e.Issue != "ptone/scion#8439" || e.Stage != StageAlpha || e.Owner != "authz" {
 		t.Fatalf("unexpected registration: %+v", e)
 	}
 }

@@ -14,6 +14,8 @@
 
 import { defineConfig } from '@playwright/test';
 
+import { chromiumLaunchOptions } from '../../playwright-chromium.js';
+
 const CI = !!process.env.CI;
 
 // Port proxy journeys (ptone/scion#5568), end to end against the real Go
@@ -31,6 +33,8 @@ const CI = !!process.env.CI;
 export default defineConfig({
   testDir: '.',
   testMatch: '**/*.pw.ts',
+  // The page view journeys run under playwright.view.config.ts.
+  testIgnore: '**/port-view.pw.ts',
   timeout: 90_000,
   workers: 1,
   retries: CI ? 1 : 0,
@@ -53,11 +57,6 @@ export default defineConfig({
     viewport: { width: 1280, height: 800 },
     navigationTimeout: 30_000,
     actionTimeout: 15_000,
-    launchOptions: {
-      ...(process.env.CHROMIUM_EXECUTABLE
-        ? { executablePath: process.env.CHROMIUM_EXECUTABLE }
-        : {}),
-      args: ['--no-sandbox', '--disable-setuid-sandbox'],
-    },
+    launchOptions: chromiumLaunchOptions(),
   },
 });

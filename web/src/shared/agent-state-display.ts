@@ -27,7 +27,7 @@ import { html } from 'lit';
 import type { TemplateResult } from 'lit';
 import { ifDefined } from 'lit/directives/if-defined.js';
 
-import { getAgentDisplayStatus } from './types.js';
+import { getAgentDisplayStatus, isKnownSuspendReason, isRetainedSuspendActivity } from './types.js';
 import type { Agent, AgentPhase, AgentActivity } from './types.js';
 
 /**
@@ -105,6 +105,10 @@ export const ACTIVITY_DISPLAY: Record<AgentActivity, StateDisplay> = {
     pulse: false,
     label: 'waiting on others',
   },
+  // The agent reported it has nothing to do until new work arrives (between
+  // assignments, or after answering a message). Healthy, not a warning: a
+  // message for it ends idleness (ptone/scion#7826).
+  idle: { emoji: '💤', icon: 'moon', variant: 'neutral', pulse: false },
   completed: { emoji: '✅', icon: 'check-circle', variant: 'success', pulse: false },
   limits_exceeded: {
     emoji: '🚫',
@@ -112,6 +116,16 @@ export const ACTIVITY_DISPLAY: Record<AgentActivity, StateDisplay> = {
     variant: 'danger',
     pulse: false,
     label: 'limits exceeded',
+  },
+  // The harness is alive at its prompt but its last turn failed on a
+  // model/API error; detail.message has the reason. A new message retries
+  // (ptone/scion#7858).
+  harness_error: {
+    emoji: '⚠️',
+    icon: 'exclamation-triangle',
+    variant: 'danger',
+    pulse: false,
+    label: 'harness error',
   },
   stalled: { emoji: '⏳', icon: 'hourglass-bottom', variant: 'warning', pulse: false },
   offline: { emoji: '📡', icon: 'wifi-off', variant: 'neutral', pulse: false },
@@ -161,6 +175,48 @@ export function isProvisionedOnly(agent: Pick<Agent, 'phase' | 'provisionedOnly'
   return agent.provisionedOnly === true && agent.phase === 'created';
 }
 
+/**
+ * Hint set by the Hub stall detector when an agent never reported any harness
+ * hook event after start (ptone/scion#4556).
+ * Keep in sync with state.StalledNoHookActivityHint in pkg/agent/state/state.go.
+ */
+export const STALLED_NO_HOOK_ACTIVITY_HINT =
+  'no harness activity since start; check harness credentials/task';
+
+/**
+ * The badge tooltip for a harness_error status (including when retained on a
+ * suspended agent): the reason the harness reported (detail.message), or
+ * undefined for any other status.
+ */
+export function harnessErrorHint(
+  agent: Pick<Agent, 'activity' | 'detail' | 'message'>,
+  status: string
+): string | undefined {
+  const isHarnessError =
+    status === 'harness_error' ||
+    (status === 'suspended' && agent.activity?.toLowerCase() === 'harness_error');
+  if (!isHarnessError) {
+    return undefined;
+  }
+  return agent.detail?.message || agent.message || undefined;
+}
+
+/**
+ * The badge tooltip for a stalled status when the Hub recorded the
+ * no-hook-activity-since-start hint, or undefined for any other status or
+ * stale pre-stall message.
+ */
+export function stalledHint(
+  agent: Pick<Agent, 'detail' | 'message'>,
+  status: string
+): string | undefined {
+  if (status !== 'stalled') {
+    return undefined;
+  }
+  const msg = agent.detail?.message || agent.message;
+  return msg === STALLED_NO_HOOK_ACTIVITY_HINT ? msg : undefined;
+}
+
 interface AgentStatusBadgeOptions {
   /** Badge status; defaults to getAgentDisplayStatus(agent). */
   status?: string;
@@ -171,19 +227,83 @@ interface AgentStatusBadgeOptions {
   testId?: string;
 }
 
+/** The agent fields the suspended display reads. */
+export interface SuspendedDisplayFields {
+  phase?: string | undefined;
+  activity?: string | undefined;
+  suspendReason?: string | undefined;
+}
+
+/**
+ * Status label for a suspended agent, matching `scion list`: the retained
+ * pre-suspend activity after a middle dot, then the recorded suspend reason
+ * in parentheses, e.g. `"suspended · completed (idle)"`, `"suspended · idle"`
+ * or `"suspended (user)"`. Returns `undefined` when the agent is not
+ * suspended, or is suspended with neither a retained activity nor a known
+ * reason (plain `"suspended"`).
+ */
+export function suspendedStatusLabel(agent: SuspendedDisplayFields): string | undefined {
+  if (agent.phase !== 'suspended') return undefined;
+  const retained = isRetainedSuspendActivity(agent.activity);
+  const reason = isKnownSuspendReason(agent.suspendReason) ? agent.suspendReason : undefined;
+  if (!retained && !reason) return undefined;
+  let label = stateLabel('suspended');
+  if (retained) label += ` · ${stateLabel(agent.activity!.toLowerCase())}`;
+  if (reason) label += ` (${reason})`;
+  return label;
+}
+
+/**
+ * A one-line explanation of a suspended agent's suspend reason, for a
+ * tooltip, or `undefined` when the agent is not suspended or has no known
+ * reason. Auto-wake of an agent the hub suspended needs the hub's
+ * lifecycle.idle_suspend experiment; the idle policy only runs with it, so
+ * an idle suspension always wakes, and a stalled one wakes where it is on.
+ */
+export function suspendReasonHint(agent: SuspendedDisplayFields): string | undefined {
+  if (agent.phase !== 'suspended') return undefined;
+  switch (agent.suspendReason) {
+    case 'user':
+      return 'Suspended by a user. Only a resume brings it back.';
+    case 'idle':
+      return 'Suspended by the hub because it was idle. New work for it wakes it automatically.';
+    case 'stalled':
+      return 'Suspended by the hub because it stalled. Where the hub has auto-wake on, new work for it wakes it.';
+    default:
+      return undefined;
+  }
+}
+
+/** The non-empty hints, one per line, or undefined when there are none. */
+function joinHints(...hints: (string | undefined)[]): string | undefined {
+  const lines = hints.filter((h): h is string => !!h);
+  return lines.length ? lines.join('\n') : undefined;
+}
+
 /**
  * An agent status badge. Use it for every agent status badge: it shows a
- * provision-only agent as "created (not started)" with a start hint.
+ * provision-only agent as "created (not started)" with a start hint, and a
+ * suspended agent as "suspended · <activity> (<reason>)" (see
+ * suspendedStatusLabel) with the reason explained in its tooltip.
  */
 export function agentStatusBadge(
   agent: Agent,
   { status = getAgentDisplayStatus(agent), label, size, testId }: AgentStatusBadgeOptions = {}
 ): TemplateResult {
   const po = isProvisionedOnly(agent);
-  const hint = po ? `Not started yet. Use Start, or run: scion start ${agent.name}` : undefined;
+  const isDisplayStatus = status === getAgentDisplayStatus(agent);
+  const hint = po
+    ? `Not started yet. Use Start, or run: scion start ${agent.name}`
+    : joinHints(
+        harnessErrorHint(agent, status) ?? stalledHint(agent, status),
+        isDisplayStatus ? suspendReasonHint(agent) : undefined
+      );
+  const defaultLabel = isDisplayStatus
+    ? (suspendedStatusLabel(agent) ?? stateLabel(status))
+    : stateLabel(status);
   return html`<scion-status-badge
     status=${status}
-    label=${po ? PROVISIONED_ONLY_LABEL : (label ?? stateLabel(status))}
+    label=${po ? PROVISIONED_ONLY_LABEL : (label ?? defaultLabel)}
     title=${ifDefined(hint)}
     size=${ifDefined(size)}
     data-testid=${ifDefined(testId)}

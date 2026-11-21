@@ -174,7 +174,7 @@ const (
 
 	// LockFailedMessageRetention guards the periodic purge of messages in
 	// dispatch_state="failed" that have exceeded the configured retention
-	// window (Server.Config.FailedMessageRetentionDays).
+	// window (messaging.failed_message_retention_days).
 	LockFailedMessageRetention AdvisoryLockKey = 0x5C100019
 
 	// LockAgentLaunchDeadline guards RunLaunchReaperTick, the T1 async-create
@@ -252,12 +252,108 @@ const (
 	// expired identities' agents and purges what each one created.
 	LockTestIdentityReaper AdvisoryLockKey = 0x5C10002D
 
+	// LockChatRetention guards the chat message retention sweeper
+	// ("chat-retention"), so one replica per tick walks and purges messages
+	// older than the hub-wide retention window. The sweep cursor lives in the
+	// database, so a failover resumes where the last holder stopped.
+	LockChatRetention AdvisoryLockKey = 0x5C10002E
+
+	// LockInvitedHubRoleGuard serializes the invited-user hub-role guard
+	// (GroupStore.LockInvitedHubRoleGuard, ptone/scion#8081) across
+	// concurrent transactions that bind a built-in system hub role to a
+	// group or add an invited user or child group to a group, preventing
+	// READ COMMITTED write skew on PostgreSQL. Allocated as the next
+	// singleton key in the 0x5C10_0xxx block after LockChatRetention
+	// (0x5C10002E), and acquired first in transaction lock order via
+	// transaction-scoped pg_advisory_xact_lock (not AdvisoryLocker).
+	LockInvitedHubRoleGuard AdvisoryLockKey = 0x5C10002F
+
 	// LockAgentDelegatedCredentialPurge guards the hourly purge of agent
 	// delegated credential rows that expired more than the retention
 	// period ago (.design/agent-delegation.md §18.1). A value in an unused
 	// gap of the range, so it does not collide with a key added next to
 	// the highest one.
 	LockAgentDelegatedCredentialPurge AdvisoryLockKey = 0x5C10001E
+
+	// LockHubSettingsGuardedBatch serializes guarded hub settings batches
+	// (HubSettingGuardedBatchWriter): a transaction-scoped
+	// pg_advisory_xact_lock taken before the batch reads and locks its
+	// rows, so a read guard on a section with no row (which FOR UPDATE
+	// cannot lock) still holds against a concurrent batch. A value in an
+	// unused gap of the range.
+	LockHubSettingsGuardedBatch AdvisoryLockKey = 0x5C10001F
+
+	// LockPendingSecretExpiry guards the periodic pending secret expiry
+	// sweep ("pending-secret-expiry"), so one replica per tick deletes
+	// expired pending secrets and releases their held values. A value in an
+	// unused gap of the range.
+	LockPendingSecretExpiry AdvisoryLockKey = 0x5C10001B
+
+	// LockScheduledExecRunSweep guards the scheduled exec run sweeper
+	// ("scheduled-exec-run-sweep", ptone/scion#7883), so one replica per tick
+	// polls the outcomes of unfinished exec runs no live tracker owns and
+	// records runs past their lease as abandoned. A value in an unused gap of
+	// the range.
+	LockScheduledExecRunSweep AdvisoryLockKey = 0x5C10001C
+
+	// LockScheduledExecPollClaim serializes ClaimScheduledExecRunsForPoll's
+	// per-agent turn sequence allocation (ptone/scion#8096) via a
+	// transaction-scoped pg_advisory_xact_lock on PostgreSQL, not taken
+	// through AdvisoryLocker.
+	LockScheduledExecPollClaim AdvisoryLockKey = 0x5C10001D
+
+	// LockAgentIdleSuspend guards the periodic idle auto-suspend sweep
+	// ("agent-idle-suspend", ptone/scion#7947), so one replica per tick
+	// scans and enqueues eligible idle/completed/harness_error agents.
+	LockAgentIdleSuspend AdvisoryLockKey = 0x5C100030
+
+	// LockNFSOrphanScan guards the daily NFS agent-directory orphan scan
+	// ("nfs-orphan-scan", ptone/scion#7932), so one replica per tick scans
+	// the shared project storage and records kind=nfs_tree runtime_orphans.
+	LockNFSOrphanScan AdvisoryLockKey = 0x5C100031
+
+	// LockPendingSecretOwnerWrite is the CLASS ID for the per-owner pending
+	// secret write lock: a transaction-scoped
+	// pg_advisory_xact_lock(classid, objid) with objid
+	// StableProjectHash(owner scope ID), taken by
+	// CreateOrReplacePendingSecret so the per-agent and per-owner caps are
+	// checked and applied atomically. Like LockQuotaEnforcement it is in the
+	// per-object range; it is not taken through AdvisoryLocker.
+	LockPendingSecretOwnerWrite AdvisoryLockKey = 0x5C101004
+
+	// LockScheduledEventQuota is the CLASS ID for the per-project scheduled
+	// event quota lock: a transaction-scoped pg_advisory_xact_lock(classid,
+	// objid) with objid StableProjectHash(project ID), taken by
+	// CreateScheduledEventChecked so the exec schedule quotas
+	// (ptone/scion#7883) are checked and applied atomically across
+	// replicas. In the per-object range; not taken through AdvisoryLocker.
+	LockScheduledEventQuota AdvisoryLockKey = 0x5C101005
+
+	// LockScheduledExecOverlap is the CLASS ID for the per-schedule recurring
+	// exec overlap lease check (ptone/scion#7884): a transaction-scoped
+	// pg_advisory_xact_lock(classid, objid) with objid
+	// StableProjectHash(schedule ID), taken by CreateScheduledExecRun so two
+	// replicas cannot insert concurrent active-lease runs for one schedule.
+	LockScheduledExecOverlap AdvisoryLockKey = 0x5C101006
+
+	// LockTriggerQuota is the CLASS ID for the per-project trigger and
+	// webhook-endpoint quota lock: a transaction-scoped
+	// pg_advisory_xact_lock(classid, objid) with objid
+	// StableProjectHash(project ID), taken inside WithTx via
+	// LockTriggerQuota before counting and inserting/updating webhook
+	// endpoints and triggers so the per-project and per-source active caps
+	// (ptone/scion#8028) hold across concurrent writers on PostgreSQL.
+	// In the per-object range; not taken through AdvisoryLocker.
+	LockTriggerQuota AdvisoryLockKey = 0x5C101007
+
+	// LockTriggerSubjectOverlap is the CLASS ID for per-(trigger, subject)
+	// subject_mode="skip" live-fire overlap serialization (ptone/scion#8031):
+	// a transaction-scoped pg_advisory_xact_lock(classid, objid) with objid
+	// StableProjectHash(triggerID + "\x00" + subject), taken by
+	// ClaimTriggerFireSubjectSkip so concurrent drainers neither double-fire
+	// nor mutually skip one subject. In the per-object range; not taken
+	// through AdvisoryLocker.
+	LockTriggerSubjectOverlap AdvisoryLockKey = 0x5C101008
 )
 
 // AdvisoryLocker is implemented by backends that can take a cluster-wide

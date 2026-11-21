@@ -16,6 +16,7 @@ package hub
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -23,11 +24,99 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/hubfire"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
-// EventHandler processes a one-shot scheduled event of a specific type.
-type EventHandler func(ctx context.Context, evt store.ScheduledEvent) error
+// scheduledSkip is the error an event handler returns when the fire ran
+// nothing because a precondition did not hold (target not running, no
+// executor, experiment off, capacity, missed window; ptone/scion#7883, D4).
+// fireEvent records the event as skipped with the reason as its error,
+// which is not a failure. It is generic: any event type may return it.
+type scheduledSkip struct {
+	reason string
+}
+
+func (e *scheduledSkip) Error() string { return e.reason }
+
+// skipScheduledFire returns a scheduledSkip with reason.
+func skipScheduledFire(reason string) error { return &scheduledSkip{reason: reason} }
+
+// asScheduledSkip returns the reason of a scheduledSkip in err's chain.
+func asScheduledSkip(err error) (string, bool) {
+	var skip *scheduledSkip
+	if errors.As(err, &skip) {
+		return skip.reason, true
+	}
+	return "", false
+}
+
+// scheduledOutcomeRecorded is the error an event handler returns when it
+// has already recorded the event's outcome itself, atomically with other
+// state (an exec run, ptone/scion#7883): fireEvent then writes nothing, so
+// its final write can never overwrite an outcome another replica recorded
+// meanwhile. err is the outcome for the log: nil for a fire, a
+// scheduledSkip, or the failure.
+type scheduledOutcomeRecorded struct {
+	err error
+}
+
+func (e *scheduledOutcomeRecorded) Error() string {
+	if e.err == nil {
+		return "outcome recorded by the handler"
+	}
+	return e.err.Error()
+}
+
+func (e *scheduledOutcomeRecorded) Unwrap() error { return e.err }
+
+// outcomeRecorded wraps err (nil for a fire) as already recorded.
+func outcomeRecorded(err error) error { return &scheduledOutcomeRecorded{err: err} }
+
+// asOutcomeRecorded reports whether err says the handler recorded the
+// outcome, and returns the recorded outcome.
+func asOutcomeRecorded(err error) (error, bool) {
+	var rec *scheduledOutcomeRecorded
+	if errors.As(err, &rec) {
+		return rec.err, true
+	}
+	return nil, false
+}
+
+// scheduledAfterRecordKey carries a fire's after-record hooks.
+type scheduledAfterRecordKey struct{}
+
+// scheduledAfterRecord collects the work a handler defers until fireEvent
+// has recorded the event's outcome, so that work never races that write.
+type scheduledAfterRecord struct {
+	mu    sync.Mutex
+	hooks []func()
+}
+
+// afterScheduledRecord runs fn once the fire's outcome is recorded: after
+// fireEvent's final write, or at once when ctx carries no fire scope (a
+// direct handler call).
+func afterScheduledRecord(ctx context.Context, fn func()) {
+	scope, _ := ctx.Value(scheduledAfterRecordKey{}).(*scheduledAfterRecord)
+	if scope == nil {
+		fn()
+		return
+	}
+	scope.mu.Lock()
+	scope.hooks = append(scope.hooks, fn)
+	scope.mu.Unlock()
+}
+
+// run runs the collected hooks, once.
+func (a *scheduledAfterRecord) run() {
+	a.mu.Lock()
+	hooks := a.hooks
+	a.hooks = nil
+	a.mu.Unlock()
+	for _, fn := range hooks {
+		fn()
+	}
+}
 
 // Scheduler manages recurring and one-shot timers within the Hub server.
 // A single root ticker fires at a configurable interval (default 1 minute) and
@@ -37,8 +126,9 @@ type EventHandler func(ctx context.Context, evt store.ScheduledEvent) error
 // via time.AfterFunc. On startup, expired timers fire immediately; future
 // timers are scheduled for their fire_at time.
 //
-// All recurring handlers must be registered via RegisterRecurring before
-// Start is called. RegisterRecurring is not safe for concurrent use.
+// All recurring handlers registered before Start use RegisterRecurring or
+// RegisterRecurringSingleton. UpsertRecurringSingleton and UnregisterRecurring
+// are safe for concurrent use after Start.
 type Scheduler struct {
 	// Store for persisting one-shot events
 	store store.Store
@@ -75,8 +165,12 @@ type Scheduler struct {
 	// RegisterLaunchReaper's doc comment for why.
 	launchReaper *launchReaperRegistration
 
-	// Event type handlers for one-shot events
-	eventHandlers map[string]EventHandler
+	// srv is the owning Hub server when wired (nil in standalone scheduler tests).
+	srv *Server
+
+	// actions backs standalone NewScheduler unit tests where srv is nil.
+	// When srv is wired, Server.actions is the single action registry.
+	actions actionRegistry
 
 	// Tick counter (monotonically increasing). Written by the ticker loop and
 	// read concurrently by handler goroutines and Status(), so it is atomic.
@@ -90,10 +184,14 @@ type Scheduler struct {
 	log *slog.Logger
 
 	// Lifecycle
-	ctx      context.Context // long-lived context from Start(); used for timer callbacks
-	stopCh   chan struct{}
-	stopOnce sync.Once
-	wg       sync.WaitGroup
+	ctx       context.Context    // long-lived context from Start(); used for timer callbacks
+	runCtx    context.Context    // derived from ctx, cancelled on halt(); guarded by mu
+	runCancel context.CancelFunc // cancels runCtx on halt(); guarded by mu
+	started   bool               // true once Start has initialized runCtx; guarded by mu
+	stopped   bool               // true once halt has run; guarded by mu
+	stopCh    chan struct{}
+	stopOnce  sync.Once
+	wg        sync.WaitGroup
 }
 
 // RecurringHandler defines a periodic task driven by the root ticker.
@@ -157,7 +255,6 @@ func NewScheduler(st store.Store, log *slog.Logger, opts ...SchedulerOption) *Sc
 		MaxJitter:      maxJitter,
 		MaxConcurrency: defaultMaxConcurrency,
 		timers:         make(map[string]*scheduledTimer),
-		eventHandlers:  make(map[string]EventHandler),
 		log:            log,
 		stopCh:         make(chan struct{}),
 	}
@@ -172,25 +269,58 @@ func NewScheduler(st store.Store, log *slog.Logger, opts ...SchedulerOption) *Sc
 	return s
 }
 
-// RegisterEventHandler registers a handler for a specific event type.
-// Must be called before Start(). Not safe for concurrent use: after Start,
-// eventHandlers is read without a lock.
-func (s *Scheduler) RegisterEventHandler(eventType string, handler EventHandler) {
-	s.eventHandlers[eventType] = handler
+// RegisterAction registers a FireAction on Server.actions when s.srv is set,
+// or on s.actions when s.srv is nil (standalone NewScheduler unit tests).
+func (s *Scheduler) RegisterAction(a FireAction) {
+	if s.srv != nil {
+		s.srv.RegisterAction(a)
+		return
+	}
+	s.actions.Register(a)
 }
 
-// GetEventHandler returns the handler for the given event type, if registered.
-func (s *Scheduler) GetEventHandler(eventType string) (EventHandler, bool) {
-	handler, ok := s.eventHandlers[eventType]
-	return handler, ok
+func (s *Scheduler) fireAction(ctx context.Context, req hubfire.FireRequest) hubfire.FireOutcome {
+	if s.srv != nil {
+		return s.srv.fireAction(ctx, req)
+	}
+	if action, ok := s.actions.Lookup(req.ActionType); ok {
+		if req.Executor.Kind != "" || req.Executor.ID != "" {
+			ctx = ContextWithExecutor(ctx, req.Executor)
+		}
+		out, err := action.Fire(ctx, req, nil)
+		if err != nil {
+			if reason, skipped := asScheduledSkip(err); skipped {
+				return hubfire.FireOutcome{
+					Status:      hubfire.FireStatusSkipped,
+					Error:       reason,
+					AfterRecord: out.AfterRecord,
+					Detached:    out.Detached,
+				}
+			}
+			return hubfire.FireOutcome{
+				Status:      hubfire.FireStatusFailed,
+				Error:       err.Error(),
+				AfterRecord: out.AfterRecord,
+				Detached:    out.Detached,
+			}
+		}
+		if out.Status == "" {
+			out.Status = hubfire.FireStatusFired
+		}
+		return out
+	}
+	return hubfire.FireOutcome{
+		Status: hubfire.FireStatusFailed,
+		Error:  unknownActionTypeError(req.ActionType),
+	}
 }
 
 // RegisterRecurring registers a recurring handler that runs every intervalMinutes
-// minutes. All handlers must be registered before Start is called: after
-// Start, recurring is read without a lock by the ticker and Status.
+// minutes.
 //
-// Tick-Zero Behavior: All recurring handlers run immediately on startup (tick 0)
-// because 0 % N == 0 for any interval N. This is intentional.
+// Tick-Zero Behavior: All recurring handlers registered before Start run
+// immediately on startup (tick 0) because 0 % N == 0 for any interval N.
+// This is intentional.
 func (s *Scheduler) RegisterRecurring(name string, intervalMinutes int, fn func(ctx context.Context)) {
 	s.registerRecurring(name, intervalMinutes, fn, false)
 }
@@ -204,12 +334,75 @@ func (s *Scheduler) registerRecurring(name string, intervalMinutes int, fn func(
 	if intervalMinutes < 1 {
 		intervalMinutes = 1
 	}
+	s.mu.Lock()
 	s.recurring = append(s.recurring, RecurringHandler{
 		Name:      name,
 		Interval:  intervalMinutes,
 		Fn:        fn,
 		Singleton: singleton,
 	})
+	s.mu.Unlock()
+}
+
+// UpsertRecurringSingleton registers a singleton recurring handler or updates
+// the interval and callback of an existing handler with the same name in place,
+// avoiding duplicate registrations. Safe for concurrent use after Start.
+//
+// When a NEW handler is added after Start (and before Stop), it is invoked once
+// asynchronously without waiting for the next interval tick, matching tick-zero
+// behavior for handlers registered before Start. Updating an existing handler
+// does not trigger an extra run.
+func (s *Scheduler) UpsertRecurringSingleton(name string, intervalMinutes int, key store.AdvisoryLockKey, fn func(ctx context.Context)) {
+	if intervalMinutes < 1 {
+		intervalMinutes = 1
+	}
+	wrapped := s.singletonGuard(name, key, fn)
+	var (
+		added   RecurringHandler
+		fireCtx context.Context
+	)
+	s.mu.Lock()
+	for i := range s.recurring {
+		if s.recurring[i].Name == name {
+			s.recurring[i].Interval = intervalMinutes
+			s.recurring[i].Fn = wrapped
+			s.recurring[i].Singleton = true
+			s.mu.Unlock()
+			return
+		}
+	}
+	added = RecurringHandler{
+		Name:      name,
+		Interval:  intervalMinutes,
+		Fn:        wrapped,
+		Singleton: true,
+	}
+	s.recurring = append(s.recurring, added)
+	if s.started && !s.stopped && s.runCtx != nil && s.runCtx.Err() == nil {
+		fireCtx = s.runCtx
+	}
+	s.mu.Unlock()
+
+	if fireCtx != nil {
+		s.launchRecurringHandler(fireCtx, added, s.tickCount.Load(), false)
+	}
+}
+
+// UnregisterRecurring removes any recurring handler with the given name.
+// Safe for concurrent use after Start.
+func (s *Scheduler) UnregisterRecurring(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	filtered := s.recurring[:0]
+	for _, h := range s.recurring {
+		if h.Name != name {
+			filtered = append(filtered, h)
+		}
+	}
+	for i := len(filtered); i < len(s.recurring); i++ {
+		s.recurring[i] = RecurringHandler{}
+	}
+	s.recurring = filtered
 }
 
 // RegisterRecurringSingleton registers a recurring handler that runs on AT MOST
@@ -345,7 +538,13 @@ func (s *Scheduler) Start(ctx context.Context) {
 	// Store the long-lived server context for use by timer callbacks.
 	// This prevents timers scheduled via HTTP requests from inheriting
 	// the short-lived request context.
+	s.mu.Lock()
 	s.ctx = ctx
+	if !s.stopped {
+		s.runCtx, s.runCancel = context.WithCancel(ctx)
+		s.started = true
+	}
+	s.mu.Unlock()
 
 	// Load and schedule persisted one-shot timers
 	s.loadPersistedTimers(ctx)
@@ -384,7 +583,9 @@ func (s *Scheduler) Start(ctx context.Context) {
 // and waits for the root ticker goroutine to exit. In-flight recurring
 // handler goroutines (spawned per tick by runRecurringHandlers) are not
 // tracked; they will be cancelled via the parent context when the server
-// shuts down. The launch reaper's dedicated goroutine is different: it runs
+// shuts down. Recurring wake fires (ptone/scion#7734) are the exception: they
+// run off the evaluator on detached contexts, and the hub's teardown joins
+// them (Server.scheduledDetachedFires). The launch reaper's dedicated goroutine is different: it runs
 // synchronously (no per-tick goroutine), is tracked by the same s.wg, and so
 // Stop also waits for it to exit — including finishing any tick already in
 // flight, bounded by the store's 10s tick timeout plus its up-to-2s
@@ -402,8 +603,12 @@ func (s *Scheduler) halt() {
 	s.stopOnce.Do(func() {
 		close(s.stopCh)
 
-		// Cancel all one-shot timers
+		// Cancel runCtx and all one-shot timers
 		s.mu.Lock()
+		s.stopped = true
+		if s.runCancel != nil {
+			s.runCancel()
+		}
 		for _, st := range s.timers {
 			st.Timer.Stop()
 			if st.Cancel != nil {
@@ -440,65 +645,84 @@ func (s *Scheduler) runRecurringHandlers(ctx context.Context) {
 
 	// Collect eligible handlers for this tick.
 	var eligible []RecurringHandler
+	s.mu.Lock()
 	for _, h := range s.recurring {
 		if tick%uint64(h.Interval) == 0 {
 			eligible = append(eligible, h)
 		}
 	}
+	s.mu.Unlock()
 	if len(eligible) == 0 {
 		return
 	}
 
 	for _, h := range eligible {
-		handler := h // capture loop variable
-		go func() {
-			// Stagger start: sleep a random 0–MaxJitter BEFORE acquiring a
-			// semaphore slot. This spreads arrivals at the semaphore over the
-			// jitter window so handlers don't hold concurrency slots during
-			// dead sleep time.
-			jitter := time.Duration(0)
-			if s.MaxJitter > 0 {
-				jitter = time.Duration(rand.Int63n(int64(s.MaxJitter)))
-			}
-			if jitter > 0 {
-				select {
-				case <-time.After(jitter):
-				case <-ctx.Done():
-					return
-				}
-			}
-
-			// Acquire semaphore slot if concurrency is limited.
-			// s.sem is shared across all ticks (initialized once in NewScheduler).
-			if s.sem != nil {
-				select {
-				case s.sem <- struct{}{}:
-					defer func() { <-s.sem }()
-				case <-ctx.Done():
-					return
-				}
-			}
-
-			handlerCtx, cancel := context.WithTimeout(ctx, 55*time.Second)
-			defer cancel()
-
-			start := time.Now()
-			s.log.Debug("Scheduler: running recurring handler", "name", handler.Name, "tick", tick)
-
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						s.log.Error("Scheduler: recurring handler panicked",
-							"name", handler.Name, "panic", r)
-					}
-				}()
-				handler.Fn(handlerCtx)
-			}()
-
-			s.log.Debug("Scheduler: recurring handler completed",
-				"name", handler.Name, "duration", time.Since(start))
-		}()
+		s.launchRecurringHandler(ctx, h, tick, true)
 	}
+}
+
+// launchRecurringHandler runs a single recurring handler in its own goroutine
+// with optional jitter, semaphore gating, timeout, and panic recovery.
+func (s *Scheduler) launchRecurringHandler(ctx context.Context, handler RecurringHandler, tick uint64, applyJitter bool) {
+	go func() {
+		// Stagger start: sleep a random 0–MaxJitter BEFORE acquiring a
+		// semaphore slot. This spreads arrivals at the semaphore over the
+		// jitter window so handlers don't hold concurrency slots during
+		// dead sleep time.
+		jitter := time.Duration(0)
+		if applyJitter && s.MaxJitter > 0 {
+			jitter = time.Duration(rand.Int63n(int64(s.MaxJitter)))
+		}
+		if jitter > 0 {
+			select {
+			case <-time.After(jitter):
+			case <-ctx.Done():
+				return
+			case <-s.stopCh:
+				return
+			}
+		}
+
+		// Acquire semaphore slot if concurrency is limited.
+		// s.sem is shared across all ticks (initialized once in NewScheduler).
+		if s.sem != nil {
+			select {
+			case s.sem <- struct{}{}:
+				defer func() { <-s.sem }()
+			case <-ctx.Done():
+				return
+			case <-s.stopCh:
+				return
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.stopCh:
+			return
+		default:
+		}
+
+		handlerCtx, cancel := context.WithTimeout(ctx, 55*time.Second)
+		defer cancel()
+
+		start := time.Now()
+		s.log.Debug("Scheduler: running recurring handler", "name", handler.Name, "tick", tick)
+
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					s.log.Error("Scheduler: recurring handler panicked",
+						"name", handler.Name, "panic", r)
+				}
+			}()
+			handler.Fn(handlerCtx)
+		}()
+
+		s.log.Debug("Scheduler: recurring handler completed",
+			"name", handler.Name, "duration", time.Since(start))
+	}()
 }
 
 // =============================================================================
@@ -582,23 +806,44 @@ func (s *Scheduler) fireEvent(ctx context.Context, evt store.ScheduledEvent, was
 	// from the initiator recorded on evt. Covers one-shot fires and restart
 	// replay of overdue events alike, since both paths call fireEvent.
 	ctx = ContextWithExecutor(ctx, ExecutorContext{Kind: "scheduler", ID: "scheduled_event:" + evt.ID})
-	handlerCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	afterRecord := &scheduledAfterRecord{}
+	ctx = context.WithValue(ctx, scheduledAfterRecordKey{}, afterRecord)
+	// Hooks run after the final status write below, on every return path
+	// after the claim; a lost claim registers none.
+	defer afterRecord.run()
+	detachedFire := s.eventFireDetaches(evt)
+	var scope *oneShotFireScope
+	if detachedFire {
+		// Registered before handlerCtx and before final persistence so
+		// runningDetachedFires / scheduledDetachedFires stay held until the final
+		// status write completes (ptone/scion#7791 b1).
+		ctx, scope = withOneShotFireScope(ctx)
+		defer scope.finish()
+	}
+	handlerCtx, cancel := context.WithTimeout(ctx, scheduledEventHandlerTimeout)
 	defer cancel()
 
-	status := store.ScheduledEventFired
+	finalStatus := store.ScheduledEventFired
 	if wasExpired {
-		status = store.ScheduledEventExpired
+		finalStatus = store.ScheduledEventExpired
+	}
+	claimStatus := finalStatus
+	if detachedFire {
+		// Claim detached events into provisional "firing" status so an unrecorded
+		// shutdown abandonment never looks like a completed delivery
+		// (ptone/scion#7791 c).
+		claimStatus = store.ScheduledEventFiring
 	}
 
 	// Multi-replica dedup (P3-5): several replicas may each recover the same
 	// pending event from the database on startup and arm a timer for it. Claim
-	// the event atomically (pending -> status) before running its side effect so
-	// exactly one replica delivers it. If the store supports claiming and we
-	// lose the race (already claimed/cancelled), skip silently. Backends without
-	// the capability fall through to the legacy run-then-mark behavior, which is
-	// correct for a single replica.
+	// the event atomically (pending -> claimStatus) before running its side
+	// effect so exactly one replica delivers it. If the store supports claiming
+	// and we lose the race (already claimed/cancelled), skip silently. Backends
+	// without the capability fall through to the legacy run-then-mark behavior,
+	// marking detached events firing first so CompleteFiringScheduledEvent matches.
 	if claimer, ok := s.store.(store.ScheduledEventClaimer); ok {
-		claimed, err := claimer.ClaimScheduledEvent(ctx, evt.ID, status)
+		claimed, err := claimer.ClaimScheduledEvent(ctx, evt.ID, claimStatus)
 		if err != nil {
 			s.log.Warn("Scheduler: failed to claim scheduled event; skipping to avoid duplicate",
 				"eventID", evt.ID, "type", evt.EventType, "error", err)
@@ -609,9 +854,18 @@ func (s *Scheduler) fireEvent(ctx context.Context, evt store.ScheduledEvent, was
 				"eventID", evt.ID, "type", evt.EventType)
 			return
 		}
+	} else if detachedFire && s.store != nil {
+		claimedAt := time.Now()
+		if err := s.store.UpdateScheduledEventStatus(ctx, evt.ID, store.ScheduledEventFiring, &claimedAt, ""); err != nil {
+			s.log.Warn("Scheduler: failed to mark detached event firing; skipping",
+				"eventID", evt.ID, "type", evt.EventType, "error", err)
+			return
+		}
 	}
 
 	var errMsg string
+	skipped := false
+	recorded := false
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -622,6 +876,20 @@ func (s *Scheduler) fireEvent(ctx context.Context, evt store.ScheduledEvent, was
 		}()
 
 		if err := s.executeEvent(handlerCtx, evt); err != nil {
+			if outcome, ok := asOutcomeRecorded(err); ok {
+				// The handler recorded the outcome itself.
+				recorded = true
+				s.log.Info("Scheduler: event outcome recorded by its handler",
+					"eventID", evt.ID, "type", evt.EventType, "outcome", outcome)
+				return
+			}
+			if reason, ok := asScheduledSkip(err); ok {
+				// Not a failure: the fire ran nothing (ptone/scion#7883).
+				skipped, errMsg = true, reason
+				s.log.Info("Scheduler: event skipped",
+					"eventID", evt.ID, "type", evt.EventType, "reason", reason)
+				return
+			}
 			errMsg = err.Error()
 			s.log.Warn("Scheduler: event handler failed",
 				"eventID", evt.ID, "type", evt.EventType, "error", err)
@@ -631,28 +899,71 @@ func (s *Scheduler) fireEvent(ctx context.Context, evt store.ScheduledEvent, was
 		}
 	}()
 
+	var run *detachedFireRun
+	if scope != nil {
+		var aborted bool
+		run, aborted = scope.state()
+		if errMsg != "" && aborted {
+			errMsg = errScheduledWakeShutdown.Error()
+		}
+	}
+
 	// If the handler returned an error or panicked, record the event as
-	// failed rather than fired. The atomic claim (when available) already
-	// transitioned pending→fired for dedup; this final write transitions
-	// fired→failed so the persisted status reflects the actual outcome.
-	if errMsg != "" {
+	// failed rather than fired/expired.
+	status := finalStatus
+	switch {
+	case skipped:
+		status = store.ScheduledEventSkipped
+	case errMsg != "":
 		status = store.ScheduledEventFailed
 	}
 
-	now := time.Now()
-	if s.store != nil {
-		_ = s.store.UpdateScheduledEventStatus(ctx, evt.ID, status, &now, errMsg)
+	// Record the outcome on a bounded context of its own: the event was
+	// claimed before the handler ran, and a shutdown that cancelled ctx
+	// meanwhile (halt) must not leave the failure unrecorded
+	// (ptone/scion#7734). When tracked via detachedFireRun, share its single-claim
+	// coordination with recordAbandonedDetachedFires so teardown and fireEvent
+	// never double-write or overwrite each other (ptone/scion#7791 b2).
+	if s.store == nil || recorded {
+		return
 	}
+	persist := func() {
+		now := time.Now()
+		recordCtx, cancelRecord := context.WithTimeout(context.WithoutCancel(ctx), scheduledEventRecordTimeout)
+		defer cancelRecord()
+		if detachedFire {
+			_, _ = s.store.CompleteFiringScheduledEvent(recordCtx, evt.ID, status, now, errMsg, "", time.Time{})
+			return
+		}
+		_ = s.store.UpdateScheduledEventStatus(recordCtx, evt.ID, status, &now, errMsg)
+	}
+	if run != nil {
+		run.tryRecord(persist)
+		return
+	}
+	persist()
 }
 
-// executeEvent dispatches the event to the appropriate handler based on its
+// executeEvent dispatches the event through the fire core based on its
 // EventType. Unknown event types return an error.
 func (s *Scheduler) executeEvent(ctx context.Context, evt store.ScheduledEvent) error {
-	handler, ok := s.eventHandlers[evt.EventType]
-	if !ok {
-		return fmt.Errorf("unknown event type: %s", evt.EventType)
+	exec := ExecutorContext{Kind: "scheduler", ID: "scheduled_event:" + evt.ID}
+	if existing, ok := ExecutorContextFromContext(ctx); ok {
+		exec = existing
 	}
-	return handler(ctx, evt)
+	fireCtx := withFireHistoryCreator(ctx, evt.CreatedBy)
+	st := s.store
+	if st == nil && s.srv != nil {
+		st = s.srv.store
+	}
+	out := s.fireAction(fireCtx, scheduledFireRequestWithSchedule(fireCtx, s.srv, st, evt, nil, exec))
+	if out.AfterRecord != nil {
+		after := out.AfterRecord
+		afterScheduledRecord(ctx, func() {
+			after(context.WithoutCancel(ctx))
+		})
+	}
+	return scheduledFireError(evt.EventType, out)
 }
 
 // ScheduleEvent creates a new one-shot scheduled event. The event is persisted
@@ -680,6 +991,26 @@ func (s *Scheduler) ScheduleEvent(ctx context.Context, evt store.ScheduledEvent)
 	return nil
 }
 
+// ScheduleEventVia is ScheduleEvent with the insert done by create (for
+// example a quota-checked insert); the timer is armed only after create
+// succeeds.
+func (s *Scheduler) ScheduleEventVia(ctx context.Context, evt store.ScheduledEvent, create func(ctx context.Context, evt *store.ScheduledEvent) error) error {
+	if s.store == nil {
+		return fmt.Errorf("scheduler has no store configured")
+	}
+	if err := create(ctx, &evt); err != nil {
+		return err
+	}
+	timerCtx := s.ctx
+	if timerCtx == nil {
+		timerCtx = context.Background()
+	}
+	s.scheduleTimer(timerCtx, evt)
+	s.log.Info("Scheduler: event scheduled",
+		"eventID", evt.ID, "type", evt.EventType, "fireAt", evt.FireAt)
+	return nil
+}
+
 // SchedulerStatus holds a point-in-time snapshot of the scheduler's state.
 type SchedulerStatus struct {
 	TickCount      uint64                 `json:"tickCount"`
@@ -698,6 +1029,7 @@ type RecurringHandlerInfo struct {
 
 // Status returns a snapshot of the scheduler's current state.
 func (s *Scheduler) Status() SchedulerStatus {
+	s.mu.Lock()
 	recurring := make([]RecurringHandlerInfo, len(s.recurring))
 	for i, h := range s.recurring {
 		recurring[i] = RecurringHandlerInfo{
@@ -705,15 +1037,15 @@ func (s *Scheduler) Status() SchedulerStatus {
 			Interval: h.Interval,
 		}
 	}
-
-	eventHandlers := make([]string, 0, len(s.eventHandlers))
-	for t := range s.eventHandlers {
-		eventHandlers = append(eventHandlers, t)
-	}
-
-	s.mu.Lock()
 	activeTimers := len(s.timers)
 	s.mu.Unlock()
+
+	var eventHandlers []string
+	if s.srv != nil {
+		eventHandlers = s.srv.actions.Types()
+	} else {
+		eventHandlers = s.actions.Types()
+	}
 
 	return SchedulerStatus{
 		TickCount:      s.tickCount.Load(),

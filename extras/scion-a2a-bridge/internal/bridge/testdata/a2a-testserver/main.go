@@ -276,16 +276,19 @@ func (m *mockProdHubClient) Subscriptions() hubclient.SubscriptionService   { re
 func (m *mockProdHubClient) SubscriptionTemplates() hubclient.SubscriptionTemplateService {
 	return nil
 }
-func (m *mockProdHubClient) ScheduledEvents(string) hubclient.ScheduledEventService { return nil }
-func (m *mockProdHubClient) Schedules(string) hubclient.ScheduleService             { return nil }
-func (m *mockProdHubClient) GCPServiceAccounts() hubclient.GCPServiceAccountService { return nil }
-func (m *mockProdHubClient) Messages() hubclient.MessageService                     { return nil }
-func (m *mockProdHubClient) Conversations() hubclient.ConversationService           { return nil }
-func (m *mockProdHubClient) ThreadGroups() hubclient.ThreadGroupService             { return nil }
-func (m *mockProdHubClient) AllowList() hubclient.AllowListService                  { return nil }
-func (m *mockProdHubClient) Invites() hubclient.InviteService                       { return nil }
-func (m *mockProdHubClient) Skills() hubclient.SkillService                         { return nil }
-func (m *mockProdHubClient) SkillRegistries() hubclient.SkillRegistryService        { return nil }
+func (m *mockProdHubClient) ScheduledEvents(string) hubclient.ScheduledEventService   { return nil }
+func (m *mockProdHubClient) Schedules(string) hubclient.ScheduleService               { return nil }
+func (m *mockProdHubClient) WebhookEndpoints(string) hubclient.WebhookEndpointService { return nil }
+func (m *mockProdHubClient) Triggers(string) hubclient.TriggerService                 { return nil }
+func (m *mockProdHubClient) TriggerEvents(string) hubclient.TriggerEventService       { return nil }
+func (m *mockProdHubClient) GCPServiceAccounts() hubclient.GCPServiceAccountService   { return nil }
+func (m *mockProdHubClient) Messages() hubclient.MessageService                       { return nil }
+func (m *mockProdHubClient) Conversations() hubclient.ConversationService             { return nil }
+func (m *mockProdHubClient) ThreadGroups() hubclient.ThreadGroupService               { return nil }
+func (m *mockProdHubClient) AllowList() hubclient.AllowListService                    { return nil }
+func (m *mockProdHubClient) Invites() hubclient.InviteService                         { return nil }
+func (m *mockProdHubClient) Skills() hubclient.SkillService                           { return nil }
+func (m *mockProdHubClient) SkillRegistries() hubclient.SkillRegistryService          { return nil }
 func (m *mockProdHubClient) ProjectInjectedSkills(projectID string) hubclient.InjectedSkillsService {
 	return nil
 }
@@ -300,9 +303,20 @@ func (m *mockProdHubClient) HubPreStartHooks() hubclient.HubPreStartHookService 
 func (m *mockProdHubClient) Artifacts() hubclient.ArtifactService               { return nil }
 func (m *mockProdHubClient) TestIdentities() hubclient.TestIdentityService      { return nil }
 func (m *mockProdHubClient) Messaging() hubclient.MessagingService              { return nil }
+func (m *mockProdHubClient) AdminSettings() hubclient.AdminSettingsService      { return nil }
 func (m *mockProdHubClient) TestIdentityDelegations() hubclient.TestIdentityDelegationService {
 	return nil
 }
+func (m *mockProdHubClient) AgentDelegations() hubclient.AgentDelegationService       { return nil }
+func (m *mockProdHubClient) Decisions() hubclient.DecisionService                     { return nil }
+func (m *mockProdHubClient) ProjectDecisions(string) hubclient.ProjectDecisionService { return nil }
+func (m *mockProdHubClient) ProjectMessagePolicies(string) hubclient.MessagePolicyService {
+	return nil
+}
+func (m *mockProdHubClient) MyDecisions() hubclient.MyDecisionService       { return nil }
+func (m *mockProdHubClient) SystemOne() hubclient.SystemOneService          { return nil }
+func (m *mockProdHubClient) GitHubApp() hubclient.GitHubAppService          { return nil }
+func (m *mockProdHubClient) TriggerPresets() hubclient.TriggerPresetService { return nil }
 func (m *mockProdHubClient) Health(ctx context.Context) (*hubclient.HealthResponse, error) {
 	return &hubclient.HealthResponse{}, nil
 }

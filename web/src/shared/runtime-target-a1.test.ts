@@ -61,6 +61,38 @@ describe('isFlatBroker and runtimeTargetLabel', () => {
     expect(runtimeTargetLabel({ runtimeTarget: docker })).toBe('docker');
     expect(runtimeTargetLabel({})).toBe('');
   });
+
+  it('labels a Cloud Run flat target with Cloud Run and region when reported', () => {
+    const cr = { id: 'rt-cr', type: 'cloudrun' };
+    const crPres: RuntimeTargetPresentation = {
+      schemaVersion: 1,
+      key: 'cr-us-central1',
+      name: 'cr-us-central1',
+      target: { type: 'cloudrun', region: 'us-central1' },
+    };
+    expect(runtimeTargetLabel({ runtimeTarget: cr })).toBe('Cloud Run');
+    expect(runtimeTargetLabel({ runtimeTarget: cr, runtimeTargetPresentation: crPres })).toBe(
+      'Cloud Run · us-central1'
+    );
+    expect(
+      runtimeTargetLabel({
+        runtimeTarget: { ...cr, displayName: 'cloudrun' },
+        runtimeTargetPresentation: crPres,
+      })
+    ).toBe('Cloud Run · us-central1');
+    expect(
+      runtimeTargetLabel({
+        runtimeTarget: { ...cr, displayName: 'Cloud Run' },
+        runtimeTargetPresentation: crPres,
+      })
+    ).toBe('Cloud Run · us-central1');
+    expect(
+      runtimeTargetLabel({
+        runtimeTarget: { ...cr, displayName: 'Staging' },
+        runtimeTargetPresentation: crPres,
+      })
+    ).toBe('Cloud Run · Staging · us-central1');
+  });
 });
 
 describe('tolerationLabel', () => {
@@ -114,10 +146,27 @@ describe('placementRows', () => {
     ]);
   });
 
-  it('is empty for docker, for an unknown type, and when nothing is reported', () => {
+  it('is empty for docker, for an unknown type, and without a presentation', () => {
     expect(placementRows(docker, withPlacement())).toEqual([]);
     expect(placementRows({ id: 'x', type: 'cloudrun' }, withPlacement())).toEqual([]);
-    expect(placementRows(k8s, fullPresentation())).toEqual([]);
     expect(placementRows(k8s, undefined)).toEqual([]);
+  });
+
+  it('tells placement not reported from reported empty placement', () => {
+    expect(placementRows(k8s, fullPresentation())).toEqual([
+      { label: 'Placement', value: 'Not reported' },
+    ]);
+    const reportedEmpty = fullPresentation();
+    reportedEmpty.target = { ...reportedEmpty.target!, placementReported: true };
+    expect(placementRows(k8s, reportedEmpty)).toEqual([
+      { label: 'Placement', value: 'None configured on the broker' },
+    ]);
+    const reported = withPlacement();
+    reported.target = { ...reported.target!, placementReported: true };
+    expect(placementRows(k8s, reported).map((r) => r.label)).toEqual([
+      'Node selector',
+      'Tolerations',
+      'Runtime class',
+    ]);
   });
 });

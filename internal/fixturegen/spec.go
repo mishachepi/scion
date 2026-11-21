@@ -61,6 +61,11 @@ const (
 	// visitorDomain a normalized visitor rule domain (lower case, exact).
 	visitorIssuer = "https://issuer.fixture.example"
 	visitorDomain = "partner.example"
+
+	webhookEndpointID = "e0100000-0000-0000-0000-000000000001"
+	triggerID         = "e0200000-0000-0000-0000-000000000001"
+	triggerEventID    = "e0300000-0000-0000-0000-000000000001"
+	triggerFireID     = "e0400000-0000-0000-0000-000000000001"
 )
 
 // baseTime is a fixed timestamp so the generated fixture is byte-reproducible
@@ -123,6 +128,11 @@ func Spec() []TableFixture {
 				"kind": "federated", "home_issuer": visitorIssuer,
 				"federated_email": "visitor@" + visitorDomain, "created_at": baseTime,
 			},
+			{ // user of the stopping forced deletion below: status deleting
+				"id": "22222222-2222-2222-2222-2222222222d1", "email": "deleting@example.com",
+				"display_name": "Deleting", "role": "member", "status": "deleting",
+				"created_at": baseTime,
+			},
 		}},
 		{Table: "runtime_brokers", Rows: []row{
 			{
@@ -138,6 +148,13 @@ func Spec() []TableFixture {
 				"applied_config": nestedConfigJSON,
 				"created_at":     baseTime, "updated_at": baseTime,
 				"phase": "running", "state_version": 1,
+				// WP1 slice 3: the bound launch run and the broker's
+				// effective-configuration echo.
+				"launch_id": "44444444-4444-4444-4444-4444444444aa", "launch_run_id": "55555555-5555-5555-5555-5555555555aa",
+				"run_id": "55555555-5555-5555-5555-5555555555aa",
+				"effective_config": `{"runId":"55555555-5555-5555-5555-5555555555aa","template":"claude",` +
+					`"templateHash":"sha256:ab","harness":"claude","model":"claude-opus","brokerId":"` + brokerID + `",` +
+					`"brokerBuild":"v1.2.3","source":"sync","reportedAt":"2026-01-01T00:00:00Z"}`,
 			},
 			{ // soft-deleted agent (deleted_at populated)
 				"id": "33333333-3333-3333-3333-3333333333aa", "agent_id": "33333333-3333-3333-3333-3333333333aa",
@@ -231,6 +248,18 @@ func Spec() []TableFixture {
 				"secret_type": "environment", "created_at": baseTime, "updated_at": baseTime,
 			},
 		}},
+		{Table: "pending_secrets", Rows: []row{
+			{ // an agent-written user secret awaiting the owner's approval
+				"id": "5ec10000-0000-0000-0000-000000000001", "key": "TOOL_AUTH",
+				"secret_type": "file", "target": "~/.config/tool/creds.json",
+				"scope": "user", "scope_id": userID, "allow_progeny": true,
+				"injection_mode": "as_needed", "value_ref": "enc:v1:test-value-1", "value_len": 12,
+				"agent_id": agentID, "agent_slug": "fixture-agent", "project_id": projectID,
+				"project_name": "fixture-project", "created": baseTime, "updated": baseTime,
+				"replaces_secret_id": "5ec00000-0000-0000-0000-000000000001", "replaces_version": 1,
+				"expires_at": baseTime.Add(7 * 24 * time.Hour),
+			},
+		}},
 		{Table: "templates", Rows: []row{
 			{
 				"id": "7e000000-0000-0000-0000-000000000001", "name": "claude", "slug": "claude",
@@ -279,6 +308,15 @@ func Spec() []TableFixture {
 				"run_id": "fixture-run-1", "broker_id": brokerID, "seen_at": baseTime,
 			},
 		}},
+		{Table: "runtime_orphans", Rows: []row{
+			{ // an instance a broker reported with no hub agent
+				"id": "b8000000-0000-0000-0000-000000000001", "kind": "instance", "broker_id": brokerID,
+				"runtime_target": "docker", "project_id": projectID, "slug": "fixture-orphan",
+				"agent_id": "", "run_id": "fixture-run-2", "reason": "no_agent", "observed_phase": "running",
+				"first_seen_at": baseTime, "last_seen_at": baseTime, "missed_inventories": 0,
+				"action_state": "none", "action_error": "",
+			},
+		}},
 		{Table: "broker_join_tokens", Rows: []row{
 			{
 				"broker_id": brokerID, "token_hash": "abc123hash", "expires_at": baseTime.Add(time.Hour),
@@ -311,12 +349,110 @@ func Spec() []TableFixture {
 			},
 		}},
 		{Table: "messages", Rows: []row{
-			{
+			{ // NULL hold_until and not_reached_at exercise the nullable hold/proof columns
 				"id": messageID, "project_id": projectID,
 				"sender": "user:alice", "sender_id": userID, "recipient": "agent:worker",
 				"recipient_id": agentID, "msg": "do the thing — café ☕", "type": "instruction",
 				"agent_id": agentID, "created_at": baseTime,
 			},
+			{ // held message in awaiting_session (ptone/scion#7881): populated hold_until and hold_launch_id
+				"id": "88888888-8888-8888-8888-888888888889", "project_id": projectID,
+				"sender": "user:alice", "sender_id": userID, "recipient": "agent:worker",
+				"recipient_id": agentID, "msg": "held until session connects", "type": "instruction",
+				"agent_id": agentID, "dispatch_state": "awaiting_session",
+				"hold_until": baseTime.Add(10 * time.Minute), "hold_launch_id": "55555555-5555-5555-5555-5555555555aa",
+				"created_at": baseTime,
+			},
+		}},
+		{Table: "agent_delivery_holds", Rows: []row{
+			{ // per-agent hold marker paired with the awaiting_session message row above (ptone/scion#7881)
+				"agent_id": agentID, "hold_until": baseTime.Add(10 * time.Minute),
+				"launch_id": "55555555-5555-5555-5555-5555555555aa", "held_count": 1,
+				"created": baseTime,
+			},
+		}},
+		// ---- Choice prompt decisions ----
+		{Table: "decisions", Rows: []row{
+			{ // decided version of a hub-numbered key, in a conversation, with a default and an intro
+				"id": "dc000000-0000-0000-0000-000000000002", "project_id": projectID,
+				"conversation_id": conversationID, "message_id": messageID, "position": 0,
+				"asker_agent_id": agentID, "asker_agent_name": "worker",
+				"key": "1", "key_norm": "1", "key_source": "hub", "version": 2,
+				"question":          "Ship the feature now? — café ☕",
+				"choices":           `[{"id":"1","label":"yes"},{"id":"2","label":"no — später"}]`,
+				"default_choice_id": "1", "intro_length": 12, "status": "decided",
+				"created_at": baseTime, "decided_at": baseTime.Add(time.Minute),
+			},
+			{ // replaced version 1 of the same key: nullable conversation and default left NULL
+				"id": "dc000000-0000-0000-0000-000000000001", "project_id": projectID,
+				"message_id": messageID, "position": 1,
+				"asker_agent_id": agentID, "asker_agent_name": "worker",
+				"key": "1", "key_norm": "1", "key_source": "hub", "version": 1,
+				"question": "Ship the feature?", "choices": `[{"id":"1","label":"yes"},{"id":"2","label":"no"}]`,
+				"status": "replaced", "replaced_by_id": "dc000000-0000-0000-0000-000000000002",
+				"created_at": baseTime, "replaced_at": baseTime,
+			},
+			{ // withdrawn decision version with reason (ptone/scion#8190)
+				"id": "dc000000-0000-0000-0000-000000000003", "project_id": projectID,
+				"conversation_id": conversationID, "message_id": messageID, "position": 2,
+				"asker_agent_id": agentID, "asker_agent_name": "worker",
+				"key": "D-WD", "key_norm": "d-wd", "key_source": "agent", "version": 1,
+				"question": "Obsolete rollout check?", "choices": `[{"id":"1","label":"yes"},{"id":"2","label":"no"}]`,
+				"status": "withdrawn", "created_at": baseTime,
+				"withdrawn_at": baseTime.Add(2 * time.Minute), "withdrawn_reason": "Plan changed",
+			},
+			{ // dismissed decision version paired with an outcome=dismiss answer row (ptone/scion#8213)
+				"id": "dc000000-0000-0000-0000-000000000004", "project_id": projectID,
+				"conversation_id": conversationID, "message_id": messageID, "position": 3,
+				"asker_agent_id": agentID, "asker_agent_name": "worker",
+				"key": "D-DSM", "key_norm": "d-dsm", "key_source": "agent", "version": 1,
+				"question": "Stale approval check?", "choices": `[{"id":"1","label":"yes"},{"id":"2","label":"no"}]`,
+				"status": "dismissed", "created_at": baseTime,
+				"dismissed_at": baseTime.Add(6 * time.Minute),
+			},
+			{ // decision with allow_other options answered with free-form text (ptone/scion#8152)
+				"id": "dc000000-0000-0000-0000-000000000005", "project_id": projectID,
+				"conversation_id": conversationID, "message_id": messageID, "position": 4,
+				"asker_agent_id": agentID, "asker_agent_name": "worker",
+				"key": "region", "key_norm": "region", "key_source": "agent", "version": 1,
+				"question": "Which region for the canary?", "choices": `[{"id":"1","label":"us-central1"}]`,
+				"allow_other": true, "other_label": "Another region",
+				"other_description": "Any GCP region code", "other_placeholder": "e.g. europe-west4",
+				"status": "decided", "created_at": baseTime, "decided_at": baseTime.Add(3 * time.Minute),
+			},
+		}},
+		{Table: "decision_answers", Rows: []row{
+			{ // a direct answer recorded from the web session
+				"id": "da000000-0000-0000-0000-000000000001", "decision_row_id": "dc000000-0000-0000-0000-000000000002",
+				"project_id": projectID, "asker_agent_id": agentID, "key": "1", "version": 2,
+				"question_text": "Ship the feature now? — café ☕", "choice_id": "2", "choice_label": "no — später",
+				"answered_by_user_id": userID, "answered_by_name": "Alice", "answered_by_email": "alice@example.com",
+				"provenance": "direct", "outcome": "answer", "surface": "native",
+				"response_message_id": messageID, "idempotency_key": "web-1", "created_at": baseTime.Add(time.Minute),
+				"batch_id": "ba000000-0000-0000-0000-000000000001", "matched_default": false,
+			},
+			{ // a dismissal recorded from the Decisions page (ptone/scion#8213)
+				"id": "da000000-0000-0000-0000-000000000002", "decision_row_id": "dc000000-0000-0000-0000-000000000004",
+				"project_id": projectID, "asker_agent_id": agentID, "key": "D-DSM", "version": 1,
+				"question_text": "Stale approval check?", "choice_id": "$dismissed", "choice_label": "Dismissed",
+				"answered_by_user_id": userID, "answered_by_name": "Alice", "answered_by_email": "alice@example.com",
+				"provenance": "direct", "outcome": "dismiss", "dismiss_reason": "Already handled out of band",
+				"surface": "decisions_page", "response_message_id": messageID, "created_at": baseTime.Add(6 * time.Minute),
+				"batch_id": "ba000000-0000-0000-0000-000000000002", "matched_default": false,
+			},
+			{ // a direct Other free-form answer (ptone/scion#8152)
+				"id": "da000000-0000-0000-0000-000000000003", "decision_row_id": "dc000000-0000-0000-0000-000000000005",
+				"project_id": projectID, "asker_agent_id": agentID, "key": "region", "version": 1,
+				"question_text": "Which region for the canary?", "choice_id": "$other", "choice_label": "Another region",
+				"other_text":          "europe-west4 canary",
+				"answered_by_user_id": userID, "answered_by_name": "Alice", "answered_by_email": "alice@example.com",
+				"provenance": "direct", "outcome": "answer", "surface": "native",
+				"response_message_id": messageID, "idempotency_key": "web-other-1", "created_at": baseTime.Add(3 * time.Minute),
+				"matched_default": false,
+			},
+		}},
+		{Table: "decision_key_counters", Rows: []row{
+			{"agent_id": agentID, "next": 2},
 		}},
 
 		// ---- Schedules ----
@@ -333,6 +469,39 @@ func Spec() []TableFixture {
 				"id": "5e000000-0000-0000-0000-000000000001", "project_id": projectID,
 				"event_type": "dispatch_agent", "fire_at": baseTime.Add(time.Hour),
 				"payload": `{"task":"run"}`, "status": "pending", "created_at": baseTime,
+			},
+			{
+				"id": "5e000000-0000-0000-0000-000000000002", "project_id": projectID,
+				"event_type": "exec", "fire_at": baseTime.Add(-time.Hour), "fired_at": baseTime.Add(-time.Hour),
+				"payload": `{"agentId":"` + agentID + `","command":["true"]}`, "status": "fired", "created_at": baseTime,
+			},
+		}},
+		// One admitted, finished exec run of the fired exec event above
+		// (ptone/scion#7883); event_id references scheduled_events.
+		{Table: "scheduled_exec_runs", Rows: []row{
+			{
+				"id": "5f000000-0000-0000-0000-000000000001", "event_id": "5e000000-0000-0000-0000-000000000002",
+				"project_id": projectID, "target_agent_id": agentID,
+				"initiator_principal_kind": "user", "initiator_principal_id": userID,
+				"initiator_credential_kind": "session", "initiator_credential_id": "",
+				"authorization_revision": 1, "executor_kind": "scheduler",
+				"executor_id":    "scheduled_event:5e000000-0000-0000-0000-000000000002",
+				"command_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+				"argc":           1, "timeout_seconds": 60,
+				"started_at": baseTime.Add(-time.Hour), "not_after": baseTime.Add(-time.Hour + time.Minute),
+				"lease_until": baseTime.Add(-time.Hour + 3*time.Minute), "finished_at": baseTime.Add(-time.Hour + time.Second),
+				"last_polled_at": baseTime.Add(-time.Hour), "poll_seq": int64(1),
+				"outcome": "ok", "exit_code": 0, "duration_ms": 1000, "output_bytes": 0,
+				"runtime": "docker", "launch_id": "",
+			},
+		}},
+		// Persisted per-agent recovery-sweep turn cursor (ptone/scion#8096).
+		{Table: "scheduled_exec_poll_cursors", Rows: []row{
+			{
+				"id":              "5f100000-0000-0000-0000-000000000001",
+				"target_agent_id": agentID,
+				"turn_seq":        int64(1),
+				"last_polled_at":  baseTime.Add(-time.Hour),
 			},
 		}},
 		{Table: "lifecycle_hooks", Rows: []row{
@@ -411,8 +580,10 @@ func Spec() []TableFixture {
 			{
 				"installation_id": int64(987654), "account_login": "example-org",
 				"account_type": "Organization", "app_id": int64(112233),
-				"repositories": `["example/platform","example/infra"]`, "status": "active",
-				"created_at": baseTime, "updated_at": baseTime,
+				"repositories":    `["example/platform","example/infra"]`,
+				"trigger_routing": `{"example/platform":{"primary_project_id":"` + projectID + `","set_by":"` + userID + `","set_at":"2026-01-15T10:00:00Z"}}`,
+				"status":          "active",
+				"created_at":      baseTime, "updated_at": baseTime,
 			},
 		}},
 
@@ -583,6 +754,40 @@ func Spec() []TableFixture {
 				"previous_applied_config": nestedConfigJSON,
 				"new_applied_config":      nestedConfigJSON,
 				"handoff":                 "handoff notes: naïve café 北京 🚀",
+			},
+		}},
+
+		// ---- Agent lifecycle event sequencing and outbox (WP1) ----
+		{Table: "agent_lifecycle_cursors", Rows: []row{
+			{
+				"agent_id": agentID, "project_id": projectID,
+				"transition_revision": 3, "metadata_revision": 2,
+				"metadata_digest": strings.Repeat("d", 64), "last_fingerprint": strings.Repeat("f", 64),
+				"last_deleted": false, "open_run": "", "open_run_generation": "",
+				"open_run_metadata_revision": 0, "pending_run_change_at": nil,
+				"reincarnation_base_run_id": "", "pending_adopted_from": "",
+				"pending_adopted_at": nil, "pending_adoption_source": "", "pending_adopted_to": "",
+				"creator_principal_type": "user", "creator_principal_id": userID,
+				"requested_template": "claude",
+				"updated_at":         baseTime,
+				// Persistent run attribution (WP1 attribution design v2.8):
+				// a clear cursor whose stamp equals updated_at.
+				"attribution_state": "clear", "attribution_stamp": baseTime,
+				"last_run": "", "last_generation": "1",
+				"attributed_run": "", "attributed_generation": "",
+				"quarantined_runs": "", "quarantine_mode": "complete",
+				"reincarnation_mint_run": "", "untrusted_open_run": "",
+				"untrusted_open_run_generation": "", "untrusted_open_run_rev": 0,
+			},
+		}},
+		{Table: "agent_lifecycle_outbox", Rows: []row{
+			{
+				"seq": 1, "event_id": "e1000000-0000-4000-8000-000000000001", "agent_id": agentID,
+				"transition_revision": 1,
+				"payload":             `{"schema_version":1,"event_type":"agent.lifecycle","event_id":"e1000000-0000-4000-8000-000000000001","transition":"created","metadata":{"name":"naïve café 北京 🚀","labels":[]}}`,
+				"created_at":          baseTime, "attempts": 2, "permanent_failures": 0,
+				"next_attempt_at": baseTime.Add(time.Minute), "lease_owner": "", "lease_until": nil,
+				"last_error": "unavailable: fixture",
 			},
 		}},
 
@@ -924,6 +1129,53 @@ func Spec() []TableFixture {
 			},
 		}},
 
+		// ---- Chat message retention (hub.chat_retention; policy and
+		// per-project counts only, never message IDs or content) ----
+		{Table: "chat_retention_runs", Rows: []row{
+			{
+				"id": "5b0c1e2d-3f4a-4b5c-8d6e-7f8091a2b3c4", "trigger": "sweep", "dry_run": false,
+				"started_at": baseTime, "finished_at": baseTime, "status": "ok",
+				"actor":  nil,
+				"policy": `{"messages_retention_days":30,"main_cutoff":"2025-12-02T12:00:00Z"}`,
+				"counts": `{"` + projectID + `":{"main":12,"addressees":12,"mentions":3,"stars":1,"ext":12}}`,
+				"error":  nil,
+			},
+		}},
+		{Table: "chat_retention_cursors", Rows: []row{
+			{
+				"phase": "main", "cursor_created": baseTime, "cursor_id": "6c1d2e3f-4a5b-4c6d-9e7f-8091a2b3c4d5",
+				"reset_at": baseTime, "last_applied_cutoff": baseTime, "updated_at": baseTime,
+			},
+		}},
+
+		// ---- Secret encryption policy and migrations (ptone/scion#1530
+		// §6; key IDs and progress only, never key material) ----
+		{Table: "hub_encryption_policy", Rows: []row{
+			{ // the singleton row (id is always 1), bound to the migration below
+				"id": 1, "generation": int64(2), "min_reader_version": 2,
+				"allowed_write_kids": `["fixture-k2"]`, "required_read_kids": `["fixture-k1","fixture-k2"]`,
+				"migration_id": "e5000000-0000-4000-8000-000000000001",
+				"state":        "rewrapping", "updated_at": baseTime,
+			},
+		}},
+		{Table: "hub_encryption_migrations", Rows: []row{
+			{ // running job with plaintext admission
+				"id": "e5000000-0000-4000-8000-000000000001", "source_generation": int64(1),
+				"target_kid": "fixture-k2", "state": "running",
+				"last_scanned_id":         "00000000-0000-4000-8000-000000000042",
+				"plaintext_read_admitted": true,
+				"scanned":                 int64(42), "rewritten": int64(40), "failures": int64(0),
+				"created": baseTime, "updated": baseTime,
+			},
+			{ // verified job: admission cleared, empty cursor default
+				"id": "e5000000-0000-4000-8000-000000000002", "source_generation": int64(0),
+				"target_kid": "fixture-k1", "state": "verified",
+				"last_scanned_id": "", "plaintext_read_admitted": false,
+				"scanned": int64(7), "rewritten": int64(7), "failures": int64(0),
+				"created": baseTime, "updated": baseTime,
+			},
+		}},
+
 		// ---- Test infrastructure marker (admin tier A0, ptone/scion#4240;
 		// single row, written only by `scion server test-infra mark`) ----
 		{Table: "test_infra_marker", Rows: []row{
@@ -966,6 +1218,188 @@ func Spec() []TableFixture {
 				"workload_sub": "100000000000000000001", "scope": "test_identity:issue",
 				"member_cap": 2, "label": "", "created_at": baseTime,
 				"expires_at": baseTime.Add(time.Hour), "revoked_at": baseTime.Add(time.Minute), "revoked_by": userID,
+			},
+		}},
+
+		// ---- Forced user deletions (ptone/scion#2143): a tombstone in state
+		// stopping (NULL completed_at) and a completed one whose user row is
+		// gone; their agents, one per outcome kind that leaves a record ----
+		{Table: "user_deletions", Rows: []row{
+			{
+				"id": "de100000-0000-0000-0000-000000000001", "user_id": "22222222-2222-2222-2222-2222222222d1",
+				"state": "stopping", "requested_by_kind": "user", "requested_by_id": userID,
+				"credential_kind": "session", "requested_at": baseTime, "completed_at": nil,
+				"last_reconciled_at": baseTime.Add(time.Minute),
+				"before_summary":     `{"role":"member","status":"active","kind":"human"}`,
+				"orphaned_by_revoke": `[{"agentId":"` + agentID + `","edgeId":"ed100000-0000-0000-0000-000000000001"}]`,
+				"last_error":         "agent 33333333: runtime broker unavailable",
+			},
+			{
+				"id": "de100000-0000-0000-0000-000000000002", "user_id": "22222222-2222-2222-2222-2222222222d2",
+				"state": "completed", "requested_by_kind": "user", "requested_by_id": userID,
+				"credential_kind": "session", "requested_at": baseTime, "completed_at": baseTime.Add(10 * time.Minute),
+				"last_reconciled_at": nil, "before_summary": "", "orphaned_by_revoke": "[]", "last_error": "",
+			},
+		}},
+		{Table: "user_deletion_agents", Rows: []row{
+			{
+				"id": "de200000-0000-0000-0000-000000000001", "deletion_id": "de100000-0000-0000-0000-000000000001",
+				"agent_id": agentID, "slug": "fixture-agent", "project_id": projectID, "outcome": "failed",
+				"attempts": 3, "last_error": "runtime broker unavailable", "updated_at": baseTime.Add(time.Minute),
+			},
+			{
+				"id": "de200000-0000-0000-0000-000000000002", "deletion_id": "de100000-0000-0000-0000-000000000002",
+				"agent_id": "33333333-3333-3333-3333-3333333333d2", "slug": "", "project_id": "", "outcome": "removed",
+				"attempts": 1, "last_error": "", "updated_at": baseTime.Add(9 * time.Minute),
+			},
+		}},
+
+		// ---- Durable delivery queue items (pkg/durablequeue, ptone/scion#8025) ----
+		{Table: "durable_queue_items", Rows: []row{
+			{
+				"seq": int64(1), "kind": "fixture.echo", "dedup_key": "dq000000-0000-0000-0000-000000000001",
+				"project_id": projectID, "payload": `{"echo":"fixture"}`,
+				"not_before": baseTime, "created_at": baseTime,
+				"attempts": 1, "permanent_failures": 0,
+				"next_attempt_at": baseTime.Add(time.Minute),
+				"lease_owner":     "", "lease_until": nil, "last_error": "unavailable: fixture",
+			},
+		}},
+
+		// ---- System One provider instances (ptone/scion#8044) ----
+		{Table: "system_one_instances", Rows: []row{
+			{
+				"id": "50100000-0000-0000-0000-000000000001", "name": "typesafe-prod",
+				"adapter": "typesafe", "model": "", "endpoint": "https://provider.example.com/v1",
+				"location": "", "auth_kind": "api_key", "auth_secret_name": "TYPESAFE_API_KEY",
+				"auth_header_name": "", "auth_scopes": nil, "auth_audience": "",
+				"options":       `{"mode":"strict"}`,
+				"max_in_flight": 8, "rate_per_sec": 0.0, "max_input_tokens": 0, "call_timeout_ns": int64(5 * time.Second),
+				"allow_private_network": false, "enabled": true, "revision": int64(1),
+				"created_by": userID, "updated_by": userID,
+				"created_at": baseTime, "updated_at": baseTime,
+			},
+		}},
+
+		// ---- Triggers & webhook endpoints (ptone/scion#8028) ----
+		{Table: "webhook_endpoints", Rows: []row{
+			{
+				"id": webhookEndpointID, "project_id": projectID,
+				"name": "fixture-webhook", "description": "Fixture webhook endpoint",
+				"owner_principal_kind": "user", "owner_principal_id": userID, "owner_credential_kind": "session",
+				"secret_version": 1, "signature_mode": "scion_v1", "status": "active",
+				"created_by": userID, "last_received_at": baseTime,
+				"receive_count": 1, "reject_count": 0,
+				"created": baseTime, "updated": baseTime,
+			},
+		}},
+		{Table: "triggers", Rows: []row{
+			{
+				"id": triggerID, "project_id": projectID,
+				"name": "fixture-trigger", "description": "Fixture webhook trigger",
+				"source_kind": "webhook", "source_id": webhookEndpointID,
+				"match_types": `["webhook.received"]`, "match_dialect": "", "match_rule": "",
+				"match_rules": `[{"dialect":"cel","expr":"true"}]`,
+				"action_type": "message", "action_payload": `{"agentId":"` + agentID + `","agentName":"fixture-agent","message":"hi","wake":true}`,
+				"subject_dialect": "cel", "subject_rule": "", "subject_mode": "new",
+				"status": "active", "status_reason": "",
+				"last_fire_at": baseTime, "last_fire_status": "fired", "last_fire_error": "",
+				"fire_count": 1, "error_count": 0,
+				"initiator_principal_kind": "user", "initiator_principal_id": userID,
+				"initiator_credential_kind": "session", "initiator_credential_id": "",
+				"initiator_credential_snapshot": "", "attribution_version": 1, "authorization_revision": 1,
+				"authority_ceiling_kind": "principal", "authority_ceiling_version": 0,
+				"authority_ceiling_permission_ids": `[]`, "authority_ceiling_boundary_kind": "",
+				"authority_ceiling_boundary_project_id": "", "authority_ceiling_source_expires_at": nil,
+				"fixture_root_id": "", "fixture_issuer_id": "",
+				"created_by": userID, "created": baseTime, "updated": baseTime,
+			},
+		}},
+		{Table: "trigger_events", Rows: []row{
+			{
+				"id": triggerEventID, "project_id": projectID,
+				"source_kind": "webhook", "source_id": webhookEndpointID,
+				"type": "webhook.received", "subject": "webhook:" + webhookEndpointID,
+				"dedup_key":   "deliv-fixture-001",
+				"body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+				"occurred_at": baseTime, "received_at": baseTime,
+				"attributes": `{"endpoint_name":"fixture-webhook","event":"received"}`,
+				"lists":      `{"labels":["bug"]}`,
+				"headers":    `{"content-type":"application/json"}`,
+				"payload":    unicodeJSON, "payload_bytes": len(unicodeJSON),
+				"status": "processed", "match_count": 1, "fire_count": 1,
+				"error": "", "processed_at": baseTime.Add(time.Second), "created": baseTime,
+			},
+		}},
+		{Table: "trigger_fires", Rows: []row{
+			{
+				"id": triggerFireID, "project_id": projectID,
+				"trigger_id": triggerID, "event_id": triggerEventID,
+				"subject": "webhook:" + webhookEndpointID, "action_type": "message",
+				"status": "fired", "error": "", "result_ref": messageID,
+				"matched_through": "1/1", "decided_dialect": "cel",
+				"rule_trace":    `{"elements":[{"i":1,"dialect":"cel","class":"matched","duration_ms":1}]}`,
+				"executor_kind": "trigger", "executor_id": "trigger:" + triggerID,
+				"initiator_principal_kind": "user", "initiator_principal_id": userID,
+				"initiator_credential_kind": "session", "initiator_credential_id": "",
+				"initiator_credential_snapshot": "", "attribution_version": 1, "authorization_revision": 1,
+				"lease_until": baseTime.Add(time.Minute), "started_at": baseTime,
+				"finished_at": baseTime.Add(time.Second), "created": baseTime,
+			},
+		}},
+
+		// ---- Message policies and content-free decision records (ptone/scion#8047) ----
+		{Table: "message_policies", Rows: []row{
+			{
+				"id": "b1000000-0000-0000-0000-000000000001", "project_id": projectID,
+				"name": "no-prose-choices", "description": "Require structured choice prompt",
+				"enabled": true, "mode": "shadow",
+				"scope":              `{"surfaces":["agent_to_user","agent_to_conversation"],"sender":{"all_agents":true},"recipient":{"kinds":["user","conversation"]}}`,
+				"violation_rule":     `!message.has_choices && message.body.matches("(?i)\\bchoose\\b")`,
+				"system_one_rule":    "",
+				"system_one_refs":    nil,
+				"on_uncertain":       "",
+				"on_failed":          "admit",
+				"on_failed_reasons":  `{"cost_limit":"reject"}`,
+				"reject_reason":      "Policy {policy} blocked prose choice to {recipient}",
+				"reject_remediation": "Resend using scion message --choices.",
+				"revision":           int64(1),
+				"created_by":         userID, "updated_by": userID,
+				"created_at": baseTime, "updated_at": baseTime,
+			},
+		}},
+		{Table: "message_policy_decisions", Rows: []row{
+			{ // rejected before message persistence: message_id is NULL
+				"id": "b2000000-0000-0000-0000-000000000001", "project_id": projectID,
+				"policy_id":       "b1000000-0000-0000-0000-000000000001",
+				"policy_name":     "no-prose-choices",
+				"policy_revision": int64(1),
+				"mode":            "enforce",
+				"surface":         "agent_to_user",
+				"sender_kind":     "agent", "sender_id": agentID,
+				"recipient_kind": "user", "recipient_id": userID,
+				"message_id": nil,
+				"class":      "violation", "action": "rejected",
+				"reason": "violation_matched", "cel_error_reason": "",
+				"evaluation": `{"dialect":"cel","matched":true}`,
+				"elapsed_ms": int64(2),
+				"created_at": baseTime,
+			},
+			{ // shadow observation on a persisted message: message_id populated
+				"id": "b2000000-0000-0000-0000-000000000002", "project_id": projectID,
+				"policy_id":       "b1000000-0000-0000-0000-000000000001",
+				"policy_name":     "no-prose-choices",
+				"policy_revision": int64(1),
+				"mode":            "shadow",
+				"surface":         "agent_to_conversation",
+				"sender_kind":     "agent", "sender_id": agentID,
+				"recipient_kind": "conversation", "recipient_id": conversationID,
+				"message_id": messageID,
+				"class":      "failed", "action": "shadow",
+				"reason": "cel_failed", "cel_error_reason": "cost_limit",
+				"evaluation": "",
+				"elapsed_ms": int64(5),
+				"created_at": baseTime.Add(time.Minute),
 			},
 		}},
 	}

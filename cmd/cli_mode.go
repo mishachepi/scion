@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 )
@@ -38,6 +39,15 @@ func warnRemovedMode(source string) {
 // Uses dot-separated command paths: "notifications.ack", "schedule.list", etc.
 // Every entry — including parent commands — must be listed explicitly;
 // parents are NOT implicitly allowed when a child is listed.
+//
+// Deliberately absent: "runtime-broker.convert" in every mode (--plan,
+// --apply, --status, --rollback). It is human mode only: it acts on this
+// host's Runtime Broker identity, settings and Hub rows, which an agent in
+// a container must not change. cmd/platform_gate.go keeps it off Windows.
+//
+// Deliberately absent: "admin" and "admin.system-one.instance.*" (create,
+// list, delete, probe). Decision system-one-admin-cli v1 keeps Hub System One
+// provider instance and credential administration human-mode only.
 var agentAllowed = map[string]bool{
 	"create":                      true,
 	"delete":                      true,
@@ -144,6 +154,7 @@ var agentAllowed = map[string]bool{
 	"artifact.versions":             true,
 	"artifact.list":                 true,
 	"artifact.view":                 true,
+	"artifact.comments":             true,
 	// artifact share, artifact grants and artifact delete are human-only
 	// and deliberately absent (ptone/scion#4529, ptone/scion#4579): agents
 	// may not share or delete artifacts, or manage their grants.
@@ -186,6 +197,53 @@ var agentAllowed = map[string]bool{
 	"conversation.group.rename": true,
 	"conversation.group.add":    true,
 	"conversation.group.remove": true,
+
+	// Project-scoped secret reads as the calling agent (ptone/scion#5013).
+	// secret.set stays out: agents write secrets with sciontool secret set.
+	"secret":      true,
+	"secret.get":  true,
+	"secret.list": true,
+
+	// Decision self-service as the calling agent (ptone/scion#7797,
+	// decision Q1; withdraw ptone/scion#8190). Hub routes enforce
+	// AgentIdentity and web.decisions.
+	"decisions":          true,
+	"decisions.list":     true,
+	"decisions.show":     true,
+	"decisions.record":   true,
+	"decisions.withdraw": true,
+
+	// Event triggers and webhook endpoints (ptone/scion#8028, Stage 1 §12):
+	// Hub routes enforce hub.triggers and caller-scoped ownership for agents.
+	"trigger":                true,
+	"trigger.create":         true,
+	"trigger.get":            true,
+	"trigger.list":           true,
+	"trigger.delete":         true,
+	"trigger.pause":          true,
+	"trigger.resume":         true,
+	"trigger.history":        true,
+	"trigger.event":          true,
+	"trigger.event.list":     true,
+	"trigger.event.get":      true,
+	"trigger.webhook":        true,
+	"trigger.webhook.create": true,
+	"trigger.webhook.get":    true,
+	"trigger.webhook.list":   true,
+	"trigger.webhook.delete": true,
+	"trigger.preset":         true,
+	"trigger.preset.list":    true,
+	"trigger.preset.show":    true,
+	"trigger.preset.apply":   true,
+
+	// Project message policy read-only inspection (ptone/scion#8047,
+	// maintainer decision m1-agent-cli v1): agents may inspect active project
+	// policies with list and get. Authoring, deletion, dry-run testing, and
+	// decision log queries (create, delete, test, decisions) are deliberately
+	// absent and remain human-mode only.
+	"message-policy":      true,
+	"message-policy.list": true,
+	"message-policy.get":  true,
 }
 
 // resolveMode determines the active CLI mode from environment and settings.
@@ -233,6 +291,64 @@ func applyModeRestrictions(root *cobra.Command, mode CLIMode) {
 	if mode == ModeAgent {
 		applyAgentMode(root)
 	}
+	hideOtherModeFlags(root, mode)
+}
+
+// cliModeFlagAnnotation marks a flag that only one CLI mode accepts. Its
+// value is the mode (ModeHuman or ModeAgent). In the other mode the flag is
+// hidden from help (applyModeRestrictions) and refused when set
+// (checkFlagsForMode).
+const cliModeFlagAnnotation = "scion_cli_mode"
+
+// markFlagsForMode marks cmd's local flags names as accepted only in mode.
+//
+// Hiding is automatic (applyModeRestrictions), but refusing is opt-in: a
+// command that marks flags must call checkFlagsForMode(cmd, resolveMode())
+// at the top of its RunE, before acting on any flag (as runDecisionsList
+// does). Without that call a marked flag set in the other mode is hidden
+// from help yet still accepted.
+func markFlagsForMode(cmd *cobra.Command, mode CLIMode, names ...string) {
+	for _, name := range names {
+		if err := cmd.Flags().SetAnnotation(name, cliModeFlagAnnotation, []string{string(mode)}); err != nil {
+			panic(fmt.Sprintf("markFlagsForMode: %s: %v", cmd.CommandPath(), err))
+		}
+	}
+}
+
+// flagModeOf returns the only mode that accepts f, or "" for every mode.
+func flagModeOf(f *pflag.Flag) CLIMode {
+	if v := f.Annotations[cliModeFlagAnnotation]; len(v) == 1 {
+		return CLIMode(v[0])
+	}
+	return ""
+}
+
+// hideOtherModeFlags hides, in every command under root, the flags marked
+// for a mode other than mode.
+func hideOtherModeFlags(root *cobra.Command, mode CLIMode) {
+	root.Flags().VisitAll(func(f *pflag.Flag) {
+		if m := flagModeOf(f); m != "" && m != mode {
+			f.Hidden = true
+		}
+	})
+	for _, child := range root.Commands() {
+		hideOtherModeFlags(child, mode)
+	}
+}
+
+// checkFlagsForMode returns a usage error naming the first flag set on cmd
+// that mode does not accept.
+func checkFlagsForMode(cmd *cobra.Command, mode CLIMode) error {
+	var err error
+	cmd.Flags().Visit(func(f *pflag.Flag) {
+		if err != nil {
+			return
+		}
+		if m := flagModeOf(f); m != "" && m != mode {
+			err = newUsageError("--%s is available only in %s mode; this CLI is in %s mode", f.Name, m, mode)
+		}
+	})
+	return err
 }
 
 func applyAgentMode(root *cobra.Command) {

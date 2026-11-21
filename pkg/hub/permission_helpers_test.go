@@ -112,7 +112,7 @@ var pendingNonRouteRows = map[string]string{
 	"secret.deliver":          "decision rules exist; no production path requests it yet (ptone/scion#4171)",
 	"env_var.deliver":         "decision rules exist; no production path requests it yet (ptone/scion#4171)",
 	"skill_injection.deliver": "decision rules exist; no production path requests it yet (ptone/scion#4171)",
-	"gcp_service_account.use": "decision rules exist; token mint checks the per-account token scope (ptone/scion#4171)",
+	"github_trigger.comment":  "held by built-in project roles; enforced by github.comment trigger action once Stage 1 trigger registry lands (ptone/scion#8090)",
 }
 
 // parseNonTestGoFiles parses the non-test Go files in dir.
@@ -160,8 +160,12 @@ var nonRouteCallSites = map[string][]permissionCallSite{
 	},
 	"project.clone":       {{"project_clone.go", "Server.handleProjectClone"}},
 	"agent.status_update": {{"handlers_agent_lifecycle.go", "Server.updateAgentStatus"}},
-	"project.secret_read": {{"material_runtime.go", "Server.materialRuntimePrecheck"}},
-	"agent.notify":        {{"handlers_notifications.go", "checkAgentNotifyScope"}},
+	"project.secret_read": {
+		{"material_runtime.go", "Server.materialRuntimePrecheck"},
+		{"handlers_env_secrets.go", "checkAgentProjectSecretReadScope"},
+		{"handlers_env_secrets.go", "agentLacksProjectSecretReadScope"},
+	},
+	"agent.notify": {{"handlers_notifications.go", "checkAgentNotifyScope"}},
 	"agent.token_refresh": {
 		{"handlers_agents_core.go", "Server.handleAgentTokenRefresh"},
 		{"handlers_agent_messaging.go", "Server.handleAgentGitHubTokenRefresh"},
@@ -170,7 +174,15 @@ var nonRouteCallSites = map[string][]permissionCallSite{
 		{"port_forward_handlers.go", "Server.authorizePortRegistration"},
 		{"conduit_agent_check.go", "conduitAgentScopeCheck"},
 	},
-	"agent.identity_token": {{"handlers_oidc.go", "Server.handleAgentIdentityToken"}},
+	// The OIDC handler denies on OIDCCallerAgent.CanRequestIdentityToken,
+	// which the hub adapter evaluates from the agent's identity-token scope.
+	"agent.identity_token": {{"deps_oidckeys.go", "oidcDeps.CallerAgent"}},
+	// Both GCP token mint endpoints decide it through authorizeAgentGCPMint;
+	// the GCS link proxy decides it for the stored sending agent.
+	"gcp_service_account.use": {
+		{"handlers_gcp_identity_mint_authority.go", "Server.authorizeAgentGCPMint"},
+		{"authz_resource_parent_ceiling.go", "AuthzService.decideStoredAgentServiceAccountUse"},
+	},
 }
 
 // routeGuardPermissionIDs returns the permissions the RouteHubAdmin guard

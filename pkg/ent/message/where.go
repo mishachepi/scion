@@ -130,6 +130,41 @@ func DispatchedAt(v time.Time) predicate.Message {
 	return predicate.Message(sql.FieldEQ(FieldDispatchedAt, v))
 }
 
+// DeliveryID applies equality check predicate on the "delivery_id" field. It's identical to DeliveryIDEQ.
+func DeliveryID(v string) predicate.Message {
+	return predicate.Message(sql.FieldEQ(FieldDeliveryID, v))
+}
+
+// DeliveringAt applies equality check predicate on the "delivering_at" field. It's identical to DeliveringAtEQ.
+func DeliveringAt(v time.Time) predicate.Message {
+	return predicate.Message(sql.FieldEQ(FieldDeliveringAt, v))
+}
+
+// DeliveryOutcome applies equality check predicate on the "delivery_outcome" field. It's identical to DeliveryOutcomeEQ.
+func DeliveryOutcome(v string) predicate.Message {
+	return predicate.Message(sql.FieldEQ(FieldDeliveryOutcome, v))
+}
+
+// HoldUntil applies equality check predicate on the "hold_until" field. It's identical to HoldUntilEQ.
+func HoldUntil(v time.Time) predicate.Message {
+	return predicate.Message(sql.FieldEQ(FieldHoldUntil, v))
+}
+
+// HoldLaunchID applies equality check predicate on the "hold_launch_id" field. It's identical to HoldLaunchIDEQ.
+func HoldLaunchID(v string) predicate.Message {
+	return predicate.Message(sql.FieldEQ(FieldHoldLaunchID, v))
+}
+
+// NotReached applies equality check predicate on the "not_reached" field. It's identical to NotReachedEQ.
+func NotReached(v string) predicate.Message {
+	return predicate.Message(sql.FieldEQ(FieldNotReached, v))
+}
+
+// NotReachedAt applies equality check predicate on the "not_reached_at" field. It's identical to NotReachedAtEQ.
+func NotReachedAt(v time.Time) predicate.Message {
+	return predicate.Message(sql.FieldEQ(FieldNotReachedAt, v))
+}
+
 // Channel applies equality check predicate on the "channel" field. It's identical to ChannelEQ.
 func Channel(v string) predicate.Message {
 	return predicate.Message(sql.FieldEQ(FieldChannel, v))
@@ -153,6 +188,21 @@ func SenderProjectID(v uuid.UUID) predicate.Message {
 // RecipientProjectID applies equality check predicate on the "recipient_project_id" field. It's identical to RecipientProjectIDEQ.
 func RecipientProjectID(v uuid.UUID) predicate.Message {
 	return predicate.Message(sql.FieldEQ(FieldRecipientProjectID, v))
+}
+
+// AuthorizingUserID applies equality check predicate on the "authorizing_user_id" field. It's identical to AuthorizingUserIDEQ.
+func AuthorizingUserID(v string) predicate.Message {
+	return predicate.Message(sql.FieldEQ(FieldAuthorizingUserID, v))
+}
+
+// DelegationGrantID applies equality check predicate on the "delegation_grant_id" field. It's identical to DelegationGrantIDEQ.
+func DelegationGrantID(v string) predicate.Message {
+	return predicate.Message(sql.FieldEQ(FieldDelegationGrantID, v))
+}
+
+// ScheduledEventID applies equality check predicate on the "scheduled_event_id" field. It's identical to ScheduledEventIDEQ.
+func ScheduledEventID(v string) predicate.Message {
+	return predicate.Message(sql.FieldEQ(FieldScheduledEventID, v))
 }
 
 // Created applies equality check predicate on the "created" field. It's identical to CreatedEQ.
@@ -980,6 +1030,456 @@ func DispatchedAtNotNil() predicate.Message {
 	return predicate.Message(sql.FieldNotNull(FieldDispatchedAt))
 }
 
+// DeliveryIDEQ applies the EQ predicate on the "delivery_id" field.
+func DeliveryIDEQ(v string) predicate.Message {
+	return predicate.Message(sql.FieldEQ(FieldDeliveryID, v))
+}
+
+// DeliveryIDNEQ applies the NEQ predicate on the "delivery_id" field.
+func DeliveryIDNEQ(v string) predicate.Message {
+	return predicate.Message(sql.FieldNEQ(FieldDeliveryID, v))
+}
+
+// DeliveryIDIn applies the In predicate on the "delivery_id" field.
+func DeliveryIDIn(vs ...string) predicate.Message {
+	return predicate.Message(sql.FieldIn(FieldDeliveryID, vs...))
+}
+
+// DeliveryIDNotIn applies the NotIn predicate on the "delivery_id" field.
+func DeliveryIDNotIn(vs ...string) predicate.Message {
+	return predicate.Message(sql.FieldNotIn(FieldDeliveryID, vs...))
+}
+
+// DeliveryIDGT applies the GT predicate on the "delivery_id" field.
+func DeliveryIDGT(v string) predicate.Message {
+	return predicate.Message(sql.FieldGT(FieldDeliveryID, v))
+}
+
+// DeliveryIDGTE applies the GTE predicate on the "delivery_id" field.
+func DeliveryIDGTE(v string) predicate.Message {
+	return predicate.Message(sql.FieldGTE(FieldDeliveryID, v))
+}
+
+// DeliveryIDLT applies the LT predicate on the "delivery_id" field.
+func DeliveryIDLT(v string) predicate.Message {
+	return predicate.Message(sql.FieldLT(FieldDeliveryID, v))
+}
+
+// DeliveryIDLTE applies the LTE predicate on the "delivery_id" field.
+func DeliveryIDLTE(v string) predicate.Message {
+	return predicate.Message(sql.FieldLTE(FieldDeliveryID, v))
+}
+
+// DeliveryIDContains applies the Contains predicate on the "delivery_id" field.
+func DeliveryIDContains(v string) predicate.Message {
+	return predicate.Message(sql.FieldContains(FieldDeliveryID, v))
+}
+
+// DeliveryIDHasPrefix applies the HasPrefix predicate on the "delivery_id" field.
+func DeliveryIDHasPrefix(v string) predicate.Message {
+	return predicate.Message(sql.FieldHasPrefix(FieldDeliveryID, v))
+}
+
+// DeliveryIDHasSuffix applies the HasSuffix predicate on the "delivery_id" field.
+func DeliveryIDHasSuffix(v string) predicate.Message {
+	return predicate.Message(sql.FieldHasSuffix(FieldDeliveryID, v))
+}
+
+// DeliveryIDIsNil applies the IsNil predicate on the "delivery_id" field.
+func DeliveryIDIsNil() predicate.Message {
+	return predicate.Message(sql.FieldIsNull(FieldDeliveryID))
+}
+
+// DeliveryIDNotNil applies the NotNil predicate on the "delivery_id" field.
+func DeliveryIDNotNil() predicate.Message {
+	return predicate.Message(sql.FieldNotNull(FieldDeliveryID))
+}
+
+// DeliveryIDEqualFold applies the EqualFold predicate on the "delivery_id" field.
+func DeliveryIDEqualFold(v string) predicate.Message {
+	return predicate.Message(sql.FieldEqualFold(FieldDeliveryID, v))
+}
+
+// DeliveryIDContainsFold applies the ContainsFold predicate on the "delivery_id" field.
+func DeliveryIDContainsFold(v string) predicate.Message {
+	return predicate.Message(sql.FieldContainsFold(FieldDeliveryID, v))
+}
+
+// DeliveringAtEQ applies the EQ predicate on the "delivering_at" field.
+func DeliveringAtEQ(v time.Time) predicate.Message {
+	return predicate.Message(sql.FieldEQ(FieldDeliveringAt, v))
+}
+
+// DeliveringAtNEQ applies the NEQ predicate on the "delivering_at" field.
+func DeliveringAtNEQ(v time.Time) predicate.Message {
+	return predicate.Message(sql.FieldNEQ(FieldDeliveringAt, v))
+}
+
+// DeliveringAtIn applies the In predicate on the "delivering_at" field.
+func DeliveringAtIn(vs ...time.Time) predicate.Message {
+	return predicate.Message(sql.FieldIn(FieldDeliveringAt, vs...))
+}
+
+// DeliveringAtNotIn applies the NotIn predicate on the "delivering_at" field.
+func DeliveringAtNotIn(vs ...time.Time) predicate.Message {
+	return predicate.Message(sql.FieldNotIn(FieldDeliveringAt, vs...))
+}
+
+// DeliveringAtGT applies the GT predicate on the "delivering_at" field.
+func DeliveringAtGT(v time.Time) predicate.Message {
+	return predicate.Message(sql.FieldGT(FieldDeliveringAt, v))
+}
+
+// DeliveringAtGTE applies the GTE predicate on the "delivering_at" field.
+func DeliveringAtGTE(v time.Time) predicate.Message {
+	return predicate.Message(sql.FieldGTE(FieldDeliveringAt, v))
+}
+
+// DeliveringAtLT applies the LT predicate on the "delivering_at" field.
+func DeliveringAtLT(v time.Time) predicate.Message {
+	return predicate.Message(sql.FieldLT(FieldDeliveringAt, v))
+}
+
+// DeliveringAtLTE applies the LTE predicate on the "delivering_at" field.
+func DeliveringAtLTE(v time.Time) predicate.Message {
+	return predicate.Message(sql.FieldLTE(FieldDeliveringAt, v))
+}
+
+// DeliveringAtIsNil applies the IsNil predicate on the "delivering_at" field.
+func DeliveringAtIsNil() predicate.Message {
+	return predicate.Message(sql.FieldIsNull(FieldDeliveringAt))
+}
+
+// DeliveringAtNotNil applies the NotNil predicate on the "delivering_at" field.
+func DeliveringAtNotNil() predicate.Message {
+	return predicate.Message(sql.FieldNotNull(FieldDeliveringAt))
+}
+
+// DeliveryOutcomeEQ applies the EQ predicate on the "delivery_outcome" field.
+func DeliveryOutcomeEQ(v string) predicate.Message {
+	return predicate.Message(sql.FieldEQ(FieldDeliveryOutcome, v))
+}
+
+// DeliveryOutcomeNEQ applies the NEQ predicate on the "delivery_outcome" field.
+func DeliveryOutcomeNEQ(v string) predicate.Message {
+	return predicate.Message(sql.FieldNEQ(FieldDeliveryOutcome, v))
+}
+
+// DeliveryOutcomeIn applies the In predicate on the "delivery_outcome" field.
+func DeliveryOutcomeIn(vs ...string) predicate.Message {
+	return predicate.Message(sql.FieldIn(FieldDeliveryOutcome, vs...))
+}
+
+// DeliveryOutcomeNotIn applies the NotIn predicate on the "delivery_outcome" field.
+func DeliveryOutcomeNotIn(vs ...string) predicate.Message {
+	return predicate.Message(sql.FieldNotIn(FieldDeliveryOutcome, vs...))
+}
+
+// DeliveryOutcomeGT applies the GT predicate on the "delivery_outcome" field.
+func DeliveryOutcomeGT(v string) predicate.Message {
+	return predicate.Message(sql.FieldGT(FieldDeliveryOutcome, v))
+}
+
+// DeliveryOutcomeGTE applies the GTE predicate on the "delivery_outcome" field.
+func DeliveryOutcomeGTE(v string) predicate.Message {
+	return predicate.Message(sql.FieldGTE(FieldDeliveryOutcome, v))
+}
+
+// DeliveryOutcomeLT applies the LT predicate on the "delivery_outcome" field.
+func DeliveryOutcomeLT(v string) predicate.Message {
+	return predicate.Message(sql.FieldLT(FieldDeliveryOutcome, v))
+}
+
+// DeliveryOutcomeLTE applies the LTE predicate on the "delivery_outcome" field.
+func DeliveryOutcomeLTE(v string) predicate.Message {
+	return predicate.Message(sql.FieldLTE(FieldDeliveryOutcome, v))
+}
+
+// DeliveryOutcomeContains applies the Contains predicate on the "delivery_outcome" field.
+func DeliveryOutcomeContains(v string) predicate.Message {
+	return predicate.Message(sql.FieldContains(FieldDeliveryOutcome, v))
+}
+
+// DeliveryOutcomeHasPrefix applies the HasPrefix predicate on the "delivery_outcome" field.
+func DeliveryOutcomeHasPrefix(v string) predicate.Message {
+	return predicate.Message(sql.FieldHasPrefix(FieldDeliveryOutcome, v))
+}
+
+// DeliveryOutcomeHasSuffix applies the HasSuffix predicate on the "delivery_outcome" field.
+func DeliveryOutcomeHasSuffix(v string) predicate.Message {
+	return predicate.Message(sql.FieldHasSuffix(FieldDeliveryOutcome, v))
+}
+
+// DeliveryOutcomeIsNil applies the IsNil predicate on the "delivery_outcome" field.
+func DeliveryOutcomeIsNil() predicate.Message {
+	return predicate.Message(sql.FieldIsNull(FieldDeliveryOutcome))
+}
+
+// DeliveryOutcomeNotNil applies the NotNil predicate on the "delivery_outcome" field.
+func DeliveryOutcomeNotNil() predicate.Message {
+	return predicate.Message(sql.FieldNotNull(FieldDeliveryOutcome))
+}
+
+// DeliveryOutcomeEqualFold applies the EqualFold predicate on the "delivery_outcome" field.
+func DeliveryOutcomeEqualFold(v string) predicate.Message {
+	return predicate.Message(sql.FieldEqualFold(FieldDeliveryOutcome, v))
+}
+
+// DeliveryOutcomeContainsFold applies the ContainsFold predicate on the "delivery_outcome" field.
+func DeliveryOutcomeContainsFold(v string) predicate.Message {
+	return predicate.Message(sql.FieldContainsFold(FieldDeliveryOutcome, v))
+}
+
+// HoldUntilEQ applies the EQ predicate on the "hold_until" field.
+func HoldUntilEQ(v time.Time) predicate.Message {
+	return predicate.Message(sql.FieldEQ(FieldHoldUntil, v))
+}
+
+// HoldUntilNEQ applies the NEQ predicate on the "hold_until" field.
+func HoldUntilNEQ(v time.Time) predicate.Message {
+	return predicate.Message(sql.FieldNEQ(FieldHoldUntil, v))
+}
+
+// HoldUntilIn applies the In predicate on the "hold_until" field.
+func HoldUntilIn(vs ...time.Time) predicate.Message {
+	return predicate.Message(sql.FieldIn(FieldHoldUntil, vs...))
+}
+
+// HoldUntilNotIn applies the NotIn predicate on the "hold_until" field.
+func HoldUntilNotIn(vs ...time.Time) predicate.Message {
+	return predicate.Message(sql.FieldNotIn(FieldHoldUntil, vs...))
+}
+
+// HoldUntilGT applies the GT predicate on the "hold_until" field.
+func HoldUntilGT(v time.Time) predicate.Message {
+	return predicate.Message(sql.FieldGT(FieldHoldUntil, v))
+}
+
+// HoldUntilGTE applies the GTE predicate on the "hold_until" field.
+func HoldUntilGTE(v time.Time) predicate.Message {
+	return predicate.Message(sql.FieldGTE(FieldHoldUntil, v))
+}
+
+// HoldUntilLT applies the LT predicate on the "hold_until" field.
+func HoldUntilLT(v time.Time) predicate.Message {
+	return predicate.Message(sql.FieldLT(FieldHoldUntil, v))
+}
+
+// HoldUntilLTE applies the LTE predicate on the "hold_until" field.
+func HoldUntilLTE(v time.Time) predicate.Message {
+	return predicate.Message(sql.FieldLTE(FieldHoldUntil, v))
+}
+
+// HoldUntilIsNil applies the IsNil predicate on the "hold_until" field.
+func HoldUntilIsNil() predicate.Message {
+	return predicate.Message(sql.FieldIsNull(FieldHoldUntil))
+}
+
+// HoldUntilNotNil applies the NotNil predicate on the "hold_until" field.
+func HoldUntilNotNil() predicate.Message {
+	return predicate.Message(sql.FieldNotNull(FieldHoldUntil))
+}
+
+// HoldLaunchIDEQ applies the EQ predicate on the "hold_launch_id" field.
+func HoldLaunchIDEQ(v string) predicate.Message {
+	return predicate.Message(sql.FieldEQ(FieldHoldLaunchID, v))
+}
+
+// HoldLaunchIDNEQ applies the NEQ predicate on the "hold_launch_id" field.
+func HoldLaunchIDNEQ(v string) predicate.Message {
+	return predicate.Message(sql.FieldNEQ(FieldHoldLaunchID, v))
+}
+
+// HoldLaunchIDIn applies the In predicate on the "hold_launch_id" field.
+func HoldLaunchIDIn(vs ...string) predicate.Message {
+	return predicate.Message(sql.FieldIn(FieldHoldLaunchID, vs...))
+}
+
+// HoldLaunchIDNotIn applies the NotIn predicate on the "hold_launch_id" field.
+func HoldLaunchIDNotIn(vs ...string) predicate.Message {
+	return predicate.Message(sql.FieldNotIn(FieldHoldLaunchID, vs...))
+}
+
+// HoldLaunchIDGT applies the GT predicate on the "hold_launch_id" field.
+func HoldLaunchIDGT(v string) predicate.Message {
+	return predicate.Message(sql.FieldGT(FieldHoldLaunchID, v))
+}
+
+// HoldLaunchIDGTE applies the GTE predicate on the "hold_launch_id" field.
+func HoldLaunchIDGTE(v string) predicate.Message {
+	return predicate.Message(sql.FieldGTE(FieldHoldLaunchID, v))
+}
+
+// HoldLaunchIDLT applies the LT predicate on the "hold_launch_id" field.
+func HoldLaunchIDLT(v string) predicate.Message {
+	return predicate.Message(sql.FieldLT(FieldHoldLaunchID, v))
+}
+
+// HoldLaunchIDLTE applies the LTE predicate on the "hold_launch_id" field.
+func HoldLaunchIDLTE(v string) predicate.Message {
+	return predicate.Message(sql.FieldLTE(FieldHoldLaunchID, v))
+}
+
+// HoldLaunchIDContains applies the Contains predicate on the "hold_launch_id" field.
+func HoldLaunchIDContains(v string) predicate.Message {
+	return predicate.Message(sql.FieldContains(FieldHoldLaunchID, v))
+}
+
+// HoldLaunchIDHasPrefix applies the HasPrefix predicate on the "hold_launch_id" field.
+func HoldLaunchIDHasPrefix(v string) predicate.Message {
+	return predicate.Message(sql.FieldHasPrefix(FieldHoldLaunchID, v))
+}
+
+// HoldLaunchIDHasSuffix applies the HasSuffix predicate on the "hold_launch_id" field.
+func HoldLaunchIDHasSuffix(v string) predicate.Message {
+	return predicate.Message(sql.FieldHasSuffix(FieldHoldLaunchID, v))
+}
+
+// HoldLaunchIDIsNil applies the IsNil predicate on the "hold_launch_id" field.
+func HoldLaunchIDIsNil() predicate.Message {
+	return predicate.Message(sql.FieldIsNull(FieldHoldLaunchID))
+}
+
+// HoldLaunchIDNotNil applies the NotNil predicate on the "hold_launch_id" field.
+func HoldLaunchIDNotNil() predicate.Message {
+	return predicate.Message(sql.FieldNotNull(FieldHoldLaunchID))
+}
+
+// HoldLaunchIDEqualFold applies the EqualFold predicate on the "hold_launch_id" field.
+func HoldLaunchIDEqualFold(v string) predicate.Message {
+	return predicate.Message(sql.FieldEqualFold(FieldHoldLaunchID, v))
+}
+
+// HoldLaunchIDContainsFold applies the ContainsFold predicate on the "hold_launch_id" field.
+func HoldLaunchIDContainsFold(v string) predicate.Message {
+	return predicate.Message(sql.FieldContainsFold(FieldHoldLaunchID, v))
+}
+
+// NotReachedEQ applies the EQ predicate on the "not_reached" field.
+func NotReachedEQ(v string) predicate.Message {
+	return predicate.Message(sql.FieldEQ(FieldNotReached, v))
+}
+
+// NotReachedNEQ applies the NEQ predicate on the "not_reached" field.
+func NotReachedNEQ(v string) predicate.Message {
+	return predicate.Message(sql.FieldNEQ(FieldNotReached, v))
+}
+
+// NotReachedIn applies the In predicate on the "not_reached" field.
+func NotReachedIn(vs ...string) predicate.Message {
+	return predicate.Message(sql.FieldIn(FieldNotReached, vs...))
+}
+
+// NotReachedNotIn applies the NotIn predicate on the "not_reached" field.
+func NotReachedNotIn(vs ...string) predicate.Message {
+	return predicate.Message(sql.FieldNotIn(FieldNotReached, vs...))
+}
+
+// NotReachedGT applies the GT predicate on the "not_reached" field.
+func NotReachedGT(v string) predicate.Message {
+	return predicate.Message(sql.FieldGT(FieldNotReached, v))
+}
+
+// NotReachedGTE applies the GTE predicate on the "not_reached" field.
+func NotReachedGTE(v string) predicate.Message {
+	return predicate.Message(sql.FieldGTE(FieldNotReached, v))
+}
+
+// NotReachedLT applies the LT predicate on the "not_reached" field.
+func NotReachedLT(v string) predicate.Message {
+	return predicate.Message(sql.FieldLT(FieldNotReached, v))
+}
+
+// NotReachedLTE applies the LTE predicate on the "not_reached" field.
+func NotReachedLTE(v string) predicate.Message {
+	return predicate.Message(sql.FieldLTE(FieldNotReached, v))
+}
+
+// NotReachedContains applies the Contains predicate on the "not_reached" field.
+func NotReachedContains(v string) predicate.Message {
+	return predicate.Message(sql.FieldContains(FieldNotReached, v))
+}
+
+// NotReachedHasPrefix applies the HasPrefix predicate on the "not_reached" field.
+func NotReachedHasPrefix(v string) predicate.Message {
+	return predicate.Message(sql.FieldHasPrefix(FieldNotReached, v))
+}
+
+// NotReachedHasSuffix applies the HasSuffix predicate on the "not_reached" field.
+func NotReachedHasSuffix(v string) predicate.Message {
+	return predicate.Message(sql.FieldHasSuffix(FieldNotReached, v))
+}
+
+// NotReachedIsNil applies the IsNil predicate on the "not_reached" field.
+func NotReachedIsNil() predicate.Message {
+	return predicate.Message(sql.FieldIsNull(FieldNotReached))
+}
+
+// NotReachedNotNil applies the NotNil predicate on the "not_reached" field.
+func NotReachedNotNil() predicate.Message {
+	return predicate.Message(sql.FieldNotNull(FieldNotReached))
+}
+
+// NotReachedEqualFold applies the EqualFold predicate on the "not_reached" field.
+func NotReachedEqualFold(v string) predicate.Message {
+	return predicate.Message(sql.FieldEqualFold(FieldNotReached, v))
+}
+
+// NotReachedContainsFold applies the ContainsFold predicate on the "not_reached" field.
+func NotReachedContainsFold(v string) predicate.Message {
+	return predicate.Message(sql.FieldContainsFold(FieldNotReached, v))
+}
+
+// NotReachedAtEQ applies the EQ predicate on the "not_reached_at" field.
+func NotReachedAtEQ(v time.Time) predicate.Message {
+	return predicate.Message(sql.FieldEQ(FieldNotReachedAt, v))
+}
+
+// NotReachedAtNEQ applies the NEQ predicate on the "not_reached_at" field.
+func NotReachedAtNEQ(v time.Time) predicate.Message {
+	return predicate.Message(sql.FieldNEQ(FieldNotReachedAt, v))
+}
+
+// NotReachedAtIn applies the In predicate on the "not_reached_at" field.
+func NotReachedAtIn(vs ...time.Time) predicate.Message {
+	return predicate.Message(sql.FieldIn(FieldNotReachedAt, vs...))
+}
+
+// NotReachedAtNotIn applies the NotIn predicate on the "not_reached_at" field.
+func NotReachedAtNotIn(vs ...time.Time) predicate.Message {
+	return predicate.Message(sql.FieldNotIn(FieldNotReachedAt, vs...))
+}
+
+// NotReachedAtGT applies the GT predicate on the "not_reached_at" field.
+func NotReachedAtGT(v time.Time) predicate.Message {
+	return predicate.Message(sql.FieldGT(FieldNotReachedAt, v))
+}
+
+// NotReachedAtGTE applies the GTE predicate on the "not_reached_at" field.
+func NotReachedAtGTE(v time.Time) predicate.Message {
+	return predicate.Message(sql.FieldGTE(FieldNotReachedAt, v))
+}
+
+// NotReachedAtLT applies the LT predicate on the "not_reached_at" field.
+func NotReachedAtLT(v time.Time) predicate.Message {
+	return predicate.Message(sql.FieldLT(FieldNotReachedAt, v))
+}
+
+// NotReachedAtLTE applies the LTE predicate on the "not_reached_at" field.
+func NotReachedAtLTE(v time.Time) predicate.Message {
+	return predicate.Message(sql.FieldLTE(FieldNotReachedAt, v))
+}
+
+// NotReachedAtIsNil applies the IsNil predicate on the "not_reached_at" field.
+func NotReachedAtIsNil() predicate.Message {
+	return predicate.Message(sql.FieldIsNull(FieldNotReachedAt))
+}
+
+// NotReachedAtNotNil applies the NotNil predicate on the "not_reached_at" field.
+func NotReachedAtNotNil() predicate.Message {
+	return predicate.Message(sql.FieldNotNull(FieldNotReachedAt))
+}
+
 // ChannelEQ applies the EQ predicate on the "channel" field.
 func ChannelEQ(v string) predicate.Message {
 	return predicate.Message(sql.FieldEQ(FieldChannel, v))
@@ -1278,6 +1778,231 @@ func RecipientProjectIDIsNil() predicate.Message {
 // RecipientProjectIDNotNil applies the NotNil predicate on the "recipient_project_id" field.
 func RecipientProjectIDNotNil() predicate.Message {
 	return predicate.Message(sql.FieldNotNull(FieldRecipientProjectID))
+}
+
+// AuthorizingUserIDEQ applies the EQ predicate on the "authorizing_user_id" field.
+func AuthorizingUserIDEQ(v string) predicate.Message {
+	return predicate.Message(sql.FieldEQ(FieldAuthorizingUserID, v))
+}
+
+// AuthorizingUserIDNEQ applies the NEQ predicate on the "authorizing_user_id" field.
+func AuthorizingUserIDNEQ(v string) predicate.Message {
+	return predicate.Message(sql.FieldNEQ(FieldAuthorizingUserID, v))
+}
+
+// AuthorizingUserIDIn applies the In predicate on the "authorizing_user_id" field.
+func AuthorizingUserIDIn(vs ...string) predicate.Message {
+	return predicate.Message(sql.FieldIn(FieldAuthorizingUserID, vs...))
+}
+
+// AuthorizingUserIDNotIn applies the NotIn predicate on the "authorizing_user_id" field.
+func AuthorizingUserIDNotIn(vs ...string) predicate.Message {
+	return predicate.Message(sql.FieldNotIn(FieldAuthorizingUserID, vs...))
+}
+
+// AuthorizingUserIDGT applies the GT predicate on the "authorizing_user_id" field.
+func AuthorizingUserIDGT(v string) predicate.Message {
+	return predicate.Message(sql.FieldGT(FieldAuthorizingUserID, v))
+}
+
+// AuthorizingUserIDGTE applies the GTE predicate on the "authorizing_user_id" field.
+func AuthorizingUserIDGTE(v string) predicate.Message {
+	return predicate.Message(sql.FieldGTE(FieldAuthorizingUserID, v))
+}
+
+// AuthorizingUserIDLT applies the LT predicate on the "authorizing_user_id" field.
+func AuthorizingUserIDLT(v string) predicate.Message {
+	return predicate.Message(sql.FieldLT(FieldAuthorizingUserID, v))
+}
+
+// AuthorizingUserIDLTE applies the LTE predicate on the "authorizing_user_id" field.
+func AuthorizingUserIDLTE(v string) predicate.Message {
+	return predicate.Message(sql.FieldLTE(FieldAuthorizingUserID, v))
+}
+
+// AuthorizingUserIDContains applies the Contains predicate on the "authorizing_user_id" field.
+func AuthorizingUserIDContains(v string) predicate.Message {
+	return predicate.Message(sql.FieldContains(FieldAuthorizingUserID, v))
+}
+
+// AuthorizingUserIDHasPrefix applies the HasPrefix predicate on the "authorizing_user_id" field.
+func AuthorizingUserIDHasPrefix(v string) predicate.Message {
+	return predicate.Message(sql.FieldHasPrefix(FieldAuthorizingUserID, v))
+}
+
+// AuthorizingUserIDHasSuffix applies the HasSuffix predicate on the "authorizing_user_id" field.
+func AuthorizingUserIDHasSuffix(v string) predicate.Message {
+	return predicate.Message(sql.FieldHasSuffix(FieldAuthorizingUserID, v))
+}
+
+// AuthorizingUserIDIsNil applies the IsNil predicate on the "authorizing_user_id" field.
+func AuthorizingUserIDIsNil() predicate.Message {
+	return predicate.Message(sql.FieldIsNull(FieldAuthorizingUserID))
+}
+
+// AuthorizingUserIDNotNil applies the NotNil predicate on the "authorizing_user_id" field.
+func AuthorizingUserIDNotNil() predicate.Message {
+	return predicate.Message(sql.FieldNotNull(FieldAuthorizingUserID))
+}
+
+// AuthorizingUserIDEqualFold applies the EqualFold predicate on the "authorizing_user_id" field.
+func AuthorizingUserIDEqualFold(v string) predicate.Message {
+	return predicate.Message(sql.FieldEqualFold(FieldAuthorizingUserID, v))
+}
+
+// AuthorizingUserIDContainsFold applies the ContainsFold predicate on the "authorizing_user_id" field.
+func AuthorizingUserIDContainsFold(v string) predicate.Message {
+	return predicate.Message(sql.FieldContainsFold(FieldAuthorizingUserID, v))
+}
+
+// DelegationGrantIDEQ applies the EQ predicate on the "delegation_grant_id" field.
+func DelegationGrantIDEQ(v string) predicate.Message {
+	return predicate.Message(sql.FieldEQ(FieldDelegationGrantID, v))
+}
+
+// DelegationGrantIDNEQ applies the NEQ predicate on the "delegation_grant_id" field.
+func DelegationGrantIDNEQ(v string) predicate.Message {
+	return predicate.Message(sql.FieldNEQ(FieldDelegationGrantID, v))
+}
+
+// DelegationGrantIDIn applies the In predicate on the "delegation_grant_id" field.
+func DelegationGrantIDIn(vs ...string) predicate.Message {
+	return predicate.Message(sql.FieldIn(FieldDelegationGrantID, vs...))
+}
+
+// DelegationGrantIDNotIn applies the NotIn predicate on the "delegation_grant_id" field.
+func DelegationGrantIDNotIn(vs ...string) predicate.Message {
+	return predicate.Message(sql.FieldNotIn(FieldDelegationGrantID, vs...))
+}
+
+// DelegationGrantIDGT applies the GT predicate on the "delegation_grant_id" field.
+func DelegationGrantIDGT(v string) predicate.Message {
+	return predicate.Message(sql.FieldGT(FieldDelegationGrantID, v))
+}
+
+// DelegationGrantIDGTE applies the GTE predicate on the "delegation_grant_id" field.
+func DelegationGrantIDGTE(v string) predicate.Message {
+	return predicate.Message(sql.FieldGTE(FieldDelegationGrantID, v))
+}
+
+// DelegationGrantIDLT applies the LT predicate on the "delegation_grant_id" field.
+func DelegationGrantIDLT(v string) predicate.Message {
+	return predicate.Message(sql.FieldLT(FieldDelegationGrantID, v))
+}
+
+// DelegationGrantIDLTE applies the LTE predicate on the "delegation_grant_id" field.
+func DelegationGrantIDLTE(v string) predicate.Message {
+	return predicate.Message(sql.FieldLTE(FieldDelegationGrantID, v))
+}
+
+// DelegationGrantIDContains applies the Contains predicate on the "delegation_grant_id" field.
+func DelegationGrantIDContains(v string) predicate.Message {
+	return predicate.Message(sql.FieldContains(FieldDelegationGrantID, v))
+}
+
+// DelegationGrantIDHasPrefix applies the HasPrefix predicate on the "delegation_grant_id" field.
+func DelegationGrantIDHasPrefix(v string) predicate.Message {
+	return predicate.Message(sql.FieldHasPrefix(FieldDelegationGrantID, v))
+}
+
+// DelegationGrantIDHasSuffix applies the HasSuffix predicate on the "delegation_grant_id" field.
+func DelegationGrantIDHasSuffix(v string) predicate.Message {
+	return predicate.Message(sql.FieldHasSuffix(FieldDelegationGrantID, v))
+}
+
+// DelegationGrantIDIsNil applies the IsNil predicate on the "delegation_grant_id" field.
+func DelegationGrantIDIsNil() predicate.Message {
+	return predicate.Message(sql.FieldIsNull(FieldDelegationGrantID))
+}
+
+// DelegationGrantIDNotNil applies the NotNil predicate on the "delegation_grant_id" field.
+func DelegationGrantIDNotNil() predicate.Message {
+	return predicate.Message(sql.FieldNotNull(FieldDelegationGrantID))
+}
+
+// DelegationGrantIDEqualFold applies the EqualFold predicate on the "delegation_grant_id" field.
+func DelegationGrantIDEqualFold(v string) predicate.Message {
+	return predicate.Message(sql.FieldEqualFold(FieldDelegationGrantID, v))
+}
+
+// DelegationGrantIDContainsFold applies the ContainsFold predicate on the "delegation_grant_id" field.
+func DelegationGrantIDContainsFold(v string) predicate.Message {
+	return predicate.Message(sql.FieldContainsFold(FieldDelegationGrantID, v))
+}
+
+// ScheduledEventIDEQ applies the EQ predicate on the "scheduled_event_id" field.
+func ScheduledEventIDEQ(v string) predicate.Message {
+	return predicate.Message(sql.FieldEQ(FieldScheduledEventID, v))
+}
+
+// ScheduledEventIDNEQ applies the NEQ predicate on the "scheduled_event_id" field.
+func ScheduledEventIDNEQ(v string) predicate.Message {
+	return predicate.Message(sql.FieldNEQ(FieldScheduledEventID, v))
+}
+
+// ScheduledEventIDIn applies the In predicate on the "scheduled_event_id" field.
+func ScheduledEventIDIn(vs ...string) predicate.Message {
+	return predicate.Message(sql.FieldIn(FieldScheduledEventID, vs...))
+}
+
+// ScheduledEventIDNotIn applies the NotIn predicate on the "scheduled_event_id" field.
+func ScheduledEventIDNotIn(vs ...string) predicate.Message {
+	return predicate.Message(sql.FieldNotIn(FieldScheduledEventID, vs...))
+}
+
+// ScheduledEventIDGT applies the GT predicate on the "scheduled_event_id" field.
+func ScheduledEventIDGT(v string) predicate.Message {
+	return predicate.Message(sql.FieldGT(FieldScheduledEventID, v))
+}
+
+// ScheduledEventIDGTE applies the GTE predicate on the "scheduled_event_id" field.
+func ScheduledEventIDGTE(v string) predicate.Message {
+	return predicate.Message(sql.FieldGTE(FieldScheduledEventID, v))
+}
+
+// ScheduledEventIDLT applies the LT predicate on the "scheduled_event_id" field.
+func ScheduledEventIDLT(v string) predicate.Message {
+	return predicate.Message(sql.FieldLT(FieldScheduledEventID, v))
+}
+
+// ScheduledEventIDLTE applies the LTE predicate on the "scheduled_event_id" field.
+func ScheduledEventIDLTE(v string) predicate.Message {
+	return predicate.Message(sql.FieldLTE(FieldScheduledEventID, v))
+}
+
+// ScheduledEventIDContains applies the Contains predicate on the "scheduled_event_id" field.
+func ScheduledEventIDContains(v string) predicate.Message {
+	return predicate.Message(sql.FieldContains(FieldScheduledEventID, v))
+}
+
+// ScheduledEventIDHasPrefix applies the HasPrefix predicate on the "scheduled_event_id" field.
+func ScheduledEventIDHasPrefix(v string) predicate.Message {
+	return predicate.Message(sql.FieldHasPrefix(FieldScheduledEventID, v))
+}
+
+// ScheduledEventIDHasSuffix applies the HasSuffix predicate on the "scheduled_event_id" field.
+func ScheduledEventIDHasSuffix(v string) predicate.Message {
+	return predicate.Message(sql.FieldHasSuffix(FieldScheduledEventID, v))
+}
+
+// ScheduledEventIDIsNil applies the IsNil predicate on the "scheduled_event_id" field.
+func ScheduledEventIDIsNil() predicate.Message {
+	return predicate.Message(sql.FieldIsNull(FieldScheduledEventID))
+}
+
+// ScheduledEventIDNotNil applies the NotNil predicate on the "scheduled_event_id" field.
+func ScheduledEventIDNotNil() predicate.Message {
+	return predicate.Message(sql.FieldNotNull(FieldScheduledEventID))
+}
+
+// ScheduledEventIDEqualFold applies the EqualFold predicate on the "scheduled_event_id" field.
+func ScheduledEventIDEqualFold(v string) predicate.Message {
+	return predicate.Message(sql.FieldEqualFold(FieldScheduledEventID, v))
+}
+
+// ScheduledEventIDContainsFold applies the ContainsFold predicate on the "scheduled_event_id" field.
+func ScheduledEventIDContainsFold(v string) predicate.Message {
+	return predicate.Message(sql.FieldContainsFold(FieldScheduledEventID, v))
 }
 
 // CreatedEQ applies the EQ predicate on the "created" field.

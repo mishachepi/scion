@@ -10,7 +10,7 @@ Before making changes, review the relevant design documentation:
 
 ## Experimental features
 
-New experimental user-facing features must be launched behind a registered experiment (`pkg/experiments/registry.go`); see `docs-site/src/content/docs/reference/experiments.md`. Browser-side flag values are user-editable and only affect presentation; if an experiment changes hub behaviour, register it with the server layer and check it in the hub (`requireExperiment` / `experimentEnabled`). Do not add ad-hoc `scion:feature:` string literals or new booleans to `/api/v1/settings/public`.
+New experimental user-facing features must be launched behind a registered experiment (`pkg/experiments/registry.go`) and classified in `pkg/hub/test_admin_policy.go`; see `docs-site/src/content/docs/reference/experiments.md`. Browser-side flag values are user-editable and only affect presentation; if an experiment changes hub behaviour, register it with the server layer and check it in the hub (`requireExperiment` / `experimentEnabled`, updating `routeRegistrationExperiments` in `pkg/hub/experiments_helpers_test.go` and—when `LayerWeb` is also set—`pkg/hub/experiments_test.go` for routes gated in `New()`). Because `GET /api/v1/experiments` and project-page API shapes are locked by `TestPerfBudget_AgentEndpoints` (`pkg/hub/perf_budget_test.go`) and `web/e2e-perf/budgets/fixture.test.mjs`, registering or changing any `LayerWeb` experiment or project-page endpoint field requires refreshing `web/e2e-perf/budgets/fixture-schema.json` and updating `web/e2e-perf/budgets/fixture.mjs` (see `docs-repo/agents/sandbox-go-toolchain.md`); adding a `UATScope` also requires updating `FALLBACK_SCOPES` in `web/src/components/shared/token-list.ts`. Do not add ad-hoc `scion:feature:` string literals or new booleans to `/api/v1/settings/public`.
 
 ## Architecture Overview
 
@@ -67,7 +67,9 @@ After making changes, verify:
 1. **Type checking passes:** `npm run typecheck`
 2. **Linting passes:** `npm run lint`
 3. **Tests pass:** `npm run test`
-4. **Client builds:** `npm run build`
+4. **Client builds:** `npm run build` (run before `npm run check:orphans` or root `make web-budget`, both of which read `web/dist/client/.vite/manifest.json`)
+
+The full Vitest suite takes about 10 to 18 minutes in an agent container, more than a 10-minute foreground tool limit. Fresh `clone-per-agent` checkouts start without `web/node_modules` (run `npm ci` in `web/` first), and scratch `git worktree` checkouts omit untracked `node_modules`. Run the touched test files first (`npx vitest run <files>`) and start the full suite in the background; in cgroup-capped containers on high-`nproc` hosts, cap workers (`npx vitest run --maxWorkers=2`) to avoid worker starvation. Repo-scanning tests in `web/src/utils/*.test.ts` also run on Windows CI, so normalize `node:path` `relative()` paths to `/` (`.split(sep).join('/')`). Gitignored build output (`web/public/shoelace/`, `build/`) makes subsequent Go and web gates fail; see "Gitignored build output" in `docs-repo/agents/sandbox-go-toolchain.md`.
 
 ## Project Structure
 
@@ -141,6 +143,7 @@ All icons use the Shoelace `<sl-icon>` component, which provides [Bootstrap Icon
 | **Groups** | `diagram-3` | Navigation, group lists, group detail |
 | **Settings** | `gear` | Navigation, project settings |
 | **Dashboard** | `house` | Navigation |
+| **Console** | `grid-1x2` | Header mode switcher |
 
 ### Project Variant Icons
 
@@ -220,6 +223,8 @@ render() {
 }
 ```
 
+**ARIA state on an `sl-*` host is not exposed.** Shoelace sets the inner control's ARIA itself (for `sl-button`, only `role` and `aria-disabled`; `sl-radio-group` names its inner `<fieldset role="radiogroup">` from its `label` property via `aria-labelledby="label"`, so pass `label` and hide `::part(form-control-label)` visually as `profile-decisions.ts` does when no visible heading is wanted) and does not forward the host's, so `aria-pressed`, `aria-expanded`, `aria-checked` or `aria-label` on the host reaches no screen reader. For toggle state use a native element, as `chat-space-rail.ts` does. Assert accessibility state through the accessibility tree (Playwright `getByRole('button', { pressed: true })`, `getByRole('radiogroup', { name })`), not through the host attribute: a test that checks the attribute passes while the control exposes nothing.
+
 ### Theme Variables
 
 Use CSS custom properties with the `--scion-` prefix for consistent theming:
@@ -264,7 +269,7 @@ PROJECT_ID=<uuid> TOKEN=<dev-token> node web/test-scripts/realtime-lifecycle-tes
 When working in a containerized or sandboxed agent environment (e.g., scion agents), keep these points in mind:
 
 - **Vite dev server is available.** You can run `npm run dev` to start the Vite dev server for client-side development and visual inspection. API calls and SSE will not work without the Go backend.
-- **Use `--dev-auth` for local testing.** When a Go server is available, `--dev-auth` bypasses OAuth and auto-creates a dev session, which is the simplest way to test the frontend end-to-end. See the README for details.
+- **Use `--dev-auth` for local testing.** When a Go server is available, `--dev-auth` bypasses OAuth and lets the dev-token holder sign in with a dev sign-in link (see [Browser authentication](#browser-authentication)), which is the simplest way to test the frontend end-to-end.
 - **Go server** the golang server can be started as a background process, but OAuth flows cannot be used in a container.
 
 ### Tool pitfalls in sandboxed environments
@@ -289,7 +294,7 @@ These tips were collected during validation work and are useful for agents debug
 
 - **Agent status updates** use `POST /api/v1/agents/{id}/status`, not `PATCH`. The handler only accepts POST.
 - **Agent creation response** wraps the agent under an `"agent"` key: `{ "agent": { "id": "...", ... }, "warnings": [...] }`.
-- **SSE endpoint** (`/events?sub=...`) requires a session cookie, not a Bearer token. To get a session cookie via curl: `curl -c - -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/projects` then pass the `scion_sess` cookie with `-b`.
+- **SSE endpoint** (`/events?sub=...`) requires a session cookie, not a Bearer token. A Bearer request gets no session cookie. To get one with curl, request a dev sign-in link with `POST /auth/dev-launch` and the dev token, open the returned `signInPath` with a cookie jar (`curl -c jar.txt "http://localhost:8080<signInPath>"`), then pass the jar with `-b jar.txt`.
 
 ### SSE event format
 
@@ -306,8 +311,10 @@ The client `SSEClient` listens for `event: update` and the `StateManager` parses
 
 - Use `waitUntil: 'domcontentloaded'` instead of `'networkidle'` — the SSE connection keeps the network perpetually active, so `networkidle` will time out.
 - Chromium needs `--no-sandbox --disable-setuid-sandbox` flags in containerized environments.
+- Agent containers have no Playwright browser bundle, and set `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium` automatically. Every Playwright config in `web/` (including `web/playwright.config.ts` / `e2e/harness/global-setup.ts`, `web/e2e/*/playwright*.config.ts`, and `web/e2e-perf/budgets/playwright.config.ts`) resolves Chromium via `web/playwright-chromium.ts` (`CHROMIUM_EXECUTABLE` -> `TERMINAL_OWNER_CHROMIUM` -> `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH`), falling back to Playwright's installed browser bundle when none is set.
 - Console logging via `page.on('console', ...)` is essential for debugging SSE connection state — the `[SSE] Connected` log confirms the EventSource opened.
 - To validate real-time updates: take a screenshot, make an API call, wait 2-3 seconds, take another screenshot. Compare visually.
+- Mocked Playwright suites (`web/e2e/chat-mobile/`) intercept `/auth/me` and skip server-side `pageData.user` hydration; cover boot-time user preferences or feature flags with a real-hub Playwright spec.
 
 ### Common failure modes
 
@@ -347,8 +354,8 @@ When using the Chrome DevTools MCP tools (`take_screenshot`, `take_snapshot`, `c
 
 ### Browser authentication
 
-- **Navigate directly to `http://localhost:8080`** — dev-auth mode sets a session cookie automatically on the first page load, no manual cookie setup needed.
-- **For API calls via curl**, use the dev token as `Authorization: Bearer scion_dev_...` to get a `scion_sess` cookie, then pass it to subsequent requests.
+- **Sign in with a dev sign-in link.** Dev auth no longer creates a session on the first page load; a request without a session goes to `/login`. Get a single-use link with `POST /auth/dev-launch` and the dev token (`Authorization: Bearer scion_dev_...`), then open the returned `signInPath` (see `pkg/hub/web_devsignin.go`, and `web/e2e/harness/auth.ts` for a scripted version). On a fresh server home, every page then redirects to `/onboarding` until onboarding is completed.
+- **For API calls via curl**, send the dev token as `Authorization: Bearer scion_dev_...` on each request. A request that carries an Authorization header gets no session, so no `scion_sess` cookie comes back.
 
 ### Taking screenshots and snapshots
 

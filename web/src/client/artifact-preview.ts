@@ -108,7 +108,65 @@ export function imageSource(src: string, entryPath: string, files: ArtifactFile[
   return file ? { kind: 'file', path } : { kind: 'missing' };
 }
 
-const PLACEHOLDER_TEXT: Record<'not-fetched' | 'failed' | 'missing', string> = {
+/** What a link of an artifact's markdown points at. */
+export type LinkTarget =
+  | { kind: 'external'; href: string }
+  | { kind: 'file'; href: string }
+  | { kind: 'fragment'; id: string }
+  | { kind: 'none' };
+
+/** The version a link or image of a markdown entry resolves in. */
+export interface ArtifactLinkContext {
+  id: string;
+  seq: number;
+  entryPath: string;
+  files: ArtifactFile[];
+}
+
+/** Schemes a link may keep as written. */
+const LINK_SCHEMES = new Set(['http:', 'https:', 'mailto:']);
+
+/**
+ * Decides where a link of an artifact's markdown may point, for the
+ * preview and the review editor alike:
+ *
+ * - an http, https or mailto URL is kept (in the form the URL parser gives);
+ * - a relative link to a file of the version opens that file;
+ * - a #fragment is a target inside the document;
+ * - anything else (other schemes, protocol-relative URLs, relative links
+ *   to files the version does not have) gets no target and shows as text.
+ *
+ * The value is read as the URL parser reads it: leading and trailing C0
+ * control characters and spaces are stripped, then ASCII tabs and line
+ * breaks anywhere are dropped (other whitespace is kept), and the scheme
+ * is taken from the parsed URL.
+ */
+export function artifactLinkTarget(href: string, ctx: ArtifactLinkContext): LinkTarget {
+  // eslint-disable-next-line no-control-regex
+  const value = href.replace(/^[\u0000- ]+|[\u0000- ]+$/g, '').replace(/[\t\n\r]/g, '');
+  if (value === '') return { kind: 'none' };
+  if (value.startsWith('#')) {
+    return value.length > 1 ? { kind: 'fragment', id: value.slice(1) } : { kind: 'none' };
+  }
+  if (/^[\\/][\\/]/.test(value)) return { kind: 'none' };
+  if (/^[a-z][a-z0-9+.-]*:/i.test(value)) {
+    try {
+      const u = new URL(value);
+      if (LINK_SCHEMES.has(u.protocol)) return { kind: 'external', href: u.href };
+    } catch {
+      // Not a URL the browser would follow.
+    }
+    return { kind: 'none' };
+  }
+  const path = resolveBundlePath(ctx.entryPath, value);
+  const file =
+    path === null ? undefined : ctx.files.find((f) => !isRemoteFile(f) && f.path === path);
+  return file
+    ? { kind: 'file', href: artifactFileUrl(ctx.id, ctx.seq, file.path) }
+    : { kind: 'none' };
+}
+
+export const PLACEHOLDER_TEXT: Record<'not-fetched' | 'failed' | 'missing', string> = {
   'not-fetched': 'Image not fetched',
   failed: 'Image could not be fetched',
   missing: 'Image not in this version',
@@ -143,18 +201,13 @@ export function rewriteImages(
       : PLACEHOLDER_TEXT[where.kind];
     img.replaceWith(span);
   }
-  // A relative link to a file of the version opens that file; any other
-  // relative link, including a #fragment (links open in a new tab), would
-  // resolve against the app's own URL, so it is made plain text. Absolute
-  // links are left as the sanitizer kept them.
+  // Links follow artifactLinkTarget, the rule the review editor uses too.
+  // Links open in a new tab (the frame's base target), so a #fragment,
+  // which would resolve against the app's own URL, is made plain text.
   for (const a of Array.from(tpl.content.querySelectorAll('a[href]'))) {
-    const href = a.getAttribute('href') ?? '';
-    if (/^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith('//')) continue;
-    const path = href.startsWith('#') ? null : resolveBundlePath(ctx.entryPath, href);
-    const file =
-      path === null ? undefined : ctx.files.find((f) => !isRemoteFile(f) && f.path === path);
-    if (file) {
-      a.setAttribute('href', artifactFileUrl(ctx.id, ctx.seq, file.path));
+    const target = artifactLinkTarget(a.getAttribute('href') ?? '', ctx);
+    if (target.kind === 'external' || target.kind === 'file') {
+      a.setAttribute('href', target.href);
     } else {
       a.removeAttribute('href');
     }
@@ -167,9 +220,23 @@ export interface PreviewTheme {
   text: string;
   muted: string;
   border: string;
+  borderHover: string;
   subtle: string;
   surface: string;
   link: string;
+  errorBg: string;
+  errorBorder: string;
+  errorText: string;
+  reviewInsText: string;
+  reviewInsBg: string;
+  reviewDelText: string;
+  reviewDelBg: string;
+  reviewHlBg: string;
+  reviewNoteText: string;
+  reviewNoteBg: string;
+  reviewNoteBlockText: string;
+  reviewNoteBlockBg: string;
+  reviewNoteLine: string;
   fontMono: string;
 }
 
@@ -177,9 +244,23 @@ const DEFAULT_THEME: PreviewTheme = {
   text: '#1e293b',
   muted: '#64748b',
   border: '#e2e8f0',
+  borderHover: '#cbd5e1',
   subtle: '#f8fafc',
   surface: '#ffffff',
   link: '#2563eb',
+  errorBg: '#fef2f2',
+  errorBorder: '#fca5a5',
+  errorText: '#991b1b',
+  reviewInsText: '#166534',
+  reviewInsBg: '#dcfce7',
+  reviewDelText: '#991b1b',
+  reviewDelBg: '#fee2e2',
+  reviewHlBg: '#fef08a',
+  reviewNoteText: '#6d28d9',
+  reviewNoteBg: '#ede9fe',
+  reviewNoteBlockText: '#4c1d95',
+  reviewNoteBlockBg: '#f5f3ff',
+  reviewNoteLine: '#8b5cf6',
   fontMono: "'SF Mono', 'Fira Code', monospace",
 };
 
@@ -189,23 +270,24 @@ function cssValue(v: string, fallback: string): string {
   return t !== '' && !/[;{}<>\\]/.test(t) ? t : fallback;
 }
 
-/** The full srcdoc of the preview frame for rewritten, sanitized HTML. */
 /**
  * Styles of rendered CriticMarkup (utils/critic.ts): insertions green and
  * underlined, deletions red and struck through, highlights yellow, and
  * comments as numbered notes in a right-hand margin when the frame is wide
  * enough, otherwise as a block under the reference.
  */
-export const CRITIC_CSS = `ins.critic-ins{color:#166534;background:#dcfce7;text-decoration:underline}
-del.critic-del{color:#991b1b;background:#fee2e2;text-decoration:line-through}
-mark.critic-hl{background:#fef08a;color:inherit}
-sup.critic-ref{font-size:.7em;font-weight:600;color:#6d28d9;background:#ede9fe;border-radius:.25rem;padding:0 .25em;margin-left:.1em}
-.critic-note{display:block;margin:.35em 0 .6em;padding:.4em .6em;font-size:.8125rem;line-height:1.45;color:#4c1d95;background:#f5f3ff;border-left:3px solid #8b5cf6;border-radius:.25rem}
+function criticCss(t: PreviewTheme): string {
+  return `ins.critic-ins{color:${t.reviewInsText};background:${t.reviewInsBg};text-decoration:underline}
+del.critic-del{color:${t.reviewDelText};background:${t.reviewDelBg};text-decoration:line-through}
+mark.critic-hl{background:${t.reviewHlBg};color:inherit}
+sup.critic-ref{font-size:.7em;font-weight:600;color:${t.reviewNoteText};background:${t.reviewNoteBg};border-radius:.25rem;padding:0 .25em;margin-left:.1em}
+.critic-note{display:block;margin:.35em 0 .6em;padding:.4em .6em;font-size:.8125rem;line-height:1.45;color:${t.reviewNoteBlockText};background:${t.reviewNoteBlockBg};border-left:3px solid ${t.reviewNoteLine};border-radius:.25rem}
 .critic-note-n{font-weight:600;margin-right:.25em}
-.critic-side{display:block;margin:0 0 1em;font-size:.8125rem;line-height:1.45;color:#64748b}
-.critic-side.empty{padding:.75em 1em;border:1px dashed #cbd5e1;border-radius:.5rem;text-align:center}
+.critic-side{display:block;margin:0 0 1em;font-size:.8125rem;line-height:1.45;color:${t.muted}}
+.critic-side.empty{padding:.75em 1em;border:1px dashed ${t.borderHover};border-radius:.5rem;text-align:center}
 body.notes-margin{padding-right:17rem}
 body.notes-margin .critic-note,body.notes-margin .critic-side{float:right;clear:right;width:14rem;margin:0 -16rem .5em 0}`;
+}
 
 /** Options of a preview document. */
 export interface PreviewOptions {
@@ -256,8 +338,8 @@ th,td{border:1px solid ${t.border};padding:.5em .75em;text-align:left}th{backgro
 hr{border:none;border-top:1px solid ${t.border};margin:1.5em 0}
 img{max-width:100%;height:auto}
 .image-placeholder{display:inline-block;padding:.2em .5em;border:1px dashed ${t.border};border-radius:.25rem;color:${t.muted};background:${t.subtle};font-size:.8125rem}
-.image-placeholder.failed{border-color:#fca5a5;color:#991b1b;background:#fef2f2}
-${CRITIC_CSS}
+.image-placeholder.failed{border-color:${t.errorBorder};color:${t.errorText};background:${t.errorBg}}
+${criticCss(t)}
 </style></head><body${options.marginNotes ? ' class="notes-margin"' : ''}>${
     options.sideNote
       ? `<aside class="critic-side${options.sideNoteEmpty ? ' empty' : ''}">${escapeText(options.sideNote)}</aside>`

@@ -75,7 +75,7 @@ How a project's workspace is provisioned across its agents. There are four canon
 A workspace sharing mode where one workspace directory is mounted into every agent with no per-agent isolation — the model used for plain (non-git) projects.
 
 ### Worktree-per-agent
-A workspace sharing mode where each agent gets its own git worktree over a shared checkout, isolating working trees while sharing one clone's history. Supported on repositories linked to the local workstation Hub (registered with this mode automatically; the worktrees are of your own checkout) and on Hub-managed git projects created with `worktree-per-agent` (see [Linked git projects](/scion/local/workspace/#linked-git-projects)); requires git 2.48 or later on the broker, and on Kubernetes it requires NFS workspace storage.
+A workspace sharing mode where each agent gets its own git worktree over a shared checkout, isolating working trees while sharing one clone's history (with the shared `.git` root mounted read-only into each container). Supported on repositories linked to the local workstation Hub (registered with this mode automatically; the worktrees are of your own checkout) and on Hub-managed git projects created with `worktree-per-agent` (see [Linked git projects](/scion/local/workspace/#linked-git-projects)); requires git 2.48 or later on the broker, and is not supported on Kubernetes or Cloud Run Instances (`cloudrun-sandbox` is unaffected).
 
 ### Clone-per-agent
 A workspace sharing mode where each agent gets its own full git clone of the repository. It is also what a Hub git project resolves to when it has no workspace mode set: only `shared` selects the shared checkout.
@@ -84,7 +84,7 @@ A workspace sharing mode where each agent gets its own full git clone of the rep
 A workspace sharing mode for Hub-managed projects without git, where each agent gets its own private directory that starts empty and is not a git repository. It is kept across suspend/resume where storage allows and deleted with the agent. Selected with workspace mode `per-agent` on a project without a git remote.
 
 ### Shared directory
-A persistent, mutable volume shared by the agents within one project. Backed by host filesystem directories (local) or Kubernetes PersistentVolumeClaims (K8s). In hosted deployments, `server.shared_dir_storage` can place them on a shared NFS export so they span Runtime Brokers.
+A persistent, mutable volume shared by the agents within one project. Backed by host filesystem directories (local) or Kubernetes PersistentVolumeClaims (K8s). In hosted deployments, `server.project_storage` can place them (with the workspaces) on a shared NFS export or volume so they span Runtime Brokers.
 
 ### Agent home
 The directory mounted as the container user's home folder, holding that agent's unique config and history.
@@ -154,6 +154,10 @@ One of the roles a server process can run — the Hub API, the Runtime Broker AP
 ### Combo server
 A server process running both the Hub and Runtime Broker components together (the default in workstation mode).
 
+### Console (web UI mode)
+The management view in the web UI's three-way header mode switcher (**Console**, **Chat**, **Terminals**), holding the left-hand navigation and the overview, project, agent, Runtime Broker, and admin pages. Distinct from **Dashboard**, which is the overview landing page (`/`) inside Console's left-hand navigation.
+_Avoid_: Dashboard (when naming the mode-switcher option rather than the `/` overview page)
+
 ### Secret
 A credential made available to an agent at runtime (e.g. API keys, tokens). A harness-config's `secrets` field *declares* which secrets an agent needs; the **Secret Backend** — a pluggable store (local SQLite for development, GCP Secret Manager in production, selected via `SCION_SERVER_SECRETS_BACKEND`) — *stores and resolves* them, scoped by user, project, runtime broker, or hub, and injects them into the container.
 
@@ -178,25 +182,6 @@ A short-lived, single-use token the Hub issues when a user creates or re-registe
 ### Artifact
 A published file or folder (a bundle) stored by the Hub, with numbered immutable versions and a stable reference `scion://artifact/<id>[@<seq>]` that works from any Runtime Broker and in the web UI. Owned by the publishing agent or user and homed in a project. Gated by the `hub.artifacts` experiment. Not a build output or a chat attachment. See [Artifacts](/scion/reference/artifacts/).
 
-## Users & Access
-
-### Access Boundary
-The user-facing term and UI representation of an underlying **AccessConstraint**. It defines a monotonic maximum-permissions boundary (permission ceiling) for users, group closures, or all principals. Admins can view, create, and manage access boundaries via a guided authoring workflow, previewing and dry-running changes using the built-in preview engine and effective-access integration before committing. It is not a User Access Token's boundary (the single project or the hub a UAT is bound to).
-_Avoid_: access ceiling, permission boundary, role constraint
-_See also_: AccessConstraint, Group, RoleBinding, User Access Token (UAT)
-
-### Agent Authorization Role
-A named authority tier (one of `none`, `readonly`, `baseline`, or `full`) assigned to an agent that governs the API scopes granted in its Hub-issued JWT. At creation, the requested or default role is capped by the project maximum and, for sub-agents, the parent agent's role. Live delegation checks separately verify the caller's authority.
-
-### Group
-A named collection of Hub users, agents and nested groups used by the Hub permissions system to assign access. This is the primary meaning of "group" in Scion. Distinct from a **Message Group** (a set of message recipients), from a **Thread Group** (a set of a project's chat threads) and from a **Project**.
-
-### User Access Token (UAT)
-A scoped, revocable bearer token (prefixed with `scion_pat_`) linked to a user account and used for non-interactive Hub authentication (e.g., CLI, CI/CD pipelines, desktop app integration). Every UAT has a boundary, either a single project or (for a hub-bound token, minted through the API) the hub, and carries a specific list of action permissions (scopes). The token boundary is not an **Access Boundary**. Formerly known as a *Personal Access Token (PAT)*.
-
-### Owner-Based Access Control
-An authorization model where certain resources (such as scheduled events, recurring schedules, and individual agents) are strictly restricted so they can only be viewed, updated, deleted, or managed by their respective creator (the "owner") or system-wide administrators. Enforced via owner-ID validation at the API layer.
-
 ### Quota System
 An advisory-lock-based enforcement system that governs resource consumption at agent and project creation. It uses fail-closed semantics and prevents reservation leaks, operating on schemas including LimitDefinition, EntitlementBinding, and UsageReservation.
 _Avoid_: rate limits, usage caps
@@ -220,6 +205,26 @@ _See also_: Inventory target key, Flat Runtime Broker
 ### Inventory target key
 The string (runtime name, plus context and namespace on Kubernetes) that heartbeats, start claims and recovery use to name the runtime an agent was observed on. It appears on an agent record as `appliedConfig.runtimeTarget` and `appliedConfig.runtimeTargetCandidate`. It is not a runtime target ID.
 _See also_: Runtime target ID
+
+## Users & Access
+
+### Access Boundary
+The user-facing term and UI representation of an underlying **AccessConstraint**. It defines a monotonic maximum-permissions boundary (permission ceiling) for users, group closures, or all principals. Admins can view, create, and manage access boundaries via a guided authoring workflow, previewing and dry-running changes using the built-in preview engine and effective-access integration before committing. It is not a User Access Token's boundary (the single project or the hub a UAT is bound to).
+_Avoid_: access ceiling, permission boundary, role constraint
+_See also_: AccessConstraint, Group, RoleBinding, User Access Token (UAT)
+
+### Agent Authorization Role
+A named authority tier (one of `none`, `readonly`, `baseline`, or `full`) assigned to an agent that governs the API scopes granted in its Hub-issued JWT. At creation, the requested or default role is capped by the project maximum and, for sub-agents, the parent agent's role. Live delegation checks separately verify the caller's authority.
+
+### Group
+A named collection of Hub users, agents and nested groups used by the Hub permissions system to assign access. This is the primary meaning of "group" in Scion. Distinct from a **Message Group** (a set of message recipients), from a **Thread Group** (a set of a project's chat threads) and from a **Project**.
+
+### User Access Token (UAT)
+A scoped, revocable bearer token (prefixed with `scion_pat_`) linked to a user account and used for non-interactive Hub authentication (e.g., CLI, CI/CD pipelines, desktop app integration). Every user access token has a boundary and carries a specific list of action permissions (scopes). Each request is allowed only when the token carries the scope and the user currently has that access. The token boundary is not an **Access Boundary**. Formerly known as a *Personal Access Token (PAT)*.
+_Token boundary_: the reach of a user access token, chosen when it is created in the web UI, the CLI or the API: a single project (a project token), or the hub (a hub token), which works in every project the user can currently access and is the only boundary that can carry hub-level scopes.
+
+### Owner-Based Access Control
+An authorization model where certain resources (such as scheduled events, recurring schedules, and individual agents) are strictly restricted so they can only be viewed, updated, deleted, or managed by their respective creator (the "owner") or system-wide administrators. Enforced via owner-ID validation at the API layer.
 
 ## Messaging
 
@@ -277,7 +282,7 @@ The tracked `root → parent → child` relationship between agents that governs
 The infrastructure lifecycle stage of an agent container: `created`, `provisioning`, `cloning`, `starting`, `running`, `stopping`, `stopped`, `suspended`, or `error`. An agent provisioned with `scion create` and not yet started is shown as `created (not started)`.
 
 ### Activity
-What a running agent is currently doing within the `running` phase, such as `initializing` (shown as "starting": the harness is not yet reading input), `thinking`, `executing`, `waiting_for_input`, `blocked`, `completed`, `limits_exceeded`, `stalled`, or `offline`. Distinct from phase.
+What a running agent is currently doing within the `running` phase, such as `initializing` (shown as "starting": the harness is not yet reading input), `thinking`, `executing`, `waiting_for_input`, `blocked`, `completed`, `limits_exceeded`, `stalled`, `offline`, or `harness_error`. Distinct from phase.
 
 ### Blocked
 The activity an agent assigns to itself when intentionally waiting for an expected event (such as a child agent completing), so it is not mistaken for stalled.
@@ -288,11 +293,14 @@ The activity an agent assigns to itself when intentionally waiting for an expect
 ### Error (crash)
 The phase an agent enters when its process or container exits non-zero (a crash, OOM, or `SIGKILL`), carrying a message like `Agent crashed with exit code N`. The `error` phase is restartable: `scion start` clears it and runs a fresh session. A clean exit goes to `stopped` instead. The `error` phase also covers setup failures (e.g. a failed git clone) that happen before an agent reaches `running`.
 
+### Harness error
+The `harness_error` activity of a `running` agent whose harness process is alive at its prompt but reported that a model, API or auth error ended its turn. The reason is in the agent's message (for example `model API: APIError (status 400)`). Notifies the `HARNESS_ERROR` trigger; cleared by the harness's next prompt, model call or tool call, so a new message retries. Distinct from the `error` phase, where the harness process is dead.
+
 ### Stalled
-A platform-set activity for a `running` agent whose heartbeat is still arriving (the process is alive) but that has produced no activity events within the stall threshold (`server.hub.stalled_threshold`, default 5 minutes; a value under 2 minutes falls back to the default). Indicates a hung agent. Agents whose activity is `blocked`, `waiting_for_input`, `completed`, `limits_exceeded` or `offline` are excluded. An agent can be marked stalled while `initializing`, but auto-suspend never suspends it for that stall. Distinct from `offline`, which means no heartbeat for over 2 minutes.
+A platform-set activity for a `running` agent whose heartbeat is still arriving (the process is alive) but that has produced no activity events within the stall threshold (`server.hub.stalled_threshold`, default 5 minutes; a value under 2 minutes falls back to the default). Indicates a hung agent. Agents whose activity is `blocked`, `idle`, `waiting_for_input`, `completed`, `limits_exceeded`, `harness_error` or `offline` are excluded, and so is an agent whose container reported live work (a process doing CPU work, such as a build or test run) within the threshold, or a tool call still in flight (for at most 60 minutes, and for only 10 when its processes make no progress). A stalled agent whose container then reports live work gets its previous activity back. An agent can be marked stalled while `initializing`, but auto-suspend never suspends it for that stall. Distinct from `offline`, which means no heartbeat for over 2 minutes.
 
 ### Auto-Suspend
-A Hub behavior, off by default (`server.hub.auto_suspend_stalled`), that suspends an agent when it is marked `stalled`, reclaiming its container. Agents whose harness does not support session resume are skipped. A message sent with wake (`scion message --wake`, or accepting the web UI's wake prompt) resumes the agent and then delivers it; a message without wake is not delivered (`scion message` gets `409 agent_not_running`).
+A Hub behavior, off by default (`server.hub.auto_suspend_stalled`), that suspends an agent when it is marked `stalled`, reclaiming its container. Agents whose harness does not support session resume are skipped, and so are agents whose container reported live work in the last 90 seconds. A message sent with wake (`scion message --wake`, or accepting the web UI's wake prompt) resumes the agent and then delivers it; a message without wake is not delivered (`scion message` gets `409 agent_not_running`).
 
 ### Run intent
 Whether the Hub has been asked to keep an agent running (`running`) or stopped (`stopped`). It is recorded when a lifecycle request (start, restart, wake, create-and-start, stop, suspend or delete) is accepted, before dispatch to the Runtime Broker, so it reflects the request even when the dispatch is queued or fails. Kept separately from phase and not shown in the agent's API record.

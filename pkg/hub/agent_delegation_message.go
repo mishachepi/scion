@@ -66,6 +66,19 @@ func delegatedSenderProjectID(ctx context.Context, d *DelegatedAgentIdentity) st
 	return d.AgentProjectID()
 }
 
+// stampDelegatedMessageAttribution records, on a message sent with an
+// agent delegated credential, the grant issuer as the authorizing user and
+// the grant (.design/agent-delegation.md §14.5). The sender columns stay
+// the actor agent's. Any other sender leaves both empty.
+func stampDelegatedMessageAttribution(ctx context.Context, msg *store.Message) {
+	delegated := delegatedAgentIdentityFromContext(ctx)
+	if delegated == nil || msg == nil {
+		return
+	}
+	msg.AuthorizingUserID = delegated.AuthorizingUserID()
+	msg.DelegationGrantID = delegated.GrantID()
+}
+
 // senderAgentProject returns the project of the agent that sends on the
 // request in ctx: an agent caller's own project, or the actor agent's
 // project for an agent delegated credential. ok is false for any other
@@ -101,12 +114,8 @@ func (s *Server) delegatedDeliveryRefusal(ctx context.Context, target *store.Age
 	if deferred {
 		return nil
 	}
-	held, err := s.agentHeld(ctx, target.ID)
-	if err != nil {
-		return heldLookupFaultDMError()
+	if dmErr := s.heldTargetRefusal(ctx, target); dmErr != nil {
+		return dmErr
 	}
-	if held {
-		return heldTargetDMError(target)
-	}
-	return validateAgentDeliverable(target)
+	return s.validateAgentDeliverable(target)
 }

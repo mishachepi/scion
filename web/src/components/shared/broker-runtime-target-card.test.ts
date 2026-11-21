@@ -46,10 +46,14 @@ function flatBroker(type: string, presentation?: RuntimeTargetPresentation): Run
   } as RuntimeBroker;
 }
 
-function withPlacement(extra: Record<string, unknown> = {}): RuntimeTargetPresentation {
+function withPlacement(
+  extra: Record<string, unknown> = {},
+  placementReported?: boolean
+): RuntimeTargetPresentation {
   const p = fullPresentation();
   p.target = {
     ...p.target!,
+    placementReported,
     nodeSelector: { 'cloud.google.com/gke-nodepool': 'agents' },
     tolerations: [
       { key: 'dedicated', operator: 'Equal', value: 'agents', effect: 'NoSchedule', ...extra },
@@ -136,11 +140,54 @@ describe('scion-broker-runtime-target-card', () => {
     expect(root.innerHTML).not.toContain('tolerationSeconds');
   });
 
-  it('has no Placement group for docker, an unknown type, or missing fields', async () => {
+  it('has no Placement group for docker or an unknown type', async () => {
     expect(rows(await mount(flatBroker('docker', withPlacement())), 'placement-rows')).toBeNull();
     expect(rows(await mount(flatBroker('cloudrun', withPlacement())), 'placement-rows')).toBeNull();
-    const none = await mount(flatBroker('kubernetes', fullPresentation()));
-    expect(rows(none, 'placement-rows')).toBeNull();
+  });
+
+  it('shows Region on a Cloud Run target card and never renders withheld Cloud Run fields', async () => {
+    const p = {
+      schemaVersion: 1,
+      key: 'cr-us-central1',
+      name: 'cr-us-central1',
+      target: {
+        type: 'cloudrun',
+        displayName: 'Cloud Run',
+        region: 'us-central1',
+        projectId: 'NEVER-project-id',
+        serviceAccount: 'NEVER-sa@example.iam.gserviceaccount.com',
+        network: 'NEVER-network',
+        subnetwork: 'NEVER-subnetwork',
+        credentialsFile: '/NEVER-credentials.json',
+      },
+    } as unknown as RuntimeTargetPresentation;
+    const broker = {
+      ...flatBroker('cloudrun', p),
+      runtimeTarget: { id: 'rt-cr-1', type: 'cloudrun', displayName: 'Cloud Run' },
+    };
+    const root = await mount(broker);
+    expect(rows(root, 'target-rows')).toEqual({
+      ID: 'rt-cr-1',
+      Type: 'cloudrun',
+      'Display name': 'Cloud Run',
+      Region: 'us-central1',
+    });
+    expect(rows(root, 'placement-rows')).toBeNull();
+    expect(root.innerHTML).not.toContain('NEVER-');
+  });
+
+  it('flat placement is read-only and tells not reported from none configured', async () => {
+    const old = await mount(flatBroker('kubernetes', fullPresentation()));
+    expect(rows(old, 'placement-rows')).toEqual({ Placement: 'Not reported' });
+    const empty = fullPresentation();
+    empty.target = { ...empty.target!, placementReported: true };
+    const reported = await mount(flatBroker('kubernetes', empty));
+    expect(rows(reported, 'placement-rows')).toEqual({
+      Placement: 'None configured on the broker',
+    });
+    const placed = await mount(flatBroker('kubernetes', withPlacement({}, true)));
+    expect(rows(placed, 'placement-rows')!['Runtime class']).toBe('gvisor');
+    expect(placed.querySelector('sl-input, sl-button, input, button, form')).toBeNull();
   });
 
   it('renders nothing for a legacy broker', async () => {

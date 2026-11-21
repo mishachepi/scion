@@ -55,6 +55,7 @@ import { isFeatureEnabled } from '../../../utils/feature-flags.js';
 import type { ArtifactPickerSelectDetail, PendingArtifact } from './artifact-picker.js';
 import './artifact-picker.js';
 import { findDefaultAgent } from './default-agent.js';
+import { hasStandaloneMentionToken } from './prose-mentions.js';
 
 /** The touch presentation of the send button's right-click menu. */
 const SEND_SHEET_INTERRUPT: ActionSheetItem = {
@@ -133,6 +134,7 @@ export interface ChatScheduleDetail {
   text: string;
   fireAt: string;
   replyToId?: string;
+  wake?: boolean;
   onSuccess: () => void;
   /** Restore composer state when scheduling fails. */
   onError?: (errorMsg: string) => void;
@@ -273,6 +275,13 @@ export class ScionChatComposer extends LitElement {
    */
   @property({ type: Boolean })
   scheduleSendEnabled = false;
+
+  /**
+   * Whether the Schedule send dialog offers the opt-in wake checkbox (topics
+   * and agent DMs, never user-to-user DMs).
+   */
+  @property({ type: Boolean })
+  wakeAvailable = false;
 
   /** Whether the Schedule send dialog is open. */
   @state() private showScheduleDialog = false;
@@ -895,11 +904,11 @@ export class ScionChatComposer extends LitElement {
       align-items: center;
       gap: 0.5rem;
       padding: calc(0.375rem - 0.25rem * var(--scion-chat-kb-open, 0)) 0.75rem;
-      background: var(--scion-surface-50, #f8fafc);
+      background: var(--scion-bg, #f8fafc);
       border-left: 3px solid var(--scion-primary-400, #60a5fa);
       border-radius: 0 0.25rem 0.25rem 0;
       font-size: var(--chat-fs-base);
-      color: var(--scion-neutral-600, #475569);
+      color: var(--scion-text-secondary, #475569);
     }
 
     /* The sender and a one-line excerpt: on two lines normally, side by
@@ -915,10 +924,11 @@ export class ScionChatComposer extends LitElement {
 
     /* While the keyboard is open the sender takes at most half the bar and
        is cut with an ellipsis, so a long name never wraps the bar back to
-       two lines. */
+       two lines. Its colour is primary-600 in the light theme and
+       primary-300 in the dark one, for AA contrast on the bar in both. */
     .reply-bar .reply-sender {
       font-weight: 600;
-      color: var(--scion-primary-600, #2563eb);
+      color: var(--scion-primary-hover, #2563eb);
       max-width: calc(100% - 50% * var(--scion-chat-kb-open, 0));
       min-width: 0;
       overflow: hidden;
@@ -1290,6 +1300,7 @@ export class ScionChatComposer extends LitElement {
               ${this.scheduleSendEnabled
                 ? html`<scion-chat-schedule-dialog
                     .open=${this.showScheduleDialog}
+                    .wakeAvailable=${this.wakeAvailable}
                     @schedule-confirm=${this.handleScheduleConfirm}
                     @schedule-cancel=${this.handleScheduleCancel}
                   ></scion-chat-schedule-dialog>`
@@ -2480,14 +2491,14 @@ export class ScionChatComposer extends LitElement {
 
   private readonly handleScheduleConfirm = (e: CustomEvent<ScheduleConfirmDetail>): void => {
     this.showScheduleDialog = false;
-    this.doSchedule(e.detail.fireAt);
+    this.doSchedule(e.detail.fireAt, e.detail.wake);
   };
 
   /**
    * Schedule the current text for `fireAt`: clears the composer like a send
    * and dispatches `chat-schedule`; the parent restores it via onError.
    */
-  private doSchedule(fireAt: string): void {
+  private doSchedule(fireAt: string, wake?: boolean): void {
     if (this.editMessage || this.pendingFiles.length > 0 || this.pendingArtifacts.length > 0)
       return;
     const trimmed = this.text.trim();
@@ -2507,6 +2518,9 @@ export class ScionChatComposer extends LitElement {
     };
     if (this.replyTo) {
       detail.replyToId = this.replyTo.messageId;
+    }
+    if (wake) {
+      detail.wake = true;
     }
 
     this.text = '';
@@ -2540,6 +2554,121 @@ export class ScionChatComposer extends LitElement {
     this.runeCount = countRunes(this.text);
     this.saveDraft();
     return true;
+  }
+
+  /**
+   * Pre-fill resolved `@slug ` tokens at the start of the draft (e.g. from
+   * "Reply all"), registering each in `mentionRanges` + `acceptedMentions`
+   * while preserving existing draft text and any already-present mentions.
+   *
+   * When `opts.leadIn` is supplied (e.g. `'cc '` for agent-authored replies so
+   * the message does not start with a leading `@mention`), the prefix starts
+   * with `leadIn` without including `leadIn` in `mentionRanges`. If the draft
+   * already begins with `leadIn`, it is not repeated.
+   */
+  seedMentions(slugs: readonly string[], opts: { leadIn?: string } = {}): void {
+    const leadIn = opts.leadIn ?? '';
+    const uniqueSlugs: string[] = [];
+    const seenLower = new Set<string>();
+    for (const raw of slugs) {
+      const slug = raw.trim();
+      if (!slug) continue;
+      const lower = slug.toLowerCase();
+      if (seenLower.has(lower)) continue;
+      seenLower.add(lower);
+      uniqueSlugs.push(slug);
+    }
+    if (uniqueSlugs.length === 0) {
+      this.focusTextareaCaretEnd();
+      return;
+    }
+
+    const missingSlugs: string[] = [];
+    for (const slug of uniqueSlugs) {
+      this.acceptedMentions.add(slug);
+      if (!hasStandaloneMentionToken(this.text, slug)) {
+        missingSlugs.push(slug);
+      }
+    }
+
+    if (missingSlugs.length > 0) {
+      const mentionText = missingSlugs.map((s) => `@${s} `).join('');
+      const hasLeadIn = leadIn !== '' && this.text.startsWith(leadIn);
+
+      if (hasLeadIn) {
+        let insertAt = leadIn.length;
+        for (;;) {
+          const nextRange = this.mentionRanges.find((r) => r.start === insertAt);
+          if (!nextRange) break;
+          insertAt = nextRange.end;
+        }
+        this.text = this.text.slice(0, insertAt) + mentionText + this.text.slice(insertAt);
+
+        const shifted = this.mentionRanges.map((r) =>
+          r.start >= insertAt
+            ? { ...r, start: r.start + mentionText.length, end: r.end + mentionText.length }
+            : r
+        );
+        const insertedRanges: MentionRange[] = [];
+        let offset = insertAt;
+        for (const slug of missingSlugs) {
+          const tokenLen = slug.length + 2; // `@${slug} `
+          insertedRanges.push({ start: offset, end: offset + tokenLen, slug });
+          offset += tokenLen;
+        }
+        this.mentionRanges = [...shifted, ...insertedRanges];
+      } else {
+        const prefix = `${leadIn}${mentionText}`;
+        this.text = `${prefix}${this.text}`;
+        const shifted = this.mentionRanges.map((r) => ({
+          ...r,
+          start: r.start + prefix.length,
+          end: r.end + prefix.length,
+        }));
+        const insertedRanges: MentionRange[] = [];
+        let offset = leadIn.length;
+        for (const slug of missingSlugs) {
+          const tokenLen = slug.length + 2; // `@${slug} `
+          insertedRanges.push({ start: offset, end: offset + tokenLen, slug });
+          offset += tokenLen;
+        }
+        this.mentionRanges = [...insertedRanges, ...shifted];
+      }
+
+      this.runeCount = countRunes(this.text);
+      this.saveDraft();
+    } else if (
+      leadIn !== '' &&
+      !this.text.startsWith(leadIn) &&
+      this.text.trimStart().startsWith('@')
+    ) {
+      // Prepend `leadIn` even when every slug is already present so a leading `@mention` does not override the reply-target agent on the hub.
+      this.text = `${leadIn}${this.text}`;
+      this.mentionRanges = this.mentionRanges.map((r) => ({
+        ...r,
+        start: r.start + leadIn.length,
+        end: r.end + leadIn.length,
+      }));
+      this.runeCount = countRunes(this.text);
+      this.saveDraft();
+    }
+
+    void this.updateComplete.then(async () => {
+      const slTextarea = this.shadowRoot?.querySelector('sl-textarea') as {
+        updateComplete?: Promise<unknown>;
+      } | null;
+      if (slTextarea?.updateComplete) {
+        await slTextarea.updateComplete;
+      }
+      const ta = this.getTextareaElement();
+      if (ta) {
+        const end = ta.value.length;
+        ta.setSelectionRange(end, end);
+      }
+      this.notifyMentionAutocompleteOfTextChange();
+      this.notifySlashAutocompleteOfTextChange();
+    });
+    this.focusTextareaCaretEnd();
   }
 
   /**

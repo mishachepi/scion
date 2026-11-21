@@ -26,7 +26,7 @@ import '@shoelace-style/shoelace/dist/themes/dark.css';
 
 import type { AuthMeResponse, PageData, User } from '../shared/types.js';
 import { stateManager } from './state.js';
-import { setDocumentTitle } from './page-title.js';
+import { getAppName, setAppName, setDocumentTitle } from './page-title.js';
 import { readInitialPageData, setInitialPageData, takeInitialPageData } from './ssr-page-data.js';
 import { configureReadinessMarks, readinessNavigationStarted } from './readiness-marks.js';
 import { legacyAgentRedirect } from './agent-routes.js';
@@ -53,6 +53,7 @@ import { resolveBrokerRoute } from './broker-routes.js';
 import { applyServerFeatureFlags } from './server-feature-flags.js';
 import { apiFetch } from './api.js';
 import { setPreferredTimeZone } from '../utils/time.js';
+import { setPreselectRecommendedChoices } from './decision-preferences.js';
 import { withTimeout } from './with-timeout.js';
 import {
   type AdminStatus,
@@ -92,7 +93,12 @@ const TZ_LOAD_BUDGET_MS = 1500;
 {
   const style = document.createElement('style');
   style.textContent = themeCSS;
-  document.head.appendChild(style);
+  const brandingStyle = document.getElementById('scion-branding-tokens');
+  if (brandingStyle?.parentNode === document.head) {
+    document.head.insertBefore(style, brandingStyle);
+  } else {
+    document.head.appendChild(style);
+  }
 }
 
 // Import Shoelace base path config (needed for icons).
@@ -124,6 +130,7 @@ import '@shoelace-style/shoelace/dist/components/spinner/spinner.js';
 import '@shoelace-style/shoelace/dist/components/progress-bar/progress-bar.js';
 import '@shoelace-style/shoelace/dist/components/textarea/textarea.js';
 import '@shoelace-style/shoelace/dist/components/tooltip/tooltip.js';
+import '@shoelace-style/shoelace/dist/components/popup/popup.js';
 import '@shoelace-style/shoelace/dist/components/dialog/dialog.js';
 import '@shoelace-style/shoelace/dist/components/divider/divider.js';
 import '@shoelace-style/shoelace/dist/components/dropdown/dropdown.js';
@@ -421,7 +428,8 @@ async function fetchCurrentUser(): Promise<User | null> {
 
 /**
  * Refreshes the display-timezone preference and applies it to the
- * effective-zone store (`setPreferredTimeZone`). Used when the SSR-injected
+ * effective-zone store (`setPreferredTimeZone`), and the decision-card
+ * preference (`setPreselectRecommendedChoices`). Used when the SSR-injected
  * user (`prefetchPageData`, `pkg/hub/web.go`) already supplied `currentUser`
  * without `preferences` — that field is deliberately never cached on the
  * session (`webSessionUser.Preferences`) and so is absent from SSR data,
@@ -453,6 +461,7 @@ async function loadPreferredTimeZone(): Promise<void> {
     if (!res.ok) return;
     const data = (await res.json()) as AuthMeResponse;
     setPreferredTimeZone(data.preferences?.timezone);
+    setPreselectRecommendedChoices(data.preferences?.preselectRecommendedChoices);
   } catch {
     // Non-critical — the effective zone falls back to the browser zone.
   }
@@ -669,6 +678,11 @@ const ROUTES: RouteConfig[] = [
     load: () => import('../components/pages/gcp-service-account-detail.js'),
   },
   {
+    pattern: /^\/profile\/decisions$/,
+    tag: 'scion-page-profile-decisions',
+    load: () => import('../components/pages/profile-decisions.js'),
+  },
+  {
     pattern: /^\/profile\/env$/,
     tag: 'scion-page-profile-env-vars',
     load: () => import('../components/pages/profile-env-vars.js'),
@@ -766,6 +780,12 @@ const ROUTES: RouteConfig[] = [
     load: () => import('../components/pages/project-schedules.js'),
   },
   {
+    // Project Decisions page (experiment web.decisions; renders 404 when off).
+    pattern: /^\/projects\/[^/]+\/decisions$/,
+    tag: 'scion-page-project-decisions',
+    load: () => import('../components/pages/project-decisions.js'),
+  },
+  {
     pattern: /^\/projects\/[^/]+\/metrics$/,
     tag: 'scion-page-project-metrics',
     load: () => import('../components/pages/metrics-dashboard.js'),
@@ -845,6 +865,7 @@ const STANDALONE_ROUTES = new Set([
  * Routes that render inside the profile shell instead of the main app shell
  */
 const PROFILE_ROUTES = new Set([
+  'scion-page-profile-decisions',
   'scion-page-profile-env-vars',
   'scion-page-profile-secrets',
   'scion-page-profile-settings',
@@ -944,6 +965,9 @@ async function init(): Promise<void> {
 
   // Get initial data from SSR
   const initialData = getInitialData();
+  if (initialData?.branding?.name) {
+    setAppName(initialData.branding.name);
+  }
   // Fixed for this document: a change of the setting applies on the next full load.
   configureReadinessMarks(initialData?.readinessMarks === true);
   if (initialData) {
@@ -974,6 +998,7 @@ async function init(): Promise<void> {
     currentUser = await fetchCurrentUser();
     if (currentUser) {
       setPreferredTimeZone(currentUser.preferences?.timezone);
+      setPreselectRecommendedChoices(currentUser.preferences?.preselectRecommendedChoices);
     }
   } else {
     // SSR supplied the user without `preferences` (never cached on the
@@ -1366,7 +1391,7 @@ async function renderRoute(path: string): Promise<void> {
   // takeInitialPageData) so page components can skip redundant API fetches.
   const pageData: PageData = {
     path,
-    title: 'Scion',
+    title: getAppName(),
     user: currentUser || undefined,
     data: initialData,
   };
@@ -1432,13 +1457,13 @@ async function renderRoute(path: string): Promise<void> {
 
   // If the shell type changed, tear down and rebuild
   if (activeShell && activeShell.type !== shellType) {
-    appContainer.innerHTML = '';
+    appContainer.replaceChildren();
     activeShell = null;
   }
 
   if (shellType === 'standalone') {
     // Standalone pages render without a persistent shell
-    appContainer.innerHTML = '';
+    appContainer.replaceChildren();
     activeShell = null;
     const page = document.createElement(tag);
     appContainer.appendChild(page);
@@ -1489,7 +1514,7 @@ async function renderRoute(path: string): Promise<void> {
     shell.appendChild(page);
   } else {
     // Create the shell for the first time — clear any SSR-rendered content
-    appContainer.innerHTML = '';
+    appContainer.replaceChildren();
     const SHELL_TAGS: Record<ShellType, string> = {
       standalone: '', // handled above — standalone pages render without a shell
       chat: 'scion-chat-shell',

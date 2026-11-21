@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
@@ -152,6 +153,12 @@ type GCPServiceAccount struct {
 	// other responses.
 	Warnings []string `json:"warnings,omitempty"`
 
+	// WorkloadIdentityBindings reports, on a mint response, the
+	// roles/iam.workloadIdentityUser grants the Hub made or skipped on the
+	// new account (hub.k8s_workload_identity_setup; ptone/scion#3329 phase
+	// 5). Absent on other responses and when the experiment is off.
+	WorkloadIdentityBindings []api.WorkloadIdentityBinding `json:"workloadIdentityBindings,omitempty"`
+
 	// Mapping summarizes the listed project's Kubernetes broker profiles that
 	// map this account. Present on project-scope lists only.
 	Mapping *GCPServiceAccountMappingSummary `json:"mapping,omitempty"`
@@ -202,13 +209,14 @@ type GCPServiceAccountStatus struct {
 		Error      string     `json:"error,omitempty"`
 	} `json:"verification"`
 	// Mappings has one entry per Kubernetes broker profile of the project.
-	// State is "mapped", "not_mapped" (on a complete, fresh report),
-	// "unknown" or "not_reported".
+	// State is "mapped", "creatable", "not_mapped" (on a complete, fresh
+	// report), "unknown" or "not_reported".
 	Mappings []GCPServiceAccountProfileMapping `json:"mappings"`
 	// WorkloadIdentityBinding.State is "bound", "not_bound" or "unknown".
 	WorkloadIdentityBinding struct {
-		State  string `json:"state"`
-		Reason string `json:"reason,omitempty"`
+		State   string                           `json:"state"`
+		Reason  string                           `json:"reason,omitempty"`
+		Targets []GCPServiceAccountBindingTarget `json:"targets,omitempty"`
 	} `json:"workloadIdentityBinding"`
 	// DefaultFor lists the defaults that name the account. Kind is
 	// "project", "profile" (with Profile set) or "hub".
@@ -222,7 +230,9 @@ type GCPServiceAccountStatus struct {
 		Count int      `json:"count"`
 		Names []string `json:"names"`
 	} `json:"agents"`
-	// NextStep.Code is "not_verified", "not_mapped" or "none".
+	// NextStep.Code is "not_verified", "not_mapped", "not_bound" (when
+	// hub.k8s_workload_identity_setup is enabled and a target is unbound) or
+	// "none".
 	NextStep struct {
 		Code       string `json:"code"`
 		BrokerName string `json:"brokerName,omitempty"`
@@ -261,6 +271,37 @@ type GCPServiceAccountProfileMapping struct {
 	// runtime key the hub cannot tell is Kubernetes) or "ambiguous_mapping".
 	// Clients should show a newer code they do not know as-is.
 	UnknownReason string `json:"unknownReason,omitempty"`
+	// WorkloadIdentityBinding is this profile's Workload Identity IAM binding
+	// state when hub.k8s_workload_identity_setup is enabled.
+	WorkloadIdentityBinding *GCPServiceAccountProfileBinding `json:"workloadIdentityBinding,omitempty"`
+}
+
+// GCPServiceAccountBindingTarget is one stored Kubernetes runtime target's
+// Workload Identity IAM binding state in the per-account status view.
+type GCPServiceAccountBindingTarget struct {
+	Pool          string     `json:"pool,omitempty"`
+	Namespace     string     `json:"namespace,omitempty"`
+	KSA           string     `json:"ksa,omitempty"`
+	Member        string     `json:"member,omitempty"`
+	Profiles      []string   `json:"profiles,omitempty"`
+	State         string     `json:"state"`
+	Reason        string     `json:"reason,omitempty"`
+	ManualStep    string     `json:"manualStep,omitempty"`
+	LastHeartbeat *time.Time `json:"lastHeartbeat,omitempty"`
+	Stale         bool       `json:"stale,omitempty"`
+	StaleReason   string     `json:"staleReason,omitempty"`
+}
+
+// GCPServiceAccountProfileBinding is one Kubernetes broker profile's Workload
+// Identity IAM binding state in the per-account status view.
+type GCPServiceAccountProfileBinding struct {
+	State       string `json:"state"`
+	Reason      string `json:"reason,omitempty"`
+	Pool        string `json:"pool,omitempty"`
+	Member      string `json:"member,omitempty"`
+	ManualStep  string `json:"manualStep,omitempty"`
+	Stale       bool   `json:"stale,omitempty"`
+	StaleReason string `json:"staleReason,omitempty"`
 }
 
 // IsHubScoped reports whether the account belongs to the hub rather than to a
@@ -459,7 +500,7 @@ const (
 )
 
 func gcpSANestedPath(projectID string) string {
-	return fmt.Sprintf("/api/v1/projects/%s/gcp-service-accounts", projectID)
+	return fmt.Sprintf("/api/v1/projects/%s/gcp-service-accounts", url.PathEscape(projectID))
 }
 
 // byIDPath resolves a ref to the address that serves it.
@@ -468,9 +509,9 @@ func gcpSANestedPath(projectID string) string {
 // is made; see GCPServiceAccountRef.
 func (r GCPServiceAccountRef) byIDPath() string {
 	if r.projectID != "" {
-		return fmt.Sprintf("%s/%s", gcpSANestedPath(r.projectID), r.id)
+		return fmt.Sprintf("%s/%s", gcpSANestedPath(r.projectID), url.PathEscape(r.id))
 	}
-	return fmt.Sprintf("%s/%s", gcpSAFlatPath, r.id)
+	return fmt.Sprintf("%s/%s", gcpSAFlatPath, url.PathEscape(r.id))
 }
 
 // scopeQuery renders scope selection as the Hub's query parameters.

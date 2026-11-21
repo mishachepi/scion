@@ -91,7 +91,7 @@ func newStreamTestServer(t *testing.T, override func(*WebServerConfig)) (*WebSer
 	ws.SetEventPublisher(pub)
 	ws.SetAuthzService(NewAuthzService(mockSuperAdminStore(DevUserID), nil))
 	t.Cleanup(pub.Close)
-	ts := httptest.NewServer(ws.Handler())
+	ts := httptest.NewServer(devSignedIn(t, ws))
 	t.Cleanup(ts.Close)
 	return ws, pub, ts, logs
 }
@@ -210,6 +210,8 @@ func TestEventStreamRegistry_MaxAge(t *testing.T) {
 	ws, _, ts, logs := newStreamTestServer(t, func(cfg *WebServerConfig) {
 		cfg.SSEHeartbeatInterval = 20 * time.Millisecond
 		cfg.SSEMaxConnectionAge = 300 * time.Millisecond
+		// The middle of the jitter range: exactly the configured age.
+		cfg.SSEMaxAgeJitter = func() float64 { return 0.5 }
 	})
 	const n = 3
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -478,6 +480,12 @@ func TestStatusUpdateIsHeartbeatOnly(t *testing.T) {
 		{"heartbeat with phase", store.AgentStatusUpdate{Heartbeat: true, Phase: "running"}, false},
 		{"heartbeat with activity", store.AgentStatusUpdate{Heartbeat: true, Activity: "thinking"}, false},
 		{"heartbeat with turns", store.AgentStatusUpdate{Heartbeat: true, CurrentTurns: &turns}, false},
+		// Live work (ptone/scion#7855) writes only the live-work
+		// timestamps, so the heartbeat stays heartbeat-only.
+		{"heartbeat with live work", store.AgentStatusUpdate{
+			Heartbeat: true, LiveWork: &store.LiveWork{Kind: "process", SuppressStall: true},
+		}, true},
+		{"live work without heartbeat", store.AgentStatusUpdate{LiveWork: &store.LiveWork{Kind: "process"}}, false},
 		{"activity alone", store.AgentStatusUpdate{Activity: "thinking"}, false},
 	}
 	for _, c := range cases {
@@ -518,6 +526,7 @@ func TestExpandProjectWildcard_DrainsEveryPage(t *testing.T) {
 	assert.Equal(t, "project.p-02502.>", got[2502])
 	assert.Equal(t, 3, st.listProjectsCalls, "three pages of at most 1000")
 	assert.Equal(t, sseProjectWildcardPageSize, st.lastListProjectsLimit)
+	assert.Zero(t, st.listProjectsFullCalls, "the expansion pages summaries, without the computed fields")
 }
 
 func TestExpandProjectWildcard_ErrorOnLaterPageFailsClosed(t *testing.T) {

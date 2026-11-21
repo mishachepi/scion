@@ -38,7 +38,16 @@ type routedInboundRequest struct {
 	ExternalRef  string                      `json:"external_ref,omitempty"`
 	ParentRef    string                      `json:"parent_ref,omitempty"`
 	Message      *messages.StructuredMessage `json:"message"`
+
+	// AttachmentIDs is not supported on this route yet; a request naming
+	// any is refused (codeAttachmentsUnsupportedOnRoute) rather than
+	// delivered without them.
+	AttachmentIDs []string `json:"attachment_ids,omitempty"`
 }
+
+// codeAttachmentsUnsupportedOnRoute is the error code of the 400 for
+// attachment_ids on the routed broker inbound route.
+const codeAttachmentsUnsupportedOnRoute = "attachments_unsupported_on_route"
 
 // routedInboundResponse is returned from POST /api/v1/broker/inbound/routed.
 type routedInboundResponse struct {
@@ -49,10 +58,15 @@ type routedInboundResponse struct {
 	MentionErrors      []routedMentionError   `json:"mention_errors,omitempty"`
 }
 
+// routedStatusHoldLookupFailed is the result status of a recipient whose
+// hold could not be read (ptone/scion#6859): the send is refused, and a
+// primary recipient answers 500 like the other send paths.
+const routedStatusHoldLookupFailed = "hold_lookup_failed"
+
 type routedDeliveryResult struct {
 	AgentSlug          string `json:"agent_slug"`
 	Type               string `json:"type"`   // "message" or "mention"
-	Status             string `json:"status"` // delivered, unauthorized, not_running, conversation_not_resolved, error, not_attempted
+	Status             string `json:"status"` // delivered, unauthorized, not_running, hold_lookup_failed, conversation_not_resolved, error, not_attempted
 	MessageID          string `json:"message_id,omitempty"`
 	Error              string `json:"error,omitempty"`
 	PersistenceWarning string `json:"persistence_warning,omitempty"`
@@ -105,6 +119,11 @@ func (s *Server) handleBrokerInboundRouted(w http.ResponseWriter, r *http.Reques
 	}
 
 	// --- Input validation ---
+	if len(req.AttachmentIDs) > 0 {
+		writeError(w, http.StatusBadRequest, codeAttachmentsUnsupportedOnRoute,
+			"attachment_ids are not accepted on this route", nil)
+		return
+	}
 	if req.ProjectID == "" {
 		ValidationError(w, "project_id is required", map[string]interface{}{"field": "project_id"})
 		return
@@ -113,6 +132,11 @@ func (s *Server) handleBrokerInboundRouted(w http.ResponseWriter, r *http.Reques
 		ValidationError(w, "message is required", map[string]interface{}{"field": "message"})
 		return
 	}
+	if isReservedSchedulerChannel(req.Message.Channel) {
+		ValidationError(w, fmt.Sprintf("channel %q is reserved for internal use", req.Message.Channel), nil)
+		return
+	}
+	clearInboundClientEvent(req.Message)
 	if !strings.HasPrefix(req.Message.Sender, "user:") {
 		writeError(w, http.StatusBadRequest, ErrCodeValidationError,
 			"sender must use user: prefix for mapped identity", nil)
@@ -142,45 +166,14 @@ func (s *Server) handleBrokerInboundRouted(w http.ResponseWriter, r *http.Reques
 	}
 
 	// --- Resolve sender identity ---
-	senderEmail := strings.TrimPrefix(req.Message.Sender, "user:")
-	// A hub test identity is reachable only through its own hub-issued
-	// token; this path resolves by email, so it refuses one outright.
-	if emailResolvedPrincipalRefused(senderEmail, nil) {
-		writeError(w, http.StatusForbidden, ErrCodeForbidden,
-			"sender identity not eligible", map[string]interface{}{"sender": req.Message.Sender})
+	senderIdentity, refusal := s.resolveBrokerInboundSender(r.Context(), req.Message.Sender)
+	if refusal != nil {
+		log.Warn("routed inbound sender refused",
+			"sender", req.Message.Sender, "refusal", brokerRefusalLogText(refusal))
+		refusal.write(w)
 		return
 	}
-	senderUser, err := s.store.GetUserByEmail(r.Context(), senderEmail)
-	if err != nil {
-		log.Warn("Could not resolve sender identity",
-			"sender", req.Message.Sender, "error", err)
-		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusForbidden, ErrCodeForbidden,
-				"sender identity could not be resolved",
-				map[string]interface{}{"sender": req.Message.Sender})
-		} else {
-			writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
-				"internal error resolving sender identity", nil)
-		}
-		return
-	}
-	// C2a containment: require active status.
-	if senderUser.Status != store.UserStatusActive {
-		log.Warn("routed inbound sender is not active",
-			"sender", req.Message.Sender, "status", senderUser.Status)
-		writeError(w, http.StatusForbidden, ErrCodeForbidden,
-			"sender identity is not active",
-			map[string]interface{}{"sender": req.Message.Sender, "status": senderUser.Status})
-		return
-	}
-	if emailResolvedPrincipalRefused(senderEmail, senderUser) {
-		log.Warn("routed inbound sender is a test identity", "sender", req.Message.Sender)
-		writeError(w, http.StatusForbidden, ErrCodeForbidden,
-			"sender identity not eligible", map[string]interface{}{"sender": req.Message.Sender})
-		return
-	}
-	req.Message.SenderID = senderUser.ID
-	senderIdentity := NewAuthenticatedUser(senderUser.ID, senderUser.Email, senderUser.DisplayName, senderUser.Role, "integration")
+	req.Message.SenderID = senderIdentity.ID()
 
 	// --- Strip leading "!" interrupt prefix ---
 	if trimmed := strings.TrimSpace(req.Message.Msg); strings.HasPrefix(trimmed, "!") {
@@ -305,6 +298,13 @@ func (s *Server) handleBrokerInboundRouted(w http.ResponseWriter, r *http.Reques
 				fmt.Sprintf("primary agent %q is not running", primaryAgent.Slug),
 				map[string]interface{}{"results": results})
 			return
+		case routedStatusHoldLookupFailed:
+			// A store fault, not a dispatch failure: the same 500 the other
+			// send paths give when the target's hold cannot be read.
+			dmErr := heldLookupFaultDMError()
+			writeError(w, dmErr.HTTPStatus, dmErr.Code, dmErr.Message,
+				map[string]interface{}{"results": results})
+			return
 		case "conversation_not_resolved":
 			writeError(w, http.StatusConflict, ErrCodeConversationNotResolved,
 				"conversation resolution failed for primary agent",
@@ -399,9 +399,27 @@ func (s *Server) dispatchRoutedRecipient(
 	}
 
 	// --- Phase check ---
+	if agent.IdleSuspendClaimActive {
+		result.Status = "not_running"
+		result.Error = "agent is suspended"
+		return result
+	}
 	if phase := state.Phase(agent.Phase); phase != state.PhaseRunning {
 		result.Status = "not_running"
 		result.Error = fmt.Sprintf("agent is %s", agent.Phase)
+		return result
+	}
+
+	// --- Hold check ---
+	// A held agent (ptone/scion#3433) is refused like a suspended one, with
+	// the refusal the other send paths use (ptone/scion#6859); a lookup
+	// fault refuses. Before conversation resolution, so nothing is written.
+	if dmErr := s.heldTargetRefusal(ctx, agent); dmErr != nil {
+		result.Status = "not_running"
+		if dmErr.HTTPStatus == http.StatusInternalServerError {
+			result.Status = routedStatusHoldLookupFailed
+		}
+		result.Error = dmErr.Message
 		return result
 	}
 
@@ -471,6 +489,8 @@ func (s *Server) dispatchRoutedRecipient(
 	// offload metadata keys — the switch above doesn't exclude them, so a
 	// plugin could otherwise spoof body_offloaded/body_chars/body_sha256.
 	msg.Metadata = messaging.StripReservedMetadata(msg.Metadata)
+	// A human sender's profile time zone travels with the message.
+	msg.Metadata = s.stampSenderTimezone(ctx, msg.Metadata, msg.Sender, msg.SenderID)
 
 	// --- Validate through envelope choke point ---
 	if err := messaging.ValidateLegacyMessage(msg); err != nil {
@@ -575,30 +595,11 @@ func (s *Server) dispatchRoutedRecipient(
 		msg.DeliveryText = messaging.RenderDeliveryText(renderInput)
 	}
 
-	// --- Dispatch ---
-	retryCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	// The record is logged from a copy carrying the effective conversation,
-	// before dispatch, so the dispatched message is unchanged.
-	recordMsg := *msg
-	if effectiveConv != nil {
-		recordMsg.ConversationID = effectiveConv.ConversationID
-	}
-	logMessageRecord(s.recordLog(), agent, &recordMsg)
-	if err := dispatchWithBrokerRetry(retryCtx, nil, dispatcher, agent, msg.Msg, msg.Urgent, msg); errors.Is(err, ErrBrokerTimeout) {
-		result.Status = "error"
-		result.Error = "broker unreachable after 30s deadline"
-		return result
-	} else if err != nil {
-		s.messageLog.Error("routed inbound dispatch failed",
-			"agent_slug", agent.Slug, "error", err)
-		result.Status = "error"
-		result.Error = "dispatch failed: " + err.Error()
-		return result
-	}
-
-	// --- Persist ---
+	// --- Persist before dispatch when hub.conduit_deliver is enabled (ptone/scion#7881, REQ-4) ---
+	// Persisting before dispatch allows Conduit row binding (withDispatchMessageID)
+	// and awaiting_session hold/re-drive, while preserving the non-fatal
+	// PersistenceWarning fallback when CreateMessage fails. When hub.conduit_deliver
+	// is off, preserve exact Phase A dispatch-first ordering.
 	storeMsg := &store.Message{
 		ID:            msgID,
 		ProjectID:     params.req.ProjectID,
@@ -619,13 +620,81 @@ func (s *Server) dispatchRoutedRecipient(
 		storeMsg.ConversationID = effectiveConv.ConversationID
 	}
 	persisted := false
-	if err := s.store.CreateMessage(ctx, storeMsg); err != nil {
+	var persistErr error
+	persistRouted := func() error {
+		err := s.store.CreateMessage(ctx, storeMsg)
+		if err == nil {
+			persisted = true
+		}
+		return err
+	}
+	if s.conduitDeliverEnabled() {
+		persistErr = persistRouted()
+	}
+
+	// --- Dispatch ---
+	dispatchParent := ctx
+	routedMsgID := ""
+	var routedStorePtr *store.Message
+	if persisted {
+		dispatchParent = withDispatchMessageID(ctx, msgID)
+		routedMsgID = msgID
+		routedStorePtr = storeMsg
+	}
+	retryCtx, cancel := context.WithTimeout(dispatchParent, 30*time.Second)
+	defer cancel()
+
+	// The record is logged from a copy carrying the effective conversation,
+	// before dispatch, so the dispatched message is unchanged.
+	recordMsg := *msg
+	if effectiveConv != nil {
+		recordMsg.ConversationID = effectiveConv.ConversationID
+	}
+	logMessageRecord(s.recordLog(), agent, &recordMsg)
+	if _, err := s.holdOrDispatch(retryCtx, agent, routedMsgID, routedStorePtr, func() error {
+		return dispatchWithBrokerRetry(retryCtx, s.deliveryMarker(), nil, dispatcher, agent, msg.Msg, msg.Urgent, msg)
+	}); errors.Is(err, ErrBrokerTimeout) {
+		if persisted {
+			_ = s.markFailed(ctx, msgID, err.Error())
+		}
+		result.Status = "error"
+		result.Error = "broker unreachable after 30s deadline"
+		return result
+	} else if err != nil {
+		var idleErr *errAgentIdleSuspending
+		if errors.As(err, &idleErr) {
+			susp := idleErr.asSuspendedAgent()
+			phase := "suspended"
+			if susp != nil && susp.Phase != "" {
+				phase = susp.Phase
+			}
+			refusal := fmt.Sprintf("agent is %s", phase)
+			if persisted {
+				_ = s.markFailed(ctx, msgID, refusal)
+			}
+			result.Status = "not_running"
+			result.Error = refusal
+			return result
+		}
+		if persisted {
+			_ = s.markFailed(ctx, msgID, err.Error())
+		}
+		s.messageLog.Error("routed inbound dispatch failed",
+			"agent_slug", agent.Slug, "error", err)
+		result.Status = "error"
+		result.Error = "dispatch failed: " + err.Error()
+		return result
+	}
+
+	if !persisted && persistErr == nil {
+		persistErr = persistRouted()
+	}
+	if persistErr != nil {
 		s.messageLog.Error("Failed to persist routed inbound message",
-			"error", err, "message_id", msgID, "agent_slug", agent.Slug)
-		// Persistence failure after dispatch is nonfatal — dispatch succeeded.
-		result.PersistenceWarning = "message dispatched but persistence failed: " + err.Error()
+			"error", persistErr, "message_id", msgID, "agent_slug", agent.Slug)
+		// Persistence failure is nonfatal once dispatch succeeded.
+		result.PersistenceWarning = "message dispatched but persistence failed: " + persistErr.Error()
 	} else {
-		persisted = true
 		s.events.PublishUserMessage(ctx, storeMsg, nil, nil)
 	}
 

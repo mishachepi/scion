@@ -92,7 +92,7 @@ variable "iap_oauth_client_id" {
 }
 
 variable "test_identities_enabled" {
-  description = "Sets the chart's hub.testIdentities.enabled, which lets the hub issue test identities. Default false leaves the value out of the chart values entirely (the chart's default is false). Unrelated to test login, which the chart does not offer."
+  description = "Sets the chart's hub.hubClass = \"test\" and hub.testIdentities.enabled = true, which lets the hub issue test identities. Default false leaves both out of the chart values entirely (the chart's defaults are \"\" and false). Unrelated to test login, which the chart does not offer."
   type        = bool
   default     = false
   nullable    = false
@@ -119,16 +119,16 @@ variable "runtime_namespace" {
 # --- Workspace storage (NFS) ---
 #
 # Rendered through the chart's workspaceStorage.nfs value, which writes
-# settings.yaml server.workspace_storage and mounts the export in the hub pod.
+# settings.yaml server.project_storage and mounts the export in the hub pod.
 # Single-source these with the agent-runtime-k8s module in the calling
 # configuration.
 
 variable "nfs" {
-  description = "This hub's NFS share: { server, export, pv_name }. server is the Filestore server IP (shared.nfs.server); export is this hub's NFS export path, e.g. \"/scion/<hub_name>\" (agent-runtime-k8s output nfs_export); pv_name is the PersistentVolumeClaim name agent pods mount this share through (agent-runtime-k8s output pv_name). Rendered as the chart's workspaceStorage.nfs.server, .export and .pvName."
+  description = "This hub's NFS share: { server, export, pv_name }. server is the Filestore server IP (shared.nfs.server); export is this hub's NFS export path, e.g. \"/scion/<hub_name>\" (agent-runtime-k8s output nfs_export); pv_name is the PersistentVolumeClaim name agent pods mount this share through (agent-runtime-k8s output pv_name); optional: empty makes agent pods mount the share inline, one NFS volume per directory with no mount options, which needs the hub pod's mount of the export to be writable by hub_run_as_uid. Rendered as the chart's workspaceStorage.nfs.server, .export and .pvName."
   type = object({
     server  = string
     export  = string
-    pv_name = string
+    pv_name = optional(string, "")
   })
   nullable = false
 
@@ -147,8 +147,8 @@ variable "nfs" {
   }
 
   validation {
-    condition     = can(regex("^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$", try(trimspace(var.nfs.pv_name), "")))
-    error_message = "nfs.pv_name must be a non-empty Kubernetes object name: lower-case letters, digits, '-' and '.', starting and ending with a letter or digit (the chart's workspaceStorage.nfs.pvName guard)."
+    condition     = try(trimspace(var.nfs.pv_name), "") == "" || can(regex("^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$", try(trimspace(var.nfs.pv_name), "")))
+    error_message = "nfs.pv_name must be empty or a Kubernetes object name: lower-case letters, digits, '-' and '.', starting and ending with a letter or digit (the chart's workspaceStorage.nfs.pvName guard)."
   }
 }
 
@@ -209,9 +209,9 @@ variable "nfs_mount_root" {
 }
 
 variable "agent_runtime_gke_mode" {
-  description = "The chart's runtime.gke, rendered as runtimes.kubernetes.gke in the hub's settings.yaml: true turns on the Kubernetes runtime's GKE-specific features for agent pods (SecretProviderClass, GCS FUSE). A pass-through only; the default true keeps the chart's previous hardcoded value."
+  description = "The chart's runtime.gke, rendered as runtimes.kubernetes.gke in the hub's settings.yaml: true turns on the Kubernetes runtime's GKE-specific features for agent pods (SecretProviderClass, GCS FUSE); false writes resolved secrets into namespaced Kubernetes Secrets instead, matching hub-identity (which grants <hub>-agent no Secret Manager roles) and the chart's RBAC (which omits secretproviderclasses). GKE Autopilot scheduling tolerances stay active via auto-detection."
   type        = bool
-  default     = true
+  default     = false
   nullable    = false
 }
 
@@ -278,4 +278,92 @@ variable "neg_zones" {
     condition     = length(var.neg_zones) > 0 && !contains(var.neg_zones, "*")
     error_message = "neg_zones must list at least one explicit zone (no \"*\" wildcard: the front door reads one NEG per listed zone)."
   }
+}
+
+# --- High Availability & Separate Conduit Relay ---
+
+variable "hub_replica_count" {
+  description = "Number of Hub replicas (the chart's replicaCount). Default 1 leaves single-replica chart_values unchanged; > 1 provisions internal hop TLS (conduit.internalTls) so Hub replicas authenticate and encrypt the internal Conduit hop."
+  type        = number
+  default     = 1
+  nullable    = false
+
+  validation {
+    condition     = var.hub_replica_count >= 1 && floor(var.hub_replica_count) == var.hub_replica_count
+    error_message = "hub_replica_count must be an integer >= 1."
+  }
+}
+
+variable "conduit_relay_mode" {
+  description = "Conduit relay topology: \"in_process\" (default; each Hub pod runs its own relay) or \"external\" (separate --role relay Deployment with HMAC peer auth, internal TLS hop and dedicated KSA/GSA)."
+  type        = string
+  default     = "in_process"
+  nullable    = false
+
+  validation {
+    condition     = contains(["in_process", "external"], var.conduit_relay_mode)
+    error_message = "conduit_relay_mode must be \"in_process\" or \"external\"."
+  }
+}
+
+variable "relay_replica_count" {
+  description = "Number of separate Conduit Relay replicas when conduit_relay_mode is \"external\" (the chart's relay.replicaCount)."
+  type        = number
+  default     = 2
+  nullable    = false
+
+  validation {
+    condition     = var.relay_replica_count >= 1 && floor(var.relay_replica_count) == var.relay_replica_count
+    error_message = "relay_replica_count must be an integer >= 1."
+  }
+}
+
+variable "enable_hub_pdb" {
+  description = "Enable the Hub Deployment's PodDisruptionBudget (hub.pdb.enabled). Requires hub_replica_count >= 2."
+  type        = bool
+  default     = false
+  nullable    = false
+
+  validation {
+    condition     = !var.enable_hub_pdb || var.hub_replica_count >= 2
+    error_message = "enable_hub_pdb = true requires hub_replica_count >= 2."
+  }
+}
+
+variable "enable_relay_pdb" {
+  description = "Enable the Conduit Relay Deployment's PodDisruptionBudget when conduit_relay_mode is \"external\" (relay.pdb.enabled). Requires conduit_relay_mode = \"external\" and relay_replica_count >= 2."
+  type        = bool
+  default     = false
+  nullable    = false
+
+  validation {
+    condition     = !var.enable_relay_pdb || (var.conduit_relay_mode == "external" && var.relay_replica_count >= 2)
+    error_message = "enable_relay_pdb = true requires conduit_relay_mode = \"external\" and relay_replica_count >= 2."
+  }
+}
+
+variable "relay_sa_email" {
+  description = "Optional least-privilege Google service account email for Conduit Relay pods (hub-identity's relay_sa_email), bound via Workload Identity on relay.serviceAccount.gcpServiceAccount when conduit_relay_mode is \"external\"."
+  type        = string
+  default     = null
+}
+
+variable "relay_ksa_name" {
+  description = "Kubernetes ServiceAccount name for separate Conduit Relay pods when conduit_relay_mode is \"external\"."
+  type        = string
+  default     = "scion-relay"
+  nullable    = false
+}
+
+variable "relay_db_user" {
+  description = "Optional dedicated Postgres user for Conduit Relay pods (cloudsql-database's relay_db_user). Null inherits var.db_user. When set and distinct from var.db_user, the chart also renders server.database.relay_role on the Hub so schema migration grants least-privilege PostgreSQL table permissions automatically."
+  type        = string
+  default     = null
+}
+
+variable "relay_db_password" {
+  description = "Optional Postgres password for relay_db_user (sensitive), passed via set_sensitive as relay.database.password when relay_db_user is non-null."
+  type        = string
+  default     = null
+  sensitive   = true
 }

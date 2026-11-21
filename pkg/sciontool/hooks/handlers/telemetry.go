@@ -38,6 +38,7 @@ var SpanMapping = map[string]string{
 	hooks.EventModelEnd:         "gen_ai.api.response",
 	hooks.EventAgentStart:       "agent.turn.start",
 	hooks.EventAgentEnd:         "agent.turn.end",
+	hooks.EventAgentError:       "agent.turn.end",
 	hooks.EventNotification:     "agent.notification",
 	hooks.EventResponseComplete: "agent.response.complete",
 	hooks.EventPreStart:         "agent.lifecycle.pre_start",
@@ -208,6 +209,15 @@ func (h *TelemetryHandler) Handle(event *hooks.Event) error {
 		return nil
 	}
 
+	// An uncounted model-end (copilot's failed-call errorOccurred) is
+	// exported as a span and log record only: the harness reports no
+	// successful calls, so counting it would make the model-call counts,
+	// the gen_ai.api.calls metric and usage records count failures only.
+	if event.Name == hooks.EventModelEnd && event.Data.Uncounted {
+		h.singleSpan(event, spanName)
+		return nil
+	}
+
 	// Update the in-memory aggregator for Hub reporting.
 	h.updateAggregator(event)
 
@@ -223,7 +233,7 @@ func (h *TelemetryHandler) Handle(event *hooks.Event) error {
 		h.endSpan(event, spanName, hooks.EventModelStart)
 	case hooks.EventAgentStart:
 		h.startSpan(event, spanName)
-	case hooks.EventAgentEnd:
+	case hooks.EventAgentEnd, hooks.EventAgentError:
 		h.endSpan(event, spanName, hooks.EventAgentStart)
 	default:
 		// Single-shot events - create and immediately end span
@@ -296,7 +306,7 @@ func toolStatusLabel(outcome telemetry.ToolOutcome) string {
 func setEndSpanStatus(span trace.Span, event *hooks.Event) {
 	switch toolOutcome(event) {
 	case telemetry.ToolFailed:
-		desc := event.Data.Error
+		desc := telemetryErrorText(event.Data.Error)
 		if desc == "" {
 			desc = "failed"
 		}
@@ -341,6 +351,7 @@ func (h *TelemetryHandler) endSpan(event *hooks.Event, spanName, startEventType 
 func (h *TelemetryHandler) singleSpan(event *hooks.Event, spanName string) {
 	ctx := context.Background()
 	attrs := h.eventToAttributes(event)
+	attrs = append(attrs, eventTokenAttributes(event)...)
 
 	// For session-end events, record session metric counters
 	if event.Name == hooks.EventSessionEnd {
@@ -406,8 +417,8 @@ func (h *TelemetryHandler) emitLogRecord(ctx context.Context, event *hooks.Event
 	if event.Data.Success {
 		attrs = append(attrs, slog.Bool("success", true))
 	}
-	if event.Data.Error != "" {
-		attrs = append(attrs, slog.String("error", event.Data.Error))
+	if errText := telemetryErrorText(event.Data.Error); errText != "" {
+		attrs = append(attrs, slog.String("error", errText))
 	}
 	if event.Data.Interrupted {
 		attrs = append(attrs, slog.Bool("interrupted", true))
@@ -420,6 +431,12 @@ func (h *TelemetryHandler) emitLogRecord(ctx context.Context, event *hooks.Event
 	}
 	if event.Data.CachedTokens > 0 {
 		attrs = append(attrs, slog.Int64("gen_ai.usage.cached_tokens", event.Data.CachedTokens))
+	}
+	if event.Data.CacheWriteTokens > 0 {
+		attrs = append(attrs, slog.Int64("gen_ai.usage.cache_write_tokens", event.Data.CacheWriteTokens))
+	}
+	if event.Data.ReasoningTokens > 0 {
+		attrs = append(attrs, slog.Int64("gen_ai.usage.reasoning_tokens", event.Data.ReasoningTokens))
 	}
 
 	h.logger.LogAttrs(ctx, slog.LevelInfo, spanName, attrs...)
@@ -496,8 +513,8 @@ func (h *TelemetryHandler) eventToEndAttributes(event *hooks.Event, startTime ti
 		attrs = append(attrs, attribute.Bool("success", true))
 	}
 
-	if event.Data.Error != "" {
-		attrs = append(attrs, attribute.String("error", event.Data.Error))
+	if errText := telemetryErrorText(event.Data.Error); errText != "" {
+		attrs = append(attrs, attribute.String("error", errText))
 	}
 	if event.Data.Interrupted {
 		attrs = append(attrs, attribute.Bool("interrupted", true))
@@ -509,6 +526,14 @@ func (h *TelemetryHandler) eventToEndAttributes(event *hooks.Event, startTime ti
 	}
 
 	// Add token usage attributes
+	attrs = append(attrs, eventTokenAttributes(event)...)
+
+	return attrs
+}
+
+// eventTokenAttributes builds gen_ai.usage.* span attributes for positive token fields.
+func eventTokenAttributes(event *hooks.Event) []attribute.KeyValue {
+	var attrs []attribute.KeyValue
 	if event.Data.InputTokens > 0 {
 		attrs = append(attrs, attribute.Int64("gen_ai.usage.input_tokens", event.Data.InputTokens))
 	}
@@ -518,7 +543,12 @@ func (h *TelemetryHandler) eventToEndAttributes(event *hooks.Event, startTime ti
 	if event.Data.CachedTokens > 0 {
 		attrs = append(attrs, attribute.Int64("gen_ai.usage.cached_tokens", event.Data.CachedTokens))
 	}
-
+	if event.Data.CacheWriteTokens > 0 {
+		attrs = append(attrs, attribute.Int64("gen_ai.usage.cache_write_tokens", event.Data.CacheWriteTokens))
+	}
+	if event.Data.ReasoningTokens > 0 {
+		attrs = append(attrs, attribute.Int64("gen_ai.usage.reasoning_tokens", event.Data.ReasoningTokens))
+	}
 	return attrs
 }
 
@@ -536,6 +566,23 @@ func (h *TelemetryHandler) metricAttrs() []attribute.KeyValue {
 		attrs = append(attrs, attribute.String("project_id", projectID))
 	}
 	return attrs
+}
+
+// apiCallsAttrs returns the producer point labels of gen_ai.api.calls:
+// harness, model and status. Like scion.usage.tokens it carries no
+// unprefixed agent_id or project_id: the pipeline stamps the canonical
+// scion_agent_id, scion_project_id and scion_agent_slug labels on every
+// exported point, so both usage metrics share one identity label set
+// (ptone/scion#3668). The native UsageDeriver emits the same set.
+func apiCallsAttrs(model, status string) []attribute.KeyValue {
+	var attrs []attribute.KeyValue
+	if v := os.Getenv("SCION_HARNESS"); v != "" {
+		attrs = append(attrs, attribute.String(telemetrycontract.HarnessLabel, v))
+	}
+	return append(attrs,
+		attribute.String(telemetrycontract.ModelLabel, model),
+		attribute.String(telemetrycontract.StatusLabel, status),
+	)
 }
 
 // usageHookRecordingEnabled reports whether this process should record
@@ -619,8 +666,7 @@ func (h *TelemetryHandler) recordEndMetrics(event *hooks.Event, startEventType s
 			if event.Data.Error != "" {
 				status = telemetrycontract.StatusError
 			}
-			attrs := append(baseAttrs, attribute.String(telemetrycontract.ModelLabel, hookModelLabel(event)))
-			attrs = append(attrs, attribute.String(telemetrycontract.StatusLabel, status))
+			attrs := apiCallsAttrs(hookModelLabel(event), status)
 			h.apiCalls.Add(ctx, 1, metric.WithAttributes(attrs...))
 		}
 		if h.apiDuration != nil {
@@ -665,8 +711,7 @@ func (h *TelemetryHandler) recordUnpairedEndMetrics(event *hooks.Event, startEve
 			if event.Data.Error != "" {
 				status = telemetrycontract.StatusError
 			}
-			attrs := append(baseAttrs, attribute.String(telemetrycontract.ModelLabel, hookModelLabel(event)))
-			attrs = append(attrs, attribute.String(telemetrycontract.StatusLabel, status))
+			attrs := apiCallsAttrs(hookModelLabel(event), status)
 			h.apiCalls.Add(ctx, 1, metric.WithAttributes(attrs...))
 		}
 
@@ -689,9 +734,9 @@ func toOTelAttrs(kvs []telemetrycontract.LabelKV) []attribute.KeyValue {
 }
 
 // recordTokenMetrics records token usage counters from an event's token
-// fields. Unlike gen_ai.api.calls (which keeps agent_id/project_id for
-// descriptor compatibility, design §3.2), scion.usage.tokens's producer
-// label set is exactly harness, model and token_type -- nothing else. The
+// fields. scion.usage.tokens's producer label set is exactly harness, model
+// and token_type -- nothing else (gen_ai.api.calls has harness, model and
+// status, see apiCallsAttrs; design §3.2). The
 // GCP allowlist for this one metric is cloudUsageTokenFields, narrower than
 // the general hook-counter allowlist cloudPointFields
 // (gcp_metric_identity.go): a point carrying any other key, such as

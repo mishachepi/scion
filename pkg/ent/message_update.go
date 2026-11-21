@@ -275,6 +275,146 @@ func (_u *MessageUpdate) ClearDispatchedAt() *MessageUpdate {
 	return _u
 }
 
+// SetDeliveryID sets the "delivery_id" field.
+func (_u *MessageUpdate) SetDeliveryID(v string) *MessageUpdate {
+	_u.mutation.SetDeliveryID(v)
+	return _u
+}
+
+// SetNillableDeliveryID sets the "delivery_id" field if the given value is not nil.
+func (_u *MessageUpdate) SetNillableDeliveryID(v *string) *MessageUpdate {
+	if v != nil {
+		_u.SetDeliveryID(*v)
+	}
+	return _u
+}
+
+// ClearDeliveryID clears the value of the "delivery_id" field.
+func (_u *MessageUpdate) ClearDeliveryID() *MessageUpdate {
+	_u.mutation.ClearDeliveryID()
+	return _u
+}
+
+// SetDeliveringAt sets the "delivering_at" field.
+func (_u *MessageUpdate) SetDeliveringAt(v time.Time) *MessageUpdate {
+	_u.mutation.SetDeliveringAt(v)
+	return _u
+}
+
+// SetNillableDeliveringAt sets the "delivering_at" field if the given value is not nil.
+func (_u *MessageUpdate) SetNillableDeliveringAt(v *time.Time) *MessageUpdate {
+	if v != nil {
+		_u.SetDeliveringAt(*v)
+	}
+	return _u
+}
+
+// ClearDeliveringAt clears the value of the "delivering_at" field.
+func (_u *MessageUpdate) ClearDeliveringAt() *MessageUpdate {
+	_u.mutation.ClearDeliveringAt()
+	return _u
+}
+
+// SetDeliveryOutcome sets the "delivery_outcome" field.
+func (_u *MessageUpdate) SetDeliveryOutcome(v string) *MessageUpdate {
+	_u.mutation.SetDeliveryOutcome(v)
+	return _u
+}
+
+// SetNillableDeliveryOutcome sets the "delivery_outcome" field if the given value is not nil.
+func (_u *MessageUpdate) SetNillableDeliveryOutcome(v *string) *MessageUpdate {
+	if v != nil {
+		_u.SetDeliveryOutcome(*v)
+	}
+	return _u
+}
+
+// ClearDeliveryOutcome clears the value of the "delivery_outcome" field.
+func (_u *MessageUpdate) ClearDeliveryOutcome() *MessageUpdate {
+	_u.mutation.ClearDeliveryOutcome()
+	return _u
+}
+
+// SetHoldUntil sets the "hold_until" field.
+func (_u *MessageUpdate) SetHoldUntil(v time.Time) *MessageUpdate {
+	_u.mutation.SetHoldUntil(v)
+	return _u
+}
+
+// SetNillableHoldUntil sets the "hold_until" field if the given value is not nil.
+func (_u *MessageUpdate) SetNillableHoldUntil(v *time.Time) *MessageUpdate {
+	if v != nil {
+		_u.SetHoldUntil(*v)
+	}
+	return _u
+}
+
+// ClearHoldUntil clears the value of the "hold_until" field.
+func (_u *MessageUpdate) ClearHoldUntil() *MessageUpdate {
+	_u.mutation.ClearHoldUntil()
+	return _u
+}
+
+// SetHoldLaunchID sets the "hold_launch_id" field.
+func (_u *MessageUpdate) SetHoldLaunchID(v string) *MessageUpdate {
+	_u.mutation.SetHoldLaunchID(v)
+	return _u
+}
+
+// SetNillableHoldLaunchID sets the "hold_launch_id" field if the given value is not nil.
+func (_u *MessageUpdate) SetNillableHoldLaunchID(v *string) *MessageUpdate {
+	if v != nil {
+		_u.SetHoldLaunchID(*v)
+	}
+	return _u
+}
+
+// ClearHoldLaunchID clears the value of the "hold_launch_id" field.
+func (_u *MessageUpdate) ClearHoldLaunchID() *MessageUpdate {
+	_u.mutation.ClearHoldLaunchID()
+	return _u
+}
+
+// SetNotReached sets the "not_reached" field.
+func (_u *MessageUpdate) SetNotReached(v string) *MessageUpdate {
+	_u.mutation.SetNotReached(v)
+	return _u
+}
+
+// SetNillableNotReached sets the "not_reached" field if the given value is not nil.
+func (_u *MessageUpdate) SetNillableNotReached(v *string) *MessageUpdate {
+	if v != nil {
+		_u.SetNotReached(*v)
+	}
+	return _u
+}
+
+// ClearNotReached clears the value of the "not_reached" field.
+func (_u *MessageUpdate) ClearNotReached() *MessageUpdate {
+	_u.mutation.ClearNotReached()
+	return _u
+}
+
+// SetNotReachedAt sets the "not_reached_at" field.
+func (_u *MessageUpdate) SetNotReachedAt(v time.Time) *MessageUpdate {
+	_u.mutation.SetNotReachedAt(v)
+	return _u
+}
+
+// SetNillableNotReachedAt sets the "not_reached_at" field if the given value is not nil.
+func (_u *MessageUpdate) SetNillableNotReachedAt(v *time.Time) *MessageUpdate {
+	if v != nil {
+		_u.SetNotReachedAt(*v)
+	}
+	return _u
+}
+
+// ClearNotReachedAt clears the value of the "not_reached_at" field.
+func (_u *MessageUpdate) ClearNotReachedAt() *MessageUpdate {
+	_u.mutation.ClearNotReachedAt()
+	return _u
+}
+
 // SetChannel sets the "channel" field.
 func (_u *MessageUpdate) SetChannel(v string) *MessageUpdate {
 	_u.mutation.SetChannel(v)
@@ -379,9 +519,24 @@ func (_u *MessageUpdate) check() error {
 			return &ValidationError{Name: "recipient", err: fmt.Errorf(`ent: validator failed for field "Message.recipient": %w`, err)}
 		}
 	}
-	if v, ok := _u.mutation.Msg(); ok {
-		if err := message.MsgValidator(v); err != nil {
-			return &ValidationError{Name: "msg", err: fmt.Errorf(`ent: validator failed for field "Message.msg": %w`, err)}
+	if v, ok := _u.mutation.DeliveryID(); ok {
+		if err := message.DeliveryIDValidator(v); err != nil {
+			return &ValidationError{Name: "delivery_id", err: fmt.Errorf(`ent: validator failed for field "Message.delivery_id": %w`, err)}
+		}
+	}
+	if v, ok := _u.mutation.DeliveryOutcome(); ok {
+		if err := message.DeliveryOutcomeValidator(v); err != nil {
+			return &ValidationError{Name: "delivery_outcome", err: fmt.Errorf(`ent: validator failed for field "Message.delivery_outcome": %w`, err)}
+		}
+	}
+	if v, ok := _u.mutation.HoldLaunchID(); ok {
+		if err := message.HoldLaunchIDValidator(v); err != nil {
+			return &ValidationError{Name: "hold_launch_id", err: fmt.Errorf(`ent: validator failed for field "Message.hold_launch_id": %w`, err)}
+		}
+	}
+	if v, ok := _u.mutation.NotReached(); ok {
+		if err := message.NotReachedValidator(v); err != nil {
+			return &ValidationError{Name: "not_reached", err: fmt.Errorf(`ent: validator failed for field "Message.not_reached": %w`, err)}
 		}
 	}
 	if v, ok := _u.mutation.Channel(); ok {
@@ -472,6 +627,48 @@ func (_u *MessageUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	if _u.mutation.DispatchedAtCleared() {
 		_spec.ClearField(message.FieldDispatchedAt, field.TypeTime)
 	}
+	if value, ok := _u.mutation.DeliveryID(); ok {
+		_spec.SetField(message.FieldDeliveryID, field.TypeString, value)
+	}
+	if _u.mutation.DeliveryIDCleared() {
+		_spec.ClearField(message.FieldDeliveryID, field.TypeString)
+	}
+	if value, ok := _u.mutation.DeliveringAt(); ok {
+		_spec.SetField(message.FieldDeliveringAt, field.TypeTime, value)
+	}
+	if _u.mutation.DeliveringAtCleared() {
+		_spec.ClearField(message.FieldDeliveringAt, field.TypeTime)
+	}
+	if value, ok := _u.mutation.DeliveryOutcome(); ok {
+		_spec.SetField(message.FieldDeliveryOutcome, field.TypeString, value)
+	}
+	if _u.mutation.DeliveryOutcomeCleared() {
+		_spec.ClearField(message.FieldDeliveryOutcome, field.TypeString)
+	}
+	if value, ok := _u.mutation.HoldUntil(); ok {
+		_spec.SetField(message.FieldHoldUntil, field.TypeTime, value)
+	}
+	if _u.mutation.HoldUntilCleared() {
+		_spec.ClearField(message.FieldHoldUntil, field.TypeTime)
+	}
+	if value, ok := _u.mutation.HoldLaunchID(); ok {
+		_spec.SetField(message.FieldHoldLaunchID, field.TypeString, value)
+	}
+	if _u.mutation.HoldLaunchIDCleared() {
+		_spec.ClearField(message.FieldHoldLaunchID, field.TypeString)
+	}
+	if value, ok := _u.mutation.NotReached(); ok {
+		_spec.SetField(message.FieldNotReached, field.TypeString, value)
+	}
+	if _u.mutation.NotReachedCleared() {
+		_spec.ClearField(message.FieldNotReached, field.TypeString)
+	}
+	if value, ok := _u.mutation.NotReachedAt(); ok {
+		_spec.SetField(message.FieldNotReachedAt, field.TypeTime, value)
+	}
+	if _u.mutation.NotReachedAtCleared() {
+		_spec.ClearField(message.FieldNotReachedAt, field.TypeTime)
+	}
 	if value, ok := _u.mutation.Channel(); ok {
 		_spec.SetField(message.FieldChannel, field.TypeString, value)
 	}
@@ -495,6 +692,15 @@ func (_u *MessageUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	}
 	if _u.mutation.RecipientProjectIDCleared() {
 		_spec.ClearField(message.FieldRecipientProjectID, field.TypeUUID)
+	}
+	if _u.mutation.AuthorizingUserIDCleared() {
+		_spec.ClearField(message.FieldAuthorizingUserID, field.TypeString)
+	}
+	if _u.mutation.DelegationGrantIDCleared() {
+		_spec.ClearField(message.FieldDelegationGrantID, field.TypeString)
+	}
+	if _u.mutation.ScheduledEventIDCleared() {
+		_spec.ClearField(message.FieldScheduledEventID, field.TypeString)
 	}
 	if _node, err = sqlgraph.UpdateNodes(ctx, _u.driver, _spec); err != nil {
 		if _, ok := err.(*sqlgraph.NotFoundError); ok {
@@ -762,6 +968,146 @@ func (_u *MessageUpdateOne) ClearDispatchedAt() *MessageUpdateOne {
 	return _u
 }
 
+// SetDeliveryID sets the "delivery_id" field.
+func (_u *MessageUpdateOne) SetDeliveryID(v string) *MessageUpdateOne {
+	_u.mutation.SetDeliveryID(v)
+	return _u
+}
+
+// SetNillableDeliveryID sets the "delivery_id" field if the given value is not nil.
+func (_u *MessageUpdateOne) SetNillableDeliveryID(v *string) *MessageUpdateOne {
+	if v != nil {
+		_u.SetDeliveryID(*v)
+	}
+	return _u
+}
+
+// ClearDeliveryID clears the value of the "delivery_id" field.
+func (_u *MessageUpdateOne) ClearDeliveryID() *MessageUpdateOne {
+	_u.mutation.ClearDeliveryID()
+	return _u
+}
+
+// SetDeliveringAt sets the "delivering_at" field.
+func (_u *MessageUpdateOne) SetDeliveringAt(v time.Time) *MessageUpdateOne {
+	_u.mutation.SetDeliveringAt(v)
+	return _u
+}
+
+// SetNillableDeliveringAt sets the "delivering_at" field if the given value is not nil.
+func (_u *MessageUpdateOne) SetNillableDeliveringAt(v *time.Time) *MessageUpdateOne {
+	if v != nil {
+		_u.SetDeliveringAt(*v)
+	}
+	return _u
+}
+
+// ClearDeliveringAt clears the value of the "delivering_at" field.
+func (_u *MessageUpdateOne) ClearDeliveringAt() *MessageUpdateOne {
+	_u.mutation.ClearDeliveringAt()
+	return _u
+}
+
+// SetDeliveryOutcome sets the "delivery_outcome" field.
+func (_u *MessageUpdateOne) SetDeliveryOutcome(v string) *MessageUpdateOne {
+	_u.mutation.SetDeliveryOutcome(v)
+	return _u
+}
+
+// SetNillableDeliveryOutcome sets the "delivery_outcome" field if the given value is not nil.
+func (_u *MessageUpdateOne) SetNillableDeliveryOutcome(v *string) *MessageUpdateOne {
+	if v != nil {
+		_u.SetDeliveryOutcome(*v)
+	}
+	return _u
+}
+
+// ClearDeliveryOutcome clears the value of the "delivery_outcome" field.
+func (_u *MessageUpdateOne) ClearDeliveryOutcome() *MessageUpdateOne {
+	_u.mutation.ClearDeliveryOutcome()
+	return _u
+}
+
+// SetHoldUntil sets the "hold_until" field.
+func (_u *MessageUpdateOne) SetHoldUntil(v time.Time) *MessageUpdateOne {
+	_u.mutation.SetHoldUntil(v)
+	return _u
+}
+
+// SetNillableHoldUntil sets the "hold_until" field if the given value is not nil.
+func (_u *MessageUpdateOne) SetNillableHoldUntil(v *time.Time) *MessageUpdateOne {
+	if v != nil {
+		_u.SetHoldUntil(*v)
+	}
+	return _u
+}
+
+// ClearHoldUntil clears the value of the "hold_until" field.
+func (_u *MessageUpdateOne) ClearHoldUntil() *MessageUpdateOne {
+	_u.mutation.ClearHoldUntil()
+	return _u
+}
+
+// SetHoldLaunchID sets the "hold_launch_id" field.
+func (_u *MessageUpdateOne) SetHoldLaunchID(v string) *MessageUpdateOne {
+	_u.mutation.SetHoldLaunchID(v)
+	return _u
+}
+
+// SetNillableHoldLaunchID sets the "hold_launch_id" field if the given value is not nil.
+func (_u *MessageUpdateOne) SetNillableHoldLaunchID(v *string) *MessageUpdateOne {
+	if v != nil {
+		_u.SetHoldLaunchID(*v)
+	}
+	return _u
+}
+
+// ClearHoldLaunchID clears the value of the "hold_launch_id" field.
+func (_u *MessageUpdateOne) ClearHoldLaunchID() *MessageUpdateOne {
+	_u.mutation.ClearHoldLaunchID()
+	return _u
+}
+
+// SetNotReached sets the "not_reached" field.
+func (_u *MessageUpdateOne) SetNotReached(v string) *MessageUpdateOne {
+	_u.mutation.SetNotReached(v)
+	return _u
+}
+
+// SetNillableNotReached sets the "not_reached" field if the given value is not nil.
+func (_u *MessageUpdateOne) SetNillableNotReached(v *string) *MessageUpdateOne {
+	if v != nil {
+		_u.SetNotReached(*v)
+	}
+	return _u
+}
+
+// ClearNotReached clears the value of the "not_reached" field.
+func (_u *MessageUpdateOne) ClearNotReached() *MessageUpdateOne {
+	_u.mutation.ClearNotReached()
+	return _u
+}
+
+// SetNotReachedAt sets the "not_reached_at" field.
+func (_u *MessageUpdateOne) SetNotReachedAt(v time.Time) *MessageUpdateOne {
+	_u.mutation.SetNotReachedAt(v)
+	return _u
+}
+
+// SetNillableNotReachedAt sets the "not_reached_at" field if the given value is not nil.
+func (_u *MessageUpdateOne) SetNillableNotReachedAt(v *time.Time) *MessageUpdateOne {
+	if v != nil {
+		_u.SetNotReachedAt(*v)
+	}
+	return _u
+}
+
+// ClearNotReachedAt clears the value of the "not_reached_at" field.
+func (_u *MessageUpdateOne) ClearNotReachedAt() *MessageUpdateOne {
+	_u.mutation.ClearNotReachedAt()
+	return _u
+}
+
 // SetChannel sets the "channel" field.
 func (_u *MessageUpdateOne) SetChannel(v string) *MessageUpdateOne {
 	_u.mutation.SetChannel(v)
@@ -879,9 +1225,24 @@ func (_u *MessageUpdateOne) check() error {
 			return &ValidationError{Name: "recipient", err: fmt.Errorf(`ent: validator failed for field "Message.recipient": %w`, err)}
 		}
 	}
-	if v, ok := _u.mutation.Msg(); ok {
-		if err := message.MsgValidator(v); err != nil {
-			return &ValidationError{Name: "msg", err: fmt.Errorf(`ent: validator failed for field "Message.msg": %w`, err)}
+	if v, ok := _u.mutation.DeliveryID(); ok {
+		if err := message.DeliveryIDValidator(v); err != nil {
+			return &ValidationError{Name: "delivery_id", err: fmt.Errorf(`ent: validator failed for field "Message.delivery_id": %w`, err)}
+		}
+	}
+	if v, ok := _u.mutation.DeliveryOutcome(); ok {
+		if err := message.DeliveryOutcomeValidator(v); err != nil {
+			return &ValidationError{Name: "delivery_outcome", err: fmt.Errorf(`ent: validator failed for field "Message.delivery_outcome": %w`, err)}
+		}
+	}
+	if v, ok := _u.mutation.HoldLaunchID(); ok {
+		if err := message.HoldLaunchIDValidator(v); err != nil {
+			return &ValidationError{Name: "hold_launch_id", err: fmt.Errorf(`ent: validator failed for field "Message.hold_launch_id": %w`, err)}
+		}
+	}
+	if v, ok := _u.mutation.NotReached(); ok {
+		if err := message.NotReachedValidator(v); err != nil {
+			return &ValidationError{Name: "not_reached", err: fmt.Errorf(`ent: validator failed for field "Message.not_reached": %w`, err)}
 		}
 	}
 	if v, ok := _u.mutation.Channel(); ok {
@@ -989,6 +1350,48 @@ func (_u *MessageUpdateOne) sqlSave(ctx context.Context) (_node *Message, err er
 	if _u.mutation.DispatchedAtCleared() {
 		_spec.ClearField(message.FieldDispatchedAt, field.TypeTime)
 	}
+	if value, ok := _u.mutation.DeliveryID(); ok {
+		_spec.SetField(message.FieldDeliveryID, field.TypeString, value)
+	}
+	if _u.mutation.DeliveryIDCleared() {
+		_spec.ClearField(message.FieldDeliveryID, field.TypeString)
+	}
+	if value, ok := _u.mutation.DeliveringAt(); ok {
+		_spec.SetField(message.FieldDeliveringAt, field.TypeTime, value)
+	}
+	if _u.mutation.DeliveringAtCleared() {
+		_spec.ClearField(message.FieldDeliveringAt, field.TypeTime)
+	}
+	if value, ok := _u.mutation.DeliveryOutcome(); ok {
+		_spec.SetField(message.FieldDeliveryOutcome, field.TypeString, value)
+	}
+	if _u.mutation.DeliveryOutcomeCleared() {
+		_spec.ClearField(message.FieldDeliveryOutcome, field.TypeString)
+	}
+	if value, ok := _u.mutation.HoldUntil(); ok {
+		_spec.SetField(message.FieldHoldUntil, field.TypeTime, value)
+	}
+	if _u.mutation.HoldUntilCleared() {
+		_spec.ClearField(message.FieldHoldUntil, field.TypeTime)
+	}
+	if value, ok := _u.mutation.HoldLaunchID(); ok {
+		_spec.SetField(message.FieldHoldLaunchID, field.TypeString, value)
+	}
+	if _u.mutation.HoldLaunchIDCleared() {
+		_spec.ClearField(message.FieldHoldLaunchID, field.TypeString)
+	}
+	if value, ok := _u.mutation.NotReached(); ok {
+		_spec.SetField(message.FieldNotReached, field.TypeString, value)
+	}
+	if _u.mutation.NotReachedCleared() {
+		_spec.ClearField(message.FieldNotReached, field.TypeString)
+	}
+	if value, ok := _u.mutation.NotReachedAt(); ok {
+		_spec.SetField(message.FieldNotReachedAt, field.TypeTime, value)
+	}
+	if _u.mutation.NotReachedAtCleared() {
+		_spec.ClearField(message.FieldNotReachedAt, field.TypeTime)
+	}
 	if value, ok := _u.mutation.Channel(); ok {
 		_spec.SetField(message.FieldChannel, field.TypeString, value)
 	}
@@ -1012,6 +1415,15 @@ func (_u *MessageUpdateOne) sqlSave(ctx context.Context) (_node *Message, err er
 	}
 	if _u.mutation.RecipientProjectIDCleared() {
 		_spec.ClearField(message.FieldRecipientProjectID, field.TypeUUID)
+	}
+	if _u.mutation.AuthorizingUserIDCleared() {
+		_spec.ClearField(message.FieldAuthorizingUserID, field.TypeString)
+	}
+	if _u.mutation.DelegationGrantIDCleared() {
+		_spec.ClearField(message.FieldDelegationGrantID, field.TypeString)
+	}
+	if _u.mutation.ScheduledEventIDCleared() {
+		_spec.ClearField(message.FieldScheduledEventID, field.TypeString)
 	}
 	_node = &Message{config: _u.config}
 	_spec.Assign = _node.assignValues

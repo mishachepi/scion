@@ -158,7 +158,7 @@ func TestResolveRejects(t *testing.T) {
 		{"local/no project dir", localLayout(), Project{ID: testPID}, "", WorkspaceMount(ModeSharedPlain, ""), "project directory is required"},
 		{"local/agent workspace", localLayout(), Project{Dir: "/p"}, "dev", WorkspaceMount(ModeClonePerAgent, ""), "not resolved here yet"},
 		{"unknown backend", Layout{Backend: "gcs"}, Project{ID: testPID}, "", scratch, "unsupported backend"},
-		{"unknown kind", nfsLayout(), Project{ID: testPID}, "", Mount{Kind: "volume", Name: "v"}, "unsupported mount kind"},
+		{"unknown kind", nfsLayout(), Project{ID: testPID}, "", Mount{Kind: "other", Name: "v"}, "unsupported mount kind"},
 		{"user owned", nfsLayout(), Project{ID: testPID}, "", Mount{Kind: KindSharedDir, Name: "v", Owner: OwnerUser}, "user-owned"},
 	}
 	for _, tt := range tests {
@@ -265,5 +265,34 @@ func TestLocalConfigDirName(t *testing.T) {
 	}
 	if got := LocalConfigDirName("acme", "abc"); got != "acme__abc" {
 		t.Errorf("LocalConfigDirName short = %q", got)
+	}
+}
+
+// TestLayoutKey: the key is a value identity, equal for equal Layouts
+// including the SharedDirs split (a pointer), and different when any field
+// or the split differs.
+func TestLayoutKey(t *testing.T) {
+	mk := func() Layout {
+		sd := Layout{Backend: BackendLocal}
+		return Layout{Backend: BackendGKESharedVolume, HostBase: "/mnt/v", SubPathRoot: "projects", Share: Share{ID: "v", PVName: "c"}, SharedDirs: &sd}
+	}
+	a, b := mk(), mk()
+	if a.Key() != b.Key() {
+		t.Errorf("equal Layouts with distinct SharedDirs pointers must share a key: %q vs %q", a.Key(), b.Key())
+	}
+	c := mk()
+	c.SharedDirs = nil
+	if c.Key() == a.Key() {
+		t.Error("the split must be part of the key")
+	}
+	d := mk()
+	d.SharedDirs.Backend = BackendNFS
+	if d.Key() == a.Key() {
+		t.Error("the split's fields must be part of the key")
+	}
+	e := mk()
+	e.Share.Export = "/other"
+	if e.Key() == a.Key() {
+		t.Error("every field must be part of the key")
 	}
 }

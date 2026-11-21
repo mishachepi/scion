@@ -16,14 +16,18 @@ package entadapter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"entgo.io/ent/dialect"
 	entsql "entgo.io/ent/dialect/sql"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/predicate"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/schedule"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/scheduledevent"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/scheduledexecpollcursor"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/scheduledexecrun"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/permissions"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/google/uuid"
@@ -34,6 +38,7 @@ import (
 // SQLite backend where schedules and scheduled events share one store.
 type ScheduleStore struct {
 	client *ent.Client
+	inTx   bool
 }
 
 // NewScheduleStore creates a new Ent-backed ScheduleStore.
@@ -68,6 +73,7 @@ func entScheduleToStore(e *ent.Schedule) *store.Schedule {
 		ProjectID:     e.ProjectID.String(),
 		Name:          e.Name,
 		CronExpr:      e.CronExpr,
+		TimeZone:      e.TimeZone,
 		EventType:     e.EventType,
 		Payload:       e.Payload,
 		Status:        e.Status,
@@ -218,6 +224,7 @@ func (s *ScheduleStore) CreateSchedule(ctx context.Context, sc *store.Schedule) 
 		SetProjectID(pid).
 		SetName(sc.Name).
 		SetCronExpr(sc.CronExpr).
+		SetTimeZone(sc.TimeZone).
 		SetEventType(sc.EventType).
 		SetStatus(sc.Status).
 		SetRunCount(sc.RunCount).
@@ -309,6 +316,20 @@ func (s *ScheduleStore) GetSchedule(ctx context.Context, id string) (*store.Sche
 	return entScheduleToStore(e), nil
 }
 
+// scheduleRecordedAuthorityIs keeps the schedules whose recorded authority
+// is the principal kind/id: the current initiator principal, with a
+// recorded attribution (version 1 or later, a credential kind neither empty
+// nor legacy_unknown). It is the store side of the hub's scheduledInitiator
+// reading, so every row it keeps is one the hub reads as that principal.
+func scheduleRecordedAuthorityIs(kind, id string) predicate.Schedule {
+	return schedule.And(
+		schedule.InitiatorPrincipalKindEQ(kind),
+		schedule.InitiatorPrincipalIDEQ(id),
+		schedule.AttributionVersionGTE(1),
+		schedule.InitiatorCredentialKindNotIn("", store.InitiatorCredentialKindLegacyUnknown),
+	)
+}
+
 // ListSchedules returns schedules matching the filter criteria.
 func (s *ScheduleStore) ListSchedules(ctx context.Context, filter store.ScheduleFilter, opts store.ListOptions) (*store.ListResult[store.Schedule], error) {
 	query := s.client.Schedule.Query()
@@ -326,6 +347,9 @@ func (s *ScheduleStore) ListSchedules(ctx context.Context, filter store.Schedule
 		// By default, exclude deleted schedules.
 		query.Where(schedule.StatusNEQ(store.ScheduleStatusDeleted))
 	}
+	if filter.EventType != "" {
+		query.Where(schedule.EventTypeEQ(filter.EventType))
+	}
 	if filter.Name != "" {
 		query.Where(schedule.NameEQ(filter.Name))
 	}
@@ -333,12 +357,13 @@ func (s *ScheduleStore) ListSchedules(ctx context.Context, filter store.Schedule
 		query.Where(schedule.LastRunStatusEQ(filter.LastRunStatus))
 	}
 	if filter.InitiatorAgentID != "" {
-		query.Where(
-			schedule.InitiatorPrincipalKindEQ(store.DelegationPrincipalAgent),
-			schedule.InitiatorPrincipalIDEQ(filter.InitiatorAgentID),
-			schedule.AttributionVersionGTE(1),
-			schedule.InitiatorCredentialKindNotIn("", store.InitiatorCredentialKindLegacyUnknown),
-		)
+		query.Where(scheduleRecordedAuthorityIs(store.DelegationPrincipalAgent, filter.InitiatorAgentID))
+	}
+	if p := filter.AuthorityPrincipal; !p.IsZero() {
+		if p.Kind == "" || p.ID == "" {
+			return nil, fmt.Errorf("%w: schedule authority principal needs both a kind and an ID", store.ErrInvalidInput)
+		}
+		query.Where(scheduleRecordedAuthorityIs(p.Kind, p.ID))
 	}
 	if filter.SystemPausedOnly {
 		query.Where(schedule.StatusEQ(store.ScheduleStatusPaused))
@@ -512,6 +537,9 @@ func (s *ScheduleStore) UpdateSchedule(
 	if fields.CronExpr {
 		update = update.SetCronExpr(sc.CronExpr)
 	}
+	if fields.TimeZone {
+		update = update.SetTimeZone(sc.TimeZone)
+	}
 	if fields.EventType {
 		update = update.SetEventType(sc.EventType)
 	}
@@ -680,6 +708,62 @@ func (s *ScheduleStore) UpdateScheduleAfterRun(ctx context.Context, id string, r
 	return nil
 }
 
+// AdvanceScheduleNextRun sets only next_run_at on a schedule.
+func (s *ScheduleStore) AdvanceScheduleNextRun(ctx context.Context, id string, nextRunAt time.Time) error {
+	uid, err := parseUUID(id)
+	if err != nil {
+		return err
+	}
+	if err := s.client.Schedule.UpdateOneID(uid).SetNextRunAt(nextRunAt).Exec(ctx); err != nil {
+		return mapError(err)
+	}
+	return nil
+}
+
+// RecordScheduleRun records a run's outcome without changing next_run_at.
+// The counters always count the run; the last-run fields are written only
+// for a run later than the stored last run. The two writes are separate: a
+// reader can see the counters before the last-run fields, never a rewound
+// outcome.
+func (s *ScheduleStore) RecordScheduleRun(ctx context.Context, id string, ranAt time.Time, errMsg string) error {
+	uid, err := parseUUID(id)
+	if err != nil {
+		return err
+	}
+	return recordScheduleRunOnClient(ctx, s.client, uid, ranAt, errMsg)
+}
+
+func recordScheduleRunOnClient(ctx context.Context, client *ent.Client, uid uuid.UUID, ranAt time.Time, errMsg string) error {
+	status := store.ScheduleRunSuccess
+	if errMsg != "" {
+		status = store.ScheduleRunError
+	}
+	return recordScheduleRunStatusOnClient(ctx, client, uid, ranAt, status, errMsg)
+}
+
+func recordScheduleRunStatusOnClient(ctx context.Context, client *ent.Client, uid uuid.UUID, ranAt time.Time, status string, errMsg string) error {
+	counters := client.Schedule.UpdateOneID(uid).AddRunCount(1)
+	if status == store.ScheduleRunError {
+		counters.AddErrorCount(1)
+	}
+	if err := counters.Exec(ctx); err != nil {
+		return mapError(err)
+	}
+	last := client.Schedule.Update().
+		Where(schedule.ID(uid), schedule.Or(schedule.LastRunAtIsNil(), schedule.LastRunAtLT(ranAt))).
+		SetLastRunAt(ranAt).
+		SetLastRunStatus(status)
+	if errMsg != "" && status != store.ScheduleRunSuccess {
+		last.SetLastRunError(errMsg)
+	} else {
+		last.ClearLastRunError()
+	}
+	if _, err := last.Save(ctx); err != nil {
+		return mapError(err)
+	}
+	return nil
+}
+
 // DeleteSchedule removes a schedule by ID (hard delete).
 func (s *ScheduleStore) DeleteSchedule(ctx context.Context, id string) error {
 	uid, err := parseUUID(id)
@@ -698,16 +782,27 @@ func (s *ScheduleStore) DeleteSchedulesByProject(ctx context.Context, projectID 
 	if err != nil {
 		return 0, err
 	}
-	// First delete all scheduled events for this project's schedules.
-	if _, err := s.client.ScheduledEvent.Delete().
-		Where(scheduledevent.ProjectIDEQ(uid)).
-		Exec(ctx); err != nil {
-		return 0, err
-	}
-	// Then delete the schedules themselves.
-	n, err := s.client.Schedule.Delete().
-		Where(schedule.ProjectIDEQ(uid)).
-		Exec(ctx)
+	// One transaction: the project's scheduled exec runs
+	// (ptone/scion#7883), then its scheduled events (whose foreign key
+	// would cascade to any run inserted meanwhile), then the schedules.
+	var n int
+	err = runInEntTx(ctx, s.client, s.inTx, func(c *ent.Client) error {
+		if _, err := c.ScheduledExecRun.Delete().
+			Where(scheduledexecrun.ProjectIDEQ(uid)).
+			Exec(ctx); err != nil {
+			return err
+		}
+		if _, err := c.ScheduledEvent.Delete().
+			Where(scheduledevent.ProjectIDEQ(uid)).
+			Exec(ctx); err != nil {
+			return err
+		}
+		deleted, err := c.Schedule.Delete().
+			Where(schedule.ProjectIDEQ(uid)).
+			Exec(ctx)
+		n = deleted
+		return err
+	})
 	if err != nil {
 		return 0, err
 	}
@@ -942,6 +1037,102 @@ func (s *ScheduleStore) UpdateScheduledEventStatus(ctx context.Context, id strin
 	return err
 }
 
+// CompleteFiringScheduledEvent atomically transitions an event in status
+// "firing" to status, setting fired_at and errMsg, and when scheduleID is
+// non-empty also records the run on that schedule inside the same transaction.
+// A deleted schedule is ignored so an orphaned firing event can still be
+// finalized.
+func (s *ScheduleStore) CompleteFiringScheduledEvent(
+	ctx context.Context,
+	id string,
+	status string,
+	firedAt time.Time,
+	errMsg string,
+	scheduleID string,
+	ranAt time.Time,
+) (bool, error) {
+	uid, err := parseUUID(id)
+	if err != nil {
+		return false, err
+	}
+	var schedUID uuid.UUID
+	if scheduleID != "" {
+		schedUID, err = parseUUID(scheduleID)
+		if err != nil {
+			return false, err
+		}
+	}
+	var updated bool
+	err = runInEntTx(ctx, s.client, s.inTx, func(c *ent.Client) error {
+		upd := c.ScheduledEvent.Update().
+			Where(
+				scheduledevent.IDEQ(uid),
+				scheduledevent.StatusEQ(store.ScheduledEventFiring),
+			).
+			SetStatus(status).
+			SetFiredAt(firedAt)
+		if errMsg != "" {
+			upd.SetError(errMsg)
+		} else {
+			upd.ClearError()
+		}
+		n, err := upd.Save(ctx)
+		if err != nil {
+			return mapError(err)
+		}
+		if n == 0 {
+			return nil
+		}
+		updated = true
+		if scheduleID != "" {
+			runStatus := store.ScheduleRunSuccess
+			switch {
+			case status == store.ScheduledEventSkipped:
+				runStatus = store.ScheduleRunSkipped
+			case status == store.ScheduledEventFailed || errMsg != "":
+				runStatus = store.ScheduleRunError
+			}
+			if err := recordScheduleRunStatusOnClient(ctx, c, schedUID, ranAt, runStatus, errMsg); err != nil && !errors.Is(err, store.ErrNotFound) {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return updated, nil
+}
+
+// ListFiringScheduledEvents returns up to limit events in status "firing"
+// whose fired_at (or fire_at when fired_at is nil) is at or before cutoff,
+// ordered oldest-first.
+func (s *ScheduleStore) ListFiringScheduledEvents(ctx context.Context, cutoff time.Time, limit int) ([]store.ScheduledEvent, error) {
+	limit = clampLimit(limit)
+	entities, err := s.client.ScheduledEvent.Query().
+		Where(
+			scheduledevent.StatusEQ(store.ScheduledEventFiring),
+			scheduledevent.Or(
+				scheduledevent.FiredAtLTE(cutoff),
+				scheduledevent.And(
+					scheduledevent.FiredAtIsNil(),
+					scheduledevent.FireAtLTE(cutoff),
+				),
+			),
+		).
+		Order(scheduledevent.ByFiredAt(), scheduledevent.ByCreated()).
+		Limit(limit).
+		All(ctx)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	out := make([]store.ScheduledEvent, 0, len(entities))
+	for _, e := range entities {
+		out = append(out, *entScheduledEventToStore(e))
+	}
+	return out, nil
+}
+
 // ClaimScheduledEvent atomically transitions a scheduled event from "pending" to
 // claimedStatus, returning whether this caller won the claim. It is the
 // multi-replica dedup primitive (store.ScheduledEventClaimer): several hub
@@ -1044,17 +1235,36 @@ func (s *ScheduleStore) ListScheduledEvents(ctx context.Context, filter store.Sc
 		return nil, err
 	}
 
+	// Keyset pagination on (created DESC, id DESC), as ListSchedules: the
+	// cursor is the opaque token encodeCursor makes from the previous page's
+	// last row, and the predicate matches the order, so a full traversal
+	// visits every matching row whatever the relation between UUID and
+	// creation order (ptone/scion#7883 P2-R2). An id-only cursor (the
+	// earlier format, or any non-token value) is refused as invalid.
+	var (
+		cursorCreated time.Time
+		cursorID      uuid.UUID
+	)
 	if opts.Cursor != "" {
-		cursorUID, err := parseCursorUUID(opts.Cursor)
+		var err error
+		cursorCreated, cursorID, err = decodeCursor(opts.Cursor)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("invalid cursor: %w", err)
 		}
-		query.Where(scheduledevent.IDLT(cursorUID))
+		cursorCreated = cursorCreated.UTC()
+		query.Where(scheduledevent.Or(
+			scheduledevent.CreatedLT(cursorCreated),
+			scheduledevent.And(
+				scheduledevent.CreatedEQ(cursorCreated),
+				scheduledevent.IDLT(cursorID),
+			),
+		))
 	}
 
 	limit := clampLimit(opts.Limit)
 	entities, err := query.
 		Order(scheduledevent.ByCreated(entsql.OrderDesc())).
+		Order(scheduledevent.ByID(entsql.OrderDesc())).
 		Limit(limit + 1).
 		All(ctx)
 	if err != nil {
@@ -1069,31 +1279,74 @@ func (s *ScheduleStore) ListScheduledEvents(ctx context.Context, filter store.Sc
 	result := &store.ListResult[store.ScheduledEvent]{TotalCount: totalCount}
 	if len(events) > limit {
 		result.Items = events[:limit]
-		result.NextCursor = events[limit-1].ID
+		last := events[limit-1]
+		// No-progress guard, as ListSchedules.
+		if opts.Cursor == "" || eventCursorAdvances(last, cursorCreated, cursorID) {
+			result.NextCursor = encodeCursor(last.CreatedAt.UTC(), last.ID)
+		}
 	} else {
 		result.Items = events
 	}
 	return result, nil
 }
 
-// PurgeOldScheduledEvents removes non-pending events that completed before
-// cutoff. Completion is fired_at (set for fired, expired and failed events);
-// an event with no fired_at (a cancelled one) falls back to created. So an
-// event scheduled far ahead keeps its outcome for the full period after it
-// fires (ptone/scion#4517).
+// eventCursorAdvances reports whether row is strictly after the cursor
+// (created, id) in (created DESC, id DESC) order.
+func eventCursorAdvances(row store.ScheduledEvent, created time.Time, id uuid.UUID) bool {
+	rc := row.CreatedAt.UTC()
+	if !rc.Equal(created) {
+		return rc.Before(created)
+	}
+	return row.ID < id.String()
+}
+
+// PurgeOldScheduledEvents removes completed events (excluding pending and
+// firing) that finished before cutoff. Completion is fired_at (set for fired,
+// expired and failed events); an event with no fired_at (a cancelled one)
+// falls back to created. So an event scheduled far ahead keeps its outcome for
+// the full period after it fires (ptone/scion#4517).
+//
+// The scheduled exec run of each purged event (ptone/scion#7883) is deleted
+// in the same transaction, before the events, by the same predicate; no
+// cascade is relied on.
 func (s *ScheduleStore) PurgeOldScheduledEvents(ctx context.Context, cutoff time.Time) (int, error) {
-	n, err := s.client.ScheduledEvent.Delete().
-		Where(
-			scheduledevent.StatusNEQ(store.ScheduledEventPending),
-			scheduledevent.Or(
-				scheduledevent.FiredAtLT(cutoff),
-				scheduledevent.And(
-					scheduledevent.FiredAtIsNil(),
-					scheduledevent.CreatedLT(cutoff),
-				),
+	purgeable := []predicate.ScheduledEvent{
+		scheduledevent.StatusNotIn(store.ScheduledEventPending, store.ScheduledEventFiring),
+		scheduledevent.Or(
+			scheduledevent.FiredAtLT(cutoff),
+			scheduledevent.And(
+				scheduledevent.FiredAtIsNil(),
+				scheduledevent.CreatedLT(cutoff),
 			),
-		).
-		Exec(ctx)
+		),
+	}
+	var n int
+	err := runInEntTx(ctx, s.client, s.inTx, func(c *ent.Client) error {
+		ids, err := c.ScheduledEvent.Query().Where(purgeable...).IDs(ctx)
+		if err != nil {
+			return err
+		}
+		for start := 0; start < len(ids); start += scheduledExecRunsByEventChunk {
+			end := min(start+scheduledExecRunsByEventChunk, len(ids))
+			chunk := ids[start:end]
+			if _, err := c.ScheduledExecRun.Delete().Where(scheduledexecrun.EventIDIn(chunk...)).Exec(ctx); err != nil {
+				return err
+			}
+			deleted, err := c.ScheduledEvent.Delete().
+				Where(append([]predicate.ScheduledEvent{scheduledevent.IDIn(chunk...)}, purgeable...)...).
+				Exec(ctx)
+			if err != nil {
+				return err
+			}
+			n += deleted
+		}
+		if _, err := c.ScheduledExecPollCursor.Delete().
+			Where(scheduledexecpollcursor.LastPolledAtLT(cutoff.UTC())).
+			Exec(ctx); err != nil {
+			return err
+		}
+		return nil
+	})
 	if err != nil {
 		return 0, err
 	}

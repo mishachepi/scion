@@ -38,6 +38,13 @@ read as `<pod name>-<UUID>` (see the [Hub monitoring dashboard](/scion/hosted/si
 and it is the default conduit relay instance ID. If `hub.extraEnv` already sets
 `POD_NAME`, the chart keeps your entry instead; that value must be unique per pod.
 
+The hub pod runs the Hub and the Runtime Broker in one process. The chart sets the
+pod's `terminationGracePeriodSeconds` to 45 (`hub.terminationGracePeriodSeconds`)
+instead of the Kubernetes default of 30. On shutdown the broker spends up to 10
+seconds ending the agent launches in progress, out of a 30-second shutdown budget, and
+the extra time lets the rest of the shutdown finish before the pod is killed. See
+[Broker restarts during a launch](/scion/reference/server-config/#asynchronous-agent-create).
+
 The chart does **not** create an Ingress, Gateway, load balancer, IAP
 configuration, Cloud SQL instance, GCS bucket, Secret Manager permissions, or
 any IAM binding. Provision those separately, for example with
@@ -48,9 +55,10 @@ IAP; see [Running a hub on GKE instead of Cloud Run](/scion/hosted/ha/terraform/
 
 The chart defaults to `replicaCount: 1`. With more than one replica, the web
 terminal, exec, log tailing, and port forwarding fail for roughly (N-1)/N of
-requests: the agent control channel, presence, and port tunnels are held in the
-memory of the pod that owns them, and load-balancer session affinity does not fix
-that.
+requests unless the `hub.conduit` experiment is on and cross-node relay TLS is
+configured (see [Relay TLS between hub nodes](#relay-tls-between-hub-nodes)):
+the agent control channel, presence, and port tunnels are held in the memory of
+the pod that owns them, and load-balancer session affinity does not fix that.
 
 ---
 
@@ -91,12 +99,17 @@ From the repository root:
 ```bash
 gcloud builds submit \
   --config=image-build/cloudbuild-hub-gke.yaml \
-  --ignore-file=image-build/gcloudignore-hub-gke \
-  --substitutions=_REGISTRY=<registry>,_SHORT_SHA=$(git rev-parse --short HEAD) \
+  --ignore-file=image-build/gcloudignore-omni \
+  --substitutions=_REGISTRY=<registry>,_SHORT_SHA=$(git rev-parse --short HEAD),_COMMIT_SHA=$(git rev-parse HEAD) \
   .
 ```
 
-`--ignore-file=image-build/gcloudignore-hub-gke` is required. The reasons are in
+For a release build on an exact git tag, also append `,_VERSION=<tag>` (a
+`vX.Y.Z[-preview.N|-rc.N]` form; and optionally
+`,_BUILD_TIME=<YYYY-MM-DDTHH:MM:SSZ>`). Off-tag, `_VERSION` defaults to `''` so
+the hub reports version `dev` and `image_tag: version` resolves to `latest`.
+
+`--ignore-file=image-build/gcloudignore-omni` is required. The reasons are in
 [`image-build/README.md`](https://github.com/GoogleCloudPlatform/scion/blob/main/image-build/README.md#gke-hub-image-cloudbuild-hub-gkeyaml).
 
 Pin the image by digest with `image.digest`. `image.tag` is accepted, but a tag
@@ -387,6 +400,149 @@ These are the chart's selector labels, and the chart's tests pin them. Labels in
 `hub.podLabels` cannot override them.
 :::
 
+### Relay TLS between hub nodes
+
+`conduit.internalTls` wires the conduit relay's internal hop between hub nodes
+over native TLS. `enabled` is `true`, `false` or `auto` (the default). `auto`
+turns it on when `replicaCount` is above one, and the render then requires
+`existingSecret`; at one replica, or under `config.existingSecret`, the chart
+renders no relay listener. Set `enabled: false` to keep a multi-replica release
+without it. When it is on, the chart:
+
+- renders `server.hub.conduit.internal_listen` on `0.0.0.0:<port>` (default
+  `9443`) with `internal_tls_cert_file`, `internal_tls_key_file`,
+  `internal_tls_ca_file` and `internal_tls_server_name`;
+- mounts `existingSecret` (a `kubernetes.io/tls` Secret with `tls.crt` and
+  `tls.key`, for example from cert-manager) and the CA bundle (`caSecret`,
+  default `existingSecret`, key `caKey`, default `ca.crt`) as whole directories,
+  so a rotated certificate and key are picked up without a restart;
+- sets `POD_IP`, so each node advertises `https://<pod IP>:<port>`, and declares
+  the port on the pod only, never on the Service.
+
+Every node verifies its peers against the CA and `serverName`, so one
+certificate whose SAN is that name serves all replicas. The default is
+`<fullname>-relay.<namespace>.svc`, usually
+`<release>-scion-hub-relay.<namespace>.svc`: issue the certificate for that
+name, or set `conduit.internalTls.serverName` to the name your certificate
+carries. A set CA replaces the system roots, and a private CA requires it.
+cert-manager fills `ca.crt` only for some issuers; for others, point `caSecret`
+at a Secret holding the CA.
+
+The hub reads the CA bundle and `serverName` once at startup. Changing
+`serverName`, `caSecret` or `caKey` through `helm upgrade` already rolls the
+pods, because the settings checksum or the pod spec changes. A change to a
+Secret's CONTENT does not: after replacing the CA bundle inside an existing
+Secret, run `kubectl rollout restart deployment/<fullname>`. (`<fullname>` is the
+chart's full name: `<release>-scion-hub` by default, `<release>-<nameOverride>`
+when `nameOverride` is set, just `<release>` when the release name already
+contains that name and does not end in `-<name>`, and `fullnameOverride` when
+that is set. When a long `nameOverride` pushes `<release>-<nameOverride>` past
+63 characters, the chart truncates the prefix and appends a 10-character hex
+SHA-256 digest of `<release>/<nameOverride>`.)
+
+To rotate the CA without breaking the hop between nodes, keep both CAs trusted
+while the leaf certificates move:
+
+1. With the default `caSecret` (empty, so `existingSecret`): when
+   `existingSecret` is issued by cert-manager, cert-manager owns its `ca.crt`
+   and replaces it along with the leaf, so it cannot hold two CAs. For the
+   overlap window, point `caSecret` at a Secret you manage that holds both the
+   old and the new CA, and run `helm upgrade` (this rolls the pods). If you made
+   `existingSecret` by hand, its `ca.crt` can hold both CAs directly; edit it and
+   run `kubectl rollout restart deployment/<fullname>`.
+2. Issue the leaf certificates from the new CA. The hub picks up the new
+   certificate and key without a restart.
+3. Remove the old CA, either by pointing `caSecret` back or by editing your
+   Secret. A `caSecret` change through `helm upgrade` rolls the pods; an edit to
+   the Secret's content needs `kubectl rollout restart deployment/<fullname>`.
+
+```yaml
+conduit:
+  internalTls:
+    enabled: true
+    existingSecret: scion-relay-tls   # issued for <fullname>-relay.<namespace>.svc
+```
+
+**Hub image version.** The chart refuses the relay wiring when the hub image is
+older than the first release that honours the `internal_tls_*` settings, because
+an older hub would serve the relay listener in plaintext. The same check applies
+to a non-loopback relay listener set through `config.extra` with
+`conduit.internalTls` off. The image tag is `image.tag`, else the chart's
+`appVersion`. A semver tag is compared by version (build metadata is ignored,
+and a pre-release sorts below its release) and a `nightly-YYYYMMDD` tag by date;
+a tag that starts like a version but is not valid semver, or has a version
+number longer than 19 digits, is refused. An `image.digest`, or a tag that is
+not a version (such as `latest`), cannot be checked: the render is allowed,
+`NOTES.txt` prints a warning, and the Deployment is annotated
+`scion.io/relay-tls-image-check: unverified`. Check such an image yourself.
+The floor is `nightly-20261029` for a nightly tag and `v0.3.0-preview.5` for a
+release tag. The chart's `appVersion` (the default image tag) is below the
+floor, so with relay TLS on (the default above one replica), set `image.tag` to
+`nightly-20261029` or later or to a release at or after `v0.3.0-preview.5`, or
+set `image.digest`.
+
+**Rolling back.** Hub releases before `v0.3.0-preview.5` (or `nightly-20261029`)
+ignore the `internal_tls_*` settings and would serve this listener in plaintext.
+If you roll the hub image back below that release, roll the chart back with it,
+or set `conduit.internalTls.enabled: false` first (for a listener set through
+`config.extra`, remove it or bind it to loopback).
+
+A relay listener that is not bound to loopback and has no TLS fails the render,
+including one set through `config.extra`. `conduit.internalTls` is refused
+together with `config.existingSecret`; put the same keys in your own settings
+file instead.
+
+### Separate Conduit Relays and PodDisruptionBudgets
+
+Setting `conduit.relayMode: external` moves Conduit session hosting out of the
+hub pods into a separate `Deployment` running `scion server start --role relay`
+(see [Separate Conduit Relays](/scion/hosted/ha/separate-relay/)):
+
+- **Peer authentication:** set `conduit.existingPeerSecret` (preferred; read as
+  `SCION_SERVER_HUB_CONDUIT_PEERSECRET` via `secretKeyRef`) or
+  `conduit.peerSecret` (redacted from `checksum/settings` and
+  `checksum/relay-settings` annotations). In `external` mode, the default
+  `conduit.peerAuth: auto` automatically resolves to `hmac` so proxy ingress
+  (`server.hub.conduit.ingress: proxy`) preserves client `Authorization`
+  headers; `conduit.peerAuth: oidc` is refused while proxy ingress is active.
+- **Internal hop Service:** when `conduit.relayMode: external` (or
+  `relay.enabled: true`), `conduit.internalTls` auto-enables and the chart
+  renders an internal `ClusterIP` `Service` `<fullname>-relay` on
+  `conduit.internalTls.port` (`9443`) selecting **Hub** pods (`scion-hub`
+  selector labels) so relay pods reach `server.relay.hub_internal_url`
+  (`https://<fullname>-relay.<namespace>.svc:9443`, matching the default
+  `conduit.internalTls.serverName`).
+- **Relay isolation, database role & probes:** `relay.*` renders a dedicated
+  `Deployment` (with distinct `scion-hub-relay` selector labels),
+  `ServiceAccount` (`relay.serviceAccount.gcpServiceAccount`), optional
+  `PodDisruptionBudget` (`relay.pdb`), and isolated settings `Secret`
+  (`<fullname>-relay-settings`) carrying no hub session secret, OAuth
+  credentials, GCS storage config, or Secret Manager config. When
+  `relay.database.user` (or IAM-derived relay user) differs from the Hub's
+  `database.user`, the chart automatically sets `server.database.relay_role` in
+  the Hub's `settings.yaml` so Hub schema migration grants that PostgreSQL role
+  the exact least-privilege table permissions. Relay HTTP probes target
+  `/healthz` (`--role relay` serves no `/readyz`).
+- **Replica sizing, disruption budgets & topology spread:** run at least 2 Hub
+  replicas (`replicaCount: 2`) and 2 Relay replicas (`relay.replicaCount: 2`)
+  for zone-level HA, keeping `(replicaCount × database.maxOpenConns) + (relay.replicaCount × relay.database.maxOpenConns)`
+  plus sidecar/listener overhead comfortably below your PostgreSQL
+  `max_connections` limit. Enable `hub.pdb.enabled: true` and
+  `relay.pdb.enabled: true` (both default to `maxUnavailable: 1` when neither
+  `minAvailable` nor `maxUnavailable` is set, so voluntary node drains keep
+  `N - 1` pods serving without wedging single-replica test releases) alongside
+  `hub.topologySpreadConstraints` / `relay.topologySpreadConstraints`.
+- **First-install and upgrade order:** on a brand-new database with
+  `conduit.relayMode: external`, the Hub runs schema migrations, applies any
+  `server.database.relay_role` PostgreSQL grants, and seeds `hub.conduit: true`
+  in `hub_settings` (when no explicit override exists). Relay pods starting in
+  the same `helm install` retry database/permission checks for up to 60 seconds
+  and may restart once if they read `hub_settings` in the brief window before
+  the Hub seeds `hub.conduit: true`; Kubernetes restarts them automatically and
+  the release converges without manual steps. On version upgrades across
+  separate releases, upgrade the Hub before separate relays (see
+  [Running a relay](/scion/hosted/ha/separate-relay/#running-a-relay)).
+
 The readiness and startup probes target `/readyz` on the hub's web port
 (`hub.webPort`, default 8080). The path cannot be changed. The liveness probe is
 off by default. When `probes.liveness.enabled` is `true`, it is a TCP check on
@@ -396,6 +552,74 @@ at least 300 seconds to allow for first-boot migrations.
 ---
 
 ## 7. Install and upgrade
+
+### Upgrade impact
+
+:::caution[Set fullnameOverride before upgrading a *-scion-hub release]
+Releases whose name ends in `-scion-hub` (such as `prod-scion-hub`, excluding
+exact `scion-hub`) are **renamed on upgrade** from `<release>` to
+`<release>-scion-hub`. Helm prints `NOTES.txt` only **after** an upgrade has
+applied, so set `fullnameOverride` **before** running `helm upgrade` (or
+rendering GitOps manifests) to avoid replacing live objects mid-service.
+:::
+
+Earlier chart versions skipped appending `-scion-hub` whenever the release name
+contained `scion-hub`, so a release named `<prefix>-scion-hub` (`prod-scion-hub`)
+rendered the exact same object names as a sibling `<prefix>` release (`prod`) in
+the same namespace.
+
+- **Unchanged releases:** releases named `scion-hub` (as in the commands below),
+  `scion-hub-*`, infix names such as `my-scion-hub-1`, or names that do not
+  contain `scion-hub` (such as `prod` or `myhub`) keep their existing object
+  names unchanged.
+- **Renamed on upgrade:** releases whose name ends in `-scion-hub` (or
+  `-<nameOverride>`, excluding exact `scion-hub`) now render `<release>-scion-hub`
+  (for example, `prod-scion-hub` becomes `prod-scion-hub-scion-hub`).
+- **What breaks if an existing `*-scion-hub` release upgrades without
+  `fullnameOverride`:** Helm deletes and recreates the Deployment, Service,
+  ServiceAccount, Secrets, ConfigMap, and RBAC objects under
+  `<release>-scion-hub`:
+  - **Workload Identity binding:** when `serviceAccount.create` is `true` and
+    `serviceAccount.name` is not set explicitly, the Kubernetes
+    `ServiceAccount` moves from `<release>` to `<release>-scion-hub`. Because
+    `roles/iam.workloadIdentityUser` on the Google service account is still
+    bound only to `<release>`, Cloud SQL IAM authentication, Cloud Storage, and
+    Secret Manager fail until rebound.
+  - **Service name:** `Service/<release>` moves to
+    `Service/<release>-scion-hub`, breaking any Ingress, Gateway backend, or
+    external target pointing at `Service/<release>`.
+  - **Relay TLS SAN:** the default conduit relay `serverName` moves from
+    `<release>-relay.<namespace>.svc` to
+    `<release>-scion-hub-relay.<namespace>.svc`, breaking cross-replica relay
+    TLS verification unless the certificate is re-issued for the new SAN or
+    `conduit.internalTls.serverName` is set explicitly.
+
+**Set `fullnameOverride` BEFORE upgrading** an existing `*-scion-hub` release
+(when **no** sibling `<prefix>` release shares the namespace) so every
+chart-owned object keeps its current name in place without replacement, outage,
+or temporary Deployment pod-selector overlap:
+
+```yaml
+# Add to your values file BEFORE running helm upgrade:
+fullnameOverride: prod-scion-hub
+```
+
+If you instead want the release to move to the new `<release>-scion-hub` object
+names (for example, to share a namespace with `<prefix>`), complete these steps
+before or alongside the upgrade:
+
+1. **Workload Identity:** pre-bind `roles/iam.workloadIdentityUser` on the
+   Google service account to
+   `serviceAccount:<project-id>.svc.id.goog[<namespace>/<release>-scion-hub]`.
+2. **Service and relay TLS:** update any Ingress or Gateway backend that points
+   at `Service/<release>`, and issue a relay TLS certificate whose SAN matches
+   `<release>-scion-hub-relay.<namespace>.svc` (or set
+   `conduit.internalTls.serverName` explicitly to your existing SAN).
+3. **Rendered manifests (`helm template | kubectl apply` or Argo CD without
+   prune):** remove the previous `<release>*` objects only after confirming no
+   sibling `<prefix>` release in the namespace owns them.
+
+### Running install or upgrade
 
 From the repository root:
 
@@ -464,13 +688,14 @@ that case the chart does not check the file's contents.
 
 ### Cluster-scoped RBAC objects under the previous name
 
-Earlier versions of the chart cut these names at 63 characters and added no
-digest. A release whose name was cut that way gets a new `ClusterRole` and
-`ClusterRoleBinding` name when it moves to the current chart. This happens only
-when `rbac.create` and `runtime.listAllNamespaces` are both `true`, and
-`<fullname>-<namespace>-agents` is longer than 63 characters. The default values
-leave `runtime.listAllNamespaces` off, so a default install renders no
-cluster-scoped objects and nothing is renamed.
+Earlier versions of the chart cut cluster-scoped RBAC names at 63 characters
+with no digest, and collapsed releases ending in `-scion-hub` onto `<prefix>`. A
+release whose full name moved or whose `<fullname>-<namespace>-agents` name
+exceeded 63 characters gets a new `ClusterRole` and `ClusterRoleBinding` name
+when it moves to the current chart. This applies only when `rbac.create` and
+`runtime.listAllNamespaces` are both `true`. The default values leave
+`runtime.listAllNamespaces` off, so a default install renders no cluster-scoped
+objects.
 
 After `helm install` or `helm upgrade`, the chart's NOTES print the current name
 and the previous one. On the rendered-manifest path, take the previous name from
@@ -544,7 +769,9 @@ On this path, remove the previous binding by hand:
    If the binding is not found, there is nothing to remove. The output shows
    only the last install that applied it, not every install that uses it.
 3. Once every release that shared the name runs a chart that includes the
-   naming fix, delete the binding:
+   naming fix — and you have confirmed that no remaining release's current
+   render still uses `<previous-name>` (such as an untruncated sibling
+   namespace or a sibling `<prefix>` release) — delete the binding:
 
    ```bash
    kubectl delete clusterrolebinding <previous-name>

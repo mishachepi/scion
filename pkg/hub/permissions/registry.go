@@ -40,6 +40,8 @@ const (
 	ResourceRole              = "role"
 	ResourceRoleBinding       = "role_binding"
 	ResourceScheduledEvent    = "scheduled_event"
+	ResourceTrigger           = "trigger"
+	ResourceWebhookEndpoint   = "webhook_endpoint"
 	ResourceAccessConstraint  = "access_constraint"
 	// ResourceSecret, ResourceEnvVar and ResourceSkillInjection are the
 	// material-delivery resource types (ptone/scion#2129): the typed target
@@ -55,6 +57,12 @@ const (
 	// ResourceTestIdentity is the hub test identity collection
 	// (POST/GET /api/v1/test-identities).
 	ResourceTestIdentity = "test_identity"
+	// ResourceSystemOneInstance is the hub-scoped System One provider
+	// instance registry (/api/v1/admin/system-one/instances).
+	ResourceSystemOneInstance = "system_one_instance"
+	// ResourceGitHubTrigger covers project-scoped GitHub App trigger
+	// actions and source settings (ptone/scion#836, ptone/scion#8090).
+	ResourceGitHubTrigger = "github_trigger"
 
 	// ResourceInbox and ResourceUserSkillInjection are self-scoped resource
 	// types: their records belong to one user and carry no project or hub
@@ -93,6 +101,8 @@ const (
 	ActionSetMessageMode = "set_message_mode"
 	ActionLifecycle      = "lifecycle"
 	ActionCreateGlobal   = "create_global"
+	ActionUpdateGlobal   = "update_global"
+	ActionDeleteGlobal   = "delete_global"
 	ActionAutoProvide    = "auto_provide"
 	// ActionDeliver and ActionUse distinguish launch-time material delivery
 	// from an agent's own runtime retrieval or token-mint request over the
@@ -121,6 +131,14 @@ const (
 	ActionDelegationCredentialRevoke = "delegation_credential_revoke"
 	ActionDelegationList             = "delegation_list"
 	ActionDelegationRead             = "delegation_read"
+	// ActionDelegationRevokeAll is the bulk agent delegation grant
+	// revocation action (.design/agent-delegation.md §7).
+	ActionDelegationRevokeAll = "delegation_revoke_all"
+	// ActionComment and ActionConfigure are the GitHub trigger action
+	// authoring/execution and project source settings actions
+	// (ptone/scion#836, ptone/scion#8090).
+	ActionComment   = "comment"
+	ActionConfigure = "configure"
 
 	// PermissionGCPServiceAccountUse is the gcp_service_account.use
 	// permission ID. Named so pkg/hub/authz.go's agent-scope handling for
@@ -224,46 +242,55 @@ var Registry = []Permission{
 	{ID: "agent.delegation.credential.revoke", Resource: ResourceAgent, Action: ActionDelegationCredentialRevoke, Description: "Revoke one delegated credential of an agent delegation grant: on the hub for any grant, on a project for grants bounded to that project", Enforcement: []string{"pkg/hub/handlers_agent_delegation_manage.go:agentDelegationControlAllowed"}},
 	{ID: "agent.delegation.list", Resource: ResourceAgent, Action: ActionDelegationList, Description: "List agent delegation grants: on the hub for any grant, on a project for grants bounded to that project", Enforcement: []string{"pkg/hub/handlers_agent_delegation_manage.go:agentDelegationControlAllowed"}},
 	{ID: "agent.delegation.read", Resource: ResourceAgent, Action: ActionDelegationRead, Description: "Read an agent delegation grant: on the hub for any grant, on a project for grants bounded to that project", Enforcement: []string{"pkg/hub/handlers_agent_delegation_manage.go:agentDelegationControlAllowed"}},
+	{ID: "agent.delegation.revoke_all", Resource: ResourceAgent, Action: ActionDelegationRevokeAll, Description: "Revoke every agent delegation grant of an agent in one call: on the hub for any grant, on a project for grants bounded to that project. The issuer and the agent's current owner need no permission for their own grants", Enforcement: []string{"pkg/hub/handlers_agent_delegation_manage.go:agentDelegationControlAllowed"}},
 
 	{ID: "project.create", Resource: ResourceProject, Action: ActionCreate, CapabilityKind: CapabilityScope, UATScope: "project:create", Description: "Create projects: project create, project register, and the new project of a clone", Enforcement: []string{"pkg/hub/handlers_projects_core.go:createProject", "pkg/hub/handlers_projects_core.go:handleProjectRegister", "pkg/hub/project_clone.go:authorizeProjectClone"}},
-	{ID: "project.read", Resource: ResourceProject, Action: ActionRead, CapabilityKind: CapabilityResource, UATScope: "project:read", AgentScopes: []string{"project:read"}, Description: "Read project metadata", Enforcement: []string{"pkg/hub/handlers_projects_core.go", "pkg/hub/authz.go"}},
+	{ID: "project.read", Resource: ResourceProject, Action: ActionRead, CapabilityKind: CapabilityResource, UATScope: "project:read", AgentScopes: []string{"project:read"}, Description: "Read project metadata", Enforcement: []string{"pkg/hub/handlers_projects_core.go", "pkg/hub/authz.go", "pkg/hub/handlers_admin_effective_permissions.go"}},
 	{ID: "project.update", Resource: ResourceProject, Action: ActionUpdate, CapabilityKind: CapabilityResource, UATScope: "project:update", Description: "Update projects", Enforcement: []string{"pkg/hub/handlers_projects_core.go", "pkg/hub/authz.go"}},
 	{ID: "project.delete", Resource: ResourceProject, Action: ActionDelete, CapabilityKind: CapabilityResource, Description: "Delete projects", Enforcement: []string{"pkg/hub/handlers_projects_core.go"}},
-	{ID: "project.manage", Resource: ResourceProject, Action: ActionManage, CapabilityKind: CapabilityResource, UATScope: "project:manage", Description: "Manage project administration (RS1 membership operations)", Enforcement: []string{"pkg/hub/handlers_projects_core.go", "pkg/hub/artifacts_host.go:func (h *artifactHost) ReviewGrantClause", "pkg/hub/artifacts_host.go:func (h *artifactHost) MayGrantReview"}},
+	{ID: "project.manage", Resource: ResourceProject, Action: ActionManage, CapabilityKind: CapabilityResource, UATScope: "project:manage", Description: "Manage project administration (RS1 membership operations). Not a read/write alias: it does not include project:read or project:list", Enforcement: []string{"pkg/hub/handlers_projects_core.go", "pkg/hub/artifacts_host.go:func (h *artifactHost) AdministersScope"}},
 	{ID: "project.register", Resource: ResourceProject, Action: ActionRegister, CapabilityKind: CapabilityResource, Description: "Register projects", Reserved: "no route checks project.register; project register checks project.create"},
 	{ID: "project.set_messaging_policy", Resource: ResourceProject, Action: "set_messaging_policy", CapabilityKind: CapabilityResource, UATScope: "project:set_messaging_policy", Description: "Set project cross-project messaging policy (owner/admin only)", Enforcement: []string{"pkg/hub/project_messaging_policy.go"}},
+	{ID: "project.manage_message_policies", Resource: ResourceProject, Action: "manage_message_policies", CapabilityKind: CapabilityResource, UATScope: "project:manage_message_policies", Description: "Create, update, delete, dry-run test, and inspect decisions for a project's message policies (project owner/admin or hub admin)", Enforcement: []string{"pkg/hub/handlers_message_policies.go"}},
+	{ID: "project.read_message_policies", Resource: ResourceProject, Action: "read_message_policies", CapabilityKind: CapabilityResource, UATScope: "project:read_message_policies", Description: "List and read a project's message policies and surface coverage", Enforcement: []string{"pkg/hub/handlers_message_policies.go"}},
 	{ID: "project.manage_visitors", Resource: ResourceProject, Action: "manage_visitors", CapabilityKind: CapabilityResource, Description: "Grant and revoke project visitor access for federated accounts (project owner/admin, hub admin)", Enforcement: []string{"pkg/hub/handlers_project_visitors.go"}},
-	// project.chat_post covers chat thread sends, scheduled sends and DM
-	// promotion (ptone/scion#5518). These chat writes do not check it yet:
-	// thread create; thread rename, default-agent change and delete;
-	// project attachment upload; message edit and delete; thread posts sent
-	// through the agent message endpoint's thread key. They are tracked in
-	// ptone/scion#5519.
+	// project.chat_post covers chat thread sends, scheduled sends, DM
+	// promotion, project attachment uploads and thread posts a user sends
+	// through the agent message endpoint's thread key, all decided by the
+	// chat resolvers (pkg/hub/chat_access.go, ptone/scion#5518 and #5519).
+	// These chat writes do not check it yet: thread create; thread rename,
+	// default-agent change and delete; message edit and delete. They are
+	// tracked in ptone/scion#5519.
 	// Its UAT selector project:chat_post only keeps the permission in a
 	// token's ceiling, so a token can delegate roles that include it (the
 	// built-in project-member role). A token never posts through it: a send
 	// by token needs inbox:write, and project.chat_post is decided on the
 	// token holder's account (chatPostIdentity).
-	{ID: "project.chat_post", Resource: ResourceProject, Action: "chat_post", CapabilityKind: CapabilityResource, UATScope: "project:chat_post", Description: "Post messages into the project's chat threads (project owner/admin/member, hub admin). Checked on the account: a user access token posts with inbox:write. On a token, project:chat_post only lets the token grant roles that include this permission", Enforcement: []string{"pkg/hub/handlers_chat_send.go:func (s *Server) chatMayPost"}},
+	{ID: "project.chat_post", Resource: ResourceProject, Action: "chat_post", CapabilityKind: CapabilityResource, UATScope: "project:chat_post", Description: "Keep project.chat_post on the token so it can grant roles that include it, such as project-member. It does not post: a token posts in a project's chat threads with inbox:write, and project.chat_post is checked on the account (project owner/admin/member, hub admin)", Enforcement: []string{"pkg/hub/chat_access.go:func (s *Server) chatUserAccess"}},
 
 	{ID: "artifact.read", Resource: ResourceArtifact, Action: ActionRead, CapabilityKind: CapabilityResource, UATScope: "artifact:read", AgentScopes: []string{"project:artifact:read"}, Description: "Read artifacts", Enforcement: []string{"pkg/hub/artifacts_host.go:func (h *artifactHost) Authorize", "pkg/artifacts/read.go:PermissionRead"}},
 	{ID: "artifact.create", Resource: ResourceArtifact, Action: ActionCreate, CapabilityKind: CapabilityScope, UATScope: "artifact:create", AgentScopes: []string{"project:artifact:write"}, Description: "Publish artifacts", Enforcement: []string{"pkg/hub/artifacts_host.go:func (h *artifactHost) Authorize", "pkg/artifacts/publish.go:PermissionCreate", "pkg/artifacts/versions.go:PermissionCreate"}},
 	{ID: "artifact.update", Resource: ResourceArtifact, Action: ActionUpdate, CapabilityKind: CapabilityResource, UATScope: "artifact:update", Description: "Edit artifact metadata (title, key, expiry)", Reserved: "no artifact route checks artifact.update; PATCH on an artifact is gated by artifact.manage (adminAuthorityWith)"},
 	{ID: "artifact.delete", Resource: ResourceArtifact, Action: ActionDelete, CapabilityKind: CapabilityResource, UATScope: "artifact:delete", Description: "Delete artifacts", Reserved: "no artifact route checks artifact.delete; DELETE on an artifact is gated by artifact.manage (ptone/scion#4529)"},
-	{ID: "artifact.manage", Resource: ResourceArtifact, Action: ActionManage, CapabilityKind: CapabilityResource, UATScope: "artifact:manage", Description: "Manage artifact grants and share links", Enforcement: []string{"pkg/hub/artifacts_host.go:func (h *artifactHost) Authorize", "pkg/artifacts/links.go:func (s *Service) canAdministerWith", "pkg/artifacts/links.go:func (s *Service) stewardAuthority", "pkg/artifacts/grants.go:func (s *Service) reviewGrantSubject", "pkg/artifacts/retire.go:func (s *Service) retireAuthority"}},
+	{ID: "artifact.manage", Resource: ResourceArtifact, Action: ActionManage, CapabilityKind: CapabilityResource, UATScope: "artifact:manage", Description: "Manage artifact grants and share links", Enforcement: []string{"pkg/hub/artifacts_host.go:func (h *artifactHost) Authorize", "pkg/artifacts/links.go:func (s *Service) canAdministerWith", "pkg/artifacts/links.go:func (s *Service) stewardAuthority", "pkg/artifacts/retire.go:func (s *Service) retireAuthority"}},
 	{ID: "artifact.steward", Resource: ResourceArtifact, Action: ActionSteward, CapabilityKind: CapabilityResource, UATScope: "artifact:steward", Description: "Share and delete artifacts owned by agents in the project (no admin grants, no moves)", Enforcement: []string{"pkg/hub/artifacts_host.go:func (h *artifactHost) StewardClause", "pkg/artifacts/links.go:func (s *Service) stewardAuthority"}},
 
 	{ID: "skill.create", Resource: ResourceSkill, Action: ActionCreate, CapabilityKind: CapabilityScope, UATScope: "skill:create", Description: "Create skills", Enforcement: []string{"pkg/hub/skill_handlers.go"}},
 	{ID: "skill.create_global", Resource: ResourceSkill, Action: ActionCreateGlobal, CapabilityKind: CapabilityScope, UATScope: "skill:create_global", ExcludeFromManageAlias: true, Description: "Create skills in the global (hub) catalog", Enforcement: []string{"pkg/hub/skill_handlers.go"}},
 	{ID: "skill.read", Resource: ResourceSkill, Action: ActionRead, CapabilityKind: CapabilityResource, UATScope: "skill:read", AgentScopes: []string{"project:read"}, Description: "Read skills", Enforcement: []string{"pkg/hub/skill_handlers.go"}},
 	{ID: "skill.update", Resource: ResourceSkill, Action: ActionUpdate, CapabilityKind: CapabilityResource, UATScope: "skill:update", Description: "Update skills", Enforcement: []string{"pkg/hub/skill_handlers.go"}},
+	{ID: "skill.update_global", Resource: ResourceSkill, Action: ActionUpdateGlobal, CapabilityKind: CapabilityNone, UATScope: "skill:update_global", ExcludeFromManageAlias: true, Description: "Update skills in the global (hub) catalog", Enforcement: []string{"pkg/hub/skill_handlers.go", "pkg/hub/skill_file_handlers.go"}},
 	{ID: "skill.delete", Resource: ResourceSkill, Action: ActionDelete, CapabilityKind: CapabilityResource, UATScope: "skill:delete", Description: "Delete skills", Enforcement: []string{"pkg/hub/skill_handlers.go"}},
+	{ID: "skill.delete_global", Resource: ResourceSkill, Action: ActionDeleteGlobal, CapabilityKind: CapabilityNone, UATScope: "skill:delete_global", ExcludeFromManageAlias: true, Description: "Delete skills from the global (hub) catalog", Enforcement: []string{"pkg/hub/skill_handlers.go"}},
 	{ID: "skill.list", Resource: ResourceSkill, Action: ActionList, CapabilityKind: CapabilityScope, UATScope: "skill:list", AgentScopes: []string{"project:read"}, Description: "List skills", Enforcement: []string{"pkg/hub/skill_handlers.go"}},
 
 	{ID: "template.create", Resource: ResourceTemplate, Action: ActionCreate, CapabilityKind: CapabilityScope, UATScope: "template:create", AgentScopes: []string{"project:template:write"}, Description: "Create templates", Enforcement: []string{"pkg/hub/template_handlers.go"}},
+	{ID: "template.create_global", Resource: ResourceTemplate, Action: ActionCreateGlobal, CapabilityKind: CapabilityNone, UATScope: "template:create_global", ExcludeFromManageAlias: true, Description: "Create templates in the global (hub) catalog", Enforcement: []string{"pkg/hub/template_handlers.go", "pkg/hub/template_reimport.go", "pkg/hub/handlers_resource_import.go"}},
 	{ID: "template.read", Resource: ResourceTemplate, Action: ActionRead, CapabilityKind: CapabilityResource, UATScope: "template:read", AgentScopes: []string{"project:read"}, Description: "Read templates", Enforcement: []string{"pkg/hub/template_handlers.go"}},
 	{ID: "template.update", Resource: ResourceTemplate, Action: ActionUpdate, CapabilityKind: CapabilityResource, UATScope: "template:update", AgentScopes: []string{"project:template:write"}, Description: "Update templates", Enforcement: []string{"pkg/hub/template_handlers.go"}},
+	{ID: "template.update_global", Resource: ResourceTemplate, Action: ActionUpdateGlobal, CapabilityKind: CapabilityNone, UATScope: "template:update_global", ExcludeFromManageAlias: true, Description: "Update templates in the global (hub) catalog", Enforcement: []string{"pkg/hub/template_handlers.go", "pkg/hub/template_file_handlers.go"}},
 	{ID: "template.delete", Resource: ResourceTemplate, Action: ActionDelete, CapabilityKind: CapabilityResource, UATScope: "template:delete", Description: "Delete templates", Enforcement: []string{"pkg/hub/template_handlers.go"}},
+	{ID: "template.delete_global", Resource: ResourceTemplate, Action: ActionDeleteGlobal, CapabilityKind: CapabilityNone, UATScope: "template:delete_global", ExcludeFromManageAlias: true, Description: "Delete templates from the global (hub) catalog", Enforcement: []string{"pkg/hub/template_handlers.go"}},
 	{ID: "template.list", Resource: ResourceTemplate, Action: ActionList, CapabilityKind: CapabilityScope, UATScope: "template:list", AgentScopes: []string{"project:read"}, Description: "List templates", Enforcement: []string{"pkg/hub/template_handlers.go"}},
 
 	{ID: "harness_config.create", Resource: ResourceHarnessConfig, Action: ActionCreate, CapabilityKind: CapabilityScope, UATScope: "harness_config:create", Description: "Create harness configs", Enforcement: []string{"pkg/hub/harness_config_handlers.go"}},
@@ -312,7 +339,7 @@ var Registry = []Permission{
 	{ID: "gcp_service_account.delete", Resource: ResourceGCPServiceAccount, Action: ActionDelete, CapabilityKind: CapabilityResource, Description: "Delete GCP service accounts", Enforcement: []string{"pkg/hub/handlers_gcp_identity.go"}},
 	{ID: "gcp_service_account.list", Resource: ResourceGCPServiceAccount, Action: ActionList, CapabilityKind: CapabilityScope, UATScope: "gcp_service_account:list", Description: "List GCP service accounts", Enforcement: []string{"pkg/hub/handlers_gcp_identity.go"}},
 	{ID: "gcp_service_account.verify", Resource: ResourceGCPServiceAccount, Action: ActionVerify, CapabilityKind: CapabilityResource, UATScope: "gcp_service_account:verify", Description: "Verify GCP service accounts", Enforcement: []string{"pkg/hub/handlers_gcp_identity.go"}},
-	{ID: "gcp_service_account.mint", Resource: ResourceGCPServiceAccount, Action: ActionMint, CapabilityKind: CapabilityScope, Description: "Mint GCP service account tokens", Enforcement: []string{"pkg/hub/handlers_gcp_identity.go"}},
+	{ID: "gcp_service_account.mint", Resource: ResourceGCPServiceAccount, Action: ActionMint, CapabilityKind: CapabilityScope, Description: "Create Hub-minted GCP service accounts", Enforcement: []string{"pkg/hub/handlers_gcp_identity.go"}},
 	// AgentScopes names project:agent:sa_assign only, its own agent scope
 	// distinct from project:agent:create (ptone/scion#2339): a ceiling that
 	// covers agent.create does not thereby cover this permission, and vice
@@ -329,7 +356,7 @@ var Registry = []Permission{
 	{ID: "hub.config.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, UATScope: "hub_config:update", Description: "Update server configuration", Enforcement: []string{"pkg/hub/admin_settings.go:handleAdminServerConfig", "pkg/hub/admin_settings.go:handleAdminServerConfigSectionReset"}},
 	{ID: "hub.maintenance.execute", Resource: ResourceHub, Action: ActionExecute, CapabilityKind: CapabilityScope, Description: "Execute maintenance operations", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
 	{ID: "hub.diagnostics.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, UATScope: "hub_diagnostics:read", Description: "Read diagnostics and logs", Enforcement: []string{"pkg/hub/route_metadata.go:admin.diagnostics.logs", "pkg/hub/route_metadata.go:admin.diagnostics.logsStream", "pkg/hub/route_metadata.go:admin.messaging.divergence", "pkg/hub/handlers_diagnostics.go:handleDiagnosticsLogsStream"}},
-	{ID: "hub.health.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, UATScope: "hub_health:read", Description: "Read health summary", Enforcement: []string{"pkg/hub/route_metadata.go:admin.health.summary", "pkg/hub/route_metadata.go:admin.gcpQuota"}},
+	{ID: "hub.health.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, UATScope: "hub_health:read", Description: "Read health summary", Enforcement: []string{"pkg/hub/route_metadata.go:admin.health.summary", "pkg/hub/route_metadata.go:admin.gcpQuota", "pkg/hub/route_metadata.go:admin.orphanedAgents"}},
 	{ID: "hub.admin_mode.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read admin mode state", Enforcement: []string{"pkg/hub/route_metadata.go:admin.maintenance"}},
 	{ID: "hub.admin_mode.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update admin mode", NonRouteUse: []string{"PUT in pkg/hub/admin_mode.go:handleAdminMaintenance; the route guard checks hub.admin_mode.read"}},
 	{ID: "hub.integrations.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, UATScope: "hub_integrations:read", Description: "Read integrations", Enforcement: []string{"pkg/hub/route_metadata.go:admin.integrations", "pkg/hub/route_metadata.go:admin.integrations.byName"}},
@@ -351,14 +378,21 @@ var Registry = []Permission{
 	{ID: "hub.teams_manifest.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, UATScope: "hub_teams_manifest:read", Description: "Read teams manifest", Enforcement: []string{"pkg/hub/route_metadata.go:admin.integrations.teamsManifest"}},
 	{ID: "hub.teams_manifest.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update teams manifest", Reserved: "no route checks hub.teams_manifest.update; the teams manifest route checks hub.teams_manifest.read"},
 	{ID: "hub.validate.execute", Resource: ResourceHub, Action: ActionExecute, CapabilityKind: CapabilityScope, UATScope: "hub_validate:execute", Description: "Validate resources", Enforcement: []string{"pkg/hub/route_metadata.go:admin.validateResources"}},
-	{ID: "hub.github_app.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, UATScope: "hub_github_app:read", Description: "Read GitHub app configuration", Enforcement: []string{"pkg/hub/route_metadata.go:githubApp.config.read", "pkg/hub/route_metadata.go:githubApp.installations.list", "pkg/hub/route_metadata.go:githubApp.installations.read"}},
-	{ID: "hub.github_app.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, UATScope: "hub_github_app:update", Description: "Manage GitHub App installations, discover and sync permissions (configuration updates need an interactive session)", Enforcement: []string{"pkg/hub/route_metadata.go:githubApp.installations.create", "pkg/hub/route_metadata.go:githubApp.installations.update", "pkg/hub/route_metadata.go:githubApp.installations.delete", "pkg/hub/route_metadata.go:githubApp.installations.discover", "pkg/hub/route_metadata.go:githubApp.syncPermissions"}},
+	{ID: "hub.github_app.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, UATScope: "hub_github_app:read", Description: "Read GitHub app configuration", Enforcement: []string{"pkg/hub/route_metadata.go:githubApp.config.read", "pkg/hub/route_metadata.go:githubApp.installations.list", "pkg/hub/route_metadata.go:githubApp.installations.read", "pkg/hub/route_metadata.go:githubApp.repoRouting.list"}},
+	{ID: "hub.github_app.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, UATScope: "hub_github_app:update", Description: "Manage GitHub App installations, discover, sync permissions and manage trigger repository routing (configuration updates need an interactive session)", Enforcement: []string{"pkg/hub/route_metadata.go:githubApp.installations.create", "pkg/hub/route_metadata.go:githubApp.installations.update", "pkg/hub/route_metadata.go:githubApp.installations.delete", "pkg/hub/route_metadata.go:githubApp.installations.discover", "pkg/hub/route_metadata.go:githubApp.syncPermissions", "pkg/hub/route_metadata.go:githubApp.repoRouting.set", "pkg/hub/route_metadata.go:githubApp.repoRouting.delete"}},
 	{ID: "hub.metrics.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, UATScope: "hub_metrics:read", Description: "Read metrics dashboard", Enforcement: []string{"pkg/hub/route_metadata.go:admin.metricsDashboard", "pkg/hub/route_metadata.go:admin.metricsDashboard.legacy"}},
 	{ID: "hub.env_vars.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "List hub-level environment variables (read only; excludes secrets)", Enforcement: []string{"pkg/hub/handlers_env_secrets.go:listEnvVars"}},
 	{ID: "hub.audit.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityNone, UATScope: "hub_audit:read", Description: "Explain authorization decisions for other principals (super-admin only)", NonRouteUse: []string{"audit_authz.go explain-for-other-principal gate"}},
 	{ID: "test_identity.issue", Resource: ResourceTestIdentity, Action: ActionIssue, CapabilityKind: CapabilityScope, UATScope: "test_identity:issue", Description: "Issue short-lived synthetic member or viewer test identities (only when the hub runs with --test-mode=member or above)", Enforcement: []string{"pkg/hub/route_metadata.go:testIdentities.create", "pkg/hub/route_metadata.go:testIdentities.list", "pkg/hub/route_metadata.go:testIdentities.token", "pkg/hub/route_metadata.go:testIdentities.webLoginCode", "pkg/hub/route_metadata.go:testIdentities.delete", "pkg/hub/route_metadata.go:testIdentityDelegations.create", "pkg/hub/route_metadata.go:testIdentityDelegations.list", "pkg/hub/route_metadata.go:testIdentityDelegations.revoke", "pkg/hub/handlers_test_identities.go:testIdentityCaller", "pkg/hub/handlers_test_identity_delegations.go:testIdentityDelegationCaller"}},
 	{ID: "test_identity.issue_admin", Resource: ResourceTestIdentity, Action: ActionIssueAdmin, CapabilityKind: CapabilityScope, UATScope: "test_identity:issue_admin", Description: "Issue short-lived test identities holding an expiring hub-admin role (only on hubs started with --test-mode=admin or above); held only by super-admin", Enforcement: []string{"pkg/hub/route_metadata.go:testIdentities.admin.create", "pkg/hub/route_metadata.go:testIdentities.admin.revokeAll", "pkg/hub/handlers_test_admin_identities.go:testAdminIssuer"}},
 	{ID: "test_identity.issue_super_admin", Resource: ResourceTestIdentity, Action: ActionIssueSuperAdmin, CapabilityKind: CapabilityScope, UATScope: "test_identity:issue_super_admin", Description: "Issue short-lived test identities holding an expiring super-admin role (only on hubs started with --test-mode=super-admin); held only by super-admin", Enforcement: []string{"pkg/hub/handlers_test_admin_identities.go:testAdminIssuer"}},
+
+	// System One provider instances (ptone/scion#8044). Interactive session
+	// only (CREDENTIAL_MANAGEMENT): no UATScope is minted.
+	{ID: "system_one_instance.read", Resource: ResourceSystemOneInstance, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "List and read System One provider instances", Enforcement: []string{"pkg/hub/route_metadata.go:admin.systemOne.instances", "pkg/hub/route_metadata.go:admin.systemOne.instances.byName"}},
+	{ID: "system_one_instance.create", Resource: ResourceSystemOneInstance, Action: ActionCreate, CapabilityKind: CapabilityScope, Description: "Create System One provider instances and bind hub-scoped internal API keys", Enforcement: []string{"pkg/hub/handlers_system_one_instances.go:handleAdminSystemOneInstances"}},
+	{ID: "system_one_instance.delete", Resource: ResourceSystemOneInstance, Action: ActionDelete, CapabilityKind: CapabilityResource, Description: "Delete System One provider instances and their stored credentials", Enforcement: []string{"pkg/hub/handlers_system_one_instances.go:handleAdminSystemOneInstanceByName"}},
+	{ID: "system_one_instance.execute", Resource: ResourceSystemOneInstance, Action: ActionExecute, CapabilityKind: CapabilityResource, Description: "Probe System One provider instances with inline specs or model queries", Enforcement: []string{"pkg/hub/handlers_system_one_instances.go:handleAdminSystemOneInstanceByName"}},
 
 	// Quota management (Phase 2B — Limits/Quotas)
 	{ID: "quota.read", Resource: ResourceQuota, Action: ActionRead, CapabilityKind: CapabilityScope, UATScope: "quota:read", Description: "Read limit definitions, entitlements, and usage", Enforcement: []string{"pkg/hub/handlers_quota.go", "pkg/hub/route_metadata.go:admin.limits", "pkg/hub/route_metadata.go:admin.limits.byId", "pkg/hub/route_metadata.go:admin.entitlements.byId", "pkg/hub/route_metadata.go:admin.usage", "pkg/hub/route_metadata.go:admin.usage.byLimit"}},
@@ -377,7 +411,7 @@ var Registry = []Permission{
 
 	// Access constraint management (AC1 — Operator Access Constraint Backend)
 	{ID: "access_constraint.admin", Resource: ResourceAccessConstraint, Action: ActionAdmin, CapabilityKind: CapabilityScope, UATScope: "access_constraint:admin", Description: "Administer access constraints (create, update, delete)", Enforcement: []string{"pkg/hub/handlers_access_constraints.go"}},
-	{ID: "access_constraint.read", Resource: ResourceAccessConstraint, Action: ActionRead, CapabilityKind: CapabilityScope, UATScope: "access_constraint:read", Description: "Read access constraints", Enforcement: []string{"pkg/hub/handlers_access_constraints.go"}},
+	{ID: "access_constraint.read", Resource: ResourceAccessConstraint, Action: ActionRead, CapabilityKind: CapabilityScope, UATScope: "access_constraint:read", Description: "Read access constraints", Enforcement: []string{"pkg/hub/handlers_access_constraints.go", "pkg/hub/handlers_admin_effective_permissions.go"}},
 
 	// Scheduled event / recurring schedule permissions (project-scoped)
 	{ID: "scheduled_event.read", Resource: ResourceScheduledEvent, Action: ActionRead, CapabilityKind: CapabilityResource, UATScope: "scheduled_event:read", Description: "Read a scheduled event", Enforcement: []string{"pkg/hub/handlers_scheduled_events.go", "pkg/hub/handlers_schedules.go"}},
@@ -386,11 +420,25 @@ var Registry = []Permission{
 	{ID: "scheduled_event.delete", Resource: ResourceScheduledEvent, Action: ActionDelete, CapabilityKind: CapabilityResource, UATScope: "scheduled_event:delete", Description: "Cancel a scheduled event or delete a schedule", Enforcement: []string{"pkg/hub/handlers_scheduled_events.go", "pkg/hub/handlers_schedules.go"}},
 	{ID: "scheduled_event.update", Resource: ResourceScheduledEvent, Action: ActionUpdate, CapabilityKind: CapabilityResource, UATScope: "scheduled_event:update", Description: "Update, pause or resume a recurring schedule", Enforcement: []string{"pkg/hub/handlers_schedules.go"}},
 
+	{ID: "github_trigger.comment", Resource: ResourceGitHubTrigger, Action: ActionComment, CapabilityKind: CapabilityScope, UATScope: "github_trigger:comment", Description: "Post comments on GitHub as the GitHub App through project triggers", NonRouteUse: []string{"Stage 3 github.comment trigger action author and execution check (ptone/scion#836)"}},
+	{ID: "github_trigger.configure", Resource: ResourceGitHubTrigger, Action: ActionConfigure, CapabilityKind: CapabilityResource, UATScope: "github_trigger:configure", Description: "Configure GitHub trigger source settings for a project", Enforcement: []string{"pkg/hub/handlers_github_trigger_settings.go:handlePutProjectGitHubTriggerSettings"}},
+
+	// Trigger and webhook endpoint permissions (project-scoped, ptone/scion#7961)
+	{ID: "trigger.read", Resource: ResourceTrigger, Action: ActionRead, CapabilityKind: CapabilityResource, UATScope: "trigger:read", Description: "Read a trigger definition, fire history or trigger event", Enforcement: []string{"pkg/hub/handlers_triggers.go", "pkg/hub/handlers_trigger_events.go"}},
+	{ID: "trigger.list", Resource: ResourceTrigger, Action: ActionList, CapabilityKind: CapabilityScope, UATScope: "trigger:list", Description: "List trigger definitions or trigger events", Enforcement: []string{"pkg/hub/handlers_triggers.go", "pkg/hub/handlers_trigger_events.go"}},
+	{ID: "trigger.create", Resource: ResourceTrigger, Action: ActionCreate, CapabilityKind: CapabilityScope, UATScope: "trigger:create", Description: "Create a trigger definition", Enforcement: []string{"pkg/hub/handlers_triggers.go", "pkg/hub/handlers_webhook_endpoints.go"}},
+	{ID: "trigger.delete", Resource: ResourceTrigger, Action: ActionDelete, CapabilityKind: CapabilityResource, UATScope: "trigger:delete", Description: "Delete a trigger definition", Enforcement: []string{"pkg/hub/handlers_triggers.go"}},
+	{ID: "trigger.update", Resource: ResourceTrigger, Action: ActionUpdate, CapabilityKind: CapabilityResource, UATScope: "trigger:update", Description: "Update, pause or resume a trigger definition", Enforcement: []string{"pkg/hub/handlers_triggers.go"}},
+	{ID: "webhook_endpoint.read", Resource: ResourceWebhookEndpoint, Action: ActionRead, CapabilityKind: CapabilityResource, UATScope: "webhook_endpoint:read", Description: "Read a webhook endpoint", Enforcement: []string{"pkg/hub/handlers_webhook_endpoints.go"}},
+	{ID: "webhook_endpoint.list", Resource: ResourceWebhookEndpoint, Action: ActionList, CapabilityKind: CapabilityScope, UATScope: "webhook_endpoint:list", Description: "List webhook endpoints", Enforcement: []string{"pkg/hub/handlers_webhook_endpoints.go"}},
+	{ID: "webhook_endpoint.create", Resource: ResourceWebhookEndpoint, Action: ActionCreate, CapabilityKind: CapabilityScope, UATScope: "webhook_endpoint:create", Description: "Create a webhook endpoint", Enforcement: []string{"pkg/hub/handlers_webhook_endpoints.go"}},
+	{ID: "webhook_endpoint.delete", Resource: ResourceWebhookEndpoint, Action: ActionDelete, CapabilityKind: CapabilityResource, UATScope: "webhook_endpoint:delete", Description: "Delete a webhook endpoint", Enforcement: []string{"pkg/hub/handlers_webhook_endpoints.go"}},
+
 	// Extensions to existing resource types (Phase 2 D4 resolution)
-	{ID: "user.invite", Resource: ResourceUser, Action: ActionInvite, CapabilityKind: CapabilityScope, UATScope: "user:invite", Description: "Invite users", Enforcement: []string{"pkg/hub/handlers_users_provision.go:handleProvisionUser"}, NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "user.invite", Resource: ResourceUser, Action: ActionInvite, CapabilityKind: CapabilityScope, UATScope: "user:invite", Description: "Invite users", Enforcement: []string{"pkg/hub/route_metadata.go:admin.users.invite", "pkg/hub/route_metadata.go:admin.users.invite.bulk", "pkg/hub/route_metadata.go:admin.invites", "pkg/hub/route_metadata.go:admin.invites.byId", "pkg/hub/handlers_users_provision.go:handleProvisionUser"}},
 	{ID: "user.suspend", Resource: ResourceUser, Action: ActionSuspend, CapabilityKind: CapabilityResource, UATScope: "user:suspend", Description: "Suspend users", Enforcement: []string{"pkg/hub/handlers_users_core.go"}},
-	{ID: "user.promote", Resource: ResourceUser, Action: ActionPromote, CapabilityKind: CapabilityResource, Description: "Promote or demote users", Enforcement: []string{"pkg/hub/handlers_users_core.go"}},
-	{ID: "user.delete", Resource: ResourceUser, Action: ActionDelete, CapabilityKind: CapabilityResource, Description: "Delete users", Enforcement: []string{"pkg/hub/handlers_users_core.go"}},
+	{ID: "user.promote", Resource: ResourceUser, Action: ActionPromote, CapabilityKind: CapabilityResource, UATScope: "user:promote", Description: "Promote or demote users", Enforcement: []string{"pkg/hub/handlers_users_core.go"}},
+	{ID: "user.delete", Resource: ResourceUser, Action: ActionDelete, CapabilityKind: CapabilityResource, UATScope: "user:delete", Description: "Delete users", Enforcement: []string{"pkg/hub/handlers_users_core.go"}},
 	{ID: "user.list", Resource: ResourceUser, Action: ActionList, CapabilityKind: CapabilityScope, UATScope: "user:list", Description: "List users", Enforcement: []string{"pkg/hub/handlers_users_core.go:listUsers"}},
 	{ID: "project.clone", Resource: ResourceProject, Action: ActionClone, CapabilityKind: CapabilityResource, UATScope: "project:clone", Description: "Clone projects", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
 	{ID: "project.list", Resource: ResourceProject, Action: ActionList, CapabilityKind: CapabilityScope, UATScope: "project:list", Description: "List projects", Enforcement: []string{"pkg/hub/handlers_projects_core.go:listProjects", "pkg/hub/skill_handlers.go:listSkills", "pkg/hub/authz_list.go"}},
@@ -422,7 +470,7 @@ var Registry = []Permission{
 	{ID: "env_var.deliver", Resource: ResourceEnvVar, Action: ActionDeliver, Description: "Deliver a stored environment variable to an agent at launch", NonRouteUse: []string{"material delivery grant evaluation"}},
 	{ID: "skill_injection.deliver", Resource: ResourceSkillInjection, Action: ActionDeliver, Description: "Deliver a stored skill reference to an agent at launch", NonRouteUse: []string{"material delivery grant evaluation"}},
 	{ID: "secret.use", Resource: ResourceSecret, Action: ActionUse, AgentScopes: []string{"project:secret:read"}, Description: "Retrieve a secret value at runtime by key", Enforcement: []string{"pkg/hub/material_runtime.go"}},
-	{ID: "gcp_service_account.use", Resource: ResourceGCPServiceAccount, Action: ActionUse, Description: "Mint a token as an assigned GCP service account", NonRouteUse: []string{"GCP token mint request"}},
+	{ID: "gcp_service_account.use", Resource: ResourceGCPServiceAccount, Action: ActionUse, Description: "Mint a token as an assigned GCP service account", NonRouteUse: []string{"GCP token mint request", "GCS link object fetch"}},
 
 	// Self-scoped permissions act only on the holder's own records. A user
 	// access token needs the exact selector, and the target checks in

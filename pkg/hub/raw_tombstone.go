@@ -256,9 +256,21 @@ func (s *Server) validateScheduledEventPayloadJSON(w http.ResponseWriter, eventT
 	case "dispatch_agent":
 		var p DispatchAgentEventPayload
 		decodeErr = json.Unmarshal([]byte(payload), &p)
+		if decodeErr == nil && !templateRefAllowed(p.Template) {
+			ValidationError(w, templateRefRefusal, nil)
+			return false
+		}
+	case scheduledEventTypeExec:
+		// Strict, bounded decode (ptone/scion#7883); the error text names
+		// the failing field, never a value.
+		if _, err := decodeScheduledExecPayload(payload); err != nil {
+			BadRequest(w, err.Error())
+			return false
+		}
+		return true
 	default:
 		// Every caller validates eventType against the closed
-		// {message, dispatch_agent} set before reaching here, so this branch
+		// {message, dispatch_agent, exec} set before reaching here, so this branch
 		// is unreachable in practice. Fail closed for an unrecognized event
 		// type rather than falling back to a lenient syntax-only check: if a
 		// future event type is ever added to the closed set without a

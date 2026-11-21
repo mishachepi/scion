@@ -82,7 +82,7 @@ The bridge supports three distinct A2A communication mechanics:
 * **Asynchronous Webhooks (Push Notifications)**: Clients register a callback URL (via the `CreateTaskPushNotificationConfig` method). The bridge stores this subscription in its state database (SQLite in default mode, PostgreSQL in standalone/HA mode) and POSTs state-change alerts (running, completed, input-required, error) to the webhook as they occur.
 
 :::note[Where the response comes from]
-The task's response (its artifacts) is whatever the agent explicitly sends back to the caller with `scion message`. The agent's final turn text is not forwarded automatically. If the agent never messages the caller, the task can still complete but carries no artifact, so instruct agents that serve A2A callers to reply with `scion message`.
+The task's response (its artifacts) is whatever the agent explicitly sends back to the caller with `scion message`. The agent's final turn text is not forwarded automatically. If the agent never messages the caller, the task can still complete but carries no artifact, so instruct agents that serve A2A callers to reply with `scion message`. By default (`reply_poll.enabled: true`), when the caller is a Scion user (`hubUAT`, `hubJWT`, `hubBearer`, `geGoogle`) or a federated user (project visitor under `oidcFederation`), the bridge reads the agent's reply from the caller's own direct conversation on the Hub (`GET /api/v1/chat/conversations/:id/messages` with the caller's own credential, after the `POST .../message` call returns `conversation_id` and `message_id`), rather than from the shared `scion.user.messages` broker plugin topic. Set `reply_poll.enabled: false` only as an emergency rollback to the legacy broker plugin topic path.
 :::
 
 ---
@@ -138,7 +138,56 @@ export A2A_API_KEY="your-secure-static-api-key"
 ```
 
 ### Step 4: Verify Connection
-Return to the Hub **Admin > Integrations** page. Click **Reconnect** on the A2A Bridge integration card. Once the Hub successfully dials the bridge's RPC server on port `9090`, the status badge will update to **Connected**.
+Return to the Hub **Admin > Integrations** page. Click **Reconnect** on the A2A Bridge integration card. Once the Hub successfully dials the bridge's RPC server on port `9090`, the status badge will update to **Connected**. If the bridge restarts or loses its RPC connection later, the Hub's plugin supervisor automatically re-dials it with exponential backoff and replays topic subscriptions; see [Message-Bus Plugin Supervision](/scion/hosted/user/external-channels/#message-bus-plugin-supervision).
+
+### Step 5: Configure a Reverse Proxy
+
+The A2A HTTP server (`:8443` by default) listens on plain HTTP. Terminate TLS at a reverse proxy such as Caddy, nginx, or a cloud load balancer in front of it, and keep the broker plugin RPC listener (`localhost:9090`) unreachable from outside the host.
+
+:::caution[Avoid Path Collisions When Co-Hosting with the Hub]
+Both the Scion Hub Web Dashboard and the A2A Protocol Bridge serve paths under `/projects/*` (as well as `/.well-known/*`, `/healthz`, `/readyz`, and `/metrics`). **Do not route `/projects/*` on the Hub's hostname directly to the bridge.**
+
+The Web Dashboard uses `/projects/*` for browser pages such as `/projects/<slug>` and `/projects/<slug>/settings`, while the bridge serves A2A endpoints under `/projects/{projectSlug}/agents/...` and enforces A2A credential authentication (`X-API-Key` or `Authorization: Bearer`) on non-public paths. Routing `/projects/*` to the bridge sends direct links and page refreshes for Hub project pages to the bridge, which rejects cookie-authenticated browser requests with `401 Unauthorized` instead of loading the Web Dashboard.
+:::
+
+When co-hosting the bridge and the Hub behind Caddy on the same machine, isolate the bridge with either a separate hostname or a stripped path prefix:
+
+#### Option A: Separate Hostname (Recommended)
+
+Serve the Hub and the bridge on distinct hostnames so neither service shares a URL namespace (including root-level `/.well-known/*` discovery endpoints):
+
+```caddy
+hub.example.com {
+    reverse_proxy localhost:8080
+}
+
+a2a.example.com {
+    reverse_proxy localhost:8443
+}
+```
+
+Set `bridge.external_url` in `scion-a2a-bridge.yaml` (and **External URL** in **Admin > Integrations > A2A Bridge**, if set there) to `https://a2a.example.com`. On a VM provisioned with `scripts/starter-hub/`, which obtains a wildcard certificate (`*.<CERT_DOMAIN>`), include the same `tls /etc/letsencrypt/live/<CERT_DOMAIN>/fullchain.pem /etc/letsencrypt/live/<CERT_DOMAIN>/privkey.pem` directive in both site blocks, and restore your custom `/etc/caddy/Caddyfile` after re-running `gce-start-hub.sh --full` (which writes the default single-site Hub Caddyfile).
+
+#### Option B: Distinct Path Prefix on the Same Hostname
+
+If you only have one hostname, mount the bridge under a dedicated prefix such as `/a2a/*` using Caddy's `handle_path` directive, which strips `/a2a` before forwarding requests to the bridge:
+
+```caddy
+hub.example.com {
+    handle_path /a2a/* {
+        reverse_proxy localhost:8443
+    }
+
+    handle {
+        reverse_proxy localhost:8080
+    }
+}
+```
+
+When serving the bridge under `/a2a/*`:
+* **Use `handle_path /a2a/*` (not `handle /a2a/*`)**: The bridge registers routes at `/projects/...` and `/.well-known/...` and expects the `/a2a` prefix to be stripped by the proxy.
+* **Include the prefix in `external_url`**: Set `bridge.external_url` in `scion-a2a-bridge.yaml` (and **External URL** in **Admin > Integrations > A2A Bridge**, if configured in the Admin UI overlay) to `https://hub.example.com/a2a` so generated Agent Cards and rewritten OIDC `jwks_uri` values advertise `https://hub.example.com/a2a/projects/<project-slug>/agents/<agent-slug>/jsonrpc` rather than the Hub's unprefixed `/projects/...` path.
+* **Point clients at the prefixed URLs**: Configure A2A clients with `https://hub.example.com/a2a/projects/<project-slug>/agents/<agent-slug>` (or `https://hub.example.com/a2a/.well-known/agent-card.json`). Root-level `https://hub.example.com/.well-known/*` remains served by the Hub.
 
 ### Dev-Mode Rebuild
 When running the Scion Hub in development mode (`MaintenanceConfig.RepoPath` is configured in `settings.yaml`), clicking **Update** inside the A2A integration detail page triggers an automatic compilation of the bridge binary directly from your local repository. The Hub will output instructions for you to restart the process manually to apply the new binary.
@@ -161,8 +210,9 @@ bridge:
   # Port and address for the A2A HTTP server (JSON-RPC, agent cards, health check).
   listen_address: ":8443"
 
-  # Public-facing base URL where A2A clients reach this bridge. 
+  # Public-facing base URL where A2A clients reach this bridge.
   # Used to construct agent card URLs and self-referencing links.
+  # Include any reverse-proxy path prefix (e.g., "https://hub.example.com/a2a").
   external_url: "https://a2a.example.com"
 
   # Identity included in generated Agent Cards.
@@ -217,6 +267,11 @@ timeouts:
   send_message: 120s      # Maximum wait time for synchronous blocking calls
   sse_keepalive: 30s     # Interval between SSE ping packets
   push_retry_max: 3      # Max delivery retries for webhook push notifications
+
+# Reply Polling (User & Visitor Conversations)
+reply_poll:
+  enabled: true          # Poll the caller's own conversation for the agent's reply (false = legacy broker topic rollback)
+  concurrency: 64        # Max concurrent Hub conversation poll requests across tasks
 
 # Client Request Rate Limiting
 rate_limit:
@@ -307,12 +362,14 @@ To secure and isolate desktop client sessions, Scion uses **User Access Token (U
 To authorize your desktop application, generate a Scion Personal Access Token scoped to the project you wish to target:
 
 ```bash
-scion token create \
+scion hub token create \
   --name "claude-desktop-integration" \
   --project "my-coding-project" \
-  --scope agent:message,agent:read \
+  --scopes agent:message,agent:read,inbox:read \
   --expires 365d
 ```
+
+`inbox:read` is required with `reply_poll.enabled: true` (the default) so the bridge can read the agent's reply from your conversation (`GET /api/v1/chat/conversations/:id/messages`) using your token. If the token lacks `inbox:read`, the Hub answers `403` on the conversation read and the task fails with `"This access token can't read your conversation with this agent (it needs the inbox:read scope and access to the agent's project); agent replies can't be returned."`
 
 This command returns a secure token starting with `scion_pat_...`. Copy it immediately; it will not be shown again.
 
@@ -400,7 +457,7 @@ auth:
 * **Users from another hub (project visitors)**: The bridge reads the `scion_token_kind` claim (`user` or `agent`). A credential without the claim counts as an agent when it carries an agent claim (`project_id`, `agent_name`, `ancestry`, `root_user`), and as a user when it carries only an email. A credential that claims both kinds, or another kind, is refused. Agent credentials work as before.
   - The Hub decides everything for a user caller, asked with the caller's own user access credential. `GET /api/v1/auth/me` names the caller's project visitor account on this Hub, and the bridge sends as `user:<account ID>`. Tasks are kept separate per account.
   - A user with no project visitor account on this Hub (for example, the user of an identity issuer who is not linked to an account) is refused: the Hub answers 403, and the bridge answers 403 with "You don't have access to this resource" before any task starts. A user access credential from another hub is refused by the Hub with 401 while the Hub's project visitor experiment is off, or while the issuer does not accept user access credentials; the bridge passes the 401 on. When the Hub cannot be reached, the caller gets 502 and can retry.
-  - Messages from a user caller are text only. The agent's reply comes back on the user's own topic, and the bridge forwards to the user only replies that arrive on that user's own topic. The bridge listens on that topic alone, and a reply on a user's topic never reaches another caller: an agent caller's task takes replies only on the bridge admin's topic. Before the bridge forwards a reply, it asks the Hub again whether the caller may still read that conversation. If the Hub refuses (for example, the grant was revoked), the task ends with "You don't have access to this resource". The caller gets the same answer when the project or agent is unknown, not exposed by the bridge, or not open to them. For an agent that is still starting, the bridge first asks the Hub, with the same conversation read, whether the caller may message it: a user caller sees launch progress only after the Hub allows the message, and if the launch fails it sees only the launch outcome code (`Agent failed to start (<code>)`), or the phase when the outcome has no code (`Agent failed to start (phase: <phase>)`). Any other Hub answer while the bridge routes or sends the message ends the task with "Failed to route message to agent" instead, and any other Hub answer to the check before a reply ends it with "Unable to verify access to agent". That includes a 400, which the Hub gives for a request it does not accept from a user caller (such as a message with an attachment); sending the same message again gets the same answer.
+  - Messages from a user caller are text only. With `reply_poll.enabled: true` (the default), the bridge takes `conversation_key` (`dm:agent:<agentId>:user:<visitor id>`) and `message_id` from the Hub's send response and polls the visitor's own direct conversation (`GET /api/v1/chat/conversations/:dmKey/messages?limit=50`) with the caller's credential (paired with a bridge-signed token for `/chat/` admission) until a reply from `agent:<slug>` newer than `message_id` arrives; no broker plugin topic subscription is used for the reply. If `reply_poll.enabled` is set to `false` (rollback mode), the agent's reply comes back on the user's own broker topic (`scion.visitors.<accountID>.messages`), which the bridge listens on for that visitor alone, and the bridge re-verifies `GET /api/v1/chat/conversations/:dmKey/messages?limit=1` before forwarding the reply. In either mode, if the Hub refuses the conversation read with `401` or `403` (for example, the visitor grant was revoked), the task ends with `"You don't have access to this resource"`; any other failure on that conversation read ends the task with `"Unable to verify access to agent"`. The caller gets `"You don't have access to this resource"` when the project or agent is unknown, not exposed by the bridge, or not open to them. For an agent that is still starting, the bridge first asks the Hub, with the same conversation read, whether the caller may message it: a user caller sees launch progress only after the Hub allows the message, and if the launch fails it sees only the launch outcome code (`Agent failed to start (<code>)`), or the phase when the outcome has no code (`Agent failed to start (phase: <phase>)`). Any other Hub answer while the bridge routes or sends the message ends the task with `"Failed to route message to agent"` instead. That includes a `400`, which the Hub gives for a request it does not accept from a user caller (such as a message with an attachment); sending the same message again gets the same answer.
   - `GET /projects/{project}/agents` (authenticated) returns the cards of the project's exposed agents that the caller may message. This comes from the Hub's `?messageable=true` agent list.
   - The bridge never creates an agent for a user caller, and never sends for it as the bridge admin.
   - Requirements: the bridge needs a signing key (`hub.signing_key` or `hub.signing_key_secret`), because it sends its own minted credential next to the caller's; without one a user caller gets 502. The Hub needs native chat enabled, because the access check before each reply reads the conversation through the chat API; with chat off, every reply to a user caller is refused, and so is every message from a user caller to an agent that is still starting.
@@ -427,11 +484,11 @@ The bridge exposes the following HTTP endpoints:
 | `/.well-known/agent-card.json` | GET | None | Base bridge registry agent card. |
 | `/.well-known/openid-configuration` | GET | None | OIDC discovery proxy document for deployments behind IAP. Uses bridge transport auth to fetch from the Hub and rewrites the `jwks_uri` to point back to the bridge. Cached for 5 minutes. |
 | `/.well-known/jwks.json` | GET | None | JSON Web Key Set (JWKS) proxy endpoint. Serves Hub public keys with a 5-minute cache. |
-| `/projects/{projectSlug}/agents/{agentSlug}/.well-known/agent-card.json` | GET | Configured Scheme | Per-agent capabilities card. |
+| `/projects/{projectSlug}/agents/{agentSlug}/.well-known/agent-card.json` | GET | None | Per-agent capabilities card. |
 | `/projects/{projectSlug}/agents/{agentSlug}/jsonrpc` | POST | Configured Scheme | Primary A2A JSON-RPC 2.0 communication endpoint. |
 | `/healthz` | GET | None | Liveness check (returns HTTP 200). |
 | `/readyz` | GET | None | Readiness check (checks DB and active broker plugin connection). |
-| `/metrics` | GET | Configured Scheme | Prometheus metrics. |
+| `/metrics` | GET | Configured Scheme | Prometheus metrics (disabled under `federation`). |
 
 ---
 
@@ -457,12 +514,35 @@ Standard A2A JSON-RPC methods supported at the `/jsonrpc` endpoint:
 
 ## 10. Troubleshooting & Operations
 
+### Direct Links to `/projects/...` Return `401 Unauthorized`
+If opening or refreshing a Hub project URL (`/projects/<slug>`) in a browser returns `401` (`unauthorized`) instead of the Web Dashboard, your reverse proxy is routing `/projects/*` on the Hub's hostname to the A2A Protocol Bridge. Because the bridge enforces A2A token authentication on `/projects/*` routes, browser session cookies are rejected. Serve the bridge on a separate hostname or behind a stripped path prefix such as `/a2a/*`; see [Step 5: Configure a Reverse Proxy](#step-5-configure-a-reverse-proxy).
+
 ### Health Checks (`/healthz` & `/readyz`)
 * **Liveness (`/healthz`)**: Returns `HTTP 200 OK` as long as the HTTP server is listening. Used by container runtimes to detect deadlocks.
 * **Readiness (`/readyz`)**: Returns `HTTP 200 OK` only when:
   1. The local SQLite database is reachable and writable.
   2. The Hub's broker plugin has successfully dialed and established its active RPC connection.
   * If either component fails, `/readyz` returns `HTTP 503 Service Unavailable`, preventing traffic from hitting the node.
+
+### Metrics Scraping (`/metrics`)
+`/metrics` serves Prometheus metrics and requires the bridge's configured `auth.scheme`, matching other non-public endpoints (and is subject to the bridge's standard rate limiting).
+
+Configure your Prometheus scrape job to send credentials matching `auth.scheme`:
+* **Bearer-based schemes (`bearer`, `hubUAT`, `hubBearer`, `hubJWT`, `geGoogle`)**: configure `authorization` in the Prometheus scrape job to send `Authorization: Bearer <token>` (for example, using `credentials_file` pointing to a token file).
+* **`apiKey`**: send `X-API-Key: <key>` (Prometheus's built-in `authorization` block sends `Authorization`; use `bearer`, a scraper that supports custom headers, or an internal proxy). When `auth.scheme` is unset, either `X-API-Key` or `Authorization: Bearer` is accepted.
+* **`federation`**: `/metrics` fails closed (`403 Forbidden`) under the federation scheme.
+* **`none`**: open (no credentials required), matching all other endpoints when authentication is explicitly disabled.
+
+```yaml
+scrape_configs:
+  - job_name: scion-a2a-bridge
+    scheme: https
+    static_configs:
+      - targets: ["a2a.example.com"]
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/secrets/a2a-bridge-token
+```
 
 ### SQLite State Database Permissions
 The SQLite database stores task metadata and webhook credentials (`auth_credentials`) in plain text.

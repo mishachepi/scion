@@ -22,6 +22,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -31,58 +32,55 @@ import (
 	"testing"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/githubapp"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
-func TestExtractOwnerRepo(t *testing.T) {
+func TestGitHubOwnerRepo(t *testing.T) {
+	githubCom := &Server{}
+	ghes := &Server{}
+	ghes.config.GitHubAppConfig.APIBaseURL = "https://github.example.com/api/v3"
+
 	tests := []struct {
 		name     string
+		srv      *Server
 		remote   string
 		expected string
 	}{
-		{"https github", "https://github.com/acme/widgets.git", "acme/widgets"},
-		{"https github no .git", "https://github.com/acme/widgets", "acme/widgets"},
-		{"https github trailing slash", "https://github.com/acme/widgets/", "acme/widgets"},
-		{"ssh github", "git@github.com:acme/widgets.git", "acme/widgets"},
-		{"ssh github no .git", "git@github.com:acme/widgets", "acme/widgets"},
-		{"http github", "http://github.com/acme/widgets.git", "acme/widgets"},
-		{"github enterprise https", "https://github.example.com/org/repo.git", "org/repo"},
-		{"ssh with slash prefix", "git@github.com:/acme/widgets.git", "acme/widgets"},
-		{"empty", "", ""},
-		{"just hostname", "github.com", ""},
-		{"no repo", "https://github.com/acme", ""},
-		{"too many parts", "https://github.com/a/b/c", ""},
+		{"https github", githubCom, "https://github.com/acme/widgets.git", "acme/widgets"},
+		{"https github no .git", githubCom, "https://github.com/acme/widgets", "acme/widgets"},
+		{"https github trailing slash", githubCom, "https://github.com/acme/widgets/", "acme/widgets"},
+		{"ssh github", githubCom, "git@github.com:acme/widgets.git", "acme/widgets"},
+		{"ssh github no .git", githubCom, "git@github.com:acme/widgets", "acme/widgets"},
+		{"http github", githubCom, "http://github.com/acme/widgets.git", "acme/widgets"},
+		{"case preserved", githubCom, "https://GitHub.com/Acme/Widgets.git", "Acme/Widgets"},
+		{"github enterprise https", ghes, "https://github.example.com/org/repo.git", "org/repo"},
+		{"github enterprise ssh with port", ghes, "ssh://git@github.example.com:2222/org/repo.git", "org/repo"},
+		{"ssh with port, other hostname", ghes, "ssh://git@gitlab.example.com:2222/org/repo.git", ""},
+		{"ssh userinfo names the GHES host", ghes, "ssh://git@github.example.com@other.example/org/repo.git", ""},
+		{"scp-form userinfo names the GHES host", ghes, "git@github.example.com@other.example:org/repo.git", ""},
+		{"scp-form path is not owner/repo", ghes, "git@github.example.com:other", ""},
+		{"https with a non-default port", ghes, "https://github.example.com:8443/org/repo.git", ""},
+		{"empty", githubCom, "", ""},
+		{"just hostname", githubCom, "github.com", ""},
+		{"no repo", githubCom, "https://github.com/acme", ""},
+		{"too many parts", githubCom, "https://github.com/a/b/c", ""},
+
+		// Host match: only the configured GitHub host.
+		{"other host", githubCom, "https://gitlab.com/acme/widgets.git", ""},
+		{"other host ssh", githubCom, "git@gitlab.com:acme/widgets.git", ""},
+		{"lookalike host", githubCom, "https://github.com.other.example/acme/widgets", ""},
+		{"port is a different host", githubCom, "https://github.com:8443/acme/widgets", ""},
+		{"userinfo before another host", githubCom, "https://github.com@other.example/acme/widgets", ""},
+		{"github.com when GHES is configured", ghes, "https://github.com/acme/widgets.git", ""},
+		{"GHES host when github.com is configured", githubCom, "https://github.example.com/org/repo.git", ""},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			result := extractOwnerRepo(tc.remote)
+			result := tc.srv.githubOwnerRepo(tc.remote)
 			if result != tc.expected {
-				t.Errorf("extractOwnerRepo(%q) = %q, want %q", tc.remote, result, tc.expected)
-			}
-		})
-	}
-}
-
-func TestIsValidOwnerRepo(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected bool
-	}{
-		{"acme/widgets", true},
-		{"a/b", true},
-		{"", false},
-		{"acme", false},
-		{"/repo", false},
-		{"owner/", false},
-		{"a/b/c", false},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.input, func(t *testing.T) {
-			result := isValidOwnerRepo(tc.input)
-			if result != tc.expected {
-				t.Errorf("isValidOwnerRepo(%q) = %v, want %v", tc.input, result, tc.expected)
+				t.Errorf("githubOwnerRepo(%q) = %q, want %q", tc.remote, result, tc.expected)
 			}
 		})
 	}
@@ -304,12 +302,20 @@ func TestHandleGitHubWebhook_InstallationCreated(t *testing.T) {
 	srv, s := webhookTestServer(t)
 	ctx := context.Background()
 
+	// The project's creator proves access to the repository with their own
+	// GitHub token; a repo-name match alone does not associate.
+	giveUserGitHubToken(t, srv, s, "creator-1", "ghp_creator_1")
+	fakeCreatorAccess(srv, map[string]githubapp.RepoAccess{
+		"ghp_creator_1|acme/widgets": {Push: true, Pull: true},
+	})
+
 	// Create a project with a matching git remote
 	project := &store.Project{
 		ID:        tid("project-1"),
 		Name:      "Test Project",
 		Slug:      "test-project",
 		GitRemote: "https://github.com/acme/widgets.git",
+		CreatedBy: "creator-1",
 		Created:   time.Now(),
 		Updated:   time.Now(),
 	}
@@ -514,6 +520,89 @@ func TestHandleGitHubWebhook_InstallationReposRemoved(t *testing.T) {
 	}
 }
 
+// TestHandleGitHubWebhook_InstallationReposRemoved_CaseInsensitive covers
+// ptone/scion#7548: GitHub owner and repo names are case-insensitive, so a
+// removed repository must match the installation's repo list and the
+// project's git remote regardless of letter case.
+func TestHandleGitHubWebhook_InstallationReposRemoved_CaseInsensitive(t *testing.T) {
+	cases := []struct {
+		name        string
+		storedRepos []string
+		gitRemote   string
+		removed     string
+	}{
+		{"mixed-case remote, lowercase payload", []string{"acme/widgets", "acme/api"}, "https://github.com/Acme/Widgets.git", "acme/widgets"},
+		{"lowercase remote, mixed-case payload", []string{"Acme/Widgets", "acme/api"}, "https://github.com/acme/widgets.git", "Acme/Widgets"},
+		{"stored list differs from payload", []string{"ACME/WIDGETS", "acme/api"}, "git@github.com:aCmE/wIdGeTs.git", "Acme/Widgets"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, s := webhookTestServer(t)
+			ctx := context.Background()
+
+			installationID := int64(12345)
+			if err := s.CreateGitHubInstallation(ctx, &store.GitHubInstallation{
+				InstallationID: installationID,
+				AccountLogin:   "acme",
+				AccountType:    "Organization",
+				AppID:          42,
+				Repositories:   tc.storedRepos,
+				Status:         store.GitHubInstallationStatusActive,
+			}); err != nil {
+				t.Fatalf("failed to create installation: %v", err)
+			}
+			if err := s.CreateProject(ctx, &store.Project{
+				ID:                   tid("project-1"),
+				Name:                 "Test Project",
+				Slug:                 "test-project",
+				GitRemote:            tc.gitRemote,
+				GitHubInstallationID: &installationID,
+				GitHubAppStatus:      &store.GitHubAppProjectStatus{State: store.GitHubAppStateOK, LastChecked: time.Now()},
+				Created:              time.Now(),
+				Updated:              time.Now(),
+			}); err != nil {
+				t.Fatalf("failed to create project: %v", err)
+			}
+
+			payload := mustJSON(t, map[string]interface{}{
+				"action":       "removed",
+				"installation": map[string]interface{}{"id": installationID},
+				"repositories_removed": []map[string]interface{}{
+					{"id": 1, "full_name": tc.removed, "name": "widgets"},
+				},
+				"repositories_added": []map[string]interface{}{},
+			})
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/github", bytes.NewReader(payload))
+			req.Header.Set("X-GitHub-Event", "installation_repositories")
+			req.Header.Set("X-Hub-Signature-256", signWebhookPayload(payload, "test-webhook-secret"))
+			rec := httptest.NewRecorder()
+			srv.handleGitHubWebhook(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d", rec.Code)
+			}
+
+			updated, err := s.GetGitHubInstallation(ctx, installationID)
+			if err != nil {
+				t.Fatalf("failed to get installation: %v", err)
+			}
+			if len(updated.Repositories) != 1 || updated.Repositories[0] != "acme/api" {
+				t.Errorf("expected [acme/api], got %v", updated.Repositories)
+			}
+
+			updatedProject, err := s.GetProject(ctx, tid("project-1"))
+			if err != nil {
+				t.Fatalf("failed to get project: %v", err)
+			}
+			if updatedProject.GitHubAppStatus == nil || updatedProject.GitHubAppStatus.State != store.GitHubAppStateError {
+				t.Fatalf("expected error state, got %v", updatedProject.GitHubAppStatus)
+			}
+			if updatedProject.GitHubAppStatus.ErrorCode != githubapp.ErrCodeRepoNotAccessible {
+				t.Errorf("expected %s error code, got %s", githubapp.ErrCodeRepoNotAccessible, updatedProject.GitHubAppStatus.ErrorCode)
+			}
+		})
+	}
+}
+
 func TestHandleGitHubWebhook_IgnoredEvent(t *testing.T) {
 	srv, _ := webhookTestServer(t)
 
@@ -542,11 +631,19 @@ func TestMatchProjectsToInstallation(t *testing.T) {
 	srv, s := webhookTestServer(t)
 	ctx := context.Background()
 
+	// The creator proves access to every repository with their own token.
+	giveUserGitHubToken(t, srv, s, "creator-g", "ghp_creator_g")
+	fakeCreatorAccess(srv, map[string]githubapp.RepoAccess{
+		"ghp_creator_g|acme/widgets": {Push: true, Pull: true},
+		"ghp_creator_g|acme/api":     {Push: true, Pull: true},
+		"ghp_creator_g|other/repo":   {Push: true, Pull: true},
+	})
+
 	// Create projects with different git remotes
 	projects := []*store.Project{
-		{ID: tid("g1"), Name: "G1", Slug: tid("g1"), GitRemote: "https://github.com/acme/widgets.git", Created: time.Now(), Updated: time.Now()},
-		{ID: tid("g2"), Name: "G2", Slug: tid("g2"), GitRemote: "https://github.com/acme/api.git", Created: time.Now(), Updated: time.Now()},
-		{ID: tid("g3"), Name: "G3", Slug: tid("g3"), GitRemote: "https://github.com/other/repo.git", Created: time.Now(), Updated: time.Now()},
+		{ID: tid("g1"), Name: "G1", Slug: tid("g1"), GitRemote: "https://github.com/acme/widgets.git", CreatedBy: "creator-g", Created: time.Now(), Updated: time.Now()},
+		{ID: tid("g2"), Name: "G2", Slug: tid("g2"), GitRemote: "https://github.com/acme/api.git", CreatedBy: "creator-g", Created: time.Now(), Updated: time.Now()},
+		{ID: tid("g3"), Name: "G3", Slug: tid("g3"), GitRemote: "https://github.com/other/repo.git", CreatedBy: "creator-g", Created: time.Now(), Updated: time.Now()},
 		{ID: tid("g4"), Name: "G4", Slug: tid("g4"), Created: time.Now(), Updated: time.Now()}, // No git remote
 	}
 
@@ -560,6 +657,7 @@ func TestMatchProjectsToInstallation(t *testing.T) {
 		InstallationID: 12345,
 		AccountLogin:   "acme",
 		Repositories:   []string{"acme/widgets", "acme/api"},
+		Status:         store.GitHubInstallationStatusActive,
 	}
 	if err := s.CreateGitHubInstallation(ctx, installation); err != nil {
 		t.Fatalf("failed to create installation: %v", err)
@@ -871,11 +969,17 @@ func TestWebhook_PublishesProjectUpdatedOnAutoMatch(t *testing.T) {
 	recorder := &recordingEventPublisher{}
 	srv.events = recorder
 
+	giveUserGitHubToken(t, srv, s, "creator-3", "ghp_creator_3")
+	fakeCreatorAccess(srv, map[string]githubapp.RepoAccess{
+		"ghp_creator_3|acme/widgets": {Push: true, Pull: true},
+	})
+
 	// Create a project with a matching git remote but no installation yet
 	project := &store.Project{
 		ID:        tid("project-event-3"),
 		Name:      "Event Test Project 3",
 		Slug:      "event-test-project-3",
+		CreatedBy: "creator-3",
 		GitRemote: "https://github.com/acme/widgets.git",
 		Created:   time.Now(),
 		Updated:   time.Now(),
@@ -922,4 +1026,536 @@ func TestWebhook_PublishesProjectUpdatedOnAutoMatch(t *testing.T) {
 	if updates[0].GitHubInstallationID == nil || *updates[0].GitHubInstallationID != 12345 {
 		t.Error("expected project to be associated with installation 12345")
 	}
+}
+
+// pagedListProjectsStore wraps store.Store and caps every ListProjects call to
+// pageSize items while its fault switch is armed, simulating the store's page
+// cap across multiple cursor pages without inserting thousands of rows.
+type pagedListProjectsStore struct {
+	store.Store
+	fault    *storeFaultSwitch
+	pageSize int
+
+	mu    sync.Mutex
+	calls []store.ListOptions
+}
+
+func (p *pagedListProjectsStore) ListProjects(ctx context.Context, filter store.ProjectFilter, opts store.ListOptions) (*store.ListResult[store.Project], error) {
+	if !p.fault.Active() {
+		return p.Store.ListProjects(ctx, filter, opts)
+	}
+	p.mu.Lock()
+	p.calls = append(p.calls, opts)
+	p.mu.Unlock()
+
+	capped := opts
+	if p.pageSize > 0 && (capped.Limit <= 0 || capped.Limit > p.pageSize) {
+		capped.Limit = p.pageSize
+	}
+	return p.Store.ListProjects(ctx, filter, capped)
+}
+
+func (p *pagedListProjectsStore) recordedCalls() []store.ListOptions {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]store.ListOptions, len(p.calls))
+	copy(out, p.calls)
+	return out
+}
+
+func assertCursorPaginationCalls(t *testing.T, calls []store.ListOptions, minPages int) {
+	t.Helper()
+	if len(calls) < minPages {
+		t.Fatalf("expected at least %d ListProjects page calls, got %d: %+v", minPages, len(calls), calls)
+	}
+	if calls[0].Cursor != "" {
+		t.Errorf("expected first ListProjects call to have empty cursor, got %q", calls[0].Cursor)
+	}
+	for i, c := range calls {
+		if c.Limit <= 0 || c.Limit > 1000 {
+			t.Errorf("call %d requested Limit=%d, want 1..1000", i, c.Limit)
+		}
+		if !c.SkipTotalCount {
+			t.Errorf("call %d did not set SkipTotalCount=true", i)
+		}
+		if i > 0 && c.Cursor == "" {
+			t.Errorf("call %d had empty Cursor, expected pagination cursor", i)
+		}
+	}
+}
+
+// scriptedListProjectsStore is a pure fake store returning scripted ListProjects
+// pages (and/or errors) without touching a database.
+type scriptedListProjectsStore struct {
+	store.Store
+	pages []func(opts store.ListOptions) (*store.ListResult[store.Project], error)
+	calls []store.ListOptions
+}
+
+func (f *scriptedListProjectsStore) ListProjects(_ context.Context, _ store.ProjectFilter, opts store.ListOptions) (*store.ListResult[store.Project], error) {
+	idx := len(f.calls)
+	f.calls = append(f.calls, opts)
+	if idx >= len(f.pages) {
+		return &store.ListResult[store.Project]{}, nil
+	}
+	return f.pages[idx](opts)
+}
+
+func TestForEachGitHubAppProject_FakeStore(t *testing.T) {
+	t.Run("follows cursors across pages until exhausted", func(t *testing.T) {
+		fake := &scriptedListProjectsStore{
+			pages: []func(store.ListOptions) (*store.ListResult[store.Project], error){
+				func(opts store.ListOptions) (*store.ListResult[store.Project], error) {
+					if opts.Cursor != "" {
+						t.Errorf("page 1 cursor = %q, want empty", opts.Cursor)
+					}
+					return &store.ListResult[store.Project]{
+						Items:      []store.Project{{ID: "p1"}, {ID: "p2"}},
+						NextCursor: "cursor-1",
+					}, nil
+				},
+				func(opts store.ListOptions) (*store.ListResult[store.Project], error) {
+					if opts.Cursor != "cursor-1" {
+						t.Errorf("page 2 cursor = %q, want cursor-1", opts.Cursor)
+					}
+					return &store.ListResult[store.Project]{
+						Items:      []store.Project{{ID: "p3"}, {ID: "p4"}},
+						NextCursor: "cursor-2",
+					}, nil
+				},
+				func(opts store.ListOptions) (*store.ListResult[store.Project], error) {
+					if opts.Cursor != "cursor-2" {
+						t.Errorf("page 3 cursor = %q, want cursor-2", opts.Cursor)
+					}
+					return &store.ListResult[store.Project]{
+						Items:      []store.Project{{ID: "p5"}},
+						NextCursor: "",
+					}, nil
+				},
+			},
+		}
+		testSrv := &Server{store: fake}
+		var visited []string
+		if err := testSrv.forEachGitHubAppProject(context.Background(), func(p *store.Project) {
+			visited = append(visited, p.ID)
+		}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := []string{"p1", "p2", "p3", "p4", "p5"}
+		if strings.Join(visited, ",") != strings.Join(want, ",") {
+			t.Fatalf("visited = %v, want %v", visited, want)
+		}
+		assertCursorPaginationCalls(t, fake.calls, 3)
+	})
+
+	t.Run("propagates error on subsequent page", func(t *testing.T) {
+		boom := errors.New("page 2 query failed")
+		fake := &scriptedListProjectsStore{
+			pages: []func(store.ListOptions) (*store.ListResult[store.Project], error){
+				func(store.ListOptions) (*store.ListResult[store.Project], error) {
+					return &store.ListResult[store.Project]{
+						Items:      []store.Project{{ID: "p1"}},
+						NextCursor: "cursor-1",
+					}, nil
+				},
+				func(store.ListOptions) (*store.ListResult[store.Project], error) {
+					return nil, boom
+				},
+			},
+		}
+		testSrv := &Server{store: fake}
+		var visited []string
+		err := testSrv.forEachGitHubAppProject(context.Background(), func(p *store.Project) {
+			visited = append(visited, p.ID)
+		})
+		if !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want %v", err, boom)
+		}
+		if len(visited) != 1 || visited[0] != "p1" {
+			t.Fatalf("visited = %v, want [p1]", visited)
+		}
+	})
+
+	t.Run("terminates on stagnant cursor or empty page", func(t *testing.T) {
+		fake := &scriptedListProjectsStore{
+			pages: []func(store.ListOptions) (*store.ListResult[store.Project], error){
+				func(store.ListOptions) (*store.ListResult[store.Project], error) {
+					return &store.ListResult[store.Project]{
+						Items:      []store.Project{{ID: "p1"}},
+						NextCursor: "stuck",
+					}, nil
+				},
+				func(store.ListOptions) (*store.ListResult[store.Project], error) {
+					return &store.ListResult[store.Project]{
+						Items:      []store.Project{{ID: "p2"}},
+						NextCursor: "stuck",
+					}, nil
+				},
+			},
+		}
+		testSrv := &Server{store: fake}
+		var visited []string
+		if err := testSrv.forEachGitHubAppProject(context.Background(), func(p *store.Project) {
+			visited = append(visited, p.ID)
+		}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(fake.calls) != 2 {
+			t.Fatalf("expected loop to stop on repeated cursor after 2 calls, got %d", len(fake.calls))
+		}
+		if strings.Join(visited, ",") != "p1,p2" {
+			t.Fatalf("visited = %v, want [p1 p2]", visited)
+		}
+	})
+}
+
+func TestGitHubAppHandlers_PaginateProjects(t *testing.T) {
+	oldBase := time.Date(2026, 4, 15, 12, 0, 0, 0, time.UTC)
+
+	t.Run("matchProjectsToInstallation", func(t *testing.T) {
+		srv, s := webhookTestServer(t)
+		paged, fault := installStoreFault(t, srv, func(inner store.Store, f *storeFaultSwitch) *pagedListProjectsStore {
+			return &pagedListProjectsStore{Store: inner, fault: f, pageSize: 2}
+		})
+		ctx := context.Background()
+
+		giveUserGitHubToken(t, srv, s, "creator-paged", "ghp_creator_paged")
+		fakeCreatorAccess(srv, map[string]githubapp.RepoAccess{
+			"ghp_creator_paged|acme/widgets": {Push: true, Pull: true},
+		})
+
+		newestTime := time.Now().UTC().Add(10 * time.Minute)
+		fixtures := []*store.Project{
+			{
+				ID: tid("match-oldest"), Name: "Match Oldest", Slug: tid("match-oldest"),
+				GitRemote: "https://github.com/acme/widgets.git", CreatedBy: "creator-paged",
+				Created: oldBase, Updated: oldBase,
+			},
+			{
+				ID: tid("match-filler-1"), Name: "Filler 1", Slug: tid("match-filler-1"),
+				GitRemote: "https://github.com/other/repo.git", CreatedBy: "creator-paged",
+				Created: oldBase.Add(1 * time.Minute), Updated: oldBase.Add(1 * time.Minute),
+			},
+			{
+				ID: tid("match-filler-2"), Name: "Filler 2", Slug: tid("match-filler-2"),
+				GitRemote: "https://github.com/other/repo.git", CreatedBy: "creator-paged",
+				Created: oldBase.Add(2 * time.Minute), Updated: oldBase.Add(2 * time.Minute),
+			},
+			{
+				ID: tid("match-filler-3"), Name: "Filler 3", Slug: tid("match-filler-3"),
+				Created: oldBase.Add(3 * time.Minute), Updated: oldBase.Add(3 * time.Minute),
+			},
+			{
+				ID: tid("match-newest"), Name: "Match Newest", Slug: tid("match-newest"),
+				GitRemote: "https://github.com/acme/widgets.git", CreatedBy: "creator-paged",
+				Created: newestTime, Updated: newestTime,
+			},
+		}
+		for _, p := range fixtures {
+			if err := s.CreateProject(ctx, p); err != nil {
+				t.Fatalf("CreateProject(%s): %v", p.ID, err)
+			}
+		}
+
+		inst := &store.GitHubInstallation{
+			InstallationID: 31001,
+			AccountLogin:   "acme",
+			AccountType:    "Organization",
+			AppID:          42,
+			Repositories:   []string{"acme/widgets"},
+			Status:         store.GitHubInstallationStatusActive,
+		}
+		if err := s.CreateGitHubInstallation(ctx, inst); err != nil {
+			t.Fatalf("CreateGitHubInstallation: %v", err)
+		}
+
+		fault.Arm()
+		matched := srv.matchProjectsToInstallation(ctx, inst)
+
+		if len(matched) != 2 {
+			t.Fatalf("expected 2 matched projects across pages, got %d: %v", len(matched), matched)
+		}
+		assertCursorPaginationCalls(t, paged.recordedCalls(), 3)
+
+		for _, id := range []string{tid("match-newest"), tid("match-oldest")} {
+			got, err := s.GetProject(ctx, id)
+			if err != nil {
+				t.Fatalf("GetProject(%s): %v", id, err)
+			}
+			if got.GitHubInstallationID == nil || *got.GitHubInstallationID != inst.InstallationID {
+				t.Errorf("project %s installation = %v, want %d", id, got.GitHubInstallationID, inst.InstallationID)
+			}
+		}
+	})
+
+	t.Run("updateProjectsForInstallation", func(t *testing.T) {
+		srv, s := webhookTestServer(t)
+		paged, fault := installStoreFault(t, srv, func(inner store.Store, f *storeFaultSwitch) *pagedListProjectsStore {
+			return &pagedListProjectsStore{Store: inner, fault: f, pageSize: 2}
+		})
+		ctx := context.Background()
+
+		instID := int64(31002)
+		if err := s.CreateGitHubInstallation(ctx, &store.GitHubInstallation{
+			InstallationID: instID,
+			AccountLogin:   "acme",
+			AccountType:    "Organization",
+			AppID:          42,
+			Status:         store.GitHubInstallationStatusActive,
+		}); err != nil {
+			t.Fatalf("CreateGitHubInstallation: %v", err)
+		}
+
+		newestTime := time.Now().UTC().Add(10 * time.Minute)
+		fixtures := []*store.Project{
+			{
+				ID: tid("upd-oldest"), Name: "Update Oldest", Slug: tid("upd-oldest"),
+				GitRemote: "https://github.com/acme/widgets.git", GitHubInstallationID: &instID,
+				GitHubAppStatus: &store.GitHubAppProjectStatus{State: store.GitHubAppStateOK, LastChecked: oldBase},
+				Created:         oldBase, Updated: oldBase,
+			},
+			{
+				ID: tid("upd-filler-1"), Name: "Filler 1", Slug: tid("upd-filler-1"),
+				Created: oldBase.Add(1 * time.Minute), Updated: oldBase.Add(1 * time.Minute),
+			},
+			{
+				ID: tid("upd-filler-2"), Name: "Filler 2", Slug: tid("upd-filler-2"),
+				Created: oldBase.Add(2 * time.Minute), Updated: oldBase.Add(2 * time.Minute),
+			},
+			{
+				ID: tid("upd-filler-3"), Name: "Filler 3", Slug: tid("upd-filler-3"),
+				Created: oldBase.Add(3 * time.Minute), Updated: oldBase.Add(3 * time.Minute),
+			},
+			{
+				ID: tid("upd-newest"), Name: "Update Newest", Slug: tid("upd-newest"),
+				GitRemote: "https://github.com/acme/widgets.git", GitHubInstallationID: &instID,
+				GitHubAppStatus: &store.GitHubAppProjectStatus{State: store.GitHubAppStateOK, LastChecked: oldBase},
+				Created:         newestTime, Updated: newestTime,
+			},
+		}
+		for _, p := range fixtures {
+			if err := s.CreateProject(ctx, p); err != nil {
+				t.Fatalf("CreateProject(%s): %v", p.ID, err)
+			}
+		}
+
+		fault.Arm()
+		payload := mustJSON(t, map[string]any{
+			"action": "deleted",
+			"installation": map[string]any{
+				"id":     instID,
+				"app_id": 42,
+				"account": map[string]any{
+					"login": "acme",
+					"type":  "Organization",
+				},
+			},
+		})
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/github", bytes.NewReader(payload))
+		req.Header.Set("X-GitHub-Event", "installation")
+		req.Header.Set("X-Hub-Signature-256", signWebhookPayload(payload, "test-webhook-secret"))
+		rec := httptest.NewRecorder()
+		srv.handleGitHubWebhook(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("webhook returned %d: %s", rec.Code, rec.Body.String())
+		}
+
+		assertCursorPaginationCalls(t, paged.recordedCalls(), 3)
+
+		for _, id := range []string{tid("upd-newest"), tid("upd-oldest")} {
+			got, err := s.GetProject(ctx, id)
+			if err != nil {
+				t.Fatalf("GetProject(%s): %v", id, err)
+			}
+			if got.GitHubAppStatus == nil || got.GitHubAppStatus.State != store.GitHubAppStateError {
+				t.Errorf("project %s status = %+v, want error state", id, got.GitHubAppStatus)
+			}
+		}
+	})
+
+	t.Run("checkProjectsForRemovedRepos", func(t *testing.T) {
+		srv, s := webhookTestServer(t)
+		paged, fault := installStoreFault(t, srv, func(inner store.Store, f *storeFaultSwitch) *pagedListProjectsStore {
+			return &pagedListProjectsStore{Store: inner, fault: f, pageSize: 2}
+		})
+		ctx := context.Background()
+
+		instID := int64(31003)
+		if err := s.CreateGitHubInstallation(ctx, &store.GitHubInstallation{
+			InstallationID: instID,
+			AccountLogin:   "acme",
+			AccountType:    "Organization",
+			AppID:          42,
+			Repositories:   []string{"acme/widgets", "acme/api"},
+			Status:         store.GitHubInstallationStatusActive,
+		}); err != nil {
+			t.Fatalf("CreateGitHubInstallation: %v", err)
+		}
+
+		newestTime := time.Now().UTC().Add(10 * time.Minute)
+		fixtures := []*store.Project{
+			{
+				ID: tid("rem-oldest"), Name: "Removed Oldest", Slug: tid("rem-oldest"),
+				GitRemote: "https://github.com/acme/widgets.git", GitHubInstallationID: &instID,
+				GitHubAppStatus: &store.GitHubAppProjectStatus{State: store.GitHubAppStateOK, LastChecked: oldBase},
+				Created:         oldBase, Updated: oldBase,
+			},
+			{
+				ID: tid("rem-filler-1"), Name: "Filler 1", Slug: tid("rem-filler-1"),
+				Created: oldBase.Add(1 * time.Minute), Updated: oldBase.Add(1 * time.Minute),
+			},
+			{
+				ID: tid("rem-filler-2"), Name: "Filler 2", Slug: tid("rem-filler-2"),
+				Created: oldBase.Add(2 * time.Minute), Updated: oldBase.Add(2 * time.Minute),
+			},
+			{
+				ID: tid("rem-filler-3"), Name: "Filler 3", Slug: tid("rem-filler-3"),
+				GitRemote: "https://github.com/acme/api.git", GitHubInstallationID: &instID,
+				GitHubAppStatus: &store.GitHubAppProjectStatus{State: store.GitHubAppStateOK, LastChecked: oldBase},
+				Created:         oldBase.Add(3 * time.Minute), Updated: oldBase.Add(3 * time.Minute),
+			},
+			{
+				ID: tid("rem-newest"), Name: "Removed Newest", Slug: tid("rem-newest"),
+				GitRemote: "https://github.com/acme/widgets.git", GitHubInstallationID: &instID,
+				GitHubAppStatus: &store.GitHubAppProjectStatus{State: store.GitHubAppStateOK, LastChecked: oldBase},
+				Created:         newestTime, Updated: newestTime,
+			},
+		}
+		for _, p := range fixtures {
+			if err := s.CreateProject(ctx, p); err != nil {
+				t.Fatalf("CreateProject(%s): %v", p.ID, err)
+			}
+		}
+
+		fault.Arm()
+		payload := mustJSON(t, map[string]any{
+			"action":       "removed",
+			"installation": map[string]any{"id": instID},
+			"repositories_removed": []map[string]any{
+				{"id": 1, "full_name": "acme/widgets", "name": "widgets"},
+			},
+			"repositories_added": []map[string]any{},
+		})
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/github", bytes.NewReader(payload))
+		req.Header.Set("X-GitHub-Event", "installation_repositories")
+		req.Header.Set("X-Hub-Signature-256", signWebhookPayload(payload, "test-webhook-secret"))
+		rec := httptest.NewRecorder()
+		srv.handleGitHubWebhook(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("webhook returned %d: %s", rec.Code, rec.Body.String())
+		}
+
+		assertCursorPaginationCalls(t, paged.recordedCalls(), 3)
+
+		for _, id := range []string{tid("rem-newest"), tid("rem-oldest")} {
+			got, err := s.GetProject(ctx, id)
+			if err != nil {
+				t.Fatalf("GetProject(%s): %v", id, err)
+			}
+			if got.GitHubAppStatus == nil ||
+				got.GitHubAppStatus.State != store.GitHubAppStateError ||
+				got.GitHubAppStatus.ErrorCode != githubapp.ErrCodeRepoNotAccessible {
+				t.Errorf("project %s status = %+v, want error/%s", id, got.GitHubAppStatus, githubapp.ErrCodeRepoNotAccessible)
+			}
+		}
+	})
+
+	t.Run("handleSyncAppPermissions", func(t *testing.T) {
+		mockGH := newMockAppEndpoint(t, http.StatusOK, map[string]any{
+			"id":     42,
+			"slug":   "scion-app",
+			"events": []string{},
+			"permissions": map[string]string{
+				"contents": "read",
+				"metadata": "read",
+			},
+		})
+
+		srv, s := webhookTestServer(t)
+		paged, fault := installStoreFault(t, srv, func(inner store.Store, f *storeFaultSwitch) *pagedListProjectsStore {
+			return &pagedListProjectsStore{Store: inner, fault: f, pageSize: 2}
+		})
+		srv.mu.Lock()
+		srv.config.GitHubAppConfig.PrivateKey = testGitHubAppPrivateKeyPEM(t)
+		srv.config.GitHubAppConfig.APIBaseURL = mockGH.server.URL
+		srv.mu.Unlock()
+
+		ctx := context.Background()
+		instID := int64(31004)
+		if err := s.CreateGitHubInstallation(ctx, &store.GitHubInstallation{
+			InstallationID: instID,
+			AccountLogin:   "acme",
+			AccountType:    "Organization",
+			AppID:          42,
+			Status:         store.GitHubInstallationStatusActive,
+		}); err != nil {
+			t.Fatalf("CreateGitHubInstallation: %v", err)
+		}
+
+		newestTime := time.Now().UTC().Add(10 * time.Minute)
+		fixtures := []*store.Project{
+			{
+				ID: tid("sync-oldest"), Name: "Sync Oldest", Slug: tid("sync-oldest"),
+				GitRemote: "https://github.com/acme/widgets.git", GitHubInstallationID: &instID,
+				GitHubPermissions: &store.GitHubTokenPermissions{Contents: "write", Metadata: "read"},
+				GitHubAppStatus:   &store.GitHubAppProjectStatus{State: store.GitHubAppStateOK, LastChecked: oldBase},
+				Created:           oldBase, Updated: oldBase,
+			},
+			{
+				ID: tid("sync-filler-1"), Name: "Filler 1", Slug: tid("sync-filler-1"),
+				Created: oldBase.Add(1 * time.Minute), Updated: oldBase.Add(1 * time.Minute),
+			},
+			{
+				ID: tid("sync-filler-2"), Name: "Filler 2", Slug: tid("sync-filler-2"),
+				GitRemote: "https://github.com/acme/widgets.git", GitHubInstallationID: &instID,
+				GitHubPermissions: &store.GitHubTokenPermissions{Contents: "read", Metadata: "read"},
+				Created:           oldBase.Add(2 * time.Minute), Updated: oldBase.Add(2 * time.Minute),
+			},
+			{
+				ID: tid("sync-filler-3"), Name: "Filler 3", Slug: tid("sync-filler-3"),
+				Created: oldBase.Add(3 * time.Minute), Updated: oldBase.Add(3 * time.Minute),
+			},
+			{
+				ID: tid("sync-newest"), Name: "Sync Newest", Slug: tid("sync-newest"),
+				GitRemote: "https://github.com/acme/widgets.git", GitHubInstallationID: &instID,
+				GitHubPermissions: &store.GitHubTokenPermissions{Contents: "write", Metadata: "read"},
+				GitHubAppStatus:   &store.GitHubAppProjectStatus{State: store.GitHubAppStateOK, LastChecked: oldBase},
+				Created:           newestTime, Updated: newestTime,
+			},
+		}
+		for _, p := range fixtures {
+			if err := s.CreateProject(ctx, p); err != nil {
+				t.Fatalf("CreateProject(%s): %v", p.ID, err)
+			}
+		}
+
+		fault.Arm()
+		rec := doRequest(t, srv, http.MethodPost, "/api/v1/github-app/sync-permissions", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("sync-permissions returned %d: %s", rec.Code, rec.Body.String())
+		}
+
+		var resp struct {
+			AffectedCount    int              `json:"affected_count"`
+			AffectedProjects []map[string]any `json:"affected_projects"`
+		}
+		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if resp.AffectedCount != 2 {
+			t.Fatalf("affected_count = %d, want 2 (body: %+v)", resp.AffectedCount, resp)
+		}
+
+		assertCursorPaginationCalls(t, paged.recordedCalls(), 3)
+
+		for _, id := range []string{tid("sync-newest"), tid("sync-oldest")} {
+			got, err := s.GetProject(ctx, id)
+			if err != nil {
+				t.Fatalf("GetProject(%s): %v", id, err)
+			}
+			if got.GitHubAppStatus == nil || got.GitHubAppStatus.State != store.GitHubAppStateDegraded {
+				t.Errorf("project %s status = %+v, want degraded", id, got.GitHubAppStatus)
+			}
+		}
+	})
 }

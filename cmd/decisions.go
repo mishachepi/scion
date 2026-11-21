@@ -1,0 +1,187 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package cmd
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
+	"github.com/GoogleCloudPlatform/scion/pkg/clitime"
+	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
+	"github.com/spf13/cobra"
+)
+
+const errMsgDecisionsExperimentRequired = "decisions need the web.decisions experiment"
+
+var decisionsClientFactory = func() (hubclient.Client, error) {
+	_, client, err := requireHubClient()
+	return client, err
+}
+
+// decisionsCmd is the top-level command group for decision self-service.
+var decisionsCmd = newDecisionsCmd()
+
+func newDecisionsCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "decisions",
+		Short: "List Decisions, and inspect and record an agent's Decisions",
+		Long: `List Decisions. In human mode, list the Decisions waiting on you in the
+current project (or across your projects with --all-projects), or search the
+Decisions made. In agent mode, inspect the Decisions your agent has asked and
+record interpreted answers from user replies.
+
+Commands:
+  scion decisions list [--waiting | --made] [--all-projects] [-q <text>]                         List Decisions (human mode)
+  scion decisions list [--pending | --decided | --withdrawn | --dismissed | --all] [-q <text>]   List your agent's Decisions (agent mode)
+  scion decisions show <key>                                                                     Show all versions and answers for a Decision (agent mode)
+  scion decisions record ... --from <message-id>                                                 Record interpreted answer(s) from a user reply (agent mode)
+  scion decisions withdraw <key>... [--set] [--reason <text>]                                    Withdraw obsolete open Decision(s) (agent mode)`,
+	}
+	cmd.AddCommand(
+		newDecisionsListCmd(),
+		newDecisionsShowCmd(),
+		newDecisionsRecordCmd(),
+		newDecisionsWithdrawCmd(),
+	)
+	return cmd
+}
+
+func init() {
+	rootCmd.AddCommand(decisionsCmd)
+}
+
+func decisionsWantJSON(cmd *cobra.Command) bool {
+	if isJSONOutput() {
+		return true
+	}
+	v, err := cmd.Flags().GetBool("json")
+	return err == nil && v
+}
+
+func decisionProvenanceDisplay(a *hubclient.DecisionAnswerView) string {
+	if a == nil {
+		return "-"
+	}
+	switch a.Provenance {
+	case "direct":
+		switch a.Outcome {
+		case "confirm":
+			return "confirmed"
+		case "override":
+			return "overridden"
+		case "dismiss":
+			return "dismissed"
+		default:
+			return "direct"
+		}
+	case "agent_interpreted":
+		return "interpreted"
+	default:
+		if a.Provenance != "" {
+			return safeText(a.Provenance)
+		}
+		return "-"
+	}
+}
+
+// decisionDismissedSummary renders a dismissal as one line. maxReasonRunes > 0
+// truncates the reason (the list table); 0 keeps it whole (show).
+func decisionDismissedSummary(d *hubclient.DecisionDismissedView, maxReasonRunes int) string {
+	if d == nil {
+		return "dismissed"
+	}
+	who := collapseSingleLine(d.ByName)
+	if who == "" {
+		who = "a user"
+	}
+	summary := fmt.Sprintf("dismissed by %s · %s", who, clitime.Format(d.At, clitime.Minute))
+	if r := collapseSingleLine(d.Reason); r != "" {
+		if maxReasonRunes > 0 {
+			r = truncateRunes(r, maxReasonRunes, true)
+		}
+		summary += " · " + r
+	}
+	return summary
+}
+
+func decisionAnswererDisplay(a *hubclient.DecisionAnswerView) string {
+	if a == nil {
+		return "-"
+	}
+	if a.AnsweredByName != "" {
+		return safeText(a.AnsweredByName)
+	}
+	if a.AnsweredByEmail != "" {
+		return safeText(a.AnsweredByEmail)
+	}
+	if a.AnsweredByUserID != "" {
+		return safeText(a.AnsweredByUserID)
+	}
+	return "-"
+}
+
+func collapseSingleLine(s string) string {
+	return strings.Join(strings.Fields(safeText(s)), " ")
+}
+
+func formatDecisionAPIError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var apiErr *apiclient.APIError
+	if !errors.As(err, &apiErr) {
+		return err
+	}
+	if apiErr.Code == "experiment_disabled" || (apiErr.StatusCode == http.StatusNotFound && apiErr.Code != "decision_not_found") {
+		return errors.New(errMsgDecisionsExperimentRequired)
+	}
+	if rawList, ok := apiErr.Details["failures"].([]interface{}); ok && len(rawList) > 0 {
+		var lines []string
+		for _, raw := range rawList {
+			entry, ok := raw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if line := formatWithdrawFailureEntry(entry); line != "" {
+				lines = append(lines, line)
+			}
+		}
+		if len(lines) > 0 {
+			return errors.New(strings.Join(lines, "\n"))
+		}
+	}
+	if rawList, ok := apiErr.Details["errors"].([]interface{}); ok && len(rawList) > 0 {
+		var lines []string
+		for _, raw := range rawList {
+			entry, ok := raw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if msg, ok := entry["message"].(string); ok && strings.TrimSpace(msg) != "" {
+				lines = append(lines, safeText(msg))
+			}
+		}
+		if len(lines) > 0 {
+			return errors.New(strings.Join(lines, "\n"))
+		}
+	}
+	if strings.TrimSpace(apiErr.Message) != "" {
+		return errors.New(safeText(apiErr.Message))
+	}
+	return err
+}

@@ -510,10 +510,34 @@ func runDoctor() error {
 				opts.Namespace = rtConfig.Namespace
 				opts.GKEMode = rtConfig.GKE
 			}
+			var srv *config.V1ServerConfig
+			if gs, _, gErr := config.LoadGlobalSettingsWithOverlay(); gErr == nil && gs != nil {
+				srv = gs.Server
+				opts.CreateServiceAccounts = doctorCreateServiceAccounts(vs, gs, profile)
+			}
+			opts.SharedDirStorageClass, opts.SharedDirStorageShared = doctorSharedDirStorage(vs, srv, profile)
+			opts.Server = srv
 		}
 	}
 	r.runtimeSection(rt.Name(), diag, opts)
 	return r.finish()
+}
+
+// doctorCreateServiceAccounts reports whether the active profile's runtime
+// entry sets create_service_accounts in the broker's global settings (with DB
+// overlay), never from a project's own settings.yaml.
+func doctorCreateServiceAccounts(vs, gs *config.VersionedSettings, profileName string) bool {
+	if vs == nil || gs == nil {
+		return false
+	}
+	if profileName == "" {
+		profileName = vs.ActiveProfile
+	}
+	p, ok := vs.Profiles[profileName]
+	if !ok || p.Runtime == "" {
+		return false
+	}
+	return gs.Runtimes[p.Runtime].CreateServiceAccounts
 }
 
 // hubChecks runs the Hub checks (D1-D4, D9) and reads the health summary
@@ -677,6 +701,28 @@ func (r *doctorReport) localSettingsChecks() {
 	// D12: inotify limits (local check, read-only): the per-user limits
 	// that a Docker or Podman broker's agents share, and their current use.
 	r.add(&r.HubChecks, checkDoctorInotifyLimitsHere())
+
+	// D13: flat instance placement pre-upgrade scan (local check,
+	// read-only, counts only). Reported only on a host with flat instances.
+	if d13, ok := checkDoctorFlatPlacementPreflightHere(); ok {
+		r.add(&r.HubChecks, d13)
+	}
+	// D14: legacy placement pre-upgrade scan (local check, read-only,
+	// counts only). Reported on every host without flat instances.
+	if d14, ok := checkDoctorLegacyPlacementPreflightHere(); ok {
+		r.add(&r.HubChecks, d14)
+	}
+	// D15: flat Cloud Run instance diagnostics (local check, read-only):
+	// checks each flat cloudrun instance's credentials_file, API
+	// reachability, and iam.serviceAccounts.actAs across all configured
+	// agent service accounts using the instance's credentials.
+	var doctorServerCfg *config.V1ServerConfig
+	if nfsErr == nil && nfsSettings != nil {
+		doctorServerCfg = nfsSettings.Server
+	}
+	for _, c := range checkDoctorFlatCloudRunInstancesHere(doctorServerCfg) {
+		r.add(&r.HubChecks, c)
+	}
 
 	// D6: Telemetry Pipeline (local check)
 	r.add(&r.HubChecks, checkDoctorTelemetry())

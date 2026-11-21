@@ -18,6 +18,7 @@ package hub
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"testing"
 	"time"
@@ -155,6 +156,7 @@ type mockRuntimeBrokerClient struct {
 	lastMessage                string
 	lastInterrupt              bool
 	lastResolvedEnv            map[string]string
+	lastStartResolvedSecrets   []ResolvedSecret
 	lastRestartResolvedEnv     map[string]string
 	lastStartExtras            StartExtras
 	lastRestartExtras          StartExtras
@@ -249,8 +251,6 @@ func setupFinalizeEnvTest(t *testing.T, ctx context.Context, memStore store.Stor
 	}
 }
 
-func intPtr(i int) *int { return &i }
-
 func (m *mockKeysBrokerClient) ExecuteKeys(ctx context.Context, brokerID, brokerEndpoint, agentSlug string, req agentkeys.BrokerRequest) (agentkeys.BrokerResult, error) {
 	m.calls++
 	m.lastBrokerID = brokerID
@@ -303,6 +303,21 @@ func (m *mockGitTokenSecretBackend) Resolve(_ context.Context, _, _, _ string, _
 
 func (m *mockGitTokenSecretBackend) HubID() string { return "test-hub" }
 
+// HoldPending, ReadPending and DropPending satisfy secret.PendingHolder; the
+// fake holds no pending values.
+func (m *mockGitTokenSecretBackend) HoldPending(context.Context, string, []byte) (string, error) {
+	return "", errors.New("pending secrets are not supported by this test backend")
+}
+
+func (m *mockGitTokenSecretBackend) ReadPending(context.Context, string) ([]byte, error) {
+	return nil, errors.New("pending secrets are not supported by this test backend")
+}
+
+func (m *mockGitTokenSecretBackend) DropPending(context.Context, string) error { return nil }
+func (m *mockGitTokenSecretBackend) ListHeldPending(context.Context) ([]secret.HeldPendingValue, error) {
+	return nil, nil
+}
+
 func (m *mockGitTokenSecretBackend) FetchValues(_ context.Context, metas []secret.SecretMeta) (map[string]secret.FetchResult, error) {
 	results := make(map[string]secret.FetchResult, len(metas))
 	for _, meta := range metas {
@@ -347,6 +362,7 @@ func (m *mockRuntimeBrokerClient) StartAgent(ctx context.Context, brokerID, brok
 	m.lastProjectPath = projectPath
 	m.lastProjectSlug = projectSlug
 	m.lastResolvedEnv = resolvedEnv
+	m.lastStartResolvedSecrets = resolvedSecrets
 	m.lastInlineConfig = inlineConfig
 	m.lastStartExtras = extras
 	m.startCallCount++
@@ -502,6 +518,21 @@ func (m *mockSecretBackend) Resolve(ctx context.Context, userID, projectID, brok
 	return m.secrets, nil
 }
 func (m *mockSecretBackend) HubID() string { return "test-hub" }
+
+// HoldPending, ReadPending and DropPending satisfy secret.PendingHolder; the
+// fake holds no pending values.
+func (m *mockSecretBackend) HoldPending(context.Context, string, []byte) (string, error) {
+	return "", errors.New("pending secrets are not supported by this test backend")
+}
+
+func (m *mockSecretBackend) ReadPending(context.Context, string) ([]byte, error) {
+	return nil, errors.New("pending secrets are not supported by this test backend")
+}
+
+func (m *mockSecretBackend) DropPending(context.Context, string) error { return nil }
+func (m *mockSecretBackend) ListHeldPending(context.Context) ([]secret.HeldPendingValue, error) {
+	return nil, nil
+}
 func (m *mockSecretBackend) FetchValues(ctx context.Context, metas []secret.SecretMeta) (map[string]secret.FetchResult, error) {
 	results := make(map[string]secret.FetchResult, len(metas))
 	for _, meta := range metas {

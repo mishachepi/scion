@@ -27,6 +27,7 @@ import (
 
 	"log/slog"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/hubfire"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
@@ -370,9 +371,9 @@ func TestOneShotTimerFiresAtCorrectTime(t *testing.T) {
 	t.Parallel()
 	ms := newMockStore()
 	s := newTestSchedulerWithStore(1*time.Second, ms)
-	s.RegisterEventHandler("message", func(_ context.Context, _ store.ScheduledEvent) error {
+	s.RegisterAction(newTestFireAction("message", func(_ context.Context, _ hubfire.FireRequest) error {
 		return nil
-	})
+	}))
 
 	var fired atomic.Int32
 
@@ -465,9 +466,9 @@ func TestOneShotExpiredTimerFiresImmediately(t *testing.T) {
 	_ = ms.CreateScheduledEvent(ctx, &evt)
 
 	s := newTestSchedulerWithStore(1*time.Second, ms)
-	s.RegisterEventHandler("message", func(_ context.Context, _ store.ScheduledEvent) error {
+	s.RegisterAction(newTestFireAction("message", func(_ context.Context, _ hubfire.FireRequest) error {
 		return nil
-	})
+	}))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -636,9 +637,9 @@ func TestOneShotHandlerPanicRecovery(t *testing.T) {
 	t.Parallel()
 	ms := newMockStore()
 	s := newTestSchedulerWithStore(1*time.Second, ms)
-	s.RegisterEventHandler("message", func(_ context.Context, _ store.ScheduledEvent) error {
+	s.RegisterAction(newTestFireAction("message", func(_ context.Context, _ hubfire.FireRequest) error {
 		return nil
-	})
+	}))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -737,13 +738,13 @@ func TestRegisterEventHandlerAndDispatch(t *testing.T) {
 	var receivedPayload string
 	var mu sync.Mutex
 
-	s.RegisterEventHandler("message", func(_ context.Context, evt store.ScheduledEvent) error {
+	s.RegisterAction(newTestFireAction("message", func(_ context.Context, req hubfire.FireRequest) error {
 		handlerCalled.Add(1)
 		mu.Lock()
-		receivedPayload = evt.Payload
+		receivedPayload = req.Payload
 		mu.Unlock()
 		return nil
-	})
+	}))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -783,9 +784,9 @@ func TestEventHandlerErrorIsCaptured(t *testing.T) {
 	ms := newMockStore()
 	s := newTestSchedulerWithStore(1*time.Second, ms)
 
-	s.RegisterEventHandler("message", func(_ context.Context, _ store.ScheduledEvent) error {
+	s.RegisterAction(newTestFireAction("message", func(_ context.Context, _ hubfire.FireRequest) error {
 		return fmt.Errorf("handler failed: something went wrong")
-	})
+	}))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -852,10 +853,10 @@ func TestScheduleEventWithCancelledCallerContext(t *testing.T) {
 	s := newTestSchedulerWithStore(1*time.Second, ms)
 
 	var handlerCalled atomic.Int32
-	s.RegisterEventHandler("message", func(_ context.Context, evt store.ScheduledEvent) error {
+	s.RegisterAction(newTestFireAction("message", func(_ context.Context, _ hubfire.FireRequest) error {
 		handlerCalled.Add(1)
 		return nil
-	})
+	}))
 
 	// Start the scheduler with a long-lived context (simulates server lifetime)
 	serverCtx, serverCancel := context.WithCancel(context.Background())
@@ -932,10 +933,10 @@ func TestExpiredEventsFromDowntimeStillFire(t *testing.T) {
 	}
 
 	s := newTestSchedulerWithStore(1*time.Second, ms)
-	s.RegisterEventHandler("message", func(_ context.Context, _ store.ScheduledEvent) error {
+	s.RegisterAction(newTestFireAction("message", func(_ context.Context, _ hubfire.FireRequest) error {
 		fired.Add(1)
 		return nil
-	})
+	}))
 
 	serverCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1021,7 +1022,9 @@ func TestMessageEventHandler_AgentNotFound(t *testing.T) {
 
 	// Create a Server with the mock store — no agents registered
 	srv := newEventHandlerTestServer(ms)
-	handler := srv.messageEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "message", evt)
+	}
 
 	err := handler(ctx, evt)
 	if err == nil {
@@ -1050,7 +1053,9 @@ func TestMessageEventHandler_AgentNotFoundByID(t *testing.T) {
 	_ = ms.CreateScheduledEvent(ctx, &evt)
 
 	srv := newEventHandlerTestServer(ms)
-	handler := srv.messageEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "message", evt)
+	}
 
 	err := handler(ctx, evt)
 	if err == nil {
@@ -1070,14 +1075,14 @@ func TestMultipleEventHandlers(t *testing.T) {
 
 	var messageCalled, statusCalled atomic.Int32
 
-	s.RegisterEventHandler("message", func(_ context.Context, _ store.ScheduledEvent) error {
+	s.RegisterAction(newTestFireAction("message", func(_ context.Context, _ hubfire.FireRequest) error {
 		messageCalled.Add(1)
 		return nil
-	})
-	s.RegisterEventHandler("status_update", func(_ context.Context, _ store.ScheduledEvent) error {
+	}))
+	s.RegisterAction(newTestFireAction("status_update", func(_ context.Context, _ hubfire.FireRequest) error {
 		statusCalled.Add(1)
 		return nil
-	})
+	}))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1118,7 +1123,9 @@ func TestDispatchAgentEventHandler_InvalidPayload(t *testing.T) {
 	t.Parallel()
 	ms := newMockStore()
 	srv := newEventHandlerTestServer(ms)
-	handler := srv.dispatchAgentEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "dispatch_agent", evt)
+	}
 
 	ctx := context.Background()
 	evt := store.ScheduledEvent{
@@ -1141,7 +1148,9 @@ func TestDispatchAgentEventHandler_MissingAgentName(t *testing.T) {
 	t.Parallel()
 	ms := newMockStore()
 	srv := newEventHandlerTestServer(ms)
-	handler := srv.dispatchAgentEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "dispatch_agent", evt)
+	}
 
 	ctx := context.Background()
 	evt := store.ScheduledEvent{
@@ -1165,7 +1174,9 @@ func TestDispatchAgentEventHandler_ProjectNotFound(t *testing.T) {
 	ms := newMockStore()
 	creatorID := seedFullRoleDispatchCreator(ms, "nonexistent-project")
 	srv := newEventHandlerTestServer(ms)
-	handler := srv.dispatchAgentEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "dispatch_agent", evt)
+	}
 
 	ctx := context.Background()
 	evt := withMockAgentRevision(store.ScheduledEvent{
@@ -1204,7 +1215,9 @@ func TestDispatchAgentEventHandler_AgentAlreadyExists(t *testing.T) {
 	}
 
 	srv := newEventHandlerTestServer(ms)
-	handler := srv.dispatchAgentEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "dispatch_agent", evt)
+	}
 
 	ctx := context.Background()
 	evt := withMockAgentRevision(store.ScheduledEvent{
@@ -1275,7 +1288,7 @@ func newBlockedFireFixture(t *testing.T, createdBy string) *blockedFireFixture {
 }
 
 func (f *blockedFireFixture) fire() error {
-	return f.srv.dispatchAgentEventHandler()(context.Background(), f.evt)
+	return fireScheduledActionForTest(context.Background(), f.srv, "dispatch_agent", f.evt)
 }
 
 // published drains every event published so far.
@@ -1316,6 +1329,11 @@ func TestDispatchAgentEventHandler_ErroredRowBlocksAndNotifiesOwner(t *testing.T
 	}
 	if n.Status != NotificationScheduleBlocked || n.AgentID != "errored-1" || n.ProjectID != "project-1" {
 		t.Errorf("notification = %+v", n)
+	}
+	// The writer names the real agent and sets no kind or resource
+	// (ptone/scion#5145): GC keys on AgentID, never on Kind.
+	if n.Kind != "" || n.ResourceType != "" || n.ResourceID != "" {
+		t.Errorf("schedule-blocked notification kind/resource = %q/%q/%q, want empty", n.Kind, n.ResourceType, n.ResourceID)
 	}
 	if !strings.Contains(n.Message, `Schedule "nightly" is blocked`) || !strings.Contains(n.Message, "Delete the agent to resume this schedule") {
 		t.Errorf("notification message = %q", n.Message)
@@ -1455,7 +1473,9 @@ func TestDispatchAgentEventHandler_CreatesAgentNoDispatcher(t *testing.T) {
 	seedFullRoleDispatchCreator(ms, "project-1")
 
 	srv := newEventHandlerTestServer(ms)
-	handler := srv.dispatchAgentEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "dispatch_agent", evt)
+	}
 
 	ctx := context.Background()
 	evt := withMockAgentRevision(store.ScheduledEvent{
@@ -1483,8 +1503,14 @@ func TestDispatchAgentEventHandler_CreatesAgentNoDispatcher(t *testing.T) {
 			if a.AppliedConfig == nil || a.AppliedConfig.Task != "Do the thing" {
 				t.Errorf("expected task 'Do the thing' in applied config")
 			}
-			if a.AppliedConfig.AgentRole != string(AgentRoleNone) {
-				t.Errorf("expected scheduled agent role %q, got %q", AgentRoleNone, a.AppliedConfig.AgentRole)
+			if a.AppliedConfig.AgentRole != string(AgentRoleFull) {
+				t.Errorf("expected scheduled agent role %q, got %q", AgentRoleFull, a.AppliedConfig.AgentRole)
+			}
+			if a.AppliedConfig.NoAuth {
+				t.Errorf("expected default scheduled agent NoAuth=false, got true")
+			}
+			if a.OwnerID != "creator-agent" {
+				t.Errorf("expected scheduled agent OwnerID %q, got %q", "creator-agent", a.OwnerID)
 			}
 			break
 		}
@@ -1505,7 +1531,9 @@ func TestDispatchAgentEventHandler_FireRequiresAgentCreateScope(t *testing.T) {
 	}
 
 	srv := newEventHandlerTestServer(ms)
-	handler := srv.dispatchAgentEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "dispatch_agent", evt)
+	}
 
 	err := handler(context.Background(), withMockAgentRevision(store.ScheduledEvent{
 		ID:        "dispatch-readonly-creator",
@@ -1528,6 +1556,7 @@ func TestDispatchAgentEventHandler_FireRequiresAgentCreateScope(t *testing.T) {
 func TestAuthorizeScheduledAgentCreate_UserSuccessReturnsAllowed(t *testing.T) {
 	t.Parallel()
 	ms := newMockStore()
+	ms.projects["project-1"] = &store.Project{ID: "project-1", Name: "test-project"}
 	ms.users["admin-user"] = &store.User{
 		ID:          "admin-user",
 		Email:       "admin@example.com",
@@ -1557,7 +1586,7 @@ func TestAuthorizeScheduledAgentCreate_UserSuccessReturnsAllowed(t *testing.T) {
 	srv := newEventHandlerTestServer(ms)
 	srv.authzService = NewAuthzService(ms, slog.Default())
 
-	allowed, err := srv.authorizeScheduledAgentCreate(context.Background(), withSessionRevision(store.ScheduledEvent{
+	allowed, err := authorizeDispatchAgentForTest(context.Background(), srv, withSessionRevision(store.ScheduledEvent{
 		ID:        "dispatch-admin-user",
 		ProjectID: "project-1",
 		EventType: "dispatch_agent",
@@ -1585,7 +1614,9 @@ func TestDispatchAgentEventHandler_SuspendedUserCreatorDenied(t *testing.T) {
 
 	srv := newEventHandlerTestServer(ms)
 	srv.authzService = NewAuthzService(ms, slog.Default())
-	handler := srv.dispatchAgentEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "dispatch_agent", evt)
+	}
 
 	err := handler(context.Background(), withSessionRevision(store.ScheduledEvent{
 		ID:        "dispatch-suspended-user",
@@ -1611,7 +1642,9 @@ func TestDispatchAgentEventHandler_EmptyCreatorDenied(t *testing.T) {
 	ms.projects["project-1"] = &store.Project{ID: "project-1", Name: "test-project"}
 
 	srv := newEventHandlerTestServer(ms)
-	handler := srv.dispatchAgentEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "dispatch_agent", evt)
+	}
 
 	err := handler(context.Background(), store.ScheduledEvent{
 		ID:        "dispatch-empty-creator",
@@ -1654,7 +1687,9 @@ func TestDispatchAgentEventHandler_ResolvableTemplateDoesNotPanic(t *testing.T) 
 	creatorID := seedFullRoleDispatchCreator(ms, "project-1")
 
 	srv := newEventHandlerTestServer(&resolvingTemplateStore{ms})
-	handler := srv.dispatchAgentEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "dispatch_agent", evt)
+	}
 
 	evt := withMockAgentRevision(store.ScheduledEvent{
 		ID:        "dispatch-resolvable-1",
@@ -2374,7 +2409,7 @@ func TestDispatchAgentEventHandler_AgentCreatorSetsCreatorName(t *testing.T) {
 	ms.agents["creator-agent"].Name = "lead-agent"
 
 	srv := newEventHandlerTestServer(ms)
-	if err := srv.dispatchAgentEventHandler()(context.Background(), withMockAgentRevision(store.ScheduledEvent{
+	if err := fireScheduledActionForTest(context.Background(), srv, "dispatch_agent", withMockAgentRevision(store.ScheduledEvent{
 		ID:        "dispatch-creator-name",
 		ProjectID: "project-1",
 		EventType: "dispatch_agent",

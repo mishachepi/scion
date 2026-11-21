@@ -53,6 +53,8 @@ var layer1RoundTripSamples = map[string]string{
 	// lifecycle
 	"server.hub.auto_suspend_stalled":          `true`,
 	"server.hub.stalled_threshold":             `"10m"`,
+	"server.hub.auto_suspend_idle":             `true`,
+	"server.hub.idle_suspend_after":            `"20m"`,
 	"server.hub.soft_delete_retention":         `"720h"`,
 	"server.hub.soft_delete_retain_files":      `true`,
 	"server.hub.start_claim_lease_ttl":         `"60s"`,
@@ -104,6 +106,53 @@ var layer1RoundTripSamples = map[string]string{
 	// hub_observability
 	"server.hub.observability.metrics_enabled": `true`,
 	"server.hub.observability.tracing_enabled": `false`,
+	// branding (deep-merged)
+	"server.hub.branding.name":                         `"Acme Cloud"`,
+	"server.hub.branding.short_name":                   `"Acme"`,
+	"server.hub.branding.subtitle":                     `"Engineering Platform"`,
+	"server.hub.branding.attribution":                  `"hidden"`,
+	"server.hub.branding.logo":                         `{"light":"https://cdn.example.com/logo.svg"}`,
+	"server.hub.branding.logo.light":                   `"https://cdn.example.com/logo-light.svg"`,
+	"server.hub.branding.logo.dark":                    `"https://cdn.example.com/logo-dark.svg"`,
+	"server.hub.branding.icons":                        `{"favicon":"https://cdn.example.com/favicon.svg"}`,
+	"server.hub.branding.icons.favicon":                `"https://cdn.example.com/favicon.svg"`,
+	"server.hub.branding.icons.apple_touch_icon":       `"https://cdn.example.com/apple.png"`,
+	"server.hub.branding.icons.icon_192":               `"https://cdn.example.com/192.png"`,
+	"server.hub.branding.icons.icon_512":               `"https://cdn.example.com/512.png"`,
+	"server.hub.branding.icons.icon_maskable_512":      `"https://cdn.example.com/maskable.png"`,
+	"server.hub.branding.accent_color":                 `"#0d9488"`,
+	"server.hub.branding.palette":                      `{"primary":{"600":"#0f766e"}}`,
+	"server.hub.branding.palette.primary":              `{"600":"#0f766e"}`,
+	"server.hub.branding.palette.neutral":              `{"900":"#111827"}`,
+	"server.hub.branding.palette.success":              `{"600":"#15803d"}`,
+	"server.hub.branding.palette.warning":              `{"600":"#b45309"}`,
+	"server.hub.branding.palette.danger":               `{"600":"#b91c1c"}`,
+	"server.hub.branding.palette.light":                `{"primary":"#0f766e"}`,
+	"server.hub.branding.palette.light.bg":             `"#fafaf9"`,
+	"server.hub.branding.palette.light.bg_subtle":      `"#ffffff"`,
+	"server.hub.branding.palette.light.surface":        `"#fafaf9"`,
+	"server.hub.branding.palette.light.surface_raised": `"#fafaf9"`,
+	"server.hub.branding.palette.light.text":           `"#111827"`,
+	"server.hub.branding.palette.light.text_secondary": `"#334155"`,
+	"server.hub.branding.palette.light.text_muted":     `"#475569"`,
+	"server.hub.branding.palette.light.border":         `"#cbd5e1"`,
+	"server.hub.branding.palette.light.primary":        `"#0f766e"`,
+	"server.hub.branding.palette.light.primary_hover":  `"#115e59"`,
+	"server.hub.branding.palette.light.primary_active": `"#134e4a"`,
+	"server.hub.branding.palette.light.primary_text":   `"#f8fafc"`,
+	"server.hub.branding.palette.dark":                 `{"primary":"#2dd4bf"}`,
+	"server.hub.branding.palette.dark.bg":              `"#020617"`,
+	"server.hub.branding.palette.dark.bg_subtle":       `"#0f172a"`,
+	"server.hub.branding.palette.dark.surface":         `"#0f172a"`,
+	"server.hub.branding.palette.dark.surface_raised":  `"#1e293b"`,
+	"server.hub.branding.palette.dark.text":            `"#ffffff"`,
+	"server.hub.branding.palette.dark.text_secondary":  `"#e2e8f0"`,
+	"server.hub.branding.palette.dark.text_muted":      `"#cbd5e1"`,
+	"server.hub.branding.palette.dark.border":          `"#475569"`,
+	"server.hub.branding.palette.dark.primary":         `"#2dd4bf"`,
+	"server.hub.branding.palette.dark.primary_hover":   `"#5eead4"`,
+	"server.hub.branding.palette.dark.primary_active":  `"#99f6e4"`,
+	"server.hub.branding.palette.dark.primary_text":    `"#020617"`,
 	// agent_defaults
 	"default_template":                        `"tmpl-a"`,
 	"default_harness_config":                  `"hc-a"`,
@@ -118,16 +167,20 @@ var layer1RoundTripSamples = map[string]string{
 	"default_gcp_identity_mode":               `"block"`,
 	"default_gcp_identity_service_account_id": `"sa-1"`,
 	// endpoints
-	"server.hub.public_url":               `"https://hub.example.com"`,
-	"server.hub.hub_name":                 `"hub-a"`,
-	"image_registry":                      `"registry.example.com/scion"`,
-	"server.hub.monitoring_dashboard_url": `"https://dash.example.com/d/hub"`,
+	"server.hub.public_url":                  `"https://hub.example.com"`,
+	"server.hub.hub_name":                    `"hub-a"`,
+	"server.hub.content_url":                 `"https://content.example.net"`,
+	"server.hub.content_url_allow_same_site": `true`,
+	"image_registry":                         `"registry.example.com/scion"`,
+	"server.hub.monitoring_dashboard_url":    `"https://dash.example.com/d/hub"`,
 	// github_app
-	"server.github_app.app_id":           `12345`,
-	"server.github_app.api_base_url":     `"https://api.github.com"`,
-	"server.github_app.webhooks_enabled": `true`,
-	"server.github_app.installation_url": `"https://github.com/apps/scion/installations/new"`,
-	"server.github_app.private_key_path": `"/etc/scion/gh.pem"`,
+	"server.github_app.app_id":                  `12345`,
+	"server.github_app.api_base_url":            `"https://api.github.com"`,
+	"server.github_app.webhooks_enabled":        `true`,
+	"server.github_app.installation_url":        `"https://github.com/apps/scion/installations/new"`,
+	"server.github_app.private_key_path":        `"/etc/scion/gh.pem"`,
+	"server.github_app.app_slug":                `"scion-enterprise"`,
+	"server.github_app.command_mention_aliases": `["scion","scion-bot"]`,
 	// notifications
 	"server.notification_channels": `[{"type":"slack","params":{"channel":"#ops"}}]`,
 	// project_defaults (PUT /api/v1/admin/project-defaults)
@@ -150,6 +203,7 @@ var layer1RoundTripExempt = map[string]string{
 	"default_max_agent_role": "read-only through server-config: accepted only as an unchanged echo of GET (dbUnwrittenLayer1Paths)",
 	"default_agent_role":     "read-only through server-config: accepted only as an unchanged echo of GET (dbUnwrittenLayer1Paths)",
 	"server.github_app":      "the whole github_app object; each of its fields is covered on its own, and a null object is not a clear (as for telemetry)",
+	"server.hub.branding":    "the whole branding object; each of its fields is covered on its own",
 	"server.hub.gcp_iam_check_mode": "gcp_iam is built by buildGCPIAMDoc: a sent key must carry a recognised value (validateGCPIAMRequest), so it has no explicit clear, " +
 		"and changes are audited; covered by gcp_iam_settings_test.go",
 	"server.hub.gcp_iam_deny_unknown_policy": "gcp_iam is built by buildGCPIAMDoc: a sent key must carry a recognised value (validateGCPIAMRequest), so it has no explicit clear, " +
@@ -211,6 +265,8 @@ func layer1FieldFor(t *testing.T, section, koanf string) layer1Field {
 		return f
 	case section == "telemetry":
 		f.docPath = strings.Split(strings.TrimPrefix(koanf, "telemetry."), ".")
+	case section == opsettings.BrandingSectionName:
+		f.docPath = strings.Split(strings.TrimPrefix(koanf, config.BrandingSectionKey+"."), ".")
 	default:
 		for _, key := range sectionJSONKeys(section) {
 			if sectionKeyKoanfPath(section, key) == koanf {
@@ -339,15 +395,19 @@ func TestPutServerConfigDB_Layer1RoundTrip(t *testing.T) {
 			t.Run(koanf, func(t *testing.T) {
 				t.Setenv("HOME", t.TempDir())
 				f := layer1FieldFor(t, sec.Name, koanf)
-				// Clearing a saved public URL is recorded before it is
-				// written, and not made without the record
-				// (ptone/scion#3905), so that save needs an audit store.
+				// A change to the saved public URL or to the content URL in
+				// effect is recorded before it is written, and not made
+				// without the record (ptone/scion#3905, ptone/scion#7107),
+				// so an endpoints save needs an audit store. Every endpoints
+				// key gets one: the omit body of a sibling key can send the
+				// content URL sample, which is such a change.
 				var audit *settingsAuditStore
 				var st store.Store
-				if koanf == config.PublicURLKey {
+				if sec.Name == "endpoints" {
 					audit = &settingsAuditStore{}
 					st = audit
 				}
+				auditedURL := koanf == config.PublicURLKey || koanf == config.ContentURLKey
 				srv, fake, ops := newTestDBServerWithStore(t, st)
 
 				seed := sample
@@ -398,9 +458,9 @@ func TestPutServerConfigDB_Layer1RoundTrip(t *testing.T) {
 					_, ok = valueAtPath(doc, pf.docPath)
 					assert.False(t, ok, "an explicit null must clear %s with %s; row %s", partner, koanf, row.Value)
 				}
-				if audit != nil {
+				if auditedURL {
 					recs := audit.records()
-					require.Len(t, recs, 1, "only the clear changes the stored public URL")
+					require.Len(t, recs, 1, "only the clear changes the stored %s", koanf)
 					assert.Equal(t, want, recs[0].BeforeSummary)
 					assert.Empty(t, recs[0].AfterSummary)
 				}
@@ -415,6 +475,37 @@ func TestPutServerConfigDB_Layer1RoundTrip(t *testing.T) {
 	}
 	for k, partner := range layer1RoundTripPairs {
 		assert.True(t, covered[k] && covered[partner], "layer1RoundTripPairs has %s / %s, which is not a registry key pair", k, partner)
+	}
+}
+
+// TestPutServerConfigDB_EndpointURLNeedsAuditStore: on a hub with no store
+// for the audit record, an endpoints save that changes the public URL or
+// the content URL in effect is refused with 500, writes nothing and applies
+// nothing. Neither change is made without its record (ptone/scion#3905,
+// ptone/scion#7107); the round trip above gives every endpoints save a
+// store, so this is where the refusal itself is checked.
+func TestPutServerConfigDB_EndpointURLNeedsAuditStore(t *testing.T) {
+	for _, tc := range []struct {
+		key, body string
+	}{
+		{config.PublicURLKey, `{"server":{"hub":{"public_url":"https://hub.example.com"}}}`},
+		{config.ContentURLKey, `{"server":{"hub":{"content_url":"https://content.example.net"}}}`},
+		{config.ContentURLAllowSameSiteKey, `{"server":{"hub":{"content_url_allow_same_site":true}}}`},
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			srv, fake, ops := newTestDBServerWithStore(t, nil)
+			ops.server = srv // a save that went through would apply at once
+			rr := putLayer1(t, srv, ops, "endpoints", tc.body)
+			require.Equal(t, http.StatusInternalServerError, rr.Code, rr.Body.String())
+			assert.Contains(t, rr.Body.String(), `Failed to update section \"endpoints\"`)
+			assert.Nil(t, storedRow(fake, "endpoints"), "the save was written without its audit record")
+			snap := ops.Snapshot()
+			assert.Empty(t, snap.PublicURL, "the public URL was applied")
+			assert.Empty(t, snap.ContentURL, "the content URL was applied")
+			assert.False(t, snap.ContentURLAllowSameSite, "the same-site override was applied")
+			assert.Empty(t, srv.HubEndpoints().Content, "the content URL in effect changed")
+		})
 	}
 }
 
@@ -496,6 +587,7 @@ func TestPutServerConfigDB_MergedSections_ConcurrentWrite409(t *testing.T) {
 		{"quotas", `{"enforce_broker_quotas":true}`, `{"enforce_broker_quotas":false}`, `{"quotas": {"enforce_broker_quotas": null}}`},
 		{"agent_secrets", `{"user_scope_only":true}`, `{"user_scope_only":false}`, `{"agent_secrets": {"user_scope_only": null}}`},
 		{"hub_observability", `{"metrics_enabled":true}`, `{"metrics_enabled":false}`, `{"server": {"hub": {"observability": {"metrics_enabled": null}}}}`},
+		{"branding", `{"name":"Acme"}`, `{"name":"Other"}`, `{"server": {"hub": {"branding": {"subtitle": "Platform"}}}}`},
 		{"notifications", `{"notification_channels":[{"type":"slack","params":{"channel":"#a"}}]}`, `{"notification_channels":[{"type":"slack","params":{"channel":"#b"}}]}`, `{"server": {"notification_channels": []}}`},
 		{"project_defaults", `{"default_scratchpad":true}`, `{"default_scratchpad":false}`, `{"default_scratchpad": null}`},
 	} {
@@ -823,7 +915,10 @@ func TestPutServerConfigDB_TelemetryMaskedHeaderNoOpMembers(t *testing.T) {
 		{"empty nested object over a stored one", `{"telemetry":{"cloud":{"tls":{},"headers":{"x-api-key":"********"}}}}`, http.StatusOK},
 		{"null nested object over a stored one", `{"telemetry":{"cloud":{"tls":null,"headers":{"x-api-key":"********"}}}}`, http.StatusBadRequest},
 		{"empty string over a shown endpoint", `{"telemetry":{"cloud":{"endpoint":"","headers":{"x-api-key":"********"}}}}`, http.StatusBadRequest},
-		{"false for a member GET omitted", `{"telemetry":{"cloud":{"cloud_logging":false,"headers":{"x-api-key":"********"}}}}`, http.StatusBadRequest},
+		// cloud_logging false where GET shows none is an echo: it is
+		// dropped before the masked-header check (ptone/scion#5664).
+		{"cloud_logging false for a member GET omitted", `{"telemetry":{"cloud":{"cloud_logging":false,"headers":{"x-api-key":"********"}}}}`, http.StatusOK},
+		{"cloud_logging true for a member GET omitted", `{"telemetry":{"cloud":{"cloud_logging":true,"headers":{"x-api-key":"********"}}}}`, http.StatusUnprocessableEntity},
 		{"case-variant nested clear", `{"telemetry":{"cloud":{"tls":{"CA_FILE":""},"headers":{"x-api-key":"********"}}}}`, http.StatusBadRequest},
 		{"case-variant nested null", `{"telemetry":{"cloud":{"tls":{"Enabled":null},"headers":{"x-api-key":"********"}}}}`, http.StatusBadRequest},
 		{"case-variant nested no-op", `{"telemetry":{"cloud":{"TLS":{"Ca_File":"/etc/ca.pem"},"headers":{"x-api-key":"********"}}}}`, http.StatusOK},

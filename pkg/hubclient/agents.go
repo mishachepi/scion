@@ -154,14 +154,14 @@ type agentService struct {
 
 func (s *agentService) agentPath(agentID string) string {
 	if s.projectID != "" {
-		return "/api/v1/projects/" + s.projectID + "/agents/" + agentID
+		return "/api/v1/projects/" + url.PathEscape(s.projectID) + "/agents/" + url.PathEscape(agentID)
 	}
-	return "/api/v1/agents/" + agentID
+	return "/api/v1/agents/" + url.PathEscape(agentID)
 }
 
 func (s *agentService) agentsPath() string {
 	if s.projectID != "" {
-		return "/api/v1/projects/" + s.projectID + "/agents"
+		return "/api/v1/projects/" + url.PathEscape(s.projectID) + "/agents"
 	}
 	return "/api/v1/agents"
 }
@@ -197,6 +197,15 @@ type ListAgentsOptions struct {
 	// all its descendants. Used by CLI --lineage.
 	LineageRootID string
 
+	// IncludeAuthority asks the Hub to include each agent's authority
+	// state (include=authority). It costs the Hub a delegation chain walk
+	// per listed agent.
+	IncludeAuthority bool
+
+	// IncludeCapabilities asks the Hub to include each agent's
+	// resolvedHarness and harnessCapabilities (include=capabilities).
+	IncludeCapabilities bool
+
 	Page apiclient.PageOptions
 }
 
@@ -229,23 +238,27 @@ type StopAllResponse struct {
 
 // CreateAgentRequest is the request body for creating an agent.
 type CreateAgentRequest struct {
-	Name            string            `json:"name"`
-	ProjectID       string            `json:"projectId"`
-	Template        string            `json:"template,omitempty"`
-	HarnessConfig   string            `json:"harnessConfig,omitempty"` // Explicit harness config name (used during sync when template may not be on Hub)
-	HarnessAuth     string            `json:"harnessAuth,omitempty"`   // Late-binding override for auth_selected_type
-	RuntimeBrokerID string            `json:"runtimeBrokerId,omitempty"`
-	Profile         string            `json:"profile,omitempty"`
-	Task            string            `json:"task,omitempty"`
-	Branch          string            `json:"branch,omitempty"`
-	Workspace       string            `json:"workspace,omitempty"`
-	Labels          map[string]string `json:"labels,omitempty"`
-	Annotations     map[string]string `json:"annotations,omitempty"`
-	Config          *api.ScionConfig  `json:"config,omitempty"`
-	Resume          bool              `json:"resume,omitempty"`
-	ForceResume     bool              `json:"forceResume,omitempty"`
-	Attach          bool              `json:"attach,omitempty"`        // If true, signals interactive attach mode to the broker/harness
-	ProvisionOnly   bool              `json:"provisionOnly,omitempty"` // If true, provision only (write task to prompt.md) without starting
+	Name            string `json:"name"`
+	ProjectID       string `json:"projectId"`
+	Template        string `json:"template,omitempty"`
+	HarnessConfig   string `json:"harnessConfig,omitempty"` // Explicit harness config name (used during sync when template may not be on Hub)
+	HarnessAuth     string `json:"harnessAuth,omitempty"`   // Late-binding override for auth_selected_type
+	RuntimeBrokerID string `json:"runtimeBrokerId,omitempty"`
+	Profile         string `json:"profile,omitempty"`
+	// ManagedAgent selects hub-direct managed-agent execution (e.g. managed:google),
+	// bypassing Runtime Brokers entirely. Mutually exclusive with RuntimeBrokerID,
+	// ExpectedRuntimeTargetID, and Runtime Broker Profile selection.
+	ManagedAgent  bool              `json:"managedAgent,omitempty"`
+	Task          string            `json:"task,omitempty"`
+	Branch        string            `json:"branch,omitempty"`
+	Workspace     string            `json:"workspace,omitempty"`
+	Labels        map[string]string `json:"labels,omitempty"`
+	Annotations   map[string]string `json:"annotations,omitempty"`
+	Config        *api.ScionConfig  `json:"config,omitempty"`
+	Resume        bool              `json:"resume,omitempty"`
+	ForceResume   bool              `json:"forceResume,omitempty"`
+	Attach        bool              `json:"attach,omitempty"`        // If true, signals interactive attach mode to the broker/harness
+	ProvisionOnly bool              `json:"provisionOnly,omitempty"` // If true, provision only (write task to prompt.md) without starting
 	// WorkspaceFiles is populated for non-git workspace bootstrap.
 	WorkspaceFiles []transfer.FileInfo `json:"workspaceFiles,omitempty"`
 
@@ -480,6 +493,16 @@ func (s *agentService) List(ctx context.Context, opts *ListAgentsOptions) (*List
 		}
 		if opts.LineageRootID != "" {
 			query.Set("lineageRootId", opts.LineageRootID)
+		}
+		var includes []string
+		if opts.IncludeAuthority {
+			includes = append(includes, "authority")
+		}
+		if opts.IncludeCapabilities {
+			includes = append(includes, "capabilities")
+		}
+		if len(includes) > 0 {
+			query.Set("include", strings.Join(includes, ","))
 		}
 		opts.Page.ToQuery(query)
 	}
@@ -894,6 +917,10 @@ type MessageResponse struct {
 	// mid-`scion reincarnate` (design agent-reincarnate §3.7). The message
 	// was saved to conversation history but not dispatched.
 	Deferred string `json:"deferred,omitempty"`
+	// ConversationID is the conversation the message was recorded in, so
+	// the sender can reply into it. Empty on hubs that predate this field,
+	// or when the message was not recorded in a conversation.
+	ConversationID string `json:"conversation_id,omitempty"`
 	// MentionResults reports the outcome of server-side @mention fan-out,
 	// one entry per resolved mention name. Empty when the message had no
 	// mentions, or on hubs that predate this field.
@@ -993,8 +1020,7 @@ func (s *agentService) SendKeys(ctx context.Context, agentID string, keys string
 
 	// Contract §2.4: the ONLY success shape is HTTP 200 with
 	// Response.Status == agentkeys.StatusDispatched. Nothing else — a 204,
-	// a 2xx the server never defines, or a 3xx apiclient.DecodeResponse's
-	// own <400 check would otherwise treat as decodable — may be reported
+	// a 2xx the server never defines, or an unfollowed 3xx — may be reported
 	// as success: each is either a response this contract never promises
 	// (so treating it as success would be a guess, not a decision) or a
 	// response DoNoRetry's "do not follow the redirect" contract leaves
@@ -1047,6 +1073,31 @@ type OutboundMessageRequest struct {
 	// AttachmentIDs names attachments the sending agent uploaded, by id
 	// (ptone/scion#4596). Attachments keeps meaning staged paths.
 	AttachmentIDs []string `json:"attachment_ids,omitempty"`
+	// Decisions makes the message a decision prompt: the decisions as the JSON
+	// array scion message takes. The hub validates them (the web.decisions
+	// experiment); Msg is then the optional intro.
+	Decisions json.RawMessage `json:"decisions,omitempty"`
+	// DecisionsUpdate lets Decisions replace decisions whose keys exist.
+	DecisionsUpdate bool `json:"decisions_update,omitempty"`
+}
+
+// DecisionSendResult is one decision of a sent decision prompt.
+type DecisionSendResult struct {
+	Key      string            `json:"key"`
+	Version  int               `json:"version"`
+	Ref      string            `json:"ref"`
+	RowID    string            `json:"row_id,omitempty"`
+	Replaced *DecisionReplaced `json:"replaced"`
+}
+
+// DecisionReplaced is the version a decision prompt replaced.
+// For a decided version, Answer is the effective answer's label and
+// AnsweredBy who gave it (the name, else the email).
+type DecisionReplaced struct {
+	Version    int    `json:"version"`
+	Status     string `json:"status"`
+	Answer     string `json:"answer,omitempty"`
+	AnsweredBy string `json:"answered_by,omitempty"`
 }
 
 // OutboundMessageResult is the parsed response from a successful outbound
@@ -1068,8 +1119,8 @@ type OutboundMessageResult struct {
 	// Deferred is set only when Status == "deferred".
 	Deferred string `json:"deferred,omitempty"`
 	// ConversationID is the conversation the message was recorded in. It is
-	// empty on hubs that predate this field, and on paths that do not report
-	// it (for example, a send to another agent).
+	// empty on hubs that predate this field, or when the message was not
+	// recorded in a conversation.
 	ConversationID string `json:"conversation_id,omitempty"`
 	// MentionResults reports the outcome of server-side @mention fan-out,
 	// one entry per resolved mention name. Empty when the message had no
@@ -1093,6 +1144,10 @@ type OutboundMessageResult struct {
 	// message, which was still sent without them. Empty when every
 	// attachment was recorded, or on hubs that predate this field.
 	AttachmentWarnings []AttachmentWarning `json:"attachment_warnings,omitempty"`
+
+	// Decisions lists the decisions of a decision prompt, one per decision
+	// sent; empty for any other message.
+	Decisions []DecisionSendResult `json:"decisions,omitempty"`
 }
 
 // SendOutboundMessage sends a message from an agent via the outbound endpoint.
@@ -1132,7 +1187,7 @@ func (s *agentService) BroadcastMessage(ctx context.Context, msg *messages.Struc
 		StructuredMessage: msg,
 		Interrupt:         interrupt,
 	}
-	resp, err := s.c.post(ctx, "/api/v1/projects/"+s.projectID+"/broadcast", body, nil)
+	resp, err := s.c.post(ctx, "/api/v1/projects/"+url.PathEscape(s.projectID)+"/broadcast", body, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1354,13 +1409,6 @@ type ReincarnateAgentRequest struct {
 	// target and the agent's local state is given up. A hub that predates
 	// it ignores it; MoveVerdict.TransferMode tells a client the hub knows it.
 	ForceMove bool `json:"forceMove,omitempty"`
-	// SharedDirBackends changes the recorded shared-dir storage backend of
-	// the named shared dirs (dir name to "nfs" or "local"). Only the
-	// agent's record changes; the data is copied by the operator.
-	SharedDirBackends map[string]string `json:"sharedDirBackends,omitempty"`
-	// AllowEmptySharedDir skips the start check that refuses an empty
-	// directory on the new backend while the previous one is not empty.
-	AllowEmptySharedDir bool `json:"allowEmptySharedDir,omitempty"`
 
 	// Patch fields: each changes the next generation's setting, and later
 	// reincarnations keep it. Empty (nil for ThinkingLevel) is unchanged.
@@ -1370,9 +1418,12 @@ type ReincarnateAgentRequest struct {
 	Model          string `json:"model,omitempty"`
 	ThinkingLevel  *int   `json:"thinkingLevel,omitempty"`
 	HarnessAuth    string `json:"harnessAuth,omitempty"`
+	// HarnessConfig (`--harness`) moves the agent to another harness config
+	// and resets its home (ptone/scion#7757). A hub that predates it
+	// answers 400 "not yet supported".
+	HarnessConfig string `json:"harnessConfig,omitempty"`
 
 	// Overrides not yet supported by the hub.
-	HarnessConfig  string            `json:"harnessConfig,omitempty"`
 	Env            map[string]string `json:"env,omitempty"`
 	TemplateHash   string            `json:"templateHash,omitempty"`
 	ResetOverrides bool              `json:"resetOverrides,omitempty"`
@@ -1474,8 +1525,10 @@ type ReincarnationPlan struct {
 	ServiceAccount *FieldChange `json:"serviceAccount,omitempty"`
 	ThinkingLevel  *FieldChange `json:"thinkingLevel,omitempty"`
 	HarnessAuth    *FieldChange `json:"harnessAuth,omitempty"`
-	// SharedDirBackends and AllowEmptySharedDir echo the request's shared
-	// dir backend change.
-	SharedDirBackends   map[string]string `json:"sharedDirBackends,omitempty"`
-	AllowEmptySharedDir bool              `json:"allowEmptySharedDir,omitempty"`
+
+	// HomeReset is set when the reincarnation deletes and rebuilds the
+	// agent's home (a harness switch); Warnings[0] is then the home-reset
+	// warning. Harness is the harness-config name old→new.
+	HomeReset bool         `json:"homeReset,omitempty"`
+	Harness   *FieldChange `json:"harness,omitempty"`
 }

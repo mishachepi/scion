@@ -57,6 +57,7 @@ type projectMemberGroup struct {
 	PrincipalType        string              `json:"principalType"`
 	PrincipalID          string              `json:"principalId"`
 	PrincipalDisplayName string              `json:"principalDisplayName,omitempty"`
+	PrincipalStatus      string              `json:"principalStatus,omitempty"`
 	BuiltInRoleName      string              `json:"builtInRoleName"`
 	Bindings             []projectMemberInfo `json:"bindings"`
 }
@@ -210,27 +211,32 @@ func (s *Server) listProjectMembers(w http.ResponseWriter, r *http.Request, proj
 	page := bindings[offset:end]
 
 	// Enrich with role name and display names.
-	rdCache := make(map[string]string) // roleDefinitionID → roleName
+	rdCache := make(map[string]*store.RoleDefinition) // roleDefinitionID → definition (nil if unresolved)
 	items := make([]projectMemberInfo, 0, len(page))
 	for _, b := range page {
 		if b == nil {
 			continue
 		}
 
-		roleName, ok := rdCache[b.RoleDefinitionID]
+		rd, ok := rdCache[b.RoleDefinitionID]
 		if !ok {
-			rd, rdErr := s.store.GetRoleDefinition(ctx, b.RoleDefinitionID)
-			if rdErr == nil && rd != nil {
-				roleName = rd.Name
+			var rdErr error
+			rd, rdErr = s.store.GetRoleDefinition(ctx, b.RoleDefinitionID)
+			if rdErr != nil {
+				rd = nil
 			}
-			rdCache[b.RoleDefinitionID] = roleName
+			rdCache[b.RoleDefinitionID] = rd
+		}
+		roleName := ""
+		if rd != nil {
+			roleName = rd.Name
 		}
 
 		info := projectMemberInfo{
 			RoleBinding: *b,
 			RoleName:    roleName,
 			Source:      "direct",
-			RoleKind:    projectRoleKind(roleName),
+			RoleKind:    projectRoleKind(rd),
 		}
 		info.PrincipalDisplayName = s.resolveGroupMemberDisplayName(ctx, b.PrincipalType, b.PrincipalID)
 		info.CreatedByDisplayName = s.resolveGroupMemberDisplayName(ctx, store.GroupMemberTypeUser, b.CreatedBy)
@@ -264,7 +270,9 @@ func (s *Server) memberListCapabilities(ctx context.Context, projectID string) *
 	if s.membershipService == nil {
 		return nil
 	}
-	return s.membershipService.ComputeCapabilities(ctx, user.ID(), projectID)
+	caps := s.membershipService.ComputeCapabilities(ctx, user.ID(), projectID)
+	caps.CanLeave, caps.LeaveBlockedReason = s.projectLeaveCapabilities(ctx, user.ID(), projectID)
+	return caps
 }
 
 // writeProjectMemberGroups writes GET …/members?groupBy=principal
@@ -446,9 +454,11 @@ func (s *Server) addProjectMember(w http.ResponseWriter, r *http.Request, projec
 
 	// Resolve role name for response.
 	var roleName string
+	var roleDef *store.RoleDefinition
 	if result.Binding != nil {
 		if rd, err := s.store.GetRoleDefinition(ctx, result.Binding.RoleDefinitionID); err == nil {
 			roleName = rd.Name
+			roleDef = rd
 		}
 	}
 
@@ -457,7 +467,7 @@ func (s *Server) addProjectMember(w http.ResponseWriter, r *http.Request, projec
 		RoleBinding: *result.Binding,
 		RoleName:    roleName,
 		Source:      "direct",
-		RoleKind:    projectRoleKind(roleName),
+		RoleKind:    projectRoleKind(roleDef),
 	}
 	info.PrincipalDisplayName = s.resolveGroupMemberDisplayName(ctx, result.Binding.PrincipalType, result.Binding.PrincipalID)
 	info.CreatedByDisplayName = s.resolveGroupMemberDisplayName(ctx, store.GroupMemberTypeUser, result.Binding.CreatedBy)
@@ -526,9 +536,11 @@ func (s *Server) updateProjectMemberRole(w http.ResponseWriter, r *http.Request,
 
 	// Enrich response.
 	var roleName string
+	var roleDef *store.RoleDefinition
 	if result.Binding != nil {
 		if rd, err := s.store.GetRoleDefinition(ctx, result.Binding.RoleDefinitionID); err == nil {
 			roleName = rd.Name
+			roleDef = rd
 		}
 	}
 
@@ -536,7 +548,7 @@ func (s *Server) updateProjectMemberRole(w http.ResponseWriter, r *http.Request,
 		RoleBinding: *result.Binding,
 		RoleName:    roleName,
 		Source:      "direct",
-		RoleKind:    projectRoleKind(roleName),
+		RoleKind:    projectRoleKind(roleDef),
 	}
 	info.PrincipalDisplayName = s.resolveGroupMemberDisplayName(ctx, result.Binding.PrincipalType, result.Binding.PrincipalID)
 	info.CreatedByDisplayName = s.resolveGroupMemberDisplayName(ctx, store.GroupMemberTypeUser, result.Binding.CreatedBy)
@@ -709,14 +721,7 @@ func (s *Server) resolveMemberPrincipal(ctx context.Context, principalType, prin
 		}
 		return u.ID, nil
 	case store.RoleBindingPrincipalGroup:
-		g, err := s.store.GetGroup(ctx, principalID)
-		if err == nil {
-			return g.ID, nil
-		}
-		if !errors.Is(err, store.ErrNotFound) {
-			return "", err
-		}
-		g, err = s.store.GetGroupBySlug(ctx, principalID)
+		g, err := s.resolveVisibleGroupByIDOrSlug(ctx, GetIdentityFromContext(ctx), principalID)
 		if err != nil {
 			return "", err
 		}
@@ -983,28 +988,56 @@ func (s *Server) deleteProjectMemberPrincipal(w http.ResponseWriter, r *http.Req
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// projectMemberEnricher resolves the role names and display names a member
-// binding is enriched with, caching each lookup for the life of one request.
+// projectMemberEnricher resolves the role names, display names, and user
+// status a member binding or group is enriched with, caching each lookup for
+// the life of one request.
 type projectMemberEnricher struct {
 	s            *Server
-	roleNames    map[string]string // roleDefinitionID → roleName ("" if unresolved)
-	displayNames map[string]string // principalType + ":" + principalID → display name
+	roleDefs     map[string]*store.RoleDefinition // roleDefinitionID → definition (nil if unresolved)
+	users        map[string]*store.User           // userID → user (nil if unresolved)
+	displayNames map[string]string                // principalType + ":" + principalID → display name
 }
 
 func newProjectMemberEnricher(s *Server) *projectMemberEnricher {
-	return &projectMemberEnricher{s: s, roleNames: map[string]string{}, displayNames: map[string]string{}}
+	return &projectMemberEnricher{
+		s:            s,
+		roleDefs:     map[string]*store.RoleDefinition{},
+		users:        map[string]*store.User{},
+		displayNames: map[string]string{},
+	}
 }
 
 func (e *projectMemberEnricher) roleName(ctx context.Context, roleDefinitionID string) string {
-	if name, ok := e.roleNames[roleDefinitionID]; ok {
-		return name
+	if rd := e.roleDef(ctx, roleDefinitionID); rd != nil {
+		return rd.Name
 	}
-	name := ""
-	if rd, err := e.s.store.GetRoleDefinition(ctx, roleDefinitionID); err == nil && rd != nil {
-		name = rd.Name
+	return ""
+}
+
+// roleDef returns the role definition, or nil when it cannot be read.
+func (e *projectMemberEnricher) roleDef(ctx context.Context, roleDefinitionID string) *store.RoleDefinition {
+	if rd, ok := e.roleDefs[roleDefinitionID]; ok {
+		return rd
 	}
-	e.roleNames[roleDefinitionID] = name
-	return name
+	rd, err := e.s.store.GetRoleDefinition(ctx, roleDefinitionID)
+	if err != nil {
+		rd = nil
+	}
+	e.roleDefs[roleDefinitionID] = rd
+	return rd
+}
+
+// user returns the user record, or nil when it cannot be read.
+func (e *projectMemberEnricher) user(ctx context.Context, userID string) *store.User {
+	if u, ok := e.users[userID]; ok {
+		return u
+	}
+	u, err := e.s.store.GetUser(ctx, userID)
+	if err != nil {
+		u = nil
+	}
+	e.users[userID] = u
+	return u
 }
 
 func (e *projectMemberEnricher) displayName(ctx context.Context, principalType, principalID string) string {
@@ -1012,9 +1045,30 @@ func (e *projectMemberEnricher) displayName(ctx context.Context, principalType, 
 	if name, ok := e.displayNames[k]; ok {
 		return name
 	}
-	name := e.s.resolveGroupMemberDisplayName(ctx, principalType, principalID)
+	var name string
+	if principalType == store.GroupMemberTypeUser {
+		if u := e.user(ctx, principalID); u != nil {
+			if u.DisplayName != "" {
+				name = u.DisplayName
+			} else {
+				name = u.Email
+			}
+		}
+	} else {
+		name = e.s.resolveGroupMemberDisplayName(ctx, principalType, principalID)
+	}
 	e.displayNames[k] = name
 	return name
+}
+
+func (e *projectMemberEnricher) principalStatus(ctx context.Context, principalType, principalID string) string {
+	if principalType != store.RoleBindingPrincipalUser {
+		return ""
+	}
+	if u := e.user(ctx, principalID); u != nil {
+		return u.Status
+	}
+	return ""
 }
 
 // group assembles one principal's projectMemberGroup from its project-scope
@@ -1028,6 +1082,7 @@ func (e *projectMemberEnricher) group(ctx context.Context, principalType, princi
 		PrincipalType:        principalType,
 		PrincipalID:          principalID,
 		PrincipalDisplayName: e.displayName(ctx, principalType, principalID),
+		PrincipalStatus:      e.principalStatus(ctx, principalType, principalID),
 	}
 
 	infos := make([]projectMemberInfo, 0, len(bindings))
@@ -1040,7 +1095,7 @@ func (e *projectMemberEnricher) group(ctx context.Context, principalType, princi
 			RoleBinding:          *b,
 			RoleName:             roleName,
 			Source:               "direct",
-			RoleKind:             projectRoleKind(roleName),
+			RoleKind:             projectRoleKind(e.roleDef(ctx, b.RoleDefinitionID)),
 			PrincipalDisplayName: group.PrincipalDisplayName,
 			CreatedByDisplayName: e.displayName(ctx, store.GroupMemberTypeUser, b.CreatedBy),
 		}

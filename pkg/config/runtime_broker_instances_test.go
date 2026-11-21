@@ -197,18 +197,10 @@ func TestRuntimeBrokerInstances_StrictLoaderFileResolution(t *testing.T) {
 		if len(got) != 1 || got[0].Key != "from-global" {
 			t.Fatalf("expected the global entry, got %+v", got)
 		}
-		// The lenient server loader silently falls back to the --config
-		// settings; the startup comparison must therefore detect a
-		// difference (the P1.2 refusal trigger).
-		gc, err := LoadGlobalConfig(cfgDir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(gc.RuntimeBroker.Instances) != 1 || gc.RuntimeBroker.Instances[0].Key != "from-config" {
-			t.Fatalf("expected the lenient loader to fall back to --config, got %+v", gc.RuntimeBroker.Instances)
-		}
-		if reflect.DeepEqual(RuntimeBrokerInstancesToGlobal(got), gc.RuntimeBroker.Instances) {
-			t.Fatal("strict and lenient results must differ in the silent-fallback case")
+		// LoadGlobalConfig also refuses to fall back to --config when the
+		// global settings.yaml server section has a decode error (ptone/scion#6187).
+		if _, err := LoadGlobalConfig(cfgDir); err == nil {
+			t.Fatal("expected LoadGlobalConfig to fail on mistyped global server.broker.port rather than falling back to --config")
 		}
 	})
 	t.Run("unparseable global settings is an error", func(t *testing.T) {
@@ -440,7 +432,7 @@ func TestRuntimeBrokerInstances_SchemaMatchesValidator(t *testing.T) {
 		"k8s numeric size":  {instancesYAML("- {key: a, name: x, runtime_target: {type: kubernetes, shared_dir_size: 40}}"), false},
 		"docker sd class":   {instancesYAML("- {key: a, name: x, runtime_target: {type: docker, shared_dir_storage_class: rwx}}"), false},
 		"docker sd size":    {instancesYAML("- {key: a, name: x, runtime_target: {type: docker, shared_dir_size: 40Gi}}"), false},
-		"k8s target infra":  {instancesYAML("- {key: a, name: x, runtime_target: {type: kubernetes, gke: true, priority_class_name: agents-high, safe_to_evict: false, shared_dir_storage_backend: local, shared_dir_storage_backends: {data: local}, home_storage_backend: local, home_storage_leaf: broker}}"), true},
+		"k8s target infra":  {instancesYAML("- {key: a, name: x, runtime_target: {type: kubernetes, gke: true, priority_class_name: agents-high, safe_to_evict: false}}"), true},
 		"k8s null evict":    {instancesYAML("- {key: a, name: x, runtime_target: {type: kubernetes, safe_to_evict: null}}"), true},
 		"k8s bad priority":  {instancesYAML("- {key: a, name: x, runtime_target: {type: kubernetes, priority_class_name: High_Priority}}"), false},
 		"k8s num priority":  {instancesYAML("- {key: a, name: x, runtime_target: {type: kubernetes, priority_class_name: 7}}"), false},
@@ -456,9 +448,9 @@ func TestRuntimeBrokerInstances_SchemaMatchesValidator(t *testing.T) {
 		"k8s bad home":      {instancesYAML("- {key: a, name: x, runtime_target: {type: kubernetes, home_storage_backend: gcs}}"), false},
 		"k8s bad leaf":      {instancesYAML("- {key: a, name: x, runtime_target: {type: kubernetes, home_storage_leaf: node}}"), false},
 		"k8s nfs no block":  {instancesYAML("- {key: a, name: x, runtime_target: {type: kubernetes, home_storage_backend: nfs}}"), false},
-		"k8s nfs block":     {"schema_version: \"1\"\nserver:\n  shared_dir_storage: {nfs: {mount_root: /mnt/x, shares: [{id: s1}]}}\n  broker:\n    instances:\n      - {key: a, name: x, runtime_target: {type: kubernetes, shared_dir_storage_backend: nfs, home_storage_backend: nfs}}\n", true},
+		"k8s nfs block":     {"schema_version: \"1\"\nserver:\n  shared_dir_storage: {nfs: {mount_root: /mnt/x, shares: [{id: s1}]}}\n  broker:\n    instances:\n      - {key: a, name: x, runtime_target: {type: kubernetes, shared_dir_storage_backend: nfs, home_storage_backend: nfs}}\n", false},
 		"docker nfs dir":    {instancesYAML("- {key: a, name: x, runtime_target: {type: docker, shared_dir_storage_backends: {data: nfs}}}"), false},
-		"docker backends":   {instancesYAML("- {key: a, name: x, runtime_target: {type: docker, shared_dir_storage_backend: local, shared_dir_storage_backends: {data: local}}}"), true},
+		"docker backends":   {instancesYAML("- {key: a, name: x, runtime_target: {type: docker, shared_dir_storage_backend: local, shared_dir_storage_backends: {data: local}}}"), false},
 		"docker gke":        {instancesYAML("- {key: a, name: x, runtime_target: {type: docker, gke: true}}"), false},
 		"docker gke false":  {instancesYAML("- {key: a, name: x, runtime_target: {type: docker, gke: false}}"), true},
 		"docker priority":   {instancesYAML("- {key: a, name: x, runtime_target: {type: docker, priority_class_name: high}}"), false},

@@ -218,6 +218,20 @@ func (_c *RuntimeBrokerCreate) SetNillableHealth(v *string) *RuntimeBrokerCreate
 	return _c
 }
 
+// SetWorkloadIdentityTargets sets the "workload_identity_targets" field.
+func (_c *RuntimeBrokerCreate) SetWorkloadIdentityTargets(v string) *RuntimeBrokerCreate {
+	_c.mutation.SetWorkloadIdentityTargets(v)
+	return _c
+}
+
+// SetNillableWorkloadIdentityTargets sets the "workload_identity_targets" field if the given value is not nil.
+func (_c *RuntimeBrokerCreate) SetNillableWorkloadIdentityTargets(v *string) *RuntimeBrokerCreate {
+	if v != nil {
+		_c.SetWorkloadIdentityTargets(*v)
+	}
+	return _c
+}
+
 // SetLabels sets the "labels" field.
 func (_c *RuntimeBrokerCreate) SetLabels(v map[string]string) *RuntimeBrokerCreate {
 	_c.mutation.SetLabels(v)
@@ -524,6 +538,48 @@ func (_c *RuntimeBrokerCreate) SetNillablePresentationObservedAt(v *time.Time) *
 	return _c
 }
 
+// SetConversionPlanPresentation sets the "conversion_plan_presentation" field.
+func (_c *RuntimeBrokerCreate) SetConversionPlanPresentation(v string) *RuntimeBrokerCreate {
+	_c.mutation.SetConversionPlanPresentation(v)
+	return _c
+}
+
+// SetNillableConversionPlanPresentation sets the "conversion_plan_presentation" field if the given value is not nil.
+func (_c *RuntimeBrokerCreate) SetNillableConversionPlanPresentation(v *string) *RuntimeBrokerCreate {
+	if v != nil {
+		_c.SetConversionPlanPresentation(*v)
+	}
+	return _c
+}
+
+// SetConversionPlanPresentationHash sets the "conversion_plan_presentation_hash" field.
+func (_c *RuntimeBrokerCreate) SetConversionPlanPresentationHash(v string) *RuntimeBrokerCreate {
+	_c.mutation.SetConversionPlanPresentationHash(v)
+	return _c
+}
+
+// SetNillableConversionPlanPresentationHash sets the "conversion_plan_presentation_hash" field if the given value is not nil.
+func (_c *RuntimeBrokerCreate) SetNillableConversionPlanPresentationHash(v *string) *RuntimeBrokerCreate {
+	if v != nil {
+		_c.SetConversionPlanPresentationHash(*v)
+	}
+	return _c
+}
+
+// SetConversionPlanObservedAt sets the "conversion_plan_observed_at" field.
+func (_c *RuntimeBrokerCreate) SetConversionPlanObservedAt(v time.Time) *RuntimeBrokerCreate {
+	_c.mutation.SetConversionPlanObservedAt(v)
+	return _c
+}
+
+// SetNillableConversionPlanObservedAt sets the "conversion_plan_observed_at" field if the given value is not nil.
+func (_c *RuntimeBrokerCreate) SetNillableConversionPlanObservedAt(v *time.Time) *RuntimeBrokerCreate {
+	if v != nil {
+		_c.SetConversionPlanObservedAt(*v)
+	}
+	return _c
+}
+
 // SetCreated sets the "created" field.
 func (_c *RuntimeBrokerCreate) SetCreated(v time.Time) *RuntimeBrokerCreate {
 	_c.mutation.SetCreated(v)
@@ -782,6 +838,10 @@ func (_c *RuntimeBrokerCreate) createSpec() (*RuntimeBroker, *sqlgraph.CreateSpe
 		_spec.SetField(runtimebroker.FieldHealth, field.TypeString, value)
 		_node.Health = value
 	}
+	if value, ok := _c.mutation.WorkloadIdentityTargets(); ok {
+		_spec.SetField(runtimebroker.FieldWorkloadIdentityTargets, field.TypeString, value)
+		_node.WorkloadIdentityTargets = value
+	}
 	if value, ok := _c.mutation.Labels(); ok {
 		_spec.SetField(runtimebroker.FieldLabels, field.TypeJSON, value)
 		_node.Labels = value
@@ -873,6 +933,18 @@ func (_c *RuntimeBrokerCreate) createSpec() (*RuntimeBroker, *sqlgraph.CreateSpe
 	if value, ok := _c.mutation.PresentationObservedAt(); ok {
 		_spec.SetField(runtimebroker.FieldPresentationObservedAt, field.TypeTime, value)
 		_node.PresentationObservedAt = &value
+	}
+	if value, ok := _c.mutation.ConversionPlanPresentation(); ok {
+		_spec.SetField(runtimebroker.FieldConversionPlanPresentation, field.TypeString, value)
+		_node.ConversionPlanPresentation = value
+	}
+	if value, ok := _c.mutation.ConversionPlanPresentationHash(); ok {
+		_spec.SetField(runtimebroker.FieldConversionPlanPresentationHash, field.TypeString, value)
+		_node.ConversionPlanPresentationHash = value
+	}
+	if value, ok := _c.mutation.ConversionPlanObservedAt(); ok {
+		_spec.SetField(runtimebroker.FieldConversionPlanObservedAt, field.TypeTime, value)
+		_node.ConversionPlanObservedAt = &value
 	}
 	if value, ok := _c.mutation.Created(); ok {
 		_spec.SetField(runtimebroker.FieldCreated, field.TypeTime, value)
@@ -1171,6 +1243,24 @@ func (u *RuntimeBrokerUpsert) UpdateHealth() *RuntimeBrokerUpsert {
 // ClearHealth clears the value of the "health" field.
 func (u *RuntimeBrokerUpsert) ClearHealth() *RuntimeBrokerUpsert {
 	u.SetNull(runtimebroker.FieldHealth)
+	return u
+}
+
+// SetWorkloadIdentityTargets sets the "workload_identity_targets" field.
+func (u *RuntimeBrokerUpsert) SetWorkloadIdentityTargets(v string) *RuntimeBrokerUpsert {
+	u.Set(runtimebroker.FieldWorkloadIdentityTargets, v)
+	return u
+}
+
+// UpdateWorkloadIdentityTargets sets the "workload_identity_targets" field to the value that was provided on create.
+func (u *RuntimeBrokerUpsert) UpdateWorkloadIdentityTargets() *RuntimeBrokerUpsert {
+	u.SetExcluded(runtimebroker.FieldWorkloadIdentityTargets)
+	return u
+}
+
+// ClearWorkloadIdentityTargets clears the value of the "workload_identity_targets" field.
+func (u *RuntimeBrokerUpsert) ClearWorkloadIdentityTargets() *RuntimeBrokerUpsert {
+	u.SetNull(runtimebroker.FieldWorkloadIdentityTargets)
 	return u
 }
 
@@ -1594,6 +1684,60 @@ func (u *RuntimeBrokerUpsert) ClearPresentationObservedAt() *RuntimeBrokerUpsert
 	return u
 }
 
+// SetConversionPlanPresentation sets the "conversion_plan_presentation" field.
+func (u *RuntimeBrokerUpsert) SetConversionPlanPresentation(v string) *RuntimeBrokerUpsert {
+	u.Set(runtimebroker.FieldConversionPlanPresentation, v)
+	return u
+}
+
+// UpdateConversionPlanPresentation sets the "conversion_plan_presentation" field to the value that was provided on create.
+func (u *RuntimeBrokerUpsert) UpdateConversionPlanPresentation() *RuntimeBrokerUpsert {
+	u.SetExcluded(runtimebroker.FieldConversionPlanPresentation)
+	return u
+}
+
+// ClearConversionPlanPresentation clears the value of the "conversion_plan_presentation" field.
+func (u *RuntimeBrokerUpsert) ClearConversionPlanPresentation() *RuntimeBrokerUpsert {
+	u.SetNull(runtimebroker.FieldConversionPlanPresentation)
+	return u
+}
+
+// SetConversionPlanPresentationHash sets the "conversion_plan_presentation_hash" field.
+func (u *RuntimeBrokerUpsert) SetConversionPlanPresentationHash(v string) *RuntimeBrokerUpsert {
+	u.Set(runtimebroker.FieldConversionPlanPresentationHash, v)
+	return u
+}
+
+// UpdateConversionPlanPresentationHash sets the "conversion_plan_presentation_hash" field to the value that was provided on create.
+func (u *RuntimeBrokerUpsert) UpdateConversionPlanPresentationHash() *RuntimeBrokerUpsert {
+	u.SetExcluded(runtimebroker.FieldConversionPlanPresentationHash)
+	return u
+}
+
+// ClearConversionPlanPresentationHash clears the value of the "conversion_plan_presentation_hash" field.
+func (u *RuntimeBrokerUpsert) ClearConversionPlanPresentationHash() *RuntimeBrokerUpsert {
+	u.SetNull(runtimebroker.FieldConversionPlanPresentationHash)
+	return u
+}
+
+// SetConversionPlanObservedAt sets the "conversion_plan_observed_at" field.
+func (u *RuntimeBrokerUpsert) SetConversionPlanObservedAt(v time.Time) *RuntimeBrokerUpsert {
+	u.Set(runtimebroker.FieldConversionPlanObservedAt, v)
+	return u
+}
+
+// UpdateConversionPlanObservedAt sets the "conversion_plan_observed_at" field to the value that was provided on create.
+func (u *RuntimeBrokerUpsert) UpdateConversionPlanObservedAt() *RuntimeBrokerUpsert {
+	u.SetExcluded(runtimebroker.FieldConversionPlanObservedAt)
+	return u
+}
+
+// ClearConversionPlanObservedAt clears the value of the "conversion_plan_observed_at" field.
+func (u *RuntimeBrokerUpsert) ClearConversionPlanObservedAt() *RuntimeBrokerUpsert {
+	u.SetNull(runtimebroker.FieldConversionPlanObservedAt)
+	return u
+}
+
 // SetUpdated sets the "updated" field.
 func (u *RuntimeBrokerUpsert) SetUpdated(v time.Time) *RuntimeBrokerUpsert {
 	u.Set(runtimebroker.FieldUpdated, v)
@@ -1934,6 +2078,27 @@ func (u *RuntimeBrokerUpsertOne) UpdateHealth() *RuntimeBrokerUpsertOne {
 func (u *RuntimeBrokerUpsertOne) ClearHealth() *RuntimeBrokerUpsertOne {
 	return u.Update(func(s *RuntimeBrokerUpsert) {
 		s.ClearHealth()
+	})
+}
+
+// SetWorkloadIdentityTargets sets the "workload_identity_targets" field.
+func (u *RuntimeBrokerUpsertOne) SetWorkloadIdentityTargets(v string) *RuntimeBrokerUpsertOne {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.SetWorkloadIdentityTargets(v)
+	})
+}
+
+// UpdateWorkloadIdentityTargets sets the "workload_identity_targets" field to the value that was provided on create.
+func (u *RuntimeBrokerUpsertOne) UpdateWorkloadIdentityTargets() *RuntimeBrokerUpsertOne {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.UpdateWorkloadIdentityTargets()
+	})
+}
+
+// ClearWorkloadIdentityTargets clears the value of the "workload_identity_targets" field.
+func (u *RuntimeBrokerUpsertOne) ClearWorkloadIdentityTargets() *RuntimeBrokerUpsertOne {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.ClearWorkloadIdentityTargets()
 	})
 }
 
@@ -2424,6 +2589,69 @@ func (u *RuntimeBrokerUpsertOne) UpdatePresentationObservedAt() *RuntimeBrokerUp
 func (u *RuntimeBrokerUpsertOne) ClearPresentationObservedAt() *RuntimeBrokerUpsertOne {
 	return u.Update(func(s *RuntimeBrokerUpsert) {
 		s.ClearPresentationObservedAt()
+	})
+}
+
+// SetConversionPlanPresentation sets the "conversion_plan_presentation" field.
+func (u *RuntimeBrokerUpsertOne) SetConversionPlanPresentation(v string) *RuntimeBrokerUpsertOne {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.SetConversionPlanPresentation(v)
+	})
+}
+
+// UpdateConversionPlanPresentation sets the "conversion_plan_presentation" field to the value that was provided on create.
+func (u *RuntimeBrokerUpsertOne) UpdateConversionPlanPresentation() *RuntimeBrokerUpsertOne {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.UpdateConversionPlanPresentation()
+	})
+}
+
+// ClearConversionPlanPresentation clears the value of the "conversion_plan_presentation" field.
+func (u *RuntimeBrokerUpsertOne) ClearConversionPlanPresentation() *RuntimeBrokerUpsertOne {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.ClearConversionPlanPresentation()
+	})
+}
+
+// SetConversionPlanPresentationHash sets the "conversion_plan_presentation_hash" field.
+func (u *RuntimeBrokerUpsertOne) SetConversionPlanPresentationHash(v string) *RuntimeBrokerUpsertOne {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.SetConversionPlanPresentationHash(v)
+	})
+}
+
+// UpdateConversionPlanPresentationHash sets the "conversion_plan_presentation_hash" field to the value that was provided on create.
+func (u *RuntimeBrokerUpsertOne) UpdateConversionPlanPresentationHash() *RuntimeBrokerUpsertOne {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.UpdateConversionPlanPresentationHash()
+	})
+}
+
+// ClearConversionPlanPresentationHash clears the value of the "conversion_plan_presentation_hash" field.
+func (u *RuntimeBrokerUpsertOne) ClearConversionPlanPresentationHash() *RuntimeBrokerUpsertOne {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.ClearConversionPlanPresentationHash()
+	})
+}
+
+// SetConversionPlanObservedAt sets the "conversion_plan_observed_at" field.
+func (u *RuntimeBrokerUpsertOne) SetConversionPlanObservedAt(v time.Time) *RuntimeBrokerUpsertOne {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.SetConversionPlanObservedAt(v)
+	})
+}
+
+// UpdateConversionPlanObservedAt sets the "conversion_plan_observed_at" field to the value that was provided on create.
+func (u *RuntimeBrokerUpsertOne) UpdateConversionPlanObservedAt() *RuntimeBrokerUpsertOne {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.UpdateConversionPlanObservedAt()
+	})
+}
+
+// ClearConversionPlanObservedAt clears the value of the "conversion_plan_observed_at" field.
+func (u *RuntimeBrokerUpsertOne) ClearConversionPlanObservedAt() *RuntimeBrokerUpsertOne {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.ClearConversionPlanObservedAt()
 	})
 }
 
@@ -2939,6 +3167,27 @@ func (u *RuntimeBrokerUpsertBulk) ClearHealth() *RuntimeBrokerUpsertBulk {
 	})
 }
 
+// SetWorkloadIdentityTargets sets the "workload_identity_targets" field.
+func (u *RuntimeBrokerUpsertBulk) SetWorkloadIdentityTargets(v string) *RuntimeBrokerUpsertBulk {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.SetWorkloadIdentityTargets(v)
+	})
+}
+
+// UpdateWorkloadIdentityTargets sets the "workload_identity_targets" field to the value that was provided on create.
+func (u *RuntimeBrokerUpsertBulk) UpdateWorkloadIdentityTargets() *RuntimeBrokerUpsertBulk {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.UpdateWorkloadIdentityTargets()
+	})
+}
+
+// ClearWorkloadIdentityTargets clears the value of the "workload_identity_targets" field.
+func (u *RuntimeBrokerUpsertBulk) ClearWorkloadIdentityTargets() *RuntimeBrokerUpsertBulk {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.ClearWorkloadIdentityTargets()
+	})
+}
+
 // SetLabels sets the "labels" field.
 func (u *RuntimeBrokerUpsertBulk) SetLabels(v map[string]string) *RuntimeBrokerUpsertBulk {
 	return u.Update(func(s *RuntimeBrokerUpsert) {
@@ -3426,6 +3675,69 @@ func (u *RuntimeBrokerUpsertBulk) UpdatePresentationObservedAt() *RuntimeBrokerU
 func (u *RuntimeBrokerUpsertBulk) ClearPresentationObservedAt() *RuntimeBrokerUpsertBulk {
 	return u.Update(func(s *RuntimeBrokerUpsert) {
 		s.ClearPresentationObservedAt()
+	})
+}
+
+// SetConversionPlanPresentation sets the "conversion_plan_presentation" field.
+func (u *RuntimeBrokerUpsertBulk) SetConversionPlanPresentation(v string) *RuntimeBrokerUpsertBulk {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.SetConversionPlanPresentation(v)
+	})
+}
+
+// UpdateConversionPlanPresentation sets the "conversion_plan_presentation" field to the value that was provided on create.
+func (u *RuntimeBrokerUpsertBulk) UpdateConversionPlanPresentation() *RuntimeBrokerUpsertBulk {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.UpdateConversionPlanPresentation()
+	})
+}
+
+// ClearConversionPlanPresentation clears the value of the "conversion_plan_presentation" field.
+func (u *RuntimeBrokerUpsertBulk) ClearConversionPlanPresentation() *RuntimeBrokerUpsertBulk {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.ClearConversionPlanPresentation()
+	})
+}
+
+// SetConversionPlanPresentationHash sets the "conversion_plan_presentation_hash" field.
+func (u *RuntimeBrokerUpsertBulk) SetConversionPlanPresentationHash(v string) *RuntimeBrokerUpsertBulk {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.SetConversionPlanPresentationHash(v)
+	})
+}
+
+// UpdateConversionPlanPresentationHash sets the "conversion_plan_presentation_hash" field to the value that was provided on create.
+func (u *RuntimeBrokerUpsertBulk) UpdateConversionPlanPresentationHash() *RuntimeBrokerUpsertBulk {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.UpdateConversionPlanPresentationHash()
+	})
+}
+
+// ClearConversionPlanPresentationHash clears the value of the "conversion_plan_presentation_hash" field.
+func (u *RuntimeBrokerUpsertBulk) ClearConversionPlanPresentationHash() *RuntimeBrokerUpsertBulk {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.ClearConversionPlanPresentationHash()
+	})
+}
+
+// SetConversionPlanObservedAt sets the "conversion_plan_observed_at" field.
+func (u *RuntimeBrokerUpsertBulk) SetConversionPlanObservedAt(v time.Time) *RuntimeBrokerUpsertBulk {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.SetConversionPlanObservedAt(v)
+	})
+}
+
+// UpdateConversionPlanObservedAt sets the "conversion_plan_observed_at" field to the value that was provided on create.
+func (u *RuntimeBrokerUpsertBulk) UpdateConversionPlanObservedAt() *RuntimeBrokerUpsertBulk {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.UpdateConversionPlanObservedAt()
+	})
+}
+
+// ClearConversionPlanObservedAt clears the value of the "conversion_plan_observed_at" field.
+func (u *RuntimeBrokerUpsertBulk) ClearConversionPlanObservedAt() *RuntimeBrokerUpsertBulk {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.ClearConversionPlanObservedAt()
 	})
 }
 

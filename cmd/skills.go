@@ -15,7 +15,6 @@
 package cmd
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -60,7 +59,23 @@ func skillsListTags(cmd *cobra.Command) []string {
 	return tags
 }
 
+func validateSkillScopeFlag(scope string) error {
+	switch scope {
+	case "", "global", "project", "user":
+		return nil
+	case "core":
+		return newUsageError(`invalid --scope "core": the "core" skill scope is no longer supported; use "global" instead`)
+	default:
+		return newUsageError("invalid --scope %q: must be one of global, project, user", scope)
+	}
+}
+
 func runSkillsList(cmd *cobra.Command, args []string) error {
+	scope, _ := cmd.Flags().GetString("scope")
+	if err := validateSkillScopeFlag(scope); err != nil {
+		return err
+	}
+
 	hubCtx, err := requireHub(projectPath)
 	if err != nil {
 		return fmt.Errorf("hub connection required: %w", err)
@@ -69,7 +84,6 @@ func runSkillsList(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	scope, _ := cmd.Flags().GetString("scope")
 	search, _ := cmd.Flags().GetString("search")
 
 	opts := &hubclient.ListSkillsOptions{
@@ -232,6 +246,36 @@ description: <describe your skill>
 	return nil
 }
 
+// findPublishTargetSkill returns the existing skill that `scion skills
+// publish` adds a version to, or nil when none exists. With a scope it asks
+// the hub for that scope only, narrowed to scopeID for project scope (the
+// project ID) and user scope (the caller's user ID), and also checks each
+// returned record, so a publish never lands on a same-named skill in
+// another scope, project or user's scope (Q6.3, ptone/scion#1713). An empty
+// scope keeps the name-only lookup.
+func findPublishTargetSkill(ctx context.Context, skillSvc hubclient.SkillService, name, scope, scopeID string) (*hubclient.Skill, error) {
+	opts := &hubclient.ListSkillsOptions{Name: name, Scope: scope}
+	narrowed := scope == "project" || scope == "user"
+	if narrowed {
+		opts.ScopeID = scopeID
+	}
+	listResp, err := skillSvc.List(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	for i := range listResp.Skills {
+		sk := &listResp.Skills[i]
+		if scope != "" && sk.Scope != scope {
+			continue
+		}
+		if narrowed && sk.ScopeID != scopeID {
+			continue
+		}
+		return sk, nil
+	}
+	return nil, nil
+}
+
 var skillsPublishCmd = &cobra.Command{
 	Use:   "publish <path>",
 	Short: "Publish a skill directory to the Hub",
@@ -247,6 +291,9 @@ func runSkillsPublish(cmd *cobra.Command, args []string) error {
 
 	if version == "" {
 		return newUsageError("--version is required")
+	}
+	if err := validateSkillScopeFlag(scope); err != nil {
+		return err
 	}
 
 	// Collect files
@@ -276,7 +323,10 @@ func runSkillsPublish(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("total size exceeds 50MB limit (%d bytes)", totalSize)
 	}
 
-	hubCtx, err := requireHub(projectPath)
+	// A global-scope publish reads no project, so it neither links nor
+	// looks up one: a hub token holding only skill selectors (no
+	// project:read) can publish global skills (ptone/scion#1713).
+	hubCtx, err := requireHubWith(projectPath, scope == "global")
 	if err != nil {
 		return fmt.Errorf("hub connection required: %w", err)
 	}
@@ -291,22 +341,44 @@ func runSkillsPublish(cmd *cobra.Command, args []string) error {
 		// Extract name from SKILL.md frontmatter or directory name
 		name := filepath.Base(filepath.Clean(skillDir))
 
-		listResp, err := skillSvc.List(ctx, &hubclient.ListSkillsOptions{Name: name})
-		if err == nil && len(listResp.Skills) > 0 {
-			skillID = listResp.Skills[0].ID
+		var projectID string
+		if scope == "project" {
+			projectID, err = GetProjectID(hubCtx)
+			if err != nil {
+				return err
+			}
+			if projectID == "" {
+				return fmt.Errorf("cannot publish project-scoped skill %q: could not determine the project ID (run 'scion hub link' to link this project with the Hub)", name)
+			}
+		}
+
+		// A user-scope skill lives in the caller's own user scope (the hub
+		// sets its scope ID to the caller), so the lookup is narrowed to the
+		// caller: an unrestricted caller, who can list every user's skills,
+		// never reuses another user's same-named skill.
+		lookupScopeID := projectID
+		if scope == "user" {
+			me, err := hubCtx.Client.Auth().Me(ctx)
+			if err != nil {
+				return fmt.Errorf("cannot publish user-scoped skill %q: failed to identify the caller: %w", name, err)
+			}
+			if me.ID == "" {
+				return fmt.Errorf("cannot publish user-scoped skill %q: the Hub did not return the caller's user ID", name)
+			}
+			lookupScopeID = me.ID
+		}
+
+		existing, err := findPublishTargetSkill(ctx, skillSvc, name, scope, lookupScopeID)
+		if err != nil && scope != "" {
+			// With a target scope a failed lookup is not "no such skill":
+			// creating one could duplicate an existing skill in that scope.
+			return fmt.Errorf("failed to look up skill %q in %s scope: %w", name, scope, err)
+		}
+		if err == nil && existing != nil {
+			skillID = existing.ID
 		} else {
 			if scope == "" {
 				scope = "global"
-			}
-			var projectID string
-			if scope == "project" {
-				projectID, err = GetProjectID(hubCtx)
-				if err != nil {
-					return err
-				}
-				if projectID == "" {
-					return fmt.Errorf("cannot create project-scoped skill %q: could not determine the project ID (run 'scion hub link' to link this project with the Hub)", name)
-				}
 			}
 			createResp, err := skillSvc.Create(ctx, &hubclient.CreateSkillRequest{
 				Name:    name,
@@ -336,32 +408,8 @@ func runSkillsPublish(cmd *cobra.Command, args []string) error {
 	}
 
 	// Upload files
-	for _, uploadInfo := range pubResp.UploadURLs {
-		// Find the matching local file
-		var match *publishFile
-		for i := range files {
-			if files[i].path == uploadInfo.Path {
-				match = &files[i]
-				break
-			}
-		}
-		if match == nil {
-			continue
-		}
-
-		// Read through os.Root (links that leave the skill directory are
-		// refused) and verified against the collected size and hash, so the
-		// uploaded bytes are the ones in the manifest. A mismatch fails
-		// before any byte of the file is sent.
-		data, err := transfer.ReadCollectedFile(skillRoot, match.collected())
-		if err != nil {
-			return err
-		}
-		err = skillSvc.UploadFile(ctx, uploadInfo.URL, uploadInfo.Method, uploadInfo.Headers, bytes.NewReader(data))
-		if err != nil {
-			return fmt.Errorf("failed to upload %s: %w", uploadInfo.Path, err)
-		}
-		fmt.Printf("  Uploaded %s\n", uploadInfo.Path)
+	if err := uploadSkillFiles(ctx, skillSvc, skillRoot, files, pubResp.UploadURLs, os.Stdout); err != nil {
+		return err
 	}
 
 	// Build manifest with the hashes recorded at collection
@@ -385,6 +433,22 @@ func runSkillsPublish(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Published %s v%s (hash: %s)\n", filepath.Base(filepath.Clean(skillDir)), sv.Version, sv.ContentHash)
 	return nil
+}
+
+// uploadSkillFiles uploads the collected skill files that have an upload
+// URL, printing "  Uploaded <path>" to out for each. Each file is read
+// through root (links that leave the skill directory are refused) and
+// verified against the collected size and hash, so the uploaded bytes are
+// the ones in the manifest. A mismatch fails before any byte of that file
+// is sent, and stops the upload.
+func uploadSkillFiles(ctx context.Context, up signedURLUploader, root *os.Root, files []publishFile, urls []hubclient.UploadURLInfo, out io.Writer) error {
+	byPath := make(map[string]transfer.FileInfo, len(files))
+	for _, f := range files {
+		byPath[f.path] = f.collected()
+	}
+	return uploadCollectedFiles(ctx, up, root, byPath, urls, nil, func(path string) {
+		_, _ = fmt.Fprintf(out, "  Uploaded %s\n", path)
+	})
 }
 
 type publishFile struct {
@@ -721,6 +785,9 @@ func runSkillsResolve(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Name: %s\n", result.Name)
 	fmt.Printf("Resolved Version: %s\n", result.ResolvedVersion)
 	fmt.Printf("Content Hash: %s\n", result.ContentHash)
+	if result.ContentHashV2 != "" {
+		fmt.Printf("Content Hash v2: %s\n", result.ContentHashV2)
+	}
 	if len(result.Files) > 0 {
 		fmt.Println("Files:")
 		for _, f := range result.Files {
@@ -743,7 +810,7 @@ func init() {
 	skillsCmd.AddCommand(skillsResolveCmd)
 
 	// Flags for list command
-	skillsListCmd.Flags().String("scope", "", "Filter by scope (core, global, project, user)")
+	skillsListCmd.Flags().String("scope", "", "Filter by scope (global, project, user)")
 	skillsListCmd.Flags().String("search", "", "Search skills by name, description, or tags")
 	skillsListCmd.Flags().StringSlice("tags", nil, "Filter by tags (repeatable or comma-separated, AND semantics; each value is parsed as CSV, so a tag containing a double quote must be CSV-quoted)")
 
@@ -754,7 +821,7 @@ func init() {
 
 	// Flags for publish command
 	skillsPublishCmd.Flags().String("version", "", "Semver version to publish (required)")
-	skillsPublishCmd.Flags().String("scope", "", "Scope for new skills (core, global, project, user)")
+	skillsPublishCmd.Flags().String("scope", "", "Scope to publish into (global, project, user). When set, only a same-named skill in that scope (this project for project, your own for user) gets the version; when unset, any same-named skill does. A new skill is created in this scope, default global")
 	skillsPublishCmd.Flags().String("skill-id", "", "Existing skill ID to publish a version for")
 
 	// Also add a 'skill' alias (singular) for convenience

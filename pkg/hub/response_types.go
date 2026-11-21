@@ -53,6 +53,11 @@ type AgentWithCapabilities struct {
 	// Pointers, so "" still reaches the wire while unset means omitted.
 	ResolvedTimezone *string `json:"resolvedTimezone,omitempty"`
 	TimezoneSource   *string `json:"timezoneSource,omitempty"`
+	// Authority is the agent's authority state (agent_authority_state.go):
+	// set on the single-agent GET, and on full-view list items when the
+	// request carries include=authority; never for a request made with an
+	// agent delegated credential.
+	Authority *api.AgentAuthority `json:"authority,omitempty"`
 }
 
 // MarshalJSON implements custom marshaling to avoid shadowing of fields by the embedded store.Agent.
@@ -72,6 +77,7 @@ func (a AgentWithCapabilities) MarshalJSON() ([]byte, error) {
 		SSHHostKey          string                           `json:"sshHostKey,omitempty"`
 		ResolvedTimezone    *string                          `json:"resolvedTimezone,omitempty"`
 		TimezoneSource      *string                          `json:"timezoneSource,omitempty"`
+		Authority           *api.AgentAuthority              `json:"authority,omitempty"`
 	}{
 		AgentAlias:          AgentAlias(a.Agent),
 		Cap:                 a.Cap,
@@ -86,6 +92,7 @@ func (a AgentWithCapabilities) MarshalJSON() ([]byte, error) {
 		SSHHostKey:          a.SSHHostKey,
 		ResolvedTimezone:    a.ResolvedTimezone,
 		TimezoneSource:      a.TimezoneSource,
+		Authority:           a.Authority,
 	})
 }
 
@@ -107,6 +114,7 @@ func (a *AgentWithCapabilities) UnmarshalJSON(data []byte) error {
 		SSHHostKey          string                           `json:"sshHostKey,omitempty"`
 		ResolvedTimezone    *string                          `json:"resolvedTimezone,omitempty"`
 		TimezoneSource      *string                          `json:"timezoneSource,omitempty"`
+		Authority           *api.AgentAuthority              `json:"authority,omitempty"`
 	}
 	var wrapper WrapperFields
 	if err := json.Unmarshal(data, &wrapper); err != nil {
@@ -124,6 +132,7 @@ func (a *AgentWithCapabilities) UnmarshalJSON(data []byte) error {
 	a.SSHHostKey = wrapper.SSHHostKey
 	a.ResolvedTimezone = wrapper.ResolvedTimezone
 	a.TimezoneSource = wrapper.TimezoneSource
+	a.Authority = wrapper.Authority
 	return nil
 }
 
@@ -332,6 +341,10 @@ type RuntimeBrokerWithCapabilities struct {
 	// load balancer with several hub replicas it describes the replica
 	// that answered. Read-only and display-only; omitted when false.
 	HostedByThisServer bool `json:"hostedByThisServer,omitempty"`
+	// VersionStatus compares the broker's version with the fleet hub
+	// version: match, mismatch or unknown (see brokerVersionStatus).
+	// Omitted for a plugin record.
+	VersionStatus string `json:"versionStatus,omitempty"`
 }
 
 // MarshalJSON implements custom marshaling to avoid shadowing of fields by the embedded store.RuntimeBroker.
@@ -344,6 +357,7 @@ func (b RuntimeBrokerWithCapabilities) MarshalJSON() ([]byte, error) {
 		AgentCount         *int64        `json:"agentCount,omitempty"`
 		AgentLimitSource   string        `json:"agentLimitSource,omitempty"`
 		HostedByThisServer bool          `json:"hostedByThisServer,omitempty"`
+		VersionStatus      string        `json:"versionStatus,omitempty"`
 	}{
 		BrokerAlias:        BrokerAlias(b.RuntimeBroker),
 		Cap:                b.Cap,
@@ -351,6 +365,7 @@ func (b RuntimeBrokerWithCapabilities) MarshalJSON() ([]byte, error) {
 		AgentCount:         b.AgentCount,
 		AgentLimitSource:   b.AgentLimitSource,
 		HostedByThisServer: b.HostedByThisServer,
+		VersionStatus:      b.VersionStatus,
 	})
 }
 
@@ -364,6 +379,7 @@ func (b *RuntimeBrokerWithCapabilities) UnmarshalJSON(data []byte) error {
 		AgentCount         *int64        `json:"agentCount,omitempty"`
 		AgentLimitSource   string        `json:"agentLimitSource,omitempty"`
 		HostedByThisServer bool          `json:"hostedByThisServer,omitempty"`
+		VersionStatus      string        `json:"versionStatus,omitempty"`
 	}{
 		BrokerAlias: (*BrokerAlias)(&b.RuntimeBroker),
 	}
@@ -375,5 +391,6 @@ func (b *RuntimeBrokerWithCapabilities) UnmarshalJSON(data []byte) error {
 	b.AgentCount = aux.AgentCount
 	b.AgentLimitSource = aux.AgentLimitSource
 	b.HostedByThisServer = aux.HostedByThisServer
+	b.VersionStatus = aux.VersionStatus
 	return nil
 }

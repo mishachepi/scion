@@ -163,7 +163,19 @@ type ResolveOpts struct {
 	// access via the policy engine. If nil, progeny secrets are not included.
 	// Returns true if access is allowed.
 	AuthzCheck func(secret SecretMeta) bool
+
+	// UserScopeCheck, when non-nil, is called for each user-scope secret
+	// of the userID scope (the owner path, not the progeny path) before its
+	// value is read. A secret it rejects is skipped, so a lower-scope secret
+	// with the same key stays in effect. If nil, no such check is made.
+	UserScopeCheck func(secret SecretMeta) bool
 }
+
+// ErrValueAccess matches (errors.Is) a FetchResult.Err for a value the
+// backend's external secret store (GCP Secret Manager) could not return,
+// other than not found. GCPBackend.Resolve skips such a secret; a caller
+// that selects through FetchValues may do the same.
+var ErrValueAccess = errors.New("secret value could not be read from the external secret store")
 
 // FetchResult holds the outcome of fetching one secret's value by its
 // recorded metadata. Value is meaningful only when Err is nil; a failed item
@@ -172,7 +184,21 @@ type ResolveOpts struct {
 // doc comments for the shared contract).
 type FetchResult struct {
 	Value string
-	Err   error
+	// Ref is the external reference the value was read from, in the form
+	// Resolve reports as SecretMeta.SecretRef for the same record, so a
+	// caller that delivers fetched values hands brokers the same reference
+	// Resolve did. On the GCP backend it is the Secret Manager resource path
+	// (projects/<project>/secrets/<name>, never the stored "gcpsm:" form),
+	// including the computed name for a record with no stored gcpsm ref; on
+	// the local backend it is the record's stored ref (normally empty).
+	// Empty when Err is set.
+	Ref string
+	// Err is store.ErrNotFound for a record deleted, replaced or
+	// reclassified since its metadata was recorded; a *ResolveDecryptError
+	// (errors.Is ErrResolveDecrypt) for a stored value that cannot be
+	// decrypted; an error matching ErrValueAccess for an external secret
+	// store read failure; otherwise the store read error.
+	Err error
 }
 
 // SecretBackend defines the interface for secret storage operations.
@@ -245,6 +271,10 @@ type SecretBackend interface {
 
 	// HubID returns the hub instance ID used for hub-scoped secret namespacing.
 	HubID() string
+
+	// PendingHolder holds pending secret values (HoldPending, ReadPending,
+	// DropPending).
+	PendingHolder
 }
 
 // scopePrecedence returns a numeric rank for the given scope string.
@@ -328,4 +358,34 @@ func DeduplicateByTarget(secrets []SecretWithValue) []SecretWithValue {
 		}
 	}
 	return result
+}
+
+// PendingHolder holds the values of pending secrets: user-scope secrets
+// written by an agent that wait for the owner's approval. A held value is
+// never part of Resolve, List, Get or FetchValues; it is read only when the
+// owner approves it.
+type PendingHolder interface {
+	// HoldPending stores value for the pending secret id and returns the
+	// reference to record on the pending row.
+	HoldPending(ctx context.Context, id string, value []byte) (ref string, err error)
+
+	// ReadPending returns the value held under ref.
+	ReadPending(ctx context.Context, ref string) ([]byte, error)
+
+	// DropPending releases the value held under ref. Dropping a value that
+	// is already gone is not an error.
+	DropPending(ctx context.Context, ref string) error
+
+	// ListHeldPending returns the pending values this hub holds outside
+	// the pending rows, with the pending id each was held for and when it
+	// was stored, so values no row references can be released. A backend
+	// that holds values on the rows themselves returns none.
+	ListHeldPending(ctx context.Context) ([]HeldPendingValue, error)
+}
+
+// HeldPendingValue is a pending value held by the secret backend.
+type HeldPendingValue struct {
+	Ref       string    // the reference HoldPending returned
+	PendingID string    // the pending id it was held for
+	Created   time.Time // when the backend stored it
 }

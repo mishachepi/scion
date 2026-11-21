@@ -19,8 +19,11 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentcredential"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentdelegatedcredential"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentdelegationgrant"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentdeliveryhold"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agenthold"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentidentitykey"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentlifecyclecursor"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentlifecycleoutbox"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentrecovery"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentreincarnation"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentserviceaccountassignment"
@@ -34,12 +37,18 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/brokersetting"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/brokertargetinventory"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/chatlinkcode"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/chatretentioncursor"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/chatretentionrun"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/conduitprincipalepoch"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/conduitsession"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/conversation"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/conversationparticipant"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/decision"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/decisionanswer"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/decisionkeycounter"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/delegationadoption"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/delegationedge"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/durablequeueitem"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/entitlementbinding"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/envvar"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/externalidentity"
@@ -49,6 +58,8 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/group"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/groupmembership"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/harnessconfig"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/hubencryptionmigration"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/hubencryptionpolicy"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/hubinstance"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/hubsetting"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/integrationconfig"
@@ -63,10 +74,13 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/membershiplosscheck"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/message"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/messageaddressee"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/messagepolicy"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/messagepolicydecision"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/mutationaudit"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/noncecache"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/notification"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/notificationsubscription"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/pendingsecret"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/policybinding"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/project"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/projectcontributor"
@@ -78,24 +92,34 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/rolebinding"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/roledefinition"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/runtimebroker"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/runtimeorphan"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/schedule"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/scheduledevent"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/scheduledexecpollcursor"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/scheduledexecrun"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/secret"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/skill"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/skillinjection"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/skillregistry"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/skillversion"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/subscriptiontemplate"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/systemoneinstance"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/template"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/testidentitydelegation"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/testidentitylogincode"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/testinframarker"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/threadgroup"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/threadgroupmember"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/trigger"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/triggerevent"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/triggerfire"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/usagereservation"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/user"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/useraccesstoken"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/userdeletion"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/userdeletionagent"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/userterminalworkspace"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/webhookendpoint"
 )
 
 // ent aliases to avoid import conflicts in user's code.
@@ -163,8 +187,11 @@ func checkColumn(t, c string) error {
 			agentcredential.Table:               agentcredential.ValidColumn,
 			agentdelegatedcredential.Table:      agentdelegatedcredential.ValidColumn,
 			agentdelegationgrant.Table:          agentdelegationgrant.ValidColumn,
+			agentdeliveryhold.Table:             agentdeliveryhold.ValidColumn,
 			agenthold.Table:                     agenthold.ValidColumn,
 			agentidentitykey.Table:              agentidentitykey.ValidColumn,
+			agentlifecyclecursor.Table:          agentlifecyclecursor.ValidColumn,
+			agentlifecycleoutbox.Table:          agentlifecycleoutbox.ValidColumn,
 			agentrecovery.Table:                 agentrecovery.ValidColumn,
 			agentreincarnation.Table:            agentreincarnation.ValidColumn,
 			agentserviceaccountassignment.Table: agentserviceaccountassignment.ValidColumn,
@@ -178,12 +205,18 @@ func checkColumn(t, c string) error {
 			brokersetting.Table:                 brokersetting.ValidColumn,
 			brokertargetinventory.Table:         brokertargetinventory.ValidColumn,
 			chatlinkcode.Table:                  chatlinkcode.ValidColumn,
+			chatretentioncursor.Table:           chatretentioncursor.ValidColumn,
+			chatretentionrun.Table:              chatretentionrun.ValidColumn,
 			conduitprincipalepoch.Table:         conduitprincipalepoch.ValidColumn,
 			conduitsession.Table:                conduitsession.ValidColumn,
 			conversation.Table:                  conversation.ValidColumn,
 			conversationparticipant.Table:       conversationparticipant.ValidColumn,
+			decision.Table:                      decision.ValidColumn,
+			decisionanswer.Table:                decisionanswer.ValidColumn,
+			decisionkeycounter.Table:            decisionkeycounter.ValidColumn,
 			delegationadoption.Table:            delegationadoption.ValidColumn,
 			delegationedge.Table:                delegationedge.ValidColumn,
+			durablequeueitem.Table:              durablequeueitem.ValidColumn,
 			entitlementbinding.Table:            entitlementbinding.ValidColumn,
 			envvar.Table:                        envvar.ValidColumn,
 			externalidentity.Table:              externalidentity.ValidColumn,
@@ -193,6 +226,8 @@ func checkColumn(t, c string) error {
 			group.Table:                         group.ValidColumn,
 			groupmembership.Table:               groupmembership.ValidColumn,
 			harnessconfig.Table:                 harnessconfig.ValidColumn,
+			hubencryptionmigration.Table:        hubencryptionmigration.ValidColumn,
+			hubencryptionpolicy.Table:           hubencryptionpolicy.ValidColumn,
 			hubinstance.Table:                   hubinstance.ValidColumn,
 			hubsetting.Table:                    hubsetting.ValidColumn,
 			integrationconfig.Table:             integrationconfig.ValidColumn,
@@ -207,10 +242,13 @@ func checkColumn(t, c string) error {
 			membershiplosscheck.Table:           membershiplosscheck.ValidColumn,
 			message.Table:                       message.ValidColumn,
 			messageaddressee.Table:              messageaddressee.ValidColumn,
+			messagepolicy.Table:                 messagepolicy.ValidColumn,
+			messagepolicydecision.Table:         messagepolicydecision.ValidColumn,
 			mutationaudit.Table:                 mutationaudit.ValidColumn,
 			noncecache.Table:                    noncecache.ValidColumn,
 			notification.Table:                  notification.ValidColumn,
 			notificationsubscription.Table:      notificationsubscription.ValidColumn,
+			pendingsecret.Table:                 pendingsecret.ValidColumn,
 			policybinding.Table:                 policybinding.ValidColumn,
 			project.Table:                       project.ValidColumn,
 			projectcontributor.Table:            projectcontributor.ValidColumn,
@@ -222,24 +260,34 @@ func checkColumn(t, c string) error {
 			rolebinding.Table:                   rolebinding.ValidColumn,
 			roledefinition.Table:                roledefinition.ValidColumn,
 			runtimebroker.Table:                 runtimebroker.ValidColumn,
+			runtimeorphan.Table:                 runtimeorphan.ValidColumn,
 			schedule.Table:                      schedule.ValidColumn,
 			scheduledevent.Table:                scheduledevent.ValidColumn,
+			scheduledexecpollcursor.Table:       scheduledexecpollcursor.ValidColumn,
+			scheduledexecrun.Table:              scheduledexecrun.ValidColumn,
 			secret.Table:                        secret.ValidColumn,
 			skill.Table:                         skill.ValidColumn,
 			skillinjection.Table:                skillinjection.ValidColumn,
 			skillregistry.Table:                 skillregistry.ValidColumn,
 			skillversion.Table:                  skillversion.ValidColumn,
 			subscriptiontemplate.Table:          subscriptiontemplate.ValidColumn,
+			systemoneinstance.Table:             systemoneinstance.ValidColumn,
 			template.Table:                      template.ValidColumn,
 			testidentitydelegation.Table:        testidentitydelegation.ValidColumn,
 			testidentitylogincode.Table:         testidentitylogincode.ValidColumn,
 			testinframarker.Table:               testinframarker.ValidColumn,
 			threadgroup.Table:                   threadgroup.ValidColumn,
 			threadgroupmember.Table:             threadgroupmember.ValidColumn,
+			trigger.Table:                       trigger.ValidColumn,
+			triggerevent.Table:                  triggerevent.ValidColumn,
+			triggerfire.Table:                   triggerfire.ValidColumn,
 			usagereservation.Table:              usagereservation.ValidColumn,
 			user.Table:                          user.ValidColumn,
 			useraccesstoken.Table:               useraccesstoken.ValidColumn,
+			userdeletion.Table:                  userdeletion.ValidColumn,
+			userdeletionagent.Table:             userdeletionagent.ValidColumn,
 			userterminalworkspace.Table:         userterminalworkspace.ValidColumn,
+			webhookendpoint.Table:               webhookendpoint.ValidColumn,
 		})
 	})
 	return columnCheck(t, c)

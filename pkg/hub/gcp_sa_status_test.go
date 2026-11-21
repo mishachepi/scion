@@ -304,14 +304,12 @@ func TestGCPSAStatus_AgentOnlyInOwnProject(t *testing.T) {
 	require.NoError(t, s.CreateProject(ctx, other))
 	otherAgent := createSAStatusAgent(t, s, other.ID, "outsider", "")
 
-	ownToken, err := srv.agentTokenService.GenerateAgentToken(agent.ID, projectID, nil, nil)
-	require.NoError(t, err)
+	ownToken := srv.generateRecordedAgentToken(t, agent.ID, projectID, nil, nil)
 	rec := doRequestWithAgentToken(t, srv, http.MethodGet, statusPath(projectID, sa.ID), nil, ownToken)
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 	assert.Contains(t, rec.Body.String(), mappedGSA, "project agents may see the account email")
 
-	otherToken, err := srv.agentTokenService.GenerateAgentToken(otherAgent.ID, other.ID, nil, nil)
-	require.NoError(t, err)
+	otherToken := srv.generateRecordedAgentToken(t, otherAgent.ID, other.ID, nil, nil)
 	rec = doRequestWithAgentToken(t, srv, http.MethodGet, statusPath(projectID, sa.ID), nil, otherToken)
 	assert.Equal(t, http.StatusNotFound, rec.Code, rec.Body.String())
 }
@@ -362,6 +360,39 @@ func TestGCPSANextStep(t *testing.T) {
 			assert.Contains(t, got.Message, tc.wantMessage)
 		})
 	}
+
+	t.Run("not_bound returns not_bound code and manual step (R1)", func(t *testing.T) {
+		manual := workloadIdentityManualStep(mappedGSA, "serviceAccount:pool-a.svc.id.goog[agents/scion-worker]")
+		got := gcpSANextStepForBinding(true, []GCPServiceAccountProfileMapping{m("a", GCPSAMappingMapped)}, nil, GCPServiceAccountBinding{
+			State: GCPSABindingNotBound,
+			Targets: []GCPServiceAccountBindingTarget{
+				{State: GCPSABindingBound, Member: "serviceAccount:pool-ok.svc.id.goog[agents/scion-worker]", Profiles: []string{"b/ok"}},
+				{State: GCPSABindingNotBound, Member: "serviceAccount:pool-a.svc.id.goog[agents/scion-worker]", Profiles: []string{"b/a"}, ManualStep: manual},
+			},
+		})
+		assert.Equal(t, GCPSANextStepNotBound, got.Code)
+		assert.Contains(t, got.Message, "b/a")
+		assert.Contains(t, got.Message, manual)
+	})
+
+	t.Run("experiment-off unknown keeps exact legacy message", func(t *testing.T) {
+		got := gcpSANextStepForBinding(true, []GCPServiceAccountProfileMapping{m("a", GCPSAMappingMapped)}, nil, GCPServiceAccountBinding{
+			State:  GCPSABindingUnknown,
+			Reason: "not checked",
+		})
+		assert.Equal(t, GCPSANextStepNone, got.Code)
+		assert.Equal(t, "Nothing missing that the hub can check. The Workload Identity binding is not checked.", got.Message)
+	})
+
+	t.Run("IAM read failure says could not be checked (O5)", func(t *testing.T) {
+		got := gcpSANextStepForBinding(true, []GCPServiceAccountProfileMapping{m("a", GCPSAMappingMapped)}, nil, GCPServiceAccountBinding{
+			State:  GCPSABindingUnknown,
+			Reason: GCPSABindingReasonIAMReadFailed,
+		})
+		assert.Equal(t, GCPSANextStepNone, got.Code)
+		assert.Contains(t, got.Message, "could not be checked")
+		assert.NotContains(t, got.Message, "is not checked")
+	})
 }
 
 // The list's mapping summary counts with the shared decision, like the status
@@ -414,8 +445,7 @@ func TestGCPSAStatus_AgentWithoutProjectReadSeesNoAgents(t *testing.T) {
 	agent := createSAStatusAgent(t, s, projectID, "no-read", sa.ID)
 	createSAStatusAgent(t, s, projectID, "sibling", sa.ID)
 
-	tok, err := srv.agentTokenService.GenerateAgentToken(agent.ID, projectID, []AgentTokenScope{ScopeAgentStatusUpdate}, nil)
-	require.NoError(t, err)
+	tok := srv.generateRecordedAgentToken(t, agent.ID, projectID, []AgentTokenScope{ScopeAgentStatusUpdate}, nil)
 
 	// Section level: the gate itself, independent of the route's project
 	// read check.
@@ -481,8 +511,7 @@ func TestGCPSAStatus_HubScopedAccount(t *testing.T) {
 	// Same read gate as the plain nested GET: a caller with no user identity
 	// (an agent) is refused hub-scoped accounts on both routes alike.
 	agent := createSAStatusAgent(t, s, projectID, "hub-reader", "")
-	tok, err := srv.agentTokenService.GenerateAgentToken(agent.ID, projectID, nil, nil)
-	require.NoError(t, err)
+	tok := srv.generateRecordedAgentToken(t, agent.ID, projectID, nil, nil)
 	plain := doRequestWithAgentToken(t, srv, http.MethodGet,
 		fmt.Sprintf("/api/v1/projects/%s/gcp-service-accounts/%s", projectID, hubSA.ID), nil, tok)
 	status := doRequestWithAgentToken(t, srv, http.MethodGet, statusPath(projectID, hubSA.ID), nil, tok)

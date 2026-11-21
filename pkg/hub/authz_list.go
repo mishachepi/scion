@@ -81,18 +81,45 @@ func (a *AuthzService) ResolveListScopes(ctx context.Context, identity Identity,
 // scopePermissionID.
 func (a *AuthzService) resolveListScopesWithCeiling(ctx context.Context, identity Identity, scopePermissionID, ceilingPermissionID string) (ListScopeResult, error) {
 	none := ListScopeResult{Scopes: ScopeSetNone()}
-	permissionID := scopePermissionID
-
 	if identity == nil {
 		return none, nil
 	}
 	// An agent delegated credential never gets a list scope from this
-	// function: the agent's own principals contribute nothing, and no list
-	// operation admits a delegated credential yet (.design/agent-delegation.md
-	// §11.8). An error, never a scope, so the caller fails closed.
+	// function: the agent's own principals contribute nothing. A delegated
+	// list takes its scope only from the delegated list arm (delegatedListScope),
+	// which resolves the authorizing user's scope through
+	// resolveListScopesForPrincipal (.design/agent-delegation.md §11.8). An
+	// error, never a scope, so any other caller fails closed.
 	if isDelegatedAgentIdentity(identity) {
 		return none, errDelegatedListScope
 	}
+	return a.resolveListScopesForIdentity(ctx, identity, scopePermissionID, ceilingPermissionID)
+}
+
+// resolveListScopesForPrincipal resolves the list scope of principal, an
+// authorizing user held as an argument, for permissionID. It is
+// ResolveListScopes for a principal that is not the request's identity:
+// the delegated list arm passes the issuer it built from the stored issuer
+// row, which is never placed in the identity slot. Only a user principal
+// with an identity is accepted; anything else gets no scope and an error.
+// The issuer is a session principal, so no credential caveat reduces its
+// scope; its access constraints apply as for any user.
+func (a *AuthzService) resolveListScopesForPrincipal(ctx context.Context, principal PrincipalContext, permissionID string) (ListScopeResult, error) {
+	none := ListScopeResult{Scopes: ScopeSetNone()}
+	if isNilIdentity(principal.Identity) || principal.Kind != PrincipalKindUser {
+		return none, errors.New("resolveListScopesForPrincipal: not a user principal")
+	}
+	if isDelegatedAgentIdentity(principal.Identity) {
+		return none, errDelegatedListScope
+	}
+	return a.resolveListScopesForIdentity(ctx, principal.Identity, permissionID, permissionID)
+}
+
+// resolveListScopesForIdentity is the body of resolveListScopesWithCeiling
+// for a non-nil identity that is not an agent delegated credential.
+func (a *AuthzService) resolveListScopesForIdentity(ctx context.Context, identity Identity, scopePermissionID, ceilingPermissionID string) (ListScopeResult, error) {
+	none := ListScopeResult{Scopes: ScopeSetNone()}
+	permissionID := scopePermissionID
 
 	// Note: Suspension is enforced at the auth middleware layer, which rejects
 	// suspended principals before the handler runs. ResolveListScopes does not
@@ -102,8 +129,8 @@ func (a *AuthzService) resolveListScopesWithCeiling(ctx context.Context, identit
 	authzIn := a.inputsFor(ctx, identity)
 	principals, err := authzIn.Principals()
 	if err != nil {
-		a.logger.WarnContext(ctx, "ResolveListScopes: failed to resolve principals",
-			"error", err, "permission", permissionID)
+		logAuthzCheckFault(ctx, a.logger, "list_scope_principals",
+			"ResolveListScopes: failed to resolve principals", err, "permission", permissionID)
 		return none, fmt.Errorf("ResolveListScopes: principal resolution: %w", err)
 	}
 
@@ -123,8 +150,8 @@ func (a *AuthzService) resolveListScopesWithCeiling(ctx context.Context, identit
 	// and project scoped) so ResolveAuthorizedScopes can compute the full set.
 	bindings, err := authzIn.Bindings()
 	if err != nil {
-		a.logger.WarnContext(ctx, "ResolveListScopes: failed to load role bindings",
-			"error", err, "permission", permissionID)
+		logAuthzCheckFault(ctx, a.logger, "list_scope_role_bindings",
+			"ResolveListScopes: failed to load role bindings", err, "permission", permissionID)
 		return none, fmt.Errorf("ResolveListScopes: role binding load: %w", err)
 	}
 
@@ -135,8 +162,8 @@ func (a *AuthzService) resolveListScopesWithCeiling(ctx context.Context, identit
 	// Step 3: Collect unique role definition IDs and load them.
 	roleDefinitions, err := authzIn.RoleDefs()
 	if err != nil {
-		a.logger.WarnContext(ctx, "ResolveListScopes: failed to load role definitions",
-			"error", err, "permission", permissionID)
+		logAuthzCheckFault(ctx, a.logger, "list_scope_role_definitions",
+			"ResolveListScopes: failed to load role definitions", err, "permission", permissionID)
 		return none, fmt.Errorf("ResolveListScopes: role definition load: %w", err)
 	}
 
@@ -243,8 +270,8 @@ func (a *AuthzService) applyListScopeConstraints(
 	constraints, err := a.loadAllAccessConstraints(ctx)
 	if err != nil {
 		// C-2 + R-1: fail closed when constraint loading errors.
-		a.logger.WarnContext(ctx, "ResolveListScopes: failed to load access constraints (fail-closed)",
-			"error", err, "permission", permissionID)
+		logAuthzCheckFault(ctx, a.logger, "list_scope_access_constraints",
+			"ResolveListScopes: failed to load access constraints (fail-closed)", err, "permission", permissionID)
 		return none, fmt.Errorf("ResolveListScopes: constraint load: %w", err)
 	}
 	if len(constraints) == 0 {
@@ -372,6 +399,7 @@ func (a *AuthzService) loadRoleDefinitions(ctx context.Context, roleDefIDs []str
 	for _, rd := range defs {
 		rp := NewRolePermissions(rd.ID, rd.Name, rd.ScopeType, rd.Permissions)
 		rp.ConfersMembership = rd.ConfersProjectMembership()
+		rp.System = rd.System
 		result[rd.ID] = rp
 	}
 	return result, nil

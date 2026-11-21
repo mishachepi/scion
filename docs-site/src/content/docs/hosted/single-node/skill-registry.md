@@ -9,8 +9,10 @@ The Hub is the authoritative **Skill Registry** for the Skill Bank: it stores pu
 
 The Hub persists two record types:
 
-- **Skill** — the logical skill: `name`, `slug`, `description`, `tags`, `scope` (`core`, `global`, `project`, `user`) and optional `scope_id`, ownership, and `status` (`active` or `archived`). Skills are unique per `(slug, scope, scope_id)`.
+- **Skill** — the logical skill: `name`, `slug`, `description`, `tags`, `scope` (`global`, `project`, `user`; the former `core` scope is retired) and optional `scope_id`, ownership, and `status` (`active` or `archived`). Skills are unique per `(slug, scope, scope_id)`.
 - **SkillVersion** — an immutable release of a skill: `version` (semver), `status` (`draft`, `published`, `deprecated`, `archived`), a `sha256:` `content_hash`, the file manifest, publisher, download count, and — for deprecated versions — a deprecation message and optional replacement URI.
+
+Resolving a version constraint or content hash considers only `published` and `deprecated` versions. Reading a file by version number, the versions list and a single version's details apply the same rule, except that callers who can update the skill also see its `draft` and `archived` versions, and so do the skill's owner and creator unless it is a global skill (for a global skill, that takes `skill.update_global`). A version outside that set is reported as not found, exactly like a version that does not exist. Signed file URLs that the Hub issues at dispatch serve the version they were issued for until they expire.
 
 `scion skills delete` performs a **soft delete**: the skill's status becomes `archived` and its records are retained for audit and history.
 
@@ -28,7 +30,7 @@ By default a skill reference resolves against the local Hub. Federation lets the
 
 ### GitHub source (`gh://`)
 
-Skills can be sourced directly from a GitHub repository path. The resolver uses the GitHub Contents API and caches its resolutions locally. Requests are retried with exponential backoff, and individual files are capped at 10 MB.
+Skills can be sourced directly from a GitHub repository path. The resolver lists the skill directory with one GitHub git trees API call and caches its resolutions locally. Requests are retried with exponential backoff, and individual files are capped at 10 MB. For what a resolved `gh://` skill contains (subdirectories, executable files, symlinks and submodules), see [GitHub skill URIs](/scion/local/skills/#github-skill-uris-gh).
 
 #### Authentication & reliability
 
@@ -135,9 +137,18 @@ scion skills registries pin partner-hub \
 | :--- | :--- | :--- |
 | `<name-or-id>` | Yes | Registry name or ID. |
 | `<skill-uri>` | Yes | The skill URI to pin. |
-| `--hash` | Yes | The `sha256:` content hash to trust for that URI. |
+| `--hash` | Yes | The `sha256:` content hash to trust for that URI, in either form (see [Content hash forms](#content-hash-forms)). |
 
 Pins can also be managed from the [registry admin UI](#web-ui). Obtain the hash to pin with `scion skills resolve <uri>` or `scion skills versions <name>`.
+
+### Content hash forms
+
+A skill version has two `sha256:` content hashes:
+
+- **Content hash** (`contentHash`): covers the file contents only. Every hub records it and sends it, and every Runtime Broker verifies an installed skill against it. Existing pins hold this form.
+- **Content hash v2** (`contentHashV2`): covers each file's path and normalized mode (executable bit) as well as its contents, so a rename or a chmod-only change gives a different value. A hub sends it only while the `hub.skill_content_hash_v2` [experiment](/scion/reference/experiments/) is on (off by default); it is derived from the version's file list, so versions published before it existed have one too. `scion skills resolve <uri>` prints it as `Content Hash v2`.
+
+While the experiment is on, a pin, and an `@sha256:` version in a skill URI, match either form (the content hash first; when multiple versions of a skill share the same v1 `contentHash` because only paths or executable bits changed between them, an `@sha256:` lookup on that v1 hash resolves deterministically to the oldest matching version). An `@sha256:` lookup considers the same versions as the other version constraints: `published` and `deprecated` versions match, and `draft` and `archived` versions never do. For a federated skill the Hub also recomputes both hashes from the file list the registry returns and rejects the skill if the registry's claimed hash disagrees; a pinned registry must also list a hash for every file, and a skill with no content hash and no per-file hashes is rejected from any registry, since nothing could verify it. A Runtime Broker verifies the v2 hash whenever the Hub sends one, in addition to the content hash. While the experiment is off, a pin matches the content hash only, as before.
 
 ## Web UI
 
@@ -150,9 +161,9 @@ Registry administration is capability-gated; it is available to users with the a
 
 ### Global catalog authoring
 
-Publishing skills to the `global` scope requires the `skill.create_global` permission. Hub administrators hold this permission by default. For non-admin users who need to author global skills, assign the system-scoped `global-catalog-author` role. This role grants only `skill.create_global`, decoupling global skill authoring from full Hub administration authority.
+Global skills have their own permissions: `skill.create_global` to create one, `skill.update_global` to publish new versions, change it or deprecate a version, and `skill.delete_global` to delete it. The plain `skill.update` and `skill.delete` permissions, and owning the skill, do not cover global skills. Hub administrators hold all three by default. For non-admin users who need to author global skills, assign the system-scoped `global-catalog-author` role, which grants these three and the matching global template permissions, and nothing on project- or user-scoped records.
 
-See [Permissions & Policy — Roles](/scion/hosted/ha/permissions/#roles) for the complete role listing.
+See [Global catalog authoring](/scion/hosted/ha/permissions/#global-catalog-authoring) for the full model, including the risk of putting a global skill on the Hub's injected list, and [Hub-boundary tokens for global catalog authoring](/scion/hosted/user/personal-access-tokens/#hub-boundary-tokens-for-global-catalog-authoring) for a CI token.
 
 ## See also
 

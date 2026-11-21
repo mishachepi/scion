@@ -135,13 +135,35 @@ type HubConduitConfig struct {
 	// grant may target besides the agent's exposed ports. The reserved
 	// ports (9810, 18380) are always refused. Empty: exposed ports only.
 	TCPAllowedPorts []int `json:"tcpAllowedPorts,omitempty" yaml:"tcpAllowedPorts,omitempty" koanf:"tcpAllowedPorts"`
+	// DisableSSH turns off the agents' SSH server; other streams still work.
+	DisableSSH bool `json:"disableSsh,omitempty" yaml:"disableSsh,omitempty" koanf:"disableSsh"`
+	// DenyPorts are agent-local ports no tunnel may reach; they win over
+	// exposed ports and TCPAllowedPorts.
+	DenyPorts []int `json:"denyPorts,omitempty" yaml:"denyPorts,omitempty" koanf:"denyPorts"`
+	// DisableSSHSocketForwarding refuses SSH Unix socket forwarding.
+	DisableSSHSocketForwarding bool `json:"disableSshSocketForwarding,omitempty" yaml:"disableSshSocketForwarding,omitempty" koanf:"disableSshSocketForwarding"`
 	// InternalListen is the host:port of the internal relay API listener
-	// ("" = none). It must be reachable only inside the cluster/VPC; TLS
-	// on the internal hop is recommended (http:// is accepted).
+	// ("" = none). It must be reachable only inside the cluster/VPC.
+	// Without InternalTLSCertFile it must be a loopback address
+	// (CheckRelayInternalListen).
 	InternalListen string `json:"internalListen,omitempty" yaml:"internalListen,omitempty" koanf:"internalListen"`
 	// InternalAdvertise is the base URL other nodes use to reach the
-	// internal listener ("" = derived).
+	// internal listener ("" = derived). It must be https:// unless it is
+	// loopback (CheckRelayTransport).
 	InternalAdvertise string `json:"internalAdvertise,omitempty" yaml:"internalAdvertise,omitempty" koanf:"internalAdvertise"`
+	// InternalTLSCertFile and InternalTLSKeyFile are the PEM certificate
+	// chain and private key the internal listener serves TLS with. Set
+	// both or neither.
+	InternalTLSCertFile string `json:"internalTlsCertFile,omitempty" yaml:"internalTlsCertFile,omitempty" koanf:"internalTlsCertFile"`
+	InternalTLSKeyFile  string `json:"internalTlsKeyFile,omitempty" yaml:"internalTlsKeyFile,omitempty" koanf:"internalTlsKeyFile"`
+	// InternalTLSCAFile is the PEM CA bundle every internal hop client
+	// verifies peers with. When set it replaces the system roots; a
+	// private or internal CA requires it.
+	InternalTLSCAFile string `json:"internalTlsCaFile,omitempty" yaml:"internalTlsCaFile,omitempty" koanf:"internalTlsCaFile"`
+	// InternalTLSServerName is the name internal hop clients verify in
+	// the peer certificate instead of the dialed host ("" = the dialed
+	// host), so one certificate can serve every node.
+	InternalTLSServerName string `json:"internalTlsServerName,omitempty" yaml:"internalTlsServerName,omitempty" koanf:"internalTlsServerName"`
 	// PeerAuth is "auto" (or ""), "oidc" or "hmac". Requests are signed in
 	// every mode; oidc (and auto on GCP) also requires an OIDC ID token.
 	PeerAuth string `json:"peerAuth,omitempty" yaml:"peerAuth,omitempty" koanf:"peerAuth"`
@@ -208,7 +230,41 @@ type HubConduitConfig struct {
 	// PeerSecretValue() (one trailing newline removed), never this raw
 	// field; only IsZero looks at the raw value.
 	PeerSecret string `json:"peerSecret,omitempty" yaml:"peerSecret,omitempty" koanf:"peerSecret"`
+	// PeerKeyFile is this node's relay-peer private key file (a PEM
+	// PKCS #8 Ed25519 key, readable only by the server). When set, the
+	// node signs relay-peer calls with it, and its instance id must be
+	// set and listed in Peers with the matching public key; startup is
+	// refused otherwise ("" = unset: the node signs as before).
+	PeerKeyFile string `json:"peerKeyFile,omitempty" yaml:"peerKeyFile,omitempty" koanf:"peerKeyFile"`
+	// Peers lists the relay peers enrolled with their own keys: each
+	// peer's instance id, role (relay or hub) and public keys. A peer's
+	// key verifies only calls made under that peer's id. Read at startup.
+	Peers []HubConduitPeer `json:"peers,omitempty" yaml:"peers,omitempty" koanf:"peers"`
 }
+
+// HubConduitPeer is one enrolled relay peer (server.hub.conduit.peers).
+type HubConduitPeer struct {
+	// ID is the peer's instance id (its server.hub.conduit.instance_id).
+	ID string `json:"id,omitempty" yaml:"id,omitempty" koanf:"id"`
+	// Role is relay or hub.
+	Role string `json:"role,omitempty" yaml:"role,omitempty" koanf:"role"`
+	// Keys are the peer's public keys; more than one during a rotation.
+	Keys []HubConduitPeerKey `json:"keys,omitempty" yaml:"keys,omitempty" koanf:"keys"`
+}
+
+// HubConduitPeerKey is one enrolled public key of a relay peer.
+type HubConduitPeerKey struct {
+	// KeyID names the key ([A-Za-z0-9_-]{1,32}, unique per peer).
+	KeyID string `json:"keyId,omitempty" yaml:"keyId,omitempty" koanf:"keyId"`
+	// PublicKey is the Ed25519 public key, standard base64.
+	PublicKey string `json:"publicKey,omitempty" yaml:"publicKey,omitempty" koanf:"publicKey"`
+}
+
+// ConduitPeerRoleRelay and ConduitPeerRoleHub are the HubConduitPeer roles.
+const (
+	ConduitPeerRoleRelay = "relay"
+	ConduitPeerRoleHub   = "hub"
+)
 
 // HubConduitStreamAuthzMax holds the stream authorization interval per
 // originating principal kind (server.hub.conduit.stream_authz_max). Each
@@ -236,11 +292,20 @@ type ConduitStreamAuthzMax struct {
 
 // IsZero reports whether nothing is configured.
 func (c HubConduitConfig) IsZero() bool {
-	return c.GrantKeyActivation == "" && len(c.TCPAllowedPorts) == 0 && c.InternalListen == "" &&
+	return c.GrantKeyActivation == "" && len(c.TCPAllowedPorts) == 0 && !c.DisableSSH &&
+		len(c.DenyPorts) == 0 && !c.DisableSSHSocketForwarding && c.InternalListen == "" &&
 		c.InternalAdvertise == "" && c.PeerAuth == "" && len(c.PeerServiceAccounts) == 0 && c.PeerAudience == "" &&
 		c.ReconnectWindow == "" && c.InstanceID == "" && c.AuthzRecheckInterval == "" && c.LifetimeCap == "" &&
 		c.ShutdownGrace == "" && c.ProxySessionMaxAge == "" && c.StreamAuthzMax.IsZero() &&
-		c.RelayMode == "" && c.Ingress == "" && c.TargetStreamDeadlines == "" && c.PeerSecret == ""
+		c.RelayMode == "" && c.Ingress == "" && c.TargetStreamDeadlines == "" && c.PeerSecret == "" &&
+		c.InternalTLSCertFile == "" && c.InternalTLSKeyFile == "" && c.InternalTLSCAFile == "" &&
+		c.InternalTLSServerName == "" && c.PeerKeyFile == "" && len(c.Peers) == 0
+}
+
+// InternalTLS reports whether the internal listener serves TLS (a
+// certificate and key are configured).
+func (c HubConduitConfig) InternalTLS() bool {
+	return c.InternalTLSCertFile != "" && c.InternalTLSKeyFile != ""
 }
 
 // IngressValue returns the ingress mode with the default applied.
@@ -491,6 +556,11 @@ func (c HubConduitConfig) Validate() error {
 		}
 		seen[p] = true
 	}
+	for _, p := range c.DenyPorts {
+		if p < 1 || p > 65535 {
+			errs = append(errs, fmt.Errorf("invalid server.hub.conduit.deny_ports: port %d is outside 1-65535", p))
+		}
+	}
 	if c.InternalListen != "" {
 		_, port, err := net.SplitHostPort(c.InternalListen)
 		if err == nil {
@@ -508,8 +578,11 @@ func (c HubConduitConfig) Validate() error {
 		u, err := url.Parse(c.InternalAdvertise)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" {
 			errs = append(errs, fmt.Errorf("invalid server.hub.conduit.internal_advertise %q: want http(s)://host:port", c.InternalAdvertise))
+		} else if err := CheckRelayTransport(c.InternalAdvertise); err != nil {
+			errs = append(errs, fmt.Errorf("invalid server.hub.conduit.internal_advertise: %w", err))
 		}
 	}
+	errs = append(errs, c.validateInternalTLS()...)
 	switch c.PeerAuthMode() {
 	case ConduitPeerAuthAuto, ConduitPeerAuthOIDC, ConduitPeerAuthHMAC:
 	default:
@@ -543,5 +616,65 @@ func (c HubConduitConfig) Validate() error {
 	if err := ValidatePeerSecret(c.PeerSecret); err != nil {
 		errs = append(errs, err)
 	}
+	errs = append(errs, validateConduitPeers(c.Peers)...)
 	return errors.Join(errs...)
+}
+
+// validateConduitPeers checks the shape of server.hub.conduit.peers: each
+// entry has an id (once), a role of relay or hub, and at least one key with
+// a key id (once per peer) and a public key. The keys themselves are
+// decoded when relay-peer auth is built.
+func validateConduitPeers(peers []HubConduitPeer) []error {
+	var errs []error
+	ids := map[string]bool{}
+	for i, p := range peers {
+		switch {
+		case p.ID == "":
+			errs = append(errs, fmt.Errorf("server.hub.conduit.peers[%d]: id is required", i))
+			continue
+		case ids[p.ID]:
+			errs = append(errs, fmt.Errorf("server.hub.conduit.peers: id %q is listed twice", p.ID))
+			continue
+		}
+		ids[p.ID] = true
+		if p.Role != ConduitPeerRoleRelay && p.Role != ConduitPeerRoleHub {
+			errs = append(errs, fmt.Errorf("server.hub.conduit.peers %q: role %q: want relay or hub", p.ID, p.Role))
+		}
+		if len(p.Keys) == 0 {
+			errs = append(errs, fmt.Errorf("server.hub.conduit.peers %q: at least one key is required", p.ID))
+		}
+		kids := map[string]bool{}
+		for _, k := range p.Keys {
+			if k.KeyID == "" || k.PublicKey == "" {
+				errs = append(errs, fmt.Errorf("server.hub.conduit.peers %q: every key needs keyId and publicKey", p.ID))
+				continue
+			}
+			if kids[k.KeyID] {
+				errs = append(errs, fmt.Errorf("server.hub.conduit.peers %q: key id %q is listed twice", p.ID, k.KeyID))
+			}
+			kids[k.KeyID] = true
+		}
+	}
+	return errs
+}
+
+// validateInternalTLS checks the internal hop TLS settings: the
+// certificate and key are set together, the server name is a bare host
+// name, and an internal listener without TLS binds loopback
+// (CheckRelayInternalListen). The files themselves are read when the
+// listener and the hop clients are built.
+func (c HubConduitConfig) validateInternalTLS() []error {
+	var errs []error
+	if (c.InternalTLSCertFile == "") != (c.InternalTLSKeyFile == "") {
+		errs = append(errs, errors.New("server.hub.conduit.internal_tls_cert_file and internal_tls_key_file must be set together"))
+	}
+	if n := c.InternalTLSServerName; n != "" && (strings.ContainsAny(n, "/: \t") || strings.TrimSpace(n) != n) {
+		errs = append(errs, fmt.Errorf("invalid server.hub.conduit.internal_tls_server_name %q: want a host name", n))
+	}
+	if c.InternalListen != "" {
+		if err := CheckRelayInternalListen("server.hub.conduit.internal_listen", c.InternalListen, c.InternalTLS()); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errs
 }

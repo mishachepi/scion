@@ -18,6 +18,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -41,6 +43,7 @@ import (
 // intentionally not surfaced here.
 type ExternalStore struct {
 	client *ent.Client
+	inTx   bool
 }
 
 // NewExternalStore creates a new Ent-backed ExternalStore.
@@ -378,6 +381,69 @@ func marshalRepos(repos []string) string {
 	return string(b)
 }
 
+func normalizeRepoKey(repoFullName string) string {
+	return strings.ToLower(strings.TrimSpace(repoFullName))
+}
+
+func normalizeTriggerRouting(routing map[string]store.GitHubTriggerRoute) map[string]store.GitHubTriggerRoute {
+	if len(routing) == 0 {
+		return nil
+	}
+	out := make(map[string]store.GitHubTriggerRoute, len(routing))
+	for k, v := range routing {
+		nk := normalizeRepoKey(k)
+		if nk == "" {
+			continue
+		}
+		out[nk] = v
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func marshalTriggerRouting(routing map[string]store.GitHubTriggerRoute) string {
+	norm := normalizeTriggerRouting(routing)
+	if len(norm) == 0 {
+		return "{}"
+	}
+	b, _ := json.Marshal(norm)
+	return string(b)
+}
+
+func unmarshalTriggerRouting(installationID int64, raw string) map[string]store.GitHubTriggerRoute {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || trimmed == "{}" {
+		return nil
+	}
+	var parsed map[string]store.GitHubTriggerRoute
+	if err := json.Unmarshal([]byte(trimmed), &parsed); err != nil {
+		slog.Warn("corrupt github_installations.trigger_routing JSON; treating as empty",
+			"installation_id", installationID)
+		return nil
+	}
+	return normalizeTriggerRouting(parsed)
+}
+
+func (s *ExternalStore) withTx(ctx context.Context, fn func(c *ent.Client) error) error {
+	if s.inTx {
+		return fn(s.client)
+	}
+	tx, err := s.client.Tx(ctx)
+	if err != nil {
+		return mapError(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := fn(tx.Client()); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return mapError(err)
+	}
+	return nil
+}
+
 // entGitHubToStore converts an Ent GithubInstallation to the store model.
 func entGitHubToStore(e *ent.GithubInstallation) *store.GitHubInstallation {
 	inst := &store.GitHubInstallation{
@@ -385,6 +451,7 @@ func entGitHubToStore(e *ent.GithubInstallation) *store.GitHubInstallation {
 		AccountLogin:   e.AccountLogin,
 		AccountType:    e.AccountType,
 		AppID:          e.AppID,
+		TriggerRouting: unmarshalTriggerRouting(e.ID, e.TriggerRouting),
 		Status:         e.Status,
 		CreatedAt:      e.Created,
 		UpdatedAt:      e.Updated,
@@ -430,6 +497,7 @@ func (s *ExternalStore) CreateGitHubInstallation(ctx context.Context, installati
 			SetAccountType(accountType).
 			SetAppID(installation.AppID).
 			SetRepositories(marshalRepos(installation.Repositories)).
+			SetTriggerRouting("{}").
 			SetStatus(installation.Status).
 			SetCreated(installation.CreatedAt).
 			SetUpdated(installation.UpdatedAt),
@@ -453,6 +521,10 @@ func (s *ExternalStore) GetGitHubInstallation(ctx context.Context, installationI
 }
 
 // UpdateGitHubInstallation updates an existing GitHub App installation.
+// It never writes trigger_routing; only SetGitHubInstallationTriggerRoute,
+// DeleteGitHubInstallationTriggerRoute, and DeleteGitHubTriggerRoutesByProject
+// modify trigger_routing so generic installation updates cannot bypass routing
+// controls or overwrite concurrent route changes.
 func (s *ExternalStore) UpdateGitHubInstallation(ctx context.Context, installation *store.GitHubInstallation) error {
 	installation.UpdatedAt = time.Now()
 
@@ -523,6 +595,135 @@ func (s *ExternalStore) GetInstallationForRepository(ctx context.Context, repoFu
 		}
 	}
 	return nil, store.ErrNotFound
+}
+
+// SetGitHubInstallationTriggerRoute sets or replaces the primary-project
+// trigger routing entry for repoFullName (lowercased) on installationID.
+func (s *ExternalStore) SetGitHubInstallationTriggerRoute(ctx context.Context, installationID int64, repoFullName string, route store.GitHubTriggerRoute) error {
+	key := normalizeRepoKey(repoFullName)
+	if key == "" || !strings.Contains(key, "/") {
+		return fmt.Errorf("%w: invalid repository name %q", store.ErrInvalidInput, repoFullName)
+	}
+	if strings.TrimSpace(route.PrimaryProjectID) == "" {
+		return fmt.Errorf("%w: primary_project_id is required", store.ErrInvalidInput)
+	}
+	if route.SetAt.IsZero() {
+		route.SetAt = time.Now().UTC()
+	}
+
+	return s.withTx(ctx, func(c *ent.Client) error {
+		q := c.GithubInstallation.Query().Where(githubinstallation.IDEQ(installationID))
+		if c.Driver().Dialect() == dialect.Postgres {
+			q = q.ForUpdate()
+		}
+		row, err := q.Only(ctx)
+		if err != nil {
+			return mapError(err)
+		}
+		routing := unmarshalTriggerRouting(row.ID, row.TriggerRouting)
+		if routing == nil {
+			routing = make(map[string]store.GitHubTriggerRoute, 1)
+		}
+		routing[key] = route
+		if _, err := c.GithubInstallation.UpdateOneID(installationID).
+			SetTriggerRouting(marshalTriggerRouting(routing)).
+			SetUpdated(time.Now()).
+			Save(ctx); err != nil {
+			return mapError(err)
+		}
+		return nil
+	})
+}
+
+// DeleteGitHubInstallationTriggerRoute removes the primary-project trigger
+// routing entry for repoFullName (case-insensitive) on installationID.
+func (s *ExternalStore) DeleteGitHubInstallationTriggerRoute(ctx context.Context, installationID int64, repoFullName string) (bool, error) {
+	key := normalizeRepoKey(repoFullName)
+	if key == "" {
+		return false, fmt.Errorf("%w: repository name is required", store.ErrInvalidInput)
+	}
+	var removed bool
+	err := s.withTx(ctx, func(c *ent.Client) error {
+		q := c.GithubInstallation.Query().Where(githubinstallation.IDEQ(installationID))
+		if c.Driver().Dialect() == dialect.Postgres {
+			q = q.ForUpdate()
+		}
+		row, err := q.Only(ctx)
+		if err != nil {
+			return mapError(err)
+		}
+		routing := unmarshalTriggerRouting(row.ID, row.TriggerRouting)
+		for k := range routing {
+			if strings.EqualFold(k, key) {
+				delete(routing, k)
+				removed = true
+			}
+		}
+		if !removed {
+			return nil
+		}
+		if _, err := c.GithubInstallation.UpdateOneID(installationID).
+			SetTriggerRouting(marshalTriggerRouting(routing)).
+			SetUpdated(time.Now()).
+			Save(ctx); err != nil {
+			return mapError(err)
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return removed, nil
+}
+
+// DeleteGitHubTriggerRoutesByProject removes every trigger_routing entry whose
+// primary_project_id equals projectID across all installations.
+func (s *ExternalStore) DeleteGitHubTriggerRoutesByProject(ctx context.Context, projectID string) (int, error) {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return 0, nil
+	}
+	var removed int
+	err := s.withTx(ctx, func(c *ent.Client) error {
+		q := c.GithubInstallation.Query().
+			Where(
+				githubinstallation.TriggerRoutingNEQ("{}"),
+				githubinstallation.TriggerRoutingNEQ(""),
+			).
+			Order(ent.Asc(githubinstallation.FieldID))
+		if c.Driver().Dialect() == dialect.Postgres {
+			q = q.ForUpdate()
+		}
+		rows, err := q.All(ctx)
+		if err != nil {
+			return mapError(err)
+		}
+		now := time.Now()
+		for _, row := range rows {
+			routing := unmarshalTriggerRouting(row.ID, row.TriggerRouting)
+			rowChanged := false
+			for k, v := range routing {
+				if v.PrimaryProjectID == projectID {
+					delete(routing, k)
+					removed++
+					rowChanged = true
+				}
+			}
+			if rowChanged {
+				if _, err := c.GithubInstallation.UpdateOneID(row.ID).
+					SetTriggerRouting(marshalTriggerRouting(routing)).
+					SetUpdated(now).
+					Save(ctx); err != nil {
+					return mapError(err)
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return removed, nil
 }
 
 // ============================================================================
@@ -797,6 +998,68 @@ func (s *ExternalStore) CountUserAccessTokens(ctx context.Context, userID string
 			useraccesstoken.RevokedEQ(false),
 		).
 		Count(ctx)
+}
+
+// RevokeUserAccessTokensForUser revokes every unrevoked token of a user and returns how many it revoked (ptone/scion#2143).
+func (s *ExternalStore) RevokeUserAccessTokensForUser(ctx context.Context, userID string) (int, error) {
+	uid, err := parseUUID(userID)
+	if err != nil {
+		return 0, err
+	}
+	n, err := s.client.UserAccessToken.Update().
+		Where(
+			useraccesstoken.UserIDEQ(uid),
+			useraccesstoken.RevokedEQ(false),
+		).
+		SetRevoked(true).
+		Save(ctx)
+	if err != nil {
+		return 0, mapError(err)
+	}
+	return n, nil
+}
+
+// RevokeUserAccessTokensForUserProject revokes every unrevoked
+// "project"-boundary token of a user scoped to projectID and returns the
+// IDs it revoked (ptone/scion#7494). The boundary_kind predicate states the
+// rule explicitly: a hub-boundary token is never revoked here. The IDs are
+// read and then revoked by ID with the same predicates, so a token revoked
+// concurrently is not reported twice; inside the caller's transaction the
+// two statements see the same rows.
+func (s *ExternalStore) RevokeUserAccessTokensForUserProject(ctx context.Context, userID, projectID string) ([]string, error) {
+	uid, err := parseUUID(userID)
+	if err != nil {
+		return nil, err
+	}
+	pid, err := parseUUID(projectID)
+	if err != nil {
+		return nil, err
+	}
+	match := []predicate.UserAccessToken{
+		useraccesstoken.UserIDEQ(uid),
+		useraccesstoken.ProjectIDEQ(pid),
+		useraccesstoken.BoundaryKindEQ(string(permissions.BoundaryKindProject)),
+		useraccesstoken.RevokedEQ(false),
+	}
+	ids, err := s.client.UserAccessToken.Query().Where(match...).IDs(ctx)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	if len(ids) == 0 {
+		return []string{}, nil
+	}
+	if _, err := s.client.UserAccessToken.Update().
+		Where(append(match, useraccesstoken.IDIn(ids...))...).
+		SetRevoked(true).
+		Save(ctx); err != nil {
+		return nil, mapError(err)
+	}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, id.String())
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // DeleteUserAccessTokensByProject permanently removes all "project"-boundary

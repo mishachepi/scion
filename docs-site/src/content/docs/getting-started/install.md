@@ -17,6 +17,10 @@ through the whole setup in your browser — no config files to edit. Install Sci
 (below), then run `scion server start`.
 :::
 
+:::note[On Windows?]
+The Windows build (`scion-windows-amd64.zip` and `scion-windows-arm64.zip` on GitHub Releases, verified against `SHA256SUMS`) is a Hub client only: it supports connecting to a remote Hub (`hub`, `project`, `config`, `message`, `secret`, `skills`) and reaching agents over Conduit (`ssh`, `ssh-config`, `tunnel`, `vscode`), while server, Runtime Broker, and local container lifecycle commands exit with a `"not supported on Windows"` error. See [Windows](/scion/hosted/user/windows/) for how to install it and which commands it supports.
+:::
+
 ## Install with Homebrew (recommended)
 
 The easiest way to get a ready-to-run Scion — CLI plus embedded web UI — is the community
@@ -27,12 +31,45 @@ brew tap homebrew-scion/scion
 brew install homebrew-scion/scion/scion
 ```
 
-This installs:
+This installs **`scion`**, the CLI with the embedded web UI, from the prebuilt binaries of
+the latest preview release. The [Onboarding Wizard](/scion/getting-started/onboarding/)
+suggests `ghcr.io/homebrew-scion` as the image registry. Images are published there for each
+preview release, tagged with that release's tag, and a Homebrew `scion` pulls the images tagged
+with its own version, so agents run images that match your binary. Chat plugins such as Telegram
+and Discord are not included; their setup guides explain how to install them.
 
-- **`scion`** — the main CLI, pre-configured to use `ghcr.io/homebrew-scion` as the default
-  image registry, so the harness images are pulled for you.
-- **`scion-plugin-telegram`** — the Telegram broker plugin, installed automatically alongside
-  the CLI. To connect it, follow [Setting Up Telegram](/scion/getting-started/telegram/).
+:::note[Which image tag agents use]
+A release build of `scion` (`vX.Y.Z`, `vX.Y.Z-preview.N`, `vX.Y.Z-rc.N` as Homebrew installs, or
+`nightly-YYYYMMDD`) uses its own version as the tag of the bundled `scion-*` images whose tag is
+`latest` or absent; development builds keep `:latest`.
+
+- An image you name explicitly with `--image scion-claude:latest`, or a bare name such as
+  `scion-claude`, is retagged the same way, to `scion-claude:<version>`.
+- Official nightly releases do not publish container images; build matching images with
+  [`build-release-images.sh`](#build-container-images) (or `build-images.sh --tag nightly-YYYYMMDD`),
+  or opt out with `image_tag` set to `latest`.
+- To keep `:latest`, set `image_tag` to `latest`: `scion config set --global image_tag latest`,
+  then `scion server restart`. Any set `image_tag` takes precedence over the version default.
+  While the `hub.image_tag_setting` experiment is off, a set value is not applied (image
+  references keep their tags) but still suppresses the version default; with it on, a value
+  other than `latest` is applied as the tag.
+- To turn the version default off for the whole Hub, disable the
+  `hub.image_tag_version_default` [experiment](/scion/reference/experiments/):
+  `scion hub experiments disable hub.image_tag_version_default`, or switch it off under
+  **Admin → Server Config → Experiments**.
+
+See [Image tag](/scion/reference/settings-precedence/#image-tag-experimental) for the details.
+:::
+
+:::note[Older Linux distributions]
+On Linux hosts whose glibc is older than 2.39 or libstdc++ older than 6.0.33 (for example Debian
+12, Ubuntu 22.04 or RHEL 9), Homebrew installs its own `gcc` (and its own `glibc`, if glibc is
+older than 2.39), with their dependencies, the first time you install any formula. Scion is a
+static binary and does not use them. To avoid them, download `scion-linux-amd64.tar.gz` or
+`scion-linux-arm64.tar.gz` from the [GitHub
+releases](https://github.com/GoogleCloudPlatform/scion/releases), verify it against the
+release's `SHA256SUMS`, and put `scion` on your `$PATH`.
+:::
 
 To upgrade later:
 
@@ -48,8 +85,9 @@ Start the Workstation combo server:
 scion server start
 ```
 
-Your browser opens to the [Onboarding Wizard](/scion/getting-started/onboarding/) at
-`http://127.0.0.1:8080/onboarding`, which handles the rest of setup for you — runtime detection
+Your browser opens, signed in through a single-use link, to the
+[Onboarding Wizard](/scion/getting-started/onboarding/) at
+`http://127.0.0.1:8080/onboarding` (run `scion server open` later for a new sign-in link), which handles the rest of setup for you — runtime detection
 (Docker, Podman, or Apple Container), identity configuration, container image setup (pulling from
 `ghcr.io/homebrew-scion`), and creating your first workspace.
 
@@ -76,7 +114,7 @@ skip this if you installed with `brew`.
 - [Download and install Go](https://golang.org/doc/install)
 
 ### 2. Container Runtime
-Scion requires a container runtime to manage agents. You can use Docker, Podman, or the Apple Virtualization Framework (experimental).
+Workstation mode requires a local container runtime to manage agents on your machine (a client that only connects to a remote Hub does not — see [Connecting to a Hub](/scion/hosted/user/hosted-user/)). You can use Docker, Podman, or the Apple Virtualization Framework (experimental).
 
 When no runtime is configured, Scion picks one automatically. On macOS it prefers Podman, then Docker, then Apple `container`. On macOS, when Podman is selected or auto-detected but not on your `PATH`, Scion also looks for it in `/opt/podman/bin`, `/usr/local/bin` and `/usr/bin` when it uses the runtime. Detection during setup, including the onboarding wizard's, looks only on your `PATH` and checks that each runtime runs; on Linux it prefers Podman, then Docker. To use another installed runtime, select it in the onboarding wizard or in your profile's `runtime` setting.
 
@@ -158,13 +196,46 @@ scion version
 
 ## Build container images
 
-No publicly hosted images are currently available for Scion, but quick and easy build scripts are included.
+Agents run in container images. The Homebrew onboarding suggests the `ghcr.io/homebrew-scion`
+registry. Images there are tagged with the release tag, and a release build of `scion` pulls the
+images tagged with its own version (see
+[Which image tag agents use](#install-with-homebrew-recommended)). You can also build the images
+locally with the scripts in the repository.
 
-The easiest way to get these images is to fork this repo, and then go to the "Actions" tab and select the "Build Scion Images" workflow.
+To build the images that match your `scion` binary, run the release image driver. It clones the
+release tag and builds the full image set from that release's own image specs, tagged
+`:<version>`. It needs only bash, git, and Docker or Podman, and runs from a checkout or as a single
+downloaded file:
 
-You will then use your `ghcr.io/myorg` registry for the `image_registry` setting. These images must be available in the registry before running the initialization command.
+```bash
+curl -fsSLO https://raw.githubusercontent.com/GoogleCloudPlatform/scion/main/image-build/scripts/build-release-images.sh
 
-See [Building Containers](/scion/local/custom-images/) for more details
+# With no version, it builds the release `scion version` reports. These images stay in the
+# local image store, named localhost/scion/<image>; nothing is pushed. A release build of scion
+# uses the :<version> images. --also-tag latest also tags them :latest, the tag development
+# builds (or image_tag latest) use; naming a registry prefix makes the driver ask for
+# --force-latest as well.
+bash build-release-images.sh --also-tag latest --force-latest -- --registry localhost/scion
+scion config set --global image_registry localhost/scion
+
+# Or build a given release and push it to your own registry:
+bash build-release-images.sh v0.3.0-preview.5 --also-tag latest --force-latest -- \
+  --registry ghcr.io/myorg --platform all --push
+scion config set --global image_registry ghcr.io/myorg
+```
+
+The images must be available before you run the initialization command below. See
+[Images that match a release](/scion/local/custom-images/#images-that-match-a-release) for how
+the image tag is chosen.
+
+To build from the tip of `main` instead, fork the repository and run the "Build Scion Images"
+workflow from its "Actions" tab, then use your `ghcr.io/myorg` registry for `image_registry`.
+With a release build of `scion`, also set `image_tag: latest` (or disable
+`hub.image_tag_version_default`), or run the workflow with its image tag set to the version
+`scion version` reports, because a release build pulls `:<version>` by default (see
+[Image tag](/scion/reference/settings-precedence/#image-tag-experimental)).
+
+See [Building Custom Images](/scion/local/custom-images/) for more details.
 
 ## Configuration
 
@@ -188,7 +259,7 @@ scion init
 
 This creates a `.scion` marker file in the directory, linking it to structures inside the global folder created on the machine initialization.
 When a hub is running (next step), `init` also links the project to it; otherwise it prints a note
-and the project links on its first `scion` command.
+and the project links on its first `scion` command. If this machine only connects to a remote Hub and has no local container runtime, register and select the Hub first (`scion hub add <name> <url>` and `scion use --hub <name>`, or `scion use <project>` to work without initializing a directory); `scion init` then skips both `scion init --machine` and local container-runtime detection.
 
 ### 3. Start the local hub
 Agents run through a hub. Start the workstation server once:

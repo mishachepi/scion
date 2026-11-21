@@ -110,6 +110,8 @@ function agent(i) {
     _capabilities: { actions: own ? OWNER_ACTIONS : ['read'] },
     activity: ACTIVITIES[i % ACTIVITIES.length],
     appliedConfig,
+    // Both lists ask for include=authority; every seeded agent's owner is live.
+    authority: { state: 'live' },
     created: iso(BASE_MS - 3600_000 + i * 1000),
     createdBy: creator,
     deletedAt: ZERO_TIME,
@@ -168,13 +170,29 @@ export function buildFixture() {
       status: 200,
       body: {
         experiments: {
+          'federation.project_visitors': false,
           'hub.agent_edit_held': false,
+          'hub.artifact_archive': false,
           'hub.artifacts': false,
+          'hub.artifacts_open_review_check': false,
           'hub.attachment_artifacts': false,
+          'hub.chat_retention': false,
+          'hub.effective_permissions': false,
+          'hub.exec_schedules': false,
           'hub.flat_runtime_brokers': false,
+          'hub.github_triggers': false,
+          'hub.k8s_workload_identity_setup': false,
+          'hub.triggers': false,
+          'hub.user_delete_force_cascade': false,
+          'hub.welcome_project': false,
+          'lifecycle.idle_suspend': false,
           'web.agent_badges': false,
           'web.agent_edit': true,
+          'web.artifact_manage_access': false,
+          'web.artifact_review_editor': false,
           'web.chat_scheduled_send': false,
+          'web.chat_starred_messages': true,
+          'web.decisions': false,
           'web.gcs_links': false,
           'web.sse_hidden_tab_close': false,
         },
@@ -256,7 +274,7 @@ export function buildFixture() {
       status: 200,
       body: { files: [], totalCount: 0, totalSize: 0 },
     },
-    [`${p}/agents?sort=updated&dir=desc&limit=25&fit=50&stats=1`]: {
+    [`${p}/agents?sort=updated&dir=desc&limit=25&fit=50&stats=1&include=authority`]: {
       status: 200,
       body: {
         _capabilities: listCaps,
@@ -274,7 +292,7 @@ export function buildFixture() {
         totalCount: AGENT_COUNT,
       },
     },
-    [`${p}/agents?limit=500`]: {
+    [`${p}/agents?include=authority&limit=500`]: {
       status: 200,
       body: {
         _capabilities: listCaps,

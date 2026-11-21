@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// These tests exercise unix-only, Windows-gated agent storage code.
+//go:build unix
+
 package agent
 
 import (
@@ -132,7 +135,7 @@ func TestStartNFSWorktree_LaterStartCreatesWorktreeDir(t *testing.T) {
 	mountRoot := filepath.Join(t.TempDir(), "nfs")
 	ws := nfsTestWorkspaceDir(mountRoot)
 	require.NoError(t, os.MkdirAll(ws, 0o770))
-	require.NoError(t, os.WriteFile(filepath.Join(ws, provision.ProvisionSentinelFile), []byte("x"), 0o644))
+	writeStateSentinel(t, ws)
 
 	cfg, wtAtRun, err := startNFSWorktreeAgent(t, "kubernetes", mountRoot, "worktree-per-agent")
 	require.NoError(t, err)
@@ -153,7 +156,7 @@ func TestStartNFSWorktree_OtherModesUnchanged(t *testing.T) {
 			mountRoot := filepath.Join(t.TempDir(), "nfs")
 			ws := nfsTestWorkspaceDir(mountRoot)
 			require.NoError(t, os.MkdirAll(ws, 0o770))
-			require.NoError(t, os.WriteFile(filepath.Join(ws, provision.ProvisionSentinelFile), []byte("x"), 0o644))
+			writeStateSentinel(t, ws)
 
 			cfg, wtAtRun, err := startNFSWorktreeAgent(t, "kubernetes", mountRoot, mode)
 			require.NoError(t, err)
@@ -173,7 +176,7 @@ func TestStartNFSWorktree_NonKubernetesUnaffected(t *testing.T) {
 	mountRoot := filepath.Join(t.TempDir(), "nfs")
 	ws := nfsTestWorkspaceDir(mountRoot)
 	require.NoError(t, os.MkdirAll(ws, 0o770))
-	require.NoError(t, os.WriteFile(filepath.Join(ws, provision.ProvisionSentinelFile), []byte("x"), 0o644))
+	writeStateSentinel(t, ws)
 
 	cfg, wtAtRun, err := startNFSWorktreeAgent(t, "docker", mountRoot, "worktree-per-agent")
 	require.NoError(t, err)
@@ -190,24 +193,24 @@ func TestEnsureNFSWorktreeLeaf(t *testing.T) {
 	resolved := resolveTestNFSWorkspace(t, mountRoot)
 	wt := filepath.Join(resolved.HostPath, "worktrees", "agent-1")
 
-	ok, err := ensureNFSWorktreeLeaf("docker", resolved, "ws-pv", "agent-1")
+	ok, err := ensureNFSWorktreeLeaf("docker", resolved, runtime.NFSPodShare{ClaimName: "ws-pv"}, "agent-1")
 	require.NoError(t, err)
 	assert.False(t, ok)
 
 	// Export not mounted on the broker.
-	ok, err = ensureNFSWorktreeLeaf("kubernetes", resolved, "ws-pv", "agent-1")
+	ok, err = ensureNFSWorktreeLeaf("kubernetes", resolved, runtime.NFSPodShare{ClaimName: "ws-pv"}, "agent-1")
 	require.NoError(t, err)
 	assert.False(t, ok)
 
 	require.NoError(t, os.MkdirAll(resolved.HostPath, 0o770))
-	ok, err = ensureNFSWorktreeLeaf("kubernetes", resolved, "ws-pv", "agent-1")
+	ok, err = ensureNFSWorktreeLeaf("kubernetes", resolved, runtime.NFSPodShare{ClaimName: "ws-pv"}, "agent-1")
 	require.NoError(t, err)
 	assert.True(t, ok)
 	_, statErr := os.Stat(filepath.Join(resolved.HostPath, "worktrees"))
 	assert.True(t, os.IsNotExist(statErr), "nothing is created before the shared checkout is provisioned")
 
-	require.NoError(t, os.WriteFile(filepath.Join(resolved.HostPath, provision.ProvisionSentinelFile), []byte("x"), 0o644))
-	ok, err = ensureNFSWorktreeLeaf("kubernetes", resolved, "ws-pv", "agent-1")
+	writeStateSentinel(t, resolved.HostPath)
+	ok, err = ensureNFSWorktreeLeaf("kubernetes", resolved, runtime.NFSPodShare{ClaimName: "ws-pv"}, "agent-1")
 	require.NoError(t, err)
 	assert.True(t, ok)
 	info, err := os.Stat(wt)
@@ -216,13 +219,13 @@ func TestEnsureNFSWorktreeLeaf(t *testing.T) {
 
 	marker := filepath.Join(wt, "work.txt")
 	require.NoError(t, os.WriteFile(marker, []byte("x"), 0o644))
-	_, err = ensureNFSWorktreeLeaf("kubernetes", resolved, "ws-pv", "agent-1")
+	_, err = ensureNFSWorktreeLeaf("kubernetes", resolved, runtime.NFSPodShare{ClaimName: "ws-pv"}, "agent-1")
 	require.NoError(t, err)
 	_, err = os.Stat(marker)
 	assert.NoError(t, err, "an existing directory is left alone")
 
 	for _, bad := range []string{"../x", "a/b", "Agent-1", ""} {
-		_, err = ensureNFSWorktreeLeaf("kubernetes", resolved, "ws-pv", bad)
+		_, err = ensureNFSWorktreeLeaf("kubernetes", resolved, runtime.NFSPodShare{ClaimName: "ws-pv"}, bad)
 		assert.Error(t, err, "name %q", bad)
 	}
 }
@@ -252,6 +255,7 @@ func setupNFSWorktreeRemoval(t *testing.T) (sharedDirStorageRunFixture, string) 
 	require.NoError(t, os.WriteFile(filepath.Join(origin, "README.md"), []byte("hi\n"), 0o644))
 	nfsWorktreeGit(t, origin, "add", ".")
 	nfsWorktreeGit(t, origin, "commit", "-m", "init")
+	provision.AllowLocalCloneFixture(t, origin)
 
 	ws := nfsTestWorkspaceDir(mountRoot)
 	for _, agent := range []string{"test-agent", "other-agent"} {
@@ -263,7 +267,7 @@ func setupNFSWorktreeRemoval(t *testing.T) (sharedDirStorageRunFixture, string) 
 			GitClone:        &api.GitCloneConfig{URL: origin},
 			NFSUID:          os.Getuid(),
 			NFSGID:          os.Getgid(),
-			SentinelDir:     ws,
+			SentinelDir:     provision.ProjectStateDir(ws),
 			MountedWorktree: true,
 		}))
 		require.True(t, provision.IsRealWorktreeDir(provision.WorktreePath(ws, agent), ws))
@@ -417,5 +421,99 @@ func TestRemoveNFSWorktree_RefusesPathOutsideExport(t *testing.T) {
 		assert.ErrorContains(t, err, "unexpected workspace path", name)
 		assert.FileExists(t, filepath.Join(outside, "worktrees", "test-agent", "keep"), name)
 		assert.True(t, provision.IsRealWorktreeDir(provision.WorktreePath(ws, "test-agent"), ws), name)
+	}
+}
+
+// writeStateSentinel marks the shared checkout at ws provisioned: the
+// sentinel in its provisioning state directory, the only place it is read.
+func writeStateSentinel(t *testing.T, ws string) {
+	t.Helper()
+	dir := provision.ProjectStateDir(ws)
+	require.NoError(t, os.MkdirAll(dir, 0o770))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, provision.ProvisionSentinelFile), []byte("x"), 0o644))
+}
+
+// A worktree-per-agent Kubernetes start with no NFS workspace storage gets
+// an in-container clone, possibly shallow, so it is labelled clone-per-agent
+// (ptone/scion#7906). With an NFS worktree the label stays
+// worktree-per-agent.
+func TestStartK8sWorktreeFallbackWorkspaceModeLabel(t *testing.T) {
+	t.Run("no workspace storage", func(t *testing.T) {
+		f := newSharedDirStorageRunFixture(t)
+		f.writeGlobalSettings(t, "")
+		var cfg runtime.RunConfig
+		mockRT := &runtime.MockRuntime{
+			NameFunc: func() string { return "kubernetes" },
+			RunFunc: func(ctx context.Context, rc runtime.RunConfig) (string, error) {
+				cfg = rc
+				return "mock-id", nil
+			},
+		}
+		depth := 1
+		info, err := NewManager(mockRT).Start(context.Background(), api.StartOptions{
+			Name:        "test-agent",
+			ProjectPath: f.projectScionDir,
+			NoAuth:      true,
+			Env: map[string]string{
+				"SCION_PROJECT_ID":     testNFSWorkspaceProjectID,
+				"SCION_WORKSPACE_MODE": "worktree-per-agent",
+				"SCION_GIT_DEPTH":      "1",
+			},
+			GitClone: &api.GitCloneConfig{URL: "https://example.com/repo.git", Depth: &depth},
+		})
+		require.NoError(t, err)
+		require.NotNil(t, cfg.GitClone, "the agent clones in its container")
+		assert.Empty(t, cfg.NFSWorktreeName)
+		assert.Equal(t, "clone-per-agent", workspaceModeOf(cfg))
+		// Only the label changes: the workspace stays node-local in the
+		// container, with no NFS mounts.
+		assert.Equal(t, api.WorkspacePlacementLocal, info.WorkspacePlacement)
+		assert.Empty(t, cfg.NFSSubPath)
+		assert.Empty(t, cfg.NFSAgentDirName)
+		assert.Equal(t, "/workspace", cfg.ContainerWorkspace)
+	})
+
+	t.Run("nfs worktree", func(t *testing.T) {
+		mountRoot := filepath.Join(t.TempDir(), "nfs")
+		require.NoError(t, os.MkdirAll(filepath.Join(mountRoot, "share-1"), 0o755))
+		cfg, _, err := startNFSWorktreeAgent(t, "kubernetes", mountRoot, "worktree-per-agent")
+		require.NoError(t, err)
+		assert.Equal(t, "test-agent", cfg.NFSWorktreeName)
+		assert.Equal(t, "worktree-per-agent", workspaceModeOf(cfg))
+	})
+}
+
+func workspaceModeOf(cfg runtime.RunConfig) string {
+	v, _ := envValue(cfg.Env, "SCION_WORKSPACE_MODE")
+	return v
+}
+
+func TestK8sWorktreeCloneFallback(t *testing.T) {
+	git := &api.GitCloneConfig{URL: "https://example.com/repo.git"}
+	wt := map[string]string{"SCION_WORKSPACE_MODE": "worktree-per-agent"}
+	cases := []struct {
+		name          string
+		runtime       string
+		backend       string
+		emptyPerAgent bool
+		env           map[string]string
+		gitClone      *api.GitCloneConfig
+		want          bool
+	}{
+		{name: "kubernetes, no backend", runtime: "kubernetes", env: wt, gitClone: git, want: true},
+		{name: "kubernetes, nfs backend", runtime: "kubernetes", backend: "nfs", env: wt, gitClone: git},
+		{name: "docker", runtime: "docker", env: wt, gitClone: git},
+		{name: "cloudrun", runtime: "cloudrun", env: wt, gitClone: git},
+		{name: "empty-per-agent", runtime: "kubernetes", emptyPerAgent: true, env: wt, gitClone: git},
+		{name: "no git clone", runtime: "kubernetes", env: wt},
+		{name: "empty clone URL", runtime: "kubernetes", env: wt, gitClone: &api.GitCloneConfig{}},
+		{name: "clone-per-agent", runtime: "kubernetes", env: map[string]string{"SCION_WORKSPACE_MODE": "clone-per-agent"}, gitClone: git},
+		{name: "shared-plain", runtime: "kubernetes", env: map[string]string{"SCION_WORKSPACE_MODE": "shared-plain"}, gitClone: git},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := k8sWorktreeCloneFallback(tc.runtime, tc.backend, tc.emptyPerAgent, api.StartOptions{Env: tc.env, GitClone: tc.gitClone})
+			assert.Equal(t, tc.want, got)
+		})
 	}
 }

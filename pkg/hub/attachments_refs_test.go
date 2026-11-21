@@ -348,11 +348,11 @@ var renderNeverCarries = map[string]string{
 	"handlers_agent_messaging.go:broadcastDirect":               "project broadcasts refuse attachment_ids",
 	"handlers_agent_messaging.go:processMentions":               "human and broker mention fan-out is out of phase 2",
 	"messagebroker.go:deliverToAgent":                           "artifact attachments never travel on the bus",
-	"handlers_broker_inbound.go:handleBrokerInbound":            "chat plugins move attachments in a later phase",
 	"handlers_broker_inbound_routed.go:dispatchRoutedRecipient": "chat plugins move attachments in a later phase",
 	"notifications.go:dispatchToAgent":                          "notifications carry no attachments",
-	"server.go:messageEventHandler":                             "event notices carry no attachments",
+	"action_message.go:deliverMessageAction":                    "event notices carry no attachments",
 	"artifacts_review.go:deliverArtifactReview":                 "artifact review notices carry no attachments",
+	"message_hold_redrive.go:processClaimedHeldRow":             "held message re-drive excludes attachments (ptone/scion#7939)",
 }
 
 // renderSite is one RenderDeliveryText call: its file:function and whether
@@ -461,7 +461,7 @@ func TestRenderSites_ApplyAttachmentPlan(t *testing.T) {
 		require.True(t, s.plan, "%s renders a delivery without the attachment plan; pass Plan or classify it in renderNeverCarries", s.where)
 		planned++
 	}
-	require.Equal(t, 6, planned, "the six delivery render sites pass the plan")
+	require.Equal(t, 7, planned, "the seven delivery render sites pass the plan")
 }
 
 // TestNeverCarriesSites_NoDeliveries: the functions on the never-carries

@@ -67,6 +67,12 @@ func Resolve(_ context.Context, opts ResolveOptions) (*ResolvedHarness, error) {
 
 	declared := declaredConfig(opts.Name, hcDir, opts.Settings, opts.ProfileName)
 	entry := withBundleReady(declared)
+	// config.yaml's agent-home path fields are checked when it is parsed;
+	// the merged entry (settings overlay applied) is checked again here so
+	// a future overlay field cannot bypass that check.
+	if err := config.ValidateHarnessHomePaths(entry); err != nil {
+		return nil, fmt.Errorf("harness-config %q: %w", opts.Name, err)
+	}
 
 	// 1. Container-script harness (provisioner block present)
 	if entry.Provisioner != nil {
@@ -102,14 +108,18 @@ func Resolve(_ context.Context, opts ResolveOptions) (*ResolvedHarness, error) {
 		}
 	}
 
+	isBuiltin := hcDir != nil && hcDir.Source == config.HarnessConfigSourceBuiltin
+
 	// 2. Declarative generic. If config.yaml has declarative metadata
 	// (command/env_template/capabilities/ready/delivery), use the
 	// declarative wrapper so callers get those fields. Otherwise fall back
 	// to the legacy Generic. The check reads the declared entry: a ready
 	// block filled in from the built-in bundle is not declared metadata.
 	if hasDeclarativeMetadata(declared) {
+		d := NewDeclarativeGenericHarness(entry)
+		d.builtin = isBuiltin
 		return &ResolvedHarness{
-			Harness:        NewDeclarativeGenericHarness(entry),
+			Harness:        d,
 			ConfigName:     opts.Name,
 			ConfigDir:      hcDir,
 			Config:         entry,
@@ -122,7 +132,7 @@ func Resolve(_ context.Context, opts ResolveOptions) (*ResolvedHarness, error) {
 	// block), so a built-in harness type keeps its readiness here too.
 	ready := entry.ResolvedReady()
 	return &ResolvedHarness{
-		Harness:        &Generic{ready: &ready},
+		Harness:        &Generic{ready: &ready, builtin: isBuiltin},
 		ConfigName:     opts.Name,
 		ConfigDir:      hcDir,
 		Config:         entry,

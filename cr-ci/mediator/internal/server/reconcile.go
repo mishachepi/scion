@@ -116,7 +116,7 @@ func (s *Server) Reconcile(ctx context.Context) ReconcileResult {
 	defer s.dispatchMu.Unlock()
 	gv := newView()
 	for _, rj := range onRunners {
-		out, err := s.checkRunnerJobLocked(ctx, gv, rj.repo.String(), rj.job.ID, rj.run.ID, rj.job.RunnerName, &rj.run, "reconcile")
+		out, err := s.checkRunnerJobLocked(ctx, gv, rj.repo.String(), rj.job.ID, rj.run.ID, rj.job.RunnerName, 0, &rj.run, "reconcile")
 		if err != nil {
 			addErr("runner_check "+rj.job.RunnerName, err)
 		}
@@ -141,6 +141,19 @@ func (s *Server) Reconcile(ctx context.Context) ReconcileResult {
 	for ref, at := range s.cancelled {
 		if now.Sub(at) > cancelledTTL {
 			delete(s.cancelled, ref)
+		}
+	}
+	// Normally cleared when a guard pass sees the registration deleted (the hijacker's
+	// completed delivery); this bounds the map if that delivery is lost. A later kill
+	// of the same runner then logs ERROR again, which is louder and safe.
+	for name, at := range s.hijacked {
+		if now.Sub(at) > cancelledTTL {
+			delete(s.hijacked, name)
+		}
+	}
+	for name, at := range s.forgotten {
+		if now.Sub(at) > cancelledTTL {
+			delete(s.forgotten, name)
 		}
 	}
 
