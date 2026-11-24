@@ -802,7 +802,7 @@ func (r *TmuxRuntime) List(ctx context.Context, labelFilter map[string]string) (
 		// on project-path keys (canonical and legacy) that docker stores
 		// as labels but tmux stores as annotations.
 		filterable := mergeLabelMaps(meta.labels, meta.annotations)
-		if !matchesLabelFilter(filterable, labelFilter) {
+		if !LabelsMatchFilter(filterable, labelFilter) {
 			continue
 		}
 		project := projectkeys.ProjectNameFromLabels(meta.labels)
@@ -888,15 +888,6 @@ func parseUserOption(line string) (name, value string, ok bool) {
 		return "", "", false
 	}
 	return line[:spaceIdx], strings.Trim(strings.TrimSpace(line[spaceIdx+1:]), "\""), true
-}
-
-func matchesLabelFilter(labels, filter map[string]string) bool {
-	for k, want := range filter {
-		if labels[k] != want {
-			return false
-		}
-	}
-	return true
 }
 
 func scionNameFromRunConfig(config RunConfig) string {
