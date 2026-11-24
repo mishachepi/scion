@@ -7,8 +7,9 @@
 #               ставит бинарь хаба и плагин telegram, перезапускает хаб и брокер на хосте хаба; если хаб не поднялся
 #               на новом теге, плейбук сам возвращает прежние файлы и падает
 #   hub-broker  брокер на хосте хаба: linux-amd64 scion+sciontool в каталог runtimes.<имя>.binaries контейнерного
-#               рантайма. Вместе с hub — тем же прогоном плейбука (hub_sciontool), один рестарт брокера; без hub —
-#               копированием в $HUB_LINUX_BIN, рестарт user-юнита scion-broker, runtime-broker status
+#               рантайма ($HUB_LINUX_BIN; пустой — бинари не обновлять). Вместе с hub — тем же прогоном плейбука
+#               (hub_sciontool, broker_linux_bin), один рестарт брокера; без hub — копированием, рестарт user-юнита
+#               scion-broker, runtime-broker status
 #   mac         брокер на удалённом Mac: scp darwin-arm64 + shasum, rm+cp в каталог бинарей, kickstart -k
 #   local       брокер на этом Mac: rm+cp darwin-arm64 и linux-arm64 (каталог runtimes.<имя>.binaries
 #               контейнерного рантайма), bootout + bootstrap + kickstart
@@ -71,7 +72,9 @@ swap() { bash -s -- "$@" <<<"$SWAP"; }
 # Плейбук хаба: бинарь хаба и плагин, с hub-broker — ещё бинари контейнеров брокера; аргументы — его доп. флаги.
 PLAYBOOK_ARGS=(-e "hub_binary=$REL/linux-amd64/scion" -e "hub_commit=$COMMIT" -e "hub_version=$TAG"
   -e "hub_plugin=$REL/linux-amd64/scion-plugin-telegram")
-wants hub-broker && PLAYBOOK_ARGS+=(-e "hub_sciontool=$REL/linux-amd64/sciontool")
+if wants hub-broker && [[ -n ${HUB_LINUX_BIN:-} ]]; then
+  PLAYBOOK_ARGS+=(-e "hub_sciontool=$REL/linux-amd64/sciontool" -e "broker_linux_bin=$HUB_LINUX_BIN")
+fi
 playbook() { (cd "$INFRA_DIR" && ansible-playbook playbooks/infra/scion-hub-rebuild.yaml --private-key "$ANSIBLE_KEY" "${PLAYBOOK_ARGS[@]}" "$@"); }
 run_playbook() { if ((DRY)); then echo "  (cd $INFRA_DIR && ansible-playbook playbooks/infra/scion-hub-rebuild.yaml --private-key $ANSIBLE_KEY ${PLAYBOOK_ARGS[*]})"; else playbook; fi; }
 
