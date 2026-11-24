@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 )
 
 // EnvHarnessOTLPEndpoint is the standard OpenTelemetry variable a harness
@@ -95,16 +96,21 @@ func AlignHarnessOTLPEndpoint(p *Pipeline) {
 }
 
 // AlignOverlayOTLPEndpoint applies the same alignment to the harness env
-// overlay the pre-start provisioner wrote. Under a native telemetry policy
-// the supervisor refuses to start the harness unless the inherited
-// OTEL_EXPORTER_OTLP_ENDPOINT equals the overlay's, so the overlay has to
-// name the bound receiver port too.
+// overlay the pre-start provisioner wrote, and makes the inherited
+// environment carry the overlay's value. Under a native telemetry policy the
+// supervisor refuses to start the harness unless every inherited
+// OTEL_EXPORTER_OTLP_*ENDPOINT equals the overlay's, so both must name the
+// bound receiver port in the overlay's spelling (127.0.0.1, not localhost).
 func AlignOverlayOTLPEndpoint(p *Pipeline, overlay map[string]string) {
-	current, ok := overlay[EnvHarnessOTLPEndpoint]
-	if !ok {
-		return
-	}
-	if next, ok := harnessOTLPEndpoint(current, p.GRPCPort()); ok {
-		overlay[EnvHarnessOTLPEndpoint] = next
+	for key, current := range overlay {
+		if !strings.HasPrefix(key, "OTEL_EXPORTER_OTLP_") || !strings.HasSuffix(key, "ENDPOINT") {
+			continue
+		}
+		if next, ok := harnessOTLPEndpoint(current, p.GRPCPort()); ok {
+			overlay[key] = next
+		}
+		if _, inherited := os.LookupEnv(key); inherited {
+			_ = os.Setenv(key, overlay[key])
+		}
 	}
 }

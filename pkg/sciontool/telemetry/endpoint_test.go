@@ -67,8 +67,9 @@ func TestAlignHarnessOTLPEndpoint_PublishesBoundPorts(t *testing.T) {
 }
 
 // The provisioner's overlay names the configured port; it must follow the
-// receiver like the inherited environment does, or the native telemetry
-// policy check sees two different endpoints and refuses the harness.
+// receiver like the inherited environment does, in the overlay's own
+// spelling, or the native telemetry policy check sees two different
+// endpoints and refuses the harness.
 func TestAlignOverlayOTLPEndpoint(t *testing.T) {
 	r := NewReceiver(&Config{GRPCPort: 0, HTTPPort: 0}, nil)
 	if err := r.Start(context.Background()); err != nil {
@@ -77,17 +78,30 @@ func TestAlignOverlayOTLPEndpoint(t *testing.T) {
 	defer func() { _ = r.Stop(context.Background()) }()
 	g, _ := r.BoundPorts()
 	p := &Pipeline{receiver: r}
+	t.Setenv(EnvHarnessOTLPEndpoint, "http://localhost:"+strconv.Itoa(g))
+	t.Setenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "")
+	os.Unsetenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT")
 
-	overlay := map[string]string{EnvHarnessOTLPEndpoint: "http://localhost:4317", "OTHER": "x"}
+	overlay := map[string]string{
+		EnvHarnessOTLPEndpoint:             "http://127.0.0.1:4317",
+		"OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "http://127.0.0.1:4317",
+		"OTEL_EXPORTER_OTLP_PROTOCOL":      "grpc",
+	}
 	AlignOverlayOTLPEndpoint(p, overlay)
-	if got, want := overlay[EnvHarnessOTLPEndpoint], "http://localhost:"+strconv.Itoa(g); got != want {
-		t.Errorf("overlay %s = %q, want %q", EnvHarnessOTLPEndpoint, got, want)
+	want := "http://127.0.0.1:" + strconv.Itoa(g)
+	for _, key := range []string{EnvHarnessOTLPEndpoint, "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"} {
+		if overlay[key] != want {
+			t.Errorf("overlay %s = %q, want %q", key, overlay[key], want)
+		}
 	}
-
-	without := map[string]string{"OTHER": "x"}
-	AlignOverlayOTLPEndpoint(p, without)
-	if _, ok := without[EnvHarnessOTLPEndpoint]; ok {
-		t.Error("an overlay without the endpoint must not gain one")
+	if got := os.Getenv(EnvHarnessOTLPEndpoint); got != want {
+		t.Errorf("inherited %s = %q, want the overlay value %q", EnvHarnessOTLPEndpoint, got, want)
 	}
-	AlignOverlayOTLPEndpoint(nil, overlay)
+	if _, ok := os.LookupEnv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"); ok {
+		t.Error("a key the environment did not carry must not be added to it")
+	}
+	if overlay["OTEL_EXPORTER_OTLP_PROTOCOL"] != "grpc" {
+		t.Error("non-endpoint keys must be left alone")
+	}
+	AlignOverlayOTLPEndpoint(nil, map[string]string{EnvHarnessOTLPEndpoint: "http://127.0.0.1:4317"})
 }
