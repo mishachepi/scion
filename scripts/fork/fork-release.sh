@@ -47,9 +47,11 @@ fi
 
 if [[ -d $WT ]]; then git -C "$WT" checkout -q --detach "$TAG"; else git worktree add -q --detach "$WT" "$TAG"; fi
 cd "$WT"
-LD=$(./hack/version.sh)
-LDT=$(./hack/version.sh github.com/GoogleCloudPlatform/scion/cmd/sciontool/commands)
-[[ $LD == *"Version=$TAG"* ]] || die "hack/version.sh не видит тег (ожидал Version=$TAG): $LD"
+# hack/version.sh ставит Version только для тегов upstream (vX.Y.Z, nightly-…); тег mch-* добавляем сами.
+PKG_VER=github.com/GoogleCloudPlatform/scion/pkg/version
+PKG_VERT=github.com/GoogleCloudPlatform/scion/cmd/sciontool/commands
+LD="$(./hack/version.sh $PKG_VER 2>/dev/null) -X $PKG_VER.Version=$TAG"
+LDT="$(./hack/version.sh $PKG_VERT 2>/dev/null) -X $PKG_VERT.Version=$TAG"
 
 echo "==> make web"
 make web
