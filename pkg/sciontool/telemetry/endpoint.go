@@ -93,3 +93,18 @@ func AlignHarnessOTLPEndpoint(p *Pipeline) {
 		_ = os.Setenv(EnvHarnessOTLPEndpoint, next)
 	}
 }
+
+// AlignOverlayOTLPEndpoint applies the same alignment to the harness env
+// overlay the pre-start provisioner wrote. Under a native telemetry policy
+// the supervisor refuses to start the harness unless the inherited
+// OTEL_EXPORTER_OTLP_ENDPOINT equals the overlay's, so the overlay has to
+// name the bound receiver port too.
+func AlignOverlayOTLPEndpoint(p *Pipeline, overlay map[string]string) {
+	current, ok := overlay[EnvHarnessOTLPEndpoint]
+	if !ok {
+		return
+	}
+	if next, ok := harnessOTLPEndpoint(current, p.GRPCPort()); ok {
+		overlay[EnvHarnessOTLPEndpoint] = next
+	}
+}

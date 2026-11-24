@@ -65,3 +65,29 @@ func TestAlignHarnessOTLPEndpoint_PublishesBoundPorts(t *testing.T) {
 		t.Errorf("%s = %q, want %q", EnvHarnessOTLPEndpoint, got, want)
 	}
 }
+
+// The provisioner's overlay names the configured port; it must follow the
+// receiver like the inherited environment does, or the native telemetry
+// policy check sees two different endpoints and refuses the harness.
+func TestAlignOverlayOTLPEndpoint(t *testing.T) {
+	r := NewReceiver(&Config{GRPCPort: 0, HTTPPort: 0}, nil)
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = r.Stop(context.Background()) }()
+	g, _ := r.BoundPorts()
+	p := &Pipeline{receiver: r}
+
+	overlay := map[string]string{EnvHarnessOTLPEndpoint: "http://localhost:4317", "OTHER": "x"}
+	AlignOverlayOTLPEndpoint(p, overlay)
+	if got, want := overlay[EnvHarnessOTLPEndpoint], "http://localhost:"+strconv.Itoa(g); got != want {
+		t.Errorf("overlay %s = %q, want %q", EnvHarnessOTLPEndpoint, got, want)
+	}
+
+	without := map[string]string{"OTHER": "x"}
+	AlignOverlayOTLPEndpoint(p, without)
+	if _, ok := without[EnvHarnessOTLPEndpoint]; ok {
+		t.Error("an overlay without the endpoint must not gain one")
+	}
+	AlignOverlayOTLPEndpoint(nil, overlay)
+}

@@ -2138,6 +2138,7 @@ func loadHarnessEnvOverlay(ctx context.Context, harnessReq hooks.HarnessManifest
 		nativeTelemetryPolicy = policy
 		delete(overlay, hooks.NativeTelemetryPolicyKey)
 	}
+	telemetry.AlignOverlayOTLPEndpoint(pipeline, overlay)
 	log.Info("Loaded %d env overlay entries from %s", len(overlay), overlayPath)
 	activateOverlayUsageSource(ctx, pipeline, overlay, nativeTelemetryPolicy)
 	return overlay, nativeTelemetryPolicy, nil
