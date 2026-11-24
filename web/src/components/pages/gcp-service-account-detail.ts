@@ -51,7 +51,7 @@
  * sections are project-relative instead of guessing a project.
  */
 
-import { LitElement, html, css, nothing } from 'lit';
+import { LitElement, html, css, nothing, type PropertyValues } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 
 import type {
@@ -63,7 +63,9 @@ import { can } from '../../shared/types.js';
 import { saRef, saStatusUrl, saVerifyUrl } from '../../shared/gcp-service-account-urls.js';
 import { deleteGCPServiceAccount } from '../../shared/gcp-service-account-delete.js';
 import { apiFetch, extractApiError } from '../../client/api.js';
+import { current, scopedResourceTrail, type Named } from '../../client/crumbs.js';
 import { dispatchPageTitle } from '../../client/page-title.js';
+import { projectLabelNow, resolveProjectLabel } from '../../client/project-label.js';
 import { navigateTo } from '../../client/navigation.js';
 import '../shared/detail-header.js';
 import '../shared/gcp-service-account-status.js';
@@ -73,6 +75,8 @@ export class ScionPageGCPServiceAccountDetail extends LitElement {
   @state() private accountId = '';
   /** The Scion project the status sections are relative to, from ?project=. */
   @state() private projectId = '';
+  @state() private projectNamed: Named | null = null;
+  private resolvedProjectId = '';
   @state() private account: GCPServiceAccount | null = null;
   @state() private accountStatus: GCPServiceAccountStatus | null = null;
   @state() private statusError: string | null = null;
@@ -140,7 +144,32 @@ export class ScionPageGCPServiceAccountDetail extends LitElement {
       }
       this.projectId = new URLSearchParams(window.location.search).get('project') ?? '';
     }
+    this.syncProjectLabel();
     void this.load();
+  }
+
+  protected override willUpdate(changed: PropertyValues): void {
+    super.willUpdate(changed);
+    if (changed.has('projectId')) {
+      this.syncProjectLabel();
+    }
+  }
+
+  private syncProjectLabel(): void {
+    const id = (this.projectId ?? '').trim();
+    if (!id) {
+      this.projectNamed = null;
+      this.resolvedProjectId = '';
+      return;
+    }
+    if (id === this.resolvedProjectId) return;
+    this.resolvedProjectId = id;
+    this.projectNamed = projectLabelNow(id);
+    void resolveProjectLabel(id).then((resolved) => {
+      if (this.isConnected && (this.projectId ?? '').trim() === id) {
+        this.projectNamed = resolved;
+      }
+    });
   }
 
   private async load(): Promise<void> {
@@ -276,20 +305,24 @@ export class ScionPageGCPServiceAccountDetail extends LitElement {
   }
 
   /**
-   * The back link: with ?project= the page returns to that project's
-   * service-accounts tab (also when the status view failed), unless the
-   * status view says the account is parentless; otherwise to the hub
-   * settings tab.
+   * Parent breadcrumb trail: with ?project= the page sits under that project's
+   * service-accounts tab (also when the status view failed), unless the status
+   * view says the account is parentless; otherwise under Hub Resources.
    */
-  private backLink(): { href: string; label: string } {
+  private parentCrumbs(allowPending: boolean) {
     const scope = this.accountStatus?.account.scope;
-    if (this.projectId && (scope === undefined || scope === 'project')) {
-      return {
-        href: `/projects/${encodeURIComponent(this.projectId)}/settings?tab=gcp-sa`,
-        label: 'Project Settings',
-      };
+    const spec = {
+      plural: 'Service Accounts',
+      projectTab: 'gcp-sa',
+      hubTab: 'service-accounts',
+    };
+    const id = this.projectId.trim();
+    if (id && (scope === undefined || scope === 'project')) {
+      const resolved = this.projectNamed?.id === id ? this.projectNamed : projectLabelNow(id);
+      const project: Named = allowPending ? resolved : { id: resolved.id, label: resolved.label };
+      return scopedResourceTrail({ kind: 'project', project }, spec);
     }
-    return { href: '/settings?tab=service-accounts', label: 'Hub Resources' };
+    return scopedResourceTrail({ kind: 'hub' }, spec);
   }
 
   private renderStatusSections() {
@@ -312,12 +345,15 @@ export class ScionPageGCPServiceAccountDetail extends LitElement {
 
   override render() {
     if (this.loading) {
-      return html`<div class="loading-state"><sl-spinner></sl-spinner></div>`;
+      return html`
+        <scion-breadcrumb .crumbs=${this.parentCrumbs(true)}></scion-breadcrumb>
+        <div class="loading-state"><sl-spinner></sl-spinner></div>
+      `;
     }
 
     if (this.error || !this.account) {
       return html`
-        <scion-back-link href=${this.backLink().href}>${this.backLink().label}</scion-back-link>
+        <scion-breadcrumb .crumbs=${this.parentCrumbs(false)}></scion-breadcrumb>
         <div class="error-state">
           <sl-icon name="exclamation-triangle"></sl-icon>
           <p>${this.error ?? 'Service account not found'}</p>
@@ -329,11 +365,13 @@ export class ScionPageGCPServiceAccountDetail extends LitElement {
     const status = this.status();
     const canVerify = can(account._capabilities, 'verify');
     const canDelete = can(account._capabilities, 'delete');
-    const back = this.backLink();
 
     return html`
       <scion-detail-header heading=${account.email}>
-        <scion-back-link slot="back" href=${back.href}>${back.label}</scion-back-link>
+        <scion-breadcrumb
+          slot="back"
+          .crumbs=${[...this.parentCrumbs(true), current(account.email)]}
+        ></scion-breadcrumb>
         ${account.displayName
           ? html`<div slot="meta" class="display-name">${account.displayName}</div>`
           : nothing}

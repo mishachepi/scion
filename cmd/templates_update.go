@@ -38,6 +38,7 @@ templates and templates created without a source URL are skipped.
 
 If --url is provided, it overrides (and updates) the stored source URL.
 Use --all to refresh every template that has a GitHub source URL.
+In agent mode, --scope defaults to project and --url is not allowed.
 
 Examples:
   scion templates update my-template
@@ -67,6 +68,11 @@ func runTemplatesUpdate(cmd *cobra.Command, args []string) error {
 		return newUsageError("--scope must be global, project or user")
 	}
 
+	agentMode := resolveMode() == ModeAgent
+	if agentMode && strings.TrimSpace(urlOverride) != "" {
+		return newUsageError("--url is not allowed in agent mode; agents can refresh a template only from its stored source URL")
+	}
+
 	// The root --global flag selects the global scope (ptone/scion#1713).
 	if globalMode {
 		switch scope {
@@ -78,10 +84,17 @@ func runTemplatesUpdate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// A global-scope refresh reads no project, so, as requireHubForUpload
-	// does for --global, it neither links nor looks up one: a hub token
-	// without project:read can refresh global templates (ptone/scion#1713).
-	hubCtx, err := requireHubWith(projectPath, scope == "global")
+	// In agent mode, omitted --scope defaults to project so agents do not
+	// attempt global template refreshes that the Hub refuses with 401.
+	if scope == "" && agentMode {
+		scope = "project"
+	}
+
+	// A global-scope or user-scope refresh reads no project, so, as
+	// requireHubForUpload does for --global, it neither links nor looks up
+	// one: a hub token without project:read can refresh global or user
+	// templates (ptone/scion#1713, ptone/scion#8643).
+	hubCtx, err := requireHubWith(projectPath, scope == "global" || scope == "user")
 	if err != nil {
 		return err
 	}
@@ -90,9 +103,10 @@ func runTemplatesUpdate(cmd *cobra.Command, args []string) error {
 	// Project templates are limited to the current project when one is
 	// resolved (from --project or the working directory). Without a project
 	// context, project templates from every project the caller can see are
-	// considered. A global-scope refresh considers no project templates.
+	// considered. A global-scope or user-scope refresh considers no project
+	// templates.
 	var currentProject string
-	if scope != "global" {
+	if scope != "global" && scope != "user" {
 		currentProject, _ = GetProjectID(hubCtx)
 	}
 
@@ -316,9 +330,13 @@ func updateAllTemplates(ctx context.Context, svc hubclient.TemplateService, scop
 	return nil
 }
 
+func registerTemplatesUpdateFlags(cmd *cobra.Command) {
+	cmd.Flags().String("url", "", "Override (and store) the template's source URL")
+	cmd.Flags().Bool("all", false, "Update all templates that have a GitHub source URL")
+	cmd.Flags().String("scope", "", "Only consider templates in this scope (global, project, user)")
+}
+
 func init() {
 	templatesCmd.AddCommand(templatesUpdateCmd)
-	templatesUpdateCmd.Flags().String("url", "", "Override (and store) the template's source URL")
-	templatesUpdateCmd.Flags().Bool("all", false, "Update all templates that have a GitHub source URL")
-	templatesUpdateCmd.Flags().String("scope", "", "Only consider templates in this scope (global, project, user)")
+	registerTemplatesUpdateFlags(templatesUpdateCmd)
 }

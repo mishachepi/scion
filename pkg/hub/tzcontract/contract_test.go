@@ -139,9 +139,9 @@ func createRunningAgent(t *testing.T, h *hubProc, projectID, name string) (strin
 	return id, sw
 }
 
-// createScheduledEvent schedules a message event with a "+02:00" fireAt and
-// checks it on the create response, GET by ID and the list.
-func createScheduledEvent(t *testing.T, h *hubProc, projectID string) {
+// createScheduledEvent schedules a message event targeting agentName with a
+// "+02:00" fireAt and checks it on the create response, GET by ID and the list.
+func createScheduledEvent(t *testing.T, h *hubProc, projectID, agentName string) {
 	t.Helper()
 	fireAt := time.Now().Add(48 * time.Hour).Truncate(time.Second).In(offsetZone)
 	wireFireAt := fireAt.Format(time.RFC3339)
@@ -151,7 +151,7 @@ func createScheduledEvent(t *testing.T, h *hubProc, projectID string) {
 	w := openWindow()
 	evt := h.mustJSON("POST", "/api/v1/projects/"+projectID+"/scheduled-events", map[string]any{
 		"eventType": "message", "fireAt": wireFireAt,
-		"agentName": "tzcontract-scheduled-target", "message": "tz contract",
+		"agentName": agentName, "message": "tz contract",
 	}, 200, 201)
 	w.close()
 	id := str(evt, "id")
@@ -299,21 +299,31 @@ func runTokyoContract(t *testing.T, b backend) {
 	})
 
 	step(t, "scheduled event fireAt +02:00", func(t *testing.T) {
-		createScheduledEvent(t, h, projectID)
+		createScheduledEvent(t, h, projectID, "tzc-agent")
 	})
 
 	// Notifications: created by the dispatcher on an agent status change.
 	step(t, "notification", func(t *testing.T) {
+		me := h.mustJSON("GET", "/api/v1/auth/me", nil, 200)
+		userID := str(me, "id")
+		if userID == "" {
+			userID = str(obj(me, "user"), "id")
+		}
+		if userID == "" {
+			t.Fatalf("GET /auth/me: no user id in %v", me)
+		}
+		notifSubject := "user." + userID + ".notification"
+
 		notifAgentID, _ := createRunningAgent(t, h, projectID, "tzc-notify")
 		h.mustJSON("POST", "/api/v1/notifications/subscriptions", map[string]any{
 			"scope": "agent", "agentId": notifAgentID, "projectId": projectID,
 			"triggerActivities": []string{"COMPLETED"},
 		}, 200, 201)
-		sse := h.subscribe("notification.created")
+		sse := h.subscribe(notifSubject)
 		w := openWindow()
 		h.mustJSON("POST", "/api/v1/agents/"+notifAgentID+"/status",
 			map[string]any{"activity": "completed"}, 200, 204)
-		ev := sse.wait(t, "notification.created", func(d map[string]any) bool {
+		ev := sse.wait(t, notifSubject, func(d map[string]any) bool {
 			return str(d, "agentId") == notifAgentID
 		})
 		w.close()
@@ -525,7 +535,7 @@ func runKathmanduThresholds(t *testing.T, b backend) {
 	staleID, _ := createRunningAgent(t, h, projectID, "tzc-stale")
 	stalledID, _ := createRunningAgent(t, h, projectID, "tzc-stalled")
 	healthyID, _ := createRunningAgent(t, h, projectID, "tzc-healthy")
-	createScheduledEvent(t, h, projectID)
+	createScheduledEvent(t, h, projectID, "tzc-healthy")
 
 	// A chat message, so the webchat tables hold rows written under this TZ.
 	topicID := createTopic(t, h, projectID, "tzcontract-kathmandu")

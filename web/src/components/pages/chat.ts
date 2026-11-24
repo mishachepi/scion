@@ -42,7 +42,7 @@ import { LitElement, html, css, nothing } from 'lit';
 import type { TemplateResult } from 'lit';
 import { customElement, property, state, query } from 'lit/decorators.js';
 
-import type { PageData, Agent, Project } from '../../shared/types.js';
+import type { PageData, Agent, Project, DeletionInfo } from '../../shared/types.js';
 import { apiFetch, parseApiError } from '../../client/api.js';
 import { navigateTo, pushRoute, replaceRoute, stateManager } from '../../client/main.js';
 import { browserPath, stripBasePath } from '../../client/navigation.js';
@@ -68,6 +68,7 @@ import {
   chatDMsLoad,
   chatLoadClock,
   chatSpacesLoad,
+  type ChatDMsBody,
 } from '../../client/chat-list-cache.js';
 import type { SharedLoadOptions } from '../../client/chat-list-cache.js';
 import { ResumeRefresh } from '../../client/resume-refresh.js';
@@ -111,6 +112,7 @@ import {
   type HorizontalScrollRoom,
 } from '../../utils/horizontal-scroll.js';
 import { openTerminal, terminalHref, agentGraphHref } from '../../client/open-terminal.js';
+import { setChatCurrentAgent } from '../../client/terminal-workspace-events.js';
 import { hasOpenModalDescendant, isOpenModalElement } from '../shared/open-modal.js';
 import { deepActiveElement } from '../shared/deep-active-element.js';
 import { PaletteTypeahead, primaryPointerIsTouch } from '../shared/palette/palette-typeahead.js';
@@ -232,6 +234,22 @@ function recentFileToPreviewTarget(file: RecentFile): PreviewTarget {
  * (unread DM state, human space membership) and re-syncs after a missed event.
  */
 const FALLBACK_POLL_INTERVAL_MS = 60_000;
+/** Full `/members` (humans + agents) runs every 5th space fallback tick (~5 min). */
+const SPACE_FULL_POLL_EVERY_TICKS = 5;
+
+/**
+ * Max age passed to `chatDMsLoad` on a 60 s fallback poll tick: skips the
+ * request when an event-driven DM refresh already ran inside the interval,
+ * while staying 1 s under `FALLBACK_POLL_INTERVAL_MS` so `SharedJsonLoad`'s
+ * `<=` check and small `visibleInterval` timer jitter never skip an idle tick.
+ */
+const FALLBACK_POLL_MAX_AGE_MS = FALLBACK_POLL_INTERVAL_MS - 1_000;
+
+/** Suppresses this tab's own SSE read-watermark echo right after a local DM read. */
+const OWN_READ_ECHO_MS = 5_000;
+
+/** Shares one `/chat/dms` request between tab-resume rail catch-up and poll catch-up. */
+const RESUME_DM_MAX_AGE_MS = 2_000;
 
 /**
  * Normalise a Hub timestamp: Go marshals a zero time as year 0001 rather than
@@ -306,6 +324,7 @@ function agentMemberToAgent(m: import('../shared/chat/chat-members.js').ChatAgen
     lastSeen: m.lastSeen || '',
     ...(m.detailMessage ? { detail: { message: m.detailMessage } } : {}),
     lastActivityEvent: m.lastActivityEvent || '',
+    deletion: m.deletion ?? null,
   };
 }
 
@@ -328,6 +347,7 @@ function withLiveAgentStatus(
     // row without a message means the message was cleared.
     detailMessage: agentDetailMessage(agent),
     lastActivityEvent: realTimestamp(agent.lastActivityEvent) || member.lastActivityEvent || '',
+    deletion: agent.deletion ?? null,
   };
 }
 
@@ -373,6 +393,7 @@ function hubAgentMember(a: Agent): import('../shared/chat/chat-members.js').Chat
     projectId: a.projectId || '',
     detailMessage: agentDetailMessage(a),
     lastActivityEvent: realTimestamp(a.lastActivityEvent) || realTimestamp(a.updated),
+    deletion: a.deletion ?? null,
     canAttach: undefined,
   };
 }
@@ -625,6 +646,17 @@ export class ScionPageChat extends LitElement {
    */
   private _resumeRefresh: ResumeRefresh | null = null;
   private _unreadDMRequestId = 0;
+  /** Perf-clock instant of the latest known DM unread/mute change on this page. */
+  private _dmListChangedAt = -Infinity;
+  /** `chatDMsLoad` request started or joined by this page after `_dmListChangedAt`. */
+  private _freshDMsLoad: { promise: Promise<ChatDMsBody | null>; startedAt: number } | null = null;
+  /** Tracks wall-clock start of the last observed `chatDMsLoad` entry across system sleep. */
+  private _dmLoadEntryStartedAt: number | undefined = undefined;
+  private _dmLoadEntryWallAt = -Infinity;
+  /** Wall-clock timestamps of local DM reads, used to suppress the immediate own-SSE echo. */
+  private _localDMReadAt = new Map<string, number>();
+  /** True while `refreshRail()` is synchronously initiating an automated catch-up refresh. */
+  private _inCatchUpRailRefresh = false;
   /**
    * Bumped whenever the user navigates within the page (opens a thread or a
    * DM, resets the view) and when the page is removed. A lookup the user
@@ -698,6 +730,8 @@ export class ScionPageChat extends LitElement {
   private _sidebarOwner: 'none' | 'hub' | 'space' = 'none';
   /** The project whose members `loadV2Members` last loaded into the sidebar. */
   private _sidebarSpaceId = '';
+  /** Fallback poll ticks elapsed since the last full `loadV2Members` call. */
+  private _spacePollTicks = 0;
   /**
    * The {@link _hubMembersGeneration} whose users load last published, or
    * null. A "join" call (no `refresh`) for that same generation has nothing
@@ -1343,6 +1377,12 @@ export class ScionPageChat extends LitElement {
       background: var(--scion-surface, #ffffff);
     }
 
+    /* Hidden on mobile while the quick switcher is open so the switcher's
+       bottom search bar replaces it without reflowing the column behind it. */
+    .palette-footer--hidden {
+      visibility: hidden;
+    }
+
     .palette-footer-btn {
       box-sizing: border-box;
       width: 100%;
@@ -1352,7 +1392,7 @@ export class ScionPageChat extends LitElement {
       gap: 0.5rem;
       padding: 0 0.625rem;
       border: 0;
-      border-radius: 6px;
+      border-radius: calc(var(--scion-radius) * 0.75);
       background: transparent;
       color: var(--scion-text, #1e293b);
       font: inherit;
@@ -1618,17 +1658,31 @@ export class ScionPageChat extends LitElement {
 
       /*
        * Phone conversation header, compact row: the conversation name leads
-       * and the project crumb follows it on the next line. This is visual
-       * order only (the crumb stays first in the DOM; neither is focusable).
-       * Nothing else in the header changes per state or with the keyboard:
-       * padding, gap, borders, button boxes, hit areas, font sizes and line
-       * heights are the baseline ones. The fold (isCompactHeaderWidth, from
-       * the ResizeObserver's content-box width) and the header's height
+       * and the project crumb follows it on the next line, indented into the
+       * name's text column past the avatar via a two-column subgrid. This is
+       * visual layout only (the crumb stays first in the DOM; neither is
+       * focusable). Nothing else in the header changes per state or with the
+       * keyboard: padding, gap, borders, button boxes, hit areas, font sizes
+       * and line heights are the baseline ones. The fold (isCompactHeaderWidth,
+       * from the ResizeObserver's content-box width) and the header's height
        * under the thread's composer sizing (composer-room.ts) therefore see
        * the same geometry as before.
        */
+      .v2-thread-header.compact .conv-title {
+        display: grid;
+        grid-template-columns: auto minmax(0, 1fr);
+        column-gap: 0.375rem;
+      }
+
       .v2-thread-header.compact .conv-name {
         order: -1;
+        display: grid;
+        grid-column: 1 / -1;
+        grid-template-columns: subgrid;
+      }
+
+      .v2-thread-header.compact .conv-crumb {
+        grid-column: 2;
       }
 
       .desktop-members {
@@ -1917,14 +1971,23 @@ export class ScionPageChat extends LitElement {
     );
     // While this page is up, the badge reads the lists the rail and the DM
     // dots already load for each event, not a separate count request.
+    this._dmListChangedAt = chatLoadClock() - CHAT_STARTUP_REUSE_MS;
+    this._freshDMsLoad = null;
     chatUnread.setSource(this._unreadCountSource);
     void this.initV2();
+  }
+
+  private _noteDMListChange(at: number = chatLoadClock()): void {
+    this._dmListChangedAt = Math.max(this._dmListChangedAt, at);
+    this._freshDMsLoad = null;
   }
 
   /**
    * The unread badge's source while this page is connected: the shared
    * `/chat/spaces` and `/chat/dms` loads, joined with any request another
    * owner (the rail's reload, loadUnreadDMPeers) started after the event.
+   * Space-thread activity leaves `_dmListChangedAt` untouched, so it reuses
+   * the current `/chat/dms` load without refetching.
    */
   private readonly _unreadCountSource = async (
     startedAfter: number
@@ -1934,8 +1997,16 @@ export class ScionPageChat extends LitElement {
     // as old as the older of the two.
     const spacesLoad = chatSpacesLoad.load({ startedAfter });
     const spacesAt = chatSpacesLoad.startedAt() ?? chatLoadClock();
-    const dmsLoad = chatDMsLoad.load({ startedAfter });
-    const dmsAt = chatDMsLoad.startedAt() ?? chatLoadClock();
+    let dmsLoad: Promise<ChatDMsBody | null>;
+    let dmsAt: number;
+    const currentDMsAt = chatDMsLoad.startedAt();
+    if (this._freshDMsLoad !== null && currentDMsAt === this._freshDMsLoad.startedAt) {
+      dmsLoad = this._freshDMsLoad.promise;
+      dmsAt = this._freshDMsLoad.startedAt;
+    } else {
+      dmsLoad = chatDMsLoad.load({ startedAfter: this._dmListChangedAt });
+      dmsAt = chatDMsLoad.startedAt() ?? chatLoadClock();
+    }
     const [spaces, dms] = await Promise.all([spacesLoad, dmsLoad]);
     const count = badgeCountFromLists(spaces, dms);
     return count === null ? null : { count, startedAt: Math.min(spacesAt, dmsAt) };
@@ -1946,6 +2017,8 @@ export class ScionPageChat extends LitElement {
     this._cancelPalettePreload?.();
     this._cancelPalettePreload = null;
     chatUnread.setSource(null);
+    this._freshDMsLoad = null;
+    this._localDMReadAt.clear();
     ++this._unreadDMRequestId;
     ++this._userNavSeq;
     ++this._initV2Generation;
@@ -2039,6 +2112,7 @@ export class ScionPageChat extends LitElement {
     this._railCatchUp.cancel();
     // Nothing is on screen any more, so nothing is being actively read.
     chatNotifications.setActiveConversation(null);
+    setChatCurrentAgent(null);
   }
 
   /**
@@ -2138,6 +2212,42 @@ export class ScionPageChat extends LitElement {
         // a DM opened from the hub view keeps showing it in the sidebar.
         this._resetHubSearch({ keepQuery: true });
       }
+    }
+    if (changedProperties.has('v2Conversation') || changedProperties.has('v2AgentMembers')) {
+      this.syncHeaderCurrentAgent();
+    }
+  }
+
+  /**
+   * Publishes the active chat conversation's target agent (DM agent peer, or
+   * thread defaultAgent once resolved to a space member ID) for the header's
+   * Terminals dropdown.
+   */
+  private syncHeaderCurrentAgent(): void {
+    const conv = this.v2Conversation;
+    if (!conv) {
+      setChatCurrentAgent(null);
+      return;
+    }
+    if (conv.isDM) {
+      if (conv.peerKind === 'agent' && conv.peerId) {
+        setChatCurrentAgent({
+          agentId: conv.peerId,
+          name: conv.peerName || conv.peerId,
+        });
+      } else {
+        setChatCurrentAgent(null);
+      }
+      return;
+    }
+    const agentId = conv.defaultAgent ? this.resolveDefaultAgentId(conv.defaultAgent) : '';
+    if (agentId) {
+      setChatCurrentAgent({
+        agentId,
+        name: this.resolveDefaultAgentName(conv.defaultAgent) || agentId,
+      });
+    } else {
+      setChatCurrentAgent(null);
     }
   }
 
@@ -2243,23 +2353,19 @@ export class ScionPageChat extends LitElement {
     // is additionally refreshed on every inbound chat message.
     // It pauses while the tab is hidden and catches up once on return.
     this._stopFallbackPoll = visibleInterval(() => {
-      // After 60 s or more hidden, the resume rail refresh also loads the DM
-      // list on return, so this catch-up sends a second /chat/dms request.
-      // Accepted: which of the two starts first is up to the rail catch-up's
-      // timing, which is not this poll's to rely on, so sharing one request
-      // could not be made reliable.
-      void this.loadUnreadDMPeers();
-      // A DM has no membership of its own, so re-syncing here would silently
-      // swap the member list the user was just looking at. Leave the sidebar on
-      // whatever the previous view loaded.
-      if (this.v2Conversation?.isDM) return;
-      if (this.v2Conversation?.projectId) {
-        void this.loadV2Members(this.v2Conversation.projectId);
-      } else if (this._sidebarOwner === 'space') {
-        // A space expanded with no conversation open (mobile) keeps its own
-        // members: reload them rather than claiming the sidebar for the hub.
-        void this.loadV2Members(this._sidebarSpaceId);
-      } else {
+      void this.loadUnreadDMPeers({ maxAgeMs: FALLBACK_POLL_MAX_AGE_MS });
+      const spaceProjectId = this.activeSpaceSidebarProjectId();
+      if (spaceProjectId) {
+        // 4 of 5 ticks refresh humans + presence only; every 5th tick (~5 min)
+        // runs a full reload to reconcile missed agent events and canAttach.
+        // Also runs while viewing a DM whose sidebar still shows a space, so
+        // missed SSE deletes do not freeze that space's sidebar indefinitely.
+        if (++this._spacePollTicks >= SPACE_FULL_POLL_EVERY_TICKS) {
+          void this.loadV2Members(spaceProjectId);
+        } else {
+          void this.refreshSpaceHumans(spaceProjectId);
+        }
+      } else if (!this.v2Conversation?.isDM) {
         // Human membership has no SSE event, so the users list is loaded
         // again — but only the bounded recent-users page, and only once it
         // is older than RECENT_USERS_TTL_MS: until then this re-publishes the
@@ -2277,6 +2383,18 @@ export class ScionPageChat extends LitElement {
   }
 
   /**
+   * Project ID whose space members currently own the sidebar, if any:
+   * an open non-DM thread's project, or `_sidebarSpaceId` when the sidebar is
+   * space-owned (mobile expanded space, or a DM opened after viewing a space).
+   */
+  private activeSpaceSidebarProjectId(): string {
+    if (!this.v2Conversation?.isDM && this.v2Conversation?.projectId) {
+      return this.v2Conversation.projectId;
+    }
+    return this._sidebarOwner === 'space' ? this._sidebarSpaceId : '';
+  }
+
+  /**
    * Quietly refresh the rail and what loads with it (see the rail's
    * `refresh`): a catch-up, so no pull indicator. A refresh already running
    * is joined.
@@ -2285,7 +2403,19 @@ export class ScionPageChat extends LitElement {
     const rail = this.shadowRoot?.querySelector('scion-chat-space-rail') as
       | import('../shared/chat/chat-space-rail.js').ScionChatSpaceRail
       | null;
-    void rail?.refresh({ quiet: true });
+    if (rail) {
+      this._inCatchUpRailRefresh = true;
+      try {
+        void rail.refresh({ quiet: true });
+      } finally {
+        this._inCatchUpRailRefresh = false;
+      }
+      return;
+    }
+    const spaceProjectId = this.activeSpaceSidebarProjectId();
+    if (spaceProjectId) {
+      void this.loadV2Members(spaceProjectId);
+    }
   }
 
   /** The SSE feed reconnected after a drop: events sent meanwhile were lost. */
@@ -2295,13 +2425,29 @@ export class ScionPageChat extends LitElement {
 
   /**
    * The rail started a full refresh. Reload the DM state the members
-   * sidebar shows (fresh, not shared with an earlier request; a failure
-   * fails the refresh), and the nav badge's count, which has the same
-   * staleness.
+   * sidebar shows (a user pull-to-refresh always fetches fresh; an automated
+   * catch-up joins a poll catch-up that started moments earlier), any active
+   * space's member list (`parseV2Route` short-circuits when a conversation is
+   * already open), and the nav badge's count, which has the same staleness.
    */
   private _handleRailRefresh(e: Event): void {
     const detail = (e as CustomEvent<RailRefreshDetail>).detail;
-    detail?.waitUntil(this.loadUnreadDMPeers());
+    if (this._inCatchUpRailRefresh) {
+      this._noteDMListChange(chatLoadClock() - RESUME_DM_MAX_AGE_MS);
+      detail?.waitUntil(
+        this.loadUnreadDMPeers({
+          maxAgeMs: RESUME_DM_MAX_AGE_MS,
+          startedAfter: this._dmListChangedAt,
+        })
+      );
+    } else {
+      this._noteDMListChange();
+      detail?.waitUntil(this.loadUnreadDMPeers());
+    }
+    const spaceProjectId = this.activeSpaceSidebarProjectId();
+    if (spaceProjectId) {
+      void this.loadV2Members(spaceProjectId);
+    }
     chatUnread.scheduleRefresh();
   }
 
@@ -2476,6 +2622,7 @@ export class ScionPageChat extends LitElement {
         this.parseV2Route();
         return;
       }
+      if (this._projectIdToSlug.size > 0) this.clearRouteOpenPanel();
       return;
     }
 
@@ -2652,6 +2799,7 @@ export class ScionPageChat extends LitElement {
     // A conversation closing puts the mobile view back on the rail. With none
     // open the panel stays put: this runs again on every rail reload, and the
     // page starts on the rail, or on the panel its history entry recorded.
+    this.clearRouteOpenPanel();
     if (this.v2Conversation) this.mobilePanel = 'left';
     this.v2Conversation = null;
     this.v2MembersExpanded = true; // Always show tray in base view (no header toggle available)
@@ -2664,7 +2812,10 @@ export class ScionPageChat extends LitElement {
    */
   private async resolveSlugAndOpenThread(slug: string, threadId: string): Promise<void> {
     const projectId = await this.resolveProjectBySlug(slug);
-    if (!projectId) return;
+    if (!projectId) {
+      if (this.routeNamesThread(slug, threadId)) this.clearRouteOpenPanel();
+      return;
+    }
     // While the lookup was in flight the rail may have opened this thread
     // (and the user swiped away from it), or the user may have moved on to
     // another conversation. Only open it if the URL still names it and it is
@@ -2702,10 +2853,14 @@ export class ScionPageChat extends LitElement {
     // The rail can load during the await and the user open a thread from it,
     // or the page be rebuilt; only open the space if it is still what the
     // URL names on this page.
-    if (projectId && this.routeNamesSpace(slug)) {
+    if (!this.routeNamesSpace(slug)) return;
+    if (projectId) {
       void this.selectSpaceBySlug(slug, projectId);
+    } else {
+      // If resolution fails, leave the URL in place — it's just a 404 space —
+      // and clear the pending route-open marker so nothing stays armed.
+      this.clearRouteOpenPanel();
     }
-    // If resolution fails, leave the URL in place — it's just a 404 space.
   }
 
   /**
@@ -2784,11 +2939,13 @@ export class ScionPageChat extends LitElement {
         peerId: '',
         peerKind: 'user',
       };
-      this.mobilePanel = 'center';
+      this.mobilePanel = this.takeRouteOpenPanel('center');
       void this.loadV2Members(projectId);
       dispatchPageTitle(this, `#${target.name}`, 'Chat');
       // Update URL to include the thread
       navigateTo(`/chat/${encodeURIComponent(slug)}/${encodeURIComponent(target.id)}`);
+    } else {
+      this.clearRouteOpenPanel();
     }
   }
 
@@ -2848,13 +3005,12 @@ export class ScionPageChat extends LitElement {
     // Only adopt agents belonging to the current view: the open conversation's
     // project, the space holding the sidebar (on mobile, expanded with no
     // conversation), or every space the user can see in the base view.
-    const scopeProjectId =
-      this.v2Conversation?.projectId ||
-      (this._sidebarOwner === 'space' ? this._sidebarSpaceId : '');
+    const scopeProjectId = this.activeSpaceSidebarProjectId();
     const inScope = (projectId: string): boolean =>
       scopeProjectId ? projectId === scopeProjectId : true;
 
     const byId = new Map(this.v2AgentMembers.map((a) => [a.id, a]));
+    const addedMembers: ChatAgentMember[] = [];
     let hasNewAgent = false;
 
     for (const agent of stateManager.getAgents()) {
@@ -2866,8 +3022,7 @@ export class ScionPageChat extends LitElement {
       // otherwise every SSE tick re-adds it and re-triggers the refetch that
       // removes it again (the flicker loop).
       if (!existing && this._serverOmittedAgentIds.has(agent.id)) continue;
-      if (!existing) hasNewAgent = true;
-      byId.set(agent.id, {
+      const mapped: ChatAgentMember = {
         id: agent.id,
         kind: 'agent' as const,
         displayName: agent.name || agent.slug || agent.id,
@@ -2885,16 +3040,23 @@ export class ScionPageChat extends LitElement {
           realTimestamp(agent.updated) ||
           existing?.lastActivityEvent ||
           '',
+        deletion: agent.deletion ?? null,
         // SSE deltas carry status, not authorization. Preserve what the
         // members endpoint decided; rebuilding without it restores the
         // terminal control on every status tick.
         canAttach: existing?.canAttach,
-      });
+      };
+      if (!existing) {
+        hasNewAgent = true;
+        addedMembers.push(mapped);
+      }
+      byId.set(agent.id, mapped);
     }
 
     // Drop agents removed via SSE `deleted` events.
+    const deletedIds = new Set(stateManager.getDeletedAgentIds());
     const deletedRefs = new Set<string>();
-    for (const id of stateManager.getDeletedAgentIds()) {
+    for (const id of deletedIds) {
       const removed = byId.get(id);
       if (removed?.slug) deletedRefs.add(removed.slug);
       deletedRefs.add(id);
@@ -2902,6 +3064,30 @@ export class ScionPageChat extends LitElement {
     }
 
     this.v2AgentMembers = Array.from(byId.values());
+
+    // Keep v2Members (@mention composer roster) in sync on SSE membership
+    // changes without replacing the array reference on status-only ticks.
+    const hasDeletedInRoster =
+      deletedIds.size > 0 && this.v2Members.some((m) => m.kind === 'agent' && deletedIds.has(m.id));
+    const existingRosterIds =
+      addedMembers.length > 0 ? new Set(this.v2Members.map((m) => m.id)) : null;
+    const newRosterEntries = existingRosterIds
+      ? addedMembers
+          .filter((a) => !deletedIds.has(a.id) && !existingRosterIds.has(a.id))
+          .map((a) => ({
+            id: a.id,
+            name: a.displayName,
+            email: '',
+            slug: a.slug || '',
+            kind: 'agent' as const,
+          }))
+      : [];
+    if (hasDeletedInRoster || newRosterEntries.length > 0) {
+      const pruned = hasDeletedInRoster
+        ? this.v2Members.filter((m) => m.kind !== 'agent' || !deletedIds.has(m.id))
+        : this.v2Members;
+      this.v2Members = newRosterEntries.length > 0 ? [...pruned, ...newRosterEntries] : pruned;
+    }
 
     // When a brand-new agent appears via SSE, its `canAttach` is unknown
     // (SSE events carry status, not per-viewer authorization). Schedule a
@@ -2977,6 +3163,8 @@ export class ScionPageChat extends LitElement {
       if (peerId && this.v2UnreadFromIds.includes(peerId)) {
         this.v2UnreadFromIds = this.v2UnreadFromIds.filter((id) => id !== peerId);
       }
+      this._localDMReadAt.set(key, Date.now());
+      this._noteDMListChange();
       void this.loadUnreadDMPeers();
       return;
     }
@@ -3002,7 +3190,12 @@ export class ScionPageChat extends LitElement {
    * list follows the badge.
    */
   private _handleOwnReadStateSSE(e: Event): void {
-    type ReadStateData = { conversationKey?: string; userId?: string; unread?: boolean };
+    type ReadStateData = {
+      conversationKey?: string;
+      userId?: string;
+      unread?: boolean;
+      muted?: boolean;
+    };
     const detail = (e as CustomEvent).detail as
       | ({ data?: ReadStateData } & ReadStateData)
       | undefined;
@@ -3011,10 +3204,24 @@ export class ScionPageChat extends LitElement {
     const userId = this.pageData?.user?.id;
     if (!key || !userId || eventData?.userId !== userId) return;
     if (eventData?.unread !== true) {
-      // The user read a DM elsewhere (another tab or device): the badge
-      // drops on this event, so the rail's Unread DMs list must follow.
-      // A fresh /chat/dms load; the badge source's refresh joins it.
-      if (key.startsWith('dm:')) void this.loadUnreadDMPeers();
+      // The user read or muted a DM: reload so the rail's Unread DMs list
+      // follows the badge, unless this is the immediate echo of a DM read
+      // already handled locally by `_handleReadStateUpdated`.
+      if (key.startsWith('dm:')) {
+        const isMuteChange = typeof eventData?.muted === 'boolean';
+        const localReadAt = this._localDMReadAt.get(key);
+        if (
+          !isMuteChange &&
+          localReadAt !== undefined &&
+          Date.now() - localReadAt < OWN_READ_ECHO_MS
+        ) {
+          this._localDMReadAt.delete(key);
+          return;
+        }
+        const eventAt = e.timeStamp > 0 ? e.timeStamp : chatLoadClock();
+        this._noteDMListChange(eventAt);
+        void this.loadUnreadDMPeers();
+      }
       return;
     }
 
@@ -3070,6 +3277,7 @@ export class ScionPageChat extends LitElement {
         dm.peerId === peerId ? { ...dm, hasUnread: true } : dm
       );
     }
+    this._noteDMListChange();
     void this.loadUnreadDMPeers();
     if (this.v2UnreadFromIds.includes(peerId) || info?.muted) return;
     this.v2UnreadFromIds = [...this.v2UnreadFromIds, peerId];
@@ -3121,7 +3329,10 @@ export class ScionPageChat extends LitElement {
     // A DM message may create an unread DM or clear one — refresh the dots.
     // A space message cannot change DM unread state; an event without a key
     // (a lightweight one) might be a DM, so it refreshes too.
-    if (mayChangeDMUnread(eventData)) this._dmDotsRefresh.schedule(eventAt);
+    if (mayChangeDMUnread(eventData)) {
+      this._noteDMListChange(eventAt);
+      this._dmDotsRefresh.schedule(eventAt);
+    }
 
     // Reload the rail (trailing and capped, see _railReload).
     this._railReload.schedule(eventAt);
@@ -3138,8 +3349,9 @@ export class ScionPageChat extends LitElement {
     const newDefault = (topic?.defaultAgent as string) ?? '';
 
     // If this is the currently-viewed conversation, update defaultAgent directly
-    // and skip the rail reload to avoid the parseV2Route race that overwrites
-    // defaultAgent on subsequent changes, and to prevent sidebar flash.
+    // (and sync the rail's cached thread entry) and skip the rail reload to avoid
+    // the parseV2Route race that overwrites defaultAgent on subsequent changes,
+    // and to prevent sidebar flash.
     if (topicId && this.v2Conversation?.conversationKey === topicId) {
       if (this.v2Conversation.defaultAgent !== newDefault) {
         this.v2Conversation = {
@@ -3147,6 +3359,10 @@ export class ScionPageChat extends LitElement {
           defaultAgent: newDefault,
         };
       }
+      const rail = this.shadowRoot?.querySelector('scion-chat-space-rail') as
+        | import('../shared/chat/chat-space-rail.js').ScionChatSpaceRail
+        | null;
+      rail?.updateThreadDefaultAgent(this.v2Conversation.projectId, topicId, newDefault);
       return;
     }
 
@@ -3192,6 +3408,7 @@ export class ScionPageChat extends LitElement {
     // Threads row, so mark both groups stale, and Agents recency with them.
     this._markPaletteGroupsDirty('people', 'threads');
     this._markAgentDmsStale();
+    this._noteDMListChange();
     const detail = (e as CustomEvent).detail as Record<string, unknown> | undefined;
     const eventData = (detail?.data ?? detail) as Record<string, unknown> | undefined;
     const oldConversationKey = eventData?.oldConversationKey as string | undefined;
@@ -3430,7 +3647,9 @@ export class ScionPageChat extends LitElement {
    */
   private async fetchThreadDetails(conversationKey: string): Promise<void> {
     try {
-      const res = await apiFetch(`/api/v1/chat/topics/${encodeURIComponent(conversationKey)}`);
+      const res = await apiFetch(`/api/v1/chat/topics/${encodeURIComponent(conversationKey)}`, {
+        cache: 'no-store',
+      });
       if (!res.ok) return;
       const data = (await res.json()) as { name?: string; defaultAgent?: string };
       const conv = this.v2Conversation;
@@ -3439,7 +3658,7 @@ export class ScionPageChat extends LitElement {
       this.v2Conversation = {
         ...conv,
         threadName: data.name || conv.threadName,
-        defaultAgent: data.defaultAgent || conv.defaultAgent,
+        defaultAgent: data.defaultAgent ?? '',
       };
       if (data.name) {
         dispatchPageTitle(this, `#${data.name}`, 'Chat');
@@ -3449,14 +3668,24 @@ export class ScionPageChat extends LitElement {
     }
   }
 
-  /** Handle default-agent-changed from the thread component. Updates local state in place to avoid re-render. */
+  /** Handle default-agent-changed from the thread component. Updates local state and cached rail entry in place. */
   private handleDefaultAgentChanged(e: CustomEvent): void {
     const detail = e.detail as { defaultAgent: string };
+    const newDefault = detail.defaultAgent || '';
     if (this.v2Conversation) {
       this.v2Conversation = {
         ...this.v2Conversation,
-        defaultAgent: detail.defaultAgent || '',
+        defaultAgent: newDefault,
       };
+      const rail = this.shadowRoot?.querySelector('scion-chat-space-rail') as
+        | import('../shared/chat/chat-space-rail.js').ScionChatSpaceRail
+        | null;
+      rail?.updateThreadDefaultAgent(
+        this.v2Conversation.projectId,
+        this.v2Conversation.conversationKey,
+        newDefault
+      );
+      this._markPaletteGroupsDirty('threads');
     }
   }
 
@@ -3640,6 +3869,7 @@ export class ScionPageChat extends LitElement {
     }
 
     // 4. Unable to resolve — log error.
+    if (opts?.fromRoute) this.clearRouteOpenPanel();
     console.error('Unable to open DM — user identity not available. Please refresh the page.');
   }
 
@@ -3975,7 +4205,9 @@ export class ScionPageChat extends LitElement {
     // merging hub presence onto another view's members.
     const seq = this._membersViewSeq;
     try {
-      const res = await apiFetch(`/api/v1/chat/spaces/${encodeURIComponent(projectId)}/members`);
+      const res = await apiFetch(
+        `/api/v1/chat/spaces/${encodeURIComponent(projectId)}/members?include=humans`
+      );
       if (!res.ok) return;
       const data = (await res.json()) as {
         humans?: Array<{ id: string; presenceState?: 'active' | 'idle' | '' }>;
@@ -4024,8 +4256,39 @@ export class ScionPageChat extends LitElement {
   private async loadUnreadDMPeers(options: SharedLoadOptions = {}): Promise<boolean> {
     const requestId = ++this._unreadDMRequestId;
     try {
-      const body = await chatDMsLoad.load(options);
-      if (!body) return false;
+      const wallNow = Date.now();
+      if (
+        options.maxAgeMs !== undefined &&
+        chatDMsLoad.startedAt() !== undefined &&
+        chatDMsLoad.startedAt() === this._dmLoadEntryStartedAt &&
+        wallNow - this._dmLoadEntryWallAt > options.maxAgeMs
+      ) {
+        chatDMsLoad.invalidate();
+      }
+      const beforeAt = chatDMsLoad.startedAt();
+      const load = chatDMsLoad.load(options);
+      const startedAt = chatDMsLoad.startedAt() ?? chatLoadClock();
+      if (startedAt !== this._dmLoadEntryStartedAt) {
+        this._dmLoadEntryStartedAt = startedAt;
+        this._dmLoadEntryWallAt = wallNow;
+      }
+      // Record `_freshDMsLoad` only when `chatDMsLoad` started a new request
+      // right now (same-tick post-change load) or joined an entry strictly
+      // newer than `_dmListChangedAt`. A `maxAgeMs` poll joining an older
+      // entry must not pin `_unreadCountSource` to pre-change data.
+      const startedNow =
+        beforeAt === undefined ||
+        (options.maxAgeMs === undefined && options.startedAfter === undefined) ||
+        (options.startedAfter !== undefined && beforeAt <= options.startedAfter) ||
+        startedAt !== beforeAt;
+      if (startedNow || startedAt > this._dmListChangedAt) {
+        this._freshDMsLoad = { promise: load, startedAt };
+      }
+      const body = await load;
+      if (!body) {
+        if (this._freshDMsLoad?.promise === load) this._freshDMsLoad = null;
+        return false;
+      }
       const data = body as {
         dms?: Array<{
           conversationKey: string;
@@ -4079,8 +4342,59 @@ export class ScionPageChat extends LitElement {
     }
   }
 
+  /**
+   * Lightweight 60 s space fallback poll: fetches `?include=humans` and merges
+   * only human membership + presence, preserving `v2AgentMembers` (kept live
+   * via SSE and reconciled in full every 5th tick / on reconnect).
+   */
+  private async refreshSpaceHumans(projectId: string): Promise<void> {
+    if (!projectId) return;
+    const seq = this._membersViewSeq;
+    try {
+      const res = await apiFetch(
+        `/api/v1/chat/spaces/${encodeURIComponent(projectId)}/members?include=humans`
+      );
+      if (!res.ok) return;
+      const data = (await res.json()) as {
+        humans?: Array<{
+          id: string;
+          displayName: string;
+          email?: string;
+          avatarUrl?: string;
+          role?: string;
+          presenceState?: 'active' | 'idle' | '';
+        }>;
+      };
+      if (seq !== this._membersViewSeq) return;
+      if (this._sidebarOwner !== 'space' || this._sidebarSpaceId !== projectId) return;
+      const humans = data.humans || [];
+      this.v2HumanMembers = humans.map((h) => ({
+        id: h.id,
+        kind: 'user' as const,
+        displayName: h.displayName,
+        email: h.email || '',
+        avatarUrl: h.avatarUrl || '',
+        role: h.role || '',
+        presenceState: h.presenceState || '',
+      }));
+      this.v2Members = [
+        ...humans.map((h) => ({
+          id: h.id,
+          name: h.displayName,
+          email: h.email || '',
+          avatarUrl: h.avatarUrl || '',
+          kind: 'user' as const,
+        })),
+        ...this.v2Members.filter((m) => m.kind === 'agent'),
+      ];
+    } catch {
+      // Non-critical — next tick or reconnect will catch up
+    }
+  }
+
   private async loadV2Members(projectId: string): Promise<void> {
     if (!projectId) return;
+    this._spacePollTicks = 0;
     const seq = ++this._membersViewSeq;
     // The sidebar is this project's now: the hub list stops updating it.
     this._sidebarOwner = 'space';
@@ -4115,7 +4429,6 @@ export class ScionPageChat extends LitElement {
         const data = (await res.json()) as {
           humans?: Array<{
             id: string;
-            kind: 'user';
             displayName: string;
             email?: string;
             avatarUrl?: string;
@@ -4124,16 +4437,14 @@ export class ScionPageChat extends LitElement {
           }>;
           agents?: Array<{
             id: string;
-            kind: 'agent';
             displayName: string;
             slug?: string;
             phase?: string;
             activity?: string;
             suspendReason?: string;
             message?: string;
-            lastSeen?: string;
             lastActivityEvent?: string;
-            projectId?: string;
+            deletion?: DeletionInfo | null;
             canAttach?: boolean;
           }>;
           members?: SpaceMember[];
@@ -4144,6 +4455,19 @@ export class ScionPageChat extends LitElement {
         // immediately before the first write, so applying this response
         // can't overwrite that current view with stale data.
         if (seq !== this._membersViewSeq) return;
+
+        // Filter out agents tombstoned via SSE `deleted` while this request
+        // was in flight (`stateManager.seedAgents` skips tombstones, so
+        // `withLiveAgentStatus(m, undefined)` would otherwise resurrect them).
+        const deletedIds = new Set(stateManager.getDeletedAgentIds());
+        const droppedRefs = new Set<string>();
+        const liveAgents = (data.agents || []).filter((a) => {
+          if (!deletedIds.has(a.id)) return true;
+          droppedRefs.add(a.id);
+          if (a.slug) droppedRefs.add(a.slug);
+          return false;
+        });
+
         // Populate the sidebar member arrays
         this._agentMembersSource = 'space';
         this.v2HumanMembers = (data.humans || []).map((h) => ({
@@ -4155,7 +4479,7 @@ export class ScionPageChat extends LitElement {
           role: h.role || '',
           presenceState: h.presenceState || '',
         }));
-        this.v2AgentMembers = (data.agents || []).map((a) => ({
+        this.v2AgentMembers = liveAgents.map((a) => ({
           id: a.id,
           kind: 'agent' as const,
           displayName: a.displayName,
@@ -4163,10 +4487,11 @@ export class ScionPageChat extends LitElement {
           phase: a.phase || '',
           activity: a.activity || '',
           suspendReason: a.suspendReason,
-          lastSeen: a.lastSeen || '',
-          projectId: a.projectId || projectId,
+          lastSeen: '',
+          projectId,
           detailMessage: agentDetailMessage(a),
           lastActivityEvent: realTimestamp(a.lastActivityEvent),
+          deletion: a.deletion ?? null,
           // Carry the Hub attach decision through. These mappers rebuild the
           // member objects field by field, so anything not named here is
           // dropped before the sidebar sees it.
@@ -4178,7 +4503,7 @@ export class ScionPageChat extends LitElement {
         // event) — stateManager.seedAgents is add-only, so a stale entry
         // would otherwise linger and get re-added by every SSE tick,
         // triggering this same refetch in a loop (see _handleAgentsUpdated).
-        const serverAgentIds = new Set((data.agents || []).map((a) => a.id));
+        const serverAgentIds = new Set(liveAgents.map((a) => a.id));
         // If an agent the server now returns was previously marked as omitted,
         // lift the suppression — it is active and should not be blocked.
         for (const id of serverAgentIds) {
@@ -4211,15 +4536,19 @@ export class ScionPageChat extends LitElement {
             avatarUrl: h.avatarUrl || '',
             kind: 'user' as const,
           })),
-          ...(data.agents || []).map((a) => ({
+          ...liveAgents.map((a) => ({
             id: a.id,
             name: a.displayName,
             email: '',
             slug: a.slug || '',
             kind: 'agent' as const,
           })),
-          ...(data.members || []),
+          ...(data.members || []).filter((m) => m.kind !== 'agent' || !deletedIds.has(m.id)),
         ];
+        const conv = this.v2Conversation;
+        if (conv?.defaultAgent && droppedRefs.has(conv.defaultAgent)) {
+          this.v2Conversation = { ...conv, defaultAgent: '' };
+        }
       }
     } catch {
       // Non-critical (an abort lands here too: a newer view took over)
@@ -4593,8 +4922,7 @@ export class ScionPageChat extends LitElement {
    * `popstate`. See chat-panel-history.
    */
   private goToPanel(target: ChatPanel): void {
-    this._restoredPanel = null;
-    this._routeOpenPending = false;
+    this.clearRouteOpenPanel();
     if (target === this.mobilePanel) return;
     const move =
       this.isMobileViewport() && this.ownsPanelHistory()
@@ -4604,13 +4932,22 @@ export class ScionPageChat extends LitElement {
   }
 
   /**
+   * Clear any pending route-open panel state so a later layout change or
+   * route open falls back to its normal default instead of using a stale
+   * restored panel.
+   */
+  private clearRouteOpenPanel(): void {
+    this._restoredPanel = null;
+    this._routeOpenPending = false;
+  }
+
+  /**
    * The panel to show for a conversation opened from the URL: the one the
    * history entry recorded, the first time, otherwise `fallback`.
    */
   private takeRouteOpenPanel(fallback: ChatPanel): ChatPanel {
     const panel = this._restoredPanel ?? fallback;
-    this._restoredPanel = null;
-    this._routeOpenPending = false;
+    this.clearRouteOpenPanel();
     return panel;
   }
 
@@ -4649,8 +4986,7 @@ export class ScionPageChat extends LitElement {
     }
     const panel = this._panelHistory.popped(e.state, !this.isMobileLayout);
     if (!panel) return;
-    this._restoredPanel = null;
-    this._routeOpenPending = false;
+    this.clearRouteOpenPanel();
     if (panel === this.mobilePanel) return;
     if (this.mobilePanel === 'center') this.dismissKeyboard();
     this.mobilePanel = panel;
@@ -4718,8 +5054,7 @@ export class ScionPageChat extends LitElement {
    */
   private pushChatPath(path: string): void {
     const seq = this._userNavSeq;
-    this._restoredPanel = null;
-    this._routeOpenPending = false;
+    this.clearRouteOpenPanel();
     // Reopening what the URL already names (the open thread picked again,
     // the open DM's peer clicked) adds no entry: Back would only land on the
     // same conversation. In the mobile layout the panel change it makes is
@@ -6498,8 +6833,9 @@ export class ScionPageChat extends LitElement {
     const isMac = isMacPlatform();
     const shortcutLabel = isMac ? '⌘K' : 'Ctrl+K';
     const keyShortcuts = isMac ? 'Meta+K' : 'Control+K';
+    const hidden = this.isMobileLayout && this.v2PaletteOpen;
     return html`
-      <div class="palette-footer">
+      <div class=${hidden ? 'palette-footer palette-footer--hidden' : 'palette-footer'}>
         <button
           type="button"
           class="palette-footer-btn"
@@ -6677,6 +7013,7 @@ export class ScionPageChat extends LitElement {
       if (!res.ok) throw new Error('mute failed');
       // Muting changes what counts as unread and what may pop up.
       chatNotifications.invalidateConversationInfo();
+      this._noteDMListChange();
       chatUnread.scheduleRefresh();
       const data = (await res.json().catch(() => ({}))) as { muted?: boolean };
       if (typeof data.muted === 'boolean' && data.muted !== next) {
@@ -7289,7 +7626,8 @@ export class ScionPageChat extends LitElement {
         class="promote-dialog"
         label="Promote DM to Thread"
         ?open=${this.promoteDialogOpen}
-        @sl-after-hide=${() => {
+        @sl-after-hide=${(e: Event) => {
+          if (e.target !== e.currentTarget) return;
           this.promoteDialogOpen = false;
         }}
       >

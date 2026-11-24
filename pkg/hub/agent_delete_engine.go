@@ -782,7 +782,7 @@ func (e *deletionEngine) run() deletionOutcome {
 		})
 	}()
 
-	// Cancel scheduled events targeting the agent.
+	// Cancel pending scheduled events targeting or created by the agent.
 	func() {
 		ctx, cancel := e.step(deleteStepTimeout)
 		defer cancel()
@@ -830,14 +830,14 @@ func (e *deletionEngine) run() deletionOutcome {
 		defer cancel()
 		s.ClearTopicDefaultAgent(ctx, agent.ID, agent.Slug, agent.ProjectID)
 	})
-	// Pause recurring exec schedules and triggers targeting this agent with
-	// target_deleted (ptone/scion#7884, Stage 1 §5.6) before pausing
-	// definitions authored by this agent, so self-targeted schedules and
-	// triggers record target_deleted.
-	e.tailStep("pause targeted exec schedules", func() {
+	// Pause recurring exec and message schedules and triggers targeting this
+	// agent with target_deleted (ptone/scion#7884, ptone/scion#8927,
+	// Stage 1 §5.6) before pausing definitions authored by this agent, so
+	// self-targeted schedules and triggers record target_deleted.
+	e.tailStep("pause targeted schedules", func() {
 		ctx, cancel := context.WithTimeout(e.base, deleteStepTimeout)
 		defer cancel()
-		s.pauseExecSchedulesTargetingAgent(ctx, agent)
+		s.pauseSchedulesTargetingAgent(ctx, agent)
 	})
 	e.tailStep("pause targeted triggers", func() {
 		ctx, cancel := context.WithTimeout(e.base, deleteStepTimeout)
@@ -845,13 +845,29 @@ func (e *deletionEngine) run() deletionOutcome {
 		s.pauseTriggersTargetingAgent(ctx, agent)
 	})
 	// Pause the schedules and triggers whose authority is this agent, with
-	// status reason creator_deleted (ptone/scion#5403, Stage 1 §5.6). Run only
-	// after the delete committed; the schedule evaluator pauses any schedules
-	// it misses.
+	// status reason creator_deleted (ptone/scion#5403, Stage 1 §5.6). Each
+	// runs in its own tail step with an independent budget so schedules cannot
+	// starve trigger pausing; the schedule evaluator and trigger fire-time
+	// standing check remain the backstops.
 	e.tailStep("pause authored schedules", func() {
 		ctx, cancel := context.WithTimeout(e.base, deleteStepTimeout)
 		defer cancel()
 		s.pauseSchedulesAuthoredByAgent(ctx, agent)
+	})
+	e.tailStep("pause authored triggers", func() {
+		ctx, cancel := context.WithTimeout(e.base, deleteStepTimeout)
+		defer cancel()
+		s.pauseTriggersAuthoredByAgent(ctx, agent)
+	})
+	// Release active trigger subject claims bound to this agent (Stage 2 §4.2, §5.6).
+	// Idempotent on retry; hourly trigger maintenance also sweeps claims for deleted agents.
+	e.tailStep("release trigger subject claims", func() {
+		ctx, cancel := context.WithTimeout(e.base, deleteStepTimeout)
+		defer cancel()
+		if _, err := s.store.ReleaseTriggerSubjectClaimsForAgent(ctx, agent.ID, time.Now().UTC()); err != nil {
+			s.agentLifecycleLog.Warn("Failed to release trigger subject claims for deleted agent",
+				"agent_id", agent.ID, "error", err)
+		}
 	})
 
 	return deletionOutcome{kind: deletionOutcomeDeleted}
@@ -1575,8 +1591,9 @@ func (e *deletionEngine) finish() (deletionOutcome, bool) {
 		return deletionOutcome{}, true
 	}
 
-	// Hard delete: publish deleted BEFORE removing the record (the
-	// documented order), then delete, retried once.
+	// Hard delete: publish deleted BEFORE removing the record (the documented
+	// order), then delete, retried once. Post-commit external (GCP) cleanup of
+	// agent-scope secrets runs structurally inside finalizeAgentDeletion.
 	e.stopRenewal()
 	s.events.PublishAgentDeleted(e.base, agent.ID, agent.ProjectID)
 	var err error
@@ -1624,7 +1641,13 @@ var agentDeletionFinalizeSeam store.DeletionFinalizeHook = func(context.Context,
 // agentDeletionFinalizeSeam var first, then the Server's lifecycle finalize,
 // agent_lifecycle_tx.go).
 func (s *Server) finalizeAgentDeletion(ctx context.Context, agentID string, pred store.DeletionPredicate, mode store.DeletionFinalizeMode, set store.DeletionFields) (int, error) {
-	return s.store.FinalizeAgentDeletion(ctx, agentID, pred, mode, set, s.agentFinalizeHook)
+	run := func(txCtx context.Context) (int, error) {
+		return s.store.FinalizeAgentDeletion(txCtx, agentID, pred, mode, set, s.agentFinalizeHook)
+	}
+	if mode == store.DeletionFinalizeHard {
+		return s.withAgentSecretCleanup(ctx, agentID, run)
+	}
+	return run(ctx)
 }
 
 // --- Request side (design §2.4) ---

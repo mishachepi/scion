@@ -497,6 +497,27 @@ func (s *Server) startAgentCore(ctx context.Context, agent *store.Agent, opts St
 		}
 		return err
 	}
+	// Admin-managed broker policy pre-check (ptone/scion#7829 §4.3.D), with
+	// the same rollback semantics as checkPinnedPlacement above: undo any
+	// capacity hold and release any existing start claim before returning.
+	if err := s.checkBrokerPolicyForStart(ctx, agent); err != nil {
+		opts.Dispatch.rollback(ctx)
+		if opts.Existing != nil {
+			opts.Existing.finish(startReleased)
+		}
+		return err
+	}
+	// Refuse to launch an agent whose create-time HomeFiles (e.g. a trigger's
+	// .scion/trigger-event.json) have not yet been delivered by its create
+	// dispatch. Prevents a concurrent manual start from starting the agent
+	// without its event file (P1c-1 O-C / sec L2).
+	if agentHomeFilesPending(agent) {
+		opts.Dispatch.rollback(ctx)
+		if opts.Existing != nil {
+			opts.Existing.finish(startReleased)
+		}
+		return errHomeFilesNotDelivered
+	}
 	// The effective resting phase (ptone/scion#4669): an error row that
 	// remembers a created or provisioning phase a failed asynchronous start
 	// began from is still a provisioned agent that never ran. Read before
@@ -1188,6 +1209,9 @@ func (s *Server) writeStartClaimError(ctx context.Context, w http.ResponseWriter
 		return true
 	case s.writeStartInProgress(w, err):
 		return true
+	case errors.Is(err, errHomeFilesNotDelivered):
+		Conflict(w, "the agent cannot be started yet: create-time home files have not been delivered yet; retry once creation completes; if creation failed, delete and re-create the agent")
+		return true
 	case errors.Is(err, store.ErrClaimPredicate):
 		Conflict(w, "the agent cannot be started now: it is being deleted or reincarnated")
 		return true
@@ -1238,14 +1262,18 @@ func (s *Server) createUnderClaim(ctx context.Context, agent *store.Agent, dispa
 // a queued stop's own stop-kind claim is kept. A holder still renewing
 // finds the claim gone and abandons its start.
 func (s *Server) releaseSupersededClaim(ctx context.Context, agentID, claimID string, stopIntentAt time.Time) {
-	if claimID == "" || stopIntentAt.IsZero() {
+	if claimID == "" || stopIntentAt.IsZero() || s == nil || s.store == nil {
 		return
 	}
-	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-	defer cancel()
-	if released, err := s.store.ReleaseSupersededStart(rctx, agentID, claimID, stopIntentAt); err != nil {
-		slog.Warn("Releasing a start claim superseded by a stop failed; the reaper will settle it", "agent_id", agentID, "error", err)
-	} else if released {
-		slog.Info("Released a start claim superseded by a stop", "agent_id", agentID, "claim_id", claimID)
-	}
+	_ = runBestEffortCleanupStep(ctx, 10*time.Second, nil,
+		"release_superseded_claim", "Recovered panic releasing superseded start claim",
+		[]any{"agent_id", agentID, "claim_id", claimID},
+		func(rctx context.Context) error {
+			if released, err := s.store.ReleaseSupersededStart(rctx, agentID, claimID, stopIntentAt); err != nil {
+				slog.Warn("Releasing a start claim superseded by a stop failed; the reaper will settle it", "agent_id", agentID, "error", err)
+			} else if released {
+				slog.Info("Released a start claim superseded by a stop", "agent_id", agentID, "claim_id", claimID)
+			}
+			return nil
+		})
 }

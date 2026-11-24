@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
+	"github.com/GoogleCloudPlatform/scion/pkg/msgaction"
 )
 
 // Decisions (ptone/scion#7514): an agent's decision prompt carries decisions,
@@ -45,24 +46,20 @@ const (
 )
 
 // MaxDecisionWithdrawReasonRunes bounds WithdrawDecisionsInput.Reason.
-const MaxDecisionWithdrawReasonRunes = 500
+const MaxDecisionWithdrawReasonRunes = msgaction.MaxReasonRunes
 
 // MaxDecisionDismissReasonRunes bounds DismissDecisionsInput.Reason.
-const MaxDecisionDismissReasonRunes = 500
+const MaxDecisionDismissReasonRunes = msgaction.MaxReasonRunes
 
 // DecisionDismissMinAge is the minimum age a decision version must reach
 // before a user may dismiss it (design-8194 section 4.4a, D10).
-const DecisionDismissMinAge = 5 * time.Minute
+const DecisionDismissMinAge = msgaction.DecisionDismissMinAge
 
 // DecisionStatusTerminal reports whether status is a terminal decision status
 // (replaced, withdrawn, or dismissed) that cannot accept new answers.
 func DecisionStatusTerminal(status string) bool {
-	switch status {
-	case DecisionStatusReplaced, DecisionStatusWithdrawn, DecisionStatusDismissed:
-		return true
-	default:
-		return false
-	}
+	cls, ok := msgaction.DecisionKindSpec.Classify(status)
+	return ok && cls.Terminal() && cls != msgaction.ClassResolved
 }
 
 // Decision key sources.
@@ -89,6 +86,7 @@ const (
 const (
 	DecisionSurfaceNative        = "native"
 	DecisionSurfaceDecisionsPage = "decisions_page"
+	DecisionSurfaceInbox         = "inbox"
 	DecisionSurfaceSlack         = "slack"
 	DecisionSurfaceGoogleChat    = "google_chat"
 	DecisionSurfaceDiscord       = "discord"
@@ -98,7 +96,7 @@ const (
 )
 
 // MaxDecisionIdempotencyKeyLen bounds RecordAnswerInput.IdempotencyKey.
-const MaxDecisionIdempotencyKeyLen = 128
+const MaxDecisionIdempotencyKeyLen = msgaction.MaxIdempotencyKeyLen
 
 var (
 	// ErrDecisionKeyExists: a decision prompt without Update reuses a key that
@@ -221,14 +219,18 @@ type ProjectDecisionAnswerFilter struct {
 	QueryChatKeys []string
 }
 
-// ProjectDecisionAnswerEntry is one append-only decision_answers log entry
-// enriched with its associated decision row, sibling agent_interpreted choice
-// label (when Outcome == DecisionOutcomeOverride), and message-availability
-// flags against the messages table.
+// ProjectDecisionAnswerEntry is one Made-tab decision_answers entry enriched
+// with its associated decision row, folded sibling agent_interpreted answer
+// (when a direct confirm/override/dismiss superseded it, design-8443 §4.2),
+// awaiting-confirmation flag (when an unconfirmed agent_interpreted row stands
+// on an active decision), and message-availability flags against messages.
 type ProjectDecisionAnswerEntry struct {
 	Answer                 *DecisionAnswer
 	Decision               *Decision
+	InterpretedAnswer      *DecisionAnswer
 	PreviousChoiceLabel    string
+	PreviousOtherText      string
+	AwaitingConfirmation   bool
 	PromptExistsInMessages bool
 	SourceExistsInMessages bool
 }
@@ -447,7 +449,11 @@ func (e ExistingDecisionKey) Hint() string {
 		if who == "" {
 			who = "a user"
 		}
-		state = fmt.Sprintf("decided by %s: %s", who, e.Answer.ChoiceLabel)
+		ansText := e.Answer.ChoiceLabel
+		if e.Answer.ChoiceID == messages.ChoiceIDOther && e.Answer.OtherText != "" {
+			ansText = fmt.Sprintf("%s %q", e.Answer.ChoiceLabel, e.Answer.OtherText)
+		}
+		state = fmt.Sprintf("decided by %s: %s", who, ansText)
 	case e.Status == DecisionStatusDismissed && e.Dismissal != nil:
 		who := e.Dismissal.AnsweredByName
 		if who == "" {
@@ -704,12 +710,14 @@ type RecordAnswerInput struct {
 	IdempotencyKey string
 }
 
-// AnswerSetItem is one answer of a set submit: the row, the chosen id and
-// the outcome the caller expects from the state it read (answer, or
+// AnswerSetItem is one answer of a set submit: the row, the chosen id,
+// optional free-form other text (required iff ChoiceID == messages.ChoiceIDOther),
+// and the outcome the caller expects from the state it read (answer, or
 // confirm or override over the user's own agent_interpreted answer).
 type AnswerSetItem struct {
 	DecisionRowID string
 	ChoiceID      string
+	OtherText     string // required iff ChoiceID == messages.ChoiceIDOther; trimmed by store
 	Outcome       string // DecisionOutcome*; empty means answer
 }
 
@@ -754,15 +762,18 @@ type InterpretedAnswerPair struct {
 	DecisionRowID string
 	Key           string
 	ChoiceID      string
+	OtherText     string // required iff ChoiceID == messages.ChoiceIDOther; trimmed by store
 }
 
-// InterpretedFormattedItem carries the canonical key and choice label of one
-// validated pair so RecordInterpretedInput.FormatMessage can render the
-// single decision-response message text inside the transaction.
+// InterpretedFormattedItem carries the canonical key, choice label, and
+// optional Other text of one validated pair so
+// RecordInterpretedInput.FormatMessage can render the single decision-response
+// message text inside the transaction.
 type InterpretedFormattedItem struct {
 	Key         string
 	ChoiceID    string
 	ChoiceLabel string
+	OtherText   string
 }
 
 // RecordInterpretedInput records 1 to MaxDecisionsPerMessage agent-interpreted
@@ -825,11 +836,14 @@ type DismissDecisionsInput struct {
 	RowIDs          []string         // optional subset; empty = every row of the prompt waiting on the user
 	User            DecisionAnswerer // id, name, email
 	Reason          string           // optional, <= 500 runes, trimmed
-	Surface         string           // native | decisions_page
+	Surface         string           // native | decisions_page | inbox
 	IdempotencyKey  string           // optional
 	ResponseMessage *Message         // the decision-response to store (built by the hub)
 	FormatMessage   func(dismissed []*Decision) string
 	Now             func() time.Time // optional clock override for tests; defaults to time.Now
+	// MinAge overrides DecisionDismissMinAge when positive (test-mode hubs
+	// only; <= 0 enforces the production 5-minute DecisionDismissMinAge).
+	MinAge time.Duration
 }
 
 // DismissDecisionsResult reports the decisions dismissed (or already dismissed)
@@ -989,10 +1003,12 @@ type DecisionStore interface {
 	// projectIDs or chatKeys returns (nil, nil) without querying.
 	ListOpenPrompts(ctx context.Context, projectIDs, chatKeys []string) ([]*ProjectDecisionPrompt, error)
 
-	// ListDecisionAnswers lists append-only decision_answers entries
-	// belonging to decisions in projectIDs with chat_key in chatKeys,
-	// filtered by filter and ordered newest first by (created_at DESC, id
-	// DESC) with keyset cursor pagination. limit must be in [0,
+	// ListDecisionAnswers lists Made-tab decision_answers entries belonging to
+	// decisions in projectIDs with chat_key in chatKeys, excluding any
+	// agent_interpreted row superseded by a direct sibling on the same
+	// decision_row_id (folding that sibling into Entry.InterpretedAnswer),
+	// filtered by filter and ordered newest first by (created_at DESC, id DESC)
+	// with keyset cursor pagination. limit must be in [0,
 	// MaxDecisionListLimit]; limit == 0 validates inputs and returns (nil,
 	// "", nil). Empty projectIDs or chatKeys validates inputs and returns
 	// (nil, "", nil).
@@ -1001,9 +1017,9 @@ type DecisionStore interface {
 	// ListDecisionFacets returns, scoped strictly to decisions/answers in
 	// projectIDs whose chat_key is in chatKeys: the distinct asking agents
 	// (each with the asker_agent_name of its newest decision), the distinct
-	// answering users (at most 500, sorted by display name then ID), and
-	// the distinct chat keys that have at least one decision (a subset of
-	// chatKeys, in no particular order).
+	// answering users on non-superseded Made entries (at most 500, sorted by
+	// display name then ID), and the distinct chat keys that have at least one
+	// decision (a subset of chatKeys, in no particular order).
 	ListDecisionFacets(ctx context.Context, projectIDs, chatKeys []string) (agents, answerers []ProjectDecisionActor, convKeys []string, err error)
 
 	// ProjectsWithDecisions returns the distinct project IDs in projectIDs
@@ -1012,8 +1028,27 @@ type DecisionStore interface {
 	// projectIDs returns (nil, nil) without querying.
 	ProjectsWithDecisions(ctx context.Context, projectIDs []string) ([]string, error)
 
-	// ListDecisionAnswersPerProject lists up to perProject newest
-	// append-only decision_answers entries per project in projectIDs whose
+	// ProjectsWithUnsettledDecisions returns the subset of projectIDs holding
+	// at least one decision with settled=false (a superset of "has open
+	// decisions"). Empty projectIDs returns (nil, nil) without querying.
+	ProjectsWithUnsettledDecisions(ctx context.Context, projectIDs []string) (map[string]bool, error)
+
+	// HasPendingDecisionIndexWork reports whether any background decision
+	// indexing work is pending (e.g. settled-eligible rows still marked
+	// settled=false).
+	HasPendingDecisionIndexWork(ctx context.Context) (bool, error)
+
+	// SweepSettledDecisionsPage marks up to limit settled-eligible decisions
+	// with id > afterID (when afterID is non-empty) whose settled hint is still
+	// false as settled=true in one transaction. Returns the number of rows
+	// updated and the highest decision ID scanned on this page (nextCursor,
+	// empty when no matching rows remain after afterID). Callers advance
+	// afterID = nextCursor while nextCursor != "" (even on short pages, since
+	// Postgres FOR UPDATE SKIP LOCKED may return fewer than limit rows).
+	SweepSettledDecisionsPage(ctx context.Context, afterID string, limit int) (updated int, nextCursor string, err error)
+
+	// ListDecisionAnswersPerProject lists up to perProject newest non-superseded
+	// Made-tab decision_answers entries per project in projectIDs whose
 	// decision's chat_key is in chatKeysByProject[projectID], filtered by
 	// filter and ordered within each project by (created_at DESC, id DESC).
 	// Projects with no keys or no matching answers are omitted from the

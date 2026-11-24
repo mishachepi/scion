@@ -237,7 +237,7 @@ export class ScionUnifiedLogViewer extends LitElement {
       align-items: center;
       gap: 0.25rem;
       padding: 0.25rem 0.5rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
       font-size: 0.75rem;
       font-weight: 600;
       font-family: var(--scion-font-mono, monospace);
@@ -335,7 +335,7 @@ export class ScionUnifiedLogViewer extends LitElement {
     .source-badge {
       display: inline-block;
       padding: 0.0625rem 0.375rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
       font-size: 0.6875rem;
       font-weight: 600;
       letter-spacing: 0.03em;
@@ -347,7 +347,7 @@ export class ScionUnifiedLogViewer extends LitElement {
     .sev {
       display: inline-block;
       padding: 0.0625rem 0.375rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
       font-size: 0.6875rem;
       font-weight: 600;
       text-transform: uppercase;
@@ -365,7 +365,7 @@ export class ScionUnifiedLogViewer extends LitElement {
       opacity: 0.7;
     }
     .sev-INFO {
-      background: var(--scion-primary-50, #eff6ff);
+      background: var(--scion-primary-tint, #eff6ff);
       color: var(--scion-primary-700, #1d4ed8);
     }
     .sev-WARNING {
@@ -438,7 +438,7 @@ export class ScionUnifiedLogViewer extends LitElement {
       display: flex;
       justify-content: center;
       padding: 0.5rem;
-      background: var(--scion-primary-50, #eff6ff);
+      background: var(--scion-primary-tint, #eff6ff);
       border-top: 1px solid var(--scion-primary-200, #bfdbfe);
       cursor: pointer;
       font-size: 0.8125rem;

@@ -28,6 +28,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentreincarnation"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentserviceaccountassignment"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentsessionmetrics"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentsuspendscreen"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/allowlistentry"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/apikey"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/brokerdispatch"
@@ -51,6 +52,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/durablequeueitem"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/entitlementbinding"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/envvar"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/execrunoutput"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/externalidentity"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/gcpserviceaccount"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/githubinstallation"
@@ -98,6 +100,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/scheduledexecpollcursor"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/scheduledexecrun"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/secret"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/secretrequest"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/skill"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/skillinjection"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/skillregistry"
@@ -113,11 +116,13 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/trigger"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/triggerevent"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/triggerfire"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/triggersubjectclaim"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/usagereservation"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/user"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/useraccesstoken"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/userdeletion"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/userdeletionagent"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/userexeccontainer"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/userterminalworkspace"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/webhookendpoint"
 )
@@ -196,6 +201,7 @@ func checkColumn(t, c string) error {
 			agentreincarnation.Table:            agentreincarnation.ValidColumn,
 			agentserviceaccountassignment.Table: agentserviceaccountassignment.ValidColumn,
 			agentsessionmetrics.Table:           agentsessionmetrics.ValidColumn,
+			agentsuspendscreen.Table:            agentsuspendscreen.ValidColumn,
 			allowlistentry.Table:                allowlistentry.ValidColumn,
 			apikey.Table:                        apikey.ValidColumn,
 			brokerdispatch.Table:                brokerdispatch.ValidColumn,
@@ -219,6 +225,7 @@ func checkColumn(t, c string) error {
 			durablequeueitem.Table:              durablequeueitem.ValidColumn,
 			entitlementbinding.Table:            entitlementbinding.ValidColumn,
 			envvar.Table:                        envvar.ValidColumn,
+			execrunoutput.Table:                 execrunoutput.ValidColumn,
 			externalidentity.Table:              externalidentity.ValidColumn,
 			gcpserviceaccount.Table:             gcpserviceaccount.ValidColumn,
 			githubresolutioncache.Table:         githubresolutioncache.ValidColumn,
@@ -266,6 +273,7 @@ func checkColumn(t, c string) error {
 			scheduledexecpollcursor.Table:       scheduledexecpollcursor.ValidColumn,
 			scheduledexecrun.Table:              scheduledexecrun.ValidColumn,
 			secret.Table:                        secret.ValidColumn,
+			secretrequest.Table:                 secretrequest.ValidColumn,
 			skill.Table:                         skill.ValidColumn,
 			skillinjection.Table:                skillinjection.ValidColumn,
 			skillregistry.Table:                 skillregistry.ValidColumn,
@@ -281,11 +289,13 @@ func checkColumn(t, c string) error {
 			trigger.Table:                       trigger.ValidColumn,
 			triggerevent.Table:                  triggerevent.ValidColumn,
 			triggerfire.Table:                   triggerfire.ValidColumn,
+			triggersubjectclaim.Table:           triggersubjectclaim.ValidColumn,
 			usagereservation.Table:              usagereservation.ValidColumn,
 			user.Table:                          user.ValidColumn,
 			useraccesstoken.Table:               useraccesstoken.ValidColumn,
 			userdeletion.Table:                  userdeletion.ValidColumn,
 			userdeletionagent.Table:             userdeletionagent.ValidColumn,
+			userexeccontainer.Table:             userexeccontainer.ValidColumn,
 			userterminalworkspace.Table:         userterminalworkspace.ValidColumn,
 			webhookendpoint.Table:               webhookendpoint.ValidColumn,
 		})

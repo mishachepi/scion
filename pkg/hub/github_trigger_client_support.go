@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/githubapp"
+	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
 const (
@@ -51,6 +52,11 @@ var (
 	// write-capable GitHub App installation token under a read-only
 	// association grant (§7.1).
 	ErrGitHubWriteNotPermitted = errors.New("github write not permitted")
+
+	// ErrGitHubPermissionNotPermitted is returned when a caller requests a
+	// GitHub App installation token permission that exceeds the project's
+	// configured GitHub permission limit (PUT /projects/{id}/github-permissions).
+	ErrGitHubPermissionNotPermitted = errors.New("github permission not permitted")
 )
 
 // githubCommentRateLimiter enforces a bounded in-memory per-project token
@@ -185,6 +191,7 @@ type githubInstallationTokenCacheKey struct {
 type githubInstallationTokenCacheEntry struct {
 	token          string
 	expiresAt      time.Time
+	permissions    map[string]string
 	appID          int64
 	apiBase        string
 	installationID int64
@@ -222,9 +229,9 @@ func (c *githubInstallationTokenCache) get(
 	apiBase string,
 	installationID int64,
 	ownerRepo string,
-) (string, time.Time, bool) {
+) (string, time.Time, map[string]string, bool) {
 	if projectID == "" || permKey == "" {
-		return "", time.Time{}, false
+		return "", time.Time{}, nil, false
 	}
 
 	c.mu.Lock()
@@ -233,7 +240,7 @@ func (c *githubInstallationTokenCache) get(
 	key := githubInstallationTokenCacheKey{projectID: projectID, permKey: permKey}
 	entry, ok := c.entries[key]
 	if !ok {
-		return "", time.Time{}, false
+		return "", time.Time{}, nil, false
 	}
 
 	now := c.clock()
@@ -243,9 +250,16 @@ func (c *githubInstallationTokenCache) get(
 		entry.installationID != installationID ||
 		!strings.EqualFold(entry.ownerRepo, ownerRepo) {
 		delete(c.entries, key)
-		return "", time.Time{}, false
+		return "", time.Time{}, nil, false
 	}
-	return entry.token, entry.expiresAt, true
+	var permsCopy map[string]string
+	if len(entry.permissions) > 0 {
+		permsCopy = make(map[string]string, len(entry.permissions))
+		for k, v := range entry.permissions {
+			permsCopy[k] = v
+		}
+	}
+	return entry.token, entry.expiresAt, permsCopy, true
 }
 
 func (c *githubInstallationTokenCache) put(
@@ -256,6 +270,7 @@ func (c *githubInstallationTokenCache) put(
 	ownerRepo string,
 	token string,
 	expiresAt time.Time,
+	permissions map[string]string,
 ) {
 	if projectID == "" || permKey == "" || token == "" {
 		return
@@ -303,9 +318,17 @@ func (c *githubInstallationTokenCache) put(
 		}
 	}
 
+	var permsCopy map[string]string
+	if len(permissions) > 0 {
+		permsCopy = make(map[string]string, len(permissions))
+		for k, v := range permissions {
+			permsCopy[k] = v
+		}
+	}
 	c.entries[githubInstallationTokenCacheKey{projectID: projectID, permKey: permKey}] = githubInstallationTokenCacheEntry{
 		token:          token,
 		expiresAt:      expiresAt,
+		permissions:    permsCopy,
 		appID:          appID,
 		apiBase:        apiBase,
 		installationID: installationID,
@@ -352,13 +375,29 @@ func canonicalGitHubTokenPermKey(perms githubapp.TokenPermissions) string {
 	return strings.Join(parts, ";")
 }
 
+func githubTokenPermRank(level string) int {
+	switch level {
+	case "read":
+		return 1
+	case "write":
+		return 2
+	default:
+		return 0
+	}
+}
+
 // scopeRequestedGitHubTokenPermissions validates an explicit permission set
-// against grant. Unknown levels and empty sets are rejected; if any requested
-// field asks for "write" under a read-only grant (!grant.WriteAllowed), it
-// refuses with ErrGitHubWriteNotPermitted rather than silently downgrading.
+// against grant and the project's stored GitHub permission limit
+// (PUT /projects/{id}/github-permissions, G3 S3). Unknown levels and empty sets
+// are rejected; if any requested field asks for "write" under a read-only grant
+// (!grant.WriteAllowed), it refuses with ErrGitHubWriteNotPermitted; if any
+// requested field exceeds the project's effective permission limit, it refuses
+// with ErrGitHubPermissionNotPermitted rather than silently downgrading.
 func scopeRequestedGitHubTokenPermissions(
 	requested githubapp.TokenPermissions,
+	stored *store.GitHubTokenPermissions,
 	grant githubAssociationGrant,
+	appPermissions map[string]string,
 ) (githubapp.TokenPermissions, error) {
 	requiresWrite := false
 	level := func(field, raw string) (string, error) {
@@ -401,6 +440,33 @@ func scopeRequestedGitHubTokenPermissions(
 	}
 	if requiresWrite && !grant.WriteAllowed {
 		return githubapp.TokenPermissions{}, ErrGitHubWriteNotPermitted
+	}
+
+	limit, _, ok := githubTokenPermissionsForGrant(stored, grant, appPermissions)
+	if !ok {
+		return githubapp.TokenPermissions{}, fmt.Errorf("%w: no usable permissions", ErrGitHubPermissionNotPermitted)
+	}
+	// GitHub always grants metadata:read implicitly on installation tokens, so
+	// a project limit such as {issues: write} (with metadata omitted) still
+	// permits metadata:read while still refusing metadata:write unless granted.
+	if githubTokenPermRank(limit.Metadata) < githubTokenPermRank("read") {
+		limit.Metadata = "read"
+	}
+	for _, f := range []struct {
+		name string
+		req  string
+		lim  string
+	}{
+		{"contents", out.Contents, limit.Contents},
+		{"pull_requests", out.PullRequests, limit.PullRequests},
+		{"issues", out.Issues, limit.Issues},
+		{"metadata", out.Metadata, limit.Metadata},
+		{"checks", out.Checks, limit.Checks},
+		{"actions", out.Actions, limit.Actions},
+	} {
+		if githubTokenPermRank(f.req) > githubTokenPermRank(f.lim) {
+			return githubapp.TokenPermissions{}, fmt.Errorf("%w: %s", ErrGitHubPermissionNotPermitted, f.name)
+		}
 	}
 	return out, nil
 }

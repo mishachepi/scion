@@ -132,20 +132,22 @@ const (
 // create (ptone/scion#4818), plus RunID and WorkspacePlacement; it ignores
 // the rest.
 type AgentLaunchReportInfo struct {
-	ID              string `json:"id,omitempty"`
-	Slug            string `json:"slug,omitempty"`
-	ContainerID     string `json:"containerId,omitempty"`
-	Name            string `json:"name,omitempty"`
-	Template        string `json:"template,omitempty"`
-	HarnessConfig   string `json:"harnessConfig,omitempty"`
-	HarnessAuth     string `json:"harnessAuth,omitempty"`
-	Image           string `json:"image,omitempty"`
-	Runtime         string `json:"runtime,omitempty"`
-	RuntimeState    string `json:"runtimeState,omitempty"`
-	Profile         string `json:"profile,omitempty"`
-	Phase           string `json:"phase,omitempty"`
-	Activity        string `json:"activity,omitempty"`
-	ContainerStatus string `json:"containerStatus,omitempty"`
+	ID              string            `json:"id,omitempty"`
+	Slug            string            `json:"slug,omitempty"`
+	ContainerID     string            `json:"containerId,omitempty"`
+	Name            string            `json:"name,omitempty"`
+	Template        string            `json:"template,omitempty"`
+	HarnessConfig   string            `json:"harnessConfig,omitempty"`
+	HarnessAuth     string            `json:"harnessAuth,omitempty"`
+	Image           string            `json:"image,omitempty"`
+	Runtime         string            `json:"runtime,omitempty"`
+	RuntimeState    string            `json:"runtimeState,omitempty"`
+	Profile         string            `json:"profile,omitempty"`
+	ProjectID       string            `json:"projectId,omitempty"`
+	Labels          map[string]string `json:"labels,omitempty"`
+	Phase           string            `json:"phase,omitempty"`
+	Activity        string            `json:"activity,omitempty"`
+	ContainerStatus string            `json:"containerStatus,omitempty"`
 	// HarnessConfigSource is which harness-config source the start resolved
 	// (wire key matches RemoteAgentInfo.HarnessConfigSource).
 	HarnessConfigSource string `json:"harnessConfigSource,omitempty"`
@@ -232,9 +234,21 @@ type AttachmentOutcome struct {
 	Reason       string `json:"reason,omitempty"`
 }
 
+// MessageDelivery identifies a hub message that the broker successfully
+// injected into the recipient agent's session (ptone/scion#9015).
+type MessageDelivery struct {
+	MessageID string `json:"messageId"`
+	AgentID   string `json:"agentId,omitempty"`
+	ProjectID string `json:"projectId,omitempty"`
+}
+
 // MessageFailuresReport is the body of a message-failures report.
 type MessageFailuresReport struct {
 	Failures []MessageFailure `json:"failures"`
+	// Deliveries are hub messages whose session injection succeeded on the
+	// broker (ptone/scion#9015). Additive and optional so older hubs ignore
+	// it cleanly.
+	Deliveries []MessageDelivery `json:"deliveries,omitempty"`
 	// AttachmentOutcomes are the per-file outcomes of attachment deliveries
 	// (ptone/scion#4596). The hub logs and counts them; they never change a
 	// message's state.
@@ -244,9 +258,10 @@ type MessageFailuresReport struct {
 // MessageFailuresResponse is the decoded body of a 200 answer from
 // POST /api/v1/runtime-brokers/{id}/message-failures.
 type MessageFailuresResponse struct {
-	Marked  int `json:"marked,omitempty"`
-	Held    int `json:"held,omitempty"`
-	Ignored int `json:"ignored,omitempty"`
+	Marked    int `json:"marked,omitempty"`
+	Delivered int `json:"delivered,omitempty"`
+	Held      int `json:"held,omitempty"`
+	Ignored   int `json:"ignored,omitempty"`
 }
 
 // runtimeBrokerService is the implementation of RuntimeBrokerService.
@@ -274,9 +289,10 @@ type ListBrokersResponse struct {
 
 // UpdateBrokerRequest is the request for updating a runtime broker.
 type UpdateBrokerRequest struct {
-	Name        string            `json:"name,omitempty"`
-	Labels      map[string]string `json:"labels,omitempty"`
-	Annotations map[string]string `json:"annotations,omitempty"`
+	Name         string            `json:"name,omitempty"`
+	Labels       map[string]string `json:"labels,omitempty"`
+	Annotations  map[string]string `json:"annotations,omitempty"`
+	AdminManaged *bool             `json:"adminManaged,omitempty"`
 }
 
 // ListBrokerProjectsResponse is the response from listing broker projects.
@@ -499,7 +515,8 @@ type CreateBrokerRequest struct {
 	Name         string            `json:"name"`
 	Capabilities []string          `json:"capabilities,omitempty"`
 	Labels       map[string]string `json:"labels,omitempty"`
-	AutoProvide  bool              `json:"autoProvide,omitempty"` // Automatically add as provider for new projects
+	AutoProvide  bool              `json:"autoProvide,omitempty"`  // Automatically add as provider for new projects
+	AdminManaged bool              `json:"adminManaged,omitempty"` // Mark broker as admin-managed (requires broker.manage)
 	// RuntimeTarget is the flat Runtime Broker registration descriptor
 	// (.design/flat-runtime-brokers-contract.md section 6); nil is legacy.
 	RuntimeTarget *api.RuntimeTargetDescriptor `json:"runtimeTarget,omitempty"`
@@ -514,6 +531,8 @@ type CreateBrokerRequest struct {
 	// PreserveSettings asks the hub to only issue a join token when the
 	// name matches an existing broker, leaving its settings unchanged.
 	PreserveSettings bool `json:"preserveSettings,omitempty"`
+	// Force allows re-registering a broker that is currently online on the Hub.
+	Force bool `json:"force,omitempty"`
 }
 
 // CreateBrokerResponse is returned when creating a new broker.

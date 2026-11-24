@@ -355,6 +355,13 @@ export class ScionPageAdminUsers extends LitElement {
   @state()
   private canReadRoleBindings = false;
 
+  /**
+   * Whether the signed-in viewer holds `user.invite` (from `/api/v1/auth/admin-status`).
+   * Gates user invite controls and the Invite Codes tab, failing closed until verified.
+   */
+  @state()
+  private canInviteUsers = false;
+
   @state()
   private confirmAction: ConfirmAction | null = null;
 
@@ -559,7 +566,7 @@ export class ScionPageAdminUsers extends LitElement {
         height: 2rem;
         border-radius: 50%;
         background: var(--scion-primary, #3b82f6);
-        color: white;
+        color: var(--scion-primary-text, #ffffff);
         display: flex;
         align-items: center;
         justify-content: center;
@@ -1068,20 +1075,43 @@ export class ScionPageAdminUsers extends LitElement {
   }
 
   private async loadCurrentUser(): Promise<void> {
+    const knownUserId = stateManager.getCurrentUserId();
+    if (knownUserId) {
+      this.currentUserId = knownUserId;
+      void this.loadInvitePermission(knownUserId);
+    }
     try {
       const res = await apiFetch('/auth/me');
       if (res.ok) {
         const data = (await res.json()) as { id?: string };
-        this.currentUserId = data.id || null;
+        const userId = data.id || null;
+        this.currentUserId = userId;
+        if (userId && userId !== knownUserId) {
+          void this.loadInvitePermission(userId);
+        } else if (!userId) {
+          this.canInviteUsers = false;
+          if (this.activeTab === 'invites') {
+            this.activeTab = 'users';
+          }
+        }
       }
     } catch {
       // Non-critical — actions will still work, just can't prevent self-actions
     }
     try {
-      const status = await loadAdminStatus(stateManager.getCurrentUserId() || this.currentUserId);
+      const status = await loadAdminStatus(this.currentUserId || stateManager.getCurrentUserId());
       this.canReadRoleBindings = hasAnyPermission(status, ['role_binding.read']);
     } catch {
       this.canReadRoleBindings = false;
+    }
+  }
+
+  private async loadInvitePermission(userId: string): Promise<void> {
+    const status = await loadAdminStatus(userId);
+    if (!this.isConnected || userId !== this.currentUserId) return;
+    this.canInviteUsers = hasAnyPermission(status, ['user.invite']);
+    if (!this.canInviteUsers && this.activeTab === 'invites') {
+      this.activeTab = 'users';
     }
   }
 
@@ -1967,6 +1997,7 @@ export class ScionPageAdminUsers extends LitElement {
   // ==================== Invite Codes Tab ====================
 
   private async loadInvites(): Promise<void> {
+    if (!this.canInviteUsers) return;
     this.invitesLoading = true;
     try {
       const response = await apiFetch('/api/v1/admin/invites');
@@ -2088,6 +2119,9 @@ export class ScionPageAdminUsers extends LitElement {
   // ==================== Render Methods ====================
 
   override render() {
+    const activeTab: AdminTab =
+      this.activeTab === 'invites' && this.canInviteUsers ? 'invites' : 'users';
+
     return html`
       <div class="header">
         <h1>Users</h1>
@@ -2098,30 +2132,34 @@ export class ScionPageAdminUsers extends LitElement {
       <div class="tabs" role="tablist">
         <button
           role="tab"
-          aria-selected=${this.activeTab === 'users'}
+          aria-selected=${activeTab === 'users'}
           aria-controls="panel-users"
-          class="tab-btn ${this.activeTab === 'users' ? 'active' : ''}"
+          class="tab-btn ${activeTab === 'users' ? 'active' : ''}"
           @click=${() => {
             this.activeTab = 'users';
           }}
         >
           Users ${!this.loading ? `(${this.tabCount})` : ''}
         </button>
-        <button
-          role="tab"
-          aria-selected=${this.activeTab === 'invites'}
-          aria-controls="panel-invites"
-          class="tab-btn ${this.activeTab === 'invites' ? 'active' : ''}"
-          @click=${() => {
-            this.activeTab = 'invites';
-            void this.loadInvites();
-          }}
-        >
-          Invite Codes ${this.invitesTotalCount > 0 ? `(${this.invitesTotalCount})` : ''}
-        </button>
+        ${this.canInviteUsers
+          ? html`
+              <button
+                role="tab"
+                aria-selected=${activeTab === 'invites'}
+                aria-controls="panel-invites"
+                class="tab-btn ${activeTab === 'invites' ? 'active' : ''}"
+                @click=${() => {
+                  this.activeTab = 'invites';
+                  void this.loadInvites();
+                }}
+              >
+                Invite Codes ${this.invitesTotalCount > 0 ? `(${this.invitesTotalCount})` : ''}
+              </button>
+            `
+          : nothing}
       </div>
 
-      ${this.activeTab === 'users'
+      ${activeTab === 'users'
         ? this.loading
           ? this.renderLoading()
           : this.error
@@ -2218,17 +2256,25 @@ export class ScionPageAdminUsers extends LitElement {
         <div class="empty-state">
           <sl-icon name="people"></sl-icon>
           <h2>No Users Found</h2>
-          <p>There are no users registered in the system. Invite users to get started.</p>
-          <sl-button
-            variant="primary"
-            style="margin-top: 1rem"
-            @click=${() => {
-              this.showInviteUserDialog = true;
-            }}
-          >
-            <sl-icon slot="prefix" name="person-plus"></sl-icon>
-            Invite User
-          </sl-button>
+          <p>
+            ${this.canInviteUsers
+              ? 'There are no users registered in the system. Invite users to get started.'
+              : 'There are no users registered in the system.'}
+          </p>
+          ${this.canInviteUsers
+            ? html`
+                <sl-button
+                  variant="primary"
+                  style="margin-top: 1rem"
+                  @click=${() => {
+                    this.showInviteUserDialog = true;
+                  }}
+                >
+                  <sl-icon slot="prefix" name="person-plus"></sl-icon>
+                  Invite User
+                </sl-button>
+              `
+            : nothing}
         </div>
       `;
     }
@@ -2241,28 +2287,32 @@ export class ScionPageAdminUsers extends LitElement {
           ${this.renderStatusFilter()} ${this.renderRoleFilter()}
           <span class="meta-text user-count">${this.displayedCount}</span>
         </div>
-        <div class="users-toolbar-right">
-          <sl-button
-            size="small"
-            variant="default"
-            @click=${() => {
-              this.showImportDialog = true;
-            }}
-          >
-            <sl-icon slot="prefix" name="upload"></sl-icon>
-            Import CSV
-          </sl-button>
-          <sl-button
-            size="small"
-            variant="primary"
-            @click=${() => {
-              this.showInviteUserDialog = true;
-            }}
-          >
-            <sl-icon slot="prefix" name="person-plus"></sl-icon>
-            Invite User
-          </sl-button>
-        </div>
+        ${this.canInviteUsers
+          ? html`
+              <div class="users-toolbar-right">
+                <sl-button
+                  size="small"
+                  variant="default"
+                  @click=${() => {
+                    this.showImportDialog = true;
+                  }}
+                >
+                  <sl-icon slot="prefix" name="upload"></sl-icon>
+                  Import CSV
+                </sl-button>
+                <sl-button
+                  size="small"
+                  variant="primary"
+                  @click=${() => {
+                    this.showInviteUserDialog = true;
+                  }}
+                >
+                  <sl-icon slot="prefix" name="person-plus"></sl-icon>
+                  Invite User
+                </sl-button>
+              </div>
+            `
+          : nothing}
       </div>
 
       ${this.users.length === 0
@@ -2789,7 +2839,7 @@ export class ScionPageAdminUsers extends LitElement {
   }
 
   private renderInviteUserDialog() {
-    if (!this.showInviteUserDialog) return nothing;
+    if (!this.showInviteUserDialog || !this.canInviteUsers) return nothing;
 
     return html`
       <sl-dialog
@@ -2854,7 +2904,7 @@ export class ScionPageAdminUsers extends LitElement {
   }
 
   private renderImportDialog() {
-    if (!this.showImportDialog) return nothing;
+    if (!this.showImportDialog || !this.canInviteUsers) return nothing;
     return html`
       <sl-dialog
         label="Import Users from CSV"

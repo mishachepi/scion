@@ -161,8 +161,14 @@ var routeAuthzManifest = map[string]string{
 	// ── User-scoped terminal workspace ─────────────────────────────────
 	"/api/v1/users/me/terminal-workspace": "authenticated", // GET/PUT: caller's own list; session/dev credential only (requireSessionCredentialFor)
 
+	// ── User-scoped execution container registration ─────────────────────
+	"/api/v1/users/me/exec-container": "authenticated", // GET/PUT/DELETE: caller's own registration; session/dev credential only (requireSessionCredentialFor)
+
 	// ── Profile decisions roll-up ──────────────────────────────────────
 	"/api/v1/users/me/decisions": "authenticated", // GET: caller's decisions across member projects; session or scoped UAT (project:read + inbox:read for DMs)
+
+	// ── Profile inbox summary ──────────────────────────────────────────
+	"/api/v1/users/me/inbox/summary": "authenticated", // GET: caller's inbox summary across categories; session or UAT with inbox:read
 
 	// ── Hub-scoped injected skills ─────────────────────────────────────
 	"/api/v1/hub/settings/injected-skills": "authenticated", // GET: authenticated (any user), PUT: admin (role check in handler)
@@ -189,6 +195,7 @@ var routeAuthzManifest = map[string]string{
 	"/api/v1/admin/maintenance/update-available": "admin", // Update availability status
 	"/api/v1/admin/maintenance/restart":          "admin", // Restart hub
 	"/api/v1/admin/maintenance/update-status":    "admin", // Update status (version, installer, last update)
+	"/api/v1/admin/maintenance/auto-update":      "admin", // Daily auto-update setting
 	"/api/v1/admin/maintenance/releases":         "admin", // Release catalog per channel
 	"/api/v1/admin/scheduler":                    "admin", // Scheduler status
 	"/api/v1/admin/allow-list":                   "admin", // Allow list management
@@ -222,6 +229,7 @@ var routeAuthzManifest = map[string]string{
 	"/api/v1/admin/experiments":                  "admin", // Admin experiment overrides
 	"/api/v1/admin/profiling":                    "admin", // Admin profiling switches (session only)
 	"/api/v1/admin/chat-retention":               "admin", // Admin chat retention settings (session only)
+	"/api/v1/admin/system-one/adapters":          "admin", // System One provider adapter capabilities (session only; 404 when hub.system_one is off)
 	"/api/v1/admin/system-one/instances":         "admin", // System One provider instances (session only; 404 when hub.system_one is off)
 	"/api/v1/admin/system-one/instances/":        "admin", // System One provider instance by name and probe (session only; 404 when hub.system_one is off)
 	"/api/v1/admin/conduit/grant-keys/rotate":    "admin", // POST: rotate the conduit grant signing key; returns kids and timestamps only; 404 when hub.conduit is off
@@ -284,6 +292,7 @@ var routeAuthzManifest = map[string]string{
 	"/api/v1/chat/search":                "authenticated", // Chat search
 	"/api/v1/decisions/":                 "authenticated", // Decision prompt decisions (read, answer)
 	"/api/v1/decision-prompts/":          "authenticated", // Decision prompt set answers and dismissal
+	"/api/v1/secret-requests/":           "authenticated", // Secret request card read, fulfill, and dismiss (session-only; agent.read / agent.attach)
 	"/api/v1/chat/stars":                 "authenticated", // Caller's starred messages in one conversation; 404 when the experiment is off
 	"/api/v1/chat/stars/":                "authenticated", // Star state, star detail, star add/remove (caller's own); 404 when the experiment is off
 	"/api/v1/chat/starred-conversations": "authenticated", // Caller's conversations with starred messages (the Starred rail); 404 when the experiment is off
@@ -310,8 +319,11 @@ var routeAuthzManifest = map[string]string{
 	"/api/v1/agent/gcp-token":          "agent-token", // Agent GCP access token
 	"/api/v1/agent/gcp-identity-token": "agent-token", // Agent GCP identity token
 	"POST /api/v1/agent/secrets":       "agent-token", // Agent secret fetch
+	"GET /api/v1/agent/hub":            "agent-token", // Agent hub metadata (hub_id)
 	"/api/v1/agent/decisions":          "agent-token", // Agent decision list (self-scoped; 404 when web.decisions is off)
 	"/api/v1/agent/decisions/":         "agent-token", // Agent decision show, interpreted answers, and withdraw (self-scoped; 404 when web.decisions is off)
+	"/api/v1/agent/secret-requests":    "agent-token", // Agent secret-request list (self-scoped; 404 when hub.agent_secrets is off)
+	"/api/v1/agent/secret-requests/":   "agent-token", // Agent secret-request withdraw (self-scoped; 404 when hub.agent_secrets is off)
 
 	// ── Public settings ────────────────────────────────────────────────
 	"/api/v1/settings/public":       "authenticated", // Public settings — requires session despite name

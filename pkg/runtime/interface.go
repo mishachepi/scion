@@ -22,6 +22,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectfs"
+	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/firewallpolicy"
 )
 
 type RunConfig struct {
@@ -34,15 +35,23 @@ type RunConfig struct {
 	RepoRoot           string
 	ContainerWorkspace string // The container-side workspace path (e.g., /workspace or /repo-root/.scion/agents/foo/workspace)
 	Env                []string
-	ResolvedSecrets    []api.ResolvedSecret
-	Volumes            []api.VolumeMount
-	Labels             map[string]string
-	Annotations        map[string]string
-	ResolvedAuth       *api.ResolvedAuth
-	Harness            api.Harness
-	Task               string
-	CommandArgs        []string
-	Resume             bool
+	// HookWithheldEnv lists environment variable names in Env whose broker-side
+	// winning value came from a harness-config layer (bundle env, settings/profile
+	// harness_configs.<name>.env, no-auth-env.yaml, or legacy bundle keys), plus
+	// any explicit withheld names. Each runtime tracks these together with
+	// Harness.GetEnv() and all non-harness-config layers during its own container
+	// env assembly and emits the final winning withheld set authoritatively via
+	// envpolicy.HookWithheldEnvVar.
+	HookWithheldEnv []string
+	ResolvedSecrets []api.ResolvedSecret
+	Volumes         []api.VolumeMount
+	Labels          map[string]string
+	Annotations     map[string]string
+	ResolvedAuth    *api.ResolvedAuth
+	Harness         api.Harness
+	Task            string
+	CommandArgs     []string
+	Resume          bool
 	// HarnessSessionID, with Resume, asks for that exact harness session
 	// (api.SessionResumer); empty uses the harness's latest-session flag.
 	HarnessSessionID string
@@ -89,7 +98,13 @@ type RunConfig struct {
 	// override can point the *agent's own* hub calls at a different value,
 	// but must never widen the egress allowlist to match it.
 	TrustedHubEndpoint string
-	SharedDirs         []api.SharedDir
+	// InitFirewall is the operator-authoritative egress firewall policy
+	// (extra allowed domains and SSH opt-in) passed only into the
+	// netns-setup container's argv when SCION_INIT_FIREWALL is effective.
+	// Set only from operator-controlled broker/hub configuration, never
+	// from Env, templates, harness-configs, or secrets.
+	InitFirewall firewallpolicy.Policy
+	SharedDirs   []api.SharedDir
 	// SharedDirStorage holds the resolved shared-dir mounts when the
 	// broker's shared-dir Layout is on a shared backend (nfs,
 	// gke-shared-volume or cloudrun-volume; design fs-cleanup §P2): every
@@ -103,7 +118,7 @@ type RunConfig struct {
 	NoAuthMessage        string
 	NoAuthCommand        string
 	Debug                bool
-	MetadataInterception bool     // Add NET_ADMIN cap for iptables-based metadata server interception
+	MetadataInterception bool     // Configure runtime-managed iptables metadata server interception via netns-setup sidecar
 	ExtraHosts           []string // Extra /etc/hosts entries (e.g. "host.docker.internal:host-gateway")
 	DNS                  []string // Nameserver IPs (--dns)
 	BinariesDir          string   // Host directory mounted read-only at /opt/scion/bin
@@ -132,14 +147,11 @@ type RunConfig struct {
 	// RuntimeName is set by the calling runtime adapter (docker/podman/apple)
 	// before invoking buildCommonRunArgs, e.g. via runtime.Name(). It gates
 	// runtime-specific choices in buildCommonRunArgs that cannot yet be
-	// applied uniformly across adapters: the narrowed read-only mount over
-	// the shared base repo's .git admin surface (config/hooks/info) for
-	// hub-native worktree-per-agent projects, which the broker-git worktree
-	// change currently applies to Docker ("docker") only, and the form and
-	// condition of the shared workspace .scion/agents mask for Apple
-	// ("container"). Docker and Apple set it; Podman leaves it empty. Code
-	// gating on this field must fail closed (i.e. skip the mount narrowing)
-	// for any value it does not explicitly recognize.
+	// applied uniformly across adapters, such as the --cap-drop NET_RAW drop
+	// and the form and condition of the shared workspace .scion/agents mask
+	// for Apple ("container"). Because the NET_RAW drop applies only when
+	// RuntimeName is "docker" or "podman", every adapter that calls
+	// buildCommonRunArgs must set it.
 	RuntimeName string
 
 	// WorkspaceBackendName is the name of the backend chosen by the workspace
@@ -336,6 +348,8 @@ func launchStepMessage(step string) string {
 		return "running init containers"
 	case api.LaunchStepContainerCreate:
 		return "preparing the container (image pull, volume mounts)"
+	case api.LaunchStepImagePull:
+		return "pulling the image"
 	case api.LaunchStepContainerStart:
 		return "starting the container"
 	case api.LaunchStepHomeSync:
@@ -409,6 +423,28 @@ func (h launchHooks) progress(step string) {
 		return
 	}
 	h.progressFn(step, launchStepMessage(step))
+}
+
+type launchProgressKey struct{}
+
+// WithLaunchProgress attaches an async launch's Progress hook to ctx so
+// runtime calls made before Run (such as PullImage) can report launch steps.
+// A nil fn returns ctx unchanged.
+func WithLaunchProgress(ctx context.Context, fn func(step, message string)) context.Context {
+	if fn == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, launchProgressKey{}, fn)
+}
+
+// reportLaunchProgress reports step with its fixed launchStepMessage to the
+// Progress hook carried on ctx, if any.
+func reportLaunchProgress(ctx context.Context, step string) {
+	fn, _ := ctx.Value(launchProgressKey{}).(func(string, string))
+	if fn == nil {
+		return
+	}
+	fn(step, launchStepMessage(step))
 }
 
 // checkpoint is called immediately before a resource-creating call. A

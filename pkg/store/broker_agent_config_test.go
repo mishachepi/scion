@@ -65,8 +65,74 @@ func TestApplyBrokerAgentConfig_NilAppliedConfigSkipsAppliedFields(t *testing.T)
 }
 
 func TestApplyBrokerAgentConfig_PinnedAgentKeepsProfile(t *testing.T) {
-	a := &Agent{PinnedRuntimeTargetID: "target-1", AppliedConfig: &AgentAppliedConfig{Profile: "pinned"}}
+	a := &Agent{
+		PinnedRuntimeTargetID: "target-1",
+		AppliedConfig: &AgentAppliedConfig{
+			Profile:      "pinned",
+			CreateInputs: &AgentCreateInputs{},
+		},
+	}
 	ApplyBrokerAgentConfig(a, fullBrokerAgentConfig())
 	assert.Equal(t, "pinned", a.AppliedConfig.Profile)
+	assert.Empty(t, a.AppliedConfig.CreateInputs.Profile, "pinned agent must not record a broker profile in CreateInputs")
 	assert.Equal(t, "img:resolved", a.AppliedConfig.Image, "the other values are still written")
+}
+
+func TestApplyBrokerAgentConfig_RecordsCreateInputsProfileWhenEmpty(t *testing.T) {
+	t.Run("fills empty CreateInputs.Profile", func(t *testing.T) {
+		a := &Agent{
+			AppliedConfig: &AgentAppliedConfig{
+				CreateInputs: &AgentCreateInputs{},
+			},
+		}
+		ApplyBrokerAgentConfig(a, BrokerAgentConfig{Profile: "remote"})
+		assert.Equal(t, "remote", a.AppliedConfig.Profile)
+		assert.Equal(t, "remote", a.AppliedConfig.CreateInputs.Profile)
+	})
+
+	t.Run("does not overwrite existing CreateInputs.Profile", func(t *testing.T) {
+		a := &Agent{
+			AppliedConfig: &AgentAppliedConfig{
+				Profile:      "original",
+				CreateInputs: &AgentCreateInputs{Profile: "original"},
+			},
+		}
+		ApplyBrokerAgentConfig(a, BrokerAgentConfig{Profile: "echoed"})
+		assert.Equal(t, "echoed", a.AppliedConfig.Profile)
+		assert.Equal(t, "original", a.AppliedConfig.CreateInputs.Profile)
+	})
+}
+
+func TestApplyBrokerAgentConfig_PreservesShellHarnessConfig(t *testing.T) {
+	t.Run("applied shell marker resists disagreeing broker report", func(t *testing.T) {
+		a := &Agent{
+			ID:            "shell-1",
+			HarnessConfig: "shell",
+			AppliedConfig: &AgentAppliedConfig{HarnessConfig: "shell"},
+		}
+		ApplyBrokerAgentConfig(a, fullBrokerAgentConfig())
+		assert.Equal(t, "shell", a.AppliedConfig.HarnessConfig)
+		assert.Equal(t, "img:resolved", a.AppliedConfig.Image)
+		assert.Equal(t, "kubernetes", a.Runtime)
+	})
+
+	t.Run("column-only shell marker resists disagreeing broker report", func(t *testing.T) {
+		a := &Agent{
+			ID:            "shell-2",
+			HarnessConfig: "shell",
+			AppliedConfig: &AgentAppliedConfig{},
+		}
+		ApplyBrokerAgentConfig(a, fullBrokerAgentConfig())
+		assert.Equal(t, "shell", a.AppliedConfig.HarnessConfig)
+	})
+
+	t.Run("non-shell agent still adopts broker harness config", func(t *testing.T) {
+		a := &Agent{
+			ID:            "llm-1",
+			HarnessConfig: "gemini",
+			AppliedConfig: &AgentAppliedConfig{HarnessConfig: "gemini"},
+		}
+		ApplyBrokerAgentConfig(a, fullBrokerAgentConfig())
+		assert.Equal(t, "claude", a.AppliedConfig.HarnessConfig)
+	})
 }

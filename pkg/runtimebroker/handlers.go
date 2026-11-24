@@ -38,16 +38,19 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent"
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
+	"github.com/GoogleCloudPlatform/scion/pkg/agenthome"
 	"github.com/GoogleCloudPlatform/scion/pkg/agentkeys"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/brokercontrol"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/harness"
+	"github.com/GoogleCloudPlatform/scion/pkg/hostedguard"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectfs"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectkeys"
 	scionrt "github.com/GoogleCloudPlatform/scion/pkg/runtime"
+	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/dirfd"
 	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/templatecache"
@@ -952,6 +955,12 @@ func startSharerKey(agentID string) string {
 	return ""
 }
 
+// isShellCreateRequest reports whether req targets the reserved built-in
+// "shell" harness config, which uses NoAuth semantics (no LLM env gathering).
+func isShellCreateRequest(req CreateAgentRequest) bool {
+	return req.Config != nil && req.Config.HarnessConfig == config.ShellHarnessConfigName
+}
+
 func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	createStart := time.Now()
@@ -1077,6 +1086,23 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		if err := checkRequestVolumes(cfgVols, inlineVols); err != nil {
 			span.SetStatus(codes.Error, brokercontrol.ErrorCode)
 			writeControlPathRefusal(w, err)
+			return
+		}
+		// On a hosted broker, member-written request config (volumes and
+		// inline config) may not name host resources. An unresolvable
+		// profile fails the create later; the default runtime's name is
+		// used for this check then.
+		runtimeName := func() string {
+			name, _ := s.resolveRuntimeNameForOpts(api.StartOptions{
+				Name:        req.Name,
+				ProjectPath: req.ProjectPath,
+				Profile:     createRequestProfile(req),
+			})
+			return name
+		}
+		if err := s.checkHostedRequestConfig(runtimeName, &api.ScionConfig{Volumes: cfgVols}, req.InlineConfig); err != nil {
+			span.SetStatus(codes.Error, hostedguard.ErrorCode)
+			writeHostedConfigRefusal(w, err)
 			return
 		}
 	}
@@ -1386,6 +1412,15 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		markAttemptFailed(status, sce.Error())
 		return
 	}
+	// Likewise refuse worktree-per-agent on shared (NFS) project storage for
+	// local container runtimes (Docker, Podman, Apple container) before any
+	// env-gather, hydration, or worktree provisioning (ptone/scion#8646).
+	if sce := s.createLocalContainerNFSWorktreePerAgentRefusal(req); sce != nil {
+		span.SetStatus(codes.Error, startContextSpanText(sce))
+		status := s.writeStartContextError(w, sce, "create agent", "agent_id", req.ID, "profile", createRequestProfile(req))
+		markAttemptFailed(status, sce.Error())
+		return
+	}
 
 	// Env-gather: if GatherEnv is true, evaluate env completeness before building full context.
 	// This needs the resolved project path and merged env to determine which keys are missing.
@@ -1398,7 +1433,7 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 	// hash-only, or no resolver) and must not trigger another attempt.
 	var hydratedTemplatePath, hydratedHCPath string
 	var tplHydrated, hcHydrated bool
-	if req.GatherEnv && !req.NoAuth {
+	if req.GatherEnv && !req.NoAuth && !isShellCreateRequest(req) {
 		// A profile the Hub's stored profiles cannot resolve fails the
 		// create at buildStartContext anyway; report it here, before the
 		// auth and env checks below, so a create whose default runtime
@@ -1486,7 +1521,14 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		required, secretInfo, alternatives, settingsEnv := s.extractRequiredEnvKeys(req, hydratedTemplatePath, hydratedHCPath)
+		required, secretInfo, alternatives, settingsEnv, hostedErr := s.extractRequiredEnvKeysChecked(req, hydratedTemplatePath, hydratedHCPath)
+		// A member-written harness config refused on a hosted broker is
+		// answered before any of its env is evaluated against this host.
+		if re, ok := hostedConfigRefusalFrom(hostedErr); ok {
+			span.SetStatus(codes.Error, hostedguard.ErrorCode)
+			writeHostedConfigRefusalDetails(w, re, nil)
+			return
+		}
 		// Fold in the settings/harness-config-directory env
 		// extractRequiredEnvKeys resolved (its withDir, minus whatever
 		// requestEnv already decided — see settingsEnvSatisfied there), but
@@ -2176,6 +2218,11 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 				s.writeUnusableProvisioner(w, ue, "provision agent", req.ID, nil)
 				return
 			}
+			if re, ok := hostedConfigRefusalFrom(err); ok {
+				markAttemptFailed(http.StatusBadRequest, re.Error())
+				writeHostedConfigRefusalDetails(w, re, nil)
+				return
+			}
 			markAttemptFailed(http.StatusInternalServerError, "failed to provision agent")
 			s.writeRuntimeOpError(w, ctx, "provision agent", err, "agent_id", req.ID)
 			return
@@ -2198,6 +2245,9 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		if cfg != nil {
 			agentResp.HarnessConfig = cfg.HarnessConfig
 			agentResp.Image = cfg.Image
+			if cfg.Info != nil && !s.isFlat() {
+				agentResp.Profile = cfg.Info.Profile
+			}
 		}
 		// Report the runtime this dispatch resolved to (its profile), not
 		// the broker's default runtime: the hub records this value as the
@@ -2249,6 +2299,7 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		isSkillErr := errors.As(err, &skillErr)
 		policyDecision, isPolicyErr := harnessPolicyRefusalFrom(err)
 		unusableErr, isUnusable := unusableProvisionerFrom(err)
+		hostedErr, isHostedRefusal := hostedConfigRefusalFrom(err)
 		storageErr, isStorageRefusal := storageMigrationRequiredFrom(err)
 		resourceErr, isResourceRefusal := resourceLimitsErrorFrom(err)
 		isEmptyGenericCmd := emptyGenericCommandFrom(err)
@@ -2257,6 +2308,8 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 			markAttemptFailed(policyDecision.HTTPStatus, policyDecision.detail())
 		case isUnusable:
 			markAttemptFailed(http.StatusUnprocessableEntity, unusableErr.PublicMessage())
+		case isHostedRefusal:
+			markAttemptFailed(http.StatusBadRequest, hostedErr.Error())
 		case isStorageRefusal:
 			markAttemptFailed(http.StatusUnprocessableEntity, storageErr.PublicMessage())
 		case isResourceRefusal:
@@ -2273,6 +2326,8 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 			markAttemptFailed(http.StatusConflict, "failed to create agent")
 		case errors.Is(err, agent.ErrProjectShareNotMounted):
 			markAttemptFailed(http.StatusServiceUnavailable, projectShareNotMountedText(err))
+		case errors.Is(err, scionrt.ErrImageLacksNetnsSetup):
+			markAttemptFailed(http.StatusUnprocessableEntity, launchFailureText[api.LaunchCodeImageLacksNetnsSetup])
 		default:
 			markAttemptFailed(http.StatusInternalServerError, "failed to create agent")
 		}
@@ -2349,6 +2404,8 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 			s.writeHarnessPolicyRefusal(w, policyDecision, "create agent", req.ID, nil)
 		case isUnusable:
 			s.writeUnusableProvisioner(w, unusableErr, "create agent", req.ID, nil)
+		case isHostedRefusal:
+			writeHostedConfigRefusalDetails(w, hostedErr, nil)
 		case isStorageRefusal:
 			s.writeStorageMigrationRequired(w, storageErr, "create agent", req.ID, nil)
 		case isResourceRefusal:
@@ -2384,6 +2441,8 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 			// (the Kubernetes workspace leaves). err names the mount
 			// point and is logged above; the body names the fields.
 			writeError(w, http.StatusServiceUnavailable, ErrCodeProjectStorageUnavailable, projectShareNotMountedText(err), nil)
+		case errors.Is(err, scionrt.ErrImageLacksNetnsSetup):
+			writeError(w, http.StatusUnprocessableEntity, api.LaunchCodeImageLacksNetnsSetup, launchFailureText[api.LaunchCodeImageLacksNetnsSetup], nil)
 		default:
 			writeCreateRuntimeError(w, err)
 		}
@@ -3690,7 +3749,7 @@ func (s *Server) deleteAgentFenced(w http.ResponseWriter, r *http.Request, id, p
 			RuntimeError(w, agentFilesDeleteRefusedMessage)
 			return
 		}
-		s.writeRuntimeOpError(w, ctx, "delete agent", err, "agent_id", id, "project_id", projectID)
+		s.writeDeleteOpError(w, ctx, "delete agent", err, "", "agent_id", id, "project_id", projectID)
 		return
 	}
 	if target.containerID == "" {
@@ -3933,10 +3992,11 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 		// LaunchKeepaliveSeconds request an async start, under the same
 		// wire keys and meaning as a create's (CreateAgentRequest; design
 		// wave 3 §2 D-f, ptone/scion#4669).
-		AsyncLaunch            bool   `json:"asyncLaunch,omitempty"`
-		LaunchID               string `json:"launchId,omitempty"`
-		LaunchTimeoutSeconds   int    `json:"launchTimeoutSeconds,omitempty"`
-		LaunchKeepaliveSeconds int    `json:"launchKeepaliveSeconds,omitempty"`
+		AsyncLaunch            bool             `json:"asyncLaunch,omitempty"`
+		LaunchID               string           `json:"launchId,omitempty"`
+		LaunchTimeoutSeconds   int              `json:"launchTimeoutSeconds,omitempty"`
+		LaunchKeepaliveSeconds int              `json:"launchKeepaliveSeconds,omitempty"`
+		PriorStatus            *api.PriorStatus `json:"priorStatus,omitempty"`
 		// ProjectPreStartHookScript is the hook stamped on the agent at
 		// create; see CreateAgentConfig.ProjectPreStartHookScript.
 		ProjectPreStartHookScript string `json:"projectPreStartHookScript,omitempty"`
@@ -4302,6 +4362,13 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 			writeControlPathRefusal(w, err)
 			return
 		}
+		// On a hosted broker, member-written inline config may not name
+		// host resources.
+		if err := s.checkHostedRequestConfig(func() string { return resolvedRuntimeType }, startReq.InlineConfig); err != nil {
+			span.SetStatus(codes.Error, hostedguard.ErrorCode)
+			writeHostedConfigRefusal(w, err)
+			return
+		}
 	}
 
 	// The runtime this start runs in may not be the one the agent's
@@ -4348,6 +4415,7 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 	if opts.Resume && opts.ProjectPath != "" {
 		opts.HarnessSessionID = agent.GetSavedHarnessSessionID(id, opts.ProjectPath)
 	}
+	opts.PriorStatus = startReq.PriorStatus
 
 	ctx = s.withHarnessConfigPolicy(ctx)
 	if ss != nil {
@@ -4408,12 +4476,15 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 		details := s.startFailureDetails(ctx, mgr, id, projectID, opts.RunID)
 		var skillErr *agent.SkillResolutionError
 		ue, unusable := unusableProvisionerFrom(err)
+		hostedErr, isHostedRefusal := hostedConfigRefusalFrom(err)
 		gitRefusal, isGitRefusal := util.StartRefusalText(err)
 		storageErr, isStorageRefusal := storageMigrationRequiredFrom(err)
 		resourceErr, isResourceRefusal := resourceLimitsErrorFrom(err)
 		switch {
 		case unusable:
 			s.writeUnusableProvisioner(w, ue, "start agent", id, details)
+		case isHostedRefusal:
+			writeHostedConfigRefusalDetails(w, hostedErr, details)
 		case isStorageRefusal:
 			s.writeStorageMigrationRequired(w, storageErr, "start agent", id, details)
 		case isResourceRefusal:
@@ -4442,6 +4513,8 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 		case errors.Is(err, agent.ErrProjectShareNotMounted):
 			// As on create: err names the mount point and is logged above.
 			writeError(w, http.StatusServiceUnavailable, ErrCodeProjectStorageUnavailable, projectShareNotMountedText(err), details)
+		case errors.Is(err, scionrt.ErrImageLacksNetnsSetup):
+			writeError(w, http.StatusUnprocessableEntity, api.LaunchCodeImageLacksNetnsSetup, launchFailureText[api.LaunchCodeImageLacksNetnsSetup], details)
 		default:
 			writeError(w, http.StatusInternalServerError, ErrCodeRuntimeError, runtimeOpError("start agent", err).Error(), details)
 		}
@@ -5334,6 +5407,8 @@ func (s *Server) restartAgent(w http.ResponseWriter, r *http.Request, id, projec
 		// secrets the Hub resolved for this restart, handled exactly as on
 		// start (buildStartContext). An older Hub sends none.
 		ResolvedSecrets []api.ResolvedSecret `json:"resolvedSecrets,omitempty"`
+		// PriorStatus mirrors the start path's field (ptone/scion#8900).
+		PriorStatus *api.PriorStatus `json:"priorStatus,omitempty"`
 	}
 	if r.Body != nil && r.ContentLength != 0 {
 		if err := json.NewDecoder(r.Body).Decode(&restartReq); err != nil {
@@ -5618,6 +5693,7 @@ func (s *Server) restartAgent(w http.ResponseWriter, r *http.Request, id, projec
 	// runs after the stop above, so a refusal leaves the agent stopped, as
 	// any other start failure after the stop does. The pre-check before
 	// the stop refuses the cases visible without Start's resolution.
+	opts.PriorStatus = restartReq.PriorStatus
 	ctx = s.withHarnessConfigPolicy(ctx)
 	agentInfo, err := mgr.Start(ctx, opts)
 	err = s.completeOwnedStart(ctx, mgr, opts.RunID, err, true)
@@ -5644,6 +5720,10 @@ func (s *Server) restartAgent(w http.ResponseWriter, r *http.Request, id, projec
 		details := s.startFailureDetails(ctx, mgr, id, projectID, opts.RunID)
 		if ue, ok := unusableProvisionerFrom(err); ok {
 			s.writeUnusableProvisioner(w, ue, "restart agent", id, details)
+			return
+		}
+		if re, ok := hostedConfigRefusalFrom(err); ok {
+			writeHostedConfigRefusalDetails(w, re, details)
 			return
 		}
 		if se, ok := storageMigrationRequiredFrom(err); ok {
@@ -5682,6 +5762,10 @@ func (s *Server) restartAgent(w http.ResponseWriter, r *http.Request, id, projec
 		if errors.Is(err, agent.ErrProjectShareNotMounted) {
 			// As on create: err names the mount point and is logged above.
 			writeError(w, http.StatusServiceUnavailable, ErrCodeProjectStorageUnavailable, projectShareNotMountedText(err), details)
+			return
+		}
+		if errors.Is(err, scionrt.ErrImageLacksNetnsSetup) {
+			writeError(w, http.StatusUnprocessableEntity, api.LaunchCodeImageLacksNetnsSetup, launchFailureText[api.LaunchCodeImageLacksNetnsSetup], details)
 			return
 		}
 		if errors.Is(err, agent.ErrContainerNameInUse) {
@@ -5795,28 +5879,44 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request, id, project
 	s.enableConduitDelivery(mgr)
 
 	msgCtx := agent.WithDeliveryMessageID(ctx, req.MessageID)
-	if !req.Interrupt && req.MessageID != "" {
-		// Non-interrupt messages are buffered and delivered after this
-		// handler has already answered 200. Register a callback so a
-		// later delivery failure is reported back to the hub, which
-		// then marks the message failed instead of "dispatched" (#1820).
-		failure := hubclient.MessageFailure{
+	connName := r.Header.Get("X-Scion-Hub-Connection")
+	if req.MessageID != "" {
+		projID := projectID
+		if projID == "" {
+			projID = req.ProjectID
+		}
+		// Report successful session injection back to the hub so the
+		// message moves from "dispatched" (Accepted) to "delivered"
+		// (ptone/scion#9015). AgentManager only invokes this on the exec
+		// injection path, never on conduit deliveries which the hub
+		// already finalizes directly.
+		delivery := hubclient.MessageDelivery{
 			MessageID: req.MessageID,
 			AgentID:   id,
-			ProjectID: projectID,
+			ProjectID: projID,
 		}
-		if failure.ProjectID == "" {
-			failure.ProjectID = req.ProjectID
-		}
-		connName := r.Header.Get("X-Scion-Hub-Connection")
-		msgCtx = agent.WithDeliveryFailureHandler(msgCtx, func(deliveryErr error) {
-			f := failure
-			if errors.Is(deliveryErr, agent.ErrAwaitingSession) {
-				f.Code = hubclient.MessageFailureCodeAwaitingSession
-			}
-			f.Reason = "broker delivery failed: " + deliveryErr.Error()
-			go s.reportMessageFailure(connName, f)
+		msgCtx = agent.WithDeliverySuccessHandler(msgCtx, func() {
+			go s.reportMessageDelivery(connName, delivery)
 		})
+		if !req.Interrupt {
+			// Non-interrupt messages are buffered and delivered after this
+			// handler has already answered 200. Register a callback so a
+			// later delivery failure is reported back to the hub, which
+			// then marks the message failed instead of "dispatched" (#1820).
+			failure := hubclient.MessageFailure{
+				MessageID: req.MessageID,
+				AgentID:   id,
+				ProjectID: projID,
+			}
+			msgCtx = agent.WithDeliveryFailureHandler(msgCtx, func(deliveryErr error) {
+				f := failure
+				if errors.Is(deliveryErr, agent.ErrAwaitingSession) {
+					f.Code = hubclient.MessageFailureCodeAwaitingSession
+				}
+				f.Reason = "broker delivery failed: " + deliveryErr.Error()
+				go s.reportMessageFailure(connName, f)
+			})
+		}
 	}
 	// Attachments (ptone/scion#4596): their capabilities are redeemed now,
 	// at receipt, on a context detached from this request; the files are
@@ -6506,6 +6606,9 @@ func (s *Server) resetAuth(w http.ResponseWriter, r *http.Request, id, projectID
 	})
 }
 
+// maxAgentLogBytes bounds the amount of data read from an agent's agent.log file.
+const maxAgentLogBytes int64 = 10 << 20 // 10 MiB
+
 func (s *Server) getLogs(w http.ResponseWriter, r *http.Request, id, projectID string) {
 	ctx := r.Context()
 
@@ -6537,16 +6640,27 @@ func (s *Server) getLogs(w http.ResponseWriter, r *http.Request, id, projectID s
 		if agentSlug == "" {
 			agentSlug = found.Name
 		}
-		agentLogPath := filepath.Join(config.GetAgentHomePath(
-			found.ProjectPath, agentSlug,
-		), "agent.log")
-		if data, err := os.ReadFile(agentLogPath); err == nil {
+		agentHome := config.GetAgentHomePath(found.ProjectPath, agentSlug)
+		data, err := agenthome.ReadFileAt(agentHome, "agent.log", maxAgentLogBytes)
+		if err == nil {
 			w.Header().Set("Content-Type", "text/plain")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(data)
 			return
 		}
-		// Fall through to container logs if agent.log not found
+		if !errors.Is(err, os.ErrNotExist) {
+			if s.agentLifecycleLog != nil {
+				s.agentLifecycleLog.Warn("Refused to read agent.log",
+					"agent_id", id, "error", err)
+			}
+			if errors.Is(err, dirfd.ErrTooLarge) {
+				Unprocessable(w, "Agent log file exceeds maximum readable size")
+				return
+			}
+			Unprocessable(w, "Agent log file could not be read: entry must be a regular file within size limits")
+			return
+		}
+		// Fall through to container logs if agent.log does not exist.
 	}
 
 	// Fallback: read container stdout logs (resolve runtime for auxiliary runtimes)
@@ -6668,6 +6782,17 @@ func (s *Server) checkAgentPrompt(w http.ResponseWriter, r *http.Request, id, pr
 // directories of the same name are consulted only when no hydrated copy was
 // supplied.
 func (s *Server) extractRequiredEnvKeys(req CreateAgentRequest, hydratedTemplatePath string, hydratedHarnessConfigPath ...string) ([]string, map[string]api.SecretKeyInfo, map[string][]string, map[string]string) {
+	keys, secretInfo, alternatives, settingsEnv, _ := s.extractRequiredEnvKeysChecked(req, hydratedTemplatePath, hydratedHarnessConfigPath...)
+	return keys, secretInfo, alternatives, settingsEnv
+}
+
+// extractRequiredEnvKeysChecked is extractRequiredEnvKeys, plus the hosted
+// harness-config refusal: on a hosted broker, a project-tier or
+// template-bundled harness config is checked (agent.CheckHostedHarnessConfig)
+// where it is resolved, and when it is refused none of its env is read or
+// expanded against this host, and the refusal is returned.
+func (s *Server) extractRequiredEnvKeysChecked(req CreateAgentRequest, hydratedTemplatePath string, hydratedHarnessConfigPath ...string) ([]string, map[string]api.SecretKeyInfo, map[string][]string, map[string]string, error) {
+	var hostedErr error
 	required := make(map[string]struct{})
 	alternatives := make(map[string][]string)
 	// settingsEnvSatisfied holds the non-empty env values that settings
@@ -6788,10 +6913,16 @@ func (s *Server) extractRequiredEnvKeys(req CreateAgentRequest, hydratedTemplate
 		}
 		if hcProjectDir := harnessConfigProjectTier(req.ProjectPath); hydratedHCPath != "" || hcProjectDir != "" {
 			if hcDir, err := config.ResolveHarnessConfigDir(hydratedHCPath, harnessConfigName, hcProjectDir, harnessConfigTemplatePaths...); err == nil && hcDir != nil {
-				harnessType = hcDir.Config.Harness
-				authType = hcDir.Config.AuthSelectedType
-				authMeta = hcDir.Config.Auth
-				hcDirEnv = hcDir.Config.Env
+				// On a hosted broker a refused member-written harness
+				// config contributes nothing, so its env is never expanded
+				// against this host (the caller answers 400).
+				hostedErr = agent.CheckHostedHarnessConfig(!s.config.WorkstationMode, hcDir, "")
+				if hostedErr == nil {
+					harnessType = hcDir.Config.Harness
+					authType = hcDir.Config.AuthSelectedType
+					authMeta = hcDir.Config.Auth
+					hcDirEnv = hcDir.Config.Env
+				}
 			} else if err != nil && s.config.Debug {
 				s.envSecretLog.Debug("extractRequiredEnvKeys: harness-config dir not resolved",
 					"harnessConfigName", harnessConfigName,
@@ -6818,30 +6949,26 @@ func (s *Server) extractRequiredEnvKeys(req CreateAgentRequest, hydratedTemplate
 		//     ResolveHarnessConfig) filling only keys absent from requestEnv
 		//     — mirroring resolveAuthEnvOverlay exactly.
 		//  3. withDir: withSettings, with the harness-config directory's own
-		//     env (pre-expanded once into expandedDirEnv, the way
-		//     buildAgentEnv, pkg/agent/run.go, expands it: ${VAR}
-		//     references, empty-after-expansion falls back to a host-env
-		//     passthrough) filling only keys still absent — since the
-		//     directory's env is the lowest-ranked source and only reaches
-		//     the container via finalScionCfg.Env when nothing
-		//     higher-ranked set the key.
+		//     env (evaluated once via the shared agent.BundleEnvLayer, matching
+		//     launch: literal keys and values, no ${VAR} expansion, no
+		//     empty-value broker-host passthrough) filling only keys still
+		//     absent — since the directory's env is the lowest-ranked source.
 		//
 		// This "an empty entry blocks every lower layer" rule is correct for
 		// an ordinary key, but NOT for a GCP-shared or harness-auth
 		// "auth-candidate" key: run.go's Start deletes an empty auth-candidate
 		// entry from opts.Env after auth resolves (its resolved.EnvVars only
-		// ever carries non-empty values), clearing the way for
-		// finalScionCfg.Env to supply the value instead. The auth-key-group
-		// check below uses authCandidateKeySatisfied for that reason, rather
-		// than withDir, for every key it evaluates.
+		// ever carries non-empty values), clearing the way for the bundle env
+		// layer to supply the value instead. The auth-key-group check below
+		// uses authCandidateKeySatisfied for that reason, rather than withDir,
+		// for every key it evaluates.
 		requestEnv := buildRequestEnv(req)
 		rawSettingsEnv := rawSettingsHarnessEnv(settings, profileName, harnessConfigName)
 		withSettings := fillAbsentEnv(requestEnv, rawSettingsEnv)
-		// expandedDirEnv is built once so fillAbsentDirEnv and
-		// authCandidateKeyValue consult the identical expanded view,
-		// so both index the directory by the expanded key, as
-		// buildAgentEnv does.
-		expandedDirEnv := expandDirEnv(hcDirEnv)
+		// expandedDirEnv is built once via the shared agent.BundleEnvLayer so
+		// fillAbsentDirEnv and authCandidateKeyValue consult the identical
+		// literal view that launch uses.
+		expandedDirEnv, _ := agent.BundleEnvLayer(hcDirEnv)
 		withDir := fillAbsentDirEnv(withSettings, expandedDirEnv)
 
 		// Settings harness_configs entry can provide/override
@@ -7081,10 +7208,13 @@ func (s *Server) extractRequiredEnvKeys(req CreateAgentRequest, hydratedTemplate
 			for _, as := range authSecrets {
 				if _, ok := fileSecrets[as.Key]; !ok {
 					// Check if any alternative env keys satisfy this requirement
-					// via resolved env, inline config env, or process env (the
-					// latter covers workstation mode where PR #719 sets
-					// GOOGLE_APPLICATION_CREDENTIALS at startup).
-					if !altEnvKeySatisfied(req.ResolvedEnv, as.AlternativeEnvKeys) {
+					// via resolved env, inline config env, or, on a
+					// workstation broker only, process env (PR #719 sets
+					// GOOGLE_APPLICATION_CREDENTIALS at startup). A hosted
+					// broker's launch never reads its own env for auth
+					// (GatherAuthWithEnv in broker mode), and a member-written
+					// harness config must not make it read env by name.
+					if !altEnvKeySatisfied(req.ResolvedEnv, as.AlternativeEnvKeys, s.config.WorkstationMode) {
 						required[as.Key] = struct{}{}
 						secretInfo[as.Key] = api.SecretKeyInfo{
 							Description: as.Description,
@@ -7200,7 +7330,7 @@ func (s *Server) extractRequiredEnvKeys(req CreateAgentRequest, hydratedTemplate
 	for k := range required {
 		keys = append(keys, k)
 	}
-	return keys, secretInfo, alternatives, settingsEnvSatisfied
+	return keys, secretInfo, alternatives, settingsEnvSatisfied, hostedErr
 }
 
 // buildRequestEnv returns req.ResolvedEnv overridden per-key by req.Config.Env
@@ -7277,33 +7407,16 @@ func fillAbsentDirEnv(base, expandedDirEnv map[string]string) map[string]string 
 	return merged
 }
 
-// expandDirEnv expands every harness-config-directory env entry once, the
-// way buildAgentEnv expands them (expandDirEnvEntry), so callers that need
-// more than one view of the directory's env (fillAbsentDirEnv,
-// authCandidateKeyValue) consult the identical result instead of each
-// re-deriving it per key. An entry expandDirEnvEntry drops (an empty
-// expanded key, or an unresolved variable reference) is simply absent here.
-func expandDirEnv(dirEnv map[string]string) map[string]string {
-	expanded := make(map[string]string, len(dirEnv))
-	for k, v := range dirEnv {
-		expandedKey, expandedValue, ok := expandDirEnvEntry(k, v)
-		if !ok {
-			continue
-		}
-		expanded[expandedKey] = expandedValue
-	}
-	return expanded
-}
-
 // altEnvKeySatisfied reports whether any of altKeys has a non-empty value in
-// resolvedEnv or, for names not refused for agents
-// (util.IsAgentRefusedHostEnvName), in this process's env.
-func altEnvKeySatisfied(resolvedEnv map[string]string, altKeys []string) bool {
+// resolvedEnv or, when processEnv is set (a workstation broker) and for names
+// not refused for agents (util.IsAgentRefusedHostEnvName), in this process's
+// env.
+func altEnvKeySatisfied(resolvedEnv map[string]string, altKeys []string, processEnv bool) bool {
 	for _, altKey := range altKeys {
 		if v, ok := resolvedEnv[altKey]; ok && v != "" {
 			return true
 		}
-		if util.IsAgentRefusedHostEnvName(altKey) {
+		if !processEnv || util.IsAgentRefusedHostEnvName(altKey) {
 			continue
 		}
 		if v := os.Getenv(altKey); v != "" {
@@ -7313,65 +7426,13 @@ func altEnvKeySatisfied(resolvedEnv map[string]string, altKeys []string) bool {
 	return false
 }
 
-// expandDirEnvEntry mirrors buildAgentEnv's treatment of a single
-// harness-config-directory env entry (pkg/agent/run.go): the key and value
-// may reference ${VAR}; a value left empty after expansion is an implicit
-// host-env passthrough. ok is false when the entry should be dropped
-// entirely — an empty expanded key, or an unresolved variable reference that
-// buildAgentEnv would also warn about and skip.
-//
-// Names refused for agents (util.IsAgentRefusedHostEnvName) expand
-// to empty and are never passed through, as in buildAgentEnv; an entry left
-// empty only because of them is dropped.
-func expandDirEnvEntry(key, value string) (expandedKey, expandedValue string, ok bool) {
-	expandedKey, _, _ = quietExpandEnv(key)
-	if expandedKey == "" {
-		return "", "", false
-	}
-	var warned, refused bool
-	expandedValue, warned, refused = quietExpandEnv(value)
-	if expandedValue == "" {
-		if warned || refused || util.IsAgentRefusedHostEnvName(expandedKey) {
-			return "", "", false
-		}
-		if hostVal, hasHost := os.LookupEnv(expandedKey); hasHost && hostVal != "" {
-			expandedValue = hostVal
-		}
-	}
-	return expandedKey, expandedValue, true
-}
-
-// quietExpandEnv mirrors util.ExpandEnv (pkg/util/env.go: os.Expand with an
-// os.LookupEnv closure) without its side-effecting stderr warning. The
-// preflight may evaluate the same ${VAR} dir-env reference on every
-// gather-env request, including ones that end in 202 and are retried, and
-// launch prints the same warning again when it expands the value for real —
-// so the preflight's own copy would be pure duplicate noise on the broker's
-// stderr, not new information. Names refused for agents
-// (util.IsAgentRefusedHostEnvName) expand to empty and set refused.
-func quietExpandEnv(s string) (expanded string, warned, refused bool) {
-	expanded = os.Expand(s, func(key string) string {
-		if util.IsAgentRefusedHostEnvName(key) {
-			refused = true
-			return ""
-		}
-		val, ok := os.LookupEnv(key)
-		if !ok {
-			warned = true
-			return ""
-		}
-		return val
-	})
-	return expanded, warned, refused
-}
-
 // authCandidateKeyValue returns the value key — a GCP-shared name or one of
 // the harness's own auth required_env names — would have in the container,
 // resolved the way launch actually resolves it, which differs from an
 // ordinary key's requestEnv/settings/dir layering (withDir,
 // fillAbsentDirEnv). satisfied reports whether that value is non-empty.
-// expandedDirEnv must already be expanded (expandDirEnv), the same map
-// fillAbsentDirEnv consults, so both agree on what a dir key expands to.
+// bundleDirEnv must be evaluated via agent.BundleEnvLayer, the same map
+// fillAbsentDirEnv consults, so both agree on the literal bundle entries.
 //
 // After auth resolves, run.go's Start deletes any such key from opts.Env
 // whenever its value did not make it into the resolved auth's EnvVars —
@@ -7380,36 +7441,20 @@ func quietExpandEnv(s string) (expanded string, warned, refused bool) {
 // imported to avoid depending on that package's unexported details — keep
 // in sync if that list changes). So an empty settings value for one of
 // these keys does not block the directory the way it would for an ordinary
-// key: deleting it from opts.Env clears the way for finalScionCfg.Env — the
-// directory, or, when the directory has no entry, the settings value
-// itself, both expanded the way buildAgentEnv expands them — to supply the
-// container's value.
+// key: deleting it from opts.Env clears the way for the bundle env layer to
+// supply the container's value.
 //
 // An empty requestEnv (ResolvedEnv/Config.Env) entry is still treated as
-// blocking, conservatively, rather than as a launch-exact mirror: at launch
-// the same deletion applies to an empty opts.Env entry regardless of where
-// it came from, so the pod may still receive the settings or directory
-// value — or the broker process's own value, via host passthrough — even
-// when requestEnv itself is empty. In a real Hub dispatch, though, such an
-// entry usually also comes from template or inline config env, which also
-// outranks the directory and settings inside finalScionCfg, so the
-// container would usually end up empty anyway — and the preflight has no
-// way to tell that case apart from one where it would not. Getting this
-// wrong can only produce a false-missing report (the preflight asks for a
-// value the pod would have had), never a false-satisfied one.
-func authCandidateKeyValue(key string, requestEnv, rawSettingsEnv, expandedDirEnv map[string]string) (value string, satisfied bool) {
+// blocking, conservatively, rather than as a launch-exact mirror.
+func authCandidateKeyValue(key string, requestEnv, rawSettingsEnv, bundleDirEnv map[string]string) (value string, satisfied bool) {
 	if v, ok := requestEnv[key]; ok {
 		return v, v != ""
 	}
 	if v, ok := rawSettingsEnv[key]; ok && v != "" {
 		return v, true
 	}
-	if v, ok := expandedDirEnv[key]; ok {
+	if v, ok := bundleDirEnv[key]; ok {
 		return v, v != ""
-	}
-	if v, ok := rawSettingsEnv[key]; ok {
-		_, expanded, ok := expandDirEnvEntry(key, v)
-		return expanded, ok && expanded != ""
 	}
 	return "", false
 }
@@ -8726,6 +8771,8 @@ func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request, slug stri
 	// and never fails or rolls back the project delete.
 	s.releaseProjectSharedDirClaims(r.Context(), slug, r.URL.Query().Get("project_id"))
 
+	projectConfigsRoot := filepath.Join(globalDir, config.ProjectConfigsDir)
+
 	if _, err := os.Stat(projectPath); os.IsNotExist(err) {
 		// The project directory is already gone (an earlier delete got
 		// this far). Its project-configs entry may remain, so remove it
@@ -8739,7 +8786,7 @@ func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request, slug stri
 		}
 		if dir != "" {
 			if err := s.removeProjectConfigs(globalDir, dir); err != nil {
-				s.writeRuntimeOpError(w, r.Context(), opRemoveProjectConfigDir, err, "project_slug", slug, "project_id", requestedID, "path", dir)
+				s.writeDeleteOpError(w, r.Context(), opRemoveProjectConfigDir, err, projectConfigsRoot, "project_slug", slug, "project_id", requestedID, "path", dir)
 				return
 			}
 			s.agentLifecycleLog.Info("Removed hub-managed project config directory left by an earlier delete", "slug", slug, "path", dir)
@@ -8791,7 +8838,7 @@ func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request, slug stri
 		configDir = projectConfigDirFor(globalDir, absProject, slug, requestedID)
 		if sharedDirsBase != "" {
 			if err := removeProjectConfigsSubtree(globalDir, sharedDirsBase); err != nil {
-				s.writeRuntimeOpError(w, r.Context(), opRemoveSharedDirStorage, err,
+				s.writeDeleteOpError(w, r.Context(), opRemoveSharedDirStorage, err, projectConfigsRoot,
 					"project_slug", slug, "project_id", requestedID, "path", sharedDirsBase)
 				return
 			}
@@ -8800,7 +8847,7 @@ func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request, slug stri
 	}
 
 	if err := os.RemoveAll(projectPath); err != nil {
-		s.writeRuntimeOpError(w, r.Context(), opRemoveProjectDir, err, "project_slug", slug, "path", projectPath)
+		s.writeDeleteOpError(w, r.Context(), opRemoveProjectDir, err, "", "project_slug", slug, "path", projectPath)
 		return
 	}
 
@@ -8811,7 +8858,7 @@ func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request, slug stri
 		// repeated delete removes the entry by its canonical name
 		// (orphanProjectConfigDir) and then succeeds.
 		if err := s.removeProjectConfigs(globalDir, configDir); err != nil {
-			s.writeRuntimeOpError(w, r.Context(), opRemoveProjectConfigDir, err, "project_slug", slug, "path", configDir)
+			s.writeDeleteOpError(w, r.Context(), opRemoveProjectConfigDir, err, projectConfigsRoot, "project_slug", slug, "path", configDir)
 			return
 		}
 		s.agentLifecycleLog.Info("Removed hub-managed project config directory", "slug", slug, "path", configDir)
@@ -9006,7 +9053,13 @@ func removeProjectConfigsSubtree(globalDir, path string) error {
 		return err
 	}
 	defer func() { _ = root.Close() }()
-	return root.RemoveAll(rel)
+	err = root.RemoveAll(rel)
+	if err != nil && errors.Is(err, os.ErrPermission) {
+		if mismatch := findForeignOwnerInRoot(root, rootDir, rel); mismatch != nil {
+			return &deleteOwnershipError{mismatch: mismatch, err: err}
+		}
+	}
+	return err
 }
 
 // errDeleteTargetNotFound means no agent with the requested slug exists in

@@ -18,7 +18,6 @@ package githubapp
 
 import (
 	"context"
-	"crypto/hmac"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
@@ -38,6 +37,8 @@ import (
 
 	"github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
+
+	triggithub "github.com/GoogleCloudPlatform/scion/pkg/hub/trigger/github"
 )
 
 // Config holds the GitHub App configuration.
@@ -72,6 +73,46 @@ func DefaultTokenPermissions() TokenPermissions {
 		PullRequests: "write",
 		Issues:       "write",
 		Metadata:     "read",
+	}
+}
+
+// IntersectTokenPermissions caps each non-empty field of requested to the level
+// granted in appPermissions ("read" or "write"). It never adds fields that are
+// empty in requested, never widens a level above requested or above "write"
+// (an App grant of "admin" satisfies "write" or "read" without widening), and
+// drops fields absent from or with unrecognized levels in appPermissions.
+// If appPermissions is nil or empty, it returns the zero TokenPermissions.
+func IntersectTokenPermissions(requested TokenPermissions, appPermissions map[string]string) TokenPermissions {
+	if len(appPermissions) == 0 {
+		return TokenPermissions{}
+	}
+	capLevel := func(req, app string) string {
+		switch req {
+		case "read":
+			if app == "read" || app == "write" || app == "admin" {
+				return "read"
+			}
+			return ""
+		case "write":
+			switch app {
+			case "write", "admin":
+				return "write"
+			case "read":
+				return "read"
+			default:
+				return ""
+			}
+		default:
+			return ""
+		}
+	}
+	return TokenPermissions{
+		Contents:     capLevel(requested.Contents, appPermissions["contents"]),
+		PullRequests: capLevel(requested.PullRequests, appPermissions["pull_requests"]),
+		Issues:       capLevel(requested.Issues, appPermissions["issues"]),
+		Metadata:     capLevel(requested.Metadata, appPermissions["metadata"]),
+		Checks:       capLevel(requested.Checks, appPermissions["checks"]),
+		Actions:      capLevel(requested.Actions, appPermissions["actions"]),
 	}
 }
 
@@ -431,10 +472,11 @@ func (c *Client) MintInstallationToken(ctx context.Context, installationID int64
 		errBody, err := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyReadLimit))
 		if err != nil {
 			return nil, &TokenMintError{
-				ErrorCode: ErrCodeTokenMintFailed,
-				Message:   "failed to read response body",
-				Err:       err,
-				upstream:  err.Error(),
+				ErrorCode:  ErrCodeTokenMintFailed,
+				StatusCode: resp.StatusCode,
+				Message:    "failed to read response body",
+				Err:        err,
+				upstream:   err.Error(),
 			}
 		}
 		return nil, classifyGitHubError(resp.StatusCode, errBody)
@@ -721,22 +763,7 @@ func (c *Client) ListInstallationRepos(ctx context.Context, installationID int64
 // VerifyWebhookSignature validates a GitHub webhook payload signature.
 // GitHub sends the signature in the X-Hub-Signature-256 header as "sha256=<hex>".
 func VerifyWebhookSignature(payload []byte, signature string, secret string) bool {
-	if secret == "" || signature == "" {
-		return false
-	}
-
-	const prefix = "sha256="
-	if !strings.HasPrefix(signature, prefix) {
-		return false
-	}
-	sigHex := signature[len(prefix):]
-
-	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write(payload)
-	expectedMAC := mac.Sum(nil)
-	expectedHex := fmt.Sprintf("%x", expectedMAC)
-
-	return hmac.Equal([]byte(sigHex), []byte(expectedHex))
+	return triggithub.VerifyWebhookSignature(payload, signature, secret)
 }
 
 // GetApp retrieves the authenticated GitHub App's information.

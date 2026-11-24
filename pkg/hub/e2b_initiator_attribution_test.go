@@ -176,7 +176,7 @@ func TestCreateScheduledEvent_CapturesInitiatorAttribution(t *testing.T) {
 	req := CreateScheduledEventRequest{
 		EventType: "message",
 		FireIn:    "1h",
-		AgentName: "nonexistent",
+		AgentName: "all",
 		Message:   "hello",
 	}
 	rec := doRequest(t, srv, http.MethodPost, "/api/v1/projects/"+projectID+"/scheduled-events", req)
@@ -336,12 +336,15 @@ func TestExecuteSchedule_RecurrenceCopiesInitiatorAttribution(t *testing.T) {
 			}
 
 			sched := &store.Schedule{
-				ID:                   tid("e2b-recur-sched-" + tc.name),
-				ProjectID:            projectID,
-				Name:                 "recur-" + tc.name,
-				CronExpr:             "0 9 * * *",
-				EventType:            "message",
-				Payload:              `{"agentName":"a","message":"hi"}`,
+				ID:        tid("e2b-recur-sched-" + tc.name),
+				ProjectID: projectID,
+				Name:      "recur-" + tc.name,
+				CronExpr:  "0 9 * * *",
+				EventType: "message",
+				// Target a live seeded agent so the target-deleted backstop
+				// does not pause the schedule before materializing the event
+				// (ptone/scion#8927).
+				Payload:              `{"agentName":"worker","message":"hi"}`,
 				Status:               store.ScheduleStatusActive,
 				CreatedBy:            DevUserID,
 				InitiatorAttribution: tc.attrs,
@@ -490,6 +493,27 @@ func (f *e2bFailingScheduleStore) UpdateSchedule(
 	return f.Store.UpdateSchedule(ctx, sc, fields, prevRevision, prevRevisionKnown, attribution)
 }
 
+// The schedule create, enable and resume handlers write through the
+// quota-checked variants (the per-project active schedule cap), so the
+// injected failures apply to them too.
+func (f *e2bFailingScheduleStore) CreateScheduleChecked(ctx context.Context, sc *store.Schedule, limit int, check func(store.ScheduledExecQuotaSnapshot) error) error {
+	if f.createScheduleErr != nil && f.fault.Active() {
+		return f.createScheduleErr
+	}
+	return f.Store.CreateScheduleChecked(ctx, sc, limit, check)
+}
+
+func (f *e2bFailingScheduleStore) UpdateScheduleChecked(
+	ctx context.Context, sc *store.Schedule, fields store.ScheduleFieldMask,
+	prevRevision int, prevRevisionKnown bool, attribution *store.InitiatorAttribution,
+	limit int, check func(store.ScheduledExecQuotaSnapshot) error,
+) error {
+	if f.updateScheduleErr != nil && f.fault.Active() {
+		return f.updateScheduleErr
+	}
+	return f.Store.UpdateScheduleChecked(ctx, sc, fields, prevRevision, prevRevisionKnown, attribution, limit, check)
+}
+
 // TestCreateScheduledEvent_StoreFailureLeavesNoPartialAttribution covers the
 // transaction-guarantee test the plan requires: an injected store failure
 // during authoring leaves neither the event row nor a partial attribution.
@@ -501,7 +525,7 @@ func TestCreateScheduledEvent_StoreFailureLeavesNoPartialAttribution(t *testing.
 	req := CreateScheduledEventRequest{
 		EventType: "message",
 		FireIn:    "1h",
-		AgentName: "nonexistent",
+		AgentName: "all",
 		Message:   "hello",
 	}
 	rec := doRequest(t, srv, http.MethodPost, "/api/v1/projects/"+projectID+"/scheduled-events", req)
@@ -1022,7 +1046,7 @@ func TestScheduleAndScheduledEventResponses_OmitInitiatorAttribution(t *testing.
 	scheduleRec := doRequest(t, srv, http.MethodPost, "/api/v1/projects/"+projectID+"/schedules", scheduleReq)
 	require.Equal(t, http.StatusCreated, scheduleRec.Code)
 
-	eventReq := CreateScheduledEventRequest{EventType: "message", FireIn: "1h", AgentName: "nonexistent", Message: "hi"}
+	eventReq := CreateScheduledEventRequest{EventType: "message", FireIn: "1h", AgentName: "all", Message: "hi"}
 	eventRec := doRequest(t, srv, http.MethodPost, "/api/v1/projects/"+projectID+"/scheduled-events", eventReq)
 	require.Equal(t, http.StatusCreated, eventRec.Code)
 
@@ -1097,7 +1121,7 @@ func TestDeleteSchedule_EmitsMutationAudit(t *testing.T) {
 func TestCancelScheduledEvent_EmitsMutationAudit(t *testing.T) {
 	srv, s, projectID := setupScheduleTest(t)
 
-	eventReq := CreateScheduledEventRequest{EventType: "message", FireIn: "1h", AgentName: "nonexistent", Message: "hi"}
+	eventReq := CreateScheduledEventRequest{EventType: "message", FireIn: "1h", AgentName: "all", Message: "hi"}
 	rec := doRequest(t, srv, http.MethodPost, "/api/v1/projects/"+projectID+"/scheduled-events", eventReq)
 	require.Equal(t, http.StatusCreated, rec.Code)
 	var created store.ScheduledEvent

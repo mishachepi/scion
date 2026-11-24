@@ -24,6 +24,7 @@ import (
 	"testing"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/entc"
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/rebuildpreflight"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/store/entadapter"
 )
@@ -154,6 +155,9 @@ func (l *recordingAuditLogger) LogLifecycleHookExecutionEvent(context.Context, *
 func (l *recordingAuditLogger) LogAgentSecretReadEvent(context.Context, *AgentSecretReadEvent) error {
 	return nil
 }
+func (l *recordingAuditLogger) LogAgentSecretWriteEvent(context.Context, *AgentSecretWriteEvent) error {
+	return nil
+}
 func (l *recordingAuditLogger) RecordSAAssignment(context.Context, *store.SAAssignmentEvent) error {
 	return nil
 }
@@ -171,5 +175,13 @@ func (l *recordingAuditLogger) deniedCount() int {
 }
 
 func (l *recordingAuditLogger) LogPendingSecretEvent(context.Context, *PendingSecretEvent) error {
+	return nil
+}
+
+func (l *recordingAuditLogger) LogMessageActionEvent(context.Context, *MessageActionEvent) error {
+	return nil
+}
+
+func (l *recordingAuditLogger) LogMaintenanceOverrideEvent(context.Context, *rebuildpreflight.MaintenanceOverrideEvent) error {
 	return nil
 }

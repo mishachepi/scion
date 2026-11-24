@@ -49,7 +49,12 @@ func (h *LoggingHandler) eventToTag(event *hooks.Event) string {
 		return string(state.ActivityWorking)
 	case hooks.EventToolStart:
 		return string(state.ActivityExecuting)
-	case hooks.EventToolEnd, hooks.EventAgentEnd:
+	case hooks.EventToolEnd:
+		if isSubagentEvent(event) {
+			return string(state.ActivityWorking)
+		}
+		return string(state.ActivityThinking)
+	case hooks.EventAgentEnd:
 		return string(state.ActivityWorking)
 	case hooks.EventAgentError:
 		return string(state.ActivityHarnessError)
@@ -62,7 +67,7 @@ func (h *LoggingHandler) eventToTag(event *hooks.Event) string {
 	case hooks.EventPreStart:
 		return string(state.PhaseStarting)
 	case hooks.EventPostStart:
-		return string(state.ActivityWorking)
+		return string(state.ActivityInitializing)
 	case hooks.EventPreStop:
 		return string(state.PhaseStopping)
 	default:

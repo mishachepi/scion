@@ -227,6 +227,14 @@ func (s *Server) authorizeWithEvidence(w http.ResponseWriter, r *http.Request, r
 // authorizeRead always evaluates ActionRead regardless of what actually
 // happens next, so it must never guard a non-read operation.
 func (s *Server) authorizeRead(w http.ResponseWriter, r *http.Request, resource Resource, notFoundLabel string) bool {
+	return s.authorizeReadAction(w, r, resource, ActionRead, notFoundLabel)
+}
+
+// authorizeReadAction is authorizeRead for read-only operations whose
+// permission action is not ActionRead (for example ActionList on
+// listProjectAgents). Only genuinely read-only actions should use this;
+// mutations must keep using authorize/authorizeMsg.
+func (s *Server) authorizeReadAction(w http.ResponseWriter, r *http.Request, resource Resource, action Action, notFoundLabel string) bool {
 	ctx := r.Context()
 	identity := GetIdentityFromContext(ctx)
 	if identity == nil {
@@ -237,9 +245,9 @@ func (s *Server) authorizeRead(w http.ResponseWriter, r *http.Request, resource 
 		NotFound(w, notFoundLabel)
 		return false
 	}
-	decision := s.authzService.CheckAccess(ctx, identity, resource, ActionRead)
+	decision := s.authzService.CheckAccess(ctx, identity, resource, action)
 	if !decision.Allowed {
-		logAuthzDenial(r, identity, resource, ActionRead, decision.Reason)
+		logAuthzDenial(r, identity, resource, action, decision.Reason)
 		NotFound(w, notFoundLabel)
 		return false
 	}
@@ -312,6 +320,109 @@ func agentCreateResource(projectID string) Resource {
 	return Resource{Type: "agent", ParentType: "project", ParentID: projectID}
 }
 
+// agentCreateDenial describes a denied agent-create decision.
+type agentCreateDenial struct {
+	// status is the HTTP status (401 or 403).
+	status int
+	// message is the client message; empty selects the default 403 text.
+	message string
+	// reason is the internal reason, for logs only.
+	reason string
+	// deniedBy is the decision stage that denied, when attributed.
+	deniedBy DeniedBy
+	// cause is the decision's adoptionDetailsCause, when applicable.
+	cause DenyCause
+}
+
+// authorizeAgentCreateDecision decides whether identity may create an agent in
+// projectID. It is the single non-HTTP rule shared by interactive agent create
+// (authorizeAgentCreate) and trigger dispatch_agent authoring
+// (validateDispatchAgentAuthoringAuthority), fail closed, with a terminating
+// default for unknown caller kinds:
+//
+//   - An agent caller needs ScopeAgentCreate (template-administered) and must
+//     create within its own project (both project IDs non-empty).
+//   - Only agent and user/dev identities are admitted; unknown kinds are denied.
+//   - Every caller needs agentCreateDecision.
+//   - An agent caller must be in good standing (ptone/scion#3433).
+//
+// Returns nil when allowed.
+func (s *Server) authorizeAgentCreateDecision(ctx context.Context, identity Identity, projectID string) *agentCreateDenial {
+	if identity == nil {
+		return &agentCreateDenial{
+			status: http.StatusUnauthorized,
+			reason: "unauthenticated",
+		}
+	}
+
+	switch identity.Type() {
+	case "agent":
+		agentIdent, ok := identity.(AgentIdentity)
+		if !ok {
+			return &agentCreateDenial{
+				status: http.StatusForbidden,
+				reason: "invalid agent identity",
+			}
+		}
+		if !agentIdent.HasScope(ScopeAgentCreate) {
+			return &agentCreateDenial{
+				status:  http.StatusForbidden,
+				message: "Missing required scope: " + string(ScopeAgentCreate),
+				reason:  "missing scope " + string(ScopeAgentCreate),
+			}
+		}
+		if projectID == "" || agentIdent.ProjectID() != projectID {
+			return &agentCreateDenial{
+				status:  http.StatusForbidden,
+				message: "Agents can only create sub-agents within their own project",
+				reason:  "agent project mismatch",
+			}
+		}
+
+	case "user", "dev":
+		if _, ok := identity.(UserIdentity); !ok {
+			return &agentCreateDenial{
+				status: http.StatusForbidden,
+				reason: "invalid user identity",
+			}
+		}
+
+	default:
+		return &agentCreateDenial{
+			status: http.StatusForbidden,
+			reason: "identity type may not create agents",
+		}
+	}
+
+	decision := s.agentCreateDecision(ctx, identity, projectID)
+	if !decision.Allowed {
+		return &agentCreateDenial{
+			status:   http.StatusForbidden,
+			message:  agentCreateDenyMessage,
+			reason:   decision.Reason,
+			deniedBy: decision.DeniedBy,
+			cause:    decision.adoptionDetailsCause(),
+		}
+	}
+	// A creating agent must also be in good standing (ptone/scion#3433):
+	// not held, its chain live and not held, and its root user active and
+	// admitted to the project. Refused with the same generic response as
+	// any other create denial; a lookup fault refuses.
+	if agentIdent, ok := identity.(AgentIdentity); ok {
+		if err := s.agentStanding(ctx, agentIdent.ID()); err != nil {
+			// The agent's authority comes from its chain, like a delegation
+			// ceiling refusal, and is answered the same way.
+			return &agentCreateDenial{
+				status:   http.StatusForbidden,
+				message:  agentCreateDenyMessage,
+				reason:   "creating agent not in good standing: " + standingReason(err),
+				deniedBy: DeniedByDelegationCeiling,
+			}
+		}
+	}
+	return nil
+}
+
 // authorizeAgentCreate gates agent creation for every caller kind, fail
 // closed, with a terminating default for unknown kinds.
 //
@@ -320,68 +431,18 @@ func agentCreateResource(projectID string) Resource {
 //   - Every caller then needs agentCreateDecision.
 func (s *Server) authorizeAgentCreate(w http.ResponseWriter, r *http.Request, projectID string) bool {
 	ctx := r.Context()
-	resource := agentCreateResource(projectID)
-
 	identity := GetIdentityFromContext(ctx)
-	if identity == nil {
+	d := s.authorizeAgentCreateDecision(ctx, identity, projectID)
+	if d == nil {
+		return true
+	}
+	if d.status == http.StatusUnauthorized {
 		Unauthorized(w)
 		return false
 	}
-
-	switch identity.Type() {
-	case "agent":
-		agentIdent, ok := identity.(AgentIdentity)
-		if !ok {
-			logAuthzDenial(r, identity, resource, ActionCreate, "invalid agent identity")
-			writeForbidden(w, "")
-			return false
-		}
-		if !agentIdent.HasScope(ScopeAgentCreate) {
-			logAuthzDenial(r, identity, resource, ActionCreate,
-				"missing scope "+string(ScopeAgentCreate))
-			writeForbidden(w, "Missing required scope: "+string(ScopeAgentCreate))
-			return false
-		}
-		if projectID == "" || agentIdent.ProjectID() != projectID {
-			logAuthzDenial(r, identity, resource, ActionCreate, "agent project mismatch")
-			writeForbidden(w, "Agents can only create sub-agents within their own project")
-			return false
-		}
-
-	case "user", "dev":
-		if _, ok := identity.(UserIdentity); !ok {
-			logAuthzDenial(r, identity, resource, ActionCreate, "invalid user identity")
-			writeForbidden(w, "")
-			return false
-		}
-
-	default:
-		logAuthzDenial(r, identity, resource, ActionCreate,
-			"identity type may not create agents")
-		writeForbidden(w, "")
-		return false
-	}
-
-	decision := s.agentCreateDecision(ctx, identity, projectID)
-	if !decision.Allowed {
-		logAuthzDenial(r, identity, resource, ActionCreate, decision.Reason)
-		writeForbiddenDenialCause(w, agentCreateDenyMessage, decision.DeniedBy, decision.adoptionDetailsCause())
-		return false
-	}
-	// A creating agent must also be in good standing (ptone/scion#3433):
-	// not held, its chain live and not held, and its root user active and
-	// admitted to the project. Refused with the same generic response as
-	// any other create denial; a lookup fault refuses.
-	if agentIdent, ok := identity.(AgentIdentity); ok {
-		if err := s.agentStanding(ctx, agentIdent.ID()); err != nil {
-			logAuthzDenial(r, identity, resource, ActionCreate, "creating agent not in good standing: "+standingReason(err))
-			// The agent's authority comes from its chain, like a delegation
-			// ceiling refusal, and is answered the same way.
-			writeForbiddenDenial(w, agentCreateDenyMessage, DeniedByDelegationCeiling)
-			return false
-		}
-	}
-	return true
+	logAuthzDenial(r, identity, agentCreateResource(projectID), ActionCreate, d.reason)
+	writeForbiddenDenialCause(w, d.message, d.deniedBy, d.cause)
+	return false
 }
 
 // agentTargetDenyMessage is the client message for a denied action on an
@@ -451,6 +512,18 @@ func (s *Server) authorizeAgentTargetAction(ctx context.Context, identity Identi
 		return &agentTargetDenial{status: http.StatusForbidden, reason: "delegated credential may not act on agents"}
 	}
 
+	// Shell execution containers hold human CLI credentials (ptone/scion#8812
+	// §3.4 S1-S3): human principals only. Deny agent principals outright,
+	// including ancestors and same-project agents with ScopeAgentLifecycle.
+	// Keyed on the agent, not the experiment flag.
+	if isShellAgent(target) && identity.Type() == "agent" {
+		return &agentTargetDenial{
+			status:  http.StatusForbidden,
+			message: "execution container: human principals only",
+			reason:  "execution container: human principals only",
+		}
+	}
+
 	switch identity.Type() {
 	case "agent":
 		agentIdent, ok := identity.(AgentIdentity)
@@ -469,6 +542,23 @@ func (s *Server) authorizeAgentTargetAction(ctx context.Context, identity Identi
 				status:  http.StatusForbidden,
 				message: "Agents can only manage agents within their own project",
 				reason:  "agent project mismatch",
+			}
+		}
+		if action == ActionAttach || action == ActionLifecycle {
+			if denied, indeterminate, reason := s.installationAgentCrossAgentDenied(ctx, identity, target); denied {
+				if indeterminate {
+					return &agentTargetDenial{
+						status:        http.StatusServiceUnavailable,
+						message:       "Could not verify caller agent GitHub token preference; retry",
+						reason:        reason,
+						indeterminate: true,
+					}
+				}
+				return &agentTargetDenial{
+					status:  http.StatusForbidden,
+					message: agentTargetDenyMessage,
+					reason:  reason,
+				}
 			}
 		}
 	case "user", "dev":
@@ -512,6 +602,14 @@ func writeAgentTargetDenial(w http.ResponseWriter, r *http.Request, identity Ide
 		resource = agentResource(target)
 	}
 	logAuthzDenial(r, identity, resource, action, denial.reason)
+	if denial.status == http.StatusServiceUnavailable {
+		msg := denial.message
+		if msg == "" {
+			msg = "Service temporarily unavailable; retry"
+		}
+		writeError(w, http.StatusServiceUnavailable, ErrCodeUnavailable, msg, nil)
+		return
+	}
 	writeForbiddenDenialCause(w, denial.message, denial.deniedBy, denial.cause)
 }
 
@@ -582,6 +680,9 @@ func (s *Server) agentLifecycleAllowed(ctx context.Context, identity Identity, t
 // through Decide. A caller without it sees only history it participates in,
 // subject to agent.read.
 func (s *Server) agentFullHistoryDecision(ctx context.Context, identity Identity, agent *store.Agent) Decision {
+	if denied, _, reason := s.installationAgentCrossAgentDenied(ctx, identity, agent); denied {
+		return Decision{Allowed: false, Reason: reason}
+	}
 	return agentFullHistoryDecide(ctx, s.authzService, identity, agent)
 }
 
@@ -623,6 +724,8 @@ func agentActionPermission(action string) Action {
 		// dispatch case that calls a real keys handler yet (task 2.2 adds
 		// one), so an authorized call still 404s via each switch's own
 		// default branch, not because it was denied.
+		return ActionAttach
+	case api.AgentActionScreen:
 		return ActionAttach
 	default:
 		return ActionAttach

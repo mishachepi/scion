@@ -93,6 +93,7 @@ var envContractStructuredKeys = map[string]bool{
 	"server.hub.branding.palette.success":         true, // map
 	"server.hub.branding.palette.warning":         true, // map
 	"server.hub.conduit.peers":                    true, // list of objects
+	"server.hub.system_one.secret_names":          true, // map of string lists (ptone/scion#8414)
 	"server.hub.test_identities.workload_issuers": true, // list of objects (ptone/scion#4240)
 	"server.notification_channels":                true, // list of objects
 	"server.plugins.broker":                       true, // map of objects
@@ -310,6 +311,8 @@ var schemaEnvVarDerivationExceptions = map[string]string{
 	"server.broker.enabled":                          envNameRuntimeBroker,
 	"server.broker.host":                             envNameRuntimeBroker,
 	"server.broker.hub_endpoint":                     envNameRuntimeBroker,
+	"server.broker.init_firewall.allow_domains":      envNameRuntimeBroker,
+	"server.broker.init_firewall.allow_ssh":          envNameRuntimeBroker,
 	"server.broker.port":                             envNameRuntimeBroker,
 	"server.broker.read_timeout":                     envNameRuntimeBroker,
 	"server.broker.state_dir":                        envNameRuntimeBroker,
@@ -461,6 +464,7 @@ func structTypeHas(t reflect.Type, path string) bool {
 // checks the tag, so an entry whose field gains a koanf tag fails.
 var globalConfigOutsideKoanf = map[string]string{
 	"agent_secrets.user_scope_only":           "AgentSecretsUserScopeOnly",
+	"broker_policy.admin_managed_only":        "BrokerPolicyAdminManagedOnly",
 	"default_gcp_identity_mode":               "DefaultGCPIdentityMode",
 	"default_gcp_identity_service_account_id": "DefaultGCPIdentityServiceAccountID",
 	"default_harness_config":                  "DefaultHarnessConfig",
@@ -1125,7 +1129,7 @@ func TestServerEnvContract(t *testing.T) {
 		}
 	}
 	for _, k := range keys {
-		if envContractStructuredKeys[k.Path] {
+		if envContractStructuredKeys[k.Path] || config.ServerEnvFileOnlyKeys[k.Path] != "" {
 			continue
 		}
 		for _, consumer := range []string{consumerGlobalConfig, consumerVersioned} {
@@ -1160,6 +1164,37 @@ func TestServerEnvContract(t *testing.T) {
 	h := newEnvContractHarness(t)
 	for _, k := range keys {
 		if envContractStructuredKeys[k.Path] {
+			continue
+		}
+		if config.ServerEnvFileOnlyKeys[k.Path] != "" {
+			t.Run(k.Path+"/file-only", func(t *testing.T) {
+				for _, name := range []string{
+					derivedServerEnv(k.Path),
+					"SCION_SERVER_" + strings.ToUpper(strings.ReplaceAll(strings.TrimPrefix(k.Path, "server."), ".", "_")),
+				} {
+					t.Setenv(name, "https://env.example/templates")
+					if got := config.LoadEnvKoanf(); got.Exists(k.Path) {
+						t.Errorf("file-only key %s must not be set by %s in opsettings env koanf", k.Path, name)
+					}
+					t.Setenv("HOME", h.versionsHome)
+					vs, err := config.LoadVersionedSettings("")
+					if err != nil {
+						t.Fatalf("LoadVersionedSettings with %s: %v", name, err)
+					}
+					if got, ok := structLeaf(reflect.ValueOf(vs), k.Path); ok && got.Len() > 0 {
+						t.Errorf("file-only key %s must not be set by %s in VersionedSettings: %v", k.Path, name, got.Interface())
+					}
+					gc, err := config.LoadGlobalConfig(h.configDir)
+					if err != nil {
+						t.Fatalf("LoadGlobalConfig with %s: %v", name, err)
+					}
+					leafOf, _ := globalConfigLeaf(k)
+					if got, ok := leafOf(gc); ok && got.Len() > 0 {
+						t.Errorf("file-only key %s must not be set by %s in GlobalConfig: %v", k.Path, name, got.Interface())
+					}
+					_ = os.Unsetenv(name)
+				}
+			})
 			continue
 		}
 		t.Run(k.Path, func(t *testing.T) {

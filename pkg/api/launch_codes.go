@@ -45,8 +45,8 @@ const (
 	// covers both the image pull and the volume mounts (pod status cannot
 	// tell them apart).
 	LaunchStepContainerCreate = "container_create"
-	// LaunchStepImagePull is reserved for a reader of Kubernetes Events that
-	// can see an image pull in progress. No runtime reports it yet.
+	// LaunchStepImagePull: pulling the agent image before starting the
+	// container (local container runtimes: Docker, Podman, Apple Container).
 	LaunchStepImagePull = "image_pull"
 	// LaunchStepContainerStart: the main container is running and the
 	// runtime is waiting for it to accept commands.
@@ -97,13 +97,32 @@ const (
 	// agents may not be given. The broker's synchronous refusal uses the
 	// same value (BrokerErrCodeGitConfigRefused).
 	LaunchCodeGitConfigRefused = "git_config_refused"
+	// LaunchCodeHostedConfigRefused: a hosted broker refused config written
+	// by project members (a harness config's volumes). The synchronous
+	// refusal uses the same value (pkg/hostedguard.ErrorCode).
+	LaunchCodeHostedConfigRefused = "hosted_config_refused"
 
 	// LaunchCodeImagePullFailed: the agent image could not be pulled
-	// (Kubernetes ImagePullBackOff or ErrImagePull).
+	// (Kubernetes ImagePullBackOff or ErrImagePull, or a failed local
+	// container runtime pull).
 	LaunchCodeImagePullFailed = "image_pull_failed"
 	// LaunchCodeInvalidImage: the image reference is not valid
-	// (Kubernetes InvalidImageName).
+	// (Kubernetes InvalidImageName, or a malformed container image reference).
 	LaunchCodeInvalidImage = "invalid_image"
+	// LaunchCodeRuntimeUnavailable: the local container runtime daemon or
+	// service is not running or could not be reached.
+	LaunchCodeRuntimeUnavailable = "runtime_unavailable"
+	// LaunchCodeImageLacksNetnsSetup: the agent image does not support the
+	// `sciontool netns-setup` sidecar required by the broker for
+	// runtime-managed metadata interception (broker/image version skew).
+	LaunchCodeImageLacksNetnsSetup = "image_lacks_netns_setup"
+	// LaunchCodeFirewallRequiresMetadataInterception: SCION_INIT_FIREWALL was
+	// requested on Docker or Podman without runtime-managed metadata
+	// interception (block or assign mode).
+	LaunchCodeFirewallRequiresMetadataInterception = "firewall_requires_metadata_interception"
+	// LaunchCodePodmanHostGatewayUnsupported: the host's Podman version is
+	// older than 4.7 and cannot accept --add-host <host>:host-gateway.
+	LaunchCodePodmanHostGatewayUnsupported = "podman_host_gateway_unsupported"
 	// LaunchCodeContainerConfig: the runtime refused the agent container's
 	// configuration, e.g. a missing secret or volume (Kubernetes
 	// CreateContainerConfigError), or CPU and memory limits outside what

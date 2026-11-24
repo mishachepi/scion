@@ -118,11 +118,14 @@ func parentHeldStep(t *testing.T, sh *StatusHandler, hh *HubHandler, sent func()
 // ask_user write), a notification-set wait, or any other activity.
 func parentHeldHold(t *testing.T, sh *StatusHandler, held string) {
 	t.Helper()
-	if held == "notification" {
+	switch held {
+	case "notification":
 		require.NoError(t, sh.setWaitingFromNotification())
-		return
+	case "ask_user":
+		require.NoError(t, sh.UpdateActivityWithSource(state.ActivityWaitingForInput, "", ActivitySourceAskUser))
+	default:
+		require.NoError(t, sh.UpdateActivity(state.Activity(held), ""))
 	}
-	require.NoError(t, sh.UpdateActivity(state.Activity(held), ""))
 }
 
 func waitOwnersOf(info map[string]interface{}) []string {
@@ -150,6 +153,7 @@ func TestParentHeld_ToolStartHubMatchesLocal(t *testing.T) {
 			{"crashed", "crashed", ""},
 			{"completed", "completed", ""},
 			{"limits_exceeded", "limits_exceeded", ""},
+			{"ask_user", "waiting_for_input", ""},
 			{"waiting_for_input", "executing", parentHeldExecuting},
 			{"notification", "executing", parentHeldExecuting},
 			{"working", "executing", parentHeldExecuting},
@@ -353,8 +357,8 @@ func TestParentHeld_SubagentEndReleasesOnlyItsOwn(t *testing.T) {
 	assert.Equal(t, []string{parentHeldWorking}, got)
 
 	got, info = parentHeldStep(t, sh, hh, sent, parentHeldParent(t, "PostToolUse", "Agent"))
-	assert.Equal(t, "working", info["activity"])
-	assert.Equal(t, []string{parentHeldWorking}, got)
+	assert.Equal(t, "thinking", info["activity"])
+	assert.Equal(t, []string{parentHeldThinking}, got)
 }
 
 // With nothing held, SubagentStop writes nothing and sends nothing.
@@ -540,7 +544,7 @@ func TestParentHeld_CapturedClaudeSubagentReplay(t *testing.T) {
 			{"executing", parentHeldExecuting}, // sub-agent Bash tool-start
 			{"working", parentHeldWorking},     // sub-agent Bash tool-end
 			{"working", ""},                    // SubagentStop: no change
-			{"working", parentHeldWorking},     // parent Agent tool-end
+			{"thinking", parentHeldThinking},   // parent Agent tool-end
 			{"working", parentHeldWorking},     // parent Stop
 		}
 		for i, e := range turn {

@@ -1648,6 +1648,280 @@ describe('scion-chat-thread dispatch state from send response', () => {
     expect(msg?.createdAt).toBe('2026-01-01T00:00:01Z');
   });
 
+  // ptone/scion#9015: delivery state is monotonic — once "delivered", an
+  // out-of-order "dispatched", "pending", or omitted dispatchState never
+  // downgrades it back to a lower state, while "failed" stays terminal.
+  it('upgrades dispatched to delivered and never downgrades delivered in mergeMessages', async () => {
+    const el = await mount();
+    const internals = el as unknown as {
+      messageMap: Map<string, Message>;
+      mergeMessages(msgs: Message[]): void;
+    };
+
+    const base: Message = {
+      id: 'server-delivered-monotonic',
+      projectId: '',
+      sender: 'me@example.com',
+      senderId: 'user-me',
+      recipient: 'agent:coder',
+      recipientId: 'coder',
+      msg: 'hello',
+      type: 'instruction',
+      agentId: '',
+      createdAt: '2026-01-01T00:00:00Z',
+      dispatchState: 'dispatched',
+    };
+
+    internals.mergeMessages([base]);
+    expect(internals.messageMap.get(base.id)?.dispatchState).toBe('dispatched');
+
+    // Broker confirmation arrives -> upgrades to delivered.
+    internals.mergeMessages([{ ...base, dispatchState: 'delivered' }]);
+    expect(internals.messageMap.get(base.id)?.dispatchState).toBe('delivered');
+
+    // Out-of-order dispatched, pending, or omitted dispatchState must not downgrade.
+    internals.mergeMessages([{ ...base, dispatchState: 'dispatched' }]);
+    expect(internals.messageMap.get(base.id)?.dispatchState).toBe('delivered');
+
+    internals.mergeMessages([{ ...base, dispatchState: 'pending' }]);
+    expect(internals.messageMap.get(base.id)?.dispatchState).toBe('delivered');
+
+    const { dispatchState: _omitted, ...withoutState } = base;
+    internals.mergeMessages([withoutState]);
+    expect(internals.messageMap.get(base.id)?.dispatchState).toBe('delivered');
+
+    // A stale synchronous timeout "failed" must not overwrite a confirmed "delivered".
+    internals.mergeMessages([
+      {
+        ...base,
+        dispatchState: 'failed',
+        dispatchFailureReason: 'broker request timed out',
+        dispatchFailureCode: 'dispatch_error',
+      },
+    ]);
+    const stillDelivered = internals.messageMap.get(base.id);
+    expect(stillDelivered?.dispatchState).toBe('delivered');
+    expect(stillDelivered?.dispatchFailureReason).toBeUndefined();
+    expect(stillDelivered?.dispatchFailureCode).toBeUndefined();
+  });
+
+  // ptone/scion#9015 (sec1 L1 W3): dispatched must not downgrade to pending or waking.
+  it('never downgrades dispatched to pending or waking in mergeMessages', async () => {
+    const el = await mount();
+    const internals = el as unknown as {
+      messageMap: Map<string, Message>;
+      mergeMessages(msgs: Message[]): void;
+    };
+
+    const base: Message = {
+      id: 'server-dispatched-monotonic',
+      projectId: '',
+      sender: 'me@example.com',
+      senderId: 'user-me',
+      recipient: 'agent:coder',
+      recipientId: 'coder',
+      msg: 'hello',
+      type: 'instruction',
+      agentId: '',
+      createdAt: '2026-01-01T00:00:00Z',
+      dispatchState: 'dispatched',
+    };
+
+    internals.mergeMessages([base]);
+    expect(internals.messageMap.get(base.id)?.dispatchState).toBe('dispatched');
+
+    internals.mergeMessages([{ ...base, dispatchState: 'pending' }]);
+    expect(internals.messageMap.get(base.id)?.dispatchState).toBe('dispatched');
+
+    internals.mergeMessages([{ ...base, dispatchState: 'waking' }]);
+    expect(internals.messageMap.get(base.id)?.dispatchState).toBe('dispatched');
+  });
+
+  // ptone/scion#9015 (sec1 L2): if a synchronous dispatch timed out after the
+  // broker injected and confirmed delivery, the HTTP 201 response can carry a
+  // stale "failed" while the DB holds "delivered". Because the store never
+  // transitions failed -> delivered, a server-emitted "delivered" (SSE or
+  // history refetch) is authoritative and must converge the UI to "delivered"
+  // while clearing stale failure metadata.
+  it('converges stale timeout failed state to delivered when server emits delivered in mergeMessages', async () => {
+    const el = await mount();
+    const internals = el as unknown as {
+      messageMap: Map<string, Message>;
+      mergeMessages(msgs: Message[]): void;
+    };
+
+    const staleFailed: Message = {
+      id: 'server-timeout-then-delivered',
+      projectId: '',
+      sender: 'me@example.com',
+      senderId: 'user-me',
+      recipient: 'agent:coder',
+      recipientId: 'coder',
+      msg: 'stop now',
+      type: 'instruction',
+      agentId: '',
+      createdAt: '2026-01-01T00:00:00Z',
+      dispatchState: 'failed',
+      dispatchFailureReason: 'broker request timed out',
+      dispatchFailureCode: 'dispatch_error',
+    };
+
+    internals.mergeMessages([staleFailed]);
+    expect(internals.messageMap.get(staleFailed.id)?.dispatchState).toBe('failed');
+
+    // Later SSE or history refetch carries the authoritative DB state: delivered.
+    internals.mergeMessages([
+      {
+        ...staleFailed,
+        dispatchState: 'delivered',
+        dispatchFailureReason: undefined,
+        dispatchFailureCode: undefined,
+      },
+    ]);
+    const converged = internals.messageMap.get(staleFailed.id);
+    expect(converged?.dispatchState).toBe('delivered');
+    expect(converged?.dispatchFailureReason).toBeUndefined();
+    expect(converged?.dispatchFailureCode).toBeUndefined();
+  });
+
+  // ptone/scion#9015 (sec1 L1 W2 & L2): the sseVersion branch must never
+  // downgrade an SSE-delivered "delivered" message when HTTP resolves afterward
+  // with "dispatched" or a stale synchronous timeout "failed".
+  it('never downgrades a delivered message when HTTP resolves as dispatched or stale failed after the SSE echo (sseVersion branch)', async () => {
+    for (const httpCase of [
+      {
+        id: 'server-sse-first-delivered-http-dispatched',
+        body: { id: 'server-sse-first-delivered-http-dispatched', dispatchState: 'dispatched' },
+      },
+      {
+        id: 'server-sse-first-delivered-http-failed',
+        body: {
+          id: 'server-sse-first-delivered-http-failed',
+          dispatchState: 'failed',
+          dispatchFailureReason: 'broker request timed out',
+          dispatchFailureCode: 'dispatch_error',
+        },
+      },
+    ]) {
+      const el = await mount();
+      el.currentUserId = 'user-me';
+      const internals = el as unknown as {
+        messageMap: Map<string, Message>;
+        handleChatSendV2(e: CustomEvent<ChatSendDetail>): Promise<void>;
+      };
+
+      let resolveSend!: (response: Response) => void;
+      apiFetch.mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveSend = resolve;
+          })
+      );
+      apiFetch.mockResolvedValue(emptyHistory());
+
+      const sendPromise = internals.handleChatSendV2(
+        new CustomEvent<ChatSendDetail>('chat-send', {
+          detail: {
+            text: 'hello',
+            plain: false,
+            interrupt: false,
+            onSuccess: vi.fn(),
+            mentions: [],
+            attachmentIds: [],
+          },
+        })
+      );
+
+      internals.messageMap.set(httpCase.id, {
+        id: httpCase.id,
+        projectId: '',
+        sender: 'me@example.com',
+        senderId: 'user-me',
+        recipient: 'agent:coder',
+        recipientId: 'coder',
+        msg: 'hello',
+        type: 'instruction',
+        agentId: '',
+        createdAt: '2026-01-01T00:00:00Z',
+        dispatchState: 'delivered',
+      });
+
+      resolveSend({
+        ok: true,
+        status: 201,
+        json: () => Promise.resolve(httpCase.body),
+      } as unknown as Response);
+
+      await sendPromise;
+
+      const msg = internals.messageMap.get(httpCase.id);
+      expect(msg?.dispatchState).toBe('delivered');
+      expect(msg?.dispatchFailureReason).toBeUndefined();
+      expect(msg?.dispatchFailureCode).toBeUndefined();
+    }
+  });
+
+  // ptone/scion#9015: mirror mergeMessages' dispatched monotonic guard in the
+  // sseVersion branch so a stale or out-of-order HTTP 201 carrying "pending" or
+  // "waking" never downgrades an SSE-delivered "dispatched" message.
+  it('never downgrades a dispatched message when HTTP resolves as pending or waking after the SSE echo (sseVersion branch)', async () => {
+    for (const staleState of ['pending', 'waking'] as const) {
+      const id = `server-sse-first-dispatched-http-${staleState}`;
+      const el = await mount();
+      el.currentUserId = 'user-me';
+      const internals = el as unknown as {
+        messageMap: Map<string, Message>;
+        handleChatSendV2(e: CustomEvent<ChatSendDetail>): Promise<void>;
+      };
+
+      let resolveSend!: (response: Response) => void;
+      apiFetch.mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveSend = resolve;
+          })
+      );
+      apiFetch.mockResolvedValue(emptyHistory());
+
+      const sendPromise = internals.handleChatSendV2(
+        new CustomEvent<ChatSendDetail>('chat-send', {
+          detail: {
+            text: 'hello',
+            plain: false,
+            interrupt: false,
+            onSuccess: vi.fn(),
+            mentions: [],
+            attachmentIds: [],
+          },
+        })
+      );
+
+      internals.messageMap.set(id, {
+        id,
+        projectId: '',
+        sender: 'me@example.com',
+        senderId: 'user-me',
+        recipient: 'agent:coder',
+        recipientId: 'coder',
+        msg: 'hello',
+        type: 'instruction',
+        agentId: '',
+        createdAt: '2026-01-01T00:00:00Z',
+        dispatchState: 'dispatched',
+      });
+
+      resolveSend({
+        ok: true,
+        status: 201,
+        json: () => Promise.resolve({ id, dispatchState: staleState }),
+      } as unknown as Response);
+
+      await sendPromise;
+
+      expect(internals.messageMap.get(id)?.dispatchState).toBe('dispatched');
+    }
+  });
+
   // Round 4, item 2: the sseVersion branch of handleChatSendV2 (the SSE echo
   // lands before the HTTP response) has the same never-downgrade guard as
   // mergeMessages, but no test exercised an actual downgrade attempt there —
@@ -1809,6 +2083,268 @@ describe('scion-chat-thread dispatch state from send response', () => {
     expect(msg?.dispatchState).toBe('failed');
     expect(msg?.dispatchFailureReason).toBe('Agent unreachable (suspended)');
     expect(msg?.dispatchFailureCode).toBe('agent_unreachable');
+  });
+
+  it('renders deleted-agent failed delivery label for both sender and a second human viewer', async () => {
+    const el = await mount();
+    el.currentUserId = 'user-viewer';
+
+    emitChatMessage({
+      threadId: CONVERSATION_KEY,
+      id: 'sse-deleted-reply-1',
+      msg: 'approved!',
+      sender: 'user:alice@example.com',
+      senderId: 'user-sender',
+      recipient: 'agent:gone-worker',
+      recipientId: 'gone-worker-id',
+      type: 'reply',
+      createdAt: '2026-01-01T00:00:00Z',
+      dispatchState: 'failed',
+      dispatchFailureReason: 'Agent unreachable (deleted)',
+      dispatchFailureCode: 'agent_unreachable',
+    });
+
+    await vi.waitFor(() => {
+      const bubble = el.shadowRoot?.querySelector('#msg-sse-deleted-reply-1') as
+        | (HTMLElement & { updateComplete: Promise<boolean> })
+        | null;
+      expect(bubble).not.toBeNull();
+      const state = bubble?.shadowRoot?.querySelector('.delivery-state.failed');
+      expect(state?.textContent).toContain('Not delivered — @gone-worker was deleted');
+    });
+
+    // Switch viewer to the sender: same label renders for the sender too.
+    el.currentUserId = 'user-sender';
+    await el.updateComplete;
+    const bubble = el.shadowRoot?.querySelector('#msg-sse-deleted-reply-1') as
+      | (HTMLElement & { updateComplete: Promise<boolean> })
+      | null;
+    await bubble?.updateComplete;
+    const state = bubble?.shadowRoot?.querySelector('.delivery-state.failed');
+    expect(state?.textContent).toContain('Not delivered — @gone-worker was deleted');
+  });
+
+  it('shows a warning toast on send when the reply target agent was deleted, without duplicating on replay', async () => {
+    showToastMock.mockReset();
+    const el = await mount();
+    el.defaultAgent = 'live-default';
+    const internals = el as unknown as {
+      messageMap: Map<string, Message>;
+      composerReplyTo: {
+        messageId: string;
+        senderName: string;
+        content: string;
+        sender?: string;
+        senderId?: string;
+      } | null;
+      handleChatSendV2(e: CustomEvent<ChatSendDetail>): Promise<void>;
+    };
+    internals.composerReplyTo = {
+      messageId: 'orig-agent-msg',
+      senderName: 'gone-worker',
+      content: 'please approve',
+      sender: 'agent:gone-worker',
+      senderId: 'gone-worker-id',
+    };
+
+    const failResponse = {
+      ok: true,
+      status: 201,
+      json: () =>
+        Promise.resolve({
+          id: 'failed-deleted-1',
+          dispatchState: 'failed',
+          dispatchFailureReason: 'Agent unreachable (deleted)',
+          dispatchFailureCode: 'agent_unreachable',
+        }),
+    } as unknown as Response;
+
+    apiFetch.mockResolvedValueOnce(failResponse);
+    await internals.handleChatSendV2(
+      new CustomEvent<ChatSendDetail>('chat-send', {
+        detail: {
+          text: 'approved',
+          plain: false,
+          interrupt: false,
+          replyToId: 'orig-agent-msg',
+          onSuccess: vi.fn(),
+          onError: vi.fn(),
+        },
+      })
+    );
+
+    expect(showToastMock).toHaveBeenCalledTimes(1);
+    expect(showToastMock).toHaveBeenCalledWith(
+      'Not delivered — @gone-worker was deleted',
+      'warning'
+    );
+
+    // Replaying the same message ID must not emit a duplicate toast.
+    apiFetch.mockResolvedValueOnce(failResponse);
+    await internals.handleChatSendV2(
+      new CustomEvent<ChatSendDetail>('chat-send', {
+        detail: {
+          text: 'approved',
+          plain: false,
+          interrupt: false,
+          replyToId: 'orig-agent-msg',
+          onSuccess: vi.fn(),
+          onError: vi.fn(),
+        },
+      })
+    );
+    expect(showToastMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows a warning toast with the reason text for non-deleted agent_unreachable failures', async () => {
+    showToastMock.mockReset();
+    const el = await mount();
+    const internals = el as unknown as {
+      handleChatSendV2(e: CustomEvent<ChatSendDetail>): Promise<void>;
+    };
+
+    apiFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: () =>
+        Promise.resolve({
+          id: 'failed-stopped-1',
+          dispatchState: 'failed',
+          dispatchFailureReason: 'Agent unreachable (stopped)',
+          dispatchFailureCode: 'agent_unreachable',
+        }),
+    } as unknown as Response);
+
+    await internals.handleChatSendV2(
+      new CustomEvent<ChatSendDetail>('chat-send', {
+        detail: {
+          text: 'hello',
+          plain: false,
+          interrupt: false,
+          onSuccess: vi.fn(),
+          onError: vi.fn(),
+        },
+      })
+    );
+
+    expect(showToastMock).toHaveBeenCalledWith('Agent unreachable (stopped)', 'warning');
+  });
+
+  it('sets optimistic bubble recipient to the replied-to agent rather than the topic default', async () => {
+    const el = await mount();
+    el.defaultAgent = 'topic-default';
+    const internals = el as unknown as {
+      messageMap: Map<string, Message>;
+      composerReplyTo: {
+        messageId: string;
+        senderName: string;
+        content: string;
+        sender?: string;
+        senderId?: string;
+      } | null;
+      handleChatSendV2(e: CustomEvent<ChatSendDetail>): Promise<void>;
+    };
+    internals.composerReplyTo = {
+      messageId: 'reply-target-msg',
+      senderName: 'specialist',
+      content: 'question',
+      sender: 'agent:specialist',
+      senderId: 'specialist-id',
+    };
+
+    let resolvePost!: (v: Response) => void;
+    apiFetch.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolvePost = resolve;
+        })
+    );
+
+    const sendPromise = internals.handleChatSendV2(
+      new CustomEvent<ChatSendDetail>('chat-send', {
+        detail: {
+          text: 'answer',
+          plain: false,
+          interrupt: false,
+          replyToId: 'reply-target-msg',
+          onSuccess: vi.fn(),
+          onError: vi.fn(),
+        },
+      })
+    );
+
+    const optimistic = [...internals.messageMap.values()].find((m) => m.msg === 'answer');
+    expect(optimistic?.recipient).toBe('agent:specialist');
+    expect(optimistic?.recipientId).toBe('specialist-id');
+
+    resolvePost({
+      ok: true,
+      status: 201,
+      json: () => Promise.resolve({ id: 'srv-reply-1', dispatchState: 'dispatched' }),
+    } as unknown as Response);
+    await sendPromise;
+  });
+
+  it('passes a composer reply-bar warning only when replying to an agent missing from a loaded agent list', async () => {
+    const el = await mount();
+    const internals = el as unknown as {
+      composerReplyTo: {
+        messageId: string;
+        senderName: string;
+        content: string;
+        sender?: string;
+        senderId?: string;
+      } | null;
+    };
+    const composerWarning = () =>
+      (
+        el.shadowRoot?.querySelector('scion-chat-composer') as
+          | (HTMLElement & { replyTargetWarning?: string })
+          | null
+      )?.replyTargetWarning ?? '';
+
+    // 1. Agent list unloaded (empty): no false-positive warning.
+    el.agents = [];
+    internals.composerReplyTo = {
+      messageId: 'm-del',
+      senderName: 'gone-agent',
+      content: 'hi',
+      sender: 'agent:gone-agent',
+      senderId: 'gone-id',
+    };
+    await el.updateComplete;
+    expect(composerWarning()).toBe('');
+
+    // 2. Agent list loaded without the target agent: warning shown.
+    el.agents = [
+      { id: 'live-id', name: 'Live Agent', slug: 'live-agent', status: 'running' } as Agent,
+    ];
+    await el.updateComplete;
+    expect(composerWarning()).toBe(
+      "@gone-agent was deleted — mention a live agent with @ or this reply won't be delivered."
+    );
+
+    // 3. Replying to a live agent in the list: no warning.
+    internals.composerReplyTo = {
+      messageId: 'm-live',
+      senderName: 'live-agent',
+      content: 'hi',
+      sender: 'agent:live-agent',
+      senderId: 'live-id',
+    };
+    await el.updateComplete;
+    expect(composerWarning()).toBe('');
+
+    // 4. Replying to a human message: no warning.
+    internals.composerReplyTo = {
+      messageId: 'm-human',
+      senderName: 'Alice',
+      content: 'hi',
+      sender: 'user:alice@example.com',
+      senderId: 'user-alice',
+    };
+    await el.updateComplete;
+    expect(composerWarning()).toBe('');
   });
 });
 
@@ -5316,6 +5852,7 @@ describe('scion-chat-thread inter-agent day-split markers', () => {
   async function mountAgentDM(opts: {
     history?: Array<Record<string, unknown>>;
     interagent?: Message[];
+    projectId?: string;
   }): Promise<ScionChatThread> {
     apiFetch.mockImplementation((url: unknown) => {
       const u = String(url);
@@ -5336,6 +5873,7 @@ describe('scion-chat-thread inter-agent day-split markers', () => {
     const el = document.createElement('scion-chat-thread') as ScionChatThread;
     el.conversationKey = 'dm:agent:coder';
     el.isDM = true;
+    if (opts.projectId !== undefined) el.projectId = opts.projectId;
     document.body.appendChild(el);
     await vi.waitFor(() => {
       const internals = el as unknown as { interagentMessages: Message[] };
@@ -5510,6 +6048,7 @@ describe('scion-chat-thread inter-agent day-split markers', () => {
 
     const marker = el.shadowRoot!.querySelector('scion-chat-interagent-marker');
     expect((marker as unknown as { messageCount: number }).messageCount).toBe(2);
+    expect(marker?.getAttribute('conversation-key')).toBe('dm:agent:coder');
   });
 
   /**
@@ -5632,6 +6171,59 @@ describe('scion-chat-thread inter-agent day-split markers', () => {
     } finally {
       setPreferredTimeZone('');
     }
+  });
+
+  it('determines inter-agent cross-project tags from message provenance, not the inherited DM projectId (ptone/scion#8273)', async () => {
+    const el = await mountAgentDM({
+      // Simulate opening an agent DM while viewing an unrelated project.
+      projectId: 'proj-viewed-other',
+      interagent: [
+        makeIaMessage({
+          id: 'ia-same',
+          createdAt: new Date(2026, 0, 15, 9, 0).toISOString(),
+          sender: 'agent:alpha',
+          senderProjectId: 'proj-aaaa-1111',
+          recipient: 'agent:beta',
+          recipientProjectId: 'proj-aaaa-1111',
+        }),
+        makeIaMessage({
+          id: 'ia-cross',
+          createdAt: new Date(2026, 0, 16, 9, 0).toISOString(),
+          sender: 'agent:alpha',
+          senderProjectId: 'proj-aaaa-1111',
+          recipient: 'agent:gamma',
+          recipientProjectId: 'proj-bbbb-2222',
+        }),
+      ],
+    });
+
+    const markers = Array.from(el.shadowRoot!.querySelectorAll('scion-chat-interagent-marker'));
+    expect(markers).toHaveLength(2);
+    const [sameMarker, crossMarker] = markers;
+
+    // Collapsed pills: same-project marker has no tag; cross-project marker has tag.
+    expect(sameMarker.shadowRoot?.querySelector('.ia-cross-project')).toBeNull();
+    expect(crossMarker.shadowRoot?.querySelector('.ia-cross-project')?.textContent).toMatch(
+      /1\s+cross-project/
+    );
+
+    // Expanded rows: same-project has plain names and no tag; cross-project has prefixes and tag.
+    (el as unknown as { interagentExpandAll: boolean }).interagentExpandAll = true;
+    await el.updateComplete;
+    await (sameMarker as unknown as { updateComplete: Promise<boolean> }).updateComplete;
+    await (crossMarker as unknown as { updateComplete: Promise<boolean> }).updateComplete;
+
+    expect(sameMarker.shadowRoot?.querySelector('.ia-cross-project')).toBeNull();
+    expect(sameMarker.shadowRoot?.querySelector('.ia-sender')?.textContent).toBe('alpha');
+    expect(sameMarker.shadowRoot?.querySelector('.ia-recipient')?.textContent).toBe('beta');
+
+    expect(crossMarker.shadowRoot?.querySelector('.ia-cross-project')).toBeTruthy();
+    expect(crossMarker.shadowRoot?.querySelector('.ia-sender')?.textContent).toBe(
+      'proj-aaa / alpha'
+    );
+    expect(crossMarker.shadowRoot?.querySelector('.ia-recipient')?.textContent).toBe(
+      'proj-bbb / gamma'
+    );
   });
 });
 
@@ -9913,5 +10505,43 @@ describe('scion-chat-thread email mention highlighting (ptone/scion#8133)', () =
         'bob-jones',
       ]);
     });
+  });
+});
+
+describe('scion-chat-thread stopStream listener cleanup', () => {
+  it('stopStream removes v2 SSE listeners and decision subscription even after conversationKey is cleared', async () => {
+    apiFetch.mockResolvedValue(emptyHistory());
+    const el = await mount();
+    const removeSpy = vi.spyOn(fakeStateManager, 'removeEventListener');
+    const unsubSpy = vi.fn();
+    const origUnsub = (el as unknown as { _unsubscribeDecisionUpdated: (() => void) | null })
+      ._unsubscribeDecisionUpdated;
+    expect(origUnsub).toBeTypeOf('function');
+    (
+      el as unknown as { _unsubscribeDecisionUpdated: (() => void) | null }
+    )._unsubscribeDecisionUpdated = () => {
+      unsubSpy();
+      origUnsub?.();
+    };
+
+    // Clear conversationKey before stopStream() is called so isV2 is false.
+    el.conversationKey = '';
+    el.stopStream();
+
+    const removedEvents = removeSpy.mock.calls.map((c) => c[0]);
+    expect(removedEvents).toEqual(
+      expect.arrayContaining([
+        'chat-message-received',
+        'chat-typing-received',
+        'chat-read-state-updated',
+        'chat-message-edited',
+        'chat-message-deleted',
+      ])
+    );
+    expect(unsubSpy).toHaveBeenCalledTimes(1);
+    expect(
+      (el as unknown as { _unsubscribeDecisionUpdated: (() => void) | null })
+        ._unsubscribeDecisionUpdated
+    ).toBeNull();
   });
 });

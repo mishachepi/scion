@@ -254,6 +254,82 @@ func TestSPAShell_BrandedHeadIconsThemeColorAndCriticalTokens(t *testing.T) {
 	assert.Contains(t, brandedHTML, `<style id="scion-branding-tokens">`)
 	assert.Contains(t, brandedHTML, `--scion-primary:`)
 	assert.NotContains(t, brandedHTML, "ZgotmplZ")
+
+	// Corners-only branding (no custom colors) injects <style id="scion-branding-tokens">
+	// with radius overrides and preserves stock colors.
+	cornersOnly, errs := config.ResolveBranding(&config.BrandingConfig{
+		Corners: config.BrandCornersSquare,
+	})
+	require.Empty(t, errs)
+	ws.SetBrandingSettingsProvider(staticBrandingProvider{resolved: cornersOnly})
+
+	req = httptest.NewRequest(http.MethodGet, "/login", nil)
+	rec = httptest.NewRecorder()
+	ws.Handler().ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	cornersHTML := rec.Body.String()
+	const tokenTag = `<style id="scion-branding-tokens">`
+	tokenStart := strings.Index(cornersHTML, tokenTag)
+	require.GreaterOrEqual(t, tokenStart, 0, "expected <style id=\"scion-branding-tokens\"> in shell HTML")
+	tokenBlock := cornersHTML[tokenStart:]
+	tokenEnd := strings.Index(tokenBlock, "</style>")
+	require.Greater(t, tokenEnd, 0, "expected closing </style> for branding tokens")
+	tokenBlock = tokenBlock[:tokenEnd]
+	assert.Contains(t, tokenBlock, `--scion-radius: 0;`)
+	assert.NotContains(t, tokenBlock, `--scion-primary:`)
+	assert.NotContains(t, cornersHTML, "ZgotmplZ")
+
+	// Font-sans "system" omits the Inter <link>, keeps JetBrains Mono, and emits system stack CSS.
+	systemFont, errs := config.ResolveBranding(&config.BrandingConfig{
+		FontSans: config.BrandFontSansSystem,
+	})
+	require.Empty(t, errs)
+	ws.SetBrandingSettingsProvider(staticBrandingProvider{resolved: systemFont})
+
+	req = httptest.NewRequest(http.MethodGet, "/login", nil)
+	rec = httptest.NewRecorder()
+	ws.Handler().ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	systemHTML := rec.Body.String()
+	assert.NotContains(t, systemHTML, `family=Inter`)
+	assert.NotContains(t, systemHTML, `id="scion-brand-font-sans"`)
+	assert.Contains(t, systemHTML, `family=JetBrains+Mono`)
+	assert.Contains(t, systemHTML, `--scion-font-sans: `+config.SystemFontSansFallback+`;`)
+	assert.NotContains(t, systemHTML, "ZgotmplZ")
+
+	// Curated Google Font preset swaps the Inter <link> for <link id="scion-brand-font-sans">.
+	ibmFont, errs := config.ResolveBranding(&config.BrandingConfig{
+		FontSans: config.BrandFontSansIBMPlexSans,
+	})
+	require.Empty(t, errs)
+	ws.SetBrandingSettingsProvider(staticBrandingProvider{resolved: ibmFont})
+
+	req = httptest.NewRequest(http.MethodGet, "/login", nil)
+	rec = httptest.NewRecorder()
+	ws.Handler().ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	ibmHTML := rec.Body.String()
+	assert.NotContains(t, ibmHTML, `family=Inter`)
+	assert.Contains(t, ibmHTML, `<link id="scion-brand-font-sans" href="https://fonts.googleapis.com/css2?family=IBM&#43;Plex&#43;Sans:wght@400;500;600;700&amp;display=swap" rel="stylesheet">`)
+	assert.Contains(t, ibmHTML, `family=JetBrains+Mono`)
+	assert.Contains(t, ibmHTML, `--scion-font-sans: 'IBM Plex Sans', `+config.SystemFontSansFallback+`;`)
+	assert.NotContains(t, ibmHTML, "ZgotmplZ")
+
+	// Arbitrary validated Google Font family name is URL-encoded and emitted safely.
+	workSans, errs := config.ResolveBranding(&config.BrandingConfig{
+		FontSans: "Work Sans",
+	})
+	require.Empty(t, errs)
+	ws.SetBrandingSettingsProvider(staticBrandingProvider{resolved: workSans})
+
+	req = httptest.NewRequest(http.MethodGet, "/login", nil)
+	rec = httptest.NewRecorder()
+	ws.Handler().ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	workHTML := rec.Body.String()
+	assert.Contains(t, workHTML, `<link id="scion-brand-font-sans" href="https://fonts.googleapis.com/css2?family=Work&#43;Sans:wght@400;500;600;700&amp;display=swap" rel="stylesheet">`)
+	assert.Contains(t, workHTML, `--scion-font-sans: 'Work Sans', `+config.SystemFontSansFallback+`;`)
+	assert.NotContains(t, workHTML, "ZgotmplZ")
 }
 
 func TestHubGoPages_BrandingAndAttribution(t *testing.T) {
@@ -341,4 +417,50 @@ func TestHubGoPages_BrandingAndAttribution(t *testing.T) {
 	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
 	assert.Contains(t, rec.Body.String(), "<title>Acme Cloud - Maintenance</title>")
 	assert.Contains(t, rec.Body.String(), `<span class="badge">Acme Cloud</span>`)
+
+	// 5. Corner radius presets apply to suspended and no-assets Go pages while keeping pill badges 9999px.
+	assert.Contains(t, defSusp, "border-radius: 6px;")
+	assert.Contains(t, defSusp, "border-radius: 9999px;")
+
+	squareResolved, errs := config.ResolveBranding(&config.BrandingConfig{Corners: config.BrandCornersSquare})
+	require.Empty(t, errs)
+	squareSusp := suspendedPageHTMLWithBranding(squareResolved, "alice@example.com")
+	assert.Contains(t, squareSusp, "border-radius: 0;")
+	assert.Contains(t, squareSusp, "border-radius: 9999px;")
+	squareNoAssets := renderNoAssetsPage(squareResolved)
+	assert.Contains(t, squareNoAssets, "padding: 0.15em 0.4em; border-radius: 0;")
+	assert.Contains(t, squareNoAssets, "border-radius: 0; text-align: left;")
+
+	roundedResolved, errs := config.ResolveBranding(&config.BrandingConfig{Corners: config.BrandCornersRounded})
+	require.Empty(t, errs)
+	roundedSusp := suspendedPageHTMLWithBranding(roundedResolved, "alice@example.com")
+	assert.Contains(t, roundedSusp, "border-radius: 10px;")
+	assert.Contains(t, roundedSusp, "border-radius: 9999px;")
+	roundedNoAssets := renderNoAssetsPage(roundedResolved)
+	assert.Contains(t, roundedNoAssets, "padding: 0.15em 0.4em; border-radius: 6px;")
+	assert.Contains(t, roundedNoAssets, "border-radius: 12px; text-align: left;")
+
+	// 6. Font-sans presets apply to error, suspended, and no-assets Go pages without external font links.
+	assert.Contains(t, defMaint, "font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;")
+	assert.Contains(t, defSusp, "font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;")
+
+	ibmResolved, errs := config.ResolveBranding(&config.BrandingConfig{FontSans: config.BrandFontSansIBMPlexSans})
+	require.Empty(t, errs)
+	wantIBMStack := "font-family: 'IBM Plex Sans', " + config.SystemFontSansFallback + ";"
+	ibmMaint := maintenancePageHTMLWithBranding(ibmResolved, "Upgrading")
+	assert.Contains(t, ibmMaint, wantIBMStack)
+	assert.NotContains(t, ibmMaint, "fonts.googleapis.com")
+	ibmSusp := suspendedPageHTMLWithBranding(ibmResolved, "alice@example.com")
+	assert.Contains(t, ibmSusp, wantIBMStack)
+	assert.NotContains(t, ibmSusp, "fonts.googleapis.com")
+	ibmNoAssets := renderNoAssetsPage(ibmResolved)
+	assert.Contains(t, ibmNoAssets, wantIBMStack)
+	assert.NotContains(t, ibmNoAssets, "fonts.googleapis.com")
+
+	sysResolved, errs := config.ResolveBranding(&config.BrandingConfig{FontSans: config.BrandFontSansSystem})
+	require.Empty(t, errs)
+	wantSysStack := "font-family: " + config.SystemFontSansFallback + ";"
+	assert.Contains(t, maintenancePageHTMLWithBranding(sysResolved, "Upgrading"), wantSysStack)
+	assert.Contains(t, suspendedPageHTMLWithBranding(sysResolved, "alice@example.com"), wantSysStack)
+	assert.Contains(t, renderNoAssetsPage(sysResolved), wantSysStack)
 }

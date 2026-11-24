@@ -101,6 +101,9 @@ type AgentService interface {
 	// Exec executes a command in an agent container.
 	Exec(ctx context.Context, agentID string, command []string, timeout int) (*ExecResponse, error)
 
+	// GetScreen retrieves the terminal screen saved before an agent's most recent suspend.
+	GetScreen(ctx context.Context, agentID string) (*AgentScreen, error)
+
 	// GetLogs retrieves agent logs.
 	GetLogs(ctx context.Context, agentID string, opts *GetLogsOptions) (string, error)
 
@@ -301,6 +304,22 @@ type CreateAgentRequest struct {
 	// on a different runtime target than the caller showed
 	// (.design/flat-runtime-brokers-contract.md section 9).
 	ExpectedRuntimeTargetID string `json:"expectedRuntimeTargetId,omitempty"`
+
+	// Secrets supplies agent-scoped secrets to store at creation time (behind
+	// hub.agent_secrets). Never persisted on the agent record.
+	Secrets []AgentSecretInput `json:"secrets,omitempty"`
+}
+
+// AgentSecretInput describes an agent-scoped secret supplied at agent creation
+// (or existing-agent start) time.
+type AgentSecretInput struct {
+	Key           string `json:"key"`
+	Value         string `json:"value"` // base64-encoded when Encoding == "base64"; raw UTF-8 otherwise
+	Encoding      string `json:"encoding,omitempty"`
+	Type          string `json:"type,omitempty"` // environment (default) | file | variable
+	Target        string `json:"target,omitempty"`
+	InjectionMode string `json:"injectionMode,omitempty"`
+	Description   string `json:"description,omitempty"`
 }
 
 // GCPIdentityConfig specifies GCP identity configuration for agent creation.
@@ -1079,6 +1098,13 @@ type OutboundMessageRequest struct {
 	Decisions json.RawMessage `json:"decisions,omitempty"`
 	// DecisionsUpdate lets Decisions replace decisions whose keys exist.
 	DecisionsUpdate bool `json:"decisions_update,omitempty"`
+	// SecretRequests makes the message a secret request prompt: the requested
+	// keys as a JSON array of SecretRequestInput. The hub validates them (the
+	// hub.agent_secrets experiment); Msg is then the optional intro.
+	SecretRequests json.RawMessage `json:"secret_requests,omitempty"`
+	// SecretRequestsUpdate lets SecretRequests replace pending secret requests
+	// whose keys already exist.
+	SecretRequestsUpdate bool `json:"secret_requests_update,omitempty"`
 }
 
 // DecisionSendResult is one decision of a sent decision prompt.
@@ -1148,6 +1174,10 @@ type OutboundMessageResult struct {
 	// Decisions lists the decisions of a decision prompt, one per decision
 	// sent; empty for any other message.
 	Decisions []DecisionSendResult `json:"decisions,omitempty"`
+
+	// SecretRequests lists the secret requests of a secret-request prompt, one
+	// per key sent; empty for any other message.
+	SecretRequests []messages.SecretRequestSendResult `json:"secret_requests,omitempty"`
 }
 
 // SendOutboundMessage sends a message from an agent via the outbound endpoint.
@@ -1209,6 +1239,24 @@ func (s *agentService) Exec(ctx context.Context, agentID string, command []strin
 		return nil, err
 	}
 	return apiclient.DecodeRequired[ExecResponse](resp)
+}
+
+// AgentScreen is the saved terminal screen returned by GET .../agents/{id}/screen.
+type AgentScreen struct {
+	AgentID    string    `json:"agentId"`
+	Content    string    `json:"content"`
+	CapturedAt time.Time `json:"capturedAt"`
+	Truncated  bool      `json:"truncated"`
+	Phase      string    `json:"phase"`
+}
+
+// GetScreen retrieves the terminal screen saved before an agent's most recent suspend.
+func (s *agentService) GetScreen(ctx context.Context, agentID string) (*AgentScreen, error) {
+	resp, err := s.c.get(ctx, s.agentPath(agentID)+"/screen", nil)
+	if err != nil {
+		return nil, err
+	}
+	return apiclient.DecodeRequired[AgentScreen](resp)
 }
 
 // GetLogs retrieves agent logs.
@@ -1492,10 +1540,12 @@ type MoveCheck struct {
 }
 
 // FieldChange describes an old→new change to a single scalar field on the
-// reincarnation plan.
+// reincarnation plan, with an optional hub-written reason explaining why the
+// field changed (or noting broker-side resolution).
 type FieldChange struct {
-	Old string `json:"old,omitempty"`
-	New string `json:"new,omitempty"`
+	Old    string `json:"old,omitempty"`
+	New    string `json:"new,omitempty"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // KeyDiff describes an old→new change to a set of map keys (e.g. env var
@@ -1528,7 +1578,9 @@ type ReincarnationPlan struct {
 
 	// HomeReset is set when the reincarnation deletes and rebuilds the
 	// agent's home (a harness switch); Warnings[0] is then the home-reset
-	// warning. Harness is the harness-config name old→new.
-	HomeReset bool         `json:"homeReset,omitempty"`
-	Harness   *FieldChange `json:"harness,omitempty"`
+	// warning. Harness is the harness-config name old→new. HarnessName is
+	// the resolved harness-config name for the new generation.
+	HomeReset   bool         `json:"homeReset,omitempty"`
+	Harness     *FieldChange `json:"harness,omitempty"`
+	HarnessName string       `json:"harnessName,omitempty"`
 }

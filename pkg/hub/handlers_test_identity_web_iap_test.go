@@ -541,6 +541,7 @@ func TestTIWebIAP_RedeemRateLimitedPerEmail(t *testing.T) {
 func TestTIWebIAP_RedeemClientIPThroughTrustedProxy(t *testing.T) {
 	e := newTIIAPEnv(t, []string{tiDriverEmail})
 	e.srv.config.TrustedProxies = []string{"192.0.2.0/24"}
+	e.srv.clientIPTrustedNets = parseTrustedProxies(e.srv.config.TrustedProxies)
 	clientIPs := func() map[string]bool {
 		out := map[string]bool{}
 		for _, a := range tiWebAudits(t, e.st, testIdentityWebSessionRefuseMutation) {
@@ -999,7 +1000,7 @@ func tiOpenStream(t *testing.T, e *tiIAPEnv, jar []*http.Cookie, assertion strin
 	t.Helper()
 	server := httptest.NewServer(e.ws.Handler())
 	t.Cleanup(server.Close)
-	req, err := http.NewRequest(http.MethodGet, server.URL+"/events?sub=notification.ti", nil)
+	req, err := http.NewRequest(http.MethodGet, server.URL+"/events?sub=broker.ti", nil)
 	require.NoError(t, err)
 	req.Header.Set("Accept", "text/event-stream")
 	if assertion != "" {

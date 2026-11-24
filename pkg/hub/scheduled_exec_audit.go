@@ -17,6 +17,7 @@ package hub
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agentcontrol"
@@ -71,11 +72,22 @@ type ScheduledExecEvent struct {
 	EventID       string
 	TargetAgentID string
 
+	// Trigger-routed exec audit fields (Stage 2 P8, ptone/scion#8241).
+	// When IsTrigger is true, audit_action is "trigger.fire.exec.<action>" and
+	// event_type is "trigger_fire_exec". ContextAttributeKeys records allow-listed
+	// keys only, never values.
+	IsTrigger            bool
+	TriggerID            string
+	FireID               string
+	TriggerEventID       string
+	ContextAttributeKeys []string
+
 	CommandSHA256  string
 	Argc           int
 	Argv0          string
 	ShellForm      bool
 	TimeoutSeconds int
+	CaptureMode    string
 
 	// Reason is the detailed reason code of a refusal or skip.
 	Reason string
@@ -83,10 +95,11 @@ type ScheduledExecEvent struct {
 	// event id).
 	OperationID string
 	// Outcome group (outcome action).
-	Outcome     string
-	ExitCode    *int
-	DurationMS  *int64
-	OutputBytes *int64
+	Outcome      string
+	ExitCode     *int
+	DurationMS   *int64
+	OutputBytes  *int64
+	OutputStatus string
 
 	RequestID string
 	Timestamp time.Time
@@ -100,19 +113,33 @@ type scheduledExecAuditor interface {
 }
 
 func scheduledExecAuditAttrs(e *ScheduledExecEvent) []slog.Attr {
-	attrs := []slog.Attr{
-		slog.String("event_type", "schedule_exec"),
-		slog.String("audit_action", "schedule.exec."+e.Action),
-		slog.String("project_id", e.ProjectID),
-		slog.String("scheduled_event_id", e.EventID),
-		slog.String("target_agent_id", e.TargetAgentID),
+	eventType := "schedule_exec"
+	auditAction := "schedule.exec." + e.Action
+	if e.IsTrigger {
+		eventType = "trigger_fire_exec"
+		auditAction = "trigger.fire.exec." + e.Action
 	}
+	attrs := []slog.Attr{
+		slog.String("event_type", eventType),
+		slog.String("audit_action", auditAction),
+		slog.String("project_id", e.ProjectID),
+	}
+	if !e.IsTrigger || e.EventID != "" {
+		attrs = append(attrs, slog.String("scheduled_event_id", e.EventID))
+	}
+	attrs = append(attrs, slog.String("target_agent_id", e.TargetAgentID))
 	add := func(key, val string) {
 		if val != "" {
 			attrs = append(attrs, slog.String(key, val))
 		}
 	}
 	add("schedule_id", e.ScheduleID)
+	add("trigger_id", e.TriggerID)
+	add("fire_id", e.FireID)
+	add("trigger_event_id", e.TriggerEventID)
+	if len(e.ContextAttributeKeys) > 0 {
+		attrs = append(attrs, slog.Any("context_attribute_keys", e.ContextAttributeKeys))
+	}
 	add("actor_kind", e.ActorKind)
 	add("actor_id", e.ActorID)
 	add("actor_credential_kind", e.ActorCredentialKind)
@@ -133,6 +160,7 @@ func scheduledExecAuditAttrs(e *ScheduledExecEvent) []slog.Attr {
 	if e.TimeoutSeconds > 0 {
 		attrs = append(attrs, slog.Int("timeout_seconds", e.TimeoutSeconds))
 	}
+	add("capture_mode", e.CaptureMode)
 	add("reason", e.Reason)
 	add("operation_id", e.OperationID)
 	add("outcome", e.Outcome)
@@ -145,6 +173,7 @@ func scheduledExecAuditAttrs(e *ScheduledExecEvent) []slog.Attr {
 	if e.OutputBytes != nil {
 		attrs = append(attrs, slog.Int64("output_bytes", *e.OutputBytes))
 	}
+	add("output_status", e.OutputStatus)
 	add("request_id", e.RequestID)
 	if !e.Timestamp.IsZero() {
 		attrs = append(attrs, slog.Time("event_time", e.Timestamp.UTC()))
@@ -189,6 +218,7 @@ func newScheduledExecAuthoringAudit(ctx context.Context, action, projectID, even
 	}
 	cred := GetCredentialContextFromContext(ctx)
 	e.ActorCredentialKind, e.ActorCredentialID = string(cred.Kind), cred.ID
+	e.CaptureMode = p.CaptureOutput
 	return e.withCommand(p.Command, p.timeout())
 }
 
@@ -212,6 +242,7 @@ func newScheduleExecAuthoringAudit(ctx context.Context, action string, sc store.
 	e.ActorCredentialKind, e.ActorCredentialID = string(cred.Kind), cred.ID
 	if p != nil {
 		e.TargetAgentID = p.AgentID
+		e.CaptureMode = p.CaptureOutput
 		e.withCommand(p.Command, p.timeout())
 	} else {
 		e.TargetAgentID = execPayloadTarget(sc.Payload)
@@ -232,10 +263,12 @@ func (s *Server) auditScheduleExecMutation(ctx context.Context, action string, s
 
 // newExecFireAudit returns the record of a deferred exec fire action on req,
 // with the initiator from req.Authority.Attribution and the executor from ctx.
-// ScheduleID is set only when DefinitionKind == "schedule". p may be nil (a
-// payload that does not decode).
+// ScheduleID is set only when DefinitionKind == "schedule"; when
+// DefinitionKind == "trigger", IsTrigger/TriggerID/FireID/TriggerEventID are
+// populated and audit_action uses "trigger.fire.exec.<action>". p may be nil.
 func newExecFireAudit(ctx context.Context, action string, req hubfire.FireRequest, p *scheduledExecPayload) *ScheduledExecEvent {
 	executor, _ := ExecutorContextFromContext(ctx)
+	isTrigger := req.Authority.DefinitionKind == hubfire.DefinitionKindTrigger
 	var scheduleID string
 	if req.Authority.DefinitionKind == hubfire.DefinitionKindSchedule {
 		scheduleID = req.Authority.DefinitionID
@@ -252,13 +285,26 @@ func newExecFireAudit(ctx context.Context, action string, req hubfire.FireReques
 		ExecutorID:              executor.ID,
 		ProjectID:               req.ProjectID,
 		ScheduleID:              scheduleID,
-		EventID:                 req.Authority.FireID,
 		OperationID:             req.Authority.FireID,
+		IsTrigger:               isTrigger,
 		Timestamp:               time.Now().UTC(),
+	}
+	if isTrigger {
+		e.TriggerID = req.Authority.DefinitionID
+		e.FireID = req.Authority.FireID
+		if req.Event != nil {
+			e.TriggerEventID = req.Event.ID
+		}
+	} else {
+		e.EventID = req.Authority.FireID
 	}
 	if p != nil {
 		e.TargetAgentID = p.AgentID
+		e.CaptureMode = p.CaptureOutput
 		e.withCommand(p.Command, p.timeout())
+		if isTrigger && len(p.ContextAttributes) > 0 {
+			e.ContextAttributeKeys = append([]string(nil), p.ContextAttributes...)
+		}
 	}
 	return e
 }
@@ -276,7 +322,7 @@ func newScheduledExecFireAudit(ctx context.Context, action string, evt store.Sch
 // newScheduledExecRunAudit returns the record of a run's outcome from its
 // durable row (the tracker and the sweeper have no payload).
 func newScheduledExecRunAudit(run store.ScheduledExecRun) *ScheduledExecEvent {
-	return &ScheduledExecEvent{
+	e := &ScheduledExecEvent{
 		Action:                  ScheduledExecAuditOutcome,
 		InitiatorPrincipalKind:  run.InitiatorPrincipalKind,
 		InitiatorPrincipalID:    run.InitiatorPrincipalID,
@@ -288,13 +334,20 @@ func newScheduledExecRunAudit(run store.ScheduledExecRun) *ScheduledExecEvent {
 		ProjectID:               run.ProjectID,
 		ScheduleID:              run.ScheduleID,
 		EventID:                 run.EventID,
-		OperationID:             run.EventID,
+		OperationID:             run.RunID(),
 		TargetAgentID:           run.TargetAgentID,
 		CommandSHA256:           run.CommandSHA256,
 		Argc:                    run.Argc,
 		TimeoutSeconds:          run.TimeoutSeconds,
+		CaptureMode:             run.CaptureMode,
+		IsTrigger:               run.IsTriggerOwned(),
+		FireID:                  run.FireID,
 		Timestamp:               time.Now().UTC(),
 	}
+	if run.IsTriggerOwned() && strings.HasPrefix(run.OverlapKey, "trigger:") {
+		e.TriggerID = strings.TrimPrefix(run.OverlapKey, "trigger:")
+	}
+	return e
 }
 
 // auditScheduledExec records e through the hub audit logger, falling back to

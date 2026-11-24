@@ -71,6 +71,10 @@ var layer0Prefixes = []string{
 	// Plugin hub_url (ptone/scion#555): read once at startup and handed to
 	// broker plugins; the server-config API refuses it in every mode.
 	"server.hub.internal_url",
+	// Hosted Hub import source allowlist (ptone/scion#8651): read once at
+	// startup from the settings file only (no env); the server-config API
+	// refuses it in every mode.
+	"server.hub.allowed_import_sources",
 	// Hub class (test admin tier gate input). Layer-0 so no DB section can
 	// hold it; the server-config API additionally refuses it in every mode,
 	// including workstation hubs where other Layer-0 keys are writable.
@@ -94,6 +98,8 @@ var layer0Prefixes = []string{
 	// ticker and the clamp on LaunchTimeout are both established at startup.
 	"server.hub.launch_timeout",
 	"server.hub.launch_keepalive_seconds",
+	// Audit record retention — read into ServerConfig at startup (ptone/scion#2232).
+	"server.hub.audit_retention_days",
 	// Request performance tracing — the middleware and the authorization
 	// store and audit-emitter decorators are installed at startup.
 	"server.hub.perf_trace",
@@ -118,9 +124,15 @@ var layer0Prefixes = []string{
 	// Web chat search limits (timeout, hub-wide cap) — read into
 	// ServerConfig at startup (ptone/scion#7586).
 	"server.hub.chat",
-	// System One rule evaluation ceiling (max_eval_time) — read into
-	// ServerConfig at startup (ptone/scion#8044).
+	// System One rule evaluation ceiling (max_eval_time) and operator-only
+	// provider named-secret extras (secret_names) — read into ServerConfig at
+	// startup (ptone/scion#8044, ptone/scion#8414).
 	"server.hub.system_one",
+	config.SystemOneSecretNamesKey,
+	// Recurring schedule limits — read into ServerConfig at startup.
+	"server.hub.schedules",
+	// Default message mode of new agents — read into ServerConfig at startup.
+	"server.hub.default_message_mode",
 	// Separate relay process settings (scion server --role relay) — read
 	// at startup.
 	"server.relay",
@@ -194,6 +206,9 @@ var koanfPathToJSONField = map[string]map[string]string{
 	"agent_secrets": {
 		"agent_secrets.user_scope_only": "user_scope_only",
 	},
+	"broker_policy": {
+		"broker_policy.admin_managed_only": "admin_managed_only",
+	},
 	"project_defaults": {
 		"project_defaults.default_scratchpad": "default_scratchpad",
 	},
@@ -263,6 +278,9 @@ var jsonFieldToKoanfPaths = map[string]map[string]string{
 	},
 	"agent_secrets": {
 		"user_scope_only": "agent_secrets.user_scope_only",
+	},
+	"broker_policy": {
+		"admin_managed_only": "broker_policy.admin_managed_only",
 	},
 	"project_defaults": {
 		"default_scratchpad": "project_defaults.default_scratchpad",

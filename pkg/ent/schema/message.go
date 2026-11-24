@@ -71,9 +71,12 @@ func (Message) Fields() []ent.Field {
 		// conduit (see the store.MessageDispatch* constants).
 		// After Phase 4 (no-queuing delivery), every writer sets the state
 		// explicitly. Only ExecuteAgentDM writes "pending", for the length of its
-		// dispatch; a row stays pending only after a deadline-ambiguous dispatch,
-		// by design (AC-4 of #1689), and brokerMessageSweepHandler reports and
-		// expires it. The schema default applies only to a writer that leaves
+		// dispatch (or background auto-wake), then marks it dispatched or failed —
+		// including when a dispatch deadline expires with an unknown outcome
+		// (ptone/scion#5111). A row stays pending past the threshold only while
+		// queued behind a slow auto-wake or after a fault (AC-3 MarkMessageDispatched
+		// failure or an interrupted dispatch), and brokerMessageSweepHandler reports
+		// and expires it. The schema default applies only to a writer that leaves
 		// the state empty, which the store logs (ptone/scion#4827).
 		field.String("dispatch_state").
 			Default("pending"),
@@ -134,6 +137,13 @@ func (Message) Fields() []ent.Field {
 		field.UUID("conversation_id", uuid.UUID{}).
 			Optional().
 			Nillable(),
+		// conversation_seq is a commit-ordered, per-conversation monotonic
+		// sequence allocated under the conversation row lock in CreateMessage
+		// (ptone/scion#8136). Nullable for legacy/non-conversation rows;
+		// backfilled on startup for existing conversation messages.
+		field.Int64("conversation_seq").
+			Optional().
+			Nillable(),
 		// sender_project_id / recipient_project_id carry server-derived
 		// cross-project provenance (store.Message.SenderProjectID /
 		// RecipientProjectID). Nullable: human senders and legacy rows have
@@ -185,6 +195,12 @@ func (Message) Indexes() []ent.Index {
 		index.Fields("recipient", "recipient_id"),
 		index.Fields("created"),
 		index.Fields("conversation_id"),
+		// Per-conversation commit-ordered sequence for conversation watch
+		// feeds (ptone/scion#8136). Non-unique so older binaries re-stamping
+		// conversation_id after a downgrade cannot hit a unique violation
+		// (preserving additive-only compatibility with no DowngradeFloor bump);
+		// uniqueness is enforced by the transactional allocator and re-stampers.
+		index.Fields("conversation_id", "conversation_seq"),
 		// Native chat tail and history reads must not sort the entire DM on
 		// every unread refresh. Both read-switch paths order by created, id.
 		index.Fields("conversation_id", "channel", "created", "id"),

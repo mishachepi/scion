@@ -110,6 +110,18 @@ const (
 // that finds no row, are not logged.
 const logActionReviewEnded = "review_session_ended"
 
+// logActionReviewDraftDeleted is written when a caller deletes its own saved
+// review draft (ptone/scion#7116, ptone/scion#8470); a DELETE when no draft
+// exists is not logged, and individual draft saves are not logged.
+// logActionDraftReapPass is the count-only summary of a TTL review-draft reap
+// pass. logActionDraftAccessReapPass is the count-only summary of a
+// lost-access and deleted-principal review-draft reap pass (ptone/scion#8475).
+const (
+	logActionReviewDraftDeleted  = "review_draft_deleted"
+	logActionDraftReapPass       = "review_draft_reap"
+	logActionDraftAccessReapPass = "review_draft_access_reap"
+)
+
 // Log reasons: why a refusal or a failure happened. Never free text.
 const (
 	logReasonNotFound              = "not_found" // no live artifact with the id
@@ -322,6 +334,8 @@ func routeTemplate(r *http.Request) string {
 		return base + "/links/{linkId}"
 	case sub[0] == reviewSessionsSegment && len(sub) == 2:
 		return base + "/" + reviewSessionsSegment + "/{sid}"
+	case sub[0] == reviewDraftSegment && len(sub) == 1:
+		return base + "/" + reviewDraftSegment
 	case sub[0] == "versions" && len(sub) == 1:
 		return base + "/versions"
 	case sub[0] == "versions" && len(sub) == 2:

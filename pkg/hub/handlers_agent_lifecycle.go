@@ -641,6 +641,7 @@ func (s *Server) suspendAgent(ctx context.Context, agent *store.Agent) error {
 	if ok, _, reason := s.harnessSupportsResume(ctx, agent); !ok {
 		return &errHarnessNoResume{reason: reason}
 	}
+	preActionPhase, preActionSuspendReason := agent.Phase, agent.SuspendReason
 
 	// The container is stopped before phase=suspended is written; see
 	// beginLifecycleOp.
@@ -658,10 +659,11 @@ func (s *Server) suspendAgent(ctx context.Context, agent *store.Agent) error {
 		state.Activity(agent.Activity),
 		state.Activity(agent.StalledFromActivity),
 	))
+	var captured *capturedScreen
 	if dispatcher != nil && agent.RuntimeBrokerID != "" {
-		// As for stop: warn about, and record, work in an ephemeral
-		// workspace that the suspend discards (ptone/scion#3819).
-		s.checkEphemeralWorkspaceBeforeStop(ctx, dispatcher, agent, true)
+		// Run the ephemeral workspace check (ptone/scion#3819) and pre-suspend
+		// terminal screen capture (ptone/scion#8530) concurrently before stop.
+		captured = s.preSuspendProbes(ctx, dispatcher, agent, true)
 		// As for stop, the dispatch is bounded by syncDispatch.
 		if err := syncDispatch(ctx, func(dctx context.Context) error {
 			return dispatcher.DispatchAgentStop(dctx, agent)
@@ -709,8 +711,12 @@ func (s *Server) suspendAgent(ctx context.Context, agent *store.Agent) error {
 	// status write keeps its own grants (ptone/scion#6403).
 	s.revokeSuspendedRunDelegationGrantsBestEffort(ctx, agent.ID, stopRunID)
 
+	// syncAgentAfterStopRecord and getAgentBestEffort align the in-memory
+	// struct for the HTTP response/event on a detached, bounded context with
+	// panic recovery so a refresh fault cannot skip quota or claim releases.
 	s.syncAgentAfterStopRecord(ctx, agent, newPhase, string(state.SuspendReasonUser))
-	if fresh, gerr := s.store.GetAgent(ctx, agent.ID); gerr == nil && fresh != nil {
+	s.persistSuspendScreen(ctx, agent.ID, captured)
+	if fresh := s.getAgentBestEffort(ctx, agent.ID, "suspend"); fresh != nil {
 		agent.Activity = fresh.Activity
 	}
 	// A suspended agent has no running container: release its
@@ -719,32 +725,58 @@ func (s *Server) suspendAgent(ctx context.Context, agent *store.Agent) error {
 	// max_agents_per_project one (ptone/scion#6033).
 	s.releaseBrokerQuota(ctx, agent)
 	s.releaseProjectQuota(ctx, agent)
+	// Defensive guard: handleAgentLifecycle currently admits only running
+	// agents or an idle-suspend claim, so this is always true in production,
+	// but keeps the dedup invariant local. Synchronous resolution/persistence
+	// runs best-effort with detached bounded context and panic recovery, and
+	// delivery runs in a detached panic-recovered goroutine; PublishAgentStatus
+	// is a non-blocking in-memory publish.
+	if isRealThirdPartyLifecycleTransition(preActionPhase, preActionSuspendReason, api.AgentActionSuspend) {
+		s.notifyThirdPartyLifecycleAction(ctx, agent, api.AgentActionSuspend, lifecycleStopReasonFromContext(ctx))
+	}
 	s.events.PublishAgentStatus(ctx, agent)
 	return nil
 }
 
 // revokeSuspendedCredentials revokes every credential of a suspended agent
-// (best-effort, Phase 1H). The agent_credential_revoke mutation audit is
-// recorded only after the revoke succeeds: a failed revoke is logged and
-// leaves no record claiming the credentials were revoked (ptone/scion#2403).
+// (best-effort, Phase 1H). It detaches from ctx's cancellation (preserving
+// context values such as the suspending actor for audit attribution) with a
+// dedicated timeout so an expiring lifecycle budget cannot cut the revoke
+// short and a slow store cannot hang the suspend sequence (ptone/scion#7658).
+// A panic inside the store call is recovered and logged so the rest of the
+// suspend sequence (delegation grant revoke, quota and claim release) still
+// runs (ptone/scion#7659). The agent_credential_revoke mutation audit is
+// recorded only after the revoke succeeds: a failed or panicked revoke is
+// logged and leaves no record claiming the credentials were revoked
+// (ptone/scion#2403).
 func (s *Server) revokeSuspendedCredentials(ctx context.Context, agentID string) {
-	if _, err := s.store.RevokeAgentCredentialsByAgent(ctx, agentID, "system", "agent_suspended"); err != nil {
-		slog.Warn("Failed to revoke agent credentials on suspend", "agent_id", agentID, "error", err)
+	if s == nil || s.store == nil {
+		slog.Warn("Skipping agent credential revoke on suspend: no store configured", "agent_id", agentID)
 		return
 	}
-	record := &store.MutationAuditRecord{
-		MutationType: "agent_credential_revoke",
-		TargetType:   "agent_credential",
-		TargetID:     agentID,
-	}
-	auditActorFromContext(ctx).ApplyActor(record)
-	if record.ActorPrincipalKind == "" {
-		// The scheduler's auto-suspend runs with no request principal; the
-		// record needs an actor, as for a hub-initiated mint.
-		record.ActorPrincipalKind = mintAuditSystemActorKind
-		record.ActorPrincipalID = mintAuditSystemActorID
-	}
-	s.emitMutationAudit(ctx, record)
+	_ = runBestEffortCleanupStep(ctx, agentCredentialRevokeTimeout, nil,
+		"revoke_suspended_credentials", "Recovered panic revoking agent credentials on suspend",
+		[]any{"agent_id", agentID},
+		func(revokeCtx context.Context) error {
+			if _, err := s.store.RevokeAgentCredentialsByAgent(revokeCtx, agentID, "system", "agent_suspended"); err != nil {
+				slog.Warn("Failed to revoke agent credentials on suspend", "agent_id", agentID, "error", err)
+				return nil
+			}
+			record := &store.MutationAuditRecord{
+				MutationType: "agent_credential_revoke",
+				TargetType:   "agent_credential",
+				TargetID:     agentID,
+			}
+			auditActorFromContext(revokeCtx).ApplyActor(record)
+			if record.ActorPrincipalKind == "" {
+				// The scheduler's auto-suspend runs with no request principal; the
+				// record needs an actor, as for a hub-initiated mint.
+				record.ActorPrincipalKind = mintAuditSystemActorKind
+				record.ActorPrincipalID = mintAuditSystemActorID
+			}
+			s.emitMutationAudit(revokeCtx, record)
+			return nil
+		})
 }
 
 // recordRunIntent sets the agent's run intent in the store and mirrors the
@@ -849,6 +881,7 @@ func (s *Server) handleAgentLifecycle(w http.ResponseWriter, r *http.Request, id
 		writeErrorFromErr(w, err, "")
 		return
 	}
+	preActionPhase, preActionSuspendReason := agent.Phase, agent.SuspendReason
 
 	// Start gate (design ptone/scion#2483 §2.1). Authz already ran in the
 	// caller. This runs before the managed-runtime branch so managed agents
@@ -895,14 +928,22 @@ func (s *Server) handleAgentLifecycle(w http.ResponseWriter, r *http.Request, id
 		}
 	}
 
+	if action == api.AgentActionStop || action == api.AgentActionSuspend {
+		if reason := parseLifecycleStopReason(r); reason != "" {
+			ctx = withLifecycleStopReason(ctx, reason)
+			r = r.WithContext(ctx)
+		}
+	}
+
 	// Managed agent lifecycle: handle directly without broker dispatch.
 	if isManagedAgentRuntime(agent.Runtime) {
 		s.handleManagedAgentLifecycle(w, r, agent, action)
 		return
 	}
 
-	// An agent already suspended by the hub (suspend_reason idle or stalled)
-	// can be converted in place to a user suspension without any broker action.
+	// An agent already in phase=suspended is handled in place without broker
+	// dispatch (idempotent 200 OK; converts idle/stalled or unheld legacy empty
+	// suspend_reason to user).
 	if action == api.AgentActionSuspend && s.convertHubSuspendToUser(ctx, w, agent) {
 		return
 	}
@@ -1027,6 +1068,12 @@ func (s *Server) handleAgentLifecycle(w http.ResponseWriter, r *http.Request, id
 			// write.
 			if err := s.checkPinnedPlacement(agent); err != nil {
 				if !writeRuntimeTargetRefusal(w, err) {
+					writeErrorFromErr(w, err, "")
+				}
+				return
+			}
+			if err := s.checkBrokerPolicyForStart(ctx, agent); err != nil {
+				if !writeBrokerPolicyError(w, r, err) {
 					writeErrorFromErr(w, err, "")
 				}
 				return
@@ -1183,6 +1230,12 @@ func (s *Server) handleAgentLifecycle(w http.ResponseWriter, r *http.Request, id
 			// restart never stops the agent.
 			if err := s.checkPinnedPlacement(agent); err != nil {
 				if !writeRuntimeTargetRefusal(w, err) {
+					writeErrorFromErr(w, err, "")
+				}
+				return
+			}
+			if err := s.checkBrokerPolicyForStart(ctx, agent); err != nil {
+				if !writeBrokerPolicyError(w, r, err) {
 					writeErrorFromErr(w, err, "")
 				}
 				return
@@ -1368,6 +1421,9 @@ func (s *Server) handleAgentLifecycle(w http.ResponseWriter, r *http.Request, id
 	// If dispatch failed, return error. A required-skill resolution failure
 	// keeps the broker's status and code; anything else is a 502.
 	if dispatchErr != nil {
+		if writeBrokerPolicyError(w, r, dispatchErr) {
+			return
+		}
 		if writeAgentTokenRecordError(w, dispatchErr) {
 			return
 		}
@@ -1560,6 +1616,10 @@ func (s *Server) handleAgentLifecycle(w http.ResponseWriter, r *http.Request, id
 		s.reassertBrokerReservation(ctx, agent)
 		s.reassertProjectReservation(ctx, agent, backstopSiteRestart)
 	}
+	if action == api.AgentActionStop && agent.DeletedAt.IsZero() &&
+		isRealThirdPartyLifecycleTransition(preActionPhase, preActionSuspendReason, api.AgentActionStop) {
+		s.notifyThirdPartyLifecycleAction(ctx, agent, api.AgentActionStop, lifecycleStopReasonFromContext(ctx))
+	}
 	s.events.PublishAgentStatus(ctx, agent)
 
 	respAgent := *agent
@@ -1621,11 +1681,15 @@ func (s *Server) queueOfflineStop(ctx context.Context, w http.ResponseWriter, ag
 	s.agentLifecycleLog.Info("Stop queued for offline broker",
 		"agent_id", agent.ID, "broker_id", agent.RuntimeBrokerID, "dispatch_id", dispatch.ID)
 
+	preActionPhase, preActionSuspendReason := agent.Phase, agent.SuspendReason
 	agent.Phase = newPhase
 	agent.ContainerStatus = containerStatusStopQueued
 	agent.Activity = ""
 	agent.Message = offlineStopMessage
 	s.expireHeldMessagesForAgent(ctx, agent.ID, holdFailReasonAgentStopped)
+	if isRealThirdPartyLifecycleTransition(preActionPhase, preActionSuspendReason, api.AgentActionStop) {
+		s.notifyThirdPartyLifecycleAction(ctx, agent, api.AgentActionStop, lifecycleStopReasonFromContext(ctx))
+	}
 	s.events.PublishAgentStatus(ctx, agent)
 
 	// The broker may have reconnected after the reachability check, in which
@@ -1921,6 +1985,7 @@ func (s *Server) handleStopAllAgents(w http.ResponseWriter, r *http.Request, pro
 		return
 	}
 
+	stopReason := parseLifecycleStopReason(r)
 	dispatcher := s.GetDispatcher()
 
 	// From here the stops no longer follow the client (ptone/scion#2661):
@@ -1990,6 +2055,20 @@ func (s *Server) handleStopAllAgents(w http.ResponseWriter, r *http.Request, pro
 		go func(agent *store.Agent) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			defer func() {
+				if r := recover(); r != nil {
+					s.lifecycleLogger().Error("stop-all: recovered panic stopping agent",
+						"agent_id", agent.ID, "panic", fmt.Sprint(r))
+					mu.Lock()
+					results = append(results, stopAllResult{
+						ID:     agent.ID,
+						Name:   agent.Name,
+						Status: "error",
+						Error:  "internal error stopping agent",
+					})
+					mu.Unlock()
+				}
+			}()
 
 			// The filter above used the list snapshot; re-read so a delete
 			// that claimed the row since is skipped the same way (a stop is
@@ -2093,7 +2172,7 @@ func (s *Server) handleStopAllAgents(w http.ResponseWriter, r *http.Request, pro
 			if dispatchErr != nil {
 				res.Status = "error"
 				res.Error = dispatchErr.Error()
-				s.agentLifecycleLog.Warn("stop-all: failed to stop agent",
+				s.lifecycleLogger().Warn("stop-all: failed to stop agent",
 					"agent_id", agent.ID, "error", dispatchErr)
 			} else {
 				// Update agent status in store
@@ -2113,18 +2192,21 @@ func (s *Server) handleStopAllAgents(w http.ResponseWriter, r *http.Request, pro
 				} else {
 					res.Status = "stopped"
 					res.Warnings = warnings
-					// Clear a failed delete marker, as a single stop does,
-					// and publish the row as stored.
-					// A failed re-read is logged inside; the stop's result stands.
-					_ = s.settleLifecycleWrite(ctx, agent, string(state.PhaseStopped))
-					// Release the per-broker and per-project reservations,
-					// same as a single explicit stop (ptone/scion#1963,
-					// ptone/scion#6033).
+					// Release the per-broker and per-project reservations
+					// before settling the lifecycle write, matching single
+					// explicit stop (ptone/scion#1963, ptone/scion#6033,
+					// ptone/scion#8862).
 					s.releaseBrokerQuota(ctx, agent)
 					s.releaseProjectQuota(ctx, agent)
+					// Clear a failed delete marker, as a single stop does,
+					// and publish the row as stored.
+					// Runs through runBestEffortCleanupStep inside
+					// settleLifecycleWrite; the stop's result stands.
+					_ = s.settleLifecycleWrite(ctx, agent, string(state.PhaseStopped))
 					// settleLifecycleWrite reloaded DeletedAt: a delete that
 					// soft-finished meanwhile gets no stale stopped status.
 					if agent.DeletedAt.IsZero() {
+						s.notifyThirdPartyLifecycleAction(ctx, agent, api.AgentActionStop, stopReason)
 						s.events.PublishAgentStatus(ctx, agent)
 					}
 				}

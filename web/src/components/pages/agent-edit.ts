@@ -36,10 +36,16 @@ import { LitElement, html, css, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 
 import { apiFetch, extractApiError } from '../../client/api.js';
+import { agentParentTrail, current, type Named } from '../../client/crumbs.js';
+import { cachedProjectLabel, projectDisplayName } from '../../client/project-label.js';
 import { showPendingSecretsStartHint } from '../../client/pending-secrets.js';
 import { navigateTo } from '../../client/navigation.js';
 import { lifecycleActionErrorMessage } from '../../client/agent-delete.js';
 import { dispatchPageTitle } from '../../client/page-title.js';
+import {
+  getAgentPageCurrentAgent,
+  setAgentPageCurrentAgent,
+} from '../../client/terminal-workspace-events.js';
 import { GCPServiceAccountsLoader } from '../../client/gcp-sa-accounts-loader.js';
 import { getPublicSettings } from '../../client/server-feature-flags.js';
 import { agentStatusBadge } from '../../shared/agent-state-display.js';
@@ -50,7 +56,12 @@ import {
 import { GcpIdentityState } from '../../shared/gcp-identity-state.js';
 import { assignStatusTarget } from '../../shared/gcp-sa-assign-status.js';
 import { isTargetKubernetesOnly } from '../../shared/runtime-kind.js';
-import { isFeatureEnabled, AGENT_EDIT_FLAG } from '../../utils/feature-flags.js';
+import {
+  isFeatureEnabled,
+  AGENT_EDIT_FLAG,
+  AGENT_SECRETS_FLAG,
+  FEATURE_FLAGS_CHANGED_EVENT,
+} from '../../utils/feature-flags.js';
 import { showToast } from '../../utils/toast.js';
 import { can } from '../../shared/types.js';
 import type {
@@ -70,6 +81,7 @@ import type {
 import { showConfirm } from '../shared/confirm-dialog.js';
 import '../shared/agent-config-form.js';
 import '../shared/detail-header.js';
+import '../shared/secret-list.js';
 import '../shared/status-badge.js';
 import './not-found.js';
 
@@ -245,6 +257,15 @@ export class ScionPageAgentEdit extends LitElement {
   private get tierView(): boolean {
     return isFeatureEnabled(AGENT_EDIT_FLAG);
   }
+
+  /** Whether the agent-scoped secrets experiment is enabled. */
+  private get agentSecretsEnabled(): boolean {
+    return isFeatureEnabled(AGENT_SECRETS_FLAG);
+  }
+
+  private readonly boundOnFeatureFlagsChanged = (): void => {
+    this.requestUpdate();
+  };
   /** The agent's runtime broker, to tell whether its target is Kubernetes. */
   @state() private targetBroker: RuntimeBroker | null = null;
   /** The hub's auto-expose default (public settings), for an inherited value. */
@@ -278,6 +299,9 @@ export class ScionPageAgentEdit extends LitElement {
 
   override connectedCallback(): void {
     super.connectedCallback();
+    if (typeof window !== 'undefined') {
+      window.addEventListener(FEATURE_FLAGS_CHANGED_EVENT, this.boundOnFeatureFlagsChanged);
+    }
     const match = window.location.pathname.match(/^\/agents\/([^/]+)\/edit$/);
     this.agentId = match ? decodeURIComponent(match[1]) : '';
     if (!this.agentId) {
@@ -286,6 +310,16 @@ export class ScionPageAgentEdit extends LitElement {
       return;
     }
     void this.load();
+  }
+
+  override disconnectedCallback(): void {
+    super.disconnectedCallback();
+    if (typeof window !== 'undefined') {
+      window.removeEventListener(FEATURE_FLAGS_CHANGED_EVENT, this.boundOnFeatureFlagsChanged);
+    }
+    if (this.agentId && getAgentPageCurrentAgent()?.agentId === this.agentId) {
+      setAgentPageCurrentAgent(null);
+    }
   }
 
   override willUpdate(changed: Map<string, unknown>): void {
@@ -324,6 +358,10 @@ export class ScionPageAgentEdit extends LitElement {
         this.gcp.applyStored(id?.metadataMode, id?.serviceAccountId);
       }
       dispatchPageTitle(this, 'Edit', agent.name || this.agentId);
+      setAgentPageCurrentAgent({
+        agentId: this.agentId,
+        name: agent.name || this.agentId,
+      });
       if (first) {
         void this.loadHubDefaults();
         void this.gcpAccounts.load();
@@ -517,8 +555,8 @@ export class ScionPageAgentEdit extends LitElement {
               Reincarnate…
             </sl-button>`
           : nothing}
-        <a href="/agents/${encodeURIComponent(this.agentId)}" class="back" data-testid="back"
-          >Back to agent</a
+        <a href="/agents/${encodeURIComponent(this.agentId)}" class="cancel-link" data-testid="back"
+          >Cancel</a
         >
       </div>
     `;
@@ -541,19 +579,53 @@ export class ScionPageAgentEdit extends LitElement {
     </sl-radio-group>`;
   }
 
+  private projectNamed(): Named | null {
+    const projectId = this.agent?.projectId;
+    if (!projectId) return null;
+    const label =
+      projectDisplayName({
+        name: this.agent?.project,
+        slug: this.agent?.projectSlug,
+      }) || cachedProjectLabel(projectId);
+    return { id: projectId, label: label || projectId };
+  }
+
+  private ancestorCrumbs(allowPending: boolean) {
+    const parent = agentParentTrail(this.projectNamed());
+    if (!this.agentId) return parent;
+    const agentLabel = this.agent?.name || this.agentId;
+    return [
+      ...parent,
+      {
+        label: agentLabel,
+        href: `/agents/${encodeURIComponent(this.agentId)}`,
+        truncate: true,
+        ...(allowPending && !this.agent ? { pending: true } : {}),
+      },
+    ];
+  }
+
   override render() {
     if (this.notFound) return html`<scion-page-404></scion-page-404>`;
     if (this.loading) {
-      return html`<div class="loading"><sl-spinner></sl-spinner></div>`;
+      return html`
+        <scion-breadcrumb .crumbs=${this.ancestorCrumbs(true)}></scion-breadcrumb>
+        <div class="loading"><sl-spinner></sl-spinner></div>
+      `;
     }
     const agent = this.agent;
     if (!agent) {
-      return html`<sl-alert variant="danger" open
-        >${this.error ?? 'Failed to load agent'}</sl-alert
-      >`;
+      return html`
+        <scion-breadcrumb .crumbs=${this.ancestorCrumbs(false)}></scion-breadcrumb>
+        <sl-alert variant="danger" open>${this.error ?? 'Failed to load agent'}</sl-alert>
+      `;
     }
     return html`
       <scion-detail-header heading=${agent.name || this.agentId}>
+        <scion-breadcrumb
+          slot="back"
+          .crumbs=${[...this.ancestorCrumbs(false), current('Edit', false)]}
+        ></scion-breadcrumb>
         ${agentStatusBadge(agent)}
       </scion-detail-header>
       ${this.conflict
@@ -574,6 +646,30 @@ export class ScionPageAgentEdit extends LitElement {
             ${this.warnings.map((w) => html`<div>${w}</div>`)}
           </sl-alert>`
         : nothing}
+      ${this.agentSecretsEnabled
+        ? html`
+            <sl-tab-group>
+              <sl-tab slot="nav" panel="configuration" active data-testid="agent-edit-config-tab"
+                >Configuration</sl-tab
+              >
+              <sl-tab slot="nav" panel="secrets" data-testid="agent-secrets-tab">Secrets</sl-tab>
+              <sl-tab-panel name="configuration"> ${this.renderConfigForm(agent)} </sl-tab-panel>
+              <sl-tab-panel name="secrets" data-testid="agent-secrets-panel">
+                <scion-secret-list
+                  scope="agent"
+                  scopeId=${agent.id}
+                  compact
+                  ?readonly=${!!agent._capabilities && !can(agent._capabilities, 'update')}
+                ></scion-secret-list>
+              </sl-tab-panel>
+            </sl-tab-group>
+          `
+        : this.renderConfigForm(agent)}
+    `;
+  }
+
+  private renderConfigForm(agent: Agent) {
+    return html`
       ${this.tierView ? this.renderGroupingToggle() : nothing}
       <scion-agent-config-form
         mode="edit"
@@ -599,6 +695,12 @@ export class ScionPageAgentEdit extends LitElement {
       display: block;
       max-width: 52rem;
     }
+    sl-tab-group {
+      --track-color: var(--scion-border, #e2e8f0);
+    }
+    sl-tab-group::part(body) {
+      padding-top: 1.25rem;
+    }
     .loading {
       display: flex;
       justify-content: center;
@@ -616,7 +718,7 @@ export class ScionPageAgentEdit extends LitElement {
       gap: 0.75rem;
       margin-top: 1rem;
     }
-    .back {
+    .cancel-link {
       margin-left: auto;
     }
   `;

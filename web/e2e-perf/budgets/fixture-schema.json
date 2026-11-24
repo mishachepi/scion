@@ -8,7 +8,8 @@
         "isAdmin:boolean",
         "isSuperAdmin:boolean",
         "permissions:array",
-        "permissions[]:string"
+        "permissions[]:string",
+        "viewAsMember:boolean"
       ]
     },
     "/api/v1/chat/dms": {
@@ -35,19 +36,28 @@
       "status": 200,
       "fields": [
         "experiments.federation.project_visitors:boolean",
+        "experiments.filters.query_dialect:boolean",
+        "experiments.hub.admin_managed_brokers:boolean",
         "experiments.hub.agent_edit_held:boolean",
+        "experiments.hub.agent_secrets:boolean",
         "experiments.hub.artifact_archive:boolean",
         "experiments.hub.artifacts:boolean",
         "experiments.hub.artifacts_open_review_check:boolean",
+        "experiments.hub.artifacts_review_drafts:boolean",
         "experiments.hub.attachment_artifacts:boolean",
         "experiments.hub.chat_retention:boolean",
+        "experiments.hub.code_span_mentions:boolean",
+        "experiments.hub.custom_default_user_role:boolean",
         "experiments.hub.effective_permissions:boolean",
+        "experiments.hub.exec_containers:boolean",
         "experiments.hub.exec_schedules:boolean",
         "experiments.hub.flat_runtime_brokers:boolean",
         "experiments.hub.github_triggers:boolean",
         "experiments.hub.k8s_workload_identity_setup:boolean",
+        "experiments.hub.system_one:boolean",
         "experiments.hub.triggers:boolean",
         "experiments.hub.user_delete_force_cascade:boolean",
+        "experiments.hub.view_as_member:boolean",
         "experiments.hub.welcome_project:boolean",
         "experiments.lifecycle.idle_suspend:boolean",
         "experiments.web.agent_badges:boolean",
@@ -58,6 +68,7 @@
         "experiments.web.chat_starred_messages:boolean",
         "experiments.web.decisions:boolean",
         "experiments.web.gcs_links:boolean",
+        "experiments.web.inbox_dashboard:boolean",
         "experiments.web.sse_hidden_tab_close:boolean",
         "experiments:object"
       ]

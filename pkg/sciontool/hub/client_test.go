@@ -2439,3 +2439,113 @@ func TestClient_SetSecret_PendingCap(t *testing.T) {
 	assert.Contains(t, err.Error(), "await your approval")
 	assert.NotContains(t, err.Error(), "already exists")
 }
+
+func TestClient_GetSelf_Provenance(t *testing.T) {
+	cleanup := SetHubTestSandboxed()
+	defer cleanup()
+
+	const digestImage = "us-docker.pkg.dev/proj/scion/claude:v2@sha256:abcdef0123456789"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "/api/v1/agents/agent-123", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"phase":      "running",
+			"image":      digestImage,
+			"generation": 2,
+			"appliedConfig": map[string]any{
+				"image": "ghcr.io/example/fallback:latest",
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClientWithConfig(server.URL, "test-token", "agent-123")
+	self, err := client.GetSelf(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "running", self.Phase)
+	assert.Equal(t, digestImage, self.Image)
+	assert.Equal(t, 2, self.Generation)
+	require.NotNil(t, self.AppliedConfig)
+	assert.Equal(t, "ghcr.io/example/fallback:latest", self.AppliedConfig.Image)
+}
+
+func TestClient_GetHubID(t *testing.T) {
+	cleanup := SetHubTestSandboxed()
+	defer cleanup()
+
+	t.Run("success sends agent token and returns trimmed hub_id", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, http.MethodGet, r.Method)
+			assert.Equal(t, "/api/v1/agent/hub", r.URL.Path)
+			assert.Equal(t, "test-token", r.Header.Get("X-Scion-Agent-Token"))
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"hub_id": "  hub-abc123  "})
+		}))
+		defer server.Close()
+
+		client := NewClientWithConfig(server.URL, "test-token", "agent-123")
+		id, err := client.GetHubID(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, "hub-abc123", id)
+	})
+
+	t.Run("404 wraps ErrHubInfoUnsupported", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.NotFound(w, r)
+		}))
+		defer server.Close()
+
+		client := NewClientWithConfig(server.URL, "test-token", "agent-123")
+		_, err := client.GetHubID(context.Background())
+		require.Error(t, err)
+		assert.True(t, errors.Is(err, ErrHubInfoUnsupported), "expected ErrHubInfoUnsupported, got %v", err)
+	})
+
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusInternalServerError} {
+		t.Run(fmt.Sprintf("HTTP %d does not wrap ErrHubInfoUnsupported", status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(status)
+				_, _ = w.Write([]byte(`{"error":{"code":"err","message":"denied"}}`))
+			}))
+			defer server.Close()
+
+			client := NewClientWithConfig(server.URL, "test-token", "agent-123")
+			_, err := client.GetHubID(context.Background())
+			require.Error(t, err)
+			assert.False(t, errors.Is(err, ErrHubInfoUnsupported), "status %d must not trigger older-hub fallback", status)
+		})
+	}
+
+	t.Run("empty hub_id returns error without ErrHubInfoUnsupported", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"hub_id":""}`))
+		}))
+		defer server.Close()
+
+		client := NewClientWithConfig(server.URL, "test-token", "agent-123")
+		_, err := client.GetHubID(context.Background())
+		require.Error(t, err)
+		assert.False(t, errors.Is(err, ErrHubInfoUnsupported))
+	})
+
+	t.Run("invalid JSON returns error without ErrHubInfoUnsupported", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte("not json"))
+		}))
+		defer server.Close()
+
+		client := NewClientWithConfig(server.URL, "test-token", "agent-123")
+		_, err := client.GetHubID(context.Background())
+		require.Error(t, err)
+		assert.False(t, errors.Is(err, ErrHubInfoUnsupported))
+	})
+
+	t.Run("unconfigured client returns error", func(t *testing.T) {
+		var client *Client
+		_, err := client.GetHubID(context.Background())
+		require.Error(t, err)
+		assert.False(t, errors.Is(err, ErrHubInfoUnsupported))
+	})
+}

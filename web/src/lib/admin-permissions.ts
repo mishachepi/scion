@@ -39,6 +39,8 @@ export interface AdminStatus {
   isAdmin: boolean;
   isSuperAdmin: boolean;
   permissions: string[];
+  /** True while the current browser session is in "View as member" mode. */
+  viewAsMember?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -97,8 +99,10 @@ const SETTINGS_PERMISSIONS: string[] = [
 export const NAV_PERMISSION_MAP: Record<string, string[]> = {
   '/settings': SETTINGS_PERMISSIONS,
   '/admin/server-config': ['hub.config.read'],
+  '/admin/branding': ['hub.config.read'],
   '/admin/federation': ['hub.config.read'],
   '/admin/integrations': ['hub.integrations.read'],
+  '/admin/system-one': ['system_one_instance.read'],
   '/admin/scheduler': ['hub.scheduler.read'],
   '/admin/users': ['user.read'],
   '/admin/groups': ['group.read', 'group.list'],
@@ -123,8 +127,10 @@ export const NAV_PERMISSION_MAP: Record<string, string[]> = {
 export const ROUTE_PERMISSION_MAP: Record<string, string[]> = {
   'scion-page-settings': SETTINGS_PERMISSIONS,
   'scion-page-admin-server-config': ['hub.config.read'],
+  'scion-page-admin-branding': ['hub.config.read'],
   'scion-page-admin-federation': ['hub.config.read'],
   'scion-page-admin-integrations': ['hub.integrations.read'],
+  'scion-page-admin-system-one': ['system_one_instance.read'],
   'scion-page-admin-scheduler': ['hub.scheduler.read'],
   'scion-page-admin-users': ['user.read'],
   'scion-page-admin-groups': ['group.read', 'group.list'],

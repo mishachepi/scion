@@ -15,9 +15,12 @@
 package messages
 
 import (
+	"encoding/json"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestExtractMentions(t *testing.T) {
@@ -267,29 +270,6 @@ func TestIsLeadingMention(t *testing.T) {
 	}
 }
 
-func TestParseCCFlag(t *testing.T) {
-	tests := []struct {
-		name string
-		cc   string
-		want []string
-	}{
-		{name: "empty", cc: "", want: nil},
-		{name: "single", cc: "alice", want: []string{"alice"}},
-		{name: "multiple", cc: "alice,bob,charlie", want: []string{"alice", "bob", "charlie"}},
-		{name: "whitespace trimmed", cc: " alice , bob ", want: []string{"alice", "bob"}},
-		{name: "empty entries", cc: "alice,,bob", want: []string{"alice", "bob"}},
-		{name: "duplicates", cc: "alice,bob,alice", want: []string{"alice", "bob"}},
-		{name: "case insensitive dedup", cc: "Alice,alice", want: []string{"Alice"}},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got := ParseCCFlag(tc.cc)
-			assert.Equal(t, tc.want, got)
-		})
-	}
-}
-
 func TestResolveMentions(t *testing.T) {
 	agents := []AgentInfo{
 		{Slug: "alice", Name: "Alice Agent"},
@@ -419,4 +399,162 @@ func TestReplaceProseMention(t *testing.T) {
 			assert.Equal(t, tc.want, ReplaceProseMention(tc.content, tc.old, tc.new))
 		})
 	}
+}
+
+func TestCodeSpanMentions_SharedVectors(t *testing.T) {
+	type vectorCase struct {
+		Name          string   `json:"name"`
+		Text          string   `json:"text"`
+		CodeSpanOff   []string `json:"codeSpanOff"`
+		CodeSpanOn    []string `json:"codeSpanOn"`
+		LeadingTarget string   `json:"leadingTarget"`
+		IsLeadingOff  *bool    `json:"isLeadingOff"`
+		IsLeadingOn   *bool    `json:"isLeadingOn"`
+	}
+	type vectorFile struct {
+		Cases []vectorCase `json:"cases"`
+	}
+
+	raw, err := os.ReadFile("testdata/code_span_mentions_vectors.json")
+	require.NoError(t, err)
+	var vf vectorFile
+	require.NoError(t, json.Unmarshal(raw, &vf))
+	require.NotEmpty(t, vf.Cases)
+
+	normalize := func(s []string) []string {
+		if len(s) == 0 {
+			return []string{}
+		}
+		return s
+	}
+
+	for _, tc := range vf.Cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			offOpts := MentionOptions{CodeSpanMentions: false}
+			onOpts := MentionOptions{CodeSpanMentions: true}
+
+			assert.Equal(t, normalize(tc.CodeSpanOff), normalize(ExtractProseMentionsWithOptions(tc.Text, offOpts)),
+				"ExtractProseMentionsWithOptions(off)")
+			assert.Equal(t, normalize(tc.CodeSpanOn), normalize(ExtractProseMentionsWithOptions(tc.Text, onOpts)),
+				"ExtractProseMentionsWithOptions(on)")
+			assert.Equal(t, normalize(tc.CodeSpanOff), normalize(ExtractProseWrappedMentionsWithOptions(tc.Text, offOpts)),
+				"ExtractProseWrappedMentionsWithOptions(off)")
+			assert.Equal(t, normalize(tc.CodeSpanOn), normalize(ExtractProseWrappedMentionsWithOptions(tc.Text, onOpts)),
+				"ExtractProseWrappedMentionsWithOptions(on)")
+			assert.Equal(t, normalize(tc.CodeSpanOn), normalize(ExtractMentionsWithOptions(tc.Text, onOpts)),
+				"ExtractMentionsWithOptions(on)")
+
+			if tc.IsLeadingOff != nil {
+				assert.Equal(t, *tc.IsLeadingOff, IsLeadingMentionWithOptions(tc.Text, tc.LeadingTarget, offOpts),
+					"IsLeadingMentionWithOptions(off)")
+			}
+			if tc.IsLeadingOn != nil {
+				assert.Equal(t, *tc.IsLeadingOn, IsLeadingMentionWithOptions(tc.Text, tc.LeadingTarget, onOpts),
+					"IsLeadingMentionWithOptions(on)")
+			}
+		})
+	}
+}
+
+func TestCodeSpanMentions_EscapedBackticksAndPathPrefixes(t *testing.T) {
+	// Odd backslashes escape the opening backtick (CommonMark §6.1), so it is
+	// not a code span and never promotes to a mention.
+	assert.Empty(t, ExtractProseMentionsWithOptions(`\@alice`, MentionOptions{CodeSpanMentions: true}))
+	assert.Empty(t, ExtractProseMentionsWithOptions("\\`@alice\\`", MentionOptions{CodeSpanMentions: true}))
+	// Even backslashes escape the backslash itself, leaving an unescaped code span.
+	assert.Equal(t, []string{"alice"}, ExtractProseMentionsWithOptions("\\\\`@alice`", MentionOptions{CodeSpanMentions: true}))
+	// Inside a code span, a trailing backslash is literal and does not escape
+	// the closing backtick; the span is closed and does not swallow the next mention.
+	assert.Equal(t, []string{"bob"}, ExtractProseMentionsWithOptions("`foo\\` then @bob", MentionOptions{CodeSpanMentions: true}))
+
+	// Path-like @./, @../, @/, @. tokens are skipped in ExtractMentions (ptone/scion#7476).
+	assert.Equal(t, []string{"alice"}, ExtractMentions("see @./local @../parent @/etc/hosts @.env and @alice"))
+	assert.Equal(t, []string{"alice"}, ExtractProseMentions("see @./local @../parent @/etc/hosts @.env and @alice"))
+	assert.False(t, IsLeadingMention("@./local check", "./local"))
+	assert.False(t, IsLeadingMention("@/etc/hosts check", "/etc/hosts"))
+
+	// RewriteAgentMentions leaves `@agent:slug` untouched in code spans.
+	assert.Equal(t, "format is `@agent:alice`", RewriteAgentMentions("format is `@agent:alice`"))
+}
+
+func TestReplaceProseMentionWithOptions_CodeSpanMentions(t *testing.T) {
+	on := MentionOptions{CodeSpanMentions: true}
+	off := MentionOptions{CodeSpanMentions: false}
+
+	in := "Ask `@john@example.com`, ` @JOHN@EXAMPLE.COM `, ``@john@example.com``, `` `@john@example.com` ``, `@john@example.com please`, and \\`@john@example.com\\`.\n```\n`@john@example.com`\n```\n> `@john@example.com`"
+
+	assert.Equal(t, in, ReplaceProseMentionWithOptions(in, "john@example.com", "john-smith", off))
+
+	wantOn := "Ask `@john-smith`, ` @john-smith `, ``@john-smith``, `` `@john@example.com` ``, `@john@example.com please`, and \\`@john@example.com\\`.\n```\n`@john@example.com`\n```\n> `@john@example.com`"
+	assert.Equal(t, wantOn, ReplaceProseMentionWithOptions(in, "john@example.com", "john-smith", on))
+}
+
+func TestExtractMentions_IgnoreNumericAndHexTokens(t *testing.T) {
+	const fullSHA = "847772c4cf1e6e1a692cb12ebd06c718ebcb7d4e"
+	const fullSHA256 = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+
+	tests := []struct {
+		name string
+		text string
+		want []string
+	}{
+		{
+			name: "bare numeric tokens ignored",
+			text: "count @0, @10, @8833, @123456, @10, @10. @10: @10's",
+			want: nil,
+		},
+		{
+			name: "short hex IDs and commit prefixes ignored",
+			text: "see @847772c, @5aaf533a, @0fb0e904, @5AAF533A, @deadbeef.",
+			want: nil,
+		},
+		{
+			name: "full 40-char SHA-1 and 64-char SHA-256 ignored",
+			text: "commit @" + fullSHA + " and @" + fullSHA256 + " landed",
+			want: nil,
+		},
+		{
+			name: "mixed valid mentions with numeric and hex tokens",
+			text: "reviewed @5aaf533a and @10 with @alice and @dev-8833 at @" + fullSHA,
+			want: []string{"alice", "dev-8833"},
+		},
+		{
+			name: "short hex-letter names and short alphanumeric slugs preserved",
+			text: "ping @abe @ada @ed @cafe @facade @a1 @b2 @e2e @be1 @fe2 @db01",
+			want: []string{"abe", "ada", "ed", "cafe", "facade", "a1", "b2", "e2e", "be1", "fe2", "db01"},
+		},
+		{
+			name: "hyphenated underscored non-hex and email mentions preserved",
+			text: "cc @agent-10 @10-agent @dev-5aaf533a @5aaf533a-dev @my_10 @v10 @5aaf533g @10@example.com @5aaf533a@example.com @proj/agent",
+			want: []string{"agent-10", "10-agent", "dev-5aaf533a", "5aaf533a-dev", "my_10", "v10", "5aaf533g", "10@example.com", "5aaf533a@example.com", "proj/agent"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, ExtractMentions(tc.text), "ExtractMentions")
+			assert.Equal(t, tc.want, ExtractProseMentions(tc.text), "ExtractProseMentions")
+		})
+	}
+
+	t.Run("ExtractWrappedMentions ignores wrapped numeric and hex tokens", func(t *testing.T) {
+		text := "see (@10) and (**@5aaf533a**) and (@" + fullSHA + ") cc (@alice) and **@e2e** and (@10@example.com)"
+		assert.Equal(t, []string{"alice", "e2e", "10@example.com"}, ExtractWrappedMentions(text))
+	})
+
+	t.Run("CodeSpanMentions does not promote numeric or hex code spans", func(t *testing.T) {
+		opts := MentionOptions{CodeSpanMentions: true}
+		text := "see `@10` and `@5aaf533a` and `@" + fullSHA + "` cc `@alice` and `@e2e`"
+		assert.Equal(t, []string{"alice", "e2e"}, ExtractProseMentionsWithOptions(text, opts))
+		assert.Equal(t, []string{"alice", "e2e"}, ExtractMentionsWithOptions(text, opts))
+		assert.False(t, IsLeadingMentionWithOptions("`@10` hello", "10", opts))
+		assert.False(t, IsLeadingMentionWithOptions("`@5aaf533a` hello", "5aaf533a", opts))
+	})
+
+	t.Run("IsLeadingMention ignores numeric and hex tokens", func(t *testing.T) {
+		assert.False(t, IsLeadingMention("@10 hello", "10"))
+		assert.False(t, IsLeadingMention("@5aaf533a hello", "5aaf533a"))
+		assert.False(t, IsLeadingMention("@"+fullSHA+" hello", fullSHA))
+		assert.True(t, IsLeadingMention("@e2e hello", "e2e"))
+	})
 }

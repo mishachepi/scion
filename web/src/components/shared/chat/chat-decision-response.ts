@@ -132,7 +132,7 @@ export class ScionChatDecisionResponse extends LitElement {
       background: var(--scion-badge-neutral-bg, #f1f5f9);
       color: var(--scion-badge-neutral-text, #334155);
       padding: 0.2rem 0.4rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
       white-space: nowrap;
     }
 
@@ -175,7 +175,7 @@ export class ScionChatDecisionResponse extends LitElement {
     summary:focus-visible {
       outline: 2px solid var(--scion-primary, #3b82f6);
       outline-offset: 2px;
-      border-radius: 0.2rem;
+      border-radius: calc(var(--scion-radius-sm) * 0.8);
     }
 
     details summary {
@@ -213,6 +213,7 @@ export class ScionChatDecisionResponse extends LitElement {
 
     .answers .lbl {
       color: var(--scion-text, #1e293b);
+      overflow-wrap: anywhere;
     }
   `;
 
@@ -268,13 +269,16 @@ export class ScionChatDecisionResponse extends LitElement {
   }
 
   private renderSingle(r: DecisionResponseView): TemplateResult {
+    const otherText = isOtherAnswer(r) ? r.otherText : undefined;
     if (r.provenance === INTERPRETED) {
       const agent = this.agentName || 'the agent';
       const whose = this.own ? 'your' : `${this.who}'s`;
       const pronoun = this.own ? 'your' : 'their';
       return html`<div class="line" data-kind="single" data-state="interpreted">
         <sl-icon class="robot" name="robot" aria-hidden="true"></sl-icon>
-        <b>${agent}</b> recorded <b>${whose}</b> answer <b>${r.label}</b>
+        <b>${agent}</b> recorded <b>${whose}</b> answer <b>${r.label}</b>${otherText
+          ? html` — <span class="other-text">“${otherText}”</span>`
+          : nothing}
         ${r.key ? html`for <span class="key">${r.key}</span>` : nothing} from ${pronoun} reply
         ${this.renderTime()} ${this.renderNotDelivered()}
         ${r.sourceMessageId
@@ -300,7 +304,9 @@ export class ScionChatDecisionResponse extends LitElement {
     if (outcome === 'confirm') {
       return html`<div class="line" data-kind="single" data-outcome="confirm">
         <sl-icon class="ok" name="patch-check" aria-hidden="true"></sl-icon>
-        <b>${this.who}</b> confirmed <b>${r.label}</b>
+        <b>${this.who}</b> confirmed <b>${r.label}</b>${otherText
+          ? html` — <span class="other-text">“${otherText}”</span>`
+          : nothing}
         ${r.key ? html`for <span class="key">${r.key}</span>` : nothing} ${this.renderTime()}
         <span class="sep" aria-hidden="true">·</span>
         <span class="muted" data-state="not-sent">not sent to the agent</span>
@@ -312,9 +318,16 @@ export class ScionChatDecisionResponse extends LitElement {
       return html`<div class="line" data-kind="single" data-outcome="override">
         <sl-icon class="change" name="arrow-left-right" aria-hidden="true"></sl-icon>
         <b>${this.who}</b> changed ${r.key ? html`<span class="key">${r.key}</span>` : nothing} to
-        <b>${r.label}</b>
+        <b>${r.label}</b>${otherText
+          ? html` — <span class="other-text">“${otherText}”</span>`
+          : nothing}
         ${r.previousChoiceLabel
-          ? html`<span class="muted">(was interpreted as ${r.previousChoiceLabel})</span>`
+          ? html`<span class="muted"
+              >(was interpreted as
+              ${r.previousChoiceLabel}${r.previousOtherText
+                ? ` “${r.previousOtherText}”`
+                : ''})</span
+            >`
           : nothing}
         ${this.renderTime()} ${this.renderNotDelivered()}
         ${this.renderJumpButton(r.promptMessageId)}
@@ -322,7 +335,6 @@ export class ScionChatDecisionResponse extends LitElement {
     }
 
     const question = r.question?.trim();
-    const otherText = isOtherAnswer(r) ? r.otherText : undefined;
     return html`<div class="line" data-kind="single">
       <sl-icon class="ok" name="check-circle-fill" aria-hidden="true"></sl-icon>
       <b>${this.who}</b> chose <b>${r.label}</b>${otherText
@@ -341,7 +353,9 @@ export class ScionChatDecisionResponse extends LitElement {
       }
       if (a.outcome === 'override') {
         return html` <i
-          >(${a.previousChoiceLabel ? `changed from ${a.previousChoiceLabel}` : 'changed'})</i
+          >(${a.previousChoiceLabel
+            ? `changed from ${a.previousChoiceLabel}${a.previousOtherText ? ` “${a.previousOtherText}”` : ''}`
+            : 'changed'})</i
         >`;
       }
     }
@@ -373,7 +387,10 @@ export class ScionChatDecisionResponse extends LitElement {
       const q = a.question?.trim();
       return q ? html`${q} — <b>Dismissed</b>` : html`<b>Dismissed</b>`;
     }
-    return html`${a.label}${this.renderSetItemNote(a)}`;
+    const otherText = isOtherAnswer(a) ? a.otherText : undefined;
+    return html`${a.label}${otherText
+      ? html` — <span class="other-text">“${otherText}”</span>`
+      : nothing}${this.renderSetItemNote(a)}`;
   }
 
   private renderSet(rs: DecisionResponseSetView): TemplateResult {

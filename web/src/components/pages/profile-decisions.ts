@@ -78,6 +78,7 @@ import {
   renderWaitingTabBadge,
 } from '../shared/decisions-views.js';
 import type { FacetChangeDetail, FacetComboboxOption } from '../shared/facet-combobox.js';
+import { inboxTabStripStyles, renderInboxTabStrip } from '../shared/inbox-tabs.js';
 import './not-found.js';
 
 interface PendingProjectGroup {
@@ -137,6 +138,7 @@ export class ScionPageProfileDecisions extends LitElement {
 
   static override styles = [
     decisionsPageSharedStyles,
+    inboxTabStripStyles,
     css`
       .sort-bar {
         display: flex;
@@ -167,7 +169,7 @@ export class ScionPageProfileDecisions extends LitElement {
 
       .sort-bar sl-radio-button[checked]::part(button) {
         background: var(--scion-primary, #3b82f6);
-        color: #ffffff;
+        color: var(--scion-primary-text, #ffffff);
         border-color: var(--scion-primary, #3b82f6);
       }
 
@@ -392,6 +394,7 @@ export class ScionPageProfileDecisions extends LitElement {
     }
 
     return html`
+      ${renderInboxTabStrip('decisions', { decisionsVisible: !this.ctrl.hubNotFound })}
       <div class="ph">
         <h1>Decisions</h1>
       </div>
@@ -599,6 +602,7 @@ export class ScionPageProfileDecisions extends LitElement {
                       currentUserId: this.ctrl.currentUserId,
                       showProjectColumn: true,
                       resolveProjectName: this.resolveProjectName,
+                      disclosure: this.ctrl.madeDisclosure,
                     })}
                     ${renderLoadMoreFooter({
                       tab: 'made',
@@ -654,6 +658,7 @@ export class ScionPageProfileDecisions extends LitElement {
                 includeProjectInMeta: false,
                 fallbackProject: g.project,
                 resolveProjectName: this.resolveProjectName,
+                disclosure: this.ctrl.madeDisclosure,
               })
           )}
         </div>

@@ -30,21 +30,22 @@ import (
 // choices v4, 4.4): the web card, the answer endpoint's responses and the
 // decision.updated event.
 type DecisionView struct {
-	RowID           string                `json:"rowId"`
-	MessageID       string                `json:"messageId"`
-	Key             string                `json:"key"`
-	Ref             string                `json:"ref"`
-	Version         int                   `json:"version"`
-	Status          string                `json:"status"`
-	AskerAgentID    string                `json:"askerAgentId"`
-	AskerAgentName  string                `json:"askerAgentName"`
-	Question        string                `json:"question"`
-	DefaultChoiceID string                `json:"defaultChoiceId,omitempty"`
-	Choices         []messages.Choice     `json:"choices"`
-	Other           *messages.OtherOption `json:"other,omitempty"`
-	ReplacedBy      *DecisionReplacedBy   `json:"replacedBy,omitempty"`
-	Withdrawn       *DecisionWithdrawn    `json:"withdrawn,omitempty"`
-	Dismissed       *DecisionDismissed    `json:"dismissed,omitempty"`
+	RowID              string                `json:"rowId"`
+	MessageID          string                `json:"messageId"`
+	Key                string                `json:"key"`
+	Ref                string                `json:"ref"`
+	Version            int                   `json:"version"`
+	Status             string                `json:"status"`
+	AskerAgentID       string                `json:"askerAgentId"`
+	AskerAgentName     string                `json:"askerAgentName"`
+	Question           string                `json:"question"`
+	DefaultChoiceID    string                `json:"defaultChoiceId,omitempty"`
+	Choices            []messages.Choice     `json:"choices"`
+	Other              *messages.OtherOption `json:"other,omitempty"`
+	ReplacedBy         *DecisionReplacedBy   `json:"replacedBy,omitempty"`
+	Withdrawn          *DecisionWithdrawn    `json:"withdrawn,omitempty"`
+	Dismissed          *DecisionDismissed    `json:"dismissed,omitempty"`
+	DismissAvailableAt *time.Time            `json:"dismissAvailableAt,omitempty"`
 	// Decision is the effective answer; nil while pending or dismissed.
 	Decision *AnswerView `json:"decision,omitempty"`
 }
@@ -55,6 +56,12 @@ type DecisionReplacedBy struct {
 	MessageID string    `json:"messageId"`
 	Version   int       `json:"version"`
 	At        time.Time `json:"at"`
+}
+
+// DecisionRef names a decision version by row ID and version number.
+type DecisionRef struct {
+	RowID   string `json:"rowId"`
+	Version int    `json:"version"`
 }
 
 // DecisionWithdrawn describes when, why, and by which agent a decision was withdrawn.
@@ -94,6 +101,7 @@ type AnswerView struct {
 	BatchID             string    `json:"batchId,omitempty"`
 	MatchedDefault      bool      `json:"matchedDefault,omitempty"`
 	PreviousChoiceLabel string    `json:"previousChoiceLabel,omitempty"`
+	PreviousOtherText   string    `json:"previousOtherText,omitempty"`
 	At                  time.Time `json:"at"`
 }
 
@@ -142,6 +150,7 @@ type DecisionResponseSetAnswer struct {
 	Question             string `json:"question"`
 	ChoiceID             string `json:"choiceId"`
 	Label                string `json:"label"`
+	OtherText            string `json:"otherText,omitempty"`
 	Provenance           string `json:"provenance"`
 	Outcome              string `json:"outcome"`
 	DismissReason        string `json:"dismissReason,omitempty"`
@@ -152,6 +161,7 @@ type DecisionResponseSetAnswer struct {
 	SourceMessageID      string `json:"sourceMessageId,omitempty"`
 	PromptMessageID      string `json:"promptMessageId,omitempty"`
 	PreviousChoiceLabel  string `json:"previousChoiceLabel,omitempty"`
+	PreviousOtherText    string `json:"previousOtherText,omitempty"`
 }
 
 // DecisionResponseView is what a decision-response row gains in history and SSE.
@@ -173,6 +183,7 @@ type DecisionResponseView struct {
 	PromptMessageID      string `json:"promptMessageId"`
 	SourceMessageID      string `json:"sourceMessageId,omitempty"`
 	PreviousChoiceLabel  string `json:"previousChoiceLabel,omitempty"`
+	PreviousOtherText    string `json:"previousOtherText,omitempty"`
 }
 
 // answerView converts a stored answer.
@@ -200,9 +211,23 @@ func answerView(a *store.DecisionAnswer) *AnswerView {
 	}
 }
 
+// cloneOtherOption returns a shallow copy of o, or nil when o is nil.
+func cloneOtherOption(o *messages.OtherOption) *messages.OtherOption {
+	if o == nil {
+		return nil
+	}
+	cp := *o
+	return &cp
+}
+
 // decisionView converts a stored decision. replacedBy, when the decision is
 // replaced, is the row that replaced it (nil when it could not be read).
-func decisionView(d *store.Decision, replacedBy *store.Decision) DecisionView {
+// minAge is the hub's effective dismiss minimum age (<= 0 defaults to
+// store.DecisionDismissMinAge).
+func decisionView(d *store.Decision, replacedBy *store.Decision, minAge time.Duration) DecisionView {
+	if minAge <= 0 {
+		minAge = store.DecisionDismissMinAge
+	}
 	eff := d.EffectiveAnswer()
 	v := DecisionView{
 		RowID:           d.ID,
@@ -216,14 +241,16 @@ func decisionView(d *store.Decision, replacedBy *store.Decision) DecisionView {
 		Question:        d.Question,
 		DefaultChoiceID: d.DefaultChoiceID,
 		Choices:         d.Choices,
+		Other:           cloneOtherOption(d.Other),
 		Decision:        answerView(eff),
 	}
-	if d.Other != nil {
-		otherCopy := *d.Other
-		v.Other = &otherCopy
+	if !d.CreatedAt.IsZero() {
+		avail := d.CreatedAt.Add(minAge).UTC()
+		v.DismissAvailableAt = &avail
 	}
 	if v.Decision != nil {
 		v.Decision.PreviousChoiceLabel = previousChoiceLabel(eff, d)
+		v.Decision.PreviousOtherText = previousOtherText(eff, d)
 	}
 	if v.Choices == nil {
 		v.Choices = []messages.Choice{}
@@ -289,7 +316,7 @@ func (s *Server) decisionViewFor(ctx context.Context, d *store.Decision) Decisio
 			replacedBy = r
 		}
 	}
-	return decisionView(d, replacedBy)
+	return decisionView(d, replacedBy, s.decisionDismissMinAge())
 }
 
 // decisionPromptViews returns the DecisionPromptView of every decision-prompt
@@ -333,7 +360,7 @@ func (s *Server) decisionPromptViews(ctx context.Context, msgs []*store.Message)
 			if d.Position == 0 {
 				view.Intro = messages.DecisionIntro(byID[id].Msg, d.IntroLength)
 			}
-			view.Decisions = append(view.Decisions, decisionView(d, replacedBy[d.ReplacedByID]))
+			view.Decisions = append(view.Decisions, decisionView(d, replacedBy[d.ReplacedByID], s.decisionDismissMinAge()))
 		}
 		out[id] = view
 	}
@@ -464,6 +491,20 @@ func previousChoiceLabel(a *store.DecisionAnswer, d *store.Decision) string {
 	return ""
 }
 
+// previousOtherText returns the Other text of d's interpreted answer when a
+// overrides it, or "".
+func previousOtherText(a *store.DecisionAnswer, d *store.Decision) string {
+	if a == nil || a.Outcome != store.DecisionOutcomeOverride || d == nil {
+		return ""
+	}
+	for _, prev := range d.Answers {
+		if prev.Provenance == store.DecisionProvenanceAgentInterpreted {
+			return prev.OtherText
+		}
+	}
+	return ""
+}
+
 // decisionResponseViewOf builds the DecisionResponseView of one answer and its
 // decision row (d may be nil if unreadable).
 func decisionResponseViewOf(a *store.DecisionAnswer, d *store.Decision) DecisionResponseView {
@@ -484,6 +525,7 @@ func decisionResponseViewOf(a *store.DecisionAnswer, d *store.Decision) Decision
 		InterpretedByAgentID: a.InterpretedByAgentID,
 		SourceMessageID:      a.SourceMessageID,
 		PreviousChoiceLabel:  previousChoiceLabel(a, d),
+		PreviousOtherText:    previousOtherText(a, d),
 	}
 	if d != nil {
 		v.RowID = d.ID
@@ -504,6 +546,7 @@ func decisionResponseSetAnswerOf(a *store.DecisionAnswer, d *store.Decision) Dec
 		Question:             a.QuestionText,
 		ChoiceID:             a.ChoiceID,
 		Label:                a.ChoiceLabel,
+		OtherText:            a.OtherText,
 		Provenance:           a.Provenance,
 		Outcome:              a.Outcome,
 		DismissReason:        a.DismissReason,
@@ -513,6 +556,7 @@ func decisionResponseSetAnswerOf(a *store.DecisionAnswer, d *store.Decision) Dec
 		InterpretedByAgentID: a.InterpretedByAgentID,
 		SourceMessageID:      a.SourceMessageID,
 		PreviousChoiceLabel:  previousChoiceLabel(a, d),
+		PreviousOtherText:    previousOtherText(a, d),
 	}
 	if d != nil {
 		item.RowID = d.ID

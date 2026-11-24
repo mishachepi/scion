@@ -228,6 +228,12 @@ func TestParseReference_ConvID_InvalidUUID(t *testing.T) {
 	_, err := ParseReference("conv:not-a-uuid")
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, store.ErrInvalidInput))
+	assert.Contains(t, err.Error(), "36-character UUID")
+	assert.Contains(t, err.Error(), "conv:<uuid>")
+
+	_, shortErr := ParseReference("conv:69e36cbf")
+	require.Error(t, shortErr)
+	assert.Contains(t, shortErr.Error(), "36-character UUID")
 }
 
 func TestParseReference_AgentSlug(t *testing.T) {
@@ -283,12 +289,14 @@ func TestParseReference_InvalidFormat(t *testing.T) {
 		"123",
 		"conversation:123",
 		"!invalid",
+		"69e36cbf-69ac-4782-8ec1-e0604abeb687",
 	}
 	for _, input := range tests {
 		t.Run(input, func(t *testing.T) {
 			_, err := ParseReference(input)
 			require.Error(t, err)
 			assert.True(t, errors.Is(err, store.ErrInvalidInput), "expected ErrInvalidInput for %q, got: %v", input, err)
+			assert.Contains(t, err.Error(), "conv:<uuid>", "invalid format error should hint conv:<uuid> for %q", input)
 		})
 	}
 }
@@ -469,6 +477,158 @@ func TestResolve_ConvByID_NotFound_DoesNotExist(t *testing.T) {
 	var resErr *ResolutionError
 	require.ErrorAs(t, err, &resErr)
 	assert.Equal(t, "not-found", resErr.Reason)
+}
+
+type mockResolveTopicLookup struct {
+	liveByProject map[string]map[string]string // projectID -> topicID -> convID
+	lookupErr     error
+}
+
+func (m *mockResolveTopicLookup) GetTopicConversationIDInProject(_ context.Context, projectID, topicID string) (string, error) {
+	if m.lookupErr != nil {
+		return "", m.lookupErr
+	}
+	topics, ok := m.liveByProject[projectID]
+	if !ok {
+		return "", store.ErrNotFound
+	}
+	convID, ok := topics[topicID]
+	if !ok {
+		return "", store.ErrNotFound
+	}
+	return convID, nil
+}
+
+func (m *mockResolveTopicLookup) GetTopicConversationIDIncludingDeletedInProject(ctx context.Context, projectID, topicID string) (string, error) {
+	return m.GetTopicConversationIDInProject(ctx, projectID, topicID)
+}
+
+func TestResolve_ConvByID_TopicID_ResolvesLinkedConversation(t *testing.T) {
+	ms := newMockStore()
+	ctx := context.Background()
+	projectID := uuid.NewString()
+	senderID := uuid.NewString()
+	topicID := uuid.NewString()
+	convID := uuid.NewString()
+
+	extRef, err := ThreadConversationExternalRef(projectID, topicID)
+	require.NoError(t, err)
+	ms.addConversation(&store.Conversation{
+		ID:          convID,
+		ProjectID:   &projectID,
+		Kind:        "group",
+		Surface:     "native",
+		ExternalRef: extRef,
+		DisplayName: "design-topic",
+	})
+
+	tl := &mockResolveTopicLookup{
+		liveByProject: map[string]map[string]string{
+			projectID: {topicID: convID},
+		},
+	}
+
+	result, err := Resolve(ctx, ms, "conv:"+topicID, ResolveContext{
+		SenderPrincipalKind: "agent",
+		SenderPrincipalID:   senderID,
+		ProjectID:           projectID,
+	}, WithResolveTopicLookup(tl))
+	require.NoError(t, err)
+	assert.Equal(t, convID, result.ConversationID)
+	assert.False(t, result.Created)
+}
+
+func TestResolve_ConvByID_TopicID_EdgeCases(t *testing.T) {
+	ctx := context.Background()
+	projectA := uuid.NewString()
+	projectB := uuid.NewString()
+	senderID := uuid.NewString()
+
+	t.Run("foreign project topic returns not-found", func(t *testing.T) {
+		ms := newMockStore()
+		topicID := uuid.NewString()
+		convID := uuid.NewString()
+		ms.addConversation(&store.Conversation{
+			ID:        convID,
+			ProjectID: &projectB,
+			Kind:      "group",
+			Surface:   "native",
+		})
+		tl := &mockResolveTopicLookup{
+			liveByProject: map[string]map[string]string{
+				projectB: {topicID: convID},
+			},
+		}
+
+		_, err := Resolve(ctx, ms, "conv:"+topicID, ResolveContext{
+			SenderPrincipalKind: "agent",
+			SenderPrincipalID:   senderID,
+			ProjectID:           projectA,
+		}, WithResolveTopicLookup(tl))
+		require.Error(t, err)
+		var resErr *ResolutionError
+		require.ErrorAs(t, err, &resErr)
+		assert.Equal(t, "not-found", resErr.Reason)
+	})
+
+	t.Run("unlinked topic with empty conversation_id returns not-found", func(t *testing.T) {
+		ms := newMockStore()
+		topicID := uuid.NewString()
+		tl := &mockResolveTopicLookup{
+			liveByProject: map[string]map[string]string{
+				projectA: {topicID: ""},
+			},
+		}
+
+		_, err := Resolve(ctx, ms, "conv:"+topicID, ResolveContext{
+			SenderPrincipalKind: "agent",
+			SenderPrincipalID:   senderID,
+			ProjectID:           projectA,
+		}, WithResolveTopicLookup(tl))
+		require.Error(t, err)
+		var resErr *ResolutionError
+		require.ErrorAs(t, err, &resErr)
+		assert.Equal(t, "not-found", resErr.Reason)
+	})
+
+	t.Run("dangling linked conversation_id returns not-found with original ref", func(t *testing.T) {
+		ms := newMockStore()
+		topicID := uuid.NewString()
+		danglingConvID := uuid.NewString()
+		tl := &mockResolveTopicLookup{
+			liveByProject: map[string]map[string]string{
+				projectA: {topicID: danglingConvID},
+			},
+		}
+
+		_, err := Resolve(ctx, ms, "conv:"+topicID, ResolveContext{
+			SenderPrincipalKind: "agent",
+			SenderPrincipalID:   senderID,
+			ProjectID:           projectA,
+		}, WithResolveTopicLookup(tl))
+		require.Error(t, err)
+		var resErr *ResolutionError
+		require.ErrorAs(t, err, &resErr)
+		assert.Equal(t, "not-found", resErr.Reason)
+		assert.Equal(t, "conv:"+topicID, resErr.Ref)
+	})
+
+	t.Run("topic lookup infrastructure error is not collapsed to ResolutionError", func(t *testing.T) {
+		ms := newMockStore()
+		topicID := uuid.NewString()
+		tl := &mockResolveTopicLookup{
+			lookupErr: errors.New("db connection lost"),
+		}
+
+		_, err := Resolve(ctx, ms, "conv:"+topicID, ResolveContext{
+			SenderPrincipalKind: "agent",
+			SenderPrincipalID:   senderID,
+			ProjectID:           projectA,
+		}, WithResolveTopicLookup(tl))
+		require.Error(t, err)
+		var resErr *ResolutionError
+		assert.False(t, errors.As(err, &resErr), "infrastructure error must not be wrapped as ResolutionError")
+	})
 }
 
 // ---------------------------------------------------------------------------

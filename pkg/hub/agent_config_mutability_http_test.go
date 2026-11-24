@@ -535,7 +535,7 @@ func TestAgentConfigPatch_RemovedEnvKeysWarning(t *testing.T) {
 	})
 
 	resp, code, body := patchAgentBody(t, srv, agent.ID, map[string]interface{}{
-		"config": map[string]interface{}{"env": map[string]string{"KEEP": "1", "NEW": "4"}},
+		"config": map[string]interface{}{"env": map[string]interface{}{"KEEP": "1", "DROP_A": nil, "DROP_B": nil, "NEW": "4"}},
 	})
 	require.Equal(t, http.StatusOK, code, body)
 	require.Len(t, resp.Warnings, 1, "%v", resp.Warnings)
@@ -659,9 +659,8 @@ func TestAgentEditGoldens(t *testing.T) {
 			assert.Equal(t, "Asia/Tokyo", after.AppliedConfig.ExplicitTimezone)
 		}},
 		{name: "env", applied: []string{"config.env"}, check: func(t *testing.T, inline *api.ScionConfig) {
-			assert.Equal(t, map[string]string{"FOO": "bar", "NEW": "1"}, inline.Env)
+			assert.Equal(t, map[string]string{"NEW": "1"}, inline.Env)
 		}, agentCheck: func(t *testing.T, after *store.Agent) {
-			assert.Equal(t, "bar", after.AppliedConfig.Env["FOO"])
 			assert.Equal(t, "1", after.AppliedConfig.Env["NEW"])
 		}},
 		{name: "task", applied: []string{"config.task"}, check: func(t *testing.T, inline *api.ScionConfig) {
@@ -869,6 +868,9 @@ func TestAgentConfigPatch_NoWarningsForUnchangedValues(t *testing.T) {
 func TestAgentConfigPatch_RemovedEntriesWarnings(t *testing.T) {
 	disp := &inlineCaptureDispatcher{reincarnateTestDispatcher: newReincarnateTestDispatcher()}
 	srv, s, project, broker := setupReincarnateTestServer(t, disp)
+	// Host volumes in agent config are refused on a hosted hub
+	// (hostedguard); the warning behaviour is the workstation one.
+	srv.workstation = true
 	agent := newReincarnateTestAgent(t, s, project, broker, func(a *store.Agent) {
 		a.Phase = string(state.PhaseStopped)
 		a.AppliedConfig.InlineConfig = &api.ScionConfig{

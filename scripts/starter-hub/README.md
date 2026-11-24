@@ -12,6 +12,7 @@ secrets. For a simpler binary-based deployment, see the
 
 - Google Cloud SDK (`gcloud`) authenticated with a project
 - A registered domain with DNS delegated to Cloud DNS (see `gce-certs.sh`)
+- **Do not use `scion` as an SSH or OS Login username** on the Hub VM. On GCE, an SSH or OS Login user named `scion` collides with the `scion` hub service account and causes the Compute Engine guest agent to add `scion` to `google-sudoers` (passwordless root). `gce-demo-provision.sh` sets `block-project-ssh-keys=TRUE` on the VM, the SSH scripts refuse when the effective SSH user is `scion` (set `SSH_USER` to another username if your local user is `scion`), and `gce-demo-setup-repo.sh` refuses to proceed if `scion` is already in `google-sudoers`.
 
 ## Configuration
 
@@ -25,6 +26,7 @@ file paths from two primary variables:
 | `ENABLE_GKE` | `false` | Set to `true` to provision a GKE cluster, grant `container.admin`, configure credentials, and use Kubernetes as the default runtime. |
 | `REGION` | `us-central1` | GCP region for GKE and resource locations |
 | `ZONE` | `us-central1-a` | GCP zone for the GCE VM instance |
+| `SSH_USER` | *(local user)* | Optional SSH username for `gcloud compute ssh`/`scp`. Must not be `scion` (set this when running from a workstation or container whose local user is `scion`). |
 | `MACHINE_TYPE` | *(derived)* | Compute machine type to use (overrides `SIZE_CHOICE`) |
 | `CERT_EMAIL` | *(none, required)* | Contact address Let's Encrypt uses for certificate notices, for example `admin@example.com`. `gce-certs.sh` and `gce-demo-deploy.sh` stop with an error if it is empty (unless `SKIP_TLS=true`). |
 | `DNS_ZONE_DESCRIPTION` | `Scion Hub zone for <CERT_DOMAIN>` | Description `gce-certs.sh` sets on a new Cloud DNS zone |
@@ -103,6 +105,13 @@ so operator-managed sections (`server.plugins`, `server.message_broker`,
 `plugins`) survive; YAML comments are not preserved across the merge round-trip
 (key order is kept).
 
+`scion-hub.service` always runs as `User=scion` and must never run as root.
+`gce-start-hub.sh --full` installs `/usr/local/libexec/scion/scion-install-rebuild.sh`
+(root-owned, `0755`) and scopes `/etc/sudoers.d/scion-rebuild-server` to that
+helper plus `systemctl restart scion-hub`; the helper verifies that
+`/home/scion/scion/scion.rebuild` is a regular, non-symlink file owned by
+`scion` before installing it to `/usr/local/bin/scion`.
+
 Behind an upstream TLS terminator, skip the Caddy/TLS step (no Caddyfile, no
 Caddy install, no HTTPS health check) and give the terminator's `https://` URL;
 the script stops without it, because the Hub refuses an `http` base URL on a
@@ -120,6 +129,28 @@ To wipe the hub database on restart:
 
 ```bash
 ./scripts/starter-hub/gce-start-hub.sh --reset-db
+```
+
+## Installed File Ownership and Permissions
+
+`gce-start-hub.sh` installs system files with `install -o root -g root -m` so
+none of them are writable by the `scion` service user or the operator's login
+user:
+
+- `/usr/local/bin/scion`: `root:root`, mode `0755`
+- `/etc/systemd/system/scion-hub.service`: `root:root`, mode `0644`
+- `/etc/sudoers.d/scion-rebuild-server`: `root:root`, mode `0440`
+
+Before starting `scion-hub`, `gce-start-hub.sh` repairs any drifted ownership
+or mode on `/etc/systemd/system/scion-hub.service` in place, then runs
+`check-install-perms.sh` on the VM and refuses to continue if any of those
+files, any command or destination path in the sudoers rules
+(`/usr/bin/install`, `/usr/bin/systemctl`, `/usr/local/bin/scion`), or any of
+their parent directories up to `/` is not root-owned or is group- or
+world-writable. You can also run the check manually on the VM:
+
+```bash
+sudo bash /home/scion/scion/scripts/starter-hub/check-install-perms.sh --require-sudoers
 ```
 
 ## Certificate renewal
@@ -167,6 +198,8 @@ the telemetry service account.
 | `gce-demo-setup-repo.sh` | Clone the repo on the VM |
 | `gce-demo-telemetry-sa.sh` | Telemetry service account and key management |
 | `gce-start-hub.sh` | Build, deploy, and restart the hub service |
+| `scion-install-rebuild.sh` | Root-owned helper installed at `/usr/local/libexec/scion/scion-install-rebuild.sh` that validates `/home/scion/scion/scion.rebuild` is a regular, non-symlink file owned by `scion` before installing it to `/usr/local/bin/scion` |
+| `check-install-perms.sh` | Verify ownership and permissions of installed binary, systemd unit, sudoers drop-in, sudoers command and destination paths, and parent directories |
 | `gce-certs.sh` | Cloud DNS setup and Let's Encrypt wildcard certificates |
 | `gce-demo-cloud-init.yaml` | Cloud-init config installed on the VM at provision time |
 | `gce-setup-nats.sh` | *(Archived)* Standalone NATS server setup — superseded by in-process events |

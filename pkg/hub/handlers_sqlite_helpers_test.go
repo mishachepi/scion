@@ -2176,11 +2176,15 @@ func seedHumanMessage(t *testing.T, s store.Store, proj *store.Project, topicID,
 type spaceMembersStore struct {
 	store.Store
 	// fault gates every override below; nil means always active.
-	fault           *storeFaultSwitch
-	listAgentsCalls int
+	fault              *storeFaultSwitch
+	listAgentsCalls    int
+	getUserCalls       int
+	getUsersByIDsCalls int
+	lastProjectMembers []*store.ProjectMembership
 	// failListAgentsOnCall makes the Nth ListAgents call (1-based) fail.
 	failListAgentsOnCall int
 	failProjectMembers   bool
+	failGetUsersByIDs    bool
 	// onAgentPage, when set, runs after each successful ListAgents call with
 	// the 1-based call number and whether that page was the last one.
 	onAgentPage func(call int, last bool)
@@ -4561,6 +4565,7 @@ func setupScheduledEventTest(t *testing.T) (*Server, store.Store, string) {
 	}
 	require.NoError(t, s.CreateProject(ctx, project))
 	seedScheduleAuthorAgent(t, s, project.ID)
+	seedScheduleTargetAgents(t, s, project.ID)
 
 	return srv, s, project.ID
 }
@@ -4613,6 +4618,7 @@ func initScheduleTest(t *testing.T, srv *Server, s store.Store) (*Server, store.
 	}
 	require.NoError(t, s.CreateProject(ctx, project))
 	seedScheduleAuthorAgent(t, s, project.ID)
+	seedScheduleTargetAgents(t, s, project.ID)
 
 	return srv, s, project.ID
 }
@@ -4697,7 +4703,6 @@ func setupProjectSecretTest(t *testing.T) (*Server, string) {
 func setupBrokerSecretTest(t *testing.T) (*Server, string) {
 	t.Helper()
 	srv, s := testServer(t)
-	grantDevUserRuntimeBrokerAccess(t, s)
 	srv.SetSecretBackend(secret.NewLocalBackend(s, "test-hub-id", "test-secret"))
 	ctx := context.Background()
 
@@ -5764,7 +5769,28 @@ func (s *spaceMembersStore) ListProjectMembers(ctx context.Context, projectID st
 	if s.failProjectMembers && s.fault.Active() {
 		return nil, errors.New("injected list project members failure")
 	}
-	return s.Store.ListProjectMembers(ctx, projectID)
+	members, err := s.Store.ListProjectMembers(ctx, projectID)
+	if err == nil && s.fault.Active() {
+		s.lastProjectMembers = members
+	}
+	return members, err
+}
+
+func (s *spaceMembersStore) GetUser(ctx context.Context, id string) (*store.User, error) {
+	if s.fault.Active() && s.lastProjectMembers != nil {
+		s.getUserCalls++
+	}
+	return s.Store.GetUser(ctx, id)
+}
+
+func (s *spaceMembersStore) GetUsersByIDs(ctx context.Context, ids []string) (map[string]*store.User, error) {
+	if s.fault.Active() {
+		s.getUsersByIDsCalls++
+		if s.failGetUsersByIDs {
+			return nil, errors.New("injected get users by IDs failure")
+		}
+	}
+	return s.Store.GetUsersByIDs(ctx, ids)
 }
 
 func (p *readStateAtPublishSpy) PublishUserMessage(ctx context.Context, msg *store.Message, _ []AttachmentRef, _ []artifacts.MessageRef, _ ...ChatEventOption) {
@@ -6216,6 +6242,24 @@ func seedScheduleAuthorAgent(t *testing.T, s store.Store, projectID string) {
 		Phase:         "running",
 		AppliedConfig: &store.AgentAppliedConfig{AgentRole: string(AgentRoleFull)},
 	}))
+}
+
+// seedScheduleTargetAgents creates the conventional target agents referenced by
+// schedule and scheduled-event handler tests so strict message target
+// resolution (ptone/scion#8588) resolves them cleanly.
+func seedScheduleTargetAgents(t *testing.T, s store.Store, projectID string) {
+	t.Helper()
+	ctx := context.Background()
+	for _, slug := range []string{"all", "worker", "worker-1", "test-agent", "some-agent"} {
+		require.NoError(t, s.CreateAgent(ctx, &store.Agent{
+			ID:          tid("sched-target-" + projectID + "-" + slug),
+			Slug:        slug,
+			Name:        slug,
+			ProjectID:   projectID,
+			Phase:       "running",
+			MessageMode: store.MessageModeProject,
+		}))
+	}
 }
 
 func (f *federatedTestIdentity) ID() string          { return f.id }

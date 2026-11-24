@@ -44,6 +44,8 @@ type Tx struct {
 	AgentServiceAccountAssignment *AgentServiceAccountAssignmentClient
 	// AgentSessionMetrics is the client for interacting with the AgentSessionMetrics builders.
 	AgentSessionMetrics *AgentSessionMetricsClient
+	// AgentSuspendScreen is the client for interacting with the AgentSuspendScreen builders.
+	AgentSuspendScreen *AgentSuspendScreenClient
 	// AllowListEntry is the client for interacting with the AllowListEntry builders.
 	AllowListEntry *AllowListEntryClient
 	// ApiKey is the client for interacting with the ApiKey builders.
@@ -90,6 +92,8 @@ type Tx struct {
 	EntitlementBinding *EntitlementBindingClient
 	// EnvVar is the client for interacting with the EnvVar builders.
 	EnvVar *EnvVarClient
+	// ExecRunOutput is the client for interacting with the ExecRunOutput builders.
+	ExecRunOutput *ExecRunOutputClient
 	// ExternalIdentity is the client for interacting with the ExternalIdentity builders.
 	ExternalIdentity *ExternalIdentityClient
 	// GCPServiceAccount is the client for interacting with the GCPServiceAccount builders.
@@ -184,6 +188,8 @@ type Tx struct {
 	ScheduledExecRun *ScheduledExecRunClient
 	// Secret is the client for interacting with the Secret builders.
 	Secret *SecretClient
+	// SecretRequest is the client for interacting with the SecretRequest builders.
+	SecretRequest *SecretRequestClient
 	// Skill is the client for interacting with the Skill builders.
 	Skill *SkillClient
 	// SkillInjection is the client for interacting with the SkillInjection builders.
@@ -214,6 +220,8 @@ type Tx struct {
 	TriggerEvent *TriggerEventClient
 	// TriggerFire is the client for interacting with the TriggerFire builders.
 	TriggerFire *TriggerFireClient
+	// TriggerSubjectClaim is the client for interacting with the TriggerSubjectClaim builders.
+	TriggerSubjectClaim *TriggerSubjectClaimClient
 	// UsageReservation is the client for interacting with the UsageReservation builders.
 	UsageReservation *UsageReservationClient
 	// User is the client for interacting with the User builders.
@@ -224,6 +232,8 @@ type Tx struct {
 	UserDeletion *UserDeletionClient
 	// UserDeletionAgent is the client for interacting with the UserDeletionAgent builders.
 	UserDeletionAgent *UserDeletionAgentClient
+	// UserExecContainer is the client for interacting with the UserExecContainer builders.
+	UserExecContainer *UserExecContainerClient
 	// UserTerminalWorkspace is the client for interacting with the UserTerminalWorkspace builders.
 	UserTerminalWorkspace *UserTerminalWorkspaceClient
 	// WebhookEndpoint is the client for interacting with the WebhookEndpoint builders.
@@ -375,6 +385,7 @@ func (tx *Tx) init() {
 	tx.AgentReincarnation = NewAgentReincarnationClient(tx.config)
 	tx.AgentServiceAccountAssignment = NewAgentServiceAccountAssignmentClient(tx.config)
 	tx.AgentSessionMetrics = NewAgentSessionMetricsClient(tx.config)
+	tx.AgentSuspendScreen = NewAgentSuspendScreenClient(tx.config)
 	tx.AllowListEntry = NewAllowListEntryClient(tx.config)
 	tx.ApiKey = NewApiKeyClient(tx.config)
 	tx.BrokerDispatch = NewBrokerDispatchClient(tx.config)
@@ -398,6 +409,7 @@ func (tx *Tx) init() {
 	tx.DurableQueueItem = NewDurableQueueItemClient(tx.config)
 	tx.EntitlementBinding = NewEntitlementBindingClient(tx.config)
 	tx.EnvVar = NewEnvVarClient(tx.config)
+	tx.ExecRunOutput = NewExecRunOutputClient(tx.config)
 	tx.ExternalIdentity = NewExternalIdentityClient(tx.config)
 	tx.GCPServiceAccount = NewGCPServiceAccountClient(tx.config)
 	tx.GitHubResolutionCache = NewGitHubResolutionCacheClient(tx.config)
@@ -445,6 +457,7 @@ func (tx *Tx) init() {
 	tx.ScheduledExecPollCursor = NewScheduledExecPollCursorClient(tx.config)
 	tx.ScheduledExecRun = NewScheduledExecRunClient(tx.config)
 	tx.Secret = NewSecretClient(tx.config)
+	tx.SecretRequest = NewSecretRequestClient(tx.config)
 	tx.Skill = NewSkillClient(tx.config)
 	tx.SkillInjection = NewSkillInjectionClient(tx.config)
 	tx.SkillRegistry = NewSkillRegistryClient(tx.config)
@@ -460,11 +473,13 @@ func (tx *Tx) init() {
 	tx.Trigger = NewTriggerClient(tx.config)
 	tx.TriggerEvent = NewTriggerEventClient(tx.config)
 	tx.TriggerFire = NewTriggerFireClient(tx.config)
+	tx.TriggerSubjectClaim = NewTriggerSubjectClaimClient(tx.config)
 	tx.UsageReservation = NewUsageReservationClient(tx.config)
 	tx.User = NewUserClient(tx.config)
 	tx.UserAccessToken = NewUserAccessTokenClient(tx.config)
 	tx.UserDeletion = NewUserDeletionClient(tx.config)
 	tx.UserDeletionAgent = NewUserDeletionAgentClient(tx.config)
+	tx.UserExecContainer = NewUserExecContainerClient(tx.config)
 	tx.UserTerminalWorkspace = NewUserTerminalWorkspaceClient(tx.config)
 	tx.WebhookEndpoint = NewWebhookEndpointClient(tx.config)
 }

@@ -2,7 +2,7 @@
 
 *Generated from Go-native OperationSpec definitions. Do not edit manually.*
 
-**Operations:** 424
+**Operations:** 435
 
 ## Table of Contents
 
@@ -11,6 +11,7 @@
 - [agent.lifecycle.control](#agentlifecyclecontrol) — Start, stop, suspend or restart an agent
 - [agent.lifecycle.restore](#agentlifecyclerestore) — Restore a soft-deleted agent
 - [agent.lifecycle.exec](#agentlifecycleexec) — Run a command in an agent's container
+- [agent.screen.read](#agentscreenread) — Read the terminal screen saved before an agent's most recent suspend
 - [agent.lifecycle.env](#agentlifecycleenv) — Submit environment values to an agent
 - [agent.lifecycle.resetauth](#agentlifecycleresetauth) — Reset an agent's harness authentication
 - [agent.hold.lift](#agentholdlift) — Lift the holds of a suspended agent whose owners are admitted to its project again (hub admin)
@@ -36,7 +37,7 @@
 - [agent.token.refresh](#agenttokenrefresh) — Refresh the calling agent's own hub token
 - [agent.outbound.message](#agentoutboundmessage) — Deliver an outbound message from the calling agent
 - [agent.metrics.report](#agentmetricsreport) — Report runtime metrics for the calling agent
-- [agent.secrets.access](#agentsecretsaccess) — List, read and write the secrets available to the calling agent: its project's and its creating user's. A user-scope write is held as a pending secret for the owner's approval (secret.user.pending.*)
+- [agent.secrets.access](#agentsecretsaccess) — List, read, write and delete the secrets available to the calling agent: its own agent-scoped secrets, its project's and its creating user's. A user-scope write is held as a pending secret for the owner's approval (secret.user.pending.*)
 - [agent.stopall](#agentstopall) — Stop all running agents on the hub
 - [agent.stopall.project](#agentstopallproject) — Stop all running agents in a project
 - [project.membership.add](#projectmembershipadd) — Add a member to a project with a specified role
@@ -77,11 +78,12 @@
 - [webhookendpoint.delete](#webhookendpointdelete) — Delete a webhook endpoint, removing its hub-scoped internal signing secret rows and pausing dependent triggers with status_reason=source_deleted. An agent caller targeting another principal's endpoint receives the same 404 as not-found
 - [trigger.list](#triggerlist) — List triggers or trigger events in a project. Agent callers see only triggers they hold and events received on endpoints they own or fired by triggers they hold (scope=caller)
 - [trigger.read](#triggerread) — Read a trigger definition, a trigger's fire history, or a trigger event in a project. An agent caller reading an event it neither received on its own endpoint nor fired through a trigger it holds receives the same 404 as not-found
-- [trigger.create](#triggercreate) — Create an event trigger in a project. Webhook triggers resolve source.id through webhookEndpointAccessDecision(read); GitHub triggers (source.kind=github, source.id="") require hub.github_triggers and an authorized GitHub App association on the project; both pass the action's target checks
-- [trigger.update](#triggerupdate) — Update or resume a trigger in a project. Agents cannot PATCH triggers; resume and dispatch-affecting updates re-validate the source (webhook endpoint read access or authorized GitHub App association) and action target and record the caller's attribution and frozen ceiling
+- [trigger.render](#triggerrender) — Dry-run compile and render a trigger's template slots against a stored trigger event without firing or exercising recorded authority. Requires trigger.read on the trigger and read visibility on the event (agents without visibility on the event receive 404)
+- [trigger.create](#triggercreate) — Create an event trigger in a project. Webhook triggers resolve source.id through webhookEndpointAccessDecision(read); GitHub triggers (source.kind=github, source.id="") require hub.github_triggers and an authorized GitHub App association on the project; a github.comment action or a dispatch_agent action with ackComment requires github_trigger.comment (users only in Stage 3; agents cannot author github.comment triggers or ackComment because github_trigger.comment has no agent scope); all actions pass their target checks
+- [trigger.update](#triggerupdate) — Update or resume a trigger in a project. Agents cannot PATCH triggers; resume and dispatch-affecting updates re-validate the source (webhook endpoint read access or authorized GitHub App association) and action target (a github.comment action or a dispatch_agent action with ackComment requires github_trigger.comment, users only in Stage 3) and record the caller's attribution and frozen ceiling
 - [trigger.pause](#triggerpause) — Pause an event trigger. Pausing only stops future fires, so a user access token with trigger:update is admitted
 - [trigger.delete](#triggerdelete) — Delete an event trigger in a project
-- [trigger.fire](#triggerfire) — Fire a matched event trigger's message action through the shared fire core under the authority recorded by the trigger's current revision
+- [trigger.fire](#triggerfire) — Fire a matched event trigger's message, dispatch_agent, or github.comment action through the shared fire core under the authority recorded by the trigger's current revision; a dispatch_agent fire re-checks agent.create, CanDelegate, the frozen ceiling and standing, and creates the agent under the recorded principal
 - [artifact.read](#artifactread) — Read an artifact's metadata or file bytes, one by one or as a zip of a version (owner, home-project readers via the scope grant, or principal grants); unreadable artifacts answer 404
 - [artifact.list](#artifactlist) — List the artifacts the caller owns, holds a grant on, or that are shared to a project it is a member of (?mine=1); each row passes the artifact.read check, so an artifact the caller cannot read is omitted, never denied
 - [artifact.create](#artifactcreate) — Create an artifact homed in a project (the caller's own, or ?scope=): a single file published at once (?name=), or a manifest that starts a pending first version (JSON body), whose files are then uploaded and finalized through the artifact.version.upload and artifact.version.finalize routes
@@ -96,6 +98,8 @@
 - [artifact.delete](#artifactdelete) — Delete an artifact with its grants and share links (its files are removed after the hub's grace period); allowed for its managers (the owner or an admin grantee), on an artifact owned by an agent for its stewards (an owner of its home project, or the agent's delegating user who reads there), and, as custodian, for an admin of its home project (project.manage there), each a user whose credential permits artifact.manage in the home project
 - [artifact.version.create](#artifactversioncreate) — Start a pending version of an artifact from a manifest; a review grantee may start review versions only
 - [artifact.review.session.write](#artifactreviewsessionwrite) — Record or end the caller's own review session of an artifact (the heartbeat of a review tab, ptone/scion#6849); 404 while the hub.artifacts_open_review_check experiment is off; any caller who may start a review version passes (the write check of artifact.version.create); rate limited per principal after authorization; the row is always the caller's own; a DELETE that deletes the caller's session row writes a review_session_ended decision-log entry; the Hub keeps the row until the reaper deletes it, at least an hour after its last beat, so this includes a session that no longer counts as open; a DELETE when no such row exists writes none (both answer 204)
+- [artifact.review.draft.read](#artifactreviewdraftread) — Read the caller's own saved draft review of an artifact (200 with draft null when none exists, plus currentSeq; ptone/scion#7116, ptone/scion#8470); 404 while the hub.artifacts_review_drafts experiment is off; requires review access (the readableArtifact and canWriteErr checks of artifact.version.create); the row is always keyed by the caller's own principal with no administrator, steward, owner or publisher override
+- [artifact.review.draft.write](#artifactreviewdraftwrite) — Create, replace or delete the caller's own saved draft review of an artifact with optimistic rev concurrency (ptone/scion#7116, ptone/scion#8470); 404 while the hub.artifacts_review_drafts experiment is off; requires review access (the readableArtifact and canWriteErr checks of artifact.version.create); rate limited per principal (LimitDraftWrite) after authorization and before reading the request body; the row is always keyed by the caller's own principal with no override; a DELETE that deletes the caller's draft row writes a review_draft_deleted decision-log entry without content, while a DELETE when no draft exists writes none (both answer 204); draft saves never trigger review notifications
 - [artifact.version.upload](#artifactversionupload) — Upload one manifest file of a pending version; only the principal that started the version may upload to it
 - [artifact.version.finalize](#artifactversionfinalize) — Finalize a pending version once every file has arrived, making it ready (and current unless a later one is); only the principal that started it may finalize it, and a review is checked against its base
 - [artifact.version.view](#artifactversionview) — Get a view URL for a ready version whose entry is HTML: a capability, valid for a limited time, that serves only that version's files under /api/v1/artifacts/view/ in the sandboxed viewer (see the view exemption); the caller needs only the read check
@@ -137,6 +141,7 @@
 - [project.triggersources.github.read](#projecttriggersourcesgithubread) — Read a project's GitHub trigger source settings, readiness, and repository routing status
 - [project.triggersources.github.update](#projecttriggersourcesgithubupdate) — Update a project's GitHub trigger source unmatched-command reply settings
 - [agent.message.send](#agentmessagesend) — Send a message to an agent
+- [inbox.summary.read](#inboxsummaryread) — Read the caller's aggregated inbox summary across categories (approvals, waiting agents, artifact reviews, chat, decisions). Interactive web sessions and dev credentials receive the full view; user access tokens with inbox:read receive the token view (approvals marked unavailable, excluded from total). Agents, visitors, federated users, and UATs without inbox:read get 403; unsupported methods get 405; 404 while web.inbox_dashboard is off
 - [inbox.message.read](#inboxmessageread) — List and read the caller's own inbox messages. A project token lists only messages of its boundary project
 - [inbox.message.write](#inboxmessagewrite) — Mark the caller's own inbox messages read. Mark-all by a project token touches only messages of its boundary project
 - [inbox.channels.list](#inboxchannelslist) — List the registered message channels: static capability metadata with no records
@@ -219,9 +224,12 @@
 - [chat.attachment.download.project](#chatattachmentdownloadproject) — Download a chat attachment of a project. Needs project:read on the project; a session also reads its own uploads and files attached to messages it can read
 - [chat.conversation.promote](#chatconversationpromote) — Promote one of the caller's DMs with an agent into a thread of the agent's space. Needs DM participation, project:read on the agent's project, and the create_thread action of chat-space-access (project.chat_post; 403 chat_post_denied without it); a token also needs inbox:write under the DM rule, and project.chat_post is checked on its holder's account (the project:chat_post selector is not needed)
 - [chat.decision.read](#chatdecisionread) — Read one version of a decision prompt decision. Needs read access to the prompt's conversation (stored chat_key, falling back to messages.thread_id: project:read for a thread; the caller in a user slot of a DM key), surviving chat retention purge of the prompt message. Agents, visitors and tokens get 403; a missing or unreadable decision is 404. 404 while web.decisions is off
-- [chat.decision.answer](#chatdecisionanswer) — Answer a decision prompt decision by choice id (the label is copied from the stored row) with optional surface (native or decisions_page). Needs the right to send in the prompt's conversation (stored chat_key, falling back to messages.thread_id: project:read and project.chat_post for a thread; for a DM, only the user in its key), surviving chat retention purge of the prompt message. Agents, visitors and tokens get 403, and so does a user other than the one an agent-interpreted answer records, or a user the asking agent takes no messages from (MESSAGE_DENIED, the chat send's check; a confirm is not delivered, so it is not checked). A replaced version or an answered one is 409, as is an idempotency key reused for another answer; the first answer wins. Records the answer and a decision-response message, delivers it to the asking agent and publishes decision.updated. 404 while web.decisions is off
-- [chat.decisionprompt.answer](#chatdecisionpromptanswer) — Answer every actionable decision of a decision prompt with two or more decisions as one set, by choice id (labels are copied from the stored rows) with optional surface (native or decisions_page). Needs the right to send in the prompt's conversation (stored chat_key, falling back to messages.thread_id: project:read and project.chat_post for a thread; for a DM, only the user in its key), surviving chat retention purge of the prompt message. Agents and visitors get 403, tokens and other non-session credentials the session-only 403, and a user the asking agent takes no messages from 403 MESSAGE_DENIED (an all-confirm set is not delivered, so it is not checked). A missing or unreadable prompt is 404; a malformed set is 400; a set that does not equal the actionable set is 409 answer_set_changed with fresh views and a reason per row, and stores nothing; an idempotency key reused for other answers is 422. Records one answer per row with a shared batch id and one decision-response message in one transaction, delivers it to the asking agent and publishes decision.updated per row. 404 while web.decisions is off
-- [chat.decisionprompt.dismiss](#chatdecisionpromptdismiss) — Dismiss open decisions of a decision prompt without answering, once the version is at least 5 minutes old, with an optional plain-text reason (up to 500 characters) and surface (native or decisions_page). Needs the right to send in the prompt's conversation (stored chat_key, falling back to messages.thread_id: project:read and project.chat_post for a thread; for a DM, only the user in its key; a UAT also needs inbox:write and the prompt's project inside its boundary), surviving chat retention purge of the prompt message. Agents get 403 users_only, visitors and non-session/non-UAT credentials get 403, and a user a live asking agent takes no messages from gets 403 MESSAGE_DENIED. A missing or unreadable prompt is 404; a too-recent version is 409 too_recent with details.availableAt; an already-settled prompt is 409 dismiss_changed (with details.availableAt when a listed row is too recent). Records one outcome=dismiss ($dismissed) answer row per dismissed decision with a shared batch id and one decision-response message in one transaction, delivers it to a live asking agent, and reports deliveryStatus: delivered, held (for the agent's next session), gone (stored without failure, not sent), unreachable (a suspended or stopped asker: stored failed, not sent), failed, or none when nothing new was dismissed; and publishes decision.updated per row. 404 while web.decisions is off
+- [chat.decision.answer](#chatdecisionanswer) — Answer a decision prompt decision by choice id (the label is copied from the stored row) with optional surface (native, decisions_page or inbox). Needs the right to send in the prompt's conversation (stored chat_key, falling back to messages.thread_id: project:read and project.chat_post for a thread; for a DM, only the user in its key), surviving chat retention purge of the prompt message. Agents, visitors and tokens get 403, and so does a user other than the one an agent-interpreted answer records, or a user the asking agent takes no messages from (MESSAGE_DENIED, the chat send's check; a confirm is not delivered, so it is not checked). A replaced version or an answered one is 409, as is an idempotency key reused for another answer; the first answer wins. Records the answer and a decision-response message, delivers it to the asking agent and publishes decision.updated. 404 while web.decisions is off
+- [chat.decisionprompt.answer](#chatdecisionpromptanswer) — Answer every actionable decision of a decision prompt with two or more decisions as one set, by choice id (labels are copied from the stored rows) with optional surface (native, decisions_page or inbox). Needs the right to send in the prompt's conversation (stored chat_key, falling back to messages.thread_id: project:read and project.chat_post for a thread; for a DM, only the user in its key), surviving chat retention purge of the prompt message. Agents and visitors get 403, tokens and other non-session credentials the session-only 403, and a user the asking agent takes no messages from 403 MESSAGE_DENIED (an all-confirm set is not delivered, so it is not checked). A missing or unreadable prompt is 404; a malformed set is 400; a set that does not equal the actionable set is 409 answer_set_changed with fresh views and a reason per row, and stores nothing; an idempotency key reused for other answers is 422. Records one answer per row with a shared batch id and one decision-response message in one transaction, delivers it to the asking agent and publishes decision.updated per row. 404 while web.decisions is off
+- [chat.secretrequest.read](#chatsecretrequestread) — Read a secret-request card (metadata and per-key status, never secret values) plus canRespond and reason. Requires a signed-in user session, recipient membership on the prompt's conversation, and agent.read on the requesting agent. 404 while hub.agent_secrets is off
+- [chat.secretrequest.fulfill](#chatsecretrequestfulfill) — Fulfill all pending keys of a secret-request card, storing each value at agent scope in the secret backend, notifying the requesting agent via a secret-response message, and emitting fulfilled audit events (never values). Requires a signed-in user session, same-origin browser check, recipient membership, and agent.attach on the requesting agent. 404 while hub.agent_secrets is off
+- [chat.secretrequest.dismiss](#chatsecretrequestdismiss) — Dismiss all or a subset of pending keys on a secret-request card with an optional reason, notifying the requesting agent via a secret-response message and emitting dismissed audit events. Requires a signed-in user session, same-origin browser check, recipient membership, and agent.attach on the requesting agent. 404 while hub.agent_secrets is off
+- [chat.decisionprompt.dismiss](#chatdecisionpromptdismiss) — Dismiss open decisions of a decision prompt without answering, once the version is at least 5 minutes old, with an optional plain-text reason (up to 500 characters) and surface (native, decisions_page or inbox). Needs the right to send in the prompt's conversation (stored chat_key, falling back to messages.thread_id: project:read and project.chat_post for a thread; for a DM, only the user in its key; a UAT also needs inbox:write and the prompt's project inside its boundary), surviving chat retention purge of the prompt message. Agents get 403 users_only, visitors and non-session/non-UAT credentials get 403, and a user a live asking agent takes no messages from gets 403 MESSAGE_DENIED. A missing or unreadable prompt is 404; a too-recent version is 409 too_recent with details.availableAt; an already-settled prompt is 409 dismiss_changed (with details.availableAt when a listed row is too recent). Records one outcome=dismiss ($dismissed) answer row per dismissed decision with a shared batch id and one decision-response message in one transaction, delivers it to a live asking agent, and reports deliveryStatus: delivered, held (for the agent's next session), gone (stored without failure, not sent), unreachable (a suspended or stopped asker: stored failed, not sent), failed, or none when nothing new was dismissed; and publishes decision.updated per row. 404 while web.decisions is off
 - [chat.projectdecisions.list](#chatprojectdecisionslist) — List pending decision prompts or the append-only recorded answer log for a project, with live waitingOnYou and waitingOnOthers counts and filter facets. Needs project:read on the project, then scopes every prompt, log entry, count, and facet to conversations the caller can read (project topics plus the caller's own canonical DMs with project agents; a UAT token includes DMs only with inbox:read). Agents, visitors and non-session/non-UAT credentials get 403; unsupported methods get 405; 404 while web.decisions is off
 - [chat.userdecisions.list](#chatuserdecisionslist) — List pending decision prompts or recorded decision answers across every project the caller is a member of and can read, with live waitingOnYou and waitingOnOthers counts, sort=project|recent, optional project narrowing, and filter facets (capped at 200 readable member projects with truncatedProjects). Filters candidate member projects by project:read (a project-bounded UAT sees only its boundary project; a UAT without project:read gets 200 with empty results), then scopes every prompt, log entry, group, count, and facet to conversations the caller can read (project topics plus the caller's own canonical DMs with project agents; a UAT includes DMs only with inbox:read). Non-member projects and project-visitor bindings are excluded even for hub admins. Agents, visitors and non-session/non-UAT credentials get 403; unsupported methods get 405; 404 while web.decisions is off
 - [role.definition.create](#roledefinitioncreate) — Create a custom role definition (create, import, duplicate). A token needs role:create and role:read on a hub boundary and the holder's live role.create authority; the holder must hold every permission of the role within the token's selectors. A project-scoped definition can be bound in every project, so it is judged on the holder's system-scope authority; a system-scoped definition is refused to every token
@@ -263,6 +271,7 @@
 - [user.session.logout](#usersessionlogout) — Sign-in flow logout step; the hub holds no server-side session state for it to change
 - [user.session.revoke](#usersessionrevoke) — Revoke every cookie session of a user (platform admin only)
 - [user.terminalworkspace](#userterminalworkspace) — Read or replace the caller's own terminal workspace
+- [user.execcontainer](#userexeccontainer) — Read, set, or clear the caller's own execution container registration
 - [user.skillinjection.update](#userskillinjectionupdate) — Add, replace or remove the skills injected into the caller's own agents. A user access token needs user_skill_injection:update on a hub boundary
 - [user.skillinjection.read](#userskillinjectionread) — List the skills injected into the caller's own agents. Any token of the holder reads its own entries; the entries belong to no project
 - [template.user.read](#templateuserread) — List, read or download the caller's own user-scope templates. A user access token needs template:read on a hub boundary
@@ -395,6 +404,8 @@
 - [gcp.identity.mint](#gcpidentitymint) — Mint a GCP access or identity token for the agent's assigned service account
 - [secret.read](#secretread) — Read project or broker secrets (scope=project or runtime_broker). User and hub scope are the session-only operations secret.user.read and secret.hub.read
 - [secret.write](#secretwrite) — Create, update or delete project or broker secrets (scope=project or runtime_broker). User and hub scope are the session-only operations secret.user.write and secret.hub.write
+- [agent.secret.read](#agentsecretread) — Read agent-scoped secret metadata (scope=agent&scopeId=<agentID>). Values are never readable by humans; gated on hub.agent_secrets.
+- [agent.secret.write](#agentsecretwrite) — Create, update or delete agent-scoped secrets (scope=agent&scopeId=<agentID>). Values are write-only for humans; gated on hub.agent_secrets.
 - [gcp.identity.read](#gcpidentityread) — Read GCP service account details or list accounts. A project's list requires project.read on it (members, and agents of that project only); the hub-scoped list requires gcp_service_account.list at hub scope (hub members)
 - [gcp.identity.verify](#gcpidentityverify) — Verify a GCP service account's IAM configuration
 - [env.read](#envread) — Read project or broker environment variables (scope=project or runtime_broker). User and hub scope are the session-only operations env.user.read, env.hub.read and env.hub.list
@@ -617,6 +628,39 @@
 **Resource Resolver:** agent-from-url
 
 **Effects:** `update-resource`
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub:TestAgentSubRoute_CatalogDrift`
+
+---
+
+## agent.screen.read
+
+**Domain:** agent
+
+**Description:** Read the terminal screen saved before an agent's most recent suspend
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | GET | `/api/v1/agents/{id}/screen` |
+| http_route | GET | `/api/v1/projects/{projectId}/agents/{id}/screen` |
+
+**Principals:** `user`, `agent`
+
+**Credentials:** `session_jwt`, `scoped_uat`, `agent_jwt`
+
+**Bearer:** `admit` (target `agent_record`; boundaries `project`, `hub`)
+
+**Base Permission:** `agent.attach`
+
+**Resource Resolver:** agent-from-url
+
+**Effects:** `read-one`
 
 **Denial Codes:** `forbidden`
 
@@ -1519,7 +1563,7 @@
 
 **Domain:** agent
 
-**Description:** List, read and write the secrets available to the calling agent: its project's and its creating user's. A user-scope write is held as a pending secret for the owner's approval (secret.user.pending.*)
+**Description:** List, read, write and delete the secrets available to the calling agent: its own agent-scoped secrets, its project's and its creating user's. A user-scope write is held as a pending secret for the owner's approval (secret.user.pending.*)
 
 ### Entry Points
 
@@ -1528,6 +1572,7 @@
 | http_route | GET | `/api/v1/agents/{id}/secrets` |
 | http_route | GET | `/api/v1/agents/{id}/secrets/{key}` |
 | http_route | PUT | `/api/v1/agents/{id}/secrets/{key}` |
+| http_route | DELETE | `/api/v1/agents/{id}/secrets/{key}` |
 
 **Principals:** `agent`
 
@@ -1537,7 +1582,7 @@
 
 **Resource Resolver:** agent-self
 
-**Effects:** `read-secret`, `update-resource`
+**Effects:** `read-secret`, `update-resource`, `delete-resource`
 
 ### Audit
 
@@ -2905,6 +2950,7 @@
 | Kind | Method | Pattern |
 |------|--------|---------|
 | http_route | GET | `/api/v1/projects/{projectId}/scheduled-events/{id}` |
+| http_route | GET | `/api/v1/projects/{projectId}/scheduled-events/{id}/output` |
 | http_route | GET | `/api/v1/projects/{projectId}/schedules/{id}` |
 | http_route | GET | `/api/v1/projects/{projectId}/schedules/{id}/history` |
 
@@ -3361,11 +3407,44 @@
 
 ---
 
+## trigger.render
+
+**Domain:** trigger
+
+**Description:** Dry-run compile and render a trigger's template slots against a stored trigger event without firing or exercising recorded authority. Requires trigger.read on the trigger and read visibility on the event (agents without visibility on the event receive 404)
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | POST | `/api/v1/projects/{projectId}/triggers/{id}/render` |
+
+**Principals:** `user`, `agent`
+
+**Credentials:** `session_jwt`, `scoped_uat`, `agent_jwt`
+
+**Bearer:** `admit` (target `project_path`; boundaries `project`, `hub`)
+
+**Base Permission:** `trigger.read`
+
+**Resource Resolver:** project-from-url
+
+**Effects:** `read-one`
+
+**Denial Codes:** `forbidden`, `not_found`
+
+### Tests
+
+- `pkg/hub:TestTriggerRender`
+- `pkg/hub:TestBearerDispositionMatrix_CatalogEntryPoints`
+
+---
+
 ## trigger.create
 
 **Domain:** trigger
 
-**Description:** Create an event trigger in a project. Webhook triggers resolve source.id through webhookEndpointAccessDecision(read); GitHub triggers (source.kind=github, source.id="") require hub.github_triggers and an authorized GitHub App association on the project; both pass the action's target checks
+**Description:** Create an event trigger in a project. Webhook triggers resolve source.id through webhookEndpointAccessDecision(read); GitHub triggers (source.kind=github, source.id="") require hub.github_triggers and an authorized GitHub App association on the project; a github.comment action or a dispatch_agent action with ackComment requires github_trigger.comment (users only in Stage 3; agents cannot author github.comment triggers or ackComment because github_trigger.comment has no agent scope); all actions pass their target checks
 
 ### Entry Points
 
@@ -3388,7 +3467,7 @@
 ### Delegation
 
 - **Kind:** `non_amplification`
-- Authoring a trigger records the author's initiator attribution and frozen effect ceiling (triggerRevisionAuthorityCeiling) on the trigger row. In Stage 1 only the message action is supported, which grants no authority; fire-time delivery remains bounded by the recorded principal's current authority and frozen ceiling
+- Authoring a trigger records the author's initiator attribution and frozen effect ceiling (triggerRevisionAuthorityCeiling) on the trigger row. A message trigger grants no authority; a dispatch_agent trigger requires agent.create and CanDelegate within the caller's role ceiling and creates agents bounded by the recorded principal's current authority and frozen ceiling; a github.comment action or a dispatch_agent action with ackComment requires github_trigger.comment (users only in Stage 3; agents are refused because github_trigger.comment has no agent scope)
 
 **Denial Codes:** `forbidden`, `not_found`
 
@@ -3403,7 +3482,7 @@
 
 **Domain:** trigger
 
-**Description:** Update or resume a trigger in a project. Agents cannot PATCH triggers; resume and dispatch-affecting updates re-validate the source (webhook endpoint read access or authorized GitHub App association) and action target and record the caller's attribution and frozen ceiling
+**Description:** Update or resume a trigger in a project. Agents cannot PATCH triggers; resume and dispatch-affecting updates re-validate the source (webhook endpoint read access or authorized GitHub App association) and action target (a github.comment action or a dispatch_agent action with ackComment requires github_trigger.comment, users only in Stage 3) and record the caller's attribution and frozen ceiling
 
 ### Entry Points
 
@@ -3427,7 +3506,7 @@
 ### Delegation
 
 - **Kind:** `non_amplification`
-- A resume, and an update that changes the source, match rules, action, subject rules or status, records the caller's initiator attribution and frozen effect ceiling (triggerRevisionAuthorityCeiling) in place of the stored ones; a metadata-only update changes neither. In Stage 1 only the message action is supported, which grants no authority
+- A resume, and an update that changes the source, match rules, action, subject rules or status, records the caller's initiator attribution and frozen effect ceiling (triggerRevisionAuthorityCeiling) in place of the stored ones; a metadata-only update changes neither. A message trigger grants no authority; a dispatch_agent trigger requires agent.create and CanDelegate within the caller's role ceiling; a github.comment action or a dispatch_agent action with ackComment requires github_trigger.comment (users only in Stage 3; agents have no github_trigger.comment scope)
 
 **Denial Codes:** `forbidden`, `not_found`
 
@@ -3522,13 +3601,16 @@
 
 **Domain:** trigger
 
-**Description:** Fire a matched event trigger's message action through the shared fire core under the authority recorded by the trigger's current revision
+**Description:** Fire a matched event trigger's message, dispatch_agent, or github.comment action through the shared fire core under the authority recorded by the trigger's current revision; a dispatch_agent fire re-checks agent.create, CanDelegate, the frozen ceiling and standing, and creates the agent under the recorded principal
 
 ### Entry Points
 
 | Kind | Method | Pattern |
 |------|--------|---------|
 | scheduler_job | — | `triggerDrainer:message` |
+| scheduler_job | — | `triggerDrainer:dispatch_agent` |
+| scheduler_job | — | `triggerDrainer:exec` |
+| scheduler_job | — | `triggerDrainer:github.comment` |
 
 **Principals:** `system`
 
@@ -3546,6 +3628,8 @@
 
 - `pkg/hub:TestTriggerDispatchE2E_RevokedAuthorityRecordsRefusedFire`
 - `pkg/hub:TestScheduledFire_UsesRecordedTokenCeiling`
+- `pkg/hub:TestTriggerDispatchAgent_EndToEndWebhookToAgent`
+- `pkg/hub:TestTriggerDispatchAgent_RenderRefusalAndCollisionMatrix`
 
 ### Exemptions
 
@@ -4021,7 +4105,7 @@
 
 - **Event Type:** `artifact_event (deleted)`
 - **Context Fields:** artifact_id, actor_kind, actor_ref, authority
-- **Before Fields:** grantsRemoved, linksRevoked
+- **Before Fields:** grantsRemoved, linksRevoked, draftsRemoved
 - **Atomic:** Yes
 
 **Denial Codes:** `not_found`, `forbidden`
@@ -4108,6 +4192,84 @@
 - `pkg/hub:TestArtifactsOpenReviewOnRoutes`
 - `pkg/artifacts:TestReviewSessionAuthorization`
 - `pkg/artifacts:TestReviewSessionEndLogged`
+
+---
+
+## artifact.review.draft.read
+
+**Domain:** artifact
+
+**Description:** Read the caller's own saved draft review of an artifact (200 with draft null when none exists, plus currentSeq; ptone/scion#7116, ptone/scion#8470); 404 while the hub.artifacts_review_drafts experiment is off; requires review access (the readableArtifact and canWriteErr checks of artifact.version.create); the row is always keyed by the caller's own principal with no administrator, steward, owner or publisher override
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | GET | `/api/v1/artifacts/{id}/review-draft` |
+
+**Principals:** `user`, `agent`
+
+**Credentials:** `session_jwt`, `scoped_uat`, `agent_jwt`
+
+**Bearer:** `admit` (target `artifact_record`; boundaries `project`, `hub`; pinned by `TestArtifactsManageAndVersionRoutesUserAccessTokensAreBounded`)
+
+**Base Permission:** `artifact.create`
+
+**Resource Resolver:** artifact-home-project
+
+**Effects:** `read-one`
+
+**Denial Codes:** `not_found`, `forbidden`
+
+### Tests
+
+- `pkg/hub:TestArtifactsReviewDraftsOnRoutes`
+- `pkg/hub:TestArtifactsReviewDraftsAgentCreatorAndScopedTokenIsolation`
+- `pkg/artifacts:TestReviewDraftAuthorizationOrder`
+
+---
+
+## artifact.review.draft.write
+
+**Domain:** artifact
+
+**Description:** Create, replace or delete the caller's own saved draft review of an artifact with optimistic rev concurrency (ptone/scion#7116, ptone/scion#8470); 404 while the hub.artifacts_review_drafts experiment is off; requires review access (the readableArtifact and canWriteErr checks of artifact.version.create); rate limited per principal (LimitDraftWrite) after authorization and before reading the request body; the row is always keyed by the caller's own principal with no override; a DELETE that deletes the caller's draft row writes a review_draft_deleted decision-log entry without content, while a DELETE when no draft exists writes none (both answer 204); draft saves never trigger review notifications
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | PUT | `/api/v1/artifacts/{id}/review-draft` |
+| http_route | DELETE | `/api/v1/artifacts/{id}/review-draft` |
+
+**Principals:** `user`, `agent`
+
+**Credentials:** `session_jwt`, `scoped_uat`, `agent_jwt`
+
+**Bearer:** `admit` (target `artifact_record`; boundaries `project`, `hub`; pinned by `TestArtifactsManageAndVersionRoutesUserAccessTokensAreBounded`)
+
+**Base Permission:** `artifact.create`
+
+**Resource Resolver:** artifact-home-project
+
+**Effects:** `create-resource`, `update-resource`, `delete-resource`
+
+### Audit
+
+- **Event Type:** `artifact decision log (review_draft_deleted)`
+- **Context Fields:** route, principal_kind, principal_id, project_id
+- **Before Fields:** artifact_id
+- **Atomic:** No
+- **Non-Atomic Justification:** The entry is written after the store deletes the caller's draft row, outside its transaction, as for every artifact decision-log entry (version creates and finalizes included; artifact_event records only artifact lifetime, home and access changes, and never records a reviewer's private draft activity on the artifact). A draft is the caller's own private, 30-day-TTL scratch state rather than a shared resource or authority grant, and is routinely deleted by the caller immediately after submitting a review
+
+**Denial Codes:** `not_found`, `forbidden`, `rate_limited`, `too_many_drafts`
+
+### Tests
+
+- `pkg/hub:TestArtifactsReviewDraftsOnRoutes`
+- `pkg/hub:TestArtifactsReviewDraftsAgentCreatorAndScopedTokenIsolation`
+- `pkg/artifacts:TestReviewDraftAuthorizationOrder`
+- `pkg/artifacts:TestReviewDraftNoContentInLogsOrErrors`
 
 ---
 
@@ -5558,6 +5720,38 @@
 
 ---
 
+## inbox.summary.read
+
+**Domain:** inbox
+
+**Description:** Read the caller's aggregated inbox summary across categories (approvals, waiting agents, artifact reviews, chat, decisions). Interactive web sessions and dev credentials receive the full view; user access tokens with inbox:read receive the token view (approvals marked unavailable, excluded from total). Agents, visitors, federated users, and UATs without inbox:read get 403; unsupported methods get 405; 404 while web.inbox_dashboard is off
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | GET | `/api/v1/users/me/inbox/summary` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`, `scoped_uat`
+
+**Bearer:** `admit` (target `self_record`; boundaries `project`, `hub`; pinned by `TestUserMeInboxSummary_AuthAndValidation`)
+
+**Base Permission:** `inbox.read`
+
+**Resource Resolver:** self-principal
+
+**Effects:** `list-scoped`
+
+**Denial Codes:** `forbidden`, `not_found`
+
+### Tests
+
+- `pkg/hub:TestUserMeInboxSummary_AuthAndValidation`
+
+---
+
 ## inbox.message.read
 
 **Domain:** inbox
@@ -5775,6 +5969,7 @@
 | http_route | GET | `/api/v1/conversations/{id}` |
 | http_route | GET | `/api/v1/conversations/{id}/messages` |
 | http_route | GET | `/api/v1/conversations/{id}/messages/{messageId}` |
+| http_route | GET | `/api/v1/conversations/{id}/watch` |
 
 **Principals:** `user`, `agent`
 
@@ -5793,6 +5988,7 @@
 ### Tests
 
 - `pkg/hub:TestGroupConversationToken_ProjectlessGroupRequiresHubBoundary`
+- `pkg/hub:TestConversationWatch_AuthzParity`
 
 ---
 
@@ -5809,6 +6005,7 @@
 | http_route | GET | `/api/v1/conversations/{id}` |
 | http_route | GET | `/api/v1/conversations/{id}/messages` |
 | http_route | GET | `/api/v1/conversations/{id}/messages/{messageId}` |
+| http_route | GET | `/api/v1/conversations/{id}/watch` |
 
 **Principals:** `user`, `agent`
 
@@ -5827,6 +6024,7 @@
 ### Tests
 
 - `pkg/hub:TestDirectConversationToken_PeerAgentMustBeInsideBoundary`
+- `pkg/hub:TestConversationWatch_AuthzParity`
 
 ---
 
@@ -8305,7 +8503,7 @@
 
 **Domain:** chat
 
-**Description:** Answer a decision prompt decision by choice id (the label is copied from the stored row) with optional surface (native or decisions_page). Needs the right to send in the prompt's conversation (stored chat_key, falling back to messages.thread_id: project:read and project.chat_post for a thread; for a DM, only the user in its key), surviving chat retention purge of the prompt message. Agents, visitors and tokens get 403, and so does a user other than the one an agent-interpreted answer records, or a user the asking agent takes no messages from (MESSAGE_DENIED, the chat send's check; a confirm is not delivered, so it is not checked). A replaced version or an answered one is 409, as is an idempotency key reused for another answer; the first answer wins. Records the answer and a decision-response message, delivers it to the asking agent and publishes decision.updated. 404 while web.decisions is off
+**Description:** Answer a decision prompt decision by choice id (the label is copied from the stored row) with optional surface (native, decisions_page or inbox). Needs the right to send in the prompt's conversation (stored chat_key, falling back to messages.thread_id: project:read and project.chat_post for a thread; for a DM, only the user in its key), surviving chat retention purge of the prompt message. Agents, visitors and tokens get 403, and so does a user other than the one an agent-interpreted answer records, or a user the asking agent takes no messages from (MESSAGE_DENIED, the chat send's check; a confirm is not delivered, so it is not checked). A replaced version or an answered one is 409, as is an idempotency key reused for another answer; the first answer wins. Records the answer and a decision-response message, delivers it to the asking agent and publishes decision.updated. 404 while web.decisions is off
 
 ### Entry Points
 
@@ -8356,7 +8554,7 @@
 
 **Domain:** chat
 
-**Description:** Answer every actionable decision of a decision prompt with two or more decisions as one set, by choice id (labels are copied from the stored rows) with optional surface (native or decisions_page). Needs the right to send in the prompt's conversation (stored chat_key, falling back to messages.thread_id: project:read and project.chat_post for a thread; for a DM, only the user in its key), surviving chat retention purge of the prompt message. Agents and visitors get 403, tokens and other non-session credentials the session-only 403, and a user the asking agent takes no messages from 403 MESSAGE_DENIED (an all-confirm set is not delivered, so it is not checked). A missing or unreadable prompt is 404; a malformed set is 400; a set that does not equal the actionable set is 409 answer_set_changed with fresh views and a reason per row, and stores nothing; an idempotency key reused for other answers is 422. Records one answer per row with a shared batch id and one decision-response message in one transaction, delivers it to the asking agent and publishes decision.updated per row. 404 while web.decisions is off
+**Description:** Answer every actionable decision of a decision prompt with two or more decisions as one set, by choice id (labels are copied from the stored rows) with optional surface (native, decisions_page or inbox). Needs the right to send in the prompt's conversation (stored chat_key, falling back to messages.thread_id: project:read and project.chat_post for a thread; for a DM, only the user in its key), surviving chat retention purge of the prompt message. Agents and visitors get 403, tokens and other non-session credentials the session-only 403, and a user the asking agent takes no messages from 403 MESSAGE_DENIED (an all-confirm set is not delivered, so it is not checked). A missing or unreadable prompt is 404; a malformed set is 400; a set that does not equal the actionable set is 409 answer_set_changed with fresh views and a reason per row, and stores nothing; an idempotency key reused for other answers is 422. Records one answer per row with a shared batch id and one decision-response message in one transaction, delivers it to the asking agent and publishes decision.updated per row. 404 while web.decisions is off
 
 ### Entry Points
 
@@ -8402,11 +8600,139 @@
 
 ---
 
+## chat.secretrequest.read
+
+**Domain:** chat
+
+**Description:** Read a secret-request card (metadata and per-key status, never secret values) plus canRespond and reason. Requires a signed-in user session, recipient membership on the prompt's conversation, and agent.read on the requesting agent. 404 while hub.agent_secrets is off
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | GET | `/api/v1/secret-requests/{messageId}` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`
+
+**Bearer:** `session_only` (reason `INTERACTIVE_STATE`)
+
+**Base Permission:** `agent.read`
+
+**Resource Resolver:** agent
+
+**Effects:** `read-one`
+
+**Denial Codes:** `forbidden`, `not_found`
+
+### Tests
+
+- `pkg/hub:TestSecretRequests_EndToEnd`
+
+---
+
+## chat.secretrequest.fulfill
+
+**Domain:** chat
+
+**Description:** Fulfill all pending keys of a secret-request card, storing each value at agent scope in the secret backend, notifying the requesting agent via a secret-response message, and emitting fulfilled audit events (never values). Requires a signed-in user session, same-origin browser check, recipient membership, and agent.attach on the requesting agent. 404 while hub.agent_secrets is off
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | POST | `/api/v1/secret-requests/{messageId}/fulfill` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`
+
+**Bearer:** `session_only` (reason `INTERACTIVE_STATE`)
+
+**Base Permission:** `agent.attach`
+
+**Resource Resolver:** agent
+
+**Effects:** `create-resource`, `update-resource`, `emit-external-effect`
+
+### Audit
+
+- **Event Type:** `chat.secretrequest.fulfill`
+- **Context Fields:** actor_id, message_id, agent_id, key
+- **After Fields:** secret_version
+- **Atomic:** No
+- **Non-Atomic Justification:** Claim CAS, backend.Set, finish CAS with response message, then fire-and-forget agent delivery
+
+### External Effect Policy
+
+- **Delivery:** `fire_and_forget`
+- **Failure Mode:** `log_and_continue`
+- **Idempotency:** idempotencyKey (optional)
+- **Retry:** repeating the call with the same idempotencyKey from the same user replays the fulfilled result
+- **Auth Before Emit:** Yes
+
+**Denial Codes:** `forbidden`, `not_found`, `conflict`
+
+### Tests
+
+- `pkg/hub:TestSecretRequests_EndToEnd`
+
+---
+
+## chat.secretrequest.dismiss
+
+**Domain:** chat
+
+**Description:** Dismiss all or a subset of pending keys on a secret-request card with an optional reason, notifying the requesting agent via a secret-response message and emitting dismissed audit events. Requires a signed-in user session, same-origin browser check, recipient membership, and agent.attach on the requesting agent. 404 while hub.agent_secrets is off
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | POST | `/api/v1/secret-requests/{messageId}/dismiss` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`
+
+**Bearer:** `session_only` (reason `INTERACTIVE_STATE`)
+
+**Base Permission:** `agent.attach`
+
+**Resource Resolver:** agent
+
+**Effects:** `create-resource`, `update-resource`, `emit-external-effect`
+
+### Audit
+
+- **Event Type:** `chat.secretrequest.dismiss`
+- **Context Fields:** actor_id, message_id, agent_id, key
+- **After Fields:** response_message_id
+- **Atomic:** No
+- **Non-Atomic Justification:** Dismiss CAS and response message are stored in one transaction before fire-and-forget agent delivery
+
+### External Effect Policy
+
+- **Delivery:** `fire_and_forget`
+- **Failure Mode:** `log_and_continue`
+- **Idempotency:** idempotencyKey (optional)
+- **Retry:** repeating the call with the same idempotencyKey from the same user replays the dismissed result
+- **Auth Before Emit:** Yes
+
+**Denial Codes:** `forbidden`, `not_found`, `conflict`
+
+### Tests
+
+- `pkg/hub:TestSecretRequests_EndToEnd`
+
+---
+
 ## chat.decisionprompt.dismiss
 
 **Domain:** chat
 
-**Description:** Dismiss open decisions of a decision prompt without answering, once the version is at least 5 minutes old, with an optional plain-text reason (up to 500 characters) and surface (native or decisions_page). Needs the right to send in the prompt's conversation (stored chat_key, falling back to messages.thread_id: project:read and project.chat_post for a thread; for a DM, only the user in its key; a UAT also needs inbox:write and the prompt's project inside its boundary), surviving chat retention purge of the prompt message. Agents get 403 users_only, visitors and non-session/non-UAT credentials get 403, and a user a live asking agent takes no messages from gets 403 MESSAGE_DENIED. A missing or unreadable prompt is 404; a too-recent version is 409 too_recent with details.availableAt; an already-settled prompt is 409 dismiss_changed (with details.availableAt when a listed row is too recent). Records one outcome=dismiss ($dismissed) answer row per dismissed decision with a shared batch id and one decision-response message in one transaction, delivers it to a live asking agent, and reports deliveryStatus: delivered, held (for the agent's next session), gone (stored without failure, not sent), unreachable (a suspended or stopped asker: stored failed, not sent), failed, or none when nothing new was dismissed; and publishes decision.updated per row. 404 while web.decisions is off
+**Description:** Dismiss open decisions of a decision prompt without answering, once the version is at least 5 minutes old, with an optional plain-text reason (up to 500 characters) and surface (native, decisions_page or inbox). Needs the right to send in the prompt's conversation (stored chat_key, falling back to messages.thread_id: project:read and project.chat_post for a thread; for a DM, only the user in its key; a UAT also needs inbox:write and the prompt's project inside its boundary), surviving chat retention purge of the prompt message. Agents get 403 users_only, visitors and non-session/non-UAT credentials get 403, and a user a live asking agent takes no messages from gets 403 MESSAGE_DENIED. A missing or unreadable prompt is 404; a too-recent version is 409 too_recent with details.availableAt; an already-settled prompt is 409 dismiss_changed (with details.availableAt when a listed row is too recent). Records one outcome=dismiss ($dismissed) answer row per dismissed decision with a shared batch id and one decision-response message in one transaction, delivers it to a live asking agent, and reports deliveryStatus: delivered, held (for the agent's next session), gone (stored without failure, not sent), unreachable (a suspended or stopped asker: stored failed, not sent), failed, or none when nothing new was dismissed; and publishes decision.updated per row. 404 while web.decisions is off
 
 ### Entry Points
 
@@ -10095,6 +10421,52 @@
 
 ---
 
+## user.execcontainer
+
+**Domain:** user
+
+**Description:** Read, set, or clear the caller's own execution container registration
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | GET | `/api/v1/users/me/exec-container` |
+| http_route | PUT | `/api/v1/users/me/exec-container` |
+| http_route | DELETE | `/api/v1/users/me/exec-container` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`
+
+**Bearer:** `session_only` (reason `INTERACTIVE_STATE`)
+
+**Resource Resolver:** self-principal
+
+**Effects:** `read-one`, `update-resource`, `delete-resource`
+
+### Audit
+
+- **Event Type:** `user.exec_container.set, user.exec_container.clear`
+- **Context Fields:** actor_id
+- **Before Fields:** agent_id
+- **After Fields:** agent_id
+- **Atomic:** No
+- **Non-Atomic Justification:** Single-row per-user upsert/delete; best-effort synchronous mutation audit follows PutUserExecContainer and DeleteUserExecContainer
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub/authzop:TestCatalogValidation`
+- `pkg/hub:TestSessionOnlyGate_ReasonIsReported`
+
+### Exemptions
+
+- **authentication_only:** The path names no user; the subject is always the caller, so no resource permission applies (scope: caller's own execution container registration) — waives: `base_permission`
+
+---
+
 ## user.skillinjection.update
 
 **Domain:** user.skillinjection
@@ -11067,6 +11439,7 @@
 | http_route | GET | `/api/v1/admin/maintenance/update-available` |
 | http_route | DELETE | `/api/v1/admin/maintenance/update-available` |
 | http_route | GET | `/api/v1/admin/maintenance/update-status` |
+| http_route | PUT | `/api/v1/admin/maintenance/auto-update` |
 | http_route | GET | `/api/v1/admin/maintenance/releases` |
 
 **Principals:** `user`
@@ -12356,6 +12729,7 @@
 
 | Kind | Method | Pattern |
 |------|--------|---------|
+| http_route | GET | `/api/v1/admin/system-one/adapters` |
 | http_route | GET | `/api/v1/admin/system-one/instances` |
 | http_route | GET | `/api/v1/admin/system-one/instances/{name}` |
 
@@ -13589,9 +13963,9 @@
 |------|--------|---------|
 | http_route | POST | `/api/v1/templates/{id}/reimport` |
 
-**Principals:** `user`
+**Principals:** `user`, `agent`
 
-**Credentials:** `session_jwt`, `scoped_uat`
+**Credentials:** `session_jwt`, `scoped_uat`, `agent_jwt`
 
 **Bearer:** `admit` (target `catalog_record`; boundaries `project`, `hub`)
 
@@ -14773,6 +15147,86 @@
 
 - **Event Type:** `secret.write`
 - **Context Fields:** actor_id, project_id
+- **Before Fields:** secret_key
+- **Atomic:** Yes
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub/authzop:TestCatalogValidation`
+
+---
+
+## agent.secret.read
+
+**Domain:** agent
+
+**Description:** Read agent-scoped secret metadata (scope=agent&scopeId=<agentID>). Values are never readable by humans; gated on hub.agent_secrets.
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | GET | `/api/v1/secrets` |
+| http_route | GET | `/api/v1/secrets/{key}` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`, `scoped_uat`
+
+**Bearer:** `admit` (target `agent_record`; boundaries `project`, `hub`)
+
+**Base Permission:** `agent.read`
+
+**Resource Resolver:** agent-from-query
+
+**Effects:** `read-secret`
+
+### Audit
+
+- **Event Type:** `agent.secret.read`
+- **Context Fields:** actor_id, agent_id
+- **Atomic:** Yes
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub/authzop:TestCatalogValidation`
+
+---
+
+## agent.secret.write
+
+**Domain:** agent
+
+**Description:** Create, update or delete agent-scoped secrets (scope=agent&scopeId=<agentID>). Values are write-only for humans; gated on hub.agent_secrets.
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | PUT | `/api/v1/secrets/{key}` |
+| http_route | PATCH | `/api/v1/secrets/{key}` |
+| http_route | DELETE | `/api/v1/secrets/{key}` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`, `scoped_uat`
+
+**Bearer:** `admit` (target `agent_record`; boundaries `project`, `hub`)
+
+**Base Permission:** `agent.update`
+
+**Resource Resolver:** agent-from-query
+
+**Effects:** `create-resource`, `update-resource`, `delete-resource`
+
+### Audit
+
+- **Event Type:** `agent.secret.write`
+- **Context Fields:** actor_id, agent_id
 - **Before Fields:** secret_key
 - **Atomic:** Yes
 

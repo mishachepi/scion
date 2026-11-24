@@ -13,6 +13,14 @@ The quickest path to a deployed Scion Hub that builds from source is a single Go
 - The **gcloud CLI** installed and configured (`gcloud auth login`, project set).
 - A **domain name** whose DNS is delegated to Cloud DNS. The default path obtains a wildcard certificate for it through a DNS-01 challenge. Without a public domain, follow [Internal Deployments (BYO TLS)](#internal-deployments-byo-tls) instead.
 
+:::caution[Never use `scion` as an SSH or OS Login username]
+The Hub runs as the `scion` Unix service user. On GCE, connecting via SSH or OS Login as `scion` (or having a `scion` key in project or instance SSH metadata) causes the Compute Engine guest agent to add `scion` to `google-sudoers`, granting passwordless root.
+
+- `gce-demo-provision.sh` sets `block-project-ssh-keys=TRUE` on newly created VMs.
+- If your local username is `scion` (for example inside a container), set `export SSH_USER=<other-user>` before running the starter scripts; the scripts refuse to connect as `scion`.
+- `gce-demo-setup-repo.sh` checks `scion`'s group memberships on the VM and refuses to continue if `scion` is in `google-sudoers`.
+:::
+
 ## Configuration
 
 Every script sources `scripts/starter-hub/hub-config.sh`. That file generates nothing. It is a shared set of shell variables that sets resource names, domains, and file paths from `HUB_NAME` (default `demo`) and `BASE_DOMAIN` (default `scion-ai.dev`). Set those, and any other variable listed in `hub-config.sh`, such as `REGION` or `ZONE`, in your environment before you run a script. Set `CERT_EMAIL` in your environment to your own address; Let's Encrypt uses it for certificate notices. It has no default, and `gce-certs.sh` and `gce-demo-deploy.sh` stop with an error before changing anything if it is not set:
@@ -91,7 +99,20 @@ If your VM has no external IP, or TLS is terminated upstream by a load balancer,
 
 Without `--full`, `gce-start-hub.sh` only pulls the latest code on the VM, rebuilds, restarts the Hub, and checks its health. Add `--full` again when you change `hub.env` or the generated configuration. When `/home/scion/.scion/settings.yaml` already exists on the VM, `gce-start-hub.sh --full` merges its generated settings into the existing file (`scripts/starter-hub/merge-settings.py`), preserving operator-owned plugin and message-broker sections (`server.plugins`, `server.message_broker`, and top-level `plugins`) and aborting without overwriting if the existing file cannot be parsed as YAML.
 
+The `scion-hub.service` unit runs as `User=scion` and must never run as root. For in-place rebuilds and updates, `gce-start-hub.sh --full` installs a root-owned helper (`/usr/local/libexec/scion/scion-install-rebuild.sh`) and limits `/etc/sudoers.d/scion-rebuild-server` to that helper and `systemctl restart scion-hub`; the helper validates that `/home/scion/scion/scion.rebuild` is a regular, non-symlink file owned by `scion` before replacing `/usr/local/bin/scion`.
+
 The final health check requests `https://<HUB_DOMAIN>/healthz` and verifies the TLS certificate, so it fails if the certificate is missing or not valid. For a self-signed or test certificate only, add `--insecure-health-check` (or set `HEALTH_CHECK_INSECURE=true`); the script then prints a warning that the certificate was not verified.
+
+### Installed file ownership and permissions
+
+`gce-start-hub.sh` installs `/usr/local/bin/scion` (`0755`), `/etc/systemd/system/scion-hub.service` (`0644`), and `/etc/sudoers.d/scion-rebuild-server` (`0440`) as `root:root` using `install -o root -g root -m` rather than `mv`, so neither the `scion` service user nor the operator login user owns or can modify them. On every run (including fast deploys without `--full`), it also repairs drifted ownership or mode on an existing `/etc/systemd/system/scion-hub.service` in place before verifying.
+
+Before starting the `scion-hub` service, `gce-start-hub.sh` runs `scripts/starter-hub/check-install-perms.sh` on the VM and refuses to continue unless:
+
+- `/usr/local/bin/scion` (`0755`), `/etc/systemd/system/scion-hub.service` (`0644`), and `/etc/sudoers.d/scion-rebuild-server` (`0440`, required on `--full` runs and checked if present on fast runs) are regular files owned by `root:root` with those exact modes.
+- Every command and destination path in the sudoers rules (`/usr/bin/install`, `/usr/bin/systemctl`, `/usr/local/bin/scion`, and any command paths listed in `/etc/sudoers.d/scion-rebuild-server`) and every parent directory up to `/` is root-owned and neither group- nor world-writable.
+
+If the check fails (for example, if `/usr/local/bin` is group-writable), fix the reported ownership or mode on the VM and re-run `gce-start-hub.sh`.
 
 ### Certificate renewal
 
@@ -161,6 +182,7 @@ Once the Hub is running:
 1. **Access the Web Dashboard** — Navigate to your domain (or the VM's external IP) in a browser.
 2. **Create your first project** — Use the dashboard or `scion project create` from the CLI.
 3. **Register a Runtime Broker** — Connect a machine to execute agents. See [Runtime Broker](/scion/hosted/ha/runtime-broker/) for details on registering your local machine or a remote VM.
+4. **Import starter templates and launch a coordinator** — Import the [scion-frontiers/agent-team](https://github.com/scion-frontiers/agent-team) templates (`https://github.com/scion-frontiers/agent-team/tree/main/templates`) in **Project Settings → Templates** (or via the CLI) and start a `coordinator` agent to help build out your project. See [Start with an Agent Team](/scion/hosted/user/hosted-user/#start-with-an-agent-team).
 
 For ongoing Hub administration (auth, permissions, observability), see the other guides in the Hub Administration section.
 
@@ -216,7 +238,7 @@ Agents on the `antigravity` harness detect the metadata-server identity and sele
 
 **Optional GKE runtime (hybrid tier).** Set `gke_target.name` and `gke_target.location` in the config file to attach an existing GKE cluster as a second, Kubernetes-based runtime alongside the VM's co-located Docker broker. The script also serves an NFS export from the VM and creates a PersistentVolumeClaim in the cluster, so agents on both runtimes share the same project [shared directories](/scion/reference/server-config/#shared-directory-storage-servershared_dir_storage) (see the hybrid tier guide for moving such a deployment to `server.project_storage`). The tier is off by default. The script attaches to the cluster but never creates or deletes it, and the cluster must be in the same project. With the tier enabled, `container_images.source: build` is refused (GKE nodes cannot pull from the VM's local Docker store), and `user_access_mode` must be `invite_only` (the default) or `domain_restricted`. See [`docs/deploy/hybrid-tier.md`](https://github.com/GoogleCloudPlatform/scion/blob/main/docs/deploy/hybrid-tier.md) for the full field list and teardown behavior.
 
-The Hub snapshots its SQLite database (`VACUUM INTO`, requiring at least 2× the database size in free disk space) and `settings.yaml` into `/opt/scion/snapshots/` before every update and keeps the five most recent snapshots. Installing an older release than the running one is supported on SQLite down to the downgrade floor (`nightly-20261112`) and requires explicit confirmation (`confirm_downgrade` matching the resolved target tag in the API, or the downgrade confirmation dialog on the Maintenance page). To return to the state before an update (stop the Hub, copy the snapshot over the database, copy the settings back if needed, point `current` at the earlier release, start the Hub), follow [Restoring after a failed update](https://github.com/GoogleCloudPlatform/scion/blob/main/docs/deploy/single-node-vm.md#restoring-after-a-failed-update) in the full guide.
+The Hub snapshots its SQLite database (`VACUUM INTO`, requiring at least 2× the database size in free disk space) and `settings.yaml` into `/opt/scion/snapshots/` before every update and keeps the five most recent snapshots. Installing an older release than the running one is supported on SQLite down to the downgrade floor (`nightly-20261120`) and requires explicit confirmation (`confirm_downgrade` matching the resolved target tag in the API, or the downgrade confirmation dialog on the Maintenance page). To return to the state before an update (stop the Hub, copy the snapshot over the database, copy the settings back if needed, point `current` at the earlier release, start the Hub), follow [Restoring after a failed update](https://github.com/GoogleCloudPlatform/scion/blob/main/docs/deploy/single-node-vm.md#restoring-after-a-failed-update) in the full guide.
 
 For the full guide, including architecture, access patterns, and troubleshooting, see [`docs/deploy/single-node-vm.md`](https://github.com/GoogleCloudPlatform/scion/blob/main/docs/deploy/single-node-vm.md). Teardown (`deploy.sh --delete`) removes the Hub service account's project-level IAM role bindings (and any `deleted:serviceAccount:...?uid=` tombstones for those roles) before deleting the service account so re-deploying with the same name starts with a clean IAM policy. If an AI agent is running the deployment for you, point it at the step-by-step [agent deployment runbook](https://github.com/GoogleCloudPlatform/scion/blob/main/docs/deploy/agent-runbook-single-node-vm.md). The runbook covers GCP preflight checks, the questions to ask the user, config file generation, and troubleshooting.
 

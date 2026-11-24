@@ -33,11 +33,12 @@ import { customElement, property, state } from 'lit/decorators.js';
 import type { PropertyValues, TemplateResult } from 'lit';
 import {
   ACTIVITY_DISPLAY,
+  activityTooltip,
   stateLabel,
   suspendReasonHint,
   suspendedStatusLabel,
 } from '../../../shared/agent-state-display.js';
-import { isTerminalActivity } from '../../../shared/types.js';
+import { isTerminalActivity, type DeletionInfo } from '../../../shared/types.js';
 import { apiFetch } from '../../../client/api.js';
 import { navigateTo } from '../../../client/main.js';
 import { openTerminal, terminalHref, agentGraphHref } from '../../../client/open-terminal.js';
@@ -56,6 +57,8 @@ import type { ActionSheetSelectDetail } from './chat-action-sheet.js';
 import './chat-action-sheet.js';
 import './chat-avatar.js';
 import '../status-badge.js';
+import { DeletionLeaseController } from '../deletion-badge.js';
+import '../deletion-badge.js';
 import { formatInstantWithZone, formatRelative } from '../../../utils/time.js';
 import { DisplayZoneController } from '../../../utils/display-zone-controller.js';
 
@@ -153,6 +156,8 @@ export interface ChatAgentMember {
   detailMessage?: string;
   /** When the agent last changed state (not the heartbeat in `lastSeen`). */
   lastActivityEvent?: string;
+  /** Backend-driven async/failed delete view when active or within display TTL. */
+  deletion?: DeletionInfo | null | undefined;
   /**
    * Whether the viewer may open a terminal on this agent, as decided by the
    * Hub. The sidebar lists every agent in the space's project, but attaching
@@ -186,6 +191,9 @@ export interface MemberClickDetail {
 export class ScionChatMembers extends LitElement {
   /** Re-renders absolute activity dates when the display zone changes. */
   readonly _zone = new DisplayZoneController(this);
+  private readonly deletionLease = new DeletionLeaseController(this, () =>
+    (this.agents || []).map((a) => ({ deletion: a.deletion ?? null }))
+  );
 
   /** Human members of the space. */
   @property({ type: Array })
@@ -362,7 +370,7 @@ export class ScionChatMembers extends LitElement {
       gap: 10px;
       padding: 6px 16px;
       cursor: pointer;
-      border-radius: 4px;
+      border-radius: var(--scion-radius-sm);
       margin: 0 8px;
       transition: background 0.15s;
     }
@@ -372,7 +380,7 @@ export class ScionChatMembers extends LitElement {
     }
 
     .member-item.active-peer {
-      background: var(--scion-primary-50, #eff6ff);
+      background: var(--scion-primary-tint, #eff6ff);
       border-left: 2px solid var(--scion-primary, #3b82f6);
       padding-left: 14px;
     }
@@ -437,6 +445,13 @@ export class ScionChatMembers extends LitElement {
       transform-origin: left center;
     }
 
+    .member-badges {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      flex-wrap: wrap;
+    }
+
     /*
      * The agent tooltip is two lines (detail + updated time) joined by a
      * newline. Shoelace's tooltip body collapses whitespace by default, so
@@ -467,7 +482,7 @@ export class ScionChatMembers extends LitElement {
       height: 1.75rem;
       padding: 0 0.5rem;
       border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: 0.375rem;
+      border-radius: calc(var(--scion-radius) * 0.75);
       background: var(--scion-surface, #ffffff);
       color: var(--scion-text, #1e293b);
       font-size: var(--chat-fs-sm);
@@ -498,7 +513,7 @@ export class ScionChatMembers extends LitElement {
       width: 8px;
       height: 8px;
       border-radius: 50%;
-      background: #3b82f6;
+      background: var(--scion-primary, #3b82f6);
       border: 2px solid var(--scion-bg, #1e293b);
       z-index: 1;
     }
@@ -517,7 +532,7 @@ export class ScionChatMembers extends LitElement {
       align-items: center;
       gap: 1.5px;
       background: var(--scion-surface, #ffffff);
-      border-radius: 6px;
+      border-radius: calc(var(--scion-radius) * 0.75);
       padding: 2px 3px;
       box-shadow: 0 0 0 1.5px var(--scion-surface, #ffffff);
     }
@@ -576,7 +591,7 @@ export class ScionChatMembers extends LitElement {
       z-index: 1000;
       background: var(--scion-surface, #ffffff);
       border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: 0.5rem;
+      border-radius: var(--scion-radius);
       box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
       min-width: 160px;
       padding: 0.25rem 0;
@@ -1155,13 +1170,17 @@ export class ScionChatMembers extends LitElement {
       suspendedLabel ||
       a.phase ||
       'unknown';
+    const badgeStatus = this.resolveAgentStatus(a);
     const updated = a.lastActivityEvent ? this.formatRelativeTime(a.lastActivityEvent) : '';
     const updatedText = updated ? `Updated: ${updated}` : '';
-    const tooltipContent = [detailText, suspendReasonHint(suspended), updatedText]
+    const tooltipContent = [
+      detailText,
+      activityTooltip(badgeStatus),
+      suspendReasonHint(suspended),
+      updatedText,
+    ]
       .filter(Boolean)
       .join('\n');
-
-    const badgeStatus = this.resolveAgentStatus(a);
 
     const agentRow = html`
       <div
@@ -1183,13 +1202,20 @@ export class ScionChatMembers extends LitElement {
         </div>
         <div class="member-info">
           <div class="member-name">${a.displayName}</div>
-          <scion-status-badge
-            status=${badgeStatus}
-            label=${suspendedLabel ?? ''}
-            size="small"
-          ></scion-status-badge>
+          <div class="member-badges">
+            <scion-status-badge
+              status=${badgeStatus}
+              label=${suspendedLabel ?? ''}
+              size="small"
+            ></scion-status-badge>
+            <scion-deletion-badge
+              .deletion=${this.deletionLease.view({ deletion: a.deletion ?? null })}
+              size="small"
+              compact
+            ></scion-deletion-badge>
+          </div>
         </div>
-        ${a.canAttach !== true
+        ${a.canAttach !== true || this.deletionLease.isDeleting({ deletion: a.deletion ?? null })
           ? nothing
           : html`<a
               href=${terminalHref(a.id)}

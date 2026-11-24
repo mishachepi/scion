@@ -126,6 +126,14 @@ function isMessageRecord(entry: MessageLogEntry, parsed: ParsedMessage): boolean
   return parsed.sender !== '' || parsed.recipient !== '';
 }
 
+/**
+ * Reports whether a message crossed project boundaries: its sender and
+ * recipient provenance stamps name two different, non-empty projects.
+ */
+function isCrossProjectMessage(senderProjectId?: string, recipientProjectId?: string): boolean {
+  return !!senderProjectId && !!recipientProjectId && senderProjectId !== recipientProjectId;
+}
+
 @customElement('scion-agent-message-viewer')
 export class ScionAgentMessageViewer extends LitElement {
   /** Re-renders timestamps and date dividers when the display zone changes. */
@@ -181,8 +189,8 @@ export class ScionAgentMessageViewer extends LitElement {
   broadcastUrl = '';
 
   /**
-   * Current project ID, used to detect cross-project messages.
-   * When set, messages from/to a different project get a cross-project badge.
+   * Host project ID when mounted in a project or agent view. Cross-project
+   * badges are computed from message provenance rather than this property.
    */
   @property()
   projectId = '';
@@ -208,6 +216,11 @@ export class ScionAgentMessageViewer extends LitElement {
   @state() private sendError: string | null = null;
 
   private eventSource: EventSource | null = null;
+  private streamOpenedOnce = false;
+  private streamHadError = false;
+  private fetchInFlight = false;
+  private pendingRefetch = false;
+  private boundOnVisibilityChange = (): void => this.onVisibilityChange();
 
   static override styles = css`
     :host {
@@ -345,7 +358,7 @@ export class ScionAgentMessageViewer extends LitElement {
       margin-top: 0.125rem;
     }
     .msg-direction.received {
-      background: var(--scion-primary-50, #eff6ff);
+      background: var(--scion-primary-tint, #eff6ff);
       color: var(--scion-primary-600, #2563eb);
     }
     .msg-direction.sent {
@@ -398,7 +411,7 @@ export class ScionAgentMessageViewer extends LitElement {
     .msg-badge {
       display: inline-block;
       padding: 0.0625rem 0.375rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
       font-size: 0.625rem;
       font-weight: 600;
       text-transform: uppercase;
@@ -477,6 +490,7 @@ export class ScionAgentMessageViewer extends LitElement {
 
   override connectedCallback(): void {
     super.connectedCallback();
+    document.addEventListener('visibilitychange', this.boundOnVisibilityChange);
     // Lit does not re-render on reconnect; show lines whose frame was
     // cancelled by disconnectedCallback.
     if (this.buffer.size > 0) this.requestUpdate();
@@ -484,11 +498,22 @@ export class ScionAgentMessageViewer extends LitElement {
 
   override disconnectedCallback(): void {
     super.disconnectedCallback();
+    document.removeEventListener('visibilitychange', this.boundOnVisibilityChange);
     this.stopStream();
     // A frame left pending would keep this detached element (and its buffer)
     // alive until a hidden tab becomes visible; connectedCallback renders
     // anything it skipped.
     this.renderBatch.cancel();
+  }
+
+  private onVisibilityChange(): void {
+    if (document.hidden || document.visibilityState === 'hidden') return;
+    if (!this.loaded) return;
+    if (this.streaming && this.eventSource && this.eventSource.readyState === EventSource.CLOSED) {
+      this.stopStream();
+      this.startStream();
+    }
+    void this.fetchMessages();
   }
 
   /** Called by the parent when the messages tab is first shown. */
@@ -519,6 +544,11 @@ export class ScionAgentMessageViewer extends LitElement {
   }
 
   private async fetchMessages(): Promise<void> {
+    if (this.fetchInFlight) {
+      this.pendingRefetch = true;
+      return;
+    }
+    this.fetchInFlight = true;
     this.loading = true;
     this.error = null;
 
@@ -581,7 +611,14 @@ export class ScionAgentMessageViewer extends LitElement {
     } catch (err) {
       this.error = err instanceof Error ? err.message : 'Failed to fetch messages';
     } finally {
+      this.fetchInFlight = false;
       this.loading = false;
+      if (this.pendingRefetch && this.isConnected) {
+        this.pendingRefetch = false;
+        void this.fetchMessages();
+      } else {
+        this.pendingRefetch = false;
+      }
     }
   }
 
@@ -592,11 +629,7 @@ export class ScionAgentMessageViewer extends LitElement {
     const direction: 'sent' | 'received' =
       !this.agentId || msg.senderId === this.agentId ? 'sent' : 'received';
 
-    // Cross-project detection: if either project ID differs from the current project
-    const crossProject =
-      !!this.projectId &&
-      ((!!msg.senderProjectId && msg.senderProjectId !== this.projectId) ||
-        (!!msg.recipientProjectId && msg.recipientProjectId !== this.projectId));
+    const crossProject = isCrossProjectMessage(msg.senderProjectId, msg.recipientProjectId);
 
     return {
       sender: msg.sender,
@@ -668,13 +701,25 @@ export class ScionAgentMessageViewer extends LitElement {
     // The actual message body is in payload['message_content'].
     const body = (payload['message_content'] as string) || '';
 
-    // Cross-project provenance from log labels
-    const senderProjectId = labels['sender_project_id'] || undefined;
-    const recipientProjectId = labels['recipient_project_id'] || undefined;
+    // Cross-project provenance from the message record itself (labels or payload)
+    const senderProjectId =
+      labels['sender_project_id'] ||
+      (typeof payload['sender_project_id'] === 'string' ? payload['sender_project_id'] : '') ||
+      undefined;
+    const recipientProjectId =
+      labels['recipient_project_id'] ||
+      (typeof payload['recipient_project_id'] === 'string'
+        ? payload['recipient_project_id']
+        : '') ||
+      undefined;
+    const explicitCrossProject =
+      payload['cross_project'] === true || labels['cross_project'] === 'true'
+        ? true
+        : payload['cross_project'] === false || labels['cross_project'] === 'false'
+          ? false
+          : undefined;
     const crossProject =
-      !!this.projectId &&
-      ((!!senderProjectId && senderProjectId !== this.projectId) ||
-        (!!recipientProjectId && recipientProjectId !== this.projectId));
+      explicitCrossProject ?? isCrossProjectMessage(senderProjectId, recipientProjectId);
 
     return {
       sender,
@@ -718,12 +763,16 @@ export class ScionAgentMessageViewer extends LitElement {
     const url = this.resolvedStreamUrl;
     if (!url) return;
     this.streaming = true;
+    this.streamOpenedOnce = false;
+    this.streamHadError = false;
 
-    this.eventSource = new EventSource(url);
+    const es = new EventSource(url);
+    this.eventSource = es;
 
     // Hub-store-backed stream: emits "message" events with a full
     // UserMessageEvent payload (hub store record) per message.
-    this.eventSource.addEventListener('message', (event: Event) => {
+    es.addEventListener('message', (event: Event) => {
+      if (es !== this.eventSource) return;
       try {
         const msg = JSON.parse((event as MessageEvent<string>).data) as Message;
         this.mergeHubMessages([msg]);
@@ -734,7 +783,8 @@ export class ScionAgentMessageViewer extends LitElement {
 
     // Cloud-Logging-backed stream (fallback path via /message-logs/stream
     // when explicitly opted in): emits "log" events with raw log entries.
-    this.eventSource.addEventListener('log', (event: Event) => {
+    es.addEventListener('log', (event: Event) => {
+      if (es !== this.eventSource) return;
       try {
         const entry = JSON.parse((event as MessageEvent<string>).data) as MessageLogEntry;
         this.mergeEntries([entry]);
@@ -743,13 +793,26 @@ export class ScionAgentMessageViewer extends LitElement {
       }
     });
 
-    this.eventSource.addEventListener('timeout', () => {
+    es.addEventListener('timeout', () => {
+      if (es !== this.eventSource) return;
       this.stopStream();
       void this.fetchMessages(); // backfill anything dropped during the prior window
       this.startStream();
     });
 
-    this.eventSource.onerror = () => {
+    es.onopen = () => {
+      if (es !== this.eventSource) return;
+      const isReconnect = this.streamOpenedOnce || this.streamHadError;
+      this.streamOpenedOnce = true;
+      this.streamHadError = false;
+      if (isReconnect) {
+        void this.fetchMessages(); // backfill anything published while the stream was down
+      }
+    };
+
+    es.onerror = () => {
+      if (es !== this.eventSource) return;
+      this.streamHadError = true;
       // EventSource will auto-reconnect for transient errors
     };
   }
@@ -760,6 +823,8 @@ export class ScionAgentMessageViewer extends LitElement {
       this.eventSource.close();
       this.eventSource = null;
     }
+    this.streamOpenedOnce = false;
+    this.streamHadError = false;
     this.streaming = false;
   }
 

@@ -15,61 +15,17 @@
 package cmd
 
 import (
-	"context"
+	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
-	"github.com/GoogleCloudPlatform/scion/pkg/store"
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 )
-
-// fakeHubSettingRows is a store.HubSettingStore that serves fixed rows;
-// only GetHubSetting is implemented.
-type fakeHubSettingRows struct {
-	store.HubSettingStore
-	rows map[string]*store.HubSetting
-}
-
-func (f fakeHubSettingRows) GetHubSetting(_ context.Context, section string) (*store.HubSetting, error) {
-	if r, ok := f.rows[section]; ok {
-		return r, nil
-	}
-	return nil, store.ErrNotFound
-}
-
-// TestManagedImageRegistryConfigured covers the deferred workstation check:
-// a saved hub value keeps the co-located broker, including a pre-origin row
-// that only the boot backfill would mark managed, and a saved value of the
-// broker's default profile; a seeded value does not.
-func TestManagedImageRegistryConfigured(t *testing.T) {
-	row := func(origin, updatedBy, value string) *store.HubSetting {
-		return &store.HubSetting{Origin: origin, UpdatedBy: updatedBy, Value: []byte(value)}
-	}
-	tests := []struct {
-		name   string
-		rows   map[string]*store.HubSetting
-		active string
-		want   bool
-	}{
-		{"no rows", nil, "", false},
-		{"managed endpoints value", map[string]*store.HubSetting{"endpoints": row("managed", "admin@example.com", `{"image_registry":"db.example/r"}`)}, "", true},
-		{"pre-origin admin row", map[string]*store.HubSetting{"endpoints": row("seeded", "admin@example.com", `{"image_registry":"db.example/r"}`)}, "", true},
-		{"seeded endpoints value", map[string]*store.HubSetting{"endpoints": row("seeded", "seed", `{"image_registry":"file.example/r"}`)}, "", false},
-		{"managed endpoints without value", map[string]*store.HubSetting{"endpoints": row("managed", "a", `{"hub_name":"h"}`)}, "", false},
-		{"managed default profile value", map[string]*store.HubSetting{"profiles": row("managed", "a", `{"k8s":{"runtime":"kubernetes","image_registry":"db.example/k8s"},"local":{"runtime":"docker"}}`)}, "k8s", true},
-		{"managed value of another profile", map[string]*store.HubSetting{"profiles": row("managed", "a", `{"k8s":{"image_registry":"db.example/k8s"},"local":{"runtime":"docker"}}`)}, "local", false},
-		{"single stored profile is the default", map[string]*store.HubSetting{"profiles": row("managed", "a", `{"only":{"image_registry":"db.example/only"}}`)}, "missing", true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := managedImageRegistryConfigured(context.Background(), fakeHubSettingRows{rows: tt.rows}, tt.active)
-			assert.Equal(t, tt.want, got)
-		})
-	}
-	assert.False(t, managedImageRegistryConfigured(context.Background(), nil, ""), "no store")
-}
 
 // TestResolveInitImageRegistry: 'scion init --global' counts the node env as
 // configured (no prompt) but never saves it.
@@ -146,24 +102,6 @@ func writeHomeSettingsYAML(t *testing.T, home, content string) {
 	}
 }
 
-// TestBootstrapImageRegistryConfigured: the deferred workstation check
-// counts the hub's file tier, including SCION_SERVER_IMAGEREGISTRY and
-// SCION_SEED_IMAGEREGISTRY, which only the bootstrap merge reads.
-func TestBootstrapImageRegistryConfigured(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	writeHomeSettingsYAML(t, home, "schema_version: \"1\"\nprofiles:\n  k8s:\n    image_registry: k8s.example\n")
-	t.Setenv("SCION_SERVER_IMAGEREGISTRY", "")
-	t.Setenv("SCION_SEED_IMAGEREGISTRY", "")
-	assert.False(t, bootstrapImageRegistryConfigured("", "staging"))
-	assert.True(t, bootstrapImageRegistryConfigured("", "k8s"), "the active profile's file value")
-	t.Setenv("SCION_SERVER_IMAGEREGISTRY", "server.example")
-	assert.True(t, bootstrapImageRegistryConfigured("", "staging"))
-	t.Setenv("SCION_SERVER_IMAGEREGISTRY", "")
-	t.Setenv("SCION_SEED_IMAGEREGISTRY", "seed.example")
-	assert.True(t, bootstrapImageRegistryConfigured("", "staging"))
-}
-
 // TestImageRegistryPresenceHint_LinksReleaseBuild: the missing-registry
 // hint names the release image driver and the README section on building
 // images that match a release (ptone/scion#6625), next to the general
@@ -171,8 +109,79 @@ func TestBootstrapImageRegistryConfigured(t *testing.T) {
 func TestImageRegistryPresenceHint_LinksReleaseBuild(t *testing.T) {
 	t.Setenv(config.EnvMaintenanceImageRegistry, "")
 	msg := brokerRegistryMissingError().Error()
+	assert.Contains(t, msg, defaultImageRegistrySuggestion)
 	assert.Contains(t, msg, "See image-build/README.md")
 	assert.Contains(t, msg, "image-build/README.md#build-images-for-a-release")
 	assert.Contains(t, msg, "run image-build/scripts/build-release-images.sh <version>")
 	assert.Contains(t, msg, "image_tag")
+}
+
+func TestPromptImageRegistryFrom(t *testing.T) {
+	t.Run("bare enter accepts default public registry", func(t *testing.T) {
+		var out bytes.Buffer
+		got := promptImageRegistryFrom(strings.NewReader("\n"), &out, true)
+		assert.Equal(t, defaultImageRegistrySuggestion, got)
+		assert.Contains(t, out.String(), defaultImageRegistrySuggestion)
+		assert.Contains(t, out.String(), "image-build/README.md")
+		assert.Contains(t, out.String(), "localhost/scion")
+	})
+
+	t.Run("custom registry overrides default", func(t *testing.T) {
+		var out bytes.Buffer
+		got := promptImageRegistryFrom(strings.NewReader("us-central1-docker.pkg.dev/my-proj/scion\n"), &out, true)
+		assert.Equal(t, "us-central1-docker.pkg.dev/my-proj/scion", got)
+	})
+
+	t.Run("skip leaves registry unset", func(t *testing.T) {
+		for _, word := range []string{"skip\n", "SKIP\n", "  Skip  \n"} {
+			var out bytes.Buffer
+			got := promptImageRegistryFrom(strings.NewReader(word), &out, true)
+			assert.Equal(t, "", got, "input=%q", word)
+		}
+	})
+
+	t.Run("EOF without newline leaves registry unset", func(t *testing.T) {
+		var out bytes.Buffer
+		got := promptImageRegistryFrom(strings.NewReader(""), &out, true)
+		assert.Equal(t, "", got)
+	})
+
+	t.Run("EOF with non-empty input uses entered registry", func(t *testing.T) {
+		var out bytes.Buffer
+		got := promptImageRegistryFrom(strings.NewReader("ghcr.io/myorg"), &out, true)
+		assert.Equal(t, "ghcr.io/myorg", got)
+	})
+
+	t.Run("non-EOF read error discards partial input", func(t *testing.T) {
+		var out bytes.Buffer
+		got := promptImageRegistryFrom(partialErrReader{data: "ghcr.io/partial", err: errors.New("terminal read failed")}, &out, true)
+		assert.Equal(t, "", got)
+	})
+
+	t.Run("non-TTY prints hints and leaves registry unset", func(t *testing.T) {
+		var out bytes.Buffer
+		got := promptImageRegistryFrom(strings.NewReader("\n"), &out, false)
+		assert.Equal(t, "", got)
+		assert.Contains(t, out.String(), defaultImageRegistrySuggestion)
+		assert.NotContains(t, out.String(), "Image registry path [")
+	})
+}
+
+func TestInitImageRegistryFlagHelpMentionsDefaultSuggestion(t *testing.T) {
+	for _, flag := range []*cobra.Command{initCmd, projectInitCmd} {
+		f := flag.Flags().Lookup("image-registry")
+		if assert.NotNil(t, f, "command %s missing --image-registry flag", flag.Name()) {
+			assert.Contains(t, f.Usage, defaultImageRegistrySuggestion)
+		}
+	}
+}
+
+type partialErrReader struct {
+	data string
+	err  error
+}
+
+func (r partialErrReader) Read(p []byte) (int, error) {
+	n := copy(p, r.data)
+	return n, r.err
 }

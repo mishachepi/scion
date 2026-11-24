@@ -186,6 +186,21 @@ const ConduitDeliver = "hub.conduit_deliver"
 // and the web UI shows the exec authoring option only while it is on.
 const ExecSchedules = "hub.exec_schedules"
 
+// ExecContainers gates user-specified execution containers (ptone/scion#8812):
+// creating shell-harness agents and registering/reading a user's default
+// execution container. While it is off, shell-agent creation returns 400
+// (experiment_disabled), GET/PUT /api/v1/users/me/exec-container return 404,
+// and ResolveExecContainer returns unconfigured. DELETE stays ungated so a
+// user can always clear their registration, and the reserved "shell" harness
+// config name and shell-agent security protections apply unconditionally.
+const ExecContainers = "hub.exec_containers"
+
+// ViewAsMember gates the "View as member" session toggle for hub admins
+// (ptone/scion#8648). The hub checks it when a session enters the mode;
+// existing sessions in the mode remain honoured and exit stays available
+// even while it is off.
+const ViewAsMember = "hub.view_as_member"
+
 // Artifacts gates the artifact service (pkg/artifacts): the hub's
 // /api/v1/artifacts routes answer 404 while it is off, and the web UI hides
 // every artifact surface.
@@ -220,6 +235,12 @@ const ChatScheduledSend = "web.chat_scheduled_send"
 // readable.
 const Decisions = "web.decisions"
 
+// InboxDashboard gates the top-level Inbox dashboard (ptone/scion#8962):
+// GET /api/v1/users/me/inbox/summary (404 while off) and user.*.inbox SSE
+// invalidation hints (LayerServer), plus the Profile Inbox page, nav badges,
+// and bell discovery link in the web UI (LayerWeb).
+const InboxDashboard = "web.inbox_dashboard"
+
 // ChatStarredMessages gates starred messages in native web chat: the
 // message Star/Unstar action, the private starred indicator, the
 // conversation header's starred-message list, the starred-only center and
@@ -237,6 +258,11 @@ const ChatStarredMessages = "web.chat_starred_messages"
 // on deletes nothing until an admin also enables the sweep and sets a
 // window.
 const ChatRetention = "hub.chat_retention"
+
+// ConversationWatch gates the long-poll conversation watch endpoint
+// (GET /api/v1/conversations/{id}/watch; ptone/scion#8136). While off, the
+// route answers 404; sequence allocation and backfill remain active.
+const ConversationWatch = "hub.conversation_watch"
 
 // AuthorizationDecisionAuditV2 gates decision logging (remaining-audit P1).
 // It is the only activation control and stays default-off; turning it on
@@ -398,6 +424,14 @@ const LifecycleEvents = "hub.lifecycle_events"
 // it the default and removes the gate.
 const SkillContentHashV2 = "hub.skill_content_hash_v2"
 
+// TemplateConfigValidation gates schema validation of template agent config
+// files (scion-agent.{yaml,yml,json}) on template commits and imports
+// (ptone/scion#7579). While it is off, invalid agent configs are logged as
+// warnings and still accepted (except the unconditional welcome auth_selectedType
+// refusal). While it is on, commits introducing an invalid agent config are
+// refused with HTTP 422 (code invalid_agent_config).
+const TemplateConfigValidation = "hub.template_config_validation"
+
 // ArtifactReviewEditor gates the graphical review editor for Markdown
 // artifacts (ptone/scion#5913). It is web-only: every save goes through the
 // unchanged review publish, and the hub's review checks are the same
@@ -433,6 +467,14 @@ const ArtifactArchive = "hub.artifact_archive"
 // review_open unless it is forced. While it is off the review-session routes
 // answer 404 and publishing behaves exactly as before.
 const ArtifactsOpenReviewCheck = "hub.artifacts_open_review_check"
+
+// ArtifactsReviewDrafts gates durable per-reviewer draft reviews on the hub
+// (ptone/scion#7116, ptone/scion#8470, ptone/scion#8475): GET, PUT and DELETE
+// /api/v1/artifacts/{id}/review-draft and the web editor's autosave and
+// resume UI. While it is off the review-draft routes answer 404 and reviewing
+// behaves as before; the 30-day TTL and lost-access/deleted-principal reapers
+// still run.
+const ArtifactsReviewDrafts = "hub.artifacts_review_drafts"
 
 // UserDeleteForceCascade gates the forced user delete (ptone/scion#2143):
 // DELETE /api/v1/users/{id}?force=true, which revokes the user's authority,
@@ -543,10 +585,127 @@ const MessagePolicies = "hub.message_policies"
 // (while off, the dialog shows only the roles content without tabs).
 const EffectivePermissions = "hub.effective_permissions"
 
+// CustomDefaultUserRole gates setting server.auth.default_user_role to an
+// eligible custom system-scope role definition (ptone/scion#8288). Server
+// layer: while off, saving a non-built-in default_user_role returns 412
+// experiment_disabled (echoes of an already-stored value and resets to
+// member/viewer pass), and runtime resolution falls back to member with a
+// warning. Web layer: shows eligible custom roles and fallback warnings in
+// Admin > Server Config.
+const CustomDefaultUserRole = "hub.custom_default_user_role"
+
+// AgentSecrets gates agent-scoped secrets (ptone/scion#8742): secrets bound to
+// a single agent, readable only by that agent's token, injected at start at
+// highest scope precedence, and deleted when the agent is hard-deleted or
+// purged. Server layer: while off, agent scope is rejected on every route (400
+// invalid scope) and skipped by launch delivery. Web layer: hides the agent
+// Secrets management and create-form tabs and secret-request UI while off.
+const AgentSecrets = "hub.agent_secrets"
+
+// CodeSpanMentions gates treating a standalone single-mention inline code span
+// (such as `@coordinator` or `@user@example.com`) as a mention across both
+// Hub dispatch/routing/translation and Web chat rendering/reply-all
+// (ptone/scion#8783). Fenced code blocks, '>' blockquote lines, multi-token
+// inline code, double-backtick literal-backtick wrappers, and slash-containing
+// tokens (such as `@scope/name`) stay plain code. On the web, code-span
+// mentions render as mention pills only when the token resolves to a known
+// project agent or human member. Default off.
+const CodeSpanMentions = "hub.code_span_mentions"
+
+// SuspendScreen gates capturing and serving the last terminal screen of a
+// suspended agent (ptone/scion#8530). It is on by default; turning it off
+// skips pre-suspend screen capture, leaves existing rows alone, and makes
+// GET /api/v1/agents/{id}/screen and its project-scoped alias answer 404.
+const SuspendScreen = "hub.suspend_screen"
+
+// AdminManagedBrokers gates the hub-level broker_policy.admin_managed_only
+// setting and explicit admin-managed broker registration/approval
+// (ptone/scion#7829). Server layer: while off, saving
+// broker_policy.admin_managed_only=true or sending adminManaged on registration
+// returns 412 experiment_disabled and enforcement is bypassed. Web layer: shows
+// the Runtime Broker policy section in Admin > Server Config and warns when the
+// stored value is true while the experiment is off.
+const AdminManagedBrokers = "hub.admin_managed_brokers"
+
+// FiltersQueryDialect gates the unified key:value filter query dialect across
+// hub list endpoints and the web UI's <scion-filter-box> (ptone/scion#9018).
+// Server layer: while off, GET /api/v1/agents ignores the q parameter; while
+// on, q is parsed, validated, and pushed down to store predicates (400
+// invalid_filter_query on invalid queries). Web layer: while off, views render
+// their existing filter controls; while on, adopted views render the unified
+// filter box. Default off.
+const FiltersQueryDialect = "filters.query_dialect"
+
 // compiled is the production experiment list. It is reachable only through
 // Default(); there is no package-level Lookup/All, so hub code cannot bypass
 // the Registry instance it was given (ptone/scion#2217).
 var compiled = []Experiment{
+	{
+		Name:        FiltersQueryDialect,
+		Title:       "Unified filter query dialect",
+		Description: "Enables the unified Gmail/GitHub-style key:value filter query dialect (q=) on supported list endpoints and replaces view-specific filter inputs with <scion-filter-box> in the web UI. Server layer: while off, GET /api/v1/agents ignores q; while on, q is parsed, validated, and translated into store predicates. Web layer: selects <scion-filter-box> on adopted list views.",
+		Default:     false,
+		Layers:      []Layer{LayerServer, LayerWeb},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#9018",
+		Owner:       "ui",
+		ReviewBy:    "2027-05-23",
+	},
+	{
+		Name:        AgentSecrets,
+		Title:       "Agent-scoped secrets",
+		Description: "Allows storing secrets bound to a single agent in the secret backend, readable only by that agent's token and delivered at start with highest scope precedence. Server layer: while off, agent scope is rejected on every route and skipped by launch delivery. Web layer: hides agent-secret management and request UI while off.",
+		Default:     false,
+		Layers:      []Layer{LayerServer, LayerWeb},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#8742",
+		Owner:       "auth",
+		ReviewBy:    "2027-05-21",
+	},
+	{
+		Name:        CodeSpanMentions,
+		Title:       "Code-span mentions",
+		Description: "Treats a standalone single-mention inline code span (such as `@coordinator`) on a prose line as a mention for both Hub notification dispatch/routing/translation and Web chat rendering/reply-all. Fenced code blocks, blockquote lines, multi-token inline code, escaped backticks, and slash-containing tokens stay plain code. Web rendering promotes a code-span mention only when it resolves to a known project agent or human member.",
+		Default:     false,
+		Layers:      []Layer{LayerServer, LayerWeb},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#8783",
+		Owner:       "native-chat",
+		ReviewBy:    "2027-05-21",
+	},
+	{
+		Name:        SuspendScreen,
+		Title:       "Suspend last terminal screen",
+		Description: "Captures a running agent's visible terminal pane just before a hub-initiated suspend (manual, stalled, or idle auto-suspend) and serves it via GET /api/v1/agents/{id}/screen (agent.attach) for scion look and the web agent page. On by default; turning it off skips capture and answers 404 on the screen endpoint.",
+		Default:     true,
+		Layers:      []Layer{LayerServer},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#8530",
+		Owner:       "hub",
+		ReviewBy:    "2027-05-21",
+	},
+	{
+		Name:        AdminManagedBrokers,
+		Title:       "Admin-managed Runtime Brokers only",
+		Description: "Enables the hub-level broker_policy.admin_managed_only setting to restrict Runtime Broker registration, attachment, placement, and starts to approved admin-managed brokers. Server layer: while off, enabling the setting or passing adminManaged returns 412 experiment_disabled and enforcement is bypassed. Web layer: shows the Runtime Broker policy section in Admin > Server Config.",
+		Default:     false,
+		Layers:      []Layer{LayerServer, LayerWeb},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#7829",
+		Owner:       "auth",
+		ReviewBy:    "2027-05-21",
+	},
+	{
+		Name:        CustomDefaultUserRole,
+		Title:       "Custom default user role",
+		Description: "Allows setting server.auth.default_user_role to an eligible custom system-scope role definition instead of only the built-in member or viewer roles. Server layer: while off, saving a custom default_user_role returns 412 experiment_disabled and runtime resolution falls back to member with a warning. Web layer: shows eligible custom roles and fallback warnings in Admin > Server Config.",
+		Default:     false,
+		Layers:      []Layer{LayerServer, LayerWeb},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#8288",
+		Owner:       "auth",
+		ReviewBy:    "2027-05-21",
+	},
 	{
 		Name:        EffectivePermissions,
 		Title:       "Effective permissions viewer",
@@ -815,6 +974,17 @@ var compiled = []Experiment{
 		ReviewBy:    "2027-02-13",
 	},
 	{
+		Name:        InboxDashboard,
+		Title:       "Inbox dashboard",
+		Description: "Aggregates pending attention items across decisions, waiting agents, approvals, artifact reviews, and unread chat into GET /api/v1/users/me/inbox/summary and the Inbox dashboard view. Gates the summary endpoint (404 while off) and user.*.inbox invalidation hints (LayerServer), and the Profile Inbox page, badges, and navigation entries (LayerWeb).",
+		Default:     false,
+		Layers:      []Layer{LayerServer, LayerWeb},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#8962",
+		Owner:       "notifications",
+		ReviewBy:    "2027-02-21",
+	},
+	{
 		Name:        ChatStarredMessages,
 		Title:       "Starred messages in chat",
 		Description: "Lets each user star chat messages privately and find them again from the conversation header. Gates the Star message action, the starred indicator and the header list (LayerWeb) and the hub's starred-message routes, which answer 404 while it is off (LayerServer). Stars are stored per user and are never shown to anyone else; turning it off keeps them.",
@@ -927,13 +1097,24 @@ var compiled = []Experiment{
 	{
 		Name:        ArtifactsOpenReviewCheck,
 		Title:       "Warn publishers about open reviews",
-		Description: "Review mode on the artifact page reports that a review is open, and a publish that would overtake an open review of the current version is refused with 409 review_open, naming the reviewers and their last activity, until the publisher publishes anyway (force). Needs hub.artifacts. While off, the review-session routes answer 404, force is ignored and publishing behaves as before. Do not turn it on, on any hub, before the filter that drops reviewers who lost access to the artifact has landed (ptone/scion#6849).",
+		Description: "Review mode on the artifact page reports that a review is open, and a publish that would overtake an open review of the current version is refused with 409 review_open, naming the reviewers and their last activity, until the publisher publishes anyway (force); sessions of principals who can no longer read the artifact are ignored. Needs hub.artifacts. While off, the review-session routes answer 404, force is ignored and publishing behaves as before.",
 		Default:     false,
 		Layers:      []Layer{LayerServer, LayerWeb},
 		Stage:       StageAlpha,
 		Issue:       "ptone/scion#6849",
 		Owner:       "artifacts",
 		ReviewBy:    "2027-02-04",
+	},
+	{
+		Name:        ArtifactsReviewDrafts,
+		Title:       "Durable artifact review drafts",
+		Description: "Saves in-progress artifact reviews as private per-reviewer drafts on the hub so reviewers can resume across browser sessions or devices before submitting; a periodic reaper removes drafts after 30 days, when their author loses review access, or when their author is deleted. Needs hub.artifacts. While off, the review-draft routes answer 404 and reviewing behaves as before.",
+		Default:     false,
+		Layers:      []Layer{LayerServer, LayerWeb},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#7116",
+		Owner:       "artifacts",
+		ReviewBy:    "2027-02-19",
 	},
 	{
 		Name:        UserDeleteForceCascade,
@@ -1050,9 +1231,9 @@ var compiled = []Experiment{
 	{
 		Name:        SystemOne,
 		Title:       "System One message guardrails",
-		Description: "Enables Hub-scoped System One provider instance administration and probing (/api/v1/admin/system-one/instances[/{name}[/probe]] and scion admin system-one instance create|list|delete|probe), with runtime probe evaluations bounded by server.hub.system_one.max_eval_time. While off, the System One admin routes answer 404 and stored provider instances are kept.",
+		Description: "Enables Hub-scoped System One provider instance administration and probing (/api/v1/admin/system-one/instances[/{name}[/probe]], /api/v1/admin/system-one/adapters, admin web UI, and scion admin system-one instance create|list|delete|probe), with runtime probe evaluations bounded by server.hub.system_one.max_eval_time. While off, the System One admin routes answer 404, the admin web page is hidden, and stored provider instances are kept.",
 		Default:     false,
-		Layers:      []Layer{LayerServer},
+		Layers:      []Layer{LayerServer, LayerWeb},
 		Stage:       StageAlpha,
 		Issue:       "ptone/scion#8044",
 		Owner:       "system-one",
@@ -1090,6 +1271,50 @@ var compiled = []Experiment{
 		Issue:       "ptone/scion#8047",
 		Owner:       "system-one",
 		ReviewBy:    "2027-02-15",
+	},
+	{
+		Name:        TemplateConfigValidation,
+		Title:       "Template agent config validation",
+		Description: "Validates template agent config files (scion-agent.{yaml,yml,json}) against the agent v1 JSON schema on template commits and imports. While off, schema violations are logged as warnings and still accepted; while on, invalid agent configs are refused with HTTP 422 (invalid_agent_config).",
+		Default:     false,
+		Layers:      []Layer{LayerServer},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#7579",
+		Owner:       "templates",
+		ReviewBy:    "2027-05-31",
+	},
+	{
+		Name:        ExecContainers,
+		Title:       "Execution containers",
+		Description: "Lets users start execution containers (--harness shell) and register one in their profile as their default execution container. While off, creating execution containers is refused, GET/PUT /api/v1/users/me/exec-container answer 404, and existing execution containers keep all human-only protections.",
+		Default:     false,
+		Layers:      []Layer{LayerServer, LayerWeb},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#8812",
+		Owner:       "@ptone",
+		ReviewBy:    "2027-03-31",
+	},
+	{
+		Name:        ConversationWatch,
+		Title:       "Conversation watch",
+		Description: "Long-poll conversation watch endpoint (GET /api/v1/conversations/{id}/watch) for receiving new conversation messages with low latency.",
+		Default:     true,
+		Layers:      []Layer{LayerServer},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#8136",
+		Owner:       "hub",
+		ReviewBy:    "2027-05-31",
+	},
+	{
+		Name:        ViewAsMember,
+		Title:       "View as member",
+		Description: "Hub admins can switch their browser session to view the hub as a member: hub-level admin grants are dropped for that session (API and UI), project memberships are kept. Exiting is always possible.",
+		Default:     false,
+		Layers:      []Layer{LayerServer, LayerWeb},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#8648",
+		Owner:       "@ptone",
+		ReviewBy:    "2027-05-31",
 	},
 }
 

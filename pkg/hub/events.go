@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/artifacts"
@@ -48,6 +49,9 @@ type EventPublisher interface {
 	PublishBrokerConnected(ctx context.Context, brokerID, brokerName string, projectIDs []string)
 	PublishBrokerDisconnected(ctx context.Context, brokerID string, projectIDs []string)
 	PublishBrokerStatus(ctx context.Context, brokerID, status string)
+	// PublishNotification emits a notification addressed to one user on
+	// user.<subscriberID>.notification. A notification with no SubscriberID
+	// is dropped.
 	PublishNotification(ctx context.Context, notif *store.Notification)
 	// PublishUserNotification emits a non-chat notification addressed to one
 	// user (for example SCHEDULE_BLOCKED) on user.<subscriberID>.notification
@@ -119,6 +123,10 @@ type EventPublisher interface {
 	// payload is a content-free invalidation ({"action":"changed"}):
 	// clients refetch current state. Only the owner is ever told.
 	PublishChatStarsChanged(ctx context.Context, userID string)
+	// PublishUserInboxHint publishes a content-free invalidation hint on
+	// user.<userID>.inbox when an inbox category changes. Only the owner is
+	// ever told.
+	PublishUserInboxHint(ctx context.Context, userID string, hint InboxHint)
 	// Subscribe returns a channel that receives events matching the given
 	// subject patterns, along with an unsubscribe function. Patterns use
 	// NATS-style wildcards: '*' matches a single token, '>' matches the
@@ -169,7 +177,8 @@ func (noopEventPublisher) Close()                                               
 
 func (noopEventPublisher) PublishChatScheduledEvent(_ context.Context, _ string, _ ChatScheduledEvent) {
 }
-func (noopEventPublisher) PublishChatStarsChanged(_ context.Context, _ string) {}
+func (noopEventPublisher) PublishChatStarsChanged(_ context.Context, _ string)           {}
+func (noopEventPublisher) PublishUserInboxHint(_ context.Context, _ string, _ InboxHint) {}
 
 // Subscribe on the no-op publisher returns a nil channel (which blocks forever
 // on receive) and a no-op unsubscribe. Callers that need real subscriptions
@@ -402,15 +411,12 @@ type NotificationCreatedEvent struct {
 	CreatedAt string `json:"createdAt"`
 }
 
-// UserNotificationEvent is the payload for a non-chat notification addressed
-// to a single user (PublishUserNotification). SubscriberID is the client's
-// second gate; the subject already scopes delivery.
+// UserNotificationEvent is the payload for a notification addressed to a
+// single user (PublishUserNotification). SubscriberID is the client's second
+// gate; the subject already scopes delivery.
 //
-// Kind, ResourceType and ResourceID are fields of this event only, never of
-// the embedded NotificationCreatedEvent: that struct is also the payload of
-// the broadcast notification.created and project.<id>.notification
-// subjects, which reach other sessions. They are empty, and omitted, for a
-// notification that does not set them.
+// Kind, ResourceType, and ResourceID are optional fields on this event and
+// are omitted for notifications that do not set them.
 type UserNotificationEvent struct {
 	NotificationCreatedEvent
 	SubscriberID string `json:"subscriberId"`
@@ -466,6 +472,31 @@ type eventBuilder struct {
 	// published counts scion.hub.events.published; the embedding
 	// publisher calls it once per event it publishes.
 	published eventstreams.PublishCounter
+	// inboxHintEnabled, when set, gates user.<ownerID>.inbox waiting hints
+	// emitted by PublishAgentStatus (design §5.2). Stored atomically so
+	// SetInboxHintEnabled is race-free with concurrent publishes.
+	inboxHintEnabled atomic.Pointer[func() bool]
+}
+
+// inboxHintEnabledSetter is implemented by event publishers backed by
+// eventBuilder so Server.SetEventPublisher can wire the inbox experiment gate.
+type inboxHintEnabledSetter interface {
+	SetInboxHintEnabled(fn func() bool)
+}
+
+// SetInboxHintEnabled sets the gate checked by PublishAgentStatus before
+// emitting a user.<ownerID>.inbox waiting hint. Passing nil disables hints.
+func (p *eventBuilder) SetInboxHintEnabled(fn func() bool) {
+	if fn == nil {
+		p.inboxHintEnabled.Store(nil)
+		return
+	}
+	p.inboxHintEnabled.Store(&fn)
+}
+
+func (p *eventBuilder) shouldEmitInboxHint() bool {
+	fn := p.inboxHintEnabled.Load()
+	return fn != nil && (*fn)()
 }
 
 // SetPublishMetrics wires the scion.hub.events.published counter
@@ -706,6 +737,13 @@ func (p *eventBuilder) PublishAgentStatus(ctx context.Context, agent *store.Agen
 	if agent.ProjectID != "" {
 		sink("project."+agent.ProjectID+".agent.status", evt)
 	}
+	if agent.OwnerID != "" && p.shouldEmitInboxHint() {
+		p.PublishUserInboxHint(ctx, agent.OwnerID, InboxHint{
+			Category: InboxCategoryWaiting,
+			AgentID:  agent.ID,
+			Activity: agent.Activity,
+		})
+	}
 }
 
 // PublishAgentCreated publishes an agent created event to both agent-specific
@@ -842,20 +880,10 @@ func (p *eventBuilder) PublishBrokerStatus(_ context.Context, brokerID, status s
 	p.sink("broker."+brokerID+".status", evt)
 }
 
-// PublishNotification publishes a user notification event.
-func (p *eventBuilder) PublishNotification(_ context.Context, notif *store.Notification) {
-	evt := NotificationCreatedEvent{
-		ID:        notif.ID,
-		AgentID:   notif.AgentID,
-		ProjectID: notif.ProjectID,
-		Status:    notif.Status,
-		Message:   notif.Message,
-		CreatedAt: notif.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
-	}
-	p.sink("notification.created", evt)
-	if notif.ProjectID != "" {
-		p.sink("project."+notif.ProjectID+".notification", evt)
-	}
+// PublishNotification publishes a notification on user.<subscriberID>.notification.
+// Notifications without a SubscriberID are dropped.
+func (p *eventBuilder) PublishNotification(ctx context.Context, notif *store.Notification) {
+	p.PublishUserNotification(ctx, notif)
 }
 
 // PublishUserNotification publishes a non-chat notification addressed to one
@@ -1224,6 +1252,23 @@ func (p *eventBuilder) PublishChatStarsChanged(_ context.Context, userID string)
 		return
 	}
 	p.sink("user."+userID+".chat.stars", ChatStarsEvent{Action: "changed"})
+}
+
+// InboxHint is a content-free invalidation hint published on
+// user.<userID>.inbox when an inbox category changes.
+type InboxHint struct {
+	Category string `json:"category"`
+	AgentID  string `json:"agentId,omitempty"`
+	Activity string `json:"activity,omitempty"`
+}
+
+// PublishUserInboxHint publishes an inbox invalidation hint to its owner only,
+// on user.<userID>.inbox.
+func (p *eventBuilder) PublishUserInboxHint(_ context.Context, userID string, hint InboxHint) {
+	if userID == "" {
+		return
+	}
+	p.sink("user."+userID+".inbox", hint)
 }
 
 // PublishDispatchDone emits a slim completion event when a broker_dispatch row

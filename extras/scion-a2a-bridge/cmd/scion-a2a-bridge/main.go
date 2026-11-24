@@ -19,6 +19,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -244,17 +245,18 @@ func main() {
 		a2asrv.WithAgentInactivityTimeout(cfg.Timeouts.SendMessage),
 		a2asrv.WithTaskStore(scopedTaskStore),
 	)
-	b.SetSDKRequestHandler(sdkRequestHandler)
+	guardedRequestHandler := bridge.NewFederationTaskAuthHandler(sdkRequestHandler)
+	b.SetSDKRequestHandler(guardedRequestHandler)
 
 	// Create SDK JSON-RPC transport handler.
 	sdkJSONRPCHandler := a2asrv.NewJSONRPCHandler(
-		sdkRequestHandler,
+		guardedRequestHandler,
 		a2asrv.WithTransportKeepAlive(cfg.Timeouts.SSEKeepalive),
 	)
 
 	// Create v0.3 REST compat handler for legacy (GE v0.3) clients.
 	v0RESTHandler := a2av0.NewRESTHandler(
-		sdkRequestHandler,
+		guardedRequestHandler,
 		a2asrv.WithTransportKeepAlive(cfg.Timeouts.SSEKeepalive),
 	)
 
@@ -581,7 +583,8 @@ func serveStandalone(cfg *bridge.Config, log *slog.Logger) {
 		a2asrv.WithAgentInactivityTimeout(cfg.Timeouts.SendMessage),
 		a2asrv.WithTaskStore(barrierStore),
 	)
-	b.SetSDKRequestHandler(sdkRequestHandler)
+	guardedSDKHandler := bridge.NewFederationTaskAuthHandler(sdkRequestHandler)
+	b.SetSDKRequestHandler(guardedSDKHandler)
 
 	// Constraint 3: DurableRequestHandler wraps the SDK handler for
 	// ownership-enforcing durable subscribe that bypasses localManager.Resubscribe.
@@ -589,15 +592,16 @@ func serveStandalone(cfg *bridge.Config, log *slog.Logger) {
 	// Federated users: access is re-checked with the hub before a reply is
 	// streamed on a resubscribe.
 	durableHandler.SetBridge(b)
+	guardedDurableHandler := bridge.NewFederationTaskAuthHandler(durableHandler)
 
 	sdkJSONRPCHandler := a2asrv.NewJSONRPCHandler(
-		durableHandler,
+		guardedDurableHandler,
 		a2asrv.WithTransportKeepAlive(cfg.Timeouts.SSEKeepalive),
 	)
 
 	// Create v0.3 REST compat handler for legacy (GE v0.3) clients.
 	v0RESTHandler := a2av0.NewRESTHandler(
-		sdkRequestHandler,
+		guardedSDKHandler,
 		a2asrv.WithTransportKeepAlive(cfg.Timeouts.SSEKeepalive),
 	)
 
@@ -931,14 +935,38 @@ func accessSecret(ctx context.Context, resourceName string) (string, error) {
 	}
 	defer client.Close()
 
+	return accessSecretVersion(ctx, resourceName, func(ctx context.Context, req *smpb.AccessSecretVersionRequest) (*smpb.AccessSecretVersionResponse, error) {
+		return client.AccessSecretVersion(ctx, req)
+	})
+}
+
+func accessSecretVersion(
+	ctx context.Context,
+	resourceName string,
+	access func(context.Context, *smpb.AccessSecretVersionRequest) (*smpb.AccessSecretVersionResponse, error),
+) (string, error) {
 	if !strings.Contains(resourceName, "/versions/") {
 		resourceName += "/versions/latest"
 	}
-	resp, err := client.AccessSecretVersion(ctx, &smpb.AccessSecretVersionRequest{
+	resp, err := access(ctx, &smpb.AccessSecretVersionRequest{
 		Name: resourceName,
 	})
 	if err != nil {
 		return "", fmt.Errorf("accessing secret version: %w", err)
 	}
-	return cleanBase64(string(resp.Payload.Data))
+	data, err := secretPayloadData(resp)
+	if err != nil {
+		return "", fmt.Errorf("accessing secret version: %w", err)
+	}
+	return cleanBase64(data)
+}
+
+// secretPayloadData returns the secret value of a successful
+// AccessSecretVersion response. A missing response or payload is an error,
+// never an empty value; a payload with empty data is an empty value.
+func secretPayloadData(resp *smpb.AccessSecretVersionResponse) (string, error) {
+	if resp == nil || resp.Payload == nil {
+		return "", errors.New("secret manager returned no payload")
+	}
+	return string(resp.Payload.Data), nil
 }

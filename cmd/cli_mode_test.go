@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"sort"
@@ -238,14 +239,14 @@ func buildTestTree() *cobra.Command {
 
 	// templates with subcommands
 	templates := &cobra.Command{Use: "templates"}
-	for _, name := range []string{"list", "show", "create", "delete", "clone", "update-default", "import", "sync", "push", "pull", "status"} {
+	for _, name := range []string{"list", "show", "create", "delete", "clone", "update-default", "import", "import-url", "update", "sync", "push", "pull", "status"} {
 		templates.AddCommand(&cobra.Command{Use: name})
 	}
 	root.AddCommand(templates)
 
 	// template (singular alias)
 	template := &cobra.Command{Use: "template"}
-	for _, name := range []string{"list", "show", "delete", "clone", "import", "sync", "push", "pull", "status"} {
+	for _, name := range []string{"list", "show", "delete", "clone", "import", "import-url", "update", "sync", "push", "pull", "status"} {
 		template.AddCommand(&cobra.Command{Use: name})
 	}
 	root.AddCommand(template)
@@ -326,14 +327,14 @@ func TestApplyModeRestrictions_Agent(t *testing.T) {
 		"shared-dir", "shared-dir.info", "shared-dir.list",
 		"start", "stop",
 		"template",
-		"template.clone", "template.delete", "template.import",
+		"template.clone", "template.delete", "template.import", "template.import-url",
 		"template.list", "template.pull", "template.push",
-		"template.show", "template.status", "template.sync",
+		"template.show", "template.status", "template.sync", "template.update",
 		"templates",
-		"templates.clone", "templates.create", "templates.delete", "templates.import",
+		"templates.clone", "templates.create", "templates.delete", "templates.import", "templates.import-url",
 		"templates.list", "templates.pull", "templates.push",
 		"templates.show", "templates.status", "templates.sync",
-		"templates.update-default",
+		"templates.update", "templates.update-default",
 		"version",
 	}
 	assert.Equal(t, expected, remaining)
@@ -449,10 +450,11 @@ func TestAgentAllowedList(t *testing.T) {
 		"shared-dir", "shared-dir.list", "shared-dir.info",
 		"templates", "templates.list", "templates.show", "templates.create",
 		"templates.clone", "templates.delete", "templates.update-default",
-		"templates.import", "templates.sync", "templates.push", "templates.pull", "templates.status",
+		"templates.import", "templates.import-url", "templates.update",
+		"templates.sync", "templates.push", "templates.pull", "templates.status",
 		"template", "template.list", "template.show", "template.clone",
-		"template.delete", "template.import", "template.sync",
-		"template.push", "template.pull", "template.status",
+		"template.delete", "template.import", "template.import-url", "template.update",
+		"template.sync", "template.push", "template.pull", "template.status",
 		"harness-config", "harness-config.list", "harness-config.show", "harness-config.install",
 		"harness-config.sync", "harness-config.push", "harness-config.pull",
 		"harness-config.delete", "harness-config.reset", "harness-config.upgrade",
@@ -549,17 +551,18 @@ func resolveCommandPath(root *cobra.Command, path string) *cobra.Command {
 	return current
 }
 
-// ptone/scion#1968: agents may browse the hub skill bank read-only. The
-// allowlisted skill paths must resolve to real commands, and every mutating
-// skill verb must stay out of agent mode.
+// ptone/scion#1968, ptone/scion#8734: agents may browse the hub skill bank
+// and publish project-scoped skills. The allowlisted skill paths must resolve
+// to real commands, and every other mutating skill verb must stay out of agent
+// mode.
 func TestAgentAllowedSkillBrowse(t *testing.T) {
-	for _, path := range []string{"skills", "skills.list", "skills.show", "skill", "skill.list"} {
+	for _, path := range []string{"skills", "skills.list", "skills.show", "skills.publish", "skill", "skill.list"} {
 		assert.True(t, agentAllowed[path], "agentAllowed should contain %s", path)
 		assert.NotNil(t, resolveCommandPath(rootCmd, path),
 			"agentAllowed key %q must resolve to a real command", path)
 	}
 	for _, path := range []string{
-		"skills.create", "skills.publish", "skills.delete", "skills.deprecate",
+		"skills.create", "skills.delete", "skills.deprecate",
 		"skills.registries", "skills.registries.add", "skills.registries.update",
 		"skills.registries.remove", "skills.registries.pin",
 	} {
@@ -587,9 +590,10 @@ func cloneCommandShape(cmd *cobra.Command) *cobra.Command {
 	return c
 }
 
-// ptone/scion#1968: runs agent-mode filtering over a copy of the real skills
-// and skill subtrees and checks that exactly the read-only browse verbs
-// survive, so a mistyped allowlist key or a new mutating verb fails here.
+// ptone/scion#1968, ptone/scion#8734: runs agent-mode filtering over a copy of
+// the real skills and skill subtrees and checks that exactly the allowed browse
+// and publish verbs survive, so a mistyped allowlist key or a new mutating verb
+// fails here.
 func TestApplyModeRestrictions_AgentRealSkillTree(t *testing.T) {
 	t.Setenv("SCION_CLI_MODE", "agent")
 	root := &cobra.Command{Use: "scion"}
@@ -599,15 +603,15 @@ func TestApplyModeRestrictions_AgentRealSkillTree(t *testing.T) {
 		root.AddCommand(cloneCommandShape(real))
 	}
 	before := collectCommandNames(root)
-	for _, mutating := range []string{"skills.create", "skills.publish", "skills.delete", "skills.deprecate"} {
+	for _, mutating := range []string{"skills.create", "skills.delete", "skills.deprecate"} {
 		require.Contains(t, before, mutating, "real tree should contain %s before filtering", mutating)
 	}
 
 	applyModeRestrictions(root, resolveMode())
 
-	assert.Equal(t, []string{"skill", "skill.list", "skills", "skills.list", "skills.show"},
+	assert.Equal(t, []string{"skill", "skill.list", "skills", "skills.list", "skills.publish", "skills.show"},
 		collectCommandNames(root),
-		"agent mode must keep exactly the read-only skill browse verbs")
+		"agent mode must keep exactly the allowed skill browse and publish verbs")
 }
 
 // TestHubTokenScopesCommand_ModeRestricted pins the mode-availability
@@ -770,4 +774,246 @@ func TestMessagePolicyCommands_AgentModeReadOnly(t *testing.T) {
 		collectCommandNames(root),
 		"agent mode must keep ONLY message-policy, list, and get",
 	)
+}
+
+// cloneCommandForModeExec copies cmd's structure, aliases, hidden flag, Args
+// validator, and Runnable state into a fresh tree so applyModeRestrictions and
+// Execute() can run against the real CLI layout without mutating rootCmd or
+// invoking real network/filesystem handlers.
+func cloneCommandForModeExec(src *cobra.Command) *cobra.Command {
+	c := &cobra.Command{
+		Use:     src.Use,
+		Aliases: append([]string(nil), src.Aliases...),
+		Long:    src.Long,
+		Hidden:  src.Hidden,
+		Args:    src.Args,
+	}
+	if src.Runnable() {
+		c.Run = func(*cobra.Command, []string) {}
+	}
+	for _, child := range src.Commands() {
+		c.AddCommand(cloneCommandForModeExec(child))
+	}
+	return c
+}
+
+// TestAgentModeGatedSubcommandsFail covers ptone/scion#8365 over the real
+// command tree: every subcommand removed by the agent-mode gate (whether its
+// surviving parent is Runnable or a pure group like "project service-accounts")
+// must fail with an unknown-command error instead of printing parent help and
+// exiting 0. Bare group invocations and "<group> help" still print help.
+func TestAgentModeGatedSubcommandsFail(t *testing.T) {
+	type gatedCase struct {
+		path       string
+		parentPath string
+		leaf       string
+		args       []string
+		wantParent string
+	}
+
+	var cases []gatedCase
+	var walk func(parent *cobra.Command, parentPath string)
+	walk = func(parent *cobra.Command, parentPath string) {
+		for _, child := range parent.Commands() {
+			name := child.Name()
+			if name == "help" {
+				continue
+			}
+			path := name
+			if parentPath != "" {
+				path = parentPath + "." + name
+			}
+			if !agentAllowed[path] {
+				// Top-level removed command, or a removed child of an allowed parent.
+				// Skip parents that intentionally accept positional arguments (e.g.
+				// "scion message <recipient> <text>"), where an unknown first word
+				// is a positional argument rather than a subcommand.
+				if parentPath == "" || !acceptsPositionalArgs(parent) {
+					args := strings.Split(path, ".")
+					wantParent := "scion"
+					if parentPath != "" {
+						wantParent = "scion " + strings.ReplaceAll(parentPath, ".", " ")
+					}
+					cases = append(cases, gatedCase{
+						path:       path,
+						parentPath: parentPath,
+						leaf:       name,
+						args:       args,
+						wantParent: wantParent,
+					})
+				}
+				// Do not descend into a removed parent; the parent itself fails.
+				continue
+			}
+			walk(child, path)
+		}
+	}
+	walk(rootCmd, "")
+	require.NotEmpty(t, cases, "real command tree must contain agent-gated commands")
+
+	// Sanity-check that representative nested non-Runnable groups are in the table.
+	var paths []string
+	for _, tc := range cases {
+		paths = append(paths, tc.path)
+	}
+	for _, mustInclude := range []string{
+		"project.service-accounts.list",
+		"project.service-accounts.add",
+		"project.service-accounts.mint",
+		"project.service-accounts.verify",
+		"project.service-accounts.remove",
+		"project.init",
+		"secret.set",
+		"shared-dir.create",
+		"skills.create",
+		"conversation.group.delete",
+		"hub.test-identity.delegate",
+		"artifact.share",
+		"message-policy.create",
+	} {
+		require.Contains(t, paths, mustInclude, "table must cover %s", mustInclude)
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			root := cloneCommandForModeExec(rootCmd)
+			root.SilenceErrors = true
+			root.SilenceUsage = true
+			var out bytes.Buffer
+			root.SetOut(&out)
+			root.SetErr(&out)
+
+			applyModeRestrictions(root, ModeAgent)
+
+			root.SetArgs(tc.args)
+			err := root.Execute()
+			require.Error(t, err, "gated command %q must fail, not fall through to help", tc.path)
+			assert.Contains(t, err.Error(), `unknown command "`+tc.leaf+`" for "`+tc.wantParent+`"`)
+			assert.NotContains(t, err.Error(), "mode")
+			assert.NotContains(t, out.String(), "Usage:", "gated command %q must not print parent help", tc.path)
+
+			// For nested gated subcommands, "<parent> <gated> --help" must also fail.
+			if tc.parentPath != "" {
+				helpArgs := append(append([]string(nil), tc.args...), "--help")
+				helpErr := unknownSubcommandHelpError(root, helpArgs)
+				require.Error(t, helpErr, "gated command help %q must fail", helpArgs)
+				assert.Contains(t, helpErr.Error(), `unknown command "`+tc.leaf+`" for "`+tc.wantParent+`"`)
+			}
+		})
+	}
+
+	// Surviving groups must still print help and exit 0 on bare invocation
+	// or "<group> help", and reject arbitrary unknown subcommands.
+	for _, groupPath := range []string{
+		"project",
+		"project.service-accounts",
+		"secret",
+		"shared-dir",
+		"skills",
+		"conversation.group",
+		"hub.test-identity",
+		"schedule",
+		"templates",
+		"decisions",
+		"trigger",
+	} {
+		t.Run("group_"+groupPath, func(t *testing.T) {
+			args := strings.Split(groupPath, ".")
+			wantParent := "scion " + strings.ReplaceAll(groupPath, ".", " ")
+
+			for _, sub := range []struct {
+				name string
+				argv []string
+			}{
+				{"bare", args},
+				{"help", append(append([]string(nil), args...), "help")},
+			} {
+				root := cloneCommandForModeExec(rootCmd)
+				root.SilenceErrors = true
+				root.SilenceUsage = true
+				var out bytes.Buffer
+				root.SetOut(&out)
+				root.SetErr(&out)
+				applyModeRestrictions(root, ModeAgent)
+
+				root.SetArgs(sub.argv)
+				require.NoError(t, root.Execute(), "%s %q should print help and succeed", sub.name, sub.argv)
+				assert.Contains(t, out.String(), "Usage:", "%s %q should print usage", sub.name, sub.argv)
+			}
+
+			root := cloneCommandForModeExec(rootCmd)
+			root.SilenceErrors = true
+			root.SilenceUsage = true
+			var out bytes.Buffer
+			root.SetOut(&out)
+			root.SetErr(&out)
+			applyModeRestrictions(root, ModeAgent)
+
+			root.SetArgs(append(append([]string(nil), args...), "nosuch"))
+			err := root.Execute()
+			require.Error(t, err, "unknown subcommand under %q must fail", groupPath)
+			assert.Contains(t, err.Error(), `unknown command "nosuch" for "`+wantParent+`"`)
+			assert.NotContains(t, out.String(), "Usage:")
+		})
+	}
+}
+
+// TestAgentModeGatedSubcommandCLI runs the real CLI entrypoint (Execute) in a
+// child process configured for agent mode via settings.yaml, confirming that
+// gated subcommands under non-Runnable parents exit non-zero with an error on
+// stderr instead of printing parent help and exiting 0.
+func TestAgentModeGatedSubcommandCLI(t *testing.T) {
+	dir, home := t.TempDir(), t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(home, ".scion"), 0755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(home, ".scion", "settings.yaml"),
+		[]byte("schema_version: \"1\"\ncli:\n  mode: agent\n"),
+		0644,
+	))
+
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{
+			name:    "project_service_accounts_list",
+			args:    []string{"project", "service-accounts", "list"},
+			wantErr: `unknown command "list" for "scion project service-accounts"`,
+		},
+		{
+			name:    "project_service_accounts_list_help",
+			args:    []string{"project", "service-accounts", "list", "--help"},
+			wantErr: `unknown command "list" for "scion project service-accounts"`,
+		},
+		{
+			name:    "project_list",
+			args:    []string{"project", "list"},
+			wantErr: `unknown command "list" for "scion project"`,
+		},
+		{
+			name:    "secret_set",
+			args:    []string{"secret", "set"},
+			wantErr: `unknown command "set" for "scion secret"`,
+		},
+		{
+			name:    "completion",
+			args:    []string{"completion"},
+			wantErr: `unknown command "completion" for "scion"`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := runSSHCLI(t, dir, home, nil, tc.args...)
+			assert.NotEqual(t, 0, res.code, "%q exited 0; stdout=%q stderr=%q", tc.args, res.stdout, res.stderr)
+			assert.Contains(t, res.stderr, tc.wantErr, "%q", tc.args)
+			assert.NotContains(t, res.stdout, "Usage:", "%q must not print parent help on stdout", tc.args)
+		})
+	}
+
+	// Bare parent still prints help and exits 0, listing only allowed subcommands.
+	res := runSSHCLI(t, dir, home, nil, "project", "service-accounts")
+	assert.Equal(t, 0, res.code, "bare group failed: stderr=%q", res.stderr)
+	assert.Contains(t, res.stdout, "Usage:")
+	assert.Contains(t, res.stdout, "show")
+	assert.NotContains(t, res.stdout, "scion project service-accounts list")
 }

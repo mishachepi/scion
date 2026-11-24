@@ -29,6 +29,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/agentkeys"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/conduit"
@@ -37,6 +38,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/observability/dispatchmetrics"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectfs"
+	"github.com/GoogleCloudPlatform/scion/pkg/projectkeys"
 	"github.com/GoogleCloudPlatform/scion/pkg/secret"
 	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
@@ -47,10 +49,11 @@ import (
 	"go.opentelemetry.io/otel/codes"
 )
 
-// permissionProjectSecretRead is the registry permission ID that governs an
-// agent reading secrets during resolution (pkg/hub/permissions/registry.go).
-// It is declared on ResourceProject, so it cannot be derived from a
-// resource type of "secret".
+// permissionProjectSecretRead is the registry permission ID declared on
+// ResourceProject (pkg/hub/permissions/registry.go). In non-test code it is
+// kept for the compatibility progeny/secret relationship row
+// (storeProgenyAdapter.ReadPermissions, TestRelationshipCharacterization_Progeny);
+// dispatcher resolution authorizes user-scope progeny secrets via secret.use.
 const permissionProjectSecretRead = "project.secret_read"
 
 // HTTPRuntimeBrokerClient is an HTTP-based implementation of RuntimeBrokerClient.
@@ -247,6 +250,16 @@ type HTTPAgentDispatcher struct {
 	// (SetWorkspaceStorage); buildCreateRequestFor asks for the signed-URL
 	// workspace download only when it is GCS. Nil means no storage.
 	workspaceStorage func() storage.Storage
+	// hostedMode makes every create, provision, start and restart
+	// dispatch check the agent's member-written config
+	// (hostedConfigPrecheck, SetHostedMode).
+	hostedMode bool
+	// hostedHarnessConfigCheck checks the hub harness config a hosted
+	// dispatch names (SetHostedHarnessConfigCheck); nil checks nothing.
+	hostedHarnessConfigCheck func(ctx context.Context, harnessConfigID, runtimeKind string) error
+	// hostedTemplateCheck checks the bundled harness configs of the hub
+	// template a hosted dispatch uses (SetHostedTemplateCheck).
+	hostedTemplateCheck func(ctx context.Context, templateID, runtimeKind string) error
 
 	// attachmentIssuer issues the attachment delivery capabilities of a
 	// message on every dispatch attempt (ptone/scion#4596). Nil issues none.
@@ -348,6 +361,9 @@ type HTTPAgentDispatcher struct {
 	gitHubWebHost func() string
 	// conduitPolicyProvider returns the agent conduit policy value, "" for none.
 	conduitPolicyProvider func() string
+	// agentSecretsEnabledProvider reports whether the hub.agent_secrets
+	// experiment is enabled, read at each dispatch. Nil means disabled.
+	agentSecretsEnabledProvider func() bool
 }
 
 // NewHTTPAgentDispatcher creates a new HTTP-based agent dispatcher.
@@ -575,6 +591,21 @@ func (d *HTTPAgentDispatcher) SetDispatchExperimentsProvider(fn func() []string)
 	d.dispatchExperimentsProvider = fn
 }
 
+// SetAgentSecretsEnabledProvider registers the accessor reporting whether
+// the hub.agent_secrets experiment is enabled at dispatch time.
+func (d *HTTPAgentDispatcher) SetAgentSecretsEnabledProvider(fn func() bool) {
+	d.agentSecretsEnabledProvider = fn
+}
+
+// agentSecretsEnabled reports whether hub.agent_secrets is enabled for this
+// dispatcher.
+func (d *HTTPAgentDispatcher) agentSecretsEnabled() bool {
+	if d.agentSecretsEnabledProvider == nil {
+		return false
+	}
+	return d.agentSecretsEnabledProvider()
+}
+
 // SetConduitPolicyProvider sets the source of the agent conduit policy.
 func (d *HTTPAgentDispatcher) SetConduitPolicyProvider(fn func() string) {
 	d.conduitPolicyProvider = fn
@@ -761,7 +792,7 @@ func (d *HTTPAgentDispatcher) repairHarnessConfig(ctx context.Context, agent *st
 	}
 	name := agent.AppliedConfig.HarnessConfig
 	// Prefer the stamped record ID; the name is only a fallback, resolved in
-	// the agent's project then global scope (ptone/scion#2898).
+	// dispatch scope order (harnessConfigLookupScopes) (ptone/scion#2898).
 	ref := HarnessConfigRepairRef{
 		ID:        agent.AppliedConfig.HarnessConfigID,
 		Name:      name,
@@ -783,8 +814,8 @@ func (d *HTTPAgentDispatcher) repairTemplate(ctx context.Context, agent *store.A
 		return fmt.Errorf("no template repairer")
 	}
 	// Prefer the stamped record ID; the agent's template reference is only a
-	// fallback, resolved in the agent's project then global scope.
-	ref := TemplateRepairRef{Name: agent.Template, ProjectID: agent.ProjectID}
+	// fallback, resolved in the agent's project, then owner's user, then global scope.
+	ref := TemplateRepairRef{Name: agent.Template, ProjectID: agent.ProjectID, UserID: agent.OwnerID}
 	if agent.AppliedConfig != nil {
 		ref.ID = agent.AppliedConfig.TemplateID
 	}
@@ -887,6 +918,9 @@ func (d *HTTPAgentDispatcher) buildCreateRequest(ctx context.Context, agent *sto
 // a stored environment settings read error, fails the request.
 func (d *HTTPAgentDispatcher) buildCreateRequestFor(ctx context.Context, agent *store.Agent, callerName string, secrets secretResolutionPolicy) (*RemoteCreateAgentRequest, error) {
 	buildRequestStart := time.Now()
+	if isShellAgent(agent) && agent.AppliedConfig == nil {
+		return nil, fmt.Errorf("%s: execution container has unreadable applied config", callerName)
+	}
 	projectInfo, err := d.resolveDispatchProjectInfo(ctx, agent)
 	if err != nil {
 		return nil, err
@@ -1034,6 +1068,14 @@ func (d *HTTPAgentDispatcher) buildCreateRequestFor(ctx context.Context, agent *
 				RequireLocalRuntime: gcpID.RequireLocalRuntime,
 				// Only this dispatch's own decision (markCloudRunNative),
 				// never a stored or client value.
+				NativeCloudRun: cloudRunNativeFrom(ctx),
+			}
+		} else if isShellAgent(agent) {
+			// Execution containers without an explicit GCP identity fail
+			// closed to "block" so runtimes like Kubernetes never fall back
+			// to node-identity passthrough (ptone/scion#8812 §14).
+			remoteGCPIdentity = &RemoteGCPIdentityConfig{
+				MetadataMode:   store.GCPMetadataModeBlock,
 				NativeCloudRun: cloudRunNativeFrom(ctx),
 			}
 		}
@@ -1288,8 +1330,12 @@ func (d *HTTPAgentDispatcher) buildCreateRequestFor(ctx context.Context, agent *
 		// it enables repository clone/pull in clone-per-agent workspaces.
 		// Without this, NoAuth blanket-suppresses all secrets including
 		// GITHUB_TOKEN, causing git clone failures (#1165).
-		if agent.ProjectID != "" && d.secretBackend != nil {
-			projectValue := d.noAuthCreateGitToken(ctx, agent, secret.ScopeProject, agent.ProjectID)
+		// Defense in depth: deliverGitHubToken also strips non-installation GitHub tokens downstream.
+		if !usesInstallationGitHubToken(agent) && agent.ProjectID != "" && d.secretBackend != nil {
+			projectValue := ""
+			if !isShellAgent(agent) {
+				projectValue = d.noAuthCreateGitToken(ctx, agent, secret.ScopeProject, agent.ProjectID)
+			}
 
 			// Fall back to the creating user's profile-level GITHUB_TOKEN,
 			// mirroring the cascade in resolveCloneToken. Users who store
@@ -1368,73 +1414,19 @@ func (d *HTTPAgentDispatcher) buildCreateRequestFor(ctx context.Context, agent *
 	// wrapper, which is the step that guarantees no later merge on any path
 	// reaches the broker.
 	sealCreateRequest(ctx, req)
+	d.warnGCPTelemetryBlockedWithoutCredentials(ctx, agent, tel, req.ResolvedEnv, req.ResolvedSecrets)
 
-	// GitHub App token minting: if the project has a GitHub App installation,
-	// always mint an installation token. GitHub App tokens take priority over
-	// GITHUB_TOKEN from secrets/env because they provide managed, scoped access
-	// with automatic refresh. If minting fails, fall back to any existing
-	// GITHUB_TOKEN from secrets/env.
-	if d.githubAppMinter != nil && agent.ProjectID != "" {
-		project, projectErr := d.store.GetProject(ctx, agent.ProjectID)
-		if projectErr == nil {
-			// Determine which project to use for GitHub App token minting:
-			// the agent's own project, or a token-source project named by
-			// label only when resolveGitHubMintProject authorizes it.
-			mintProject := d.githubMintProject(ctx, agent, project)
-			if mintProject != nil {
-				if req.ResolvedEnv != nil && req.ResolvedEnv["GITHUB_TOKEN"] != "" {
-					// User already has a GITHUB_TOKEN from secrets/env.
-					// Respect it: skip overwriting with the GitHub App token.
-					d.log.Warn("buildCreateRequest: user has GITHUB_TOKEN from secrets; skipping GitHub App token injection — user token takes precedence for gh CLI, GitHub App will still be used for git credential helper",
-						"project_id", agent.ProjectID)
-					req.ResolvedEnv["SCION_USER_GITHUB_TOKEN"] = "true"
-					classifyEnv(&req.EnvClassifications, "SCION_USER_GITHUB_TOKEN", api.EnvKindPlain)
-					// Still enable the GitHub App machinery so the credential
-					// helper can mint tokens for git push/pull operations.
-					req.ResolvedEnv["SCION_GITHUB_APP_ENABLED"] = "true"
-					classifyEnv(&req.EnvClassifications, "SCION_GITHUB_APP_ENABLED", api.EnvKindPlain)
-				} else {
-					token, expiry, mintErr := d.githubAppMinter.MintGitHubAppTokenForProject(ctx, mintProject)
-					if mintErr != nil {
-						if d.debug {
-							d.log.Warn("buildCreateRequest: GitHub App token minting failed, falling back to PAT",
-								"error", mintErr, "project_id", agent.ProjectID)
-						}
-						// Fall through — PAT from secrets/env may still be available
-					} else if token != "" {
-						if req.ResolvedEnv == nil {
-							req.ResolvedEnv = make(map[string]string)
-						}
-						// GitHub App minted token — ephemeral, not in secret store.
-						// This MUST run AFTER the secret-store GITHUB_TOKEN injection
-						// (H6/H7/H8 above) so the classification overwrites
-						// secret-fetchable → secret-injected when the App token wins.
-						// A test pins this ordering dependency.
-						req.ResolvedEnv["GITHUB_TOKEN"] = token
-						classifyEnv(&req.EnvClassifications, "GITHUB_TOKEN", api.EnvKindSecretInjected)
-						// Only a token minted for the agent's own project counts
-						// as project-bound (gitTokenProjectBound); a token-source
-						// project's token is bound to that other project.
-						if mintProject.ID == project.ID {
-							req.githubAppToken = token
-						}
-						req.ResolvedEnv["SCION_GITHUB_APP_ENABLED"] = "true"
-						classifyEnv(&req.EnvClassifications, "SCION_GITHUB_APP_ENABLED", api.EnvKindPlain)
-						req.ResolvedEnv["SCION_GITHUB_TOKEN_EXPIRY"] = expiry
-						classifyEnv(&req.EnvClassifications, "SCION_GITHUB_TOKEN_EXPIRY", api.EnvKindPlain)
-						req.ResolvedEnv["SCION_GITHUB_TOKEN_PATH"] = "/tmp/.github-token"
-						classifyEnv(&req.EnvClassifications, "SCION_GITHUB_TOKEN_PATH", api.EnvKindPlain)
-						if d.debug {
-							d.log.Debug("buildCreateRequest: injected GitHub App token",
-								"project_id", agent.ProjectID,
-								"installationID", *mintProject.GitHubInstallationID,
-								"expiry", expiry)
-						}
-					}
-				}
-			}
-		}
+	// GitHub token delivery (Stage 2 §5.1a): single auditable policy deciding
+	// whether user PATs / GH_* aliases are dropped in favor of the GitHub App
+	// installation token (GitHubTokenPreference == "installation") or keep the
+	// default user-preferred precedence.
+	// Defense in depth: the noAuth fetch above is already skipped for installation-only agents.
+	if usesInstallationGitHubToken(agent) {
+		req.noAuthProjectToken = ""
 	}
+	req.ResolvedSecrets, req.AvailableAsNeededKeys, req.githubAppToken = d.deliverGitHubToken(
+		ctx, agent, req.ResolvedEnv, &req.EnvClassifications, req.ResolvedSecrets, req.AvailableAsNeededKeys, "buildCreateRequest",
+	)
 
 	// A personal git token goes only to a recorded remote on the GitHub
 	// host (personal_git_token.go). This runs after secret resolution and
@@ -1952,27 +1944,153 @@ func (d *HTTPAgentDispatcher) beginRun(ctx context.Context, agent *store.Agent, 
 	return runID, previous, token, recorded, nil
 }
 
+// reportedEntryProjectID returns the project ID reported on info (from
+// info.ProjectID and the project-ID labels). If more than one source is set
+// and they disagree, ok is false.
+func reportedEntryProjectID(info *RemoteAgentInfo) (string, bool) {
+	if info == nil {
+		return "", false
+	}
+	var found string
+	candidates := []string{
+		info.ProjectID,
+		projectkeys.ProjectIDFromLabels(info.Labels),
+	}
+	if info.Labels != nil {
+		// Cloud Run sanitizes dotted label keys (runtime.CloudRunRuntime.storedLabelKey),
+		// turning scion.project_id into scion_project_id.
+		candidates = append(candidates, info.Labels["scion_project_id"])
+	}
+	for _, c := range candidates {
+		if c == "" {
+			continue
+		}
+		if found != "" && found != c {
+			return "", false
+		}
+		found = c
+	}
+	return found, found != ""
+}
+
+// reportedEntryAgentID returns the agent ID reported on info (from
+// info.Labels["agent_id"] and info.ID). If both are set and disagree, ok is
+// false.
+func reportedEntryAgentID(info *RemoteAgentInfo) (string, bool) {
+	if info == nil {
+		return "", false
+	}
+	labelID := ""
+	if info.Labels != nil {
+		labelID = info.Labels["agent_id"]
+	}
+	if labelID != "" {
+		if info.ID != "" && info.ID != labelID {
+			return "", false
+		}
+		return labelID, true
+	}
+	if info.ID != "" {
+		return info.ID, true
+	}
+	return "", false
+}
+
+// canAdoptBrokerRunID verifies that a broker-reported run ID (different from
+// the minted run) belongs to agent before the hub adopts it (ptone/scion#8240):
+// the reported entry's project and agent ID must match agent, and the hub must
+// have minted a credential for (agent.ID, info.RunID), matching heartbeat
+// adoption's HasAgentCredentialForRun check. On any mismatch or lookup error,
+// it logs a warning and returns false so the caller keeps the minted run.
+func canAdoptBrokerRunID(ctx context.Context, st store.Store, log *slog.Logger, caller string, agent *store.Agent, minted string, info *RemoteAgentInfo) bool {
+	if agent == nil || agent.ID == "" || info == nil || info.RunID == "" {
+		return false
+	}
+	gotProject, ok := reportedEntryProjectID(info)
+	if !ok || agent.ProjectID == "" || gotProject != agent.ProjectID {
+		if log != nil {
+			log.Warn(caller+": refusing to adopt broker run ID: reported entry project does not match agent",
+				"agent_id", agent.ID, "agent", agent.Slug,
+				"project_id", agent.ProjectID, "reported_project_id", gotProject,
+				"minted_run_id", minted, "broker_run_id", info.RunID)
+		}
+		return false
+	}
+	gotAgent, ok := reportedEntryAgentID(info)
+	if !ok || gotAgent != agent.ID {
+		if log != nil {
+			log.Warn(caller+": refusing to adopt broker run ID: reported entry agent ID does not match agent",
+				"agent_id", agent.ID, "agent", agent.Slug,
+				"reported_agent_id", gotAgent,
+				"minted_run_id", minted, "broker_run_id", info.RunID)
+		}
+		return false
+	}
+	if st == nil {
+		if log != nil {
+			log.Warn(caller+": refusing to adopt broker run ID: no store to verify credential",
+				"agent_id", agent.ID, "agent", agent.Slug,
+				"minted_run_id", minted, "broker_run_id", info.RunID)
+		}
+		return false
+	}
+	credMinted, err := st.HasAgentCredentialForRun(ctx, agent.ID, info.RunID)
+	if err != nil {
+		if log != nil {
+			log.Warn(caller+": refusing to adopt broker run ID: credential lookup failed",
+				"agent_id", agent.ID, "agent", agent.Slug,
+				"minted_run_id", minted, "broker_run_id", info.RunID, "error", err)
+		}
+		return false
+	}
+	if !credMinted {
+		if log != nil {
+			log.Warn(caller+": refusing to adopt broker run ID: hub did not mint a credential for the reported run",
+				"agent_id", agent.ID, "agent", agent.Slug,
+				"minted_run_id", minted, "broker_run_id", info.RunID)
+		}
+		return false
+	}
+	return true
+}
+
 // adoptBrokerRunID records the run ID the broker reports for the entry it
 // created or found, when that differs from the one this dispatch minted:
 // a start that found the agent already running keeps the existing entry
-// and reports its run (ptone/scion#2550). The write is a compare-and-swap
-// against the minted ID, so a late response cannot overwrite a newer run
-// ID that a later dispatch has recorded. A response without a run ID (an
-// older broker) keeps the minted value.
+// and reports its run (ptone/scion#2550). Before adopting a different run ID,
+// it verifies that the reported entry's project and agent ID match agent and
+// that the hub minted a credential for that run (ptone/scion#8240); otherwise
+// it keeps the minted run and logs the mismatch. The write is a
+// compare-and-swap against the minted ID, so a late response cannot overwrite
+// a newer run ID that a later dispatch has recorded. A response without a run
+// ID (an older broker) keeps the minted value.
 //
-// Either way the run has settled, so the swap (a same-value swap when the
-// broker reports the minted run or none) also clears the row's previous
-// runs (ptone/scion#3097): the broker's Start removes every existing entry
-// of the agent's name in its project, whatever run it carries, before it
+// Returns the settled run ID for downstream callers such as compensateLandedRun
+// ("" when the broker reported no run ID, minted when adoption was rejected or
+// matched minted, or the verified adopted run ID).
+//
+// When the run settles (a same-value swap when the broker reports the minted
+// run or none, or a verified adoption swap), the swap also clears the row's
+// previous runs (ptone/scion#3097): the broker's Start removes every existing
+// entry of the agent's name in its project, whatever run it carries, before it
 // creates the new one (agent.AgentManager.Start, step 0), so no previous
-// run's entry is left once a start has landed.
-func (d *HTTPAgentDispatcher) adoptBrokerRunID(ctx context.Context, agent *store.Agent, minted string, resp *RemoteAgentResponse) {
+// run's entry is left once a start has landed. When adoption is refused by
+// canAdoptBrokerRunID, no settle swap runs and PreviousRunIDs is preserved
+// conservatively so a later delete still covers earlier runs.
+func (d *HTTPAgentDispatcher) adoptBrokerRunID(ctx context.Context, agent *store.Agent, minted string, resp *RemoteAgentResponse) string {
 	if resp == nil || resp.Agent == nil {
-		return
+		return ""
 	}
-	if resp.Agent.RunID == "" || resp.Agent.RunID == minted {
+	if resp.Agent.RunID == "" {
 		d.swapRunID(ctx, agent, minted, minted, true, "settled the run")
-		return
+		return ""
+	}
+	if resp.Agent.RunID == minted {
+		d.swapRunID(ctx, agent, minted, minted, true, "settled the run")
+		return minted
+	}
+	if !canAdoptBrokerRunID(ctx, d.store, d.log, "Dispatcher", agent, minted, resp.Agent) {
+		return minted
 	}
 	actual := resp.Agent.RunID
 	if d.store != nil && agent.ID != "" {
@@ -1980,12 +2098,12 @@ func (d *HTTPAgentDispatcher) adoptBrokerRunID(ctx context.Context, agent *store
 		if err != nil {
 			d.log.Warn("Dispatcher: failed to record the broker's run ID",
 				"agent_id", agent.ID, "minted_run_id", minted, "broker_run_id", actual, "error", err)
-			return
+			return actual
 		}
 		if !swapped {
 			d.log.Debug("Dispatcher: a newer run ID is recorded; not adopting the broker's",
 				"agent_id", agent.ID, "minted_run_id", minted, "broker_run_id", actual)
-			return
+			return actual
 		}
 	}
 	if agent.RunID == minted {
@@ -1994,6 +2112,7 @@ func (d *HTTPAgentDispatcher) adoptBrokerRunID(ctx context.Context, agent *store
 	}
 	d.log.Info("Dispatcher: adopted the broker's run ID",
 		"agent_id", agent.ID, "agent", agent.Slug, "minted_run_id", minted, "run_id", actual)
+	return actual
 }
 
 // shouldRevertRun reports whether a failed start or restart left the
@@ -2153,6 +2272,10 @@ func (d *HTTPAgentDispatcher) DispatchAgentCreate(ctx context.Context, agent *st
 		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
+	if err := d.hostedConfigPrecheck(ctx, agent); err != nil {
+		span.SetStatus(codes.Error, err.Error())
+		return nil, err
+	}
 	if err := d.createHomeFilesPrecheck(ctx, agent, false); err != nil {
 		span.SetStatus(codes.Error, err.Error())
 		return nil, err
@@ -2183,7 +2306,7 @@ func (d *HTTPAgentDispatcher) DispatchAgentCreate(ctx context.Context, agent *st
 	runID, _, token, recorded, err := d.beginRun(ctx, agent, req.tokenGrant)
 	if err != nil {
 		span.SetStatus(codes.Error, err.Error())
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", errStartRunNotBegun, err)
 	}
 	req.RunID = runID
 	req.AgentToken = token
@@ -2296,6 +2419,9 @@ func (d *HTTPAgentDispatcher) dispatchProvision(ctx context.Context, agent *stor
 		return err
 	}
 	if err := d.storageLayoutPrecheck(ctx, agent); err != nil {
+		return err
+	}
+	if err := d.hostedConfigPrecheck(ctx, agent); err != nil {
 		return err
 	}
 	if err := d.createHomeFilesPrecheck(ctx, agent, reprovision); err != nil {
@@ -2551,6 +2677,9 @@ func (d *HTTPAgentDispatcher) DispatchAgentCreateWithGather(ctx context.Context,
 	if err := d.storageLayoutPrecheck(ctx, agent); err != nil {
 		return nil, err
 	}
+	if err := d.hostedConfigPrecheck(ctx, agent); err != nil {
+		return nil, err
+	}
 	if err := d.createHomeFilesPrecheck(ctx, agent, false); err != nil {
 		return nil, err
 	}
@@ -2582,7 +2711,7 @@ func (d *HTTPAgentDispatcher) DispatchAgentCreateWithGather(ctx context.Context,
 	// on the owning node, which mints its own.
 	runID, _, token, recorded, err := d.beginRun(ctx, agent, req.tokenGrant)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", errStartRunNotBegun, err)
 	}
 	req.RunID = runID
 	req.AgentToken = token
@@ -2768,6 +2897,9 @@ func (d *HTTPAgentDispatcher) finalizeEnv(ctx context.Context, agent *store.Agen
 	if err := d.storageLayoutPrecheck(ctx, agent); err != nil {
 		return nil, err
 	}
+	if err := d.hostedConfigPrecheck(ctx, agent); err != nil {
+		return nil, err
+	}
 	if err := d.createHomeFilesPrecheck(ctx, agent, false); err != nil {
 		return nil, err
 	}
@@ -2796,7 +2928,7 @@ func (d *HTTPAgentDispatcher) finalizeEnv(ctx context.Context, agent *store.Agen
 	// mints the run ID the new entry carries.
 	runID, _, token, recorded, err := d.beginRun(ctx, agent, req.tokenGrant)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", errStartRunNotBegun, err)
 	}
 	req.RunID = runID
 	req.AgentToken = token
@@ -2805,11 +2937,14 @@ func (d *HTTPAgentDispatcher) finalizeEnv(ctx context.Context, agent *store.Agen
 	if req.ResolvedEnv == nil {
 		req.ResolvedEnv = map[string]string{}
 	}
+	installationOnly := usesInstallationGitHubToken(agent)
 	for k, v := range env {
+		if installationOnly && isBlockedInstallationGitHubEnvKey(k) {
+			continue
+		}
 		req.ResolvedEnv[k] = v
+		classifyEnv(&req.EnvClassifications, k, api.EnvKindPlain)
 	}
-	// Classify the caller-provided env as plain config vars.
-	classifyEnvKeys(&req.EnvClassifications, env, api.EnvKindPlain)
 	// The caller's env may carry a GITHUB_TOKEN: decide the token remote
 	// again on the merged env.
 	d.restrictCreateRequestTokenRemote(req)
@@ -3293,7 +3428,7 @@ func (d *HTTPAgentDispatcher) resolveEnvFromStorageWithSource(ctx context.Contex
 	// whose creator is in the ancestry chain. These are added at user-scope
 	// precedence — project/broker env vars with the same key will already
 	// have overridden them.
-	if agent != nil && len(agent.Ancestry) > 1 {
+	if agent != nil && len(agent.Ancestry) > 1 && !isShellAgent(agent) {
 		progenyVars, err := d.store.ListProgenyEnvVars(ctx, agent.Ancestry)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("list progeny env vars: %w", err)
@@ -3356,6 +3491,15 @@ func (d *HTTPAgentDispatcher) resolveAsNeededForKeys(
 
 	// TZ is never an as_needed key: only the agent TZ resolver supplies it.
 	delete(keySet, agentTZEnvKey)
+	// When the agent requires installation-only GitHub tokens, never satisfy
+	// as_needed requests for GITHUB_TOKEN or GH_* aliases from stored PATs.
+	if usesInstallationGitHubToken(agent) {
+		for k := range keySet {
+			if isBlockedInstallationGitHubEnvKey(k) {
+				delete(keySet, k)
+			}
+		}
+	}
 
 	// The start-time user-scope checks: both passes below apply them to the
 	// owner's rows (startSecretResolveOpts).
@@ -3417,12 +3561,20 @@ func (d *HTTPAgentDispatcher) resolveAsNeededForKeys(
 		}
 	}
 
-	// 2. Check secrets (all scopes via backend.Resolve).
+	// 2. Check secrets (all scopes via backend.Resolve; shell agents are
+	// restricted to the owning user's user-scope secrets only).
 	// Only environment-type secrets can be mapped to env key=value pairs.
-	if d.secretBackend != nil {
+	if d.secretBackend != nil && agent != nil && (!isShellAgent(agent) || agent.OwnerID != "") {
+		projectID, brokerID := agent.ProjectID, agent.RuntimeBrokerID
+		if isShellAgent(agent) {
+			projectID, brokerID = "", ""
+		} else if resolveOpts == nil && d.agentSecretsEnabled() && agent != nil && agent.ID != "" {
+			resolveOpts = &secret.ResolveOpts{AgentID: agent.ID}
+		}
 		resolved, err := d.secretBackend.Resolve(
-			ctx, agent.OwnerID, agent.ProjectID, agent.RuntimeBrokerID, resolveOpts)
+			ctx, agent.OwnerID, projectID, brokerID, resolveOpts)
 		if err == nil {
+			resolved = filterShellUserSecrets(agent, resolved)
 			resolved = d.applyTestAdminSecretScopes(ctx, agent, resolved, ta.restricted, ta.allowed, ta.root)
 		}
 		if errors.Is(err, secret.ErrResolveDecrypt) {
@@ -3436,7 +3588,7 @@ func (d *HTTPAgentDispatcher) resolveAsNeededForKeys(
 			}
 		} else {
 			// Iterate in reverse: resolved is ordered lowest-precedence first
-			// (runtime_broker < hub < project < user), so walking backwards
+			// (runtime_broker < hub < project < user < agent), so walking backwards
 			// lets higher-precedence secrets win.
 			for i := len(resolved) - 1; i >= 0; i-- {
 				sv := resolved[i]
@@ -3488,65 +3640,14 @@ func (d *HTTPAgentDispatcher) resolveAsNeededForKeys(
 	}
 
 	delete(result, agentTZEnvKey)
-	return result, nil
-}
-
-func (d *HTTPAgentDispatcher) injectLifecycleGitHubToken(
-	ctx context.Context,
-	agent *store.Agent,
-	resolvedEnv map[string]string,
-	envClassifications *map[string]api.EnvKind,
-	operation string,
-) (ownAppToken string) {
-	if d.githubAppMinter == nil || agent.ProjectID == "" {
-		return ""
-	}
-
-	project, err := d.store.GetProject(ctx, agent.ProjectID)
-	if err != nil {
-		return ""
-	}
-	mintProject := d.githubMintProject(ctx, agent, project)
-	if mintProject == nil {
-		return ""
-	}
-
-	if resolvedEnv["GITHUB_TOKEN"] != "" {
-		d.log.Warn(operation+": user GITHUB_TOKEN takes precedence over GitHub App token — user token will be used for gh CLI, GitHub App for git credential helper",
-			"project_id", agent.ProjectID)
-		resolvedEnv["SCION_USER_GITHUB_TOKEN"] = "true"
-		classifyEnv(envClassifications, "SCION_USER_GITHUB_TOKEN", api.EnvKindPlain)
-		resolvedEnv["SCION_GITHUB_APP_ENABLED"] = "true"
-		classifyEnv(envClassifications, "SCION_GITHUB_APP_ENABLED", api.EnvKindPlain)
-		return ""
-	}
-
-	token, expiry, err := d.githubAppMinter.MintGitHubAppTokenForProject(ctx, mintProject)
-	if err != nil {
-		if d.debug {
-			d.log.Warn(operation+": GitHub App token minting failed", "error", err, "project_id", agent.ProjectID)
+	if usesInstallationGitHubToken(agent) {
+		for k := range result {
+			if isBlockedInstallationGitHubEnvKey(k) {
+				delete(result, k)
+			}
 		}
-		return ""
 	}
-	if token == "" {
-		return ""
-	}
-
-	resolvedEnv["GITHUB_TOKEN"] = token
-	classifyEnv(envClassifications, "GITHUB_TOKEN", api.EnvKindSecretInjected)
-	resolvedEnv["SCION_GITHUB_APP_ENABLED"] = "true"
-	classifyEnv(envClassifications, "SCION_GITHUB_APP_ENABLED", api.EnvKindPlain)
-	resolvedEnv["SCION_GITHUB_TOKEN_EXPIRY"] = expiry
-	classifyEnv(envClassifications, "SCION_GITHUB_TOKEN_EXPIRY", api.EnvKindPlain)
-	resolvedEnv["SCION_GITHUB_TOKEN_PATH"] = "/tmp/.github-token"
-	classifyEnv(envClassifications, "SCION_GITHUB_TOKEN_PATH", api.EnvKindPlain)
-	// ownAppToken is only a token minted for the agent's own project; a
-	// token-source project's token is not project-bound for this agent
-	// (gitTokenProjectBound).
-	if mintProject.ID != project.ID {
-		return ""
-	}
-	return token
+	return result, nil
 }
 
 // setStartEnvToken adds the Hub auth token beginRun issued to a start's
@@ -3630,6 +3731,9 @@ func (d *HTTPAgentDispatcher) buildStartEnv(ctx context.Context, agent *store.Ag
 		purpose = PurposeRestart
 	default:
 		return startEnvResult{}, fmt.Errorf("%s: unsupported mint site %q for a start", caller, site)
+	}
+	if isShellAgent(agent) && agent.AppliedConfig == nil {
+		return startEnvResult{}, fmt.Errorf("%s: execution container has unreadable applied config", caller)
 	}
 	// Launch material is selected under the delivery credential: every
 	// project-, hub- and broker-scope env var and secret is authorized
@@ -3730,9 +3834,12 @@ func (d *HTTPAgentDispatcher) buildStartEnv(ctx context.Context, agent *store.Ag
 	// (over any existing value), and none is sent as a resolved secret.
 	var gitToken noAuthGitToken
 	if noAuth {
-		gitToken = pickNoAuthGitTokenFrom(resolvedSecrets)
+		// Defense in depth: deliverGitHubToken also strips non-installation GitHub tokens downstream.
+		if !usesInstallationGitHubToken(agent) {
+			gitToken = pickNoAuthGitTokenFrom(resolvedSecrets)
+			applyNoAuthGitToken(resolvedEnv, &envClassifications, gitToken)
+		}
 		resolvedSecrets = nil
-		applyNoAuthGitToken(resolvedEnv, &envClassifications, gitToken)
 	}
 	resolvedSecrets = d.dropTZTargetedSecrets(ctx, agent, resolvedSecrets)
 	for _, s := range resolvedSecrets {
@@ -3899,7 +4006,13 @@ func (d *HTTPAgentDispatcher) buildStartEnv(ctx context.Context, agent *store.Ag
 		}
 	}
 
-	appToken := d.injectLifecycleGitHubToken(ctx, agent, resolvedEnv, &envClassifications, caller)
+	var appToken string
+	resolvedSecrets, _, appToken = d.deliverGitHubToken(ctx, agent, resolvedEnv, &envClassifications, resolvedSecrets, nil, caller)
+	projectToken := gitToken.projectBound()
+	// Defense in depth: the noAuth fetch above is already skipped for installation-only agents.
+	if usesInstallationGitHubToken(agent) {
+		projectToken = ""
+	}
 	// A personal git token goes only to a recorded remote on the GitHub
 	// host (personal_git_token.go).
 	d.restrictPersonalTokenRemote(gitTokenDispatch{
@@ -3910,13 +4023,20 @@ func (d *HTTPAgentDispatcher) buildStartEnv(ctx context.Context, agent *store.Ag
 		appToken:  appToken,
 		// The project's own token, for an agent without credentials (as
 		// create passes it): it is not in secrets.
-		projectToken: gitToken.projectBound(),
+		projectToken: projectToken,
 	}, &wsSpec.GitClone, &wsSpec.SharedWorkspaceClone)
 	// Read once: DispatchAgentStart/Restart send the same set to the broker.
 	experiments := d.dispatchExperiments()
 	applyAgentExperiments(resolvedEnv, &envClassifications, experiments)
 	d.applyConduitPolicy(resolvedEnv, &envClassifications)
 
+	var skippedAudienceCanEditAgent bool
+	for _, item := range skippedSecrets {
+		if item.Scope == store.ScopeAgent {
+			skippedAudienceCanEditAgent = d.skippedSecretAudienceCanEditAgent(ctx, agent)
+			break
+		}
+	}
 	return startEnvResult{
 		env:             resolvedEnv,
 		classifications: envClassifications,
@@ -3927,10 +4047,16 @@ func (d *HTTPAgentDispatcher) buildStartEnv(ctx context.Context, agent *store.Ag
 		tokenGrant:      tokenGrant,
 		experiments:     experiments,
 		// The warning's audience is this request's: the agent's owner
-		// sees user-scope names, everyone else a count.
-		skippedSecrets:       skippedSecrets,
-		skippedSecretWarning: formatSkippedSecretWarning(skippedSecrets, startedVerb, skippedSecretAudienceIsOwner(ctx, agent)),
-		purpose:              purpose,
+		// sees user-scope names, requesters who can edit the agent see
+		// agent-scope names, and everyone else sees counts.
+		skippedSecrets: skippedSecrets,
+		skippedSecretWarning: formatSkippedSecretWarningFor(
+			skippedSecrets,
+			startedVerb,
+			skippedSecretAudienceIsOwner(ctx, agent),
+			skippedAudienceCanEditAgent,
+		),
+		purpose: purpose,
 	}, nil
 }
 
@@ -4024,6 +4150,13 @@ func (d *HTTPAgentDispatcher) dispatchAgentStart(ctx context.Context, agent *sto
 		return nil, err
 	}
 
+	// HomeFiles delivery backstop: no start path may launch an agent whose
+	// create-time HomeFiles have not yet been delivered.
+	if agentHomeFilesPending(agent) {
+		span.SetStatus(codes.Error, errHomeFilesNotDelivered.Error())
+		return nil, errHomeFilesNotDelivered
+	}
+
 	if err := requireRuntimeBrokerAssigned(agent); err != nil {
 		span.SetStatus(codes.Error, err.Error())
 		return nil, err
@@ -4047,6 +4180,10 @@ func (d *HTTPAgentDispatcher) dispatchAgentStart(ctx context.Context, agent *sto
 		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
+	if err := d.hostedConfigPrecheck(ctx, agent); err != nil {
+		span.SetStatus(codes.Error, err.Error())
+		return nil, err
+	}
 
 	// Capture the phase and launch-error this dispatch found the agent in,
 	// before buildStartEnv/applyBrokerResponse can change either. The
@@ -4061,11 +4198,20 @@ func (d *HTTPAgentDispatcher) dispatchAgentStart(ctx context.Context, agent *sto
 	priorPhase := agent.Phase
 	priorLaunchError := agent.LaunchError
 
+	priorStatus := opts.PriorStatus
+	if priorStatus == nil {
+		priorStatus = dispatchPriorStatus(agent)
+	}
+
 	// If no explicit task provided, fall back to the agent's applied config
 	// task. Skip this on a pure resume (no new message): the harness should
 	// just continue its prior session rather than be re-handed the original
-	// creation task. A wake-with-message still passes that message as task.
-	if task == "" && !resume && agent.AppliedConfig != nil {
+	// creation task. Also skip when the agent's prior run already completed
+	// (ptone/scion#8900): the broker will present a completion notice instead
+	// of replaying the original task prompt. A wake-with-message or explicit
+	// task still passes that task through.
+	priorCompleted := priorStatus != nil && strings.EqualFold(strings.TrimSpace(priorStatus.Activity), string(state.ActivityCompleted))
+	if task == "" && !resume && !priorCompleted && agent.AppliedConfig != nil {
 		task = agent.AppliedConfig.Task
 	}
 
@@ -4156,6 +4302,7 @@ func (d *HTTPAgentDispatcher) dispatchAgentStart(ctx context.Context, agent *sto
 	// the top tier (ptone/scion#4222).
 	tel := d.dispatchTelemetry(agent, projectInfo.telemetryPolicy)
 	tel.injectRequesterEnabled(resolvedEnv, &envClassifications)
+	d.warnGCPTelemetryBlockedWithoutCredentials(ctx, agent, tel, resolvedEnv, startEnv.secrets)
 
 	// Thread through updated InlineConfig so the broker can apply config
 	// changes (e.g. max_turns) made after initial provisioning.
@@ -4199,6 +4346,7 @@ func (d *HTTPAgentDispatcher) dispatchAgentStart(ctx context.Context, agent *sto
 		TemplateName:       agent.Template,
 		PreviousProjectIDs: d.previousProjectIDs(ctx, projectInfo),
 		NoAuth:             launchesWithoutCredentials(agent),
+		PriorStatus:        priorStatus,
 	}
 	extras.TemplateID, extras.TemplateHash = dispatchTemplateIdentity(agent)
 	extras.Profile = dispatchProfile(agent)
@@ -4316,8 +4464,9 @@ func (d *HTTPAgentDispatcher) dispatchAgentStart(ctx context.Context, agent *sto
 		// The owning node mints and records its own run ID.
 		d.revertRun(ctx, agent, runID, previousRunID)
 		args := &StartDispatchArgs{
-			Task:   task,
-			Resume: resume,
+			Task:        task,
+			Resume:      resume,
+			PriorStatus: priorStatus,
 		}
 		if opts.Async {
 			// The owner applies its own dispatcher rules; the requester
@@ -4423,6 +4572,9 @@ func (d *HTTPAgentDispatcher) DispatchAgentRestart(ctx context.Context, agent *s
 	if err := d.launchGuardError(ctx, agent, "DispatchAgentRestart"); err != nil {
 		return err
 	}
+	if agentHomeFilesPending(agent) {
+		return errHomeFilesNotDelivered
+	}
 	if err := requireRuntimeBrokerAssigned(agent); err != nil {
 		return err
 	}
@@ -4439,6 +4591,9 @@ func (d *HTTPAgentDispatcher) DispatchAgentRestart(ctx context.Context, agent *s
 		return err
 	}
 	if err := d.storageLayoutPrecheck(ctx, agent); err != nil {
+		return err
+	}
+	if err := d.hostedConfigPrecheck(ctx, agent); err != nil {
 		return err
 	}
 
@@ -4475,6 +4630,11 @@ func (d *HTTPAgentDispatcher) DispatchAgentRestart(ctx context.Context, agent *s
 	// sends no inline config, so it never carries inline telemetry.
 	tel := d.dispatchTelemetry(agent, projectInfo.telemetryPolicy)
 	tel.injectRequesterEnabled(resolvedEnv, &envClassifications)
+	d.warnGCPTelemetryBlockedWithoutCredentials(ctx, agent, tel, resolvedEnv, startEnv.secrets)
+	priorStatus := dispatchPriorStatusFromContext(ctx)
+	if priorStatus == nil {
+		priorStatus = dispatchPriorStatus(agent)
+	}
 	// image_tag, resolved once for both the explicit image and the hub
 	// defaults (ptone/scion#6625).
 	imageTag := d.dispatchImageTag(agent)
@@ -4497,6 +4657,7 @@ func (d *HTTPAgentDispatcher) DispatchAgentRestart(ctx context.Context, agent *s
 		ResolvedSecrets:    startEnv.secrets,
 		PreviousProjectIDs: d.previousProjectIDs(ctx, projectInfo),
 		NoAuth:             launchesWithoutCredentials(agent),
+		PriorStatus:        priorStatus,
 	}
 	extras.TemplateID, extras.TemplateHash = dispatchTemplateIdentity(agent)
 	extras.Profile = dispatchProfile(agent)
@@ -4529,7 +4690,7 @@ func (d *HTTPAgentDispatcher) DispatchAgentRestart(ctx context.Context, agent *s
 	if errors.Is(err, ErrLifecycleDeferred) {
 		// The owning node mints and records its own run ID.
 		d.revertRun(ctx, agent, runID, previousRunID)
-		return d.deferredRestart(ctx, agent)
+		return d.deferredRestart(ctx, agent, priorStatus)
 	}
 	d.settleFailedRun(ctx, agent, runID, previousRunID, err)
 	if err != nil {
@@ -4540,6 +4701,50 @@ func (d *HTTPAgentDispatcher) DispatchAgentRestart(ctx context.Context, agent *s
 	// keep it, reporting that entry's (older) run ID.
 	d.settleLandedRun(ctx, agent, runID, recorded, resp)
 	return nil
+}
+
+type dispatchPriorStatusCtxKey struct{}
+
+// withDispatchPriorStatus attaches a requester-captured PriorStatus to ctx so
+// cross-node execDispatchRestart can pass it into DispatchAgentRestart after
+// the requester's starting write has cleared any retained activity on the row
+// (ptone/scion#8900).
+func withDispatchPriorStatus(ctx context.Context, ps *api.PriorStatus) context.Context {
+	if ps == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, dispatchPriorStatusCtxKey{}, ps)
+}
+
+func dispatchPriorStatusFromContext(ctx context.Context) *api.PriorStatus {
+	ps, _ := ctx.Value(dispatchPriorStatusCtxKey{}).(*api.PriorStatus)
+	return ps
+}
+
+// dispatchPriorStatus snapshots the agent's last known activity status for the
+// broker so a resume or restart can build a status-aware notice without
+// replaying the original task prompt when the prior run completed
+// (ptone/scion#8900). Returns nil when no prior activity is recorded.
+func dispatchPriorStatus(agent *store.Agent) *api.PriorStatus {
+	if agent == nil {
+		return nil
+	}
+	activity := strings.ToLower(strings.TrimSpace(agent.Activity))
+	if activity == "" {
+		return nil
+	}
+	summary := strings.TrimSpace(agent.TaskSummary)
+	if summary == "" && activity != string(state.ActivityCompleted) {
+		summary = strings.TrimSpace(agent.Message)
+	}
+	ps := &api.PriorStatus{
+		Activity: activity,
+		Summary:  summary,
+	}
+	if !agent.LastActivityEvent.IsZero() {
+		ps.At = agent.LastActivityEvent.UTC()
+	}
+	return ps
 }
 
 // DispatchAgentResetAuth injects a fresh auth token into a running agent without
@@ -5029,8 +5234,8 @@ func (d *HTTPAgentDispatcher) deferredStop(ctx context.Context, agent *store.Age
 }
 
 // deferredRestart handles a cross-node agent restart.
-func (d *HTTPAgentDispatcher) deferredRestart(ctx context.Context, agent *store.Agent) error {
-	err := d.deferredLifecycle(ctx, agent, "restart", &RestartDispatchArgs{}, isStartTerminal)
+func (d *HTTPAgentDispatcher) deferredRestart(ctx context.Context, agent *store.Agent, priorStatus *api.PriorStatus) error {
+	err := d.deferredLifecycle(ctx, agent, "restart", &RestartDispatchArgs{PriorStatus: priorStatus}, isStartTerminal)
 	return d.deferredLaunchGuardError(ctx, agent, "deferredRestart", err)
 }
 
@@ -5294,17 +5499,15 @@ func (d *HTTPAgentDispatcher) deferredLifecycleResult(
 // from the agent's stored role, scopes and ancestry:
 //
 // The progeny path (an agent created by another agent: ancestry of more
-// than one entry). Each progeny candidate must pass both:
-//   - project.secret_read with ActionRead on the secret, the generic
-//     delegation walk this path has always applied (an unrecorded hop never
-//     allows it, so a chain without recorded provenance stays denied here);
-//   - for a user-scope candidate, secret.use with ActionUse on
-//     userSecretResource, the decision the runtime read (check 8) makes.
-//     Its step 10 applies the user-scope secret parent ceiling
-//     (EvaluateUserSecretParentCeiling), including the terminal user's
-//     secret.use access constraints (S4b) and the owner binding at the head
-//     of the ancestry (S7, S8); Decide also applies the agent's own access
-//     constraints for secret.use.
+// than one entry). Each progeny candidate must be user-scope (any non-user
+// scope fails closed) and pass secret.use with ActionUse on
+// userSecretResource, the same decision the runtime read (check 8) makes.
+// Its step 10 applies the user-scope secret parent ceiling
+// (EvaluateUserSecretParentCeiling), including unrecorded-hop denial (S3a),
+// intermediate agent secret.use (S3d), terminal user project admission
+// (S4a) and secret.use access constraints (S4b), and the owner binding at
+// the head of the ancestry (S7, S8); Decide also applies the agent's own
+// scopes (project:secret:read) and access constraints for secret.use.
 //
 // The owner path (the user scope of agent.OwnerID, resolved directly; for an
 // agent created by a user, OwnerID is that user). It used to have no check.
@@ -5422,7 +5625,7 @@ func (d *HTTPAgentDispatcher) startSecretResolveOpts(ctx context.Context, agent 
 	}
 
 	opts := &secret.ResolveOpts{}
-	if len(ancestry) > 1 {
+	if len(ancestry) > 1 && !isShellAgent(agent) {
 		if d.debug {
 			d.log.Debug("progeny resolution enabled",
 				"agent_id", agentID, "ancestry_len", len(ancestry),
@@ -5430,31 +5633,19 @@ func (d *HTTPAgentDispatcher) startSecretResolveOpts(ctx context.Context, agent 
 		}
 		opts.AgentAncestry = ancestry
 		opts.AuthzCheck = func(s secret.SecretMeta) bool {
+			if s.Scope != store.ScopeUser {
+				deny("progeny", s, "progeny secret resolution applies to user-scope secrets only")
+				return false
+			}
 			ident := identity()
-			// Name the permission explicitly. (resource="secret",
-			// action="read") has no registry entry - agent secret access is
-			// registered as project.secret_read on ResourceProject - so
-			// resolveResourcePermission cannot resolve the pair on its own.
-			decision := d.authzService.Decide(ctx, AuthzRequest{
-				Principal:  principalContextForIdentity(ident),
-				Credential: credentialContextForIdentity(ident),
-				Resource:   Resource{Type: "secret", ID: s.ID},
-				Action:     ActionRead,
-				Permission: permissionProjectSecretRead,
-			})
-			if decision.Allowed && s.Scope == store.ScopeUser {
-				decision = secretUse(ident, s)
-				if !decision.Allowed {
-					// One line per refused user row: the rate-limited
-					// withheld record, not also the deny line below.
-					withheld("progeny", s, decision)
-					return false
-				}
-			}
+			decision := secretUse(ident, s)
 			if !decision.Allowed {
-				deny("progeny", s, decision.Reason)
+				// One line per refused user row: the rate-limited
+				// withheld record, not also the deny line above.
+				withheld("progeny", s, decision)
+				return false
 			}
-			return decision.Allowed
+			return true
 		}
 	}
 	if agent.OwnerID != "" {
@@ -5520,16 +5711,47 @@ func (d *HTTPAgentDispatcher) startSecretResolveOpts(ctx context.Context, agent 
 			return ceiling.Allowed
 		}
 	}
+	if d.agentSecretsEnabled() && agentID != "" && !isShellAgent(agent) {
+		opts.AgentID = agentID
+	}
 	return opts, gate
+}
+
+// skippedSecretAudienceCanEditAgent reports whether the requester of this
+// dispatch can edit agent (agent.update), so skipped agent-scope secrets can
+// be listed by name instead of counted.
+func (d *HTTPAgentDispatcher) skippedSecretAudienceCanEditAgent(ctx context.Context, agent *store.Agent) bool {
+	if agent == nil || ctx == nil {
+		return false
+	}
+	if skippedSecretAudienceIsOwner(ctx, agent) {
+		return true
+	}
+	if d.authzService == nil {
+		return false
+	}
+	identity := GetIdentityFromContext(ctx)
+	userIdent, ok := identity.(UserIdentity)
+	if !ok || isNilIdentity(userIdent) {
+		return false
+	}
+	return d.authzService.CheckAccess(ctx, userIdent, Resource{
+		Type:       "agent",
+		ID:         agent.ID,
+		OwnerID:    agent.OwnerID,
+		ParentType: "project",
+		ParentID:   agent.ProjectID,
+	}, ActionUpdate).Allowed
 }
 
 // resolveSecrets queries secrets from all applicable scopes and merges them
 // into a flat list. Higher scopes override lower:
 //
-//	runtime_broker  <  hub  <  project  <  user
+//	runtime_broker  <  hub  <  project  <  user  <  agent
 //
-// This matches envScopePrecedence (see above). The divergence previously
-// tracked in issue #624 was corrected in PR #1227.
+// Plain env vars use envScopePrecedence (runtime_broker < hub < project < user);
+// secrets add agent scope at the highest precedence (ptone/scion#8743). The
+// earlier divergence tracked in issue #624 was corrected in PR #1227.
 func (d *HTTPAgentDispatcher) resolveSecrets(ctx context.Context, agent *store.Agent) ([]ResolvedSecret, []string, error) {
 	if d.secretBackend == nil {
 		if d.debug {
@@ -5544,18 +5766,32 @@ func (d *HTTPAgentDispatcher) resolveSecrets(ctx context.Context, agent *store.A
 			"brokerID", agent.RuntimeBrokerID,
 		)
 	}
+	// Shell execution containers receive only the owning user's user-scope
+	// secrets, never project, broker, hub, or progeny secrets (ptone/scion#8817 H2).
+	if isShellAgent(agent) && agent.OwnerID == "" {
+		return nil, nil, nil
+	}
+
 	// The start-time checks on the progeny and owner user-scope paths
 	// (startSecretResolveOpts).
 	// One evaluation of the test-admin scope restriction, for both the
 	// start-time checks' keep decision and the restriction itself.
 	ta := d.testAdminScopesFor(ctx, agent)
 	resolveOpts, gate := d.startSecretResolveOpts(ctx, agent, &ta)
+	if resolveOpts == nil && d.agentSecretsEnabled() && agent != nil && agent.ID != "" && !isShellAgent(agent) {
+		resolveOpts = &secret.ResolveOpts{AgentID: agent.ID}
+	}
 
-	resolved, err := d.secretBackend.Resolve(ctx, agent.OwnerID, agent.ProjectID, agent.RuntimeBrokerID, resolveOpts)
+	projectID, brokerID := agent.ProjectID, agent.RuntimeBrokerID
+	if isShellAgent(agent) {
+		projectID, brokerID = "", ""
+	}
+	resolved, err := d.secretBackend.Resolve(ctx, agent.OwnerID, projectID, brokerID, resolveOpts)
 	gate.flush(ctx, ownerMaterialSiteResolveSecrets)
 	if err != nil {
 		return nil, nil, err
 	}
+	resolved = filterShellUserSecrets(agent, resolved)
 	resolved = d.applyTestAdminSecretScopes(ctx, agent, resolved, ta.restricted, ta.allowed, ta.root)
 	result := make([]ResolvedSecret, 0, len(resolved))
 	var asNeededKeys []string
@@ -5605,6 +5841,26 @@ func (d *HTTPAgentDispatcher) resolveSecrets(ctx context.Context, agent *store.A
 			"asNeededKeys", asNeededKeys)
 	}
 	return result, asNeededKeys, nil
+}
+
+// filterShellUserSecrets restricts resolved secrets for shell execution
+// containers to the owning user's own user-scope rows only, stripping hub,
+// project, broker, and progeny rows (ptone/scion#8817 H2). For non-shell
+// agents it returns resolved unchanged.
+func filterShellUserSecrets(agent *store.Agent, resolved []secret.SecretWithValue) []secret.SecretWithValue {
+	if !isShellAgent(agent) {
+		return resolved
+	}
+	if agent.OwnerID == "" || len(resolved) == 0 {
+		return nil
+	}
+	out := resolved[:0:0]
+	for _, sv := range resolved {
+		if sv.Scope == store.ScopeUser && sv.ScopeID == agent.OwnerID {
+			out = append(out, sv)
+		}
+	}
+	return out
 }
 
 // applyHubGCPMetadataModeEnv writes the hub's authoritative GCP identity

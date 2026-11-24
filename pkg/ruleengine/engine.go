@@ -70,21 +70,19 @@ type Input struct {
 // ErrBudgetExhausted is returned when an aggregate BudgetTracker has no remaining time.
 var ErrBudgetExhausted = errors.New("rule budget exhausted")
 
-// maxEngineDeadlineMargin is the upper bound on the safety margin that
+// MaxEngineDeadlineMargin is the upper bound on the safety margin that
 // dialects such as System One subtract from Budget.MaxEvalTime so their own
 // internal deadline fires slightly before the engine's context deadline.
-// Keep in sync with pkg/systemone/runtime.engineDeadlineWithMargin (unification
-// tracked under ptone/scion#8033).
-const maxEngineDeadlineMargin = 10 * time.Millisecond
+const MaxEngineDeadlineMargin = 10 * time.Millisecond
 
-// engineDeadlineMargin returns the deadline safety margin min(10ms, d/20) for
-// an evaluation timeout d (0 when d <= 0). Keep in sync with
-// pkg/systemone/runtime.engineDeadlineWithMargin (ptone/scion#8033).
-func engineDeadlineMargin(d time.Duration) time.Duration {
+// EngineDeadlineMargin returns the deadline safety margin
+// min(MaxEngineDeadlineMargin, d/20) for a positive evaluation timeout d
+// (floored to 1ns), or 0 when d <= 0.
+func EngineDeadlineMargin(d time.Duration) time.Duration {
 	if d <= 0 {
 		return 0
 	}
-	margin := min(maxEngineDeadlineMargin, d/20)
+	margin := min(MaxEngineDeadlineMargin, d/20)
 	if margin <= 0 {
 		return 1
 	}
@@ -309,6 +307,19 @@ type CachedDialect interface {
 	Invalidate(envName string, scope celengine.CacheScope)
 }
 
+// CachedCompileGateDialect is an optional extension of CachedDialect that
+// reports whether CachedCompile hit the cache and invokes beforeCompile (when
+// non-nil) only on a cache miss before compiling.
+//
+// Any CachedDialect used by a compile-budgeted consumer must implement this
+// interface so cache hits are not charged to the compile budget or counted as
+// compile misses; today only the CEL dialect is granted to the trigger
+// consumer, and it implements CachedCompileGateDialect.
+type CachedCompileGateDialect interface {
+	CachedDialect
+	CachedCompileWithGate(ctx context.Context, scope celengine.CacheScope, rule string, kind Kind, env EnvironmentRef, beforeCompile func() error) (Compiled, bool, error)
+}
+
 // Engine dispatches rule compilation and evaluation by dialect, enforces
 // deny-by-default per-consumer dialect grants, and bounds evaluation time and budgets.
 type Engine struct {
@@ -466,26 +477,59 @@ func (e *Engine) Compile(ctx context.Context, dialect, rule string, kind Kind, e
 // defaults to env.Consumer; a non-empty scope.Consumer that differs from
 // env.Consumer is rejected after admission.
 func (e *Engine) CachedCompile(ctx context.Context, dialect string, scope celengine.CacheScope, rule string, kind Kind, env EnvironmentRef) (Compiled, error) {
+	compiled, _, err := e.CachedCompileWithGate(ctx, dialect, scope, rule, kind, env, nil)
+	return compiled, err
+}
+
+// CachedCompileWithGate behaves like CachedCompile and additionally reports
+// whether the program came from cache (hit=true) and invokes beforeCompile
+// (when non-nil) only before compiling on a cache miss. Dialects that do not
+// implement CachedCompileGateDialect treat calls as misses and run beforeCompile
+// before compiling.
+func (e *Engine) CachedCompileWithGate(
+	ctx context.Context,
+	dialect string,
+	scope celengine.CacheScope,
+	rule string,
+	kind Kind,
+	env EnvironmentRef,
+	beforeCompile func() error,
+) (Compiled, bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	d, err := e.resolveDialect(env.Consumer, dialect)
 	if err != nil {
-		return Compiled{}, err
+		return Compiled{}, false, err
 	}
 	env.Consumer = strings.TrimSpace(env.Consumer)
 	if s := strings.TrimSpace(scope.Consumer); s != "" && s != env.Consumer {
-		return Compiled{}, &UnsupportedDialectError{
+		return Compiled{}, false, &UnsupportedDialectError{
 			Dialect:  normalizeDialect(dialect),
 			Consumer: env.Consumer,
 			Reason:   ReasonDialectNotAllowed,
 		}
 	}
 	scope.Consumer = env.Consumer
-	if cd, ok := d.(CachedDialect); ok {
-		return cd.CachedCompile(ctx, scope, rule, kind, env)
+	if gcd, ok := d.(CachedCompileGateDialect); ok {
+		return gcd.CachedCompileWithGate(ctx, scope, rule, kind, env, beforeCompile)
 	}
-	return d.Compile(ctx, rule, kind, env)
+	if beforeCompile != nil {
+		if err := beforeCompile(); err != nil {
+			return Compiled{}, false, err
+		}
+	}
+	if cd, ok := d.(CachedDialect); ok {
+		// Fallback for CachedDialects that do not implement CachedCompileGateDialect:
+		// always reports hit=false (after running beforeCompile above), so lookups
+		// are charged to any compile budget and counted as misses. Cached dialects
+		// used by budgeted consumers must implement CachedCompileGateDialect (today
+		// only the CEL dialect is granted to the trigger consumer, and it implements it).
+		c, err := cd.CachedCompile(ctx, scope, rule, kind, env)
+		return c, false, err
+	}
+	c, err := d.Compile(ctx, rule, kind, env)
+	return c, false, err
 }
 
 // Invalidate forwards scoped cache invalidation to a CachedDialect when
@@ -577,7 +621,7 @@ func (e *Engine) Evaluate(ctx context.Context, c Compiled, input Input, budget B
 			}
 		}
 		trackerDeadline := errors.Is(context.Cause(evalCtx), errTrackerTimeout) ||
-			elapsed >= evalTimeout-engineDeadlineMargin(evalTimeout)
+			elapsed >= evalTimeout-EngineDeadlineMargin(evalTimeout)
 		if boundFromTracker && trackerDeadline && isTimeoutOrCancelFailure(err) {
 			budget.Tracker.Exhaust()
 			return Decision{}, fmt.Errorf("%w: %w", ErrBudgetExhausted, err)

@@ -289,6 +289,10 @@ const (
 	// unused gap of the range.
 	LockPendingSecretExpiry AdvisoryLockKey = 0x5C10001B
 
+	// LockSecretRequestExpiry guards the periodic secret-request expiry and
+	// stale-claim recovery sweep ("secret-request-expiry", ptone/scion#8747).
+	LockSecretRequestExpiry AdvisoryLockKey = 0x5C100033
+
 	// LockScheduledExecRunSweep guards the scheduled exec run sweeper
 	// ("scheduled-exec-run-sweep", ptone/scion#7883), so one replica per tick
 	// polls the outcomes of unfinished exec runs no live tracker owns and
@@ -311,6 +315,11 @@ const (
 	// ("nfs-orphan-scan", ptone/scion#7932), so one replica per tick scans
 	// the shared project storage and records kind=nfs_tree runtime_orphans.
 	LockNFSOrphanScan AdvisoryLockKey = 0x5C100031
+
+	// LockAuditRecordCleanup guards the hourly periodic cleanup of mutation
+	// audit records older than server.hub.audit_retention_days
+	// ("audit-record-cleanup", ptone/scion#2232).
+	LockAuditRecordCleanup AdvisoryLockKey = 0x5C100032
 
 	// LockPendingSecretOwnerWrite is the CLASS ID for the per-owner pending
 	// secret write lock: a transaction-scoped

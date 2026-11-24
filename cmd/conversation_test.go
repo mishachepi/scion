@@ -118,6 +118,19 @@ func TestConversationCreateFlags(t *testing.T) {
 	require.NotNil(t, f, "--json flag should exist")
 }
 
+// TestConversationCreateHelpStatesAllowedCharacters covers ptone/scion#8455:
+// `scion conversation create --help` states the allowed character set and
+// 100-character length limit for group conversation names.
+func TestConversationCreateHelpStatesAllowedCharacters(t *testing.T) {
+	long := conversationCreateCmd.Long
+	assert.Contains(t, long, "100", "help must state the 100-character length limit")
+	assert.Contains(t, long, "letter", "help must state that letters are allowed")
+	assert.Contains(t, long, "digit", "help must state that digits are allowed")
+	assert.Contains(t, long, "space", "help must state that spaces are allowed")
+	assert.Contains(t, long, "underscore", "help must state that underscores are allowed")
+	assert.Contains(t, long, "hyphen", "help must state that hyphens are allowed")
+}
+
 func TestConversationGetFlags(t *testing.T) {
 	flags := conversationGetCmd.Flags()
 
@@ -185,6 +198,114 @@ func TestConversationGetRequiresArgs(t *testing.T) {
 	assert.Error(t, err, "get should require a conversation ref argument")
 }
 
+func TestConversationRejectsPositionalArgs(t *testing.T) {
+	require.NotNil(t, conversationCmd.Args, "conversationCmd must set Args to reject unknown subcommands")
+	assert.NoError(t, conversationCmd.Args(conversationCmd, []string{}))
+	assert.Error(t, conversationCmd.Args(conversationCmd, []string{"view"}))
+
+	require.NotNil(t, conversationListCmd.Args, "conversationListCmd must set Args to reject extra arguments")
+	assert.NoError(t, conversationListCmd.Args(conversationListCmd, []string{}))
+	assert.Error(t, conversationListCmd.Args(conversationListCmd, []string{"extra"}))
+}
+
+// TestConversationBareAndUnknownSubcommand covers ptone/scion#8160 through
+// rootCmd.Execute(): bare "scion conversation" still lists conversations,
+// while unknown subcommands (e.g. "scion conversation view ...") and extra
+// arguments to "scion conversation list" fail fast without hitting the hub.
+func TestConversationBareAndUnknownSubcommand(t *testing.T) {
+	restoreAllSilenceUsage(t)
+	orig := saveConversationListTestState()
+	defer orig.restore()
+
+	var sawRequest bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/conversations" && r.Method == http.MethodGet {
+			sawRequest = true
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"conversations": []interface{}{}})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	isolateHubEnvForTest(t, server.URL, "")
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	projectPath = setupConversationCreateProject(t, tmpHome, server.URL, "")
+	convProject = ""
+	convJSON = false
+	outputFormat = ""
+
+	execArgs := func(t *testing.T, args []string) (string, error) {
+		t.Helper()
+		t.Cleanup(func() {
+			resetCommandFlags(t, conversationCmd)
+			resetCommandFlags(t, conversationListCmd)
+		})
+		var buf bytes.Buffer
+		rootCmd.SetArgs(args)
+		rootCmd.SetOut(&buf)
+		rootCmd.SetErr(&buf)
+		defer func() {
+			rootCmd.SetArgs(nil)
+			rootCmd.SetOut(nil)
+			rootCmd.SetErr(nil)
+		}()
+		var execErr error
+		stdout := captureStdout(t, func() {
+			execErr = rootCmd.Execute()
+		})
+		return stdout + buf.String(), execErr
+	}
+
+	for _, bare := range [][]string{{"conversation"}, {"conv"}} {
+		t.Run("bare_"+bare[0], func(t *testing.T) {
+			sawRequest = false
+			out, err := execArgs(t, bare)
+			require.NoError(t, err)
+			assert.True(t, sawRequest, "bare %v must call the hub list endpoint", bare)
+			assert.Contains(t, out, "No conversations found.")
+		})
+	}
+
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{
+			name:    "unknown_view_subcommand",
+			args:    []string{"conversation", "view", "conv:abc"},
+			wantErr: `unknown command "view" for "scion conversation"`,
+		},
+		{
+			name:    "unknown_show_subcommand",
+			args:    []string{"conversation", "show", "conv:abc"},
+			wantErr: `unknown command "show" for "scion conversation"`,
+		},
+		{
+			name:    "conv_alias_unknown_subcommand",
+			args:    []string{"conv", "view", "conv:abc"},
+			wantErr: `unknown command "view" for "scion conversation"`,
+		},
+		{
+			name:    "list_extra_arg",
+			args:    []string{"conversation", "list", "extra"},
+			wantErr: `unknown command "extra" for "scion conversation list"`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sawRequest = false
+			_, err := execArgs(t, tc.args)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+			assert.False(t, sawRequest, "unknown subcommand/arg must fail fast before calling the hub")
+		})
+	}
+}
+
 func TestConversationGetMessageRequiresTwoArgs(t *testing.T) {
 	err := conversationGetMessageCmd.Args(conversationGetMessageCmd, []string{})
 	assert.Error(t, err, "get-message should require two arguments")
@@ -218,6 +339,66 @@ func TestConversationJoinRequiresArgs(t *testing.T) {
 
 	err = conversationJoinCmd.Args(conversationJoinCmd, []string{"ref", "agent"})
 	assert.Error(t, err, "join should require three arguments")
+}
+
+func TestConversationJoinHelpDocumentsResolution(t *testing.T) {
+	long := conversationJoinCmd.Long
+	assert.Contains(t, long, "email", "help should document email resolution")
+	assert.Contains(t, long, "handle", "help should document handle resolution")
+	assert.Contains(t, long, "name", "help should document agent name resolution")
+}
+
+func TestRunConversationJoin_DisplaysResolvedID(t *testing.T) {
+	orig := saveConversationCreateTestState()
+	defer orig.restore()
+
+	const (
+		convID     = "11111111-2222-3333-4444-555555555555"
+		resolvedID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	)
+
+	var gotKind, gotPrincipal string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/conversations/"+convID+"/participants" && r.Method == http.MethodPost {
+			var req hubclient.AddParticipantRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			gotKind = req.PrincipalKind
+			gotPrincipal = req.PrincipalID
+
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(store.ConversationParticipant{
+				ID:             "part-1",
+				ConversationID: convID,
+				PrincipalKind:  req.PrincipalKind,
+				PrincipalID:    resolvedID,
+				Role:           "member",
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	isolateHubEnvForTest(t, server.URL, "proj-1")
+	projectDir := setupConversationCreateProject(t, home, server.URL, "proj-1")
+	projectPath = projectDir
+
+	c := &cobra.Command{}
+	c.SetContext(context.Background())
+
+	var runErr error
+	stdout, _ := captureStdoutStderr(t, func() {
+		runErr = runConversationJoin(c, []string{"conv:" + convID, "user", "alice@example.com"})
+	})
+	require.NoError(t, runErr)
+	assert.Equal(t, "user", gotKind)
+	assert.Equal(t, "alice@example.com", gotPrincipal)
+	assert.Contains(t, stdout, "alice@example.com")
+	assert.Contains(t, stdout, resolvedID)
+	assert.Contains(t, stdout, convID)
 }
 
 func TestConversationLeaveRequiresArgs(t *testing.T) {
@@ -512,6 +693,8 @@ type conversationListTestState struct {
 	projectPath  string
 	convProject  string
 	convJSON     bool
+	convLimit    int
+	convAll      bool
 	outputFormat string
 }
 
@@ -521,6 +704,8 @@ func saveConversationListTestState() conversationListTestState {
 		projectPath:  projectPath,
 		convProject:  convProject,
 		convJSON:     convJSON,
+		convLimit:    convLimit,
+		convAll:      convAll,
 		outputFormat: outputFormat,
 	}
 }
@@ -530,6 +715,8 @@ func (s conversationListTestState) restore() {
 	projectPath = s.projectPath
 	convProject = s.convProject
 	convJSON = s.convJSON
+	convLimit = s.convLimit
+	convAll = s.convAll
 	outputFormat = s.outputFormat
 }
 
@@ -1124,4 +1311,190 @@ func TestConversationProjectFlag_ResolvesSlug(t *testing.T) {
 	err := runConversationList(cmd, nil)
 	require.Error(t, err, "an unknown project must fail, not list nothing")
 	assert.Contains(t, err.Error(), `project "nope"`)
+}
+
+func TestRunConversationList_TruncationNotice_TableAndJSON(t *testing.T) {
+	orig := saveConversationListTestState()
+	defer orig.restore()
+
+	var respBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/conversations" || r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(respBody))
+	}))
+	defer server.Close()
+
+	isolateHubEnvForTest(t, server.URL, "")
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	projectPath = setupConversationCreateProject(t, tmpHome, server.URL, "")
+	convProject = ""
+	convLimit = 2
+	convAll = false
+
+	truncatedBody := `{"conversations":[
+		{"id":"11111111-1111-1111-1111-111111111111","kind":"group","surface":"native","displayName":"alpha","driftState":"active"},
+		{"id":"22222222-2222-2222-2222-222222222222","kind":"group","surface":"native","displayName":"beta","driftState":"active"}
+	],"total":5,"truncated":true}`
+	fullBody := `{"conversations":[
+		{"id":"11111111-1111-1111-1111-111111111111","kind":"group","surface":"native","displayName":"alpha","driftState":"active"},
+		{"id":"22222222-2222-2222-2222-222222222222","kind":"group","surface":"native","displayName":"beta","driftState":"active"}
+	],"total":2,"truncated":false}`
+
+	// Truncated table output: table on stdout, notice on stderr.
+	respBody = truncatedBody
+	convJSON = false
+	outputFormat = ""
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	stdout, stderr := captureStdoutStderr(t, func() {
+		require.NoError(t, runConversationList(cmd, nil))
+	})
+	assert.Contains(t, stdout, "11111111-1111-1111-1111-111111111111")
+	assert.Contains(t, stdout, "22222222-2222-2222-2222-222222222222")
+	assert.Equal(t, "Showing 2 of 5 conversations; use --limit or --all to see more.\n", stderr)
+
+	// Non-truncated table output: table on stdout, empty stderr.
+	respBody = fullBody
+	stdout, stderr = captureStdoutStderr(t, func() {
+		require.NoError(t, runConversationList(cmd, nil))
+	})
+	assert.Contains(t, stdout, "11111111-1111-1111-1111-111111111111")
+	assert.Empty(t, stderr)
+
+	// Truncated JSON output: pure valid JSON with total/truncated on stdout,
+	// and truncation notice on stderr.
+	respBody = truncatedBody
+	convJSON = true
+	outputFormat = ""
+	stdout, stderr = captureStdoutStderr(t, func() {
+		require.NoError(t, runConversationList(cmd, nil))
+	})
+	var parsed struct {
+		Conversations []map[string]any `json:"conversations"`
+		Total         int              `json:"total"`
+		Truncated     bool             `json:"truncated"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(stdout), &parsed), "stdout must be valid JSON: %s", stdout)
+	assert.Len(t, parsed.Conversations, 2)
+	assert.Equal(t, 5, parsed.Total)
+	assert.True(t, parsed.Truncated)
+	assert.Equal(t, "Showing 2 of 5 conversations; use --limit or --all to see more.\n", stderr)
+
+	// Non-truncated JSON output: valid JSON with truncated=false, empty stderr.
+	respBody = fullBody
+	stdout, stderr = captureStdoutStderr(t, func() {
+		require.NoError(t, runConversationList(cmd, nil))
+	})
+	parsed = struct {
+		Conversations []map[string]any `json:"conversations"`
+		Total         int              `json:"total"`
+		Truncated     bool             `json:"truncated"`
+	}{}
+	require.NoError(t, json.Unmarshal([]byte(stdout), &parsed), "stdout must be valid JSON: %s", stdout)
+	assert.Len(t, parsed.Conversations, 2)
+	assert.Equal(t, 2, parsed.Total)
+	assert.False(t, parsed.Truncated)
+	assert.Empty(t, stderr)
+}
+
+func TestRunConversationList_AllFlag_OmitsLimit(t *testing.T) {
+	orig := saveConversationListTestState()
+	defer orig.restore()
+
+	var sawLimit bool
+	var gotLimit string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/conversations" || r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		sawLimit = r.URL.Query().Has("limit")
+		gotLimit = r.URL.Query().Get("limit")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"conversations":[
+			{"id":"11111111-1111-1111-1111-111111111111","kind":"group","surface":"native","displayName":"alpha","driftState":"active"}
+		],"total":1,"truncated":false}`))
+	}))
+	defer server.Close()
+
+	isolateHubEnvForTest(t, server.URL, "")
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	projectPath = setupConversationCreateProject(t, tmpHome, server.URL, "")
+	convProject = ""
+	convJSON = true
+	outputFormat = ""
+
+	// With --all set (and default --limit untouched), limit query param is omitted.
+	convLimit = 50
+	convAll = true
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	stdout, stderr := captureStdoutStderr(t, func() {
+		require.NoError(t, runConversationList(cmd, nil))
+	})
+	assert.False(t, sawLimit, "--all must omit the limit query parameter")
+	assert.Empty(t, gotLimit)
+	assert.Contains(t, stdout, `"truncated": false`)
+	assert.Empty(t, stderr)
+
+	// Without --all, --limit is sent.
+	convLimit = 25
+	convAll = false
+	_, _ = captureStdoutStderr(t, func() {
+		require.NoError(t, runConversationList(cmd, nil))
+	})
+	assert.True(t, sawLimit, "without --all, limit query parameter must be sent")
+	assert.Equal(t, "25", gotLimit)
+}
+
+func TestRunConversationList_AllFlagRegisteredOnBothCommands(t *testing.T) {
+	for _, c := range []*cobra.Command{conversationCmd, conversationListCmd} {
+		f := c.Flags().Lookup("all")
+		require.NotNil(t, f, "expected --all flag on %q", c.Name())
+		assert.Equal(t, "false", f.DefValue)
+	}
+}
+
+func TestRunConversationList_FlagValidation(t *testing.T) {
+	orig := saveConversationListTestState()
+	defer orig.restore()
+
+	t.Run("all with explicit limit", func(t *testing.T) {
+		convAll = true
+		convLimit = 10
+		cmd := &cobra.Command{}
+		cmd.Flags().IntVar(&convLimit, "limit", 50, "")
+		cmd.Flags().BoolVar(&convAll, "all", false, "")
+		require.NoError(t, cmd.Flags().Set("limit", "10"))
+		require.NoError(t, cmd.Flags().Set("all", "true"))
+
+		err := runConversationList(cmd, nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "--all")
+		assert.Contains(t, err.Error(), "--limit")
+	})
+
+	t.Run("limit zero", func(t *testing.T) {
+		convAll = false
+		convLimit = 0
+		cmd := &cobra.Command{}
+		err := runConversationList(cmd, nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "--limit")
+	})
+
+	t.Run("limit negative", func(t *testing.T) {
+		convAll = false
+		convLimit = -1
+		cmd := &cobra.Command{}
+		err := runConversationList(cmd, nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "--limit")
+	})
 }

@@ -54,6 +54,9 @@ type AgentServiceAccountAssignment func(*sql.Selector)
 // AgentSessionMetrics is the predicate function for agentsessionmetrics builders.
 type AgentSessionMetrics func(*sql.Selector)
 
+// AgentSuspendScreen is the predicate function for agentsuspendscreen builders.
+type AgentSuspendScreen func(*sql.Selector)
+
 // AllowListEntry is the predicate function for allowlistentry builders.
 type AllowListEntry func(*sql.Selector)
 
@@ -122,6 +125,9 @@ type EntitlementBinding func(*sql.Selector)
 
 // EnvVar is the predicate function for envvar builders.
 type EnvVar func(*sql.Selector)
+
+// ExecRunOutput is the predicate function for execrunoutput builders.
+type ExecRunOutput func(*sql.Selector)
 
 // ExternalIdentity is the predicate function for externalidentity builders.
 type ExternalIdentity func(*sql.Selector)
@@ -264,6 +270,9 @@ type ScheduledExecRun func(*sql.Selector)
 // Secret is the predicate function for secret builders.
 type Secret func(*sql.Selector)
 
+// SecretRequest is the predicate function for secretrequest builders.
+type SecretRequest func(*sql.Selector)
+
 // Skill is the predicate function for skill builders.
 type Skill func(*sql.Selector)
 
@@ -309,6 +318,9 @@ type TriggerEvent func(*sql.Selector)
 // TriggerFire is the predicate function for triggerfire builders.
 type TriggerFire func(*sql.Selector)
 
+// TriggerSubjectClaim is the predicate function for triggersubjectclaim builders.
+type TriggerSubjectClaim func(*sql.Selector)
+
 // UsageReservation is the predicate function for usagereservation builders.
 type UsageReservation func(*sql.Selector)
 
@@ -323,6 +335,9 @@ type UserDeletion func(*sql.Selector)
 
 // UserDeletionAgent is the predicate function for userdeletionagent builders.
 type UserDeletionAgent func(*sql.Selector)
+
+// UserExecContainer is the predicate function for userexeccontainer builders.
+type UserExecContainer func(*sql.Selector)
 
 // UserTerminalWorkspace is the predicate function for userterminalworkspace builders.
 type UserTerminalWorkspace func(*sql.Selector)

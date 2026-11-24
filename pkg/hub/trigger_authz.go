@@ -20,10 +20,12 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"reflect"
 	"strings"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/permissions"
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/trigger"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/google/uuid"
 )
@@ -71,17 +73,17 @@ func newTriggerAudit(ctx context.Context, mutationType, triggerID string) *store
 }
 
 // triggerRevisionAuthorityCeiling resolves the caller's frozen effect ceiling
-// for a trigger authoring write (create, dispatch-affecting PATCH, or resume),
-// mirroring revisionAuthorityCeiling for schedules.
-func (s *Server) triggerRevisionAuthorityCeiling(w http.ResponseWriter, r *http.Request, projectID string, action Action) (store.EffectCeiling, bool) {
+// and provenance for a trigger authoring write (create, dispatch-affecting
+// PATCH, or resume), mirroring revisionAuthorityCeiling for schedules.
+func (s *Server) triggerRevisionAuthorityCeiling(w http.ResponseWriter, r *http.Request, projectID string, action Action) (store.EffectCeiling, store.AuthorityProvenance, bool) {
 	ctx := r.Context()
 	identity := GetIdentityFromContext(ctx)
 	if s.authzService == nil {
 		slog.ErrorContext(ctx, "trigger authoring: no authorization service", "project_id", projectID)
 		InternalError(w)
-		return store.EffectCeiling{}, false
+		return store.EffectCeiling{}, store.AuthorityProvenance{}, false
 	}
-	ceiling, _, err := s.authzService.sourceEffectCeiling(ctx, identity)
+	ceiling, prov, err := s.authzService.sourceEffectCeiling(ctx, identity)
 	if err != nil {
 		cause, structural := ceilingDenyCauseForError(err)
 		if !structural {
@@ -89,7 +91,7 @@ func (s *Server) triggerRevisionAuthorityCeiling(w http.ResponseWriter, r *http.
 				"project_id", projectID, "error", err)
 			writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
 				"Unable to evaluate the credential's delegation ceiling; retry later", nil)
-			return store.EffectCeiling{}, false
+			return store.EffectCeiling{}, store.AuthorityProvenance{}, false
 		}
 		logAuthzDenial(r, identity, triggerResource(projectID), action,
 			"effect ceiling denied: "+string(cause)+": "+err.Error())
@@ -98,9 +100,47 @@ func (s *Server) triggerRevisionAuthorityCeiling(w http.ResponseWriter, r *http.
 			msg = "This credential kind cannot authorize trigger work"
 		}
 		writeForbiddenDenial(w, msg, DeniedByDelegationCeiling)
-		return store.EffectCeiling{}, false
+		return store.EffectCeiling{}, store.AuthorityProvenance{}, false
 	}
-	return ceiling, true
+	return ceiling, prov, true
+}
+
+// resolveDispatchAgentAuthoringCeiling returns the caller's effect ceiling and
+// provenance for dispatch_agent authoring, reusing pre-resolved values when
+// supplied by an HTTP handler and otherwise resolving them via
+// authzService.sourceEffectCeiling so dispatchAgentAction.Validate is
+// self-sufficient while keeping sourceEffectCeiling out of fire-core files.
+func (s *Server) resolveDispatchAgentAuthoringCeiling(
+	ctx context.Context,
+	caller Identity,
+	ceiling *store.EffectCeiling,
+	prov *store.AuthorityProvenance,
+) (store.EffectCeiling, store.AuthorityProvenance, error) {
+	if ceiling != nil && prov != nil {
+		return *ceiling, *prov, nil
+	}
+	if s.authzService == nil {
+		return store.EffectCeiling{}, store.AuthorityProvenance{}, errors.New("dispatch_agent authoring: no authorization service")
+	}
+	c, p, err := s.authzService.sourceEffectCeiling(ctx, caller)
+	if err != nil {
+		cause, structural := ceilingDenyCauseForError(err)
+		if !structural {
+			return store.EffectCeiling{}, store.AuthorityProvenance{}, err
+		}
+		msg := ceilingSourceDenialMessage(cause)
+		if cause == DenyCauseCeilingSourceNotAllowed {
+			msg = "This credential kind cannot authorize trigger work"
+		}
+		return store.EffectCeiling{}, store.AuthorityProvenance{}, &dispatchAgentValidationError{
+			status:   http.StatusForbidden,
+			code:     ErrCodeForbidden,
+			message:  msg,
+			reason:   "effect ceiling denied: " + string(cause) + ": " + err.Error(),
+			deniedBy: DeniedByDelegationCeiling,
+		}
+	}
+	return c, p, nil
 }
 
 func writeWebhookEndpointNotFound(w http.ResponseWriter) {
@@ -145,6 +185,9 @@ func (s *Server) webhookEndpointAccessDecision(ctx context.Context, projectID st
 	}
 	switch identity.Type() {
 	case "agent":
+		if s.agentStanding(ctx, identity.ID()) != nil {
+			return webhookEndpointAccess{reason: "agent not in good standing"}
+		}
 		if ep == nil || action == ActionCreate {
 			return webhookEndpointAccess{allowed: true}
 		}
@@ -413,12 +456,354 @@ func (s *Server) authorizeTriggerMessageAuthoring(w http.ResponseWriter, r *http
 	return normalized, true
 }
 
+// authorizeTriggerDispatchAgentAuthoring validates a Stage 2 dispatch_agent
+// action spec for triggers (§5.1, §5.1a, §5.5, §7.3) through the single
+// self-sufficient dispatchAgentAction.validateForAuthoring entry point
+// (replay-protected source, github-source gate, payload/template/label checks,
+// authorizeAgentCreateDecision incl. standing, role caps, CanDelegate, and the
+// caller's UAT-hop effect ceiling).
+func (s *Server) authorizeTriggerDispatchAgentAuthoring(
+	w http.ResponseWriter,
+	r *http.Request,
+	projectID string,
+	sourceKind string,
+	ep *store.WebhookEndpoint,
+	spec *TriggerActionSpec,
+	ceiling store.EffectCeiling,
+	prov store.AuthorityProvenance,
+) (string, bool) {
+	ctx := r.Context()
+	identity := GetIdentityFromContext(ctx)
+	if identity == nil {
+		Unauthorized(w)
+		return "", false
+	}
+
+	raw, err := json.Marshal(DispatchAgentEventPayload{
+		AgentName:     spec.AgentName,
+		NameConflict:  spec.NameConflict,
+		Template:      spec.Template,
+		Task:          spec.Task,
+		Branch:        spec.Branch,
+		Labels:        spec.Labels,
+		Ephemeral:     spec.Ephemeral,
+		GithubToken:   spec.GithubToken,
+		AgentRole:     spec.AgentRole,
+		ReuseMessage:  spec.ReuseMessage,
+		AckComment:    spec.AckComment,
+		UntrustedVars: spec.UntrustedVars,
+		NoAuth:        spec.NoAuth,
+	})
+	if err != nil {
+		InternalError(w)
+		return "", false
+	}
+
+	action := &dispatchAgentAction{srv: s}
+	authCtx := withDispatchAgentAuthoringOpts(ctx, dispatchAgentAuthoringOpts{
+		sourceKind: sourceKind,
+		endpoint:   ep,
+		ceiling:    &ceiling,
+		provenance: &prov,
+	})
+	normalized, err := action.Validate(authCtx, identity, projectID, string(raw))
+	if err != nil {
+		var ve *dispatchAgentValidationError
+		if errors.As(err, &ve) {
+			if ve.status == http.StatusUnauthorized {
+				Unauthorized(w)
+				return "", false
+			}
+			if ve.status == http.StatusForbidden && ve.reason != "" {
+				logAuthzDenial(r, identity, agentCreateResource(projectID), ActionCreate, ve.reason)
+			}
+			if ve.deniedBy != "" {
+				writeForbiddenDenialCause(w, ve.message, ve.deniedBy, ve.cause)
+				return "", false
+			}
+			writeError(w, ve.status, ve.code, ve.message, ve.details)
+			return "", false
+		}
+		slog.ErrorContext(ctx, "trigger dispatch_agent authoring failed", "project_id", projectID, "error", err)
+		InternalError(w)
+		return "", false
+	}
+
+	if sourceKind == store.TriggerSourceKindGitHub && spec.AckComment != nil {
+		if !s.authorizeGitHubCommentAuthoringPermission(w, r, projectID) {
+			return "", false
+		}
+	}
+
+	return normalized, true
+}
+
+func (s *Server) authorizeGitHubCommentAuthoringPermission(
+	w http.ResponseWriter,
+	r *http.Request,
+	projectID string,
+) bool {
+	ctx := r.Context()
+	identity := GetIdentityFromContext(ctx)
+	if identity == nil {
+		Unauthorized(w)
+		return false
+	}
+	res := Resource{
+		Type:       permissions.ResourceGitHubTrigger,
+		ID:         projectID,
+		ParentType: permissions.ResourceProject,
+		ParentID:   projectID,
+	}
+	switch identity.Type() {
+	case "user", "dev", "federated_user":
+		userIdent, ok := identity.(UserIdentity)
+		if !ok || s.authzService == nil {
+			writeForbidden(w, "You don't have permission to post GitHub comments through triggers in this project")
+			return false
+		}
+		decision := s.authzService.Decide(ctx, AuthzRequest{
+			Principal:  principalContextForIdentity(userIdent),
+			Credential: credentialContextForIdentity(userIdent),
+			Resource:   res,
+			Action:     Action(permissions.ActionComment),
+			Permission: githubTriggerCommentPermission,
+		})
+		if !decision.Allowed {
+			logAuthzDenial(r, identity, res, Action(permissions.ActionComment), decision.Reason)
+			writeForbidden(w, "You don't have permission to post GitHub comments through triggers in this project")
+			return false
+		}
+		return true
+
+	case "agent":
+		// Design rev 1.12 §8.1: in Stage 3, github_trigger.comment has no agent
+		// scope, so agents cannot author github.comment triggers or ackComment.
+		logAuthzDenial(r, identity, res, Action(permissions.ActionComment), "agent callers cannot author github.comment triggers or ackComment")
+		writeForbidden(w, "Agent callers cannot author github.comment triggers or ackComment")
+		return false
+
+	default:
+		logAuthzDenial(r, identity, res, Action(permissions.ActionComment), "identity type may not author github.comment triggers")
+		writeForbidden(w, "")
+		return false
+	}
+}
+
+// authorizeTriggerGitHubCommentAuthoring enforces Stage 3 §7.1 / §8.1 authoring
+// checks for a github.comment trigger action: source must be github, caller must
+// hold github_trigger.comment (users via authz policy + UAT scope/boundary;
+// agents via AgentRoleFull + delegation ceiling), replyInThread requires
+// pull_request_review_comment match types, and githubCommentAction.Validate
+// compiles and bounds the template and checks the project's GitHub association.
+func (s *Server) authorizeTriggerGitHubCommentAuthoring(
+	w http.ResponseWriter,
+	r *http.Request,
+	projectID string,
+	sourceKind string,
+	matchTypes []string,
+	spec *TriggerActionSpec,
+) (string, bool) {
+	ctx := r.Context()
+	identity := GetIdentityFromContext(ctx)
+	if identity == nil {
+		Unauthorized(w)
+		return "", false
+	}
+	if sourceKind != store.TriggerSourceKindGitHub {
+		ValidationError(w, "github.comment action requires a github trigger source", nil)
+		return "", false
+	}
+	if !s.authorizeGitHubCommentAuthoringPermission(w, r, projectID) {
+		return "", false
+	}
+
+	if err := validateGitHubCommentReplyInThreadMatchTypes(spec.ReplyInThread, matchTypes); err != nil {
+		ValidationError(w, err.Error(), nil)
+		return "", false
+	}
+
+	raw, err := json.Marshal(GitHubCommentActionPayload{
+		Body:          spec.Body,
+		Target:        spec.Target,
+		ReplyInThread: spec.ReplyInThread,
+		UntrustedVars: spec.UntrustedVars,
+	})
+	if err != nil {
+		InternalError(w)
+		return "", false
+	}
+
+	action := &githubCommentAction{srv: s}
+	normalized, err := action.Validate(ctx, identity, projectID, string(raw))
+	if err != nil {
+		switch {
+		case errors.Is(err, errGitHubCommentNotAssociated):
+			writeError(w, http.StatusConflict, ErrCodeGitHubNotAssociated,
+				"project does not have an authorized GitHub App association", nil)
+		case errors.Is(err, errGitHubCommentInvalid):
+			ValidationError(w, err.Error(), nil)
+		case errors.Is(err, store.ErrNotFound), errors.Is(err, store.ErrInvalidInput):
+			NotFound(w, "Project")
+		default:
+			writeErrorFromErr(w, err, "")
+		}
+		return "", false
+	}
+	return normalized, true
+}
+
+// authorizeTriggerExecAuthoring validates a Stage 2 P8 exec trigger action
+// (ptone/scion#8241):
+//   - requires hub.exec_schedules and hub.conduit enabled;
+//   - refuses subject mode "reuse";
+//   - requires a replay-protected source (400 source_not_replay_protected);
+//   - refuses any non-exec action fields and any "${" in command (400 templating_not_allowed_in_argv);
+//   - checks caller's effect ceiling allows agent.attach;
+//   - delegates target resolution, no-existence-oracle 404, live agent.attach,
+//     managed-runtime 422, and authoring rate limit to authorizeScheduledExecAuthoringOpts
+//     with checkQuota=false (trigger exec uses its own per-trigger caps, never
+//     the exec-schedule quotas).
+func (s *Server) authorizeTriggerExecAuthoring(
+	w http.ResponseWriter,
+	r *http.Request,
+	projectID string,
+	sourceKind string,
+	ep *store.WebhookEndpoint,
+	subjectMode string,
+	spec *TriggerActionSpec,
+	ceiling store.EffectCeiling,
+	prov store.AuthorityProvenance,
+) (string, string, bool) {
+	ctx := r.Context()
+	identity := GetIdentityFromContext(ctx)
+	if identity == nil {
+		Unauthorized(w)
+		return "", "", false
+	}
+	if !s.execSchedulesEnabled() {
+		writeError(w, http.StatusBadRequest, ErrCodeExperimentDisabled,
+			"exec triggers require hub.exec_schedules and hub.conduit experiments to be enabled", nil)
+		return "", "", false
+	}
+	if subjectMode == "reuse" {
+		ValidationError(w, "subject mode reuse is not supported for exec triggers", nil)
+		return "", "", false
+	}
+	if !trigger.SourceReplayProtected(sourceKind, ep) {
+		writeError(w, http.StatusBadRequest, "source_not_replay_protected",
+			"exec triggers require a replay-protected source", nil)
+		return "", "", false
+	}
+	// Allow-list of TriggerActionSpec fields valid on exec triggers: zeroing
+	// only the allowed fields must leave the rest of the struct empty so any
+	// future field added to TriggerActionSpec is rejected by default.
+	stripped := *spec
+	stripped.Type = ""
+	stripped.AgentID = ""
+	stripped.AgentName = ""
+	stripped.Command = nil
+	stripped.TimeoutSeconds = 0
+	stripped.ContextAttributes = nil
+	if !reflect.ValueOf(stripped).IsZero() {
+		ValidationError(w, "exec triggers take agentId or agentName, command, timeoutSeconds, and contextAttributes only", nil)
+		return "", "", false
+	}
+	if idx, ok := validateTriggerExecCommandNoTemplates(spec.Command); !ok {
+		writeError(w, http.StatusBadRequest, "templating_not_allowed_in_argv",
+			"template placeholders are not allowed in exec command argv",
+			map[string]any{"field": "action.command", "index": idx})
+		return "", "", false
+	}
+	p := &scheduledExecPayload{
+		AgentID:           spec.AgentID,
+		AgentName:         spec.AgentName,
+		Command:           append([]string(nil), spec.Command...),
+		TimeoutSeconds:    spec.TimeoutSeconds,
+		Wake:              spec.Wake,
+		ContextAttributes: append([]string(nil), spec.ContextAttributes...),
+	}
+	if err := p.validate(); err != nil {
+		ValidationError(w, err.Error(), nil)
+		return "", "", false
+	}
+	if !EffectCeilingAllows(
+		uatHopEffectCeiling(prov.SourcePrincipalKind, prov.SourcePrincipalID, prov, ceiling),
+		scheduledExecPermission,
+		false,
+	) {
+		writeForbiddenDenial(w, "caller's delegation ceiling does not allow agent.attach", DeniedByDelegationCeiling)
+		return "", "", false
+	}
+	if _, ok := s.authorizeScheduledExecAuthoringOpts(w, r, projectID, p, "", false); !ok {
+		return "", "", false
+	}
+	encoded, err := p.encode()
+	if err != nil {
+		ValidationError(w, err.Error(), nil)
+		return "", "", false
+	}
+	spec.AgentID = p.AgentID
+	spec.AgentName = p.AgentName
+	return encoded, p.AgentID, true
+}
+
+var (
+	errTriggerExecProjectCapExceeded = errors.New("project active exec trigger limit exceeded")
+	errTriggerExecTargetCapExceeded  = errors.New("target agent active exec trigger limit exceeded")
+)
+
+// checkTriggerExecCapsInTx enforces P8's own per-trigger-exec authoring caps
+// inside WithTx under LockTriggerQuota, independent of exec-schedule quotas.
+func checkTriggerExecCapsInTx(
+	ctx context.Context,
+	tx store.Store,
+	projectID string,
+	targetAgentID string,
+	alreadyCountedInProject bool,
+	alreadyCountedOnTarget bool,
+) error {
+	projExecCount, err := tx.CountTriggers(ctx, store.TriggerFilter{
+		ProjectID:   projectID,
+		ActionTypes: []string{store.TriggerActionExec},
+		Status:      store.TriggerStatusActive,
+	})
+	if err != nil {
+		return err
+	}
+	if alreadyCountedInProject && projExecCount > 0 {
+		projExecCount--
+	}
+	if projExecCount >= triggerExecMaxActivePerProject {
+		return errTriggerExecProjectCapExceeded
+	}
+	if targetAgentID != "" {
+		targetExecCount, err := tx.CountTriggers(ctx, store.TriggerFilter{
+			ProjectID:     projectID,
+			ActionTypes:   []string{store.TriggerActionExec},
+			TargetAgentID: targetAgentID,
+			Status:        store.TriggerStatusActive,
+		})
+		if err != nil {
+			return err
+		}
+		if alreadyCountedOnTarget && targetExecCount > 0 {
+			targetExecCount--
+		}
+		if targetExecCount >= triggerExecMaxActivePerTarget {
+			return errTriggerExecTargetCapExceeded
+		}
+	}
+	return nil
+}
+
 // triggerEventAccess is the outcome of triggerEventAccessDecision.
 type triggerEventAccess struct {
 	allowed           bool
 	reason            string
 	byPolicy          bool
 	notVisibleToAgent bool
+	wrongProject      bool
 	storeErr          error
 }
 
@@ -474,6 +859,16 @@ func (s *Server) triggerEventAccessDecision(ctx context.Context, projectID strin
 		if fired {
 			return triggerEventAccess{allowed: true}
 		}
+		dispatched, err := s.store.EventHasTriggerFireForResultRef(ctx, ev.ID, identity.ID())
+		if err != nil && !errors.Is(err, store.ErrInvalidInput) {
+			return triggerEventAccess{
+				reason:   "trigger fire result_ref visibility lookup failed",
+				storeErr: err,
+			}
+		}
+		if dispatched {
+			return triggerEventAccess{allowed: true}
+		}
 		return triggerEventAccess{
 			reason:            "trigger event is not visible to agent",
 			notVisibleToAgent: true,
@@ -498,6 +893,12 @@ func (s *Server) triggerEventAccessDecision(ctx context.Context, projectID strin
 		if !decision.Allowed {
 			return triggerEventAccess{reason: decision.Reason, byPolicy: true}
 		}
+		if ev != nil && ev.ProjectID != projectID {
+			return triggerEventAccess{
+				reason:       "trigger event does not belong to project",
+				wrongProject: true,
+			}
+		}
 		return triggerEventAccess{allowed: true}
 
 	default:
@@ -510,13 +911,20 @@ func (s *Server) authorizeTriggerEventAccess(w http.ResponseWriter, r *http.Requ
 }
 
 // authorizeTriggerEventRow decides action on one trigger event row (nil for the
-// project-level gate). When an agent addresses an event it neither received on
-// its own endpoint nor fired through a trigger it holds, it writes 404
+// project-level gate). It always enforces ev.ProjectID == projectID for every
+// caller kind (writing 404 on mismatch) so callers cannot accidentally leak
+// cross-project events. When an agent addresses an event it neither received on
+// its own endpoint nor fired through a trigger it holds, it also writes 404
 // identical to a missing event so event IDs cannot be probed (§10.2, §16.7).
 func (s *Server) authorizeTriggerEventRow(w http.ResponseWriter, r *http.Request, projectID string, action Action, ev *store.TriggerEvent) bool {
 	identity := GetIdentityFromContext(r.Context())
 	if identity == nil {
 		Unauthorized(w)
+		return false
+	}
+	if ev != nil && ev.ProjectID != projectID {
+		logAuthzDenial(r, identity, triggerResource(projectID), action, "trigger event does not belong to project")
+		NotFound(w, "Trigger event")
 		return false
 	}
 	if ev != nil && identity.Type() != "agent" {
@@ -533,7 +941,7 @@ func (s *Server) authorizeTriggerEventRow(w http.ResponseWriter, r *http.Request
 		return false
 	}
 	logAuthzDenial(r, identity, triggerResource(projectID), action, d.reason)
-	if d.notVisibleToAgent {
+	if d.notVisibleToAgent || d.wrongProject {
 		NotFound(w, "Trigger event")
 	} else if d.byPolicy {
 		writeForbidden(w, "You don't have permission to access triggers in this project")

@@ -161,8 +161,8 @@ func TestAgentDecisions_ListAndShow(t *testing.T) {
 	}
 	require.NoError(t, f.store.CreateAgent(ctx, otherAgent))
 
-	// Post D234 v1 + hub-keyed 1, interpret D234=1, Bob overrides D234=2, then repost D234 v2.
-	p1 := f.sendPromptToBob(t, twoDecisions, false)
+	// Post D234 v1 + hub-keyed 1 (with choice descriptions), interpret D234=1, Bob overrides D234=2, then repost D234 v2.
+	p1 := f.sendPromptToBob(t, `[{"id":"D234","question":"Ship the **feature** now?","choices":[{"id":"1","label":"yes","description":"Deploy immediately"},{"id":"2","label":"no","description":"Hold until Monday"}],"default":"1"},{"question":"Which approach?","choices":[{"id":"a","label":"Extend","description":"Extend existing table"},{"id":"b","label":"New type"}]}]`, false)
 	reply := f.bobDMReply(t, p1.MessageID, "D234: yes")
 	recRR := f.agentDecisionReq(t, f.agent, http.MethodPost, "/api/v1/agent/decisions/interpreted", RecordInterpretedRequest{
 		SourceMessageID: reply.ID,
@@ -190,15 +190,19 @@ func TestAgentDecisions_ListAndShow(t *testing.T) {
 		assert.NotEmpty(t, it.PromptMessageID)
 	}
 
-	// List decided: hub-keyed "1" (decided).
+	// List decided: hub-keyed "1" (decided), carrying choices (with descriptions) and empty previousChoiceLabel.
 	decRR := f.agentDecisionReq(t, f.agent, http.MethodGet, "/api/v1/agent/decisions?state=decided", nil)
 	require.Equal(t, http.StatusOK, decRR.Code)
 	var decOut AgentDecisionListResponse
 	require.NoError(t, json.Unmarshal(decRR.Body.Bytes(), &decOut))
 	require.Len(t, decOut.Items, 1)
 	assert.Equal(t, "1", decOut.Items[0].Key)
+	assert.Empty(t, decOut.Items[0].DefaultChoiceID)
+	require.Len(t, decOut.Items[0].Choices, 2)
+	assert.Equal(t, "Extend existing table", decOut.Items[0].Choices[0].Description)
 	require.NotNil(t, decOut.Items[0].Answer)
 	assert.Equal(t, "Extend", decOut.Items[0].Answer.Label)
+	assert.Empty(t, decOut.Items[0].Answer.PreviousChoiceLabel)
 
 	// List all with pagination (limit=2 -> 4 total items across 2 pages: D234 v1 replaced, 1 decided, D234 v2 pending, D900 pending).
 	all1RR := f.agentDecisionReq(t, f.agent, http.MethodGet, "/api/v1/agent/decisions?state=all&limit=2", nil)
@@ -214,6 +218,24 @@ func TestAgentDecisions_ListAndShow(t *testing.T) {
 	require.NoError(t, json.Unmarshal(all2RR.Body.Bytes(), &all2))
 	require.Len(t, all2.Items, 2)
 	assert.Empty(t, all2.NextCursor)
+
+	// Verify D234 v1 in state=all carries choices (with descriptions), defaultChoiceId="1", and answer.previousChoiceLabel="yes" on override!
+	var d234v1 *AgentDecisionListItem
+	for _, it := range append(append([]AgentDecisionListItem{}, all1.Items...), all2.Items...) {
+		itCopy := it
+		if itCopy.Key == "D234" && itCopy.Version == 1 {
+			d234v1 = &itCopy
+		}
+	}
+	require.NotNil(t, d234v1)
+	assert.Equal(t, "1", d234v1.DefaultChoiceID)
+	require.Len(t, d234v1.Choices, 2)
+	assert.Equal(t, "Deploy immediately", d234v1.Choices[0].Description)
+	assert.Equal(t, "Hold until Monday", d234v1.Choices[1].Description)
+	require.NotNil(t, d234v1.Answer)
+	assert.Equal(t, store.DecisionOutcomeOverride, d234v1.Answer.Outcome)
+	assert.Equal(t, "no", d234v1.Answer.Label)
+	assert.Equal(t, "yes", d234v1.Answer.PreviousChoiceLabel)
 
 	// Show D234 (case-insensitive "d234"): v1 has BOTH answers (interpreted + direct override), v2 is pending.
 	showRR := f.agentDecisionReq(t, f.agent, http.MethodGet, "/api/v1/agent/decisions/d234", nil)
@@ -252,6 +274,60 @@ func TestAgentDecisions_ListAndShow(t *testing.T) {
 		rr := f.agentDecisionReq(t, f.agent, http.MethodGet, "/api/v1/agent/decisions?"+q, nil)
 		assert.Equal(t, http.StatusBadRequest, rr.Code, "%s: %s", q, rr.Body.String())
 	}
+}
+
+func TestAgentDecisions_ListAndShowOtherOptionAndText(t *testing.T) {
+	f := newDecisionsFixture(t)
+
+	pOther := f.sendPromptToBob(t, `[{"id":"REG","question":"Deploy region?","choices":[{"id":"us","label":"US Central"}],"allow_other":{"label":"Custom region","description":"Specify any GCP region","placeholder":"e.g. europe-west4"}}]`, false)
+	require.Len(t, pOther.Decisions, 1)
+	ansRR := f.answer(t, f.bob, pOther.Decisions[0].RowID, map[string]interface{}{
+		"choice_id":  messages.ChoiceIDOther,
+		"other_text": "europe-west4 canary",
+	})
+	require.Equal(t, http.StatusOK, ansRR.Code, ansRR.Body.String())
+
+	pPlain := f.sendPromptToBob(t, `[{"id":"PLAIN","question":"Proceed?","choices":["yes","no"]}]`, false)
+	require.Len(t, pPlain.Decisions, 1)
+	require.Equal(t, http.StatusOK, f.answer(t, f.bob, pPlain.Decisions[0].RowID, map[string]interface{}{"choice_id": "1"}).Code)
+
+	listRR := f.agentDecisionReq(t, f.agent, http.MethodGet, "/api/v1/agent/decisions?state=decided", nil)
+	require.Equal(t, http.StatusOK, listRR.Code, listRR.Body.String())
+	var listOut AgentDecisionListResponse
+	require.NoError(t, json.Unmarshal(listRR.Body.Bytes(), &listOut))
+	require.Len(t, listOut.Items, 2)
+	byKey := map[string]AgentDecisionListItem{}
+	for _, it := range listOut.Items {
+		byKey[it.Key] = it
+	}
+
+	reg := byKey["REG"]
+	require.NotNil(t, reg.Other)
+	assert.Equal(t, messages.OtherOption{
+		Label:       "Custom region",
+		Description: "Specify any GCP region",
+		Placeholder: "e.g. europe-west4",
+	}, *reg.Other)
+	require.NotNil(t, reg.Answer)
+	assert.Equal(t, messages.ChoiceIDOther, reg.Answer.ChoiceID)
+	assert.Equal(t, "Custom region", reg.Answer.Label)
+	assert.Equal(t, "europe-west4 canary", reg.Answer.OtherText)
+
+	plain := byKey["PLAIN"]
+	assert.Nil(t, plain.Other)
+	require.NotNil(t, plain.Answer)
+	assert.Empty(t, plain.Answer.OtherText)
+
+	showRR := f.agentDecisionReq(t, f.agent, http.MethodGet, "/api/v1/agent/decisions/REG", nil)
+	require.Equal(t, http.StatusOK, showRR.Code, showRR.Body.String())
+	var showOut AgentDecisionShowResponse
+	require.NoError(t, json.Unmarshal(showRR.Body.Bytes(), &showOut))
+	require.Len(t, showOut.Versions, 1)
+	require.NotNil(t, showOut.Versions[0].Other)
+	assert.Equal(t, *reg.Other, *showOut.Versions[0].Other)
+	require.Len(t, showOut.Versions[0].Answers, 1)
+	assert.Equal(t, messages.ChoiceIDOther, showOut.Versions[0].Answers[0].ChoiceID)
+	assert.Equal(t, "europe-west4 canary", showOut.Versions[0].Answers[0].OtherText)
 }
 
 func TestAgentDecisions_InterpretedSingleAndMultiPromptPartialSet(t *testing.T) {
@@ -1541,4 +1617,257 @@ func TestAgentDecisions_WithdrawMultiKeyWholeSetRefusalsAndListWithdrawn(t *test
 	badStateRR := f.agentDecisionReq(t, f.agent, http.MethodGet, "/api/v1/agent/decisions?state=bogus", nil)
 	require.Equal(t, http.StatusBadRequest, badStateRR.Code)
 	assert.Contains(t, badStateRR.Body.String(), "withdrawn")
+}
+
+func TestAgentDecisions_InterpretedOther_ConfirmOverrideKeyStateShowAndList(t *testing.T) {
+	f := newDecisionsFixture(t)
+
+	// Create 3 decisions with Other on + 1 without Other.
+	_, pConfirm := f.topicPrompt(t, `[{"id":"reg-conf","question":"Confirm region?","choices":["us-central1"],"allow_other":{"label":"Another region","placeholder":"e.g. europe-west4"}}]`, false)
+	_, pOverride := f.topicPrompt(t, `[{"id":"reg-over","question":"Override region?","choices":["us-central1"],"allow_other":{"label":"Another region"}}]`, false)
+	_, pFixedToOther := f.topicPrompt(t, `[{"id":"reg-f2o","question":"Fixed to other?","choices":["us-central1"],"allow_other":"Something else"}]`, false)
+	_, _ = f.topicPrompt(t, `[{"id":"no-other","question":"No other?","choices":["yes","no"]}]`, false)
+
+	reply := f.storeUserReply(t, f.alice, f.topicID, "", "slack", "use europe-west4 for both, us-central1 for f2o")
+
+	// 1. Validation rejections on POST /api/v1/agent/decisions/interpreted.
+	for name, ans := range map[string]InterpretedAnswerInput{
+		"reserved $dismissed": {Key: "reg-conf", ChoiceID: messages.ChoiceIDDismissed},
+		"empty other_text":    {Key: "reg-conf", ChoiceID: messages.ChoiceIDOther, OtherText: "  "},
+		"newline other_text":  {Key: "reg-conf", ChoiceID: messages.ChoiceIDOther, OtherText: "a\nb"},
+		"201 runes":           {Key: "reg-conf", ChoiceID: messages.ChoiceIDOther, OtherText: strings.Repeat("x", 201)},
+		"text on fixed":       {Key: "reg-conf", ChoiceID: "1", OtherText: "extra"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rr := f.agentDecisionReq(t, f.agent, http.MethodPost, "/api/v1/agent/decisions/interpreted", RecordInterpretedRequest{
+				SourceMessageID: reply.ID,
+				Answers:         []InterpretedAnswerInput{ans},
+			})
+			assert.Equal(t, http.StatusBadRequest, rr.Code, rr.Body.String())
+		})
+	}
+
+	// $other on decision without allow_other -> 400 invalid_choice.
+	rrNoOther := f.agentDecisionReq(t, f.agent, http.MethodPost, "/api/v1/agent/decisions/interpreted", RecordInterpretedRequest{
+		SourceMessageID: reply.ID,
+		Answers:         []InterpretedAnswerInput{{Key: "no-other", ChoiceID: messages.ChoiceIDOther, OtherText: "custom"}},
+	})
+	require.Equal(t, http.StatusBadRequest, rrNoOther.Code, rrNoOther.Body.String())
+	assert.Equal(t, ErrCodeInvalidChoice, errorCode(t, rrNoOther))
+
+	// 2. Record interpreted Other answers (and interpreted fixed for reg-f2o).
+	recRR := f.agentDecisionReq(t, f.agent, http.MethodPost, "/api/v1/agent/decisions/interpreted", RecordInterpretedRequest{
+		SourceMessageID: reply.ID,
+		IdempotencyKey:  "hub-interp-other-1",
+		Answers: []InterpretedAnswerInput{
+			{Key: "reg-conf", ChoiceID: messages.ChoiceIDOther, OtherText: "  europe-west4  "},
+			{Key: "reg-over", ChoiceID: messages.ChoiceIDOther, OtherText: "europe-west4"},
+			{Key: "reg-f2o", ChoiceID: "1"},
+		},
+	})
+	require.Equal(t, http.StatusOK, recRR.Code, recRR.Body.String())
+	var recOut RecordInterpretedResponse
+	require.NoError(t, json.Unmarshal(recRR.Body.Bytes(), &recOut))
+	assert.False(t, recOut.Replayed)
+	require.Len(t, recOut.Decisions, 3)
+	assert.Equal(t, "europe-west4", recOut.Decisions[0].Decision.OtherText)
+	assert.Empty(t, f.dispatcher.getMessages(), "interpreted record never delivers back to asking agent")
+
+	// Replay with same key + same (choice_id, other_text) -> 200 replayed.
+	replayRR := f.agentDecisionReq(t, f.agent, http.MethodPost, "/api/v1/agent/decisions/interpreted", RecordInterpretedRequest{
+		SourceMessageID: reply.ID,
+		IdempotencyKey:  "hub-interp-other-1",
+		Answers: []InterpretedAnswerInput{
+			{Key: "reg-conf", ChoiceID: messages.ChoiceIDOther, OtherText: "europe-west4"},
+			{Key: "reg-over", ChoiceID: messages.ChoiceIDOther, OtherText: "europe-west4"},
+			{Key: "reg-f2o", ChoiceID: "1"},
+		},
+	})
+	require.Equal(t, http.StatusOK, replayRR.Code, replayRR.Body.String())
+	var replayOut RecordInterpretedResponse
+	require.NoError(t, json.Unmarshal(replayRR.Body.Bytes(), &replayOut))
+	assert.True(t, replayOut.Replayed)
+
+	// Same key + different other_text -> 422 idempotency_mismatch.
+	mismatchRR := f.agentDecisionReq(t, f.agent, http.MethodPost, "/api/v1/agent/decisions/interpreted", RecordInterpretedRequest{
+		SourceMessageID: reply.ID,
+		IdempotencyKey:  "hub-interp-other-1",
+		Answers: []InterpretedAnswerInput{
+			{Key: "reg-conf", ChoiceID: messages.ChoiceIDOther, OtherText: "us-east1"},
+			{Key: "reg-over", ChoiceID: messages.ChoiceIDOther, OtherText: "europe-west4"},
+			{Key: "reg-f2o", ChoiceID: "1"},
+		},
+	})
+	require.Equal(t, http.StatusUnprocessableEntity, mismatchRR.Code, mismatchRR.Body.String())
+	assert.Equal(t, ErrCodeIdempotencyMismatch, errorCode(t, mismatchRR))
+
+	// 3. Direct confirm of interpreted Other with same text -> outcome=confirm, NOT delivered.
+	confRR := f.answer(t, f.alice, pConfirm.Decisions[0].RowID, map[string]interface{}{
+		"choice_id":  messages.ChoiceIDOther,
+		"other_text": "europe-west4",
+	})
+	require.Equal(t, http.StatusOK, confRR.Code, confRR.Body.String())
+	var confOut DecisionAnswerResponse
+	require.NoError(t, json.Unmarshal(confRR.Body.Bytes(), &confOut))
+	assert.Equal(t, store.DecisionOutcomeConfirm, confOut.Decision.Decision.Outcome)
+	assert.Equal(t, "europe-west4", confOut.Decision.Decision.OtherText)
+	assert.Empty(t, f.dispatcher.getMessages(), "confirming interpreted Other must not deliver to agent")
+
+	// 4. Direct override of interpreted Other with different text -> outcome=override, delivered with previous label & text.
+	overRR := f.answer(t, f.alice, pOverride.Decisions[0].RowID, map[string]interface{}{
+		"choice_id":  messages.ChoiceIDOther,
+		"other_text": "asia-east1 canary",
+	})
+	require.Equal(t, http.StatusOK, overRR.Code, overRR.Body.String())
+	var overOut DecisionAnswerResponse
+	require.NoError(t, json.Unmarshal(overRR.Body.Bytes(), &overOut))
+	assert.Equal(t, store.DecisionOutcomeOverride, overOut.Decision.Decision.Outcome)
+	assert.Equal(t, "asia-east1 canary", overOut.Decision.Decision.OtherText)
+	assert.Equal(t, "Another region", overOut.Decision.Decision.PreviousChoiceLabel)
+	assert.Equal(t, "europe-west4", overOut.Decision.Decision.PreviousOtherText)
+
+	deliv := f.dispatcher.getMessages()
+	require.Len(t, deliv, 1)
+	wantLine := fmt.Sprintf(`[decision-response] reg-over v1 ("Override region?") answer=Another region (choice $other) text="asia-east1 canary" by %s, overriding interpreted answer Another region text="europe-west4"`, f.alice.Email)
+	assert.Equal(t, wantLine, deliv[0].structured.Msg)
+	assert.Equal(t, "asia-east1 canary", deliv[0].structured.Metadata[messages.MetadataDecisionOtherText])
+
+	// 5. Direct override of interpreted fixed choice with $other.
+	f2oRR := f.answer(t, f.alice, pFixedToOther.Decisions[0].RowID, map[string]interface{}{
+		"choice_id":  messages.ChoiceIDOther,
+		"other_text": "me-west1",
+	})
+	require.Equal(t, http.StatusOK, f2oRR.Code, f2oRR.Body.String())
+	var f2oOut DecisionAnswerResponse
+	require.NoError(t, json.Unmarshal(f2oRR.Body.Bytes(), &f2oOut))
+	assert.Equal(t, store.DecisionOutcomeOverride, f2oOut.Decision.Decision.Outcome)
+	assert.Equal(t, "us-central1", f2oOut.Decision.Decision.PreviousChoiceLabel)
+	assert.Empty(t, f2oOut.Decision.Decision.PreviousOtherText)
+
+	deliv = f.dispatcher.getMessages()
+	require.Len(t, deliv, 2)
+	wantF2O := fmt.Sprintf(`[decision-response] reg-f2o v1 ("Fixed to other?") answer=Something else (choice $other) text="me-west1" by %s, overriding interpreted answer us-central1`, f.alice.Email)
+	assert.Equal(t, wantF2O, deliv[1].structured.Msg)
+
+	// 6. GET /api/v1/agent/decisions/{key} carries other, otherText, and previousOtherText.
+	showRR := f.agentDecisionReq(t, f.agent, http.MethodGet, "/api/v1/agent/decisions/reg-over", nil)
+	require.Equal(t, http.StatusOK, showRR.Code, showRR.Body.String())
+	var showOut AgentDecisionShowResponse
+	require.NoError(t, json.Unmarshal(showRR.Body.Bytes(), &showOut))
+	require.Len(t, showOut.Versions, 1)
+	require.NotNil(t, showOut.Versions[0].Other)
+	assert.Equal(t, "Another region", showOut.Versions[0].Other.Label)
+	require.Len(t, showOut.Versions[0].Answers, 2)
+	assert.Equal(t, "europe-west4", showOut.Versions[0].Answers[0].OtherText)
+	assert.Equal(t, "asia-east1 canary", showOut.Versions[0].Answers[1].OtherText)
+	assert.Equal(t, "Another region", showOut.Versions[0].Answers[1].PreviousChoiceLabel)
+	assert.Equal(t, "europe-west4", showOut.Versions[0].Answers[1].PreviousOtherText)
+
+	// 7. GET /api/v1/agent/decisions?state=decided&q=asia-east1 matches effective other_text.
+	assert.Equal(t, []string{"reg-over"}, agentListKeys(t, f, f.agent, url.Values{"state": {"decided"}, "q": {"asia-east1"}}))
+	assert.Equal(t, []string{"reg-conf"}, agentListKeys(t, f, f.agent, url.Values{"state": {"decided"}, "q": {"europe-west4"}}))
+
+	// 8. Key-state summaries in decisions_send.go (409 decision_key_exists and --update replaced.answer) include Other text.
+	dupRR := f.sendAsAgent(t, OutboundMessageRequest{
+		Recipient: "user:" + f.bob.Email,
+		Msg:       "dup",
+		Decisions: decisionInputs(t, `[{"id":"reg-over","question":"Again?","choices":["yes","no"]}]`),
+	})
+	require.Equal(t, http.StatusConflict, dupRR.Code, dupRR.Body.String())
+	_, dupDetails := errorCodeAndDetails(t, dupRR)
+	existingList := dupDetails["existing"].([]interface{})
+	require.Len(t, existingList, 1)
+	assert.Equal(t, `Another region "asia-east1 canary"`, existingList[0].(map[string]interface{})["answer"])
+
+	updPrompt := f.sendPromptToBob(t, `[{"id":"reg-over","question":"Updated?","choices":["yes","no"]}]`, true)
+	require.Len(t, updPrompt.Decisions, 1)
+	require.NotNil(t, updPrompt.Decisions[0].Replaced)
+	assert.Equal(t, `Another region "asia-east1 canary"`, updPrompt.Decisions[0].Replaced.Answer)
+}
+
+func TestFormatInterpretedOther_Golden(t *testing.T) {
+	const rawText = `europe-west4 "canary" *urgent* @everyone`
+	const escapedText = "europe-west4 \"canary\" \\*urgent\\* @\u200beveryone"
+
+	// Single-item Other response line escapes markdown & neutralizes @everyone.
+	single := formatInterpretedResponseLine("release-bot", "Alice", []store.InterpretedFormattedItem{
+		{
+			Key:         "region",
+			ChoiceID:    messages.ChoiceIDOther,
+			ChoiceLabel: "Another *region*",
+			OtherText:   rawText,
+		},
+	})
+	assert.Equal(t,
+		`release-bot recorded Alice's answer "`+escapedText+`" (Another \*region\*) to region, interpreted from their reply`,
+		single,
+	)
+
+	// Multi-item batch response line mixes fixed and Other items.
+	batch := formatInterpretedResponseLine("release-bot", "Alice", []store.InterpretedFormattedItem{
+		{Key: "proceed", ChoiceID: "yes", ChoiceLabel: "Yes"},
+		{Key: "region", ChoiceID: messages.ChoiceIDOther, ChoiceLabel: "Another *region*", OtherText: rawText},
+	})
+	assert.Equal(t,
+		`release-bot recorded Alice's answers to 2 decisions: proceed Yes · region Another \*region\* "`+escapedText+`", interpreted from their reply`,
+		batch,
+	)
+
+	// Failure messages for already_answered Other decisions across provenance & outcomes.
+	const quotedAns = `Another region "europe-west4 \"canary\" *urgent* @everyone"`
+	cases := []struct {
+		name       string
+		provenance string
+		outcome    string
+		want       string
+	}{
+		{
+			name:       "interpreted",
+			provenance: store.DecisionProvenanceAgentInterpreted,
+			outcome:    store.DecisionOutcomeAnswer,
+			want:       `region: already answered (interpreted by you from Alice's reply, ` + quotedAns + `)`,
+		},
+		{
+			name:       "confirmed",
+			provenance: store.DecisionProvenanceDirect,
+			outcome:    store.DecisionOutcomeConfirm,
+			want:       `region: already answered (confirmed by Alice, ` + quotedAns + `)`,
+		},
+		{
+			name:       "overridden",
+			provenance: store.DecisionProvenanceDirect,
+			outcome:    store.DecisionOutcomeOverride,
+			want:       `region: already answered (overridden by Alice, ` + quotedAns + `)`,
+		},
+		{
+			name:       "direct",
+			provenance: store.DecisionProvenanceDirect,
+			outcome:    store.DecisionOutcomeAnswer,
+			want:       `region: already answered (by Alice, ` + quotedAns + `)`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &store.Decision{
+				Key:    "region",
+				Status: store.DecisionStatusDecided,
+				Answers: []*store.DecisionAnswer{
+					{
+						ChoiceID:       messages.ChoiceIDOther,
+						ChoiceLabel:    "Another region",
+						OtherText:      rawText,
+						AnsweredByName: "Alice",
+						Provenance:     tc.provenance,
+						Outcome:        tc.outcome,
+					},
+				},
+			}
+			got := formatInterpretedFailureMessage(store.InterpretedKeyFailure{
+				Key:      "region",
+				Reason:   store.InterpretedReasonAlreadyAnswered,
+				Decision: d,
+			})
+			assert.Equal(t, tc.want, got)
+		})
+	}
 }

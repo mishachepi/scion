@@ -447,6 +447,26 @@ func (s *ProjectStore) SetProjectOwnerID(ctx context.Context, projectID, ownerID
 	return nil
 }
 
+// UpdateProjectGitHubAppStatus updates only the github_app_status column of a
+// project, leaving every other column untouched so concurrent admin unbinds or
+// remote/permission changes are never reverted by a stale snapshot writer.
+func (s *ProjectStore) UpdateProjectGitHubAppStatus(ctx context.Context, projectID string, status *store.GitHubAppProjectStatus) error {
+	uid, err := parseUUID(projectID)
+	if err != nil {
+		return err
+	}
+	update := s.client.Project.UpdateOneID(uid)
+	if status != nil {
+		update.SetGithubAppStatus(marshalRawJSON(status))
+	} else {
+		update.ClearGithubAppStatus()
+	}
+	if err := update.Exec(ctx); err != nil {
+		return mapError(err)
+	}
+	return nil
+}
+
 // UpdateProjectMessagingPolicy atomically updates the cross-project inbound
 // policy using optimistic concurrency on the revision counter. Returns the
 // updated project or ErrRevisionConflict if expectedRevision does not match.
@@ -791,6 +811,7 @@ func entBrokerToStore(b *ent.RuntimeBroker) *store.RuntimeBroker {
 		ConnectionState: b.ConnectionState,
 		Endpoint:        b.Endpoint,
 		AutoProvide:     b.AutoProvide,
+		AdminManaged:    b.AdminManaged,
 		Created:         b.Created,
 		Updated:         b.Updated,
 		CreatedBy:       b.CreatedBy,
@@ -916,6 +937,7 @@ func createRuntimeBroker(ctx context.Context, client *ent.Client, uid uuid.UUID,
 		SetSlug(b.Slug).
 		SetEndpoint(b.Endpoint).
 		SetAutoProvide(b.AutoProvide).
+		SetAdminManaged(b.AdminManaged).
 		SetCapabilities(marshalRawJSON(b.Capabilities)).
 		SetRuntimes(marshalRawJSON(profiles)).
 		SetDefaultProfile(defaultProfile).
@@ -1077,6 +1099,7 @@ func (s *ProjectStore) UpdateRuntimeBroker(ctx context.Context, b *store.Runtime
 		} else {
 			update.ClearConnectedAt()
 		}
+		// admin_managed is never written here; see SetRuntimeBrokerAdminManaged.
 		// The GCP host pair and its source are never written here; see
 		// SetRuntimeBrokerGCPHost*.
 		affected, err := update.Save(ctx)
@@ -1169,6 +1192,34 @@ func (s *ProjectStore) SetRuntimeBrokerCreatedByIfEmpty(ctx context.Context, id,
 		return false, mapError(err)
 	}
 	return affected == 1, nil
+}
+
+// SetRuntimeBrokerAdminManaged sets admin_managed on a runtime broker as a
+// compare-and-set on lock_version and returns the value it replaced.
+func (s *ProjectStore) SetRuntimeBrokerAdminManaged(ctx context.Context, id string, adminManaged bool) (bool, error) {
+	uid, err := parseUUID(id)
+	if err != nil {
+		return false, err
+	}
+	for attempt := 0; attempt < maxCASRetries; attempt++ {
+		cur, err := s.client.RuntimeBroker.Get(ctx, uid)
+		if err != nil {
+			return false, mapError(err)
+		}
+		affected, err := s.client.RuntimeBroker.Update().
+			Where(runtimebroker.IDEQ(uid), runtimebroker.LockVersionEQ(cur.LockVersion)).
+			SetAdminManaged(adminManaged).
+			SetUpdated(time.Now()).
+			AddLockVersion(1).
+			Save(ctx)
+		if err != nil {
+			return false, mapError(err)
+		}
+		if affected == 1 {
+			return cur.AdminManaged, nil
+		}
+	}
+	return false, store.ErrVersionConflict
 }
 
 // gcpHostEmailUnset and the other predicates below match both an empty

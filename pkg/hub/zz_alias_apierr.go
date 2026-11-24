@@ -34,11 +34,17 @@ const (
 	ErrCodeAddrAmbiguous                    = apierr.ErrCodeAddrAmbiguous
 	ErrCodeAddrMalformed                    = apierr.ErrCodeAddrMalformed
 	ErrCodeAddrUnknown                      = apierr.ErrCodeAddrUnknown
+	ErrCodeAgentExistsResumable             = apierr.ErrCodeAgentExistsResumable
 	ErrCodeAgentNotFound                    = apierr.ErrCodeAgentNotFound
+	ErrCodeAgentNotMessageable              = apierr.ErrCodeAgentNotMessageable
 	ErrCodeAgentNotRunning                  = apierr.ErrCodeAgentNotRunning
+	ErrCodeReservedName                     = apierr.ErrCodeReservedName
+	ErrCodeTaskNotSupported                 = apierr.ErrCodeTaskNotSupported
 	ErrCodeAgentSessionUnavailable          = apierr.ErrCodeAgentSessionUnavailable
 	ErrCodeAgentUpgradeRequired             = apierr.ErrCodeAgentUpgradeRequired
 	ErrCodeBrokerAuthFailed                 = apierr.ErrCodeBrokerAuthFailed
+	ErrCodeBrokerDeregistered               = apierr.ErrCodeBrokerDeregistered
+	ErrCodeBrokerOnline                     = apierr.ErrCodeBrokerOnline
 	ErrCodeBrokerTimeout                    = apierr.ErrCodeBrokerTimeout
 	ErrCodeChatPostDenied                   = apierr.ErrCodeChatPostDenied
 	ErrCodeClockSkew                        = apierr.ErrCodeClockSkew
@@ -63,6 +69,7 @@ const (
 	ErrCodeInternalError                    = apierr.ErrCodeInternalError
 	ErrCodeInvalidCursor                    = apierr.ErrCodeInvalidCursor
 	ErrCodeInvalidDMKey                     = apierr.ErrCodeInvalidDMKey
+	ErrCodeInvalidFilterQuery               = apierr.ErrCodeInvalidFilterQuery
 	ErrCodeInvalidJoinToken                 = apierr.ErrCodeInvalidJoinToken
 	ErrCodeInvalidRequest                   = apierr.ErrCodeInvalidRequest
 	ErrCodeInvalidRoleSet                   = apierr.ErrCodeInvalidRoleSet
@@ -107,6 +114,7 @@ const (
 	ErrCodeSecretPendingHeldByOtherAgent    = apierr.ErrCodeSecretPendingHeldByOtherAgent
 	ErrCodeSecretPendingCap                 = apierr.ErrCodeSecretPendingCap
 	ErrCodeSecretScopeRestricted            = apierr.ErrCodeSecretScopeRestricted
+	ErrCodeBrokerPolicyAdminManagedOnly     = apierr.ErrCodeBrokerPolicyAdminManagedOnly
 	ErrCodeInternalSecret                   = apierr.ErrCodeInternalSecret
 	ErrCodeLimitExceeded                    = apierr.ErrCodeLimitExceeded
 	ErrCodeSecurityReviewRequired           = apierr.ErrCodeSecurityReviewRequired
@@ -121,6 +129,7 @@ const (
 	ErrCodeUnavailable                      = apierr.ErrCodeUnavailable
 	ErrCodeUnprocessable                    = apierr.ErrCodeUnprocessable
 	ErrCodeUnsupportedCapability            = apierr.ErrCodeUnsupportedCapability
+	ErrCodeImplicitHarnessSwitch            = apierr.ErrCodeImplicitHarnessSwitch
 	ErrCodeUserDeleteBlocked                = apierr.ErrCodeUserDeleteBlocked
 	ErrCodeUserDeleteBlockersChanged        = apierr.ErrCodeUserDeleteBlockersChanged
 	ErrCodeUserDeleteForceForbidden         = apierr.ErrCodeUserDeleteForceForbidden

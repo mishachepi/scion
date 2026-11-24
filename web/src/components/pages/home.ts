@@ -30,6 +30,7 @@ import '../shared/status-badge.js';
 import { stateManager } from '../../client/state.js';
 import type { AgentsChangedDetail } from '../../client/state.js';
 import { apiFetch } from '../../client/api.js';
+import { loadAdminStatus } from '../../client/admin-status.js';
 import { AgentMemberIndex } from '../../client/agent-member-index.js';
 import { AgentSeedEpoch } from '../../client/agent-seed-epoch.js';
 import { dropTombstoned, dropTombstonedPairs } from '../../client/agent-merge.js';
@@ -40,6 +41,7 @@ import {
 } from '../../client/hub-capabilities.js';
 import { formatInstantWithZone, formatRelative } from '../../utils/time.js';
 import { DisplayZoneController } from '../../utils/display-zone-controller.js';
+import { openTerminalWorkspace } from '../../client/open-terminal.js';
 
 /**
  * Home's agents request: one agent, plus the complete set when it fits in
@@ -343,15 +345,16 @@ export class ScionPageHome extends LitElement {
 
   private async loadData(): Promise<void> {
     try {
-      const isAdmin = this.pageData?.user?.role === 'admin';
       const [, projectsResp, inviteStatsResp] = await Promise.all([
         this.fetchAgents(),
         apiFetch('/api/v1/projects'),
-        isAdmin
-          ? apiFetch('/api/v1/admin/invites/stats', {
-              suppressAccessDeniedToast: true,
-            }).catch(() => null)
-          : Promise.resolve(null),
+        loadAdminStatus(this.pageData?.user?.id).then((status) =>
+          status?.isAdmin
+            ? apiFetch('/api/v1/admin/invites/stats', {
+                suppressAccessDeniedToast: true,
+              }).catch(() => null)
+            : null
+        ),
       ]);
 
       if (!this.isConnected || stateManager.currentScope?.type !== 'dashboard') return;
@@ -393,7 +396,7 @@ export class ScionPageHome extends LitElement {
         var(--scion-primary, #3b82f6) 0%,
         var(--scion-primary-700, #1d4ed8) 100%
       );
-      color: white;
+      color: var(--scion-primary-text, #ffffff);
       padding: 2rem;
       border-radius: var(--scion-radius-lg, 0.75rem);
       margin-bottom: 2rem;
@@ -485,7 +488,7 @@ export class ScionPageHome extends LitElement {
       width: 3rem;
       height: 3rem;
       border-radius: var(--scion-radius, 0.5rem);
-      background: var(--scion-primary-50, #eff6ff);
+      background: var(--scion-primary-tint, #eff6ff);
       display: flex;
       align-items: center;
       justify-content: center;
@@ -666,7 +669,11 @@ export class ScionPageHome extends LitElement {
             <p>Browse project workspaces</p>
           </div>
         </a>
-        <a href="/agents" class="action-card">
+        <a
+          href="/terminals"
+          class="action-card"
+          @click=${(e: MouseEvent): void => this.handleOpenTerminalClick(e)}
+        >
           <div class="action-icon">
             <sl-icon name="terminal"></sl-icon>
           </div>
@@ -755,6 +762,14 @@ export class ScionPageHome extends LitElement {
   private onCountsChip(): void {
     if (this.countsLoading) return;
     void this.loadAgentCounts();
+  }
+
+  private handleOpenTerminalClick(e: MouseEvent): void {
+    if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) {
+      return;
+    }
+    e.preventDefault();
+    openTerminalWorkspace({ openPickerWhenEmpty: true });
   }
 
   private formatRelativeTime(dateStr: string): string {

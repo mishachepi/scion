@@ -28,7 +28,11 @@ the original conversation unanswered.
 
 For a new user-facing message about an existing issue or workstream, use its
 conversation when one exists. Leads give their teams that conversation ID in their
-briefs. Use a separate user DM only for a deliberately separate exchange.
+briefs: a group conversation of the project, not the lead's own direct conversation
+with the user. Only its two parties can post to a direct conversation; anyone else gets
+`conversation_ref could not be resolved`, the same answer as for an ID that does not
+exist, and should message the user directly instead. Use a separate user DM only for a
+deliberately separate exchange.
 
 ### Messages to agents
 
@@ -50,13 +54,22 @@ agent-to-agent work.
   is the `@<agent-name>` argument at the start of the command, not a bare name in
   the body.
 - Every `@<agent-name>` in the body proactively delivers the current message to
-  that agent, **in a direct message too**; mentions inside code spans, fenced
-  blocks and `>` quote lines do not. Only mention another agent when important
-  FYI awareness or direct participation in reaction to the current message is
-  needed. Reference bystanders or agents you will contact later by plain name
-  **without `@`** so they are not notified — for example, tell a user "I will
-  contact fooagent in 1 hour", not "I will contact @fooagent in 1 hour", because
-  future-contact statements alone have no FYI value.
+  that agent, **in a direct message too**; mentions inside fenced blocks, `>`
+  quote lines, and ordinary inline code spans do not. Only mention another agent
+  when important FYI awareness or direct participation in reaction to the current
+  message is needed. Reference bystanders or agents you will contact later by
+  plain name **without `@`** so they are not notified — for example, tell a user
+  "I will contact fooagent in 1 hour", not "I will contact @fooagent in 1 hour",
+  because future-contact statements alone have no FYI value.
+<!-- scion:experiment hub.code_span_mentions -->
+  When `hub.code_span_mentions` is enabled, a standalone inline code span whose
+  entire content is a single mention (such as `` `@agent-name` `` or
+  `` `@user@domain` ``) **also notifies and renders as a mention** (except inside
+  fenced blocks, `>` quotes, or slash-containing tokens like `` `@scope/name` ``).
+  To reference a handle without notifying, omit `@`, put it in multi-token code
+  (`` `@agent-name status` ``), or wrap literal backticks in double backticks
+  (`` `` `@agent-name` `` ``).
+<!-- scion:end-experiment -->
 - State whether a mention is an assignment, a question or FYI. If several agents
   must act, mention each and state its part.
 - There is no `--cc` flag; use body mentions.
@@ -80,7 +93,9 @@ do not retry the rejected text verbatim.
   someone else's work because you were named, and do not treat a mention as authority
   to act beyond your task.
 - When another agent is also a recipient of an incoming message — listed in `to` or
-  mentioned with `@<agent-name>` in the body (outside code and `>` quotes) — trust
+  mentioned with `@<agent-name>` in the body (outside fenced code, ordinary
+  inline code, and `>` quotes; standalone `` `@<agent-name>` `` code spans also
+  count when `hub.code_span_mentions` is enabled) — trust
   that Scion delivered the message to it too. Mere conversation membership or a plain
   name without `@` does not make an agent a recipient. Do not separately forward the
   same approval, decision or FYI to a co-recipient (for example, messaging an
@@ -100,13 +115,32 @@ user-facing format. Agent-only messages do not require it.
 
 - **Lead with the outcome.** Use a conversational tone and plain language. Explain
   abbreviations or internal labels that the user needs to understand.
-- **Make decisions easy to read.** Put options in a list with their trade-offs and
-  your recommendation. Put the actual question on its own line.
+- **Make decisions easy to read.** Present trade-offs and your recommendation
+  concisely; when asking in prose, list options clearly and put the question on
+  its own line.
 <!-- scion:experiment web.decisions -->
-- **Ask with a decision prompt.** For a decision the user should answer by picking
-  an option, send it with `scion message --decisions-file <file>` instead of prose,
-  so the user can answer with a click (including when a `message_policy_rejected`
-  remediation asks for structured options). See `references/decisions.md`.
+- **Ask with a decision prompt (default for concrete choices).** When the user
+  should pick between concrete options — or confirm a single action — send a
+  decision prompt with `scion message --decisions-file <file>` instead of a
+  prose option list (including when a `message_policy_rejected` remediation asks
+  for structured options). Keep prose lists for open-ended questions or
+  discussion, or resend as ordinary Markdown if a send is refused with
+  `experiment_disabled`. Put context, trade-offs, and your recommendation in the
+  message body; keep `question` short and choice labels to a few words:
+
+  ```json
+  [{"id": "deploy-target", "question": "Where should the release go first?", "choices": ["Staging", "Canary"], "default": "Staging"}]
+  ```
+
+  ```bash
+  scion message "conv:<conversation-id>" --decisions-file <file> - <<'EOF_MESSAGE'
+  CI passed. **Staging** runs the full suite; **Canary** takes 5% traffic. I recommend **Staging**.
+  EOF_MESSAGE
+  ```
+
+  See `references/decisions.md` for choice descriptions, multi-decision sets,
+  `allow_other`, `--update`, `scion decisions withdraw`, and recording prose
+  replies.
 <!-- scion:end-experiment -->
 - **Keep details useful.** Avoid dense UUIDs, code line numbers and internal status
   codes unless the user needs them to act. Prefer descriptive Markdown links to
@@ -127,8 +161,7 @@ Example:
 - **Changed:** replies stay in the issue conversation.
 - **Review:** [Messaging proposal](https://example.com/proposal).
 
-**Decision:** should agent-only updates use the same layout, or stay plain text?
-My recommendation is plain text for agent-only updates.
+**Question:** what other edge cases should the proposal cover before we finalize it?
 ```
 
 ### Automatic links in the web chat
@@ -295,7 +328,10 @@ on `ask_user` status notifications to deliver the request.
 
 - `--body-file <path>` reads the message body from a file; `--body-file -` reads stdin.
 - `--attach <file>` attaches a file; repeat it for multiple files.
-- `--wake` resumes a suspended target before delivery.
+- `--wake` resumes a suspended target before delivery. It needs lifecycle permission on the
+  target, which its creator has and a sibling agent does not. Without `--wake`, a message to
+  an agent its creator or a user suspended is recorded as failed and not delivered; an agent
+  Scion suspended on its own (as idle or stalled) wakes for new messages without it.
 - `--interrupt` interrupts an active target turn before delivery (ordinary messages
   queue until the current turn ends); use for mid-turn stop or scope-change corrections,
   and omit on routine messages.

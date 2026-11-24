@@ -110,7 +110,7 @@ type TargetScopeEvidence struct {
 //  3. r.Type == permissions.ResourceHub: TargetScopeHub.
 //  4. facts.hasProjectParent: TargetScopeProject.
 //  5. facts.hasSystemParent: TargetScopeHub.
-//  6. r.Type is "broker" or "runtime_broker": TargetScopeHub.
+//  6. r.Type == permissions.ResourceBroker: TargetScopeHub.
 //  7. facts.hasGlobalScope: TargetScopeHub.
 //  8. Anything else: TargetScopeUnknown. Never equate missing resource
 //     parent metadata with hub scope.
@@ -136,7 +136,7 @@ func ResolveTargetScope(r Resource, evidence TargetScopeEvidence) TargetScope {
 	if facts.hasSystemParent {
 		return TargetScope{Kind: TargetScopeHub}
 	}
-	if r.Type == "broker" || r.Type == "runtime_broker" {
+	if r.Type == permissions.ResourceBroker {
 		return TargetScope{Kind: TargetScopeHub}
 	}
 	if facts.hasGlobalScope {
@@ -929,7 +929,7 @@ var validRealProjectScopeKinds = map[string][]string{
 	permissions.ResourceSkill:          {store.SkillScopeProject},
 	permissions.ResourceTemplate:       {store.TemplateScopeProject},
 	permissions.ResourceHarnessConfig:  {store.HarnessConfigScopeProject},
-	permissions.ResourceSecret:         {store.ScopeProject, store.ScopeHub, store.ScopeUser, store.ScopeRuntimeBroker},
+	permissions.ResourceSecret:         {store.ScopeProject, store.ScopeHub, store.ScopeUser, store.ScopeRuntimeBroker, store.ScopeAgent},
 	permissions.ResourceEnvVar:         {store.ScopeProject, store.ScopeHub, store.ScopeUser, store.ScopeRuntimeBroker},
 	permissions.ResourceSkillInjection: {store.ScopeProject, store.ScopeHub, store.ScopeUser, store.ScopeRuntimeBroker},
 }

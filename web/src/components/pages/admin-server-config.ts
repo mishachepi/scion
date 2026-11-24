@@ -27,7 +27,7 @@ import type { TemplateResult } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 
 import { apiFetch, extractApiError } from '../../client/api.js';
-import { invalidatePublicSettings } from '../../client/server-feature-flags.js';
+import { getPublicSettings, invalidatePublicSettings } from '../../client/server-feature-flags.js';
 import { KNOWN_HARNESS_NAMES, harnessDisplayName } from '../../shared/harness-utils.js';
 import { normalizeModelAlias } from '../../shared/model-utils.js';
 import { isKubernetesRuntimeType } from '../../shared/runtime-kind.js';
@@ -103,6 +103,8 @@ import {
   renderKeysEnvBadge,
 } from '../shared/env-badge-views.js';
 import {
+  ADMIN_MANAGED_BROKERS_FLAG,
+  CUSTOM_DEFAULT_USER_ROLE_FLAG,
   FEATURE_FLAGS_CHANGED_EVENT,
   FLAT_BROKERS_FLAG,
   isFeatureEnabled,
@@ -525,6 +527,8 @@ interface ServerConfigResponse {
 
   agent_secrets?: { user_scope_only?: boolean };
 
+  broker_policy?: { admin_managed_only?: boolean };
+
   // Settings-DB metadata (DB-backed hubs, any driver; absent when the hub has no operational settings)
   settings_tier?: 'db' | 'file';
   // True on workstation hubs: Layer-0 and file-only settings are editable and
@@ -547,6 +551,21 @@ interface ServerConfigResponse {
   section_metadata?: Record<string, SectionMetadataInfo>;
   superseded_keys?: Record<string, SupersededKeyInfo[]>;
   deprecated_env_keys?: DeprecatedEnvKeyInfo[];
+  default_user_role_warning?: DefaultUserRoleWarning;
+  eligible_default_roles?: EligibleDefaultRole[];
+}
+
+interface DefaultUserRoleWarning {
+  code: string;
+  configured_role: string;
+  effective_role: string;
+  message: string;
+}
+
+interface EligibleDefaultRole {
+  id: string;
+  name: string;
+  description?: string;
 }
 
 interface HarnessConfigEntry {
@@ -774,6 +793,8 @@ const KOANF_KEY_LABELS: Record<string, string> = {
   'quotas.enforce_broker_quotas': 'Enforce Broker Agent Quotas',
   // agent_secrets section
   'agent_secrets.user_scope_only': 'Agent Secrets: Profile Scope Only',
+  // broker_policy section
+  'broker_policy.admin_managed_only': 'Runtime Broker Policy: Admin-Managed Only',
   // telemetry section
   'telemetry.enabled': 'Telemetry Enabled',
   'telemetry.cloud.enabled': 'Cloud Export Enabled',
@@ -1284,6 +1305,8 @@ export class ScionPageAdminServerConfig extends LitElement {
   @state() private authAuthorizedDomains = '';
   @state() private authUserAccessMode = 'open';
   @state() private authDefaultUserRole = 'member';
+  @state() private defaultUserRoleWarning: DefaultUserRoleWarning | null = null;
+  @state() private eligibleDefaultRoles: EligibleDefaultRole[] = [];
 
   // Storage
   @state() private storageProvider = '';
@@ -1312,6 +1335,10 @@ export class ScionPageAdminServerConfig extends LitElement {
   // Agent Secrets (unset means permissive)
   @state() private agentSecretsUserScopeOnly: boolean | null = null;
   private loadedAgentSecretsUserScopeOnly: boolean | null = null;
+
+  // Runtime Broker Policy (unset means permissive)
+  @state() private brokerPolicyAdminManagedOnly: boolean | null = null;
+  private loadedBrokerPolicyAdminManagedOnly: boolean | null = null;
 
   // Telemetry
   @state() private telemetryEnabled: boolean | null = null;
@@ -1661,7 +1688,7 @@ export class ScionPageAdminServerConfig extends LitElement {
       font-size: 0.8125rem;
       background: var(--scion-bg, #f8fafc);
       padding: 0.125rem 0.375rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
       border: 1px solid var(--scion-border, #e2e8f0);
     }
 
@@ -1840,7 +1867,7 @@ export class ScionPageAdminServerConfig extends LitElement {
       font-size: 0.75rem;
       background: var(--sl-color-warning-100, #fef3c7);
       padding: 0.125rem 0.375rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
     }
 
     /* ── Settings-DB: section metadata caption ── */
@@ -1956,7 +1983,7 @@ export class ScionPageAdminServerConfig extends LitElement {
       font-size: 0.75rem;
       background: var(--sl-color-primary-100, #dbeafe);
       padding: 0.125rem 0.375rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
     }
 
     .superseded-source {
@@ -2003,7 +2030,7 @@ export class ScionPageAdminServerConfig extends LitElement {
       font-size: 0.75rem;
       background: var(--sl-color-warning-100, #fef3c7);
       padding: 0.125rem 0.375rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
     }
 
     /* ── Settings-DB: reset confirm dialog ── */
@@ -2060,7 +2087,7 @@ export class ScionPageAdminServerConfig extends LitElement {
       font-size: 0.75rem;
       background: var(--sl-color-neutral-100, #f1f5f9);
       padding: 0.125rem 0.375rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
     }
 
     /* ── Structured error handling (§3.6) ── */
@@ -2110,7 +2137,7 @@ export class ScionPageAdminServerConfig extends LitElement {
       font-size: 0.75rem;
       background: var(--sl-color-neutral-100, #f1f5f9);
       padding: 0.125rem 0.375rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
     }
 
     .validation-errors {
@@ -2161,7 +2188,7 @@ export class ScionPageAdminServerConfig extends LitElement {
       font-size: 0.75rem;
       background: rgba(0, 0, 0, 0.05);
       padding: 0.125rem 0.375rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
       margin-right: 0.25rem;
     }
 
@@ -2421,6 +2448,10 @@ export class ScionPageAdminServerConfig extends LitElement {
     this.authAuthorizedDomains = (authBlock.authorized_domains || []).join(', ');
     this.authUserAccessMode = authBlock.user_access_mode || 'open';
     this.authDefaultUserRole = authBlock.default_user_role || 'member';
+    this.defaultUserRoleWarning = data.default_user_role_warning ?? null;
+    this.eligibleDefaultRoles = Array.isArray(data.eligible_default_roles)
+      ? data.eligible_default_roles
+      : [];
 
     // Storage
     const storageBlock = srv.storage ?? {};
@@ -2470,6 +2501,10 @@ export class ScionPageAdminServerConfig extends LitElement {
     // Agent Secrets — absent means permissive (agents may write project scope).
     this.agentSecretsUserScopeOnly = data.agent_secrets?.user_scope_only ?? null;
     this.loadedAgentSecretsUserScopeOnly = this.agentSecretsUserScopeOnly;
+
+    // Runtime Broker Policy — absent means permissive (members may register brokers).
+    this.brokerPolicyAdminManagedOnly = data.broker_policy?.admin_managed_only ?? null;
+    this.loadedBrokerPolicyAdminManagedOnly = this.brokerPolicyAdminManagedOnly;
 
     // Hub observability export switches — absent means unset.
     const obs = data.server?.hub?.observability;
@@ -3186,6 +3221,13 @@ export class ScionPageAdminServerConfig extends LitElement {
         this.agentSecretsUserScopeOnly,
         this.loadedAgentSecretsUserScopeOnly,
       ],
+      [
+        'broker_policy',
+        'admin_managed_only',
+        'broker_policy.admin_managed_only',
+        this.brokerPolicyAdminManagedOnly,
+        this.loadedBrokerPolicyAdminManagedOnly,
+      ],
     ];
     for (const [section, field, key, value, loaded] of sections) {
       if (!ok(key)) continue;
@@ -3680,6 +3722,7 @@ export class ScionPageAdminServerConfig extends LitElement {
       // toggle, telemetry and auto-expose defaults, hub agent defaults,
       // agent_secrets.user_scope_only); drop this tab's cached copy.
       invalidatePublicSettings();
+      void getPublicSettings();
 
       const result = (await res.json()) as {
         reload?: ReloadResult;
@@ -4168,6 +4211,7 @@ export class ScionPageAdminServerConfig extends LitElement {
       }
       // Like a save, a reset can change GET /api/v1/settings/public.
       invalidatePublicSettings();
+      void getPublicSettings();
       this.resetConfirmSection = null;
       await this.loadConfig();
       this.successMessage = `Section "${sectionName}" has been reset to deployment configuration.`;
@@ -5284,6 +5328,54 @@ export class ScionPageAdminServerConfig extends LitElement {
               >When on, agents (including Capture Auth) can only store secrets in the user's
               profile. Project-scope writes from agents are rejected. Existing project secrets are
               not removed. Users can still manage project secrets.</span
+            >
+          </div>
+        </div>
+      </div>
+
+      ${this.renderBrokerPolicySection()}
+    `;
+  }
+
+  private renderBrokerPolicySection() {
+    const expEnabled = isFeatureEnabled(ADMIN_MANAGED_BROKERS_FLAG);
+    if (!expEnabled) {
+      if (this.brokerPolicyAdminManagedOnly !== true) {
+        return nothing;
+      }
+      return html`
+        <div class="section" data-section="broker-policy-mismatch">
+          <h3 class="section-title">Runtime Broker Policy</h3>
+          <sl-alert variant="warning" open data-broker-policy-mismatch>
+            <sl-icon slot="icon" name="exclamation-triangle"></sl-icon>
+            <code>broker_policy.admin_managed_only</code> is stored as <strong>true</strong>, but
+            experiment <code>${ADMIN_MANAGED_BROKERS_FLAG}</code> is off. The admin-managed-only
+            Runtime Broker policy is not currently enforced. Enable the experiment on
+            <a href="/admin/experiments">Admin &gt; Experiments</a> to activate enforcement.
+          </sl-alert>
+        </div>
+      `;
+    }
+    return html`
+      <!-- Card: Runtime Broker Policy -->
+      <div class="section" data-section="broker-policy">
+        <h3 class="section-title">Runtime Broker Policy</h3>
+        <div class="form-grid">
+          <div class="form-field full-width">
+            ${this.renderTriStateSwitch({
+              key: 'broker_policy.admin_managed_only',
+              label: 'Require admin-managed Runtime Brokers only',
+              value: this.brokerPolicyAdminManagedOnly,
+              loaded: this.loadedBrokerPolicyAdminManagedOnly,
+              unsetChecked: false,
+              unsetLabel: 'Not set (default: off)',
+              set: (v) => (this.brokerPolicyAdminManagedOnly = v),
+            })}
+            <span class="hint"
+              >When on, only hub administrators may register new Runtime Brokers (using
+              <code>--admin-managed</code>), non-approved brokers cannot be registered or used for
+              new workloads, and existing agents on non-approved brokers cannot be started, resumed,
+              restarted, or woken. Embedded and auto-provide brokers remain eligible.</span
             >
           </div>
         </div>
@@ -7460,6 +7552,62 @@ export class ScionPageAdminServerConfig extends LitElement {
     );
   }
 
+  private renderDefaultUserRoleControl() {
+    const customDefaultRoleEnabled = isFeatureEnabled(CUSTOM_DEFAULT_USER_ROLE_FLAG);
+    const eligibleRoles = customDefaultRoleEnabled ? this.eligibleDefaultRoles : [];
+    const isBuiltinRole =
+      !this.authDefaultUserRole ||
+      this.authDefaultUserRole === 'member' ||
+      this.authDefaultUserRole === 'viewer';
+    const hasUnavailableConfiguredRole =
+      !isBuiltinRole && !eligibleRoles.some((r) => r.name === this.authDefaultUserRole);
+
+    return html`
+      ${this.renderFieldValue(
+        'server.auth.default_user_role',
+        this.authDefaultUserRole,
+        html`${this.renderEnvBadge('server.auth.default_user_role')}<sl-select
+            class="default-user-role-select"
+            value=${this.authDefaultUserRole}
+            @sl-change=${(e: Event) => {
+              this.authDefaultUserRole = (e.target as HTMLSelectElement).value;
+            }}
+          >
+            <sl-option value="member">Member</sl-option>
+            <sl-option value="viewer">Viewer</sl-option>
+            ${eligibleRoles.length > 0 || hasUnavailableConfiguredRole
+              ? html`<sl-divider></sl-divider>`
+              : nothing}
+            ${eligibleRoles.map(
+              (role) => html`
+                <sl-option value=${role.name}>
+                  ${role.name}${role.description ? ` — ${role.description}` : ''}
+                </sl-option>
+              `
+            )}
+            ${hasUnavailableConfiguredRole
+              ? html`
+                  <sl-option value=${this.authDefaultUserRole} disabled>
+                    ${this.authDefaultUserRole} (unavailable)
+                  </sl-option>
+                `
+              : nothing}
+          </sl-select>`
+      )}
+      ${this.defaultUserRoleWarning
+        ? html`<sl-alert
+            class="default-user-role-warning"
+            variant="warning"
+            open
+            style="margin-top: 0.75rem"
+          >
+            <sl-icon slot="icon" name="exclamation-triangle"></sl-icon>
+            <strong>Fallback active:</strong> ${this.defaultUserRoleWarning.message}
+          </sl-alert>`
+        : nothing}
+    `;
+  }
+
   private renderBrokerInstancesSection() {
     if (
       !isFeatureEnabled(FLAT_BROKERS_FLAG) &&
@@ -8087,25 +8235,24 @@ export class ScionPageAdminServerConfig extends LitElement {
                   <strong>cannot create projects</strong> (including cloning). Viewers can still be
                   added to projects and work there according to their project role.
                 </li>
+                ${isFeatureEnabled(CUSTOM_DEFAULT_USER_ROLE_FLAG)
+                  ? html`
+                      <li>
+                        <strong>Custom system roles:</strong> eligible custom system-scope roles can
+                        be selected instead of Member or Viewer. A custom default role replaces the
+                        built-in <code>hub-member</code> grant rather than adding to it. If a
+                        configured custom role is removed or becomes ineligible, new users fall back
+                        to Member.
+                      </li>
+                    `
+                  : nothing}
               </ul>
               <p>
                 This is also the role given to an admin who is removed from Admin Emails. Change an
                 individual user's role on <a href="/admin/users">Admin &gt; Users</a>.
               </p>
             </div>
-            ${this.renderFieldValue(
-              'server.auth.default_user_role',
-              this.authDefaultUserRole,
-              html`${this.renderEnvBadge('server.auth.default_user_role')}<sl-select
-                  value=${this.authDefaultUserRole}
-                  @sl-change=${(e: Event) => {
-                    this.authDefaultUserRole = (e.target as HTMLSelectElement).value;
-                  }}
-                >
-                  <sl-option value="member">Member</sl-option>
-                  <sl-option value="viewer">Viewer</sl-option>
-                </sl-select>`
-            )}
+            ${this.renderDefaultUserRoleControl()}
           </div>
         </div>
       </div>

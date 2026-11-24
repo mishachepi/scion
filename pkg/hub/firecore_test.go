@@ -1363,12 +1363,12 @@ func TestFireCoreDispatchAgentAction(t *testing.T) {
 		}))
 
 		normalized, err := act.Validate(context.Background(), nil, projectID, `{"agentName":"worker"}`)
-		require.ErrorContains(t, err, "dispatch_agent action authoring validation is not wired in Stage 1")
+		require.ErrorContains(t, err, "authentication required")
 		assert.Empty(t, normalized)
 
 		var nilAction *dispatchAgentAction
 		normalized, err = nilAction.Validate(context.Background(), nil, "", "")
-		require.ErrorContains(t, err, "dispatch_agent action authoring validation is not wired in Stage 1")
+		require.ErrorContains(t, err, "dispatch_agent action: server not configured")
 		assert.Empty(t, normalized)
 	})
 
@@ -2260,7 +2260,7 @@ func TestFireCoreExecActionPreauthorizeAndAuthorize(t *testing.T) {
 		assert.Equal(t, 45, ea.payload.timeout())
 	})
 
-	t.Run("DefinitionKindTrigger fails closed with generic refusal before any skip or refusal audit", func(t *testing.T) {
+	t.Run("DefinitionKindTrigger gates on experiment, event presence, and replay protection without schedule audit", func(t *testing.T) {
 		logBuf := &fireCoreLogBuffer{}
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
@@ -2269,9 +2269,8 @@ func TestFireCoreExecActionPreauthorizeAndAuthorize(t *testing.T) {
 		ms, srv, _, auth, identity, target := setupFixture(t)
 		act := &execAction{srv: srv}
 
-		// Even with hub.exec_schedules disabled, stale FireAt, and unrecorded
-		// authority, DefinitionKindTrigger refuses before Preauthorize's skip
-		// audit or OnAuthorityRefused's refusal audit can fire.
+		// With hub.exec_schedules disabled, DefinitionKindTrigger skips cleanly
+		// and logs under trigger.fire.exec.*, never schedule.exec.*.
 		setFireCoreExperiments(t, srv, map[string]bool{
 			conduitExperiment:         true,
 			experiments.ExecSchedules: false,
@@ -2289,14 +2288,23 @@ func TestFireCoreExecActionPreauthorizeAndAuthorize(t *testing.T) {
 		}
 
 		out := srv.fireAction(context.Background(), trigReq)
-		assert.Equal(t, hubfire.FireStatusRefused, out.Status)
-		assert.Equal(t, execReasonRefused, out.Error)
+		assert.Equal(t, hubfire.FireStatusSkipped, out.Status)
+		assert.Equal(t, execReasonDisabled, out.Error)
 		assert.Empty(t, out.ResultRef)
 		assert.False(t, out.Detached)
 		assert.NotContains(t, logBuf.String(), "audit_action=schedule.exec.")
 
-		// Direct Authorize and Fire calls also fail closed with generic refusal
-		// text and zero schedule.exec.* audit records.
+		// With hub.exec_schedules enabled, missing Event fails closed in both
+		// Preauthorize and Authorize, with zero schedule.exec.* audit records.
+		setFireCoreExperiments(t, srv, map[string]bool{
+			conduitExperiment:         true,
+			experiments.ExecSchedules: true,
+		})
+		refusal, err := act.Preauthorize(context.Background(), trigReq)
+		require.NoError(t, err)
+		require.NotNil(t, refusal)
+		assert.Equal(t, execReasonRefused, refusal.Reason)
+
 		trigRec := newFireCoreTestAuthority(ms, projectID) // DefinitionKindTrigger
 		authorized, refusal, err := act.Authorize(context.Background(), hubfire.FireRequest{
 			ProjectID:  projectID,
@@ -2308,16 +2316,7 @@ func TestFireCoreExecActionPreauthorizeAndAuthorize(t *testing.T) {
 		require.NoError(t, err)
 		assert.Nil(t, authorized)
 		require.NotNil(t, refusal)
-		assert.Equal(t, execReasonRefused, refusal.Reason)
-
-		fireOut, fireErr := act.Fire(context.Background(), trigReq, &execAuthorized{
-			payload: &scheduledExecPayload{AgentID: target.ID, Command: []string{"echo", "ok"}},
-			target:  target,
-			auth:    auth,
-		})
-		require.EqualError(t, fireErr, execReasonRefused)
-		assert.Empty(t, fireOut.ResultRef)
-		assert.False(t, fireOut.Detached)
+		assert.Equal(t, execReasonContextInvalid, refusal.Reason)
 		assert.NotContains(t, logBuf.String(), "audit_action=schedule.exec.")
 	})
 }
@@ -2337,60 +2336,87 @@ func TestFireCoreTriggerGenericErrorText(t *testing.T) {
 	cases := []struct {
 		name       string
 		actionType string
-		rawErr     string
+		rawErr     error
 		wantTrig   string
+		allowSlug  bool
 	}{
 		{
 			name:       "dispatch error with slug and deadline",
 			actionType: "message",
-			rawErr:     `failed to dispatch message to agent secret-slug: context deadline exceeded`,
+			rawErr:     errors.New(`failed to dispatch message to agent secret-slug: context deadline exceeded`),
 			wantTrig:   "message delivery failed",
 		},
 		{
 			name:       "target stopped phase message",
 			actionType: "message",
-			rawErr:     `agent "secret-slug" is not running (phase: stopped)`,
+			rawErr:     errors.New(`agent "secret-slug" is not running (phase: stopped)`),
 			wantTrig:   "target not running",
 		},
 		{
 			name:       "reincarnation in flight",
 			actionType: "message",
-			rawErr:     "target agent is reincarnating",
+			rawErr:     errors.New("target agent is reincarnating"),
 			wantTrig:   "agent restarted during fire",
 		},
 		{
 			name:       "wake error with slug",
 			actionType: "message",
-			rawErr:     `failed to wake agent secret-slug: 502: bad gateway`,
+			rawErr:     errors.New(`failed to wake agent secret-slug: 502: bad gateway`),
 			wantTrig:   "target wake failed",
 		},
 		{
 			name:       "hub shutting down",
 			actionType: "message",
-			rawErr:     errScheduledWakeShuttingDown.Error(),
+			rawErr:     errScheduledWakeShuttingDown,
 			wantTrig:   "hub shutting down",
 		},
 		{
-			name:       "designed env-gather remedy preserved",
+			name:       "designed env-gather remedy preserved for typed dispatch_agent error",
 			actionType: "dispatch_agent",
-			rawErr:     "missing required environment variables (2)",
+			rawErr:     &HeadlessMissingEnvError{Count: 2},
 			wantTrig:   "missing required environment variables (2)",
+		},
+		{
+			name:       "SCHEDULE_BLOCKED remedy preserved for typed dispatch_agent error",
+			actionType: "dispatch_agent",
+			rawErr:     scheduleBlockedError(&store.Agent{Slug: "worker-1"}, false),
+			wantTrig:   `agent "worker-1" already exists in project in phase error; delete the agent to resume this schedule`,
+			allowSlug:  true,
+		},
+		{
+			name:       "untyped missing-env substring on message does not bypass mapping",
+			actionType: "message",
+			rawErr:     errors.New("missing required environment variables (2) for secret-slug"),
+			wantTrig:   "message delivery failed",
+		},
+		{
+			name:       "untyped phase-error substring on message does not bypass mapping",
+			actionType: "message",
+			rawErr:     errors.New(`broker echoed: agent "secret-slug" already exists in project in phase error`),
+			wantTrig:   "message delivery failed",
+		},
+		{
+			name:       "untyped phase-error substring on dispatch_agent does not bypass mapping",
+			actionType: "dispatch_agent",
+			rawErr:     errors.New(`broker echoed: agent "secret-slug" already exists in project in phase error`),
+			wantTrig:   "dispatch_agent failed",
 		},
 		{
 			name:       "generic refusal preserved",
 			actionType: "message",
-			rawErr:     errScheduledMessageRefused.Error(),
+			rawErr:     errScheduledMessageRefused,
 			wantTrig:   errScheduledMessageRefused.Error(),
 		},
 	}
 
+	core := serverTriggerCore{srv: srv}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			srv.RegisterAction(&fakeFireAction{
 				actionType: tc.actionType,
 				permission: scheduledMessagePermission,
 				fireFn: func(context.Context, hubfire.FireRequest, FireAuthorized) (hubfire.FireOutcome, error) {
-					return hubfire.FireOutcome{}, errors.New(tc.rawErr)
+					return hubfire.FireOutcome{}, tc.rawErr
 				},
 			})
 
@@ -2398,14 +2424,16 @@ func TestFireCoreTriggerGenericErrorText(t *testing.T) {
 			trigRec.DefinitionKind = hubfire.DefinitionKindTrigger
 			trigRec.DefinitionID = "tr-1"
 			trigRec.FireID = "fire-1"
-			trigOut := srv.fireAction(context.Background(), hubfire.FireRequest{
+			trigOut := core.Fire(context.Background(), hubfire.FireRequest{
 				ProjectID:  projectID,
 				Authority:  trigRec,
 				ActionType: tc.actionType,
 			})
 			assert.Equal(t, hubfire.FireStatusFailed, trigOut.Status)
 			assert.Equal(t, tc.wantTrig, trigOut.Error)
-			assert.NotContains(t, trigOut.Error, "secret-slug")
+			if !tc.allowSlug {
+				assert.NotContains(t, trigOut.Error, "secret-slug")
+			}
 
 			schedRec := rec
 			schedRec.DefinitionKind = hubfire.DefinitionKindSchedule
@@ -2417,7 +2445,7 @@ func TestFireCoreTriggerGenericErrorText(t *testing.T) {
 				ActionType: tc.actionType,
 			})
 			assert.Equal(t, hubfire.FireStatusFailed, schedOut.Status)
-			assert.Equal(t, tc.rawErr, schedOut.Error, "schedule error text must remain bit-identical")
+			assert.Equal(t, tc.rawErr.Error(), schedOut.Error, "schedule error text must remain bit-identical")
 		})
 	}
 }

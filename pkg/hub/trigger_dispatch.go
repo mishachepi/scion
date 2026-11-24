@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,13 +42,40 @@ import (
 // triggerRuntime holds the hub's shared trigger.event durablequeue handle and
 // background drainer lifecycle state. The zero value is ready to use.
 type triggerRuntime struct {
-	mu          sync.Mutex
-	queue       *durablequeue.StoreQueue
-	ruleMetrics *trigger.OTelRuleEvalMetrics
-	drainer     *durablequeue.Drainer
-	cancel      context.CancelFunc
-	done        chan struct{}
-	started     bool
+	mu                   sync.Mutex
+	queue                *durablequeue.StoreQueue
+	ruleMetrics          *trigger.OTelRuleEvalMetrics
+	templateRefusalAudit trigger.TemplateRefusalAuditSink
+	drainer              *durablequeue.Drainer
+	cancel               context.CancelFunc
+	done                 chan struct{}
+	started              bool
+}
+
+// SetTriggerTemplateRefusalAuditSink overrides the audit sink used for
+// trigger.fire.template_refused records (primarily for tests). Passing nil
+// restores the default SlogAuditSink.
+func (s *Server) SetTriggerTemplateRefusalAuditSink(sink trigger.TemplateRefusalAuditSink) {
+	if s == nil {
+		return
+	}
+	s.triggers.mu.Lock()
+	s.triggers.templateRefusalAudit = sink
+	s.triggers.mu.Unlock()
+}
+
+func (s *Server) triggerTemplateRefusalAudit() trigger.TemplateRefusalAuditSink {
+	if s != nil {
+		s.triggers.mu.Lock()
+		sink := s.triggers.templateRefusalAudit
+		if sink == nil {
+			sink = trigger.NewSlogAuditSink(trigger.SlogAuditConfig{})
+			s.triggers.templateRefusalAudit = sink
+		}
+		s.triggers.mu.Unlock()
+		return sink
+	}
+	return trigger.NewSlogAuditSink(trigger.SlogAuditConfig{})
 }
 
 // TriggerEventQueue returns the hub's shared durablequeue.StoreQueue for
@@ -77,7 +105,7 @@ func (s *Server) triggerQueueLocked(dqStore store.DurableQueueStore) *durableque
 		return s.durableQueue
 	}
 	if s.triggers.queue == nil {
-		s.triggers.queue = durablequeue.NewQueue(dqStore)
+		s.triggers.queue = durablequeue.NewQueue(dqStore, durablequeue.WithQueueMetrics(serverTriggerMetrics{srv: s}))
 	}
 	return s.triggers.queue
 }
@@ -90,17 +118,184 @@ type serverTriggerCore struct {
 }
 
 var (
-	_ trigger.Core             = serverTriggerCore{}
-	_ trigger.FireAdmitter     = serverTriggerCore{}
-	_ trigger.SourceAuthorizer = serverTriggerCore{}
+	_ trigger.Core                 = serverTriggerCore{}
+	_ trigger.FireAdmitter         = serverTriggerCore{}
+	_ trigger.SourceAuthorizer     = serverTriggerCore{}
+	_ trigger.SourceEnricher       = serverTriggerCore{}
+	_ trigger.PostEvaluationHook   = serverTriggerCore{}
+	_ trigger.ReuseMessageRenderer = serverTriggerCore{}
+	_ trigger.PreFireRefuser       = serverTriggerCore{}
 )
 
+func (c serverTriggerCore) PreFireRefusal(ctx context.Context, tr *store.Trigger, ev *hubfire.FireEvent) (string, string, bool) {
+	if c.srv == nil || tr == nil || ev == nil {
+		return "", "", false
+	}
+	if !trigger.ActionSubjectToPreFireGuards(tr.ActionType) {
+		return "", "", false
+	}
+	if refusal, auditReason := c.srv.githubBotSenderRefusal(ctx, ev); refusal != nil {
+		return refusal.Reason, auditReason, true
+	}
+	return "", "", false
+}
+
+func (c serverTriggerCore) RenderReuseMessage(ctx context.Context, req hubfire.FireRequest) (string, *hubfire.FireOutcome, error) {
+	return c.srv.renderDispatchReuseMessage(ctx, req)
+}
+
 func (c serverTriggerCore) Fire(ctx context.Context, req hubfire.FireRequest) hubfire.FireOutcome {
-	return c.srv.fireAction(ctx, req)
+	out, action, rawErr := c.srv.fireActionWithError(ctx, req)
+	if out.Status == hubfire.FireStatusFailed && out.Error != "" {
+		out.Error = sanitizeTriggerFireError(ctx, action, req, out.Status, out.Error, rawErr)
+	}
+	return out
+}
+
+// sanitizeTriggerFireError maps failed error text persisted to
+// trigger_fires.error onto the Stage 1 §5.5 generic set for built-in actions
+// (or an action's FireErrorSanitizer allowlist) so internal details (agent
+// slugs, broker HTTP bodies, raw context errors) never leak through trigger
+// history (1b-3 review N4, 2c item 4). Refusals and skips already carry generic
+// reasons by contract; schedule fires never pass through serverTriggerCore.Fire
+// and retain their existing scheduled_events.error text unchanged.
+func sanitizeTriggerFireError(ctx context.Context, action FireAction, req hubfire.FireRequest, status hubfire.FireStatus, raw string, rawErr error) string {
+	if raw == "" {
+		return ""
+	}
+	if sanitizer, ok := action.(FireErrorSanitizer); ok {
+		known, fallback := sanitizer.SanitizedReasons()
+		if raw == req.ActionType+" refused" ||
+			raw == errScheduledAuthorityUnrecorded.Error() ||
+			raw == "hub shutting down" ||
+			raw == "fire failed" ||
+			slices.Contains(known, raw) {
+			return raw
+		}
+		mapped := fallback
+		if mapped == "" {
+			mapped = "fire failed"
+		}
+		slog.WarnContext(ctx, "trigger fire error mapped to generic text",
+			"actionType", req.ActionType,
+			"status", status,
+			"fireID", req.Authority.FireID,
+			"triggerID", req.Authority.DefinitionID,
+			"projectID", req.ProjectID,
+			"mapped", mapped,
+			"raw_error", raw)
+		return mapped
+	}
+	switch req.ActionType {
+	case "message", "dispatch_agent", scheduledEventTypeExec:
+	default:
+		return raw
+	}
+	switch raw {
+	case errScheduledMessageRefused.Error(),
+		"dispatch_agent refused",
+		"exec refused",
+		req.ActionType + " refused",
+		errScheduledAuthorityUnrecorded.Error(),
+		"target not running",
+		"agent restarted during fire",
+		"rule evaluation failed",
+		"target wake failed",
+		"hub shutting down",
+		"message delivery failed",
+		"dispatch_agent failed",
+		"name exhausted",
+		"event file too large",
+		"exec failed",
+		"fire failed",
+		"invalid message payload",
+		"invalid dispatch_agent payload",
+		errScheduledExecPayloadInvalid.Error(),
+		execReasonDispatchFailed,
+		execReasonOverlap,
+		execReasonCapacity,
+		execReasonStartExpired,
+		execReasonMissedWindow,
+		execReasonDisabled,
+		execReasonUnavailable,
+		execReasonStartFailed,
+		execReasonAgentRestarted,
+		execReasonAgentStopped,
+		execReasonOutcomeUnknown,
+		execReasonSourceNotReplayProtected,
+		execReasonRateLimit,
+		execReasonSubjectBusy,
+		execReasonContextInvalid,
+		execReasonContextUnsupported,
+		execReasonMissingDeliveryID:
+		return raw
+	}
+	if req.ActionType == "dispatch_agent" && rawErr != nil {
+		var missingEnv *HeadlessMissingEnvError
+		var blocked *scheduleBlockedAgentError
+		if errors.As(rawErr, &missingEnv) || errors.As(rawErr, &blocked) {
+			return raw
+		}
+	}
+
+	var mapped string
+	switch {
+	case raw == "target agent is reincarnating":
+		mapped = "agent restarted during fire"
+	case raw == errScheduledWakeShuttingDown.Error() || raw == errScheduledWakeShutdown.Error():
+		mapped = "hub shutting down"
+	case raw == errScheduledWakeNotReady.Error() || strings.HasPrefix(raw, "failed to wake agent "):
+		mapped = "target wake failed"
+	case strings.Contains(raw, "has no running container") ||
+		strings.Contains(raw, "is not running") ||
+		strings.Contains(raw, "not in a deliverable phase") ||
+		strings.Contains(raw, "cannot receive messages"):
+		mapped = "target not running"
+	case strings.HasPrefix(raw, "invalid message payload") ||
+		raw == "message payload is empty" ||
+		strings.HasPrefix(raw, "message payload must include"):
+		mapped = "invalid message payload"
+	case strings.HasPrefix(raw, "invalid dispatch_agent payload") ||
+		strings.HasPrefix(raw, "dispatch_agent payload:"):
+		mapped = "invalid dispatch_agent payload"
+	default:
+		switch req.ActionType {
+		case "message":
+			mapped = "message delivery failed"
+		case "dispatch_agent":
+			mapped = "dispatch_agent failed"
+		case scheduledEventTypeExec:
+			mapped = "exec failed"
+		default:
+			mapped = "fire failed"
+		}
+	}
+
+	slog.WarnContext(ctx, "trigger fire error mapped to generic text",
+		"actionType", req.ActionType,
+		"status", status,
+		"fireID", req.Authority.FireID,
+		"triggerID", req.Authority.DefinitionID,
+		"projectID", req.ProjectID,
+		"mapped", mapped,
+		"raw_error", raw)
+	return mapped
 }
 
 func (c serverTriggerCore) Experiment(name string) bool {
 	return c.srv.experimentEnabled(name)
+}
+
+func (c serverTriggerCore) OnEventEvaluated(ctx context.Context, ev *store.TriggerEvent, outcome trigger.EventEvaluationOutcome, attempts int) {
+	if c.srv == nil || ev == nil {
+		return
+	}
+	if outcome.AnyFireRecorded || outcome.MatchCount != 0 || outcome.FireCount != 0 {
+		return
+	}
+	if ev.SourceKind == store.TriggerSourceKindGitHub {
+		c.srv.handleUnmatchedGitHubCommand(ctx, ev, attempts)
+	}
 }
 
 // AuthorizeEventSource implements trigger.SourceAuthorizer for Stage 3 §4.2
@@ -143,7 +338,7 @@ func (c serverTriggerCore) AuthorizeEventSource(ctx context.Context, ev *store.T
 		}
 		errCode := githubAssociationErrorCode(authzErr)
 		c.srv.updateProjectGitHubAppStatus(ctx, project, store.GitHubAppStateError,
-			errCode, authzErr.Error())
+			errCode, githubAppStatusMessage(errCode))
 		if errors.Is(authzErr, errGitHubAssociationCheckFailed) {
 			slog.WarnContext(ctx, "GitHub trigger fire deferred: installation association check inconclusive; will retry",
 				"project_id", project.ID, "installation_id", instID, "event_id", ev.ID, "error", authzErr)
@@ -281,7 +476,8 @@ func (s *Server) reconcileTriggerDrainerLocked(ctx context.Context, dqStore stor
 }
 
 // triggerDrainer constructs the trigger.event durablequeue.Drainer wired to
-// Server's fire core (catalog entry point triggerDrainer:message for trigger.fire).
+// Server's fire core (catalog entry points triggerDrainer:message,
+// triggerDrainer:dispatch_agent, and triggerDrainer:github.comment for trigger.fire).
 func (s *Server) triggerDrainer(dqStore store.DurableQueueStore, queue *durablequeue.StoreQueue) (*durablequeue.Drainer, error) {
 	core := serverTriggerCore{srv: s}
 	logger := logging.Subsystem("hub.trigger-drainer")
@@ -293,12 +489,15 @@ func (s *Server) triggerDrainer(dqStore store.DurableQueueStore, queue *durableq
 			s.triggers.ruleMetrics = m
 		}
 	}
+	metrics := serverTriggerMetrics{srv: s}
 	disp, err := trigger.NewDispatcher(trigger.DispatcherConfig{
-		Store:       s.store,
-		Core:        core,
-		Rules:       s.TriggerRules(),
-		RuleMetrics: s.triggers.ruleMetrics,
-		Logger:      logger,
+		Store:         s.store,
+		Core:          core,
+		SubjectClaims: trigger.NewSubjectClaims(s.store, s.store, nil),
+		Rules:         s.TriggerRules(),
+		RuleMetrics:   s.triggers.ruleMetrics,
+		Metrics:       metrics,
+		Logger:        logger,
 	})
 	if err != nil {
 		return nil, err
@@ -307,6 +506,7 @@ func (s *Server) triggerDrainer(dqStore store.DurableQueueStore, queue *durableq
 		QueueStore: dqStore,
 		Queue:      queue,
 		Owner:      s.HubID(),
+		Metrics:    metrics,
 	})
 }
 
@@ -336,16 +536,20 @@ func (s *Server) runTriggerMaintenance(ctx context.Context) {
 	if s == nil || s.store == nil {
 		return
 	}
-	res, err := trigger.RunMaintenance(ctx, s.store, time.Now())
+	runAt := time.Now().UTC()
+	res, err := trigger.RunMaintenance(ctx, s.store, runAt)
+	serverTriggerMetrics{srv: s}.RecordReaperRun(res.FiresReaped, runAt, err)
 	if err != nil {
 		slog.Error("Scheduler: trigger maintenance failed", "error", err)
 	}
-	if res.FiresReaped > 0 || res.EventsReconciled > 0 || res.EventsPurged > 0 || res.FiresPurged > 0 {
+	if res.FiresReaped > 0 || res.EventsReconciled > 0 || res.EventsPurged > 0 || res.FiresPurged > 0 || res.ClaimsReleased > 0 || res.ClaimsPurged > 0 {
 		slog.Info("Scheduler: completed trigger maintenance",
 			"fires_reaped", res.FiresReaped,
 			"events_reconciled", res.EventsReconciled,
 			"events_purged", res.EventsPurged,
-			"fires_purged", res.FiresPurged)
+			"fires_purged", res.FiresPurged,
+			"claims_released", res.ClaimsReleased,
+			"claims_purged", res.ClaimsPurged)
 	}
 }
 

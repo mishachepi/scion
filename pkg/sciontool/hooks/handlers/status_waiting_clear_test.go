@@ -87,21 +87,21 @@ func waitClearClaudeStop(t *testing.T) *hooks.Event {
 }
 
 // waitClearAskUser applies the status write that sciontool status ask_user
-// (cmd/sciontool/commands/status.go runStatusUpdate) and the legacy
-// runAskUser (hook.go) both make.
+// (pkg/sciontool/agentstatus) and the legacy runAskUser (hook.go) both make.
 func waitClearAskUser(t *testing.T, h *StatusHandler) {
 	t.Helper()
-	require.NoError(t, h.UpdateActivity(state.ActivityWaitingForInput, ""))
+	require.NoError(t, h.UpdateActivityWithSource(state.ActivityWaitingForInput, "", ActivitySourceAskUser))
 }
 
 func TestStatusWaitingClear_ClaudeNotificationThenEndEvent(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		end  func(*testing.T) *hooks.Event
+		want string
 	}{
-		{"PostToolUse", waitClearClaudeToolEnd},
-		{"PostToolUseFailure", waitClearClaudeToolFailure},
-		{"Stop", waitClearClaudeStop},
+		{"PostToolUse", waitClearClaudeToolEnd, "thinking"},
+		{"PostToolUseFailure", waitClearClaudeToolFailure, "thinking"},
+		{"Stop", waitClearClaudeStop, "working"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			statusPath := filepath.Join(t.TempDir(), "agent-info.json")
@@ -115,7 +115,7 @@ func TestStatusWaitingClear_ClaudeNotificationThenEndEvent(t *testing.T) {
 
 			require.NoError(t, h.Handle(tc.end(t)))
 			info = readAgentInfoMap(t, statusPath)
-			assert.Equal(t, "working", info["activity"], "answered prompt must leave waiting_for_input")
+			assert.Equal(t, tc.want, info["activity"], "answered prompt must leave waiting_for_input")
 			assert.NotContains(t, info, activitySourceKey, "marker must be dropped with the activity it described")
 		})
 	}
@@ -154,7 +154,7 @@ func TestStatusWaitingClear_AskUserAfterNotificationStaysSticky(t *testing.T) {
 
 	require.NoError(t, h.Handle(waitClearClaudeNotification(t)))
 	waitClearAskUser(t, h)
-	assert.NotContains(t, readAgentInfoMap(t, statusPath), activitySourceKey)
+	assert.Equal(t, ActivitySourceAskUser, readAgentInfoMap(t, statusPath)[activitySourceKey])
 
 	require.NoError(t, h.Handle(waitClearClaudeToolEnd(t)))
 	require.NoError(t, h.Handle(waitClearClaudeStop(t)))
@@ -278,7 +278,7 @@ func TestStatusWaitingClear_OtherDialects(t *testing.T) {
 			require.NoError(t, h.Handle(notify))
 			require.Equal(t, "waiting_for_input", readAgentInfo(t, statusPath).Activity)
 			require.NoError(t, h.Handle(toolEnd))
-			assert.Equal(t, "working", readAgentInfo(t, statusPath).Activity)
+			assert.Equal(t, "thinking", readAgentInfo(t, statusPath).Activity)
 		})
 	}
 }
@@ -299,7 +299,7 @@ func TestStatusWaitingClear_HubFollowsLocal(t *testing.T) {
 			name: "notification then PostToolUse",
 			steps: []step{
 				{event: waitClearClaudeNotification, wantStatus: "waiting_for_input"},
-				{event: waitClearClaudeToolEnd, wantStatus: "working"},
+				{event: waitClearClaudeToolEnd, wantStatus: "thinking"},
 			},
 		},
 		{

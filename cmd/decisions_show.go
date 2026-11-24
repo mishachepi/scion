@@ -23,6 +23,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/clitime"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
+	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/spf13/cobra"
 )
 
@@ -109,9 +110,22 @@ func writeDecisionsShow(out io.Writer, resp *hubclient.AgentDecisionShowResponse
 		for _, c := range v.Choices {
 			suffix := ""
 			if v.DefaultChoiceID != "" && c.ID == v.DefaultChoiceID {
-				suffix = " (default)"
+				suffix = " (recommended)"
 			}
 			_, _ = fmt.Fprintf(out, "    - %s: %s%s\n", safeText(c.ID), collapseSingleLine(c.Label), suffix)
+			if desc := collapseSingleLine(c.Description); desc != "" {
+				_, _ = fmt.Fprintf(out, "      %s\n", desc)
+			}
+		}
+		if v.Other != nil {
+			lbl := collapseSingleLine(v.Other.Label)
+			if lbl == "" {
+				lbl = messages.DefaultOtherLabel
+			}
+			_, _ = fmt.Fprintf(out, "    - %s  %s (free-form)\n", messages.ChoiceIDOther, lbl)
+			if desc := collapseSingleLine(v.Other.Description); desc != "" {
+				_, _ = fmt.Fprintf(out, "      %s\n", desc)
+			}
 		}
 		if len(v.Answers) == 0 {
 			_, _ = fmt.Fprintln(out, "  Answers:      none")
@@ -122,8 +136,12 @@ func writeDecisionsShow(out io.Writer, resp *hubclient.AgentDecisionShowResponse
 			aCopy := a
 			prov := decisionProvenanceDisplay(&aCopy)
 			who := decisionAnswererDisplay(&aCopy)
+			ansDisp := collapseSingleLine(a.Label)
+			if a.ChoiceID == messages.ChoiceIDOther && a.OtherText != "" {
+				ansDisp = fmt.Sprintf("%s \"%s\"", ansDisp, safeText(a.OtherText))
+			}
 			line := fmt.Sprintf("    - %s (%s) [%s] by %s via %s at %s",
-				collapseSingleLine(a.Label),
+				ansDisp,
 				safeText(a.ChoiceID),
 				prov,
 				who,

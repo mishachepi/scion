@@ -131,9 +131,10 @@ above.
 Share a locally-authored config with your Hub, or pull one down:
 
 ```bash
-scion harness-config sync <name>          # upload local dir to the Hub (alias: push)
+scion harness-config sync <name>                     # upload local dir to the Hub (alias: push)
+scion harness-config sync <name> --scope global      # publish a local (or project-local) config globally
 scion harness-config sync <name> --name <hub-name>   # publish under a different Hub name
-scion harness-config pull <name>          # download from the Hub to the global dir
+scion harness-config pull <name>                     # download from the Hub to the global dir
 scion harness-config pull <name> --to <path>
 ```
 
@@ -142,10 +143,11 @@ file removed from the local directory is removed from the Hub, and the removed p
 Backup and temp files (`*.bak.<timestamp>`, `.*.tmp-*`) are never uploaded, so any left on the Hub
 are removed the same way. A directory with no files left to sync is refused. `pull` verifies each
 file's hash before writing. Like `install`, `sync`/`push` target the current project's Hub scope by
-default, or the global scope with `--global` (which needs hub admin rights). `--global` also reads
-the config from the global directory (`~/.scion/harness-configs`), so to publish a config globally
-it must live there. They create the config in that scope or update an existing one of the same name,
-and print the scope they used.
+default. Use `--scope global` to publish a local config (including a project-local one) to the
+global Hub scope (requires hub admin rights), or the root `--global` flag to both read from the
+global directory (`~/.scion/harness-configs`) and target the global Hub scope (`--global` conflicts
+with `--scope project`). They create the config in that scope or update an existing one of the same
+name, and print the scope they used.
 
 ### Listing, inspecting, and resetting
 
@@ -282,11 +284,12 @@ The same applies to the built-in `default` template: you can re-import it as a g
 result is always user-managed and does not receive later bundled updates. Workstation Hubs keep
 it updated.
 
-The Hub must be able to reach GitHub to fetch the URL. An air-gapped Hub needs another source it
-can reach, for example a mirror given as an rclone URI in `sourceUrl` (`:gcs:bucket/path`), or a
-project workspace import (`POST /api/v1/projects/{id}/import-harness-configs` with
-`workspacePath`), which creates a project-scoped config. On a hosted Hub, both give a
-user-managed copy.
+The Hub must be able to reach GitHub to fetch the URL. Rclone URIs in `sourceUrl`
+(`:gcs:bucket/path`) and other non-https sources work on **workstation** Hubs only. A hosted Hub
+accepts only `https://` sources on public addresses, and does not follow redirects for archive
+URLs. On a hosted Hub without access to GitHub, use a project workspace import
+(`POST /api/v1/projects/{id}/import-harness-configs` with `workspacePath`), which creates a
+project-scoped, user-managed config.
 
 ## Configuration (`config.yaml`)
 
@@ -435,12 +438,31 @@ The `command` block defines how the agent's primary LLM tool is invoked.
 
 #### Launcher harnesses and live-work detection
 
-The Hub's live-work detection treats the process `command.base` starts as the harness itself, never as work, because a TUI keeps redrawing while it waits (see [Agent Lifecycle](/scion/local/agent-lifecycle/#auto-suspend-of-stalled-agents)). Some tools start through a launcher that keeps running and spawns the real TUI as a child. Codex's npm launcher (`node bin/codex.js`) is one. For a harness like that, set `SCION_LIVENESS_HARNESS_ROOT_DEPTH` in the config's `env` map. The value is the number of process levels counted as the harness, so the launcher and its TUI make 2. The default is 1 and the maximum is 4. Without it, a hung agent's animated status can keep it from ever being marked stalled.
+The Hub's live-work detection treats the process `command.base` starts as the harness itself, never as work, because a TUI keeps redrawing while it waits (see [Agent Lifecycle](/scion/local/agent-lifecycle/#auto-suspend-of-stalled-agents)). Some tools start through a launcher that keeps running and spawns the real TUI as a child. Codex's npm launcher (`node bin/codex.js`) is one. For a harness like that, set `HARNESS_HINT_LIVENESS_ROOT_DEPTH` in the config's `env` map. The value is the number of process levels counted as the harness, so the launcher and its TUI make 2. The default is 1 and the maximum is 4. Without it, a hung agent's animated status can keep it from ever being marked stalled. (An operator- or Hub-supplied `SCION_LIVENESS_HARNESS_ROOT_DEPTH` takes precedence over the hint.)
 
 ```yaml
 env:
-  SCION_LIVENESS_HARNESS_ROOT_DEPTH: "2"
+  HARNESS_HINT_LIVENESS_ROOT_DEPTH: "2"
 ```
+
+### Environment Variables (`env`)
+
+The `env` block in a harness-config's `config.yaml` defines workload environment variables for agents using that harness-config.
+
+- **Literal values:** Values in a bundle's `env` map are used verbatim. The Runtime Broker does not expand `${VAR}` references and never copies variables from the broker host environment.
+  - A value containing `${` or `$VAR` is passed literally to the workload and emits a start warning.
+  - An empty value (`KEY: ""`) declares the key without supplying a value. A higher-precedence layer (Hub environment/secrets, inline agent config, or settings) can fill it; otherwise the key is omitted with a missing-key warning.
+- **Resolved per start:** Bundle `env` entries and settings `harness_configs.<name>.env` entries are resolved fresh from the current harness-config and settings on every start and are not persisted into `scion-agent.json`. Edits to a bundle's `env` take effect on the agent's next start. (An older Runtime Broker restarting an agent provisioned by a newer broker will not load bundle `env` entries until the agent is re-provisioned.)
+  - In settings `harness_configs.<name>.env`, auth-candidate keys that are not used by the selected auth method are filtered out and are not delivered to the workload.
+  - An empty value (`KEY: ""`) in settings `harness_configs.<name>.env` does not copy the broker host's environment variable of that name; if no higher-precedence layer supplies a value, the key is omitted with a missing-key warning.
+- **Reserved `SCION_*` namespace and `HARNESS_HINT_*` hints:** Harness-config layers (`env`, `env_template`, and settings `harness_configs.<name>.env` / profile `harness_overrides`) cannot set `SCION_*` keys; any such key is stripped with a start warning. Safe harness-publishable settings use the `HARNESS_HINT_` prefix:
+  - `HARNESS_HINT_LIVENESS_ROOT_DEPTH`
+  - `HARNESS_HINT_AUTO_EXPOSE_PORTS`
+  - `HARNESS_HINT_AUTO_EXPOSE_MODE`
+  - `HARNESS_HINT_AUTO_EXPOSE_PORTS_LIST`
+
+  An explicit `SCION_*` value from the Hub, inline config, or operator settings takes precedence over the corresponding hint. During the transition window, the four legacy `SCION_*` equivalents (`SCION_LIVENESS_HARNESS_ROOT_DEPTH`, `SCION_AUTO_EXPOSE_PORTS`, `SCION_AUTO_EXPOSE_MODE`, `SCION_AUTO_EXPOSE_PORTS_LIST`) are automatically rewritten to their `HARNESS_HINT_*` names with a deprecation warning.
+- **Workload-only scope:** Environment variables whose effective value comes from a harness-config layer reach the workload (the harness process, SSH sessions, scheduled exec, and `exec` shells), and are withheld from in-container lifecycle/pre-start hooks and startup `git` subprocesses. See [Pre-Start Hooks — Hook Environment](/scion/hosted/user/pre-start-hooks/#hook-environment).
 
 ### Environment Templates (`env_template`)
 

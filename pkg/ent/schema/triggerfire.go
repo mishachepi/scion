@@ -20,6 +20,7 @@ import (
 	"entgo.io/ent"
 	"entgo.io/ent/dialect/entsql"
 	"entgo.io/ent/schema"
+	"entgo.io/ent/schema/edge"
 	"entgo.io/ent/schema/field"
 	"entgo.io/ent/schema/index"
 	"github.com/google/uuid"
@@ -72,11 +73,20 @@ func (TriggerFire) Fields() []ent.Field {
 		field.Text("rule_trace").
 			MaxLen(4096).
 			Optional(),
+		field.UUID("target_agent_id", uuid.UUID{}).
+			Optional().
+			Nillable(),
 		field.String("executor_kind").
 			Default(""),
 		field.String("executor_id").
 			Default(""),
 		field.Time("lease_until"),
+		field.Time("not_before").
+			Optional().
+			Nillable(),
+		field.Time("deferred_at").
+			Optional().
+			Nillable(),
 		field.Time("started_at").
 			Immutable(),
 		field.Time("finished_at").
@@ -88,6 +98,15 @@ func (TriggerFire) Fields() []ent.Field {
 	}
 }
 
+// Edges of the TriggerFire.
+func (TriggerFire) Edges() []ent.Edge {
+	return []ent.Edge{
+		edge.To("exec_run", ScheduledExecRun.Type).
+			Unique().
+			Annotations(entsql.OnDelete(entsql.Cascade)),
+	}
+}
+
 // Indexes of the TriggerFire.
 func (TriggerFire) Indexes() []ent.Index {
 	return []ent.Index{
@@ -96,6 +115,8 @@ func (TriggerFire) Indexes() []ent.Index {
 			Unique(),
 		index.Fields("trigger_id", "subject", "status"),
 		index.Fields("status", "lease_until"),
+		index.Fields("target_agent_id", "status"),
+		index.Fields("result_ref"),
 	}
 }
 

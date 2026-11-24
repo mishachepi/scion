@@ -881,8 +881,12 @@ func resolveAndValidatePalette(cfg *BrandingConfig) (
 		checkContrast(BrandingSectionKey+".palette.dark.primary_text", dark.PrimaryText, "dark.primary_active", dark.PrimaryActive, wcagAATextContrastMin)
 	}
 
-	// 4 & 5: Shoelace filled button contrast (step 600 light, step 400 dark >= 4.5:1)
-	// and status badge contrast (light 800 on 100/200, dark 300 on 20% 500 over dark.surface >= 4.5:1).
+	// 4 & 5: Shoelace filled button/badge contrast — Shoelace 2.20.1 uses
+	// --sl-color-neutral-0 as the foreground for all 5 filled variants:
+	// #ffffff on step 600 in light mode; neutral-800 on step 300 (--sl-color-*-600)
+	// and hover step 400 (--sl-color-*-500) in dark mode, matching theme.css —
+	// and status badge contrast (light 800 on 100/200, dark 300 on 20% 500 over
+	// dark.surface >= 4.5:1).
 	type rampCheck struct {
 		name       string
 		customized bool
@@ -895,25 +899,59 @@ func resolveAndValidatePalette(cfg *BrandingConfig) (
 		{"warning", customWarningScale, "100"},
 		{"danger", customDangerScale, "100"},
 	}
+	rampStepCustomized := func(rampName, step string) bool {
+		if rampName == "primary" && (accent != "" || explicitPrimarySeed != "") {
+			return true
+		}
+		if cfg.Palette == nil {
+			return false
+		}
+		var m BrandingScale
+		switch rampName {
+		case "primary":
+			m = cfg.Palette.Primary
+		case "neutral":
+			m = cfg.Palette.Neutral
+		case "success":
+			m = cfg.Palette.Success
+		case "warning":
+			m = cfg.Palette.Warning
+		case "danger":
+			m = cfg.Palette.Danger
+		}
+		return m != nil && m[step] != ""
+	}
 	darkSurfaceCustomized := modeTokenCustomized(modeField(darkIn, "surface"), "800")
 	for _, rc := range ramps {
 		sc := scales[rc.name]
-		if rc.customized || neutralStepCustomized("950") {
-			// Light Shoelace filled button (--sl-color-<variant>-600)
-			lightBtnFg := pickAutoForeground(neutral["950"], sc["600"])
+		if rampStepCustomized(rc.name, "600") {
+			// Light Shoelace filled button/badge: #ffffff (--sl-color-neutral-0) on step 600.
 			checkContrast(
 				fmt.Sprintf("%s.palette.%s.600", BrandingSectionKey, rc.name),
-				lightBtnFg,
+				"#ffffff",
 				fmt.Sprintf("light --sl-color-%s-600", rc.name),
 				sc["600"],
 				wcagAATextContrastMin,
 			)
-			// Dark Shoelace filled button (--sl-color-<variant>-600 maps to step 400 in dark mode)
-			darkBtnFg := pickAutoForeground(neutral["950"], sc["400"])
+		}
+		if rampStepCustomized(rc.name, "300") || neutralStepCustomized("800") {
+			// Dark Shoelace filled button/badge: neutral-800 (--sl-color-neutral-0) on
+			// step 300 (--sl-color-<variant>-600).
+			checkContrast(
+				fmt.Sprintf("%s.palette.%s.300", BrandingSectionKey, rc.name),
+				neutral["800"],
+				fmt.Sprintf("dark --sl-color-%s-600 (step 300)", rc.name),
+				sc["300"],
+				wcagAATextContrastMin,
+			)
+		}
+		if rampStepCustomized(rc.name, "400") || neutralStepCustomized("800") {
+			// Dark Shoelace filled button hover: neutral-800 (--sl-color-neutral-0) on
+			// step 400 (--sl-color-<variant>-500).
 			checkContrast(
 				fmt.Sprintf("%s.palette.%s.400", BrandingSectionKey, rc.name),
-				darkBtnFg,
-				fmt.Sprintf("dark --sl-color-%s-600 (step 400)", rc.name),
+				neutral["800"],
+				fmt.Sprintf("dark --sl-color-%s-500 hover (step 400)", rc.name),
 				sc["400"],
 				wcagAATextContrastMin,
 			)
@@ -1025,31 +1063,64 @@ func lighterPrimaryStep(scale BrandingScale, baseHex, fallbackStep string) strin
 	return scale[fallbackStep]
 }
 
-// buildBrandingCSSText renders the validated --scion-* and --sl-color-* CSS
-// custom property declarations for light, explicit dark, and system dark modes.
-func buildBrandingCSSText(scales map[string]BrandingScale, light, dark BrandingSemanticMode) string {
+// buildBrandingCSSText renders validated CSS custom property declarations for
+// custom palettes (light, explicit dark, and system dark modes) and/or
+// mode-independent style overrides (such as corner radius and sans-serif font).
+func buildBrandingCSSText(hasCustomPalette bool, scales map[string]BrandingScale, light, dark BrandingSemanticMode, corners, fontSans, fontSansStack string) string {
+	hasCustomCorners := corners != "" && corners != BrandCornersDefault
+	hasCustomFontSans := fontSans != "" && fontSans != BrandFontSansDefault && fontSansStack != ""
+	if !hasCustomPalette && !hasCustomCorners && !hasCustomFontSans {
+		return ""
+	}
 	var b strings.Builder
 	b.WriteString("html:root, :host, .sl-theme-light {\n")
-	for _, ramp := range []string{"primary", "neutral", "success", "warning", "danger"} {
-		sc := scales[ramp]
-		for _, step := range ScaleSteps {
-			if v := sc[step]; v != "" {
-				fmt.Fprintf(&b, "  --scion-%s-%s: %s;\n", ramp, step, v)
-				fmt.Fprintf(&b, "  --sl-color-%s-%s: %s;\n", ramp, step, v)
+	if hasCustomPalette {
+		for _, ramp := range []string{"primary", "neutral", "success", "warning", "danger"} {
+			sc := scales[ramp]
+			for _, step := range ScaleSteps {
+				if v := sc[step]; v != "" {
+					fmt.Fprintf(&b, "  --scion-%s-%s: %s;\n", ramp, step, v)
+					fmt.Fprintf(&b, "  --sl-color-%s-%s: %s;\n", ramp, step, v)
+				}
 			}
 		}
+		writeSemanticVars(&b, light)
 	}
-	writeSemanticVars(&b, light)
+	if hasCustomCorners {
+		writeCornerVars(&b, corners)
+	}
+	if hasCustomFontSans {
+		fmt.Fprintf(&b, "  --scion-font-sans: %s;\n", fontSansStack)
+	}
 	b.WriteString("}\n")
 
-	b.WriteString("html:root.sl-theme-dark, html:root[data-theme='dark'], :root.dark {\n")
-	writeSemanticVars(&b, dark)
-	b.WriteString("}\n")
+	if hasCustomPalette {
+		b.WriteString("html:root.sl-theme-dark, html:root[data-theme='dark'], :root.dark {\n")
+		writeSemanticVars(&b, dark)
+		b.WriteString("}\n")
 
-	b.WriteString("@media (prefers-color-scheme: dark) {\n  html:root:not([data-theme='light']) {\n")
-	writeSemanticVarsIndented(&b, dark, "    ")
-	b.WriteString("  }\n}\n")
+		b.WriteString("@media (prefers-color-scheme: dark) {\n  html:root:not([data-theme='light']) {\n")
+		writeSemanticVarsIndented(&b, dark, "    ")
+		b.WriteString("  }\n}\n")
+	}
 	return b.String()
+}
+
+func writeCornerVars(b *strings.Builder, corners string) {
+	switch corners {
+	case BrandCornersSquare:
+		b.WriteString("  --scion-radius-sm: 0;\n")
+		b.WriteString("  --scion-radius: 0;\n")
+		b.WriteString("  --scion-radius-md: 0;\n")
+		b.WriteString("  --scion-radius-lg: 0;\n")
+		b.WriteString("  --scion-radius-xl: 0;\n")
+	case BrandCornersRounded:
+		b.WriteString("  --scion-radius-sm: 0.375rem;\n")
+		b.WriteString("  --scion-radius: 0.75rem;\n")
+		b.WriteString("  --scion-radius-md: 0.75rem;\n")
+		b.WriteString("  --scion-radius-lg: 1rem;\n")
+		b.WriteString("  --scion-radius-xl: 1.25rem;\n")
+	}
 }
 
 func writeSemanticVars(b *strings.Builder, m BrandingSemanticMode) {

@@ -30,6 +30,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
+	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agent"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agenthold"
@@ -103,6 +104,7 @@ func entAgentToStore(a *ent.Agent) *store.Agent {
 		Slug:                a.Slug,
 		Name:                a.Name,
 		Template:            a.Template,
+		HarnessConfig:       a.HarnessConfig,
 		ProjectID:           a.ProjectID.String(),
 		Labels:              a.Labels,
 		Annotations:         a.Annotations,
@@ -999,9 +1001,14 @@ func buildAgentUpdate(ctx context.Context, ac *ent.AgentClient, uid uuid.UUID, a
 	}
 	// Always set, never clear to NULL — see CreateAgent's identical comment
 	// and ReconcileHarnessConfigColumn's doc (ptone/scion#2146).
-	// AppliedConfig=nil (cleared above) still yields "" here, which is
-	// exactly the sentinel this row should carry, not NULL.
-	update.SetHarnessConfig(harnessConfigOf(a.AppliedConfig))
+	// For execution containers (HarnessConfig == "shell"), never clear or
+	// overwrite the shell marker (for example after loading a row whose
+	// applied_config failed to parse, or from a disagreeing broker report).
+	hc := harnessConfigOf(a.AppliedConfig)
+	if a.HarnessConfig == config.ShellHarnessConfigName {
+		hc = a.HarnessConfig
+	}
+	update.SetHarnessConfig(hc)
 	if a.LastSeen.IsZero() {
 		update.ClearLastSeen()
 	} else {
@@ -1628,6 +1635,9 @@ func (s *AgentStore) agentFilterPredicates(ctx context.Context, filter store.Age
 	case filter.OrRunIntent != "":
 		preds = append(preds, agent.RunIntentEQ(filter.OrRunIntent))
 	}
+	if filter.Activity != "" {
+		preds = append(preds, agent.ActivityEQ(filter.Activity))
+	}
 	if filter.AncestorID != "" {
 		preds = append(preds, ancestryContains(filter.AncestorID))
 	}
@@ -1719,12 +1729,127 @@ func (s *AgentStore) agentFilterPredicates(ctx context.Context, filter store.Age
 		preds = append(preds, agent.ProjectIDNotIn(excludeIDs...))
 	}
 
+	// Structured filter query terms (ANDed with all other predicates,
+	// including AuthorizedProjectIDs and ExcludedProjectIDs).
+	if filter.Query != nil {
+		qPreds, err := agentQueryTermsPredicates(filter.Query)
+		if err != nil {
+			return nil, err
+		}
+		preds = append(preds, qPreds...)
+	}
+
 	// Exclude soft-deleted agents unless explicitly requested.
 	if !filter.IncludeDeleted {
 		preds = append(preds, agent.DeletedAtIsNil())
 	}
 
 	return preds, nil
+}
+
+// agentQueryTermsPredicates translates validated store.QueryTerms into Ent
+// predicates through an explicit field allowlist. Unknown fields return an
+// error rather than becoming a no-op.
+func agentQueryTermsPredicates(qt *store.QueryTerms) ([]predicate.Agent, error) {
+	if qt == nil {
+		return nil, nil
+	}
+	var preds []predicate.Agent
+
+	for _, term := range qt.Terms {
+		if len(term.Values) == 0 {
+			continue
+		}
+		switch term.Field {
+		case "phase":
+			if term.Negate {
+				preds = append(preds, agent.PhaseNotIn(term.Values...))
+			} else {
+				preds = append(preds, agent.PhaseIn(term.Values...))
+			}
+		case "label":
+			if term.Negate {
+				// NOT (v1 OR v2 ...) == (NOT v1) AND (NOT v2) ...
+				for _, v := range term.Values {
+					p, err := agentLabelPredicate(v, term.Op, true)
+					if err != nil {
+						return nil, err
+					}
+					preds = append(preds, p)
+				}
+			} else {
+				orParts := make([]predicate.Agent, 0, len(term.Values))
+				for _, v := range term.Values {
+					p, err := agentLabelPredicate(v, term.Op, false)
+					if err != nil {
+						return nil, err
+					}
+					orParts = append(orParts, p)
+				}
+				if len(orParts) == 1 {
+					preds = append(preds, orParts[0])
+				} else {
+					preds = append(preds, agent.Or(orParts...))
+				}
+			}
+		default:
+			return nil, fmt.Errorf("agentQueryTermsPredicates: unsupported filter field %q: %w", term.Field, store.ErrInvalidInput)
+		}
+	}
+
+	if qt.Text != "" {
+		preds = append(preds, agent.Or(
+			agent.NameContainsFold(qt.Text),
+			agent.SlugContainsFold(qt.Text),
+		))
+	}
+
+	for _, ex := range qt.ExcludeText {
+		if ex == "" {
+			continue
+		}
+		preds = append(preds, agent.Not(agent.Or(
+			agent.NameContainsFold(ex),
+			agent.SlugContainsFold(ex),
+		)))
+	}
+
+	return preds, nil
+}
+
+func agentLabelPredicate(val string, op store.QueryOp, negate bool) (predicate.Agent, error) {
+	switch op {
+	case store.QueryOpHasKey:
+		if negate {
+			return labelNotHasKey(val), nil
+		}
+		return labelHasKey(val), nil
+	case store.QueryOpLabelEq:
+		k, v, ok := strings.Cut(val, "=")
+		if !ok || k == "" {
+			return nil, fmt.Errorf("agentLabelPredicate: invalid label_eq value %q: %w", val, store.ErrInvalidInput)
+		}
+		if negate {
+			return labelNotContains(k, v), nil
+		}
+		return labelContains(k, v), nil
+	case store.QueryOpEq, "":
+		if k, v, ok := strings.Cut(val, "="); ok {
+			if k == "" {
+				return nil, fmt.Errorf("agentLabelPredicate: empty label key in %q: %w", val, store.ErrInvalidInput)
+			}
+			if negate {
+				return labelNotContains(k, v), nil
+			}
+			return labelContains(k, v), nil
+		}
+		if negate {
+			return labelNotHasKey(val), nil
+		}
+		return labelHasKey(val), nil
+	default:
+		return nil, fmt.Errorf("agentLabelPredicate: unsupported op %q: %w", op, store.ErrInvalidInput)
+	}
 }
 
 // UpdateAgentStatus applies a partial, status-only update. It is the hottest
@@ -2048,8 +2173,20 @@ func (s *AgentStore) UpdateAgentStatus(ctx context.Context, id string, su store.
 		// any leftover live activity (e.g. a lingering "stalled" set by the
 		// platform) so a stopped/crashed agent never displays a stale activity.
 		// A terminal activity (crashed/limits_exceeded) carries information about
-		// HOW the agent stopped and is preserved.
-		if current.Activity != "" && !isTerminalActivity(current.Activity) {
+		// HOW the agent stopped and is preserved. On PhaseStopped, completed is
+		// also retained (like PhaseSuspended) so a subsequent resume/restart
+		// knows the prior run finished (ptone/scion#8900).
+		if strings.EqualFold(su.Phase, string(state.PhaseStopped)) {
+			retained := string(state.RetainedStopActivity(
+				state.Activity(current.Activity),
+				state.Activity(current.StalledFromActivity),
+			))
+			if retained != current.Activity || current.StalledFromActivity != "" || current.ToolName != "" {
+				upd.SetActivity(retained)
+				upd.SetStalledFromActivity("")
+				upd.SetToolName("")
+			}
+		} else if current.Activity != "" && !isTerminalActivity(current.Activity) {
 			upd.SetActivity("")
 			upd.SetStalledFromActivity("")
 			upd.SetToolName("")
@@ -2069,10 +2206,16 @@ func (s *AgentStore) UpdateAgentStatus(ctx context.Context, id string, su store.
 		upd.SetLastActivityEvent(now)
 		unstalled = true
 	}
-	// A halt clears the activity outright, a terminal one included: the
-	// exit reason says how the run ended.
+	// A halt clears live and terminal activities (the exit reason says how the
+	// run ended), but retains completed (including stalled-from-completed) so a
+	// subsequent resume or restart knows the prior run finished
+	// (ptone/scion#8900).
 	if halting {
-		upd.SetActivity("")
+		retained := string(state.RetainedHaltActivity(
+			state.Activity(current.Activity),
+			state.Activity(current.StalledFromActivity),
+		))
+		upd.SetActivity(retained)
 		upd.SetStalledFromActivity("")
 		upd.SetToolName("")
 	}
@@ -2095,12 +2238,15 @@ func (s *AgentStore) UpdateAgentStatus(ctx context.Context, id string, su store.
 		}
 		upd.SetExitReason("")
 	}
-	// Leaving suspended for starting or running clears any retained pre-suspend
-	// activity before the new container runs, without disturbing exit fields
+	// Leaving suspended (or stopped/halted with a retained completed activity)
+	// for starting or running clears any retained activity before the new
+	// container runs, without disturbing exit fields
 	// (pinned by TestUpdateAgentStatus_ExitFieldsKeptOutsidePreRunningToRunning)
 	// or a new container's activity posted during dispatch before
 	// ClearTerminalRemnants runs.
-	if current.Phase == string(state.PhaseSuspended) &&
+	if (current.Phase == string(state.PhaseSuspended) ||
+		((current.Phase == string(state.PhaseStopped) || current.Phase == string(state.PhaseHalted)) &&
+			state.Activity(current.Activity).IsRetainedOnStop())) &&
 		(su.Phase == string(state.PhaseStarting) || su.Phase == string(state.PhaseRunning)) {
 		if !activityProvided {
 			upd.SetActivity("")
@@ -2226,6 +2372,24 @@ func (s *AgentStore) UpdateAgentStatus(ctx context.Context, id string, su store.
 	}
 
 	stampActivitySince(upd.Mutation(), current.Phase, current.Activity, now)
+
+	// Shell execution container attached-terminal guard (ptone/scion#8812 §3.3, AC2):
+	// while a terminal client is attached, refresh activity_since so idle-suspend
+	// measures IdleSuspendAfter from detach rather than from container ready time.
+	// Scoped strictly to shell agents in running/idle so LLM-agent behavior is unchanged.
+	if su.LiveWork != nil && su.LiveWork.Kind == "attached" && isShellEntAgent(current) {
+		effPhase, ok := upd.Mutation().Phase()
+		if !ok && !upd.Mutation().PhaseCleared() {
+			effPhase = current.Phase
+		}
+		effActivity, ok := upd.Mutation().Activity()
+		if !ok && !upd.Mutation().ActivityCleared() {
+			effActivity = current.Activity
+		}
+		if effPhase == string(state.PhaseRunning) && strings.EqualFold(effActivity, string(state.ActivityIdle)) {
+			upd.SetActivitySince(now)
+		}
+	}
 
 	if err := upd.Exec(ctx); err != nil {
 		return mapError(err)
@@ -2501,9 +2665,15 @@ func (s *AgentStore) UpdateAgentConfig(ctx context.Context, agentID string, expe
 		update := ac.Update().
 			Where(agent.IDEQ(uid), agent.StateVersionEQ(expectedVersion), agent.DeletedAtIsNil(), keepNative).
 			SetStateVersion(newVersion).
-			SetUpdated(time.Now()).
-			// Always set, never NULL: see buildAgentUpdate.
-			SetHarnessConfig(harnessConfigOf(applied))
+			SetUpdated(time.Now())
+		if applied != nil {
+			// Always set, never NULL: see buildAgentUpdate. When applied is
+			// nil, leave harness_config untouched for all agents so
+			// pending-config clears on a row whose applied_config failed to
+			// parse do not erase an existing harness_config (including the
+			// shell marker).
+			update.SetHarnessConfig(harnessConfigOf(applied))
+		}
 		if appliedRaw != "" {
 			update.SetAppliedConfig(appliedRaw)
 		} else {
@@ -3178,12 +3348,13 @@ func (s *AgentStore) setAgentNativeCloudRunOnce(ctx context.Context, uid uuid.UU
 var stalledExcluded = []string{"completed", "limits_exceeded", "blocked", "idle", "stalled", "offline", "waiting_for_input", string(state.ActivityHarnessError)}
 
 // MarkStalledAgents marks running agents whose last activity event predates
-// activityThreshold but whose heartbeat is still recent (>= heartbeatRecency)
-// as stalled, preserving the prior activity in stalled_from_activity. An
-// agent whose container reported stall-suppressing live work since
-// activityThreshold is left alone (ptone/scion#7855): a long tool call or a
-// background job doing CPU work is not a hang.
-func (s *AgentStore) MarkStalledAgents(ctx context.Context, activityThreshold, heartbeatRecency time.Time) ([]store.Agent, error) {
+// the applicable cutoff (cutoffs.Thinking for activity "thinking",
+// cutoffs.Activity for every other included activity) while their heartbeat is
+// still recent (>= heartbeatRecency) as stalled, preserving the prior activity
+// in stalled_from_activity. An agent whose container reported stall-suppressing
+// live work since the applicable cutoff is left alone (ptone/scion#7855): a
+// long tool call or a background job doing CPU work is not a hang.
+func (s *AgentStore) MarkStalledAgents(ctx context.Context, cutoffs store.StallCutoffs, heartbeatRecency time.Time) ([]store.Agent, error) {
 	useLock := s.usesRowLocks()
 
 	tx, err := s.client.Tx(ctx)
@@ -3196,12 +3367,22 @@ func (s *AgentStore) MarkStalledAgents(ctx context.Context, activityThreshold, h
 
 	q := tx.Agent.Query().Where(
 		agent.LastActivityEventNotNil(),
-		agent.LastActivityEventLT(activityThreshold),
 		agent.LastSeenNotNil(),
 		agent.LastSeenGTE(heartbeatRecency),
 		agent.PhaseEQ("running"),
 		agent.ActivityNotIn(stalledExcluded...),
-		agent.Or(agent.LastLiveWorkAtIsNil(), agent.LastLiveWorkAtLT(activityThreshold)),
+		agent.Or(
+			agent.And(
+				agent.ActivityNEQ(string(state.ActivityThinking)),
+				agent.LastActivityEventLT(cutoffs.Activity),
+				agent.Or(agent.LastLiveWorkAtIsNil(), agent.LastLiveWorkAtLT(cutoffs.Activity)),
+			),
+			agent.And(
+				agent.ActivityEQ(string(state.ActivityThinking)),
+				agent.LastActivityEventLT(cutoffs.Thinking),
+				agent.Or(agent.LastLiveWorkAtIsNil(), agent.LastLiveWorkAtLT(cutoffs.Thinking)),
+			),
+		),
 	)
 	if useLock {
 		q = q.ForUpdate()
@@ -3406,6 +3587,17 @@ func harnessConfigOf(cfg *store.AgentAppliedConfig) string {
 		return ""
 	}
 	return cfg.HarnessConfig
+}
+
+// isShellEntAgent reports whether the stored ent.Agent uses the reserved
+// built-in "shell" harness config.
+//
+// The indexed harness_config shadow column (populated unconditionally from
+// AppliedConfig.HarnessConfig via harnessConfigOf on CreateAgent and
+// UpdateAgent) is the authoritative store-level source, matching
+// pkg/hub.isShellAgent without raw-decoding applied_config JSON.
+func isShellEntAgent(a *ent.Agent) bool {
+	return a != nil && a.HarnessConfig == config.ShellHarnessConfigName
 }
 
 // parseTimeString parses a status update's started_at string, accepting the

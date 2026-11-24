@@ -27,7 +27,7 @@ import type { DecisionView, PageData } from '../../shared/types.js';
 import { apiFetch } from '../../client/api.js';
 import {
   actionableReason,
-  dismissAvailableAtMs,
+  dismissAvailableAtMsForDecisions,
   dismissDecisionPrompt,
   fetchAskerAnswerability,
   newerDecisionView,
@@ -168,6 +168,8 @@ export class DecisionsPageController implements ReactiveController {
   madeEntries: ProjectDecisionLogEntryView[] = [];
   madeGroups: ProfileDecisionMadeGroupView[] = [];
   madeNextCursor = '';
+  /** Answer IDs of Made entries whose detail panel is open (ptone/scion#8443). */
+  madeExpanded: ReadonlySet<string> = new Set<string>();
 
   facetsAgents: ProfileDecisionActorView[] = [];
   facetsAnswerers: ProfileDecisionActorView[] = [];
@@ -230,6 +232,22 @@ export class DecisionsPageController implements ReactiveController {
 
   private notify(): void {
     this.host.requestUpdate();
+  }
+
+  /** Opens or closes one Made entry's detail panel. */
+  readonly toggleMadeExpanded = (answerId: string): void => {
+    const next = new Set(this.madeExpanded);
+    if (!next.delete(answerId)) next.add(answerId);
+    this.madeExpanded = next;
+    this.notify();
+  };
+
+  /** Expand state and toggle handed to the Made renderers. */
+  get madeDisclosure(): {
+    expanded: ReadonlySet<string>;
+    onToggle: (answerId: string) => void;
+  } {
+    return { expanded: this.madeExpanded, onToggle: this.toggleMadeExpanded };
   }
 
   setError(message: string): void {
@@ -1553,7 +1571,10 @@ export class DecisionsPageController implements ReactiveController {
 
   promptDismissAvailableAtMs = (prompt: ProjectDecisionPromptView): number => {
     const overrideMs = this.dismissAvailableAtOverrides.get(prompt.promptMessageId) ?? 0;
-    return Math.max(dismissAvailableAtMs(prompt.createdAt), overrideMs);
+    return Math.max(
+      dismissAvailableAtMsForDecisions(prompt.decisions, prompt.createdAt),
+      overrideMs
+    );
   };
 
   promptDismissRemainingMinutes = (prompt: ProjectDecisionPromptView): number => {
@@ -1574,8 +1595,7 @@ export class DecisionsPageController implements ReactiveController {
     for (const p of this.pendingPrompts) {
       if (!p.waitingOnYou || !p.canAnswer) continue;
       if (promptWaitingOnViewerRows(p, this.currentUserId).length === 0) continue;
-      const overrideMs = this.dismissAvailableAtOverrides.get(p.promptMessageId) ?? 0;
-      const availMs = Math.max(dismissAvailableAtMs(p.createdAt), overrideMs);
+      const availMs = this.promptDismissAvailableAtMs(p);
       if (availMs > nowMs && availMs < earliestMs) {
         earliestMs = availMs;
       }

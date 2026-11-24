@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -29,6 +30,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/messaging"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 )
 
@@ -38,11 +40,13 @@ var (
 	convProject string
 	convJSON    bool
 	convLimit   int
+	convAll     bool
 
 	convMsgLimit  int
 	convMsgBefore string
 	convMsgAfter  string
 	convMsgJSON   bool
+	convMsgFull   bool
 
 	convCreateJSON bool
 
@@ -54,6 +58,7 @@ var (
 
 	convCatchUpSince string
 	convCatchUpJSON  bool
+	convCatchUpFull  bool
 )
 
 // conversationCmd is the top-level command for conversation management.
@@ -77,9 +82,11 @@ Commands:
   scion conversation group ...                  Manage project thread groups
 
 Conversation references:
-  conv:<uuid>     Direct conversation ID
+  conv:<uuid>     Direct conversation ID (full 36-character UUID)
+  <uuid>          Bare 36-character conversation ID
   @<agent-name>   Agent DM conversation
   #<thread-name>  Named thread conversation`,
+	Args: cobra.NoArgs,
 	RunE: runConversationList,
 }
 
@@ -93,7 +100,9 @@ Examples:
   scion conversation list
   scion conversation list --kind group
   scion conversation list --surface discord --json
-  scion conversation list --limit 10`,
+  scion conversation list --limit 10
+  scion conversation list --all`,
+	Args: cobra.NoArgs,
 	RunE: runConversationList,
 }
 
@@ -101,15 +110,19 @@ Examples:
 var conversationMessagesCmd = &cobra.Command{
 	Use:   "messages <conversation-ref>",
 	Short: "View messages in a conversation",
-	Long: `View messages in a conversation.
+	Long: `View messages in a conversation, in chronological order.
+
+Pass --full to print complete untruncated message bodies and message IDs.
 
 Conversation references:
-  conv:<uuid>     Direct conversation ID
+  conv:<uuid>     Direct conversation ID (full 36-character UUID)
+  <uuid>          Bare 36-character conversation ID
   @<agent-name>   Agent DM conversation
   #<thread-name>  Named thread conversation
 
 Examples:
   scion conversation messages conv:a1b2c3d4-...
+  scion conversation messages a1b2c3d4-... --full
   scion conversation messages @my-agent --limit 50
   scion conversation messages #design-thread --json`,
 	Args: cobra.ExactArgs(1),
@@ -121,6 +134,10 @@ var conversationCreateCmd = &cobra.Command{
 	Use:   "create <name>",
 	Short: "Create a new group conversation",
 	Long: `Create a new group conversation.
+
+A name is 1 to 100 characters after trimming, must start with an ASCII
+letter or digit (a-z, A-Z, 0-9), and may contain only ASCII letters,
+digits, spaces, underscores (_), and hyphens (-).
 
 Examples:
   scion conversation create "Design Discussion"
@@ -207,13 +224,19 @@ Examples:
 
 // conversationJoinCmd adds a participant to a conversation.
 var conversationJoinCmd = &cobra.Command{
-	Use:   "join <conversation-ref> <principal-kind> <principal-id>",
+	Use:   "join <conversation-ref> <principal-kind> <principal>",
 	Short: "Add a participant to a conversation",
 	Long: `Add a participant to a conversation.
 
+The principal argument accepts a user ID, email, or handle (display name,
+hyphenated display-name slug, or email local part) for kind "user", and an
+agent ID, slug, or name for kind "agent".
+
 Examples:
+  scion conversation join conv:a1b2c3d4-... agent my-agent
   scion conversation join conv:a1b2c3d4-... agent 0b56e8d0-...
-  scion conversation join #design-thread user a1b2c3d4-...`,
+  scion conversation join #design-thread user alice@example.com
+  scion conversation join #design-thread user alice-smith`,
 	Args: cobra.ExactArgs(3),
 	RunE: runConversationJoin,
 }
@@ -235,10 +258,13 @@ Examples:
 var conversationCatchUpCmd = &cobra.Command{
 	Use:   "catch-up <conversation-ref>",
 	Short: "Show recent messages in a conversation",
-	Long: `Show recent messages in a conversation. Defaults to the last hour.
+	Long: `Show recent messages in a conversation, in chronological order. Defaults to the last hour.
+
+Pass --full to print complete untruncated message bodies and message IDs.
 
 Examples:
   scion conversation catch-up conv:a1b2c3d4-...
+  scion conversation catch-up a1b2c3d4-... --full
   scion conversation catch-up @my-agent --since 30m
   scion conversation catch-up #design-thread --since 2h --json`,
 	Args: cobra.ExactArgs(1),
@@ -265,6 +291,7 @@ func init() {
 		cmd.Flags().StringVar(&convProject, "project", "", "Filter by project (slug, name or ID)")
 		cmd.Flags().BoolVar(&convJSON, "json", false, "Output in JSON format")
 		cmd.Flags().IntVar(&convLimit, "limit", 50, "Maximum number of conversations to show")
+		cmd.Flags().BoolVar(&convAll, "all", false, "Return all conversations without a limit")
 	}
 
 	// Messages flags
@@ -272,6 +299,7 @@ func init() {
 	conversationMessagesCmd.Flags().StringVar(&convMsgBefore, "before", "", "Show messages before this time (RFC3339)")
 	conversationMessagesCmd.Flags().StringVar(&convMsgAfter, "after", "", "Show messages after this time (RFC3339)")
 	conversationMessagesCmd.Flags().BoolVar(&convMsgJSON, "json", false, "Output in JSON format")
+	conversationMessagesCmd.Flags().BoolVar(&convMsgFull, "full", false, "Show full untruncated message text and message IDs")
 
 	// Create flags
 	conversationCreateCmd.Flags().StringVar(&convProject, "project", "", "Project slug, name or ID (defaults to current project)")
@@ -288,9 +316,25 @@ func init() {
 	// Catch-up flags
 	conversationCatchUpCmd.Flags().StringVar(&convCatchUpSince, "since", "1h", "Show messages from this duration ago (e.g. 30m, 2h)")
 	conversationCatchUpCmd.Flags().BoolVar(&convCatchUpJSON, "json", false, "Output in JSON format")
+	conversationCatchUpCmd.Flags().BoolVar(&convCatchUpFull, "full", false, "Show full untruncated message text and message IDs")
+}
+
+func printConversationTruncationNotice(result *hubclient.ConversationListResult) {
+	if result == nil || !result.Truncated {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "Showing %d of %d conversations; use --limit or --all to see more.\n",
+		len(result.Conversations), result.Total)
 }
 
 func runConversationList(cmd *cobra.Command, args []string) error {
+	if convAll && cmd.Flags().Changed("limit") {
+		return fmt.Errorf("cannot use --all together with --limit")
+	}
+	if !convAll && convLimit <= 0 {
+		return fmt.Errorf("--limit must be a positive integer (got %d); use --all to list all conversations", convLimit)
+	}
+
 	if convJSON {
 		outputFormat = "json"
 	}
@@ -303,10 +347,15 @@ func runConversationList(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(cmd.Context(), 30*time.Second)
 	defer cancel()
 
+	limit := convLimit
+	if convAll {
+		limit = 0
+	}
+
 	opts := &hubclient.ListConversationsOptions{
 		Kind:    convKind,
 		Surface: convSurface,
-		Limit:   convLimit,
+		Limit:   limit,
 	}
 
 	// Review round 1 finding #2 / design §3.2 addendum: project_id keeps
@@ -339,7 +388,11 @@ func runConversationList(cmd *cobra.Command, args []string) error {
 	}
 
 	if isJSONOutput() {
-		return outputJSON(result)
+		if err := outputJSON(result); err != nil {
+			return err
+		}
+		printConversationTruncationNotice(result)
+		return nil
 	}
 
 	if len(result.Conversations) == 0 {
@@ -361,7 +414,11 @@ func runConversationList(cmd *cobra.Command, args []string) error {
 		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
 			conv.ID, conv.Kind, conv.Surface, name, defaultAgent, lastActivity)
 	}
-	return tw.Flush()
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	printConversationTruncationNotice(result)
+	return nil
 }
 
 func runConversationMessages(cmd *cobra.Command, args []string) error {
@@ -402,11 +459,15 @@ func runConversationMessages(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	items := chronologicalMessages(result.Items)
 	label := newUserLabeler(ctx, client)
+	if convMsgFull {
+		return writeConversationMessagesFull(os.Stdout, items, label)
+	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	_, _ = fmt.Fprintln(tw, "TIME\tFROM\tMESSAGE")
-	for i := range result.Items {
-		msg := &result.Items[i]
+	for i := range items {
+		msg := &items[i]
 		timeStr := clitime.Format(msg.CreatedAt, clitime.Clock)
 		from := truncateRunes(msg.Sender, 20, true)
 		body := truncateRunes(msg.Msg, 60, true)
@@ -506,9 +567,9 @@ func runConversationCreate(cmd *cobra.Command, args []string) error {
 		// (pkg/hub/handlers_conversations.go): the conversation exists and
 		// is visible on the web, but until a participant row exists the
 		// creator can't read it back via `scion conversation
-		// show/messages/participants` or see it in `scion conversation list`.
+		// get/messages/participants` or see it in `scion conversation list`.
 		fmt.Fprintf(os.Stderr, "warning: created conversation %s but could not add you as a participant; "+
-			"it won't appear in `scion conversation list` or be readable via `scion conversation show` yet\n", conv.ID)
+			"it won't appear in `scion conversation list` or be readable via `scion conversation get` yet\n", conv.ID)
 	}
 
 	fmt.Printf("Conversation created: %s\n", conv.ID)
@@ -794,11 +855,16 @@ func runConversationJoin(cmd *cobra.Command, args []string) error {
 		PrincipalID:   args[2],
 	}
 
-	if _, err := client.Conversations().AddParticipant(ctx, conversationID, req); err != nil {
+	participant, err := client.Conversations().AddParticipant(ctx, conversationID, req)
+	if err != nil {
 		return fmt.Errorf("failed to add participant: %w", err)
 	}
 
-	fmt.Printf("Added %s %s to conversation %s\n", req.PrincipalKind, req.PrincipalID, conversationID)
+	if participant != nil && participant.PrincipalID != "" && participant.PrincipalID != req.PrincipalID {
+		fmt.Printf("Added %s %s (%s) to conversation %s\n", req.PrincipalKind, req.PrincipalID, participant.PrincipalID, conversationID)
+	} else {
+		fmt.Printf("Added %s %s to conversation %s\n", req.PrincipalKind, req.PrincipalID, conversationID)
+	}
 	return nil
 }
 
@@ -867,11 +933,15 @@ func runConversationCatchUp(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	items := chronologicalMessages(result.Items)
 	label := newUserLabeler(ctx, client)
+	if convCatchUpFull {
+		return writeConversationMessagesFull(os.Stdout, items, label)
+	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	_, _ = fmt.Fprintln(tw, "TIME\tFROM\tMESSAGE")
-	for i := range result.Items {
-		msg := &result.Items[i]
+	for i := range items {
+		msg := &items[i]
 		timeStr := clitime.Format(msg.CreatedAt, clitime.Clock)
 		from := truncateRunes(msg.Sender, 20, true)
 		body := truncateRunes(msg.Msg, 60, true)
@@ -887,6 +957,50 @@ func runConversationCatchUp(cmd *cobra.Command, args []string) error {
 		}
 	}
 	return tw.Flush()
+}
+
+// chronologicalMessages returns a copy of msgs sorted from oldest to newest
+// by CreatedAt, preserving relative order when timestamps are equal.
+func chronologicalMessages(msgs []store.Message) []store.Message {
+	sorted := append([]store.Message(nil), msgs...)
+	slices.SortStableFunc(sorted, func(a, b store.Message) int {
+		return a.CreatedAt.Compare(b.CreatedAt)
+	})
+	return sorted
+}
+
+// writeConversationMessagesFull prints full untruncated messages in
+// chronological order (ptone/scion#8469).
+func writeConversationMessagesFull(w io.Writer, items []store.Message, label func(string) string) error {
+	for i := range items {
+		if i > 0 {
+			if _, err := fmt.Fprintln(w); err != nil {
+				return err
+			}
+		}
+		msg := &items[i]
+		header := fmt.Sprintf("[%s] %s", clitime.Format(msg.CreatedAt, clitime.Full), msg.Sender)
+		if msg.ID != "" {
+			header += fmt.Sprintf(" (id: %s)", msg.ID)
+		}
+		if _, err := fmt.Fprintln(w, header); err != nil {
+			return err
+		}
+		if authorizedBy := messageAuthorizedBy(msg, label); authorizedBy != "" {
+			if _, err := fmt.Fprintf(w, "  %s\n", authorizedBy); err != nil {
+				return err
+			}
+		}
+		if _, err := fmt.Fprintln(w, msg.Msg); err != nil {
+			return err
+		}
+		for _, a := range msg.DeferredAttachments {
+			if _, err := fmt.Fprintf(w, "  %s\n", messaging.AttachmentNotDeliveredLine(a.Name, a.Size, "the message was deferred")); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // conversationListName is the NAME column of conversation list
@@ -906,11 +1020,20 @@ func conversationListName(conv hubclient.ConversationDetail) string {
 }
 
 // resolveConversationRef resolves a conversation reference string to a conversation ID.
-// Supports conv:<uuid> directly. For @agent and #thread, it first lists the caller's
-// conversations and tries to match.
+// Supports conv:<uuid> and bare 36-character <uuid> directly. For @agent and
+// #thread, it first lists the caller's conversations and tries to match.
 func resolveConversationRef(ctx context.Context, client hubclient.Client, refStr string) (string, error) {
+	if len(refStr) == 36 {
+		if id, err := uuid.Parse(refStr); err == nil {
+			return id.String(), nil
+		}
+	}
+
 	ref, err := messaging.ParseReference(refStr)
 	if err != nil {
+		if looksLikeTruncatedUUID(refStr) {
+			return "", newUsageError("invalid conversation reference %q: truncated conversation IDs do not resolve; use a full 36-character UUID (conv:<uuid> or <uuid>): %w", refStr, err)
+		}
 		return "", newUsageError("invalid conversation reference %q: %w", refStr, err)
 	}
 
@@ -953,6 +1076,28 @@ func resolveConversationRef(ctx context.Context, client hubclient.Client, refStr
 	default:
 		return "", newUsageError("unsupported conversation reference type: %s", refStr)
 	}
+}
+
+// looksLikeTruncatedUUID reports whether s looks like a shortened hex/UUID
+// prefix (4 to 35 hex/hyphen characters, optionally ending in "..." or "…")
+// rather than another reference kind.
+func looksLikeTruncatedUUID(s string) bool {
+	s = strings.TrimSuffix(strings.TrimSuffix(s, "..."), "…")
+	if len(s) < 4 || len(s) >= 36 {
+		return false
+	}
+	hasHex := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'):
+			hasHex = true
+		case c == '-':
+		default:
+			return false
+		}
+	}
+	return hasHex
 }
 
 // truncateRunes truncates a string to at most max runes, preserving multi-byte

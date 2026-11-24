@@ -308,6 +308,9 @@ func copyBrokerEcho(dst, src *store.AgentAppliedConfig, includeImage bool) {
 	}
 	if src.Profile != "" {
 		dst.Profile = src.Profile
+		if dst.CreateInputs != nil && dst.CreateInputs.Profile == "" {
+			dst.CreateInputs.Profile = src.Profile
+		}
 	}
 	if includeImage && src.Image != "" {
 		dst.Image = src.Image
@@ -1414,11 +1417,12 @@ func (s *Server) finishFailReincarnation(ctx context.Context, agentID, reincarna
 // callers' doc comments for why that ordering is required.
 //
 // When restoreConfig is non-nil, the same transaction restores the
-// service-account assignment the reincarnation reincarnationID replaced
-// (restoreReincarnationAssignment), recording cause on the replacement, so
-// the active assignment and the restored configuration change together.
-// Without restoreConfig the disk keeps the new generation's configuration,
-// and the assignment recorded for it stays.
+// service-account assignment (restoreReincarnationAssignment) and delegation
+// edge (restoreReincarnationDelegationEdge) that reincarnationID replaced,
+// recording cause on the replacement, so the active authority records and
+// the restored configuration change together. Without restoreConfig the disk
+// keeps the new generation's configuration, and the authority records
+// written for it stay.
 func (s *Server) writeFailedAgent(ctx context.Context, agentID, reincarnationID string, cause store.EdgeDeactivationCause, errMsg string, restoreConfig *store.AgentAppliedConfig, now time.Time) {
 	upd := reincarnationStepUpdate{
 		reincarnationState: store.ReincarnationStateFailed,
@@ -1433,6 +1437,9 @@ func (s *Server) writeFailedAgent(ctx context.Context, agentID, reincarnationID 
 			if err := restoreReincarnationAssignment(ctx, tx, agent, reincarnationID, cause, now); err != nil {
 				return fmt.Errorf("assignment restore: %w", err)
 			}
+			if err := restoreReincarnationDelegationEdge(ctx, tx, agent, reincarnationID, cause, now); err != nil {
+				return fmt.Errorf("delegation edge restore: %w", err)
+			}
 			return nil
 		}
 	}
@@ -1440,12 +1447,12 @@ func (s *Server) writeFailedAgent(ctx context.Context, agentID, reincarnationID 
 	// here leaves the agent in its in-flight state, refused with 409, with
 	// no worker left to retry it, until the sweep's orphaned agent-state
 	// reset marks it failed (without restoring the configuration). With a
-	// restore, the assignment restore is lost with it: both roll back
-	// together.
+	// restore, the assignment and delegation edge restores are lost with it:
+	// all roll back together.
 	agent, err := s.updateReincarnationStep(ctx, agentID, upd, reincarnationStepMaxAttempts+3)
 	if err != nil {
 		if restoreConfig != nil {
-			s.agentLifecycleLog.Error("failReincarnation: failed to update agent after retries; the agent write and the assignment restore are not applied, and the agent is left for the orphaned agent-state sweep",
+			s.agentLifecycleLog.Error("failReincarnation: failed to update agent after retries; the agent write and authority restores are not applied, and the agent is left for the orphaned agent-state sweep",
 				"agent_id", agentID, "reincarnation_id", reincarnationID, "error", err)
 		} else {
 			s.agentLifecycleLog.Error("failReincarnation: failed to update agent after retries",
@@ -1788,15 +1795,18 @@ func (s *Server) buildReincarnationPreambleWith(agent *store.Agent, toGeneration
 		// template) is authoritative on who to tell; the resolved creator
 		// (if any, and not the agent itself) is only a hint for when the
 		// handoff names no one, rendered as its own sentence (A26.3 N2).
-		fmt.Fprintf(&b, " 3. Message the owner named in your handoff's \"Authority and ownership\" section that generation %d is up, and state your next action.", toGeneration)
+		// Step 3 defers to the handoff's "Immediate active work" section so
+		// a handoff that instructs the new generation to stay idle or quiet
+		// is not contradicted (ptone/scion#8830).
+		fmt.Fprintf(&b, " 3. Unless your handoff's \"Immediate active work\" section says otherwise, message the owner named in your handoff's \"Authority and ownership\" section that generation %d is up, and state your next action.", toGeneration)
 		if requester.CreatorResolved {
 			fmt.Fprintf(&b, " If the handoff names none, message %s.", requester.CreatorHandle)
 		}
 		b.WriteString("\n")
 	case requester.Resolved:
-		fmt.Fprintf(&b, " 3. Message %s that generation %d is up, and state your next action.\n", requester.Handle, toGeneration)
+		fmt.Fprintf(&b, " 3. Unless your handoff's \"Immediate active work\" section says otherwise, message %s that generation %d is up, and state your next action.\n", requester.Handle, toGeneration)
 	default:
-		fmt.Fprintf(&b, " 3. Message %s that generation %d is up, and state your next action.\n", reincarnationRequesterFallback, toGeneration)
+		fmt.Fprintf(&b, " 3. Unless your handoff's \"Immediate active work\" section says otherwise, message %s that generation %d is up, and state your next action.\n", reincarnationRequesterFallback, toGeneration)
 	}
 	b.WriteString(" 4. Continue from the handoff's \"Immediate active work\" section below (its next action). Do not redo anything listed under \"Do not redo\".\n")
 	b.WriteString("The handoff from your previous generation follows.\n---\n")

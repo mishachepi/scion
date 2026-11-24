@@ -54,7 +54,7 @@ const resourceImportConcurrency = 6
 
 // resourceDir pairs a derived resource name with its on-disk directory.
 type resourceDir struct {
-	name, path, sourceURL string
+	name, path, sourceURL, sourceCommit string
 	// nameFromConfig is set when name was read from the directory's
 	// config.yaml before collection; the import then requires the collected
 	// config.yaml to carry the same name.
@@ -149,10 +149,15 @@ type resourceImportKind struct {
 	// it can fail; failures cause that directory to be skipped.
 	newStore func(dir string) (*ResourceStore, error)
 	// checkContent, when set, validates the content of every directory
-	// selected for import before any directory is persisted. A non-nil error
-	// refuses the whole import, so a refused import or reimport writes
-	// nothing. It reports every refused directory, not just the first.
-	checkContent func(dirs []resourceDir) error
+	// selected for import into scope before any directory is persisted. A
+	// non-nil error refuses the whole import, so a refused import or
+	// reimport writes nothing. It reports every refused directory, not just
+	// the first.
+	checkContent func(dirs []resourceDir, scope string) error
+	// createOnly, when true, refuses to overwrite an existing resource (or any
+	// bundled harness-config whose slug already exists in the target scope).
+	// Used for agent-initiated template imports.
+	createOnly bool
 }
 
 // templateImportKind returns the import knobs for templates.
@@ -162,6 +167,7 @@ func (s *Server) templateImportKind() resourceImportKind {
 		marker:        "scion-agent.yaml",
 		isResourceDir: templateimport.IsScionTemplate,
 		newStore:      func(string) (*ResourceStore, error) { return s.templateStore(), nil },
+		checkContent:  s.checkHostedTemplateDirs,
 	}
 }
 
@@ -178,7 +184,12 @@ func (s *Server) harnessConfigImportKind() resourceImportKind {
 			}
 			return s.harnessConfigStore(hcDir.Config.Harness), nil
 		},
-		checkContent: checkHarnessConfigDirsProvisioner,
+		checkContent: func(dirs []resourceDir, scope string) error {
+			if err := checkHarnessConfigDirsProvisioner(dirs); err != nil {
+				return err
+			}
+			return s.checkHostedHarnessConfigDirs(dirs, scope)
+		},
 	}
 }
 
@@ -205,17 +216,22 @@ func (s *Server) importFromRemote(ctx context.Context, projectID, sourceURL, sco
 // of the discovered dirs; dirs it drops must be appended to skipped. noMatch is
 // the error message returned when the selection keeps no dirs.
 func (s *Server) importFromRemoteSelected(ctx context.Context, projectID, sourceURL, scope string, kind resourceImportKind, progress importProgressFunc, selectDirs func([]resourceDir, []skippedDir) ([]resourceDir, []skippedDir), noMatch string) ([]string, error) {
-	if !config.IsRemoteURI(sourceURL) {
-		return nil, fmt.Errorf("source must be a remote URI (http://, https://, or rclone)")
+	if s.workstation {
+		if !config.IsRemoteURI(sourceURL) {
+			return nil, fmt.Errorf("source must be a remote URI (http://, https://, or rclone)")
+		}
+	} else if _, err := s.checkImportSource(sourceURL); err != nil {
+		return nil, err
 	}
 	if s.GetStorage() == nil {
 		return nil, fmt.Errorf("%s storage is not configured", kind.noun)
 	}
 
-	cachePath, err := s.fetchRemoteForImport(ctx, scope, projectID, sourceURL)
+	fetched, err := s.fetchRemoteForImportWithResult(ctx, scope, projectID, sourceURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch remote %s: %w", kind.noun, err)
 	}
+	cachePath := fetched.Path
 	defer func() { _ = os.RemoveAll(cachePath) }()
 
 	dirs, skipped, err := discoverResourceDirs(cachePath, sourceURL, kind)
@@ -223,7 +239,10 @@ func (s *Server) importFromRemoteSelected(ctx context.Context, projectID, source
 		return nil, err
 	}
 	if len(dirs) == 0 {
-		return nil, fmt.Errorf("no scion %s found at %s", kind.noun, sourceURL)
+		return nil, fmt.Errorf("no scion %s found at the source", kind.noun)
+	}
+	for i := range dirs {
+		dirs[i].sourceCommit = fetched.Commit
 	}
 
 	dirs, skipped = selectDirs(dirs, skipped)
@@ -231,7 +250,7 @@ func (s *Server) importFromRemoteSelected(ctx context.Context, projectID, source
 		return nil, errors.New(noMatch)
 	}
 
-	if err := checkResourceDirsContent(dirs, kind); err != nil {
+	if err := checkResourceDirsContent(dirs, scope, kind); err != nil {
 		return nil, err
 	}
 
@@ -274,7 +293,7 @@ func (s *Server) importFromWorkspace(ctx context.Context, project *store.Project
 		return nil, fmt.Errorf("no scion %s matched the requested names", kind.noun)
 	}
 
-	if err := checkResourceDirsContent(dirs, kind); err != nil {
+	if err := checkResourceDirsContent(dirs, scope, kind); err != nil {
 		return nil, err
 	}
 
@@ -282,23 +301,13 @@ func (s *Server) importFromWorkspace(ctx context.Context, project *store.Project
 }
 
 // checkResourceDirsContent runs the kind's content check over every directory
-// selected for import. It runs before importResourceDirs so that a refusal
-// persists nothing.
-func checkResourceDirsContent(dirs []resourceDir, kind resourceImportKind) error {
+// selected for import into scope. It runs before importResourceDirs so that
+// a refusal persists nothing.
+func checkResourceDirsContent(dirs []resourceDir, scope string, kind resourceImportKind) error {
 	if kind.checkContent == nil {
 		return nil
 	}
-	return kind.checkContent(dirs)
-}
-
-// fetchRemoteForImport fetches a remote source URL to a local cache directory,
-// authenticating against GitHub with the credential importCredential selects
-// for the import's scope ("global", "project" or "user") and scopeID. It
-// applies to both resource kinds (templates and harness-configs) and to skill
-// directory discovery. The caller owns the returned cache path and must
-// remove it.
-func (s *Server) fetchRemoteForImport(ctx context.Context, scope, scopeID, sourceURL string) (string, error) {
-	return config.FetchRemoteTemplate(ctx, sourceURL, s.importCredential(ctx, scope, scopeID, sourceURL))
+	return kind.checkContent(dirs, scope)
 }
 
 // importCredential returns the GitHub credential for fetching sourceURL into
@@ -549,6 +558,10 @@ func (s *Server) importResourceDirs(ctx context.Context, dirs []resourceDir, ski
 				if rd.nameFromConfig {
 					rstore.requireConfigName()
 				}
+				if kind.createOnly {
+					rstore.setCreateOnly(scope, scopeID)
+				}
+				rstore.setSourceCommit(rd.sourceCommit)
 				_, err = rstore.Bootstrap(ctx, rd.name, rd.path, scope, scopeID, rd.sourceURL, true)
 			}
 			done := int(completed.Add(1))
@@ -556,10 +569,16 @@ func (s *Server) importResourceDirs(ctx context.Context, dirs []resourceDir, ski
 				s.resourceLog.Warn(kind.noun+" import: failed to import resource, skipping",
 					"name", rd.name, "error", err)
 				failedSlots[i] = rd.name
-				emit(progress, ResourceImportEvent{
+				ev := ResourceImportEvent{
 					Type: ImportEventFailed, Name: rd.name, Reason: err.Error(),
 					Completed: done, Total: total,
-				})
+				}
+				var invalidCfg *invalidAgentConfigError
+				if errors.As(err, &invalidCfg) {
+					ev.Code = ErrCodeInvalidAgentConfig
+					ev.Reason = invalidCfg.PublicMessage()
+				}
+				emit(progress, ev)
 				return nil
 			}
 			importedSlots[i] = rd.name
@@ -638,8 +657,12 @@ func applySlugFilter(dirs []resourceDir, skipped []skippedDir, slug string) ([]r
 // fetch authenticates with the credentials of scope and scopeID (see
 // importCredential).
 func (s *Server) discoverFromRemote(ctx context.Context, scope, scopeID, sourceURL string, kind resourceImportKind) ([]string, []string, error) {
-	if !config.IsRemoteURI(sourceURL) {
-		return nil, nil, fmt.Errorf("source must be a remote URI (http://, https://, or rclone)")
+	if s.workstation {
+		if !config.IsRemoteURI(sourceURL) {
+			return nil, nil, fmt.Errorf("source must be a remote URI (http://, https://, or rclone)")
+		}
+	} else if _, err := s.checkImportSource(sourceURL); err != nil {
+		return nil, nil, err
 	}
 	if s.GetStorage() == nil {
 		return nil, nil, fmt.Errorf("%s storage is not configured", kind.noun)
@@ -656,7 +679,7 @@ func (s *Server) discoverFromRemote(ctx context.Context, scope, scopeID, sourceU
 		return nil, nil, err
 	}
 	if len(dirs) == 0 {
-		return nil, nil, fmt.Errorf("no scion %s found at %s", kind.noun, sourceURL)
+		return nil, nil, fmt.Errorf("no scion %s found at the source", kind.noun)
 	}
 
 	names := make([]string, len(dirs))

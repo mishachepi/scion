@@ -15,6 +15,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -29,6 +30,8 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/spf13/cobra"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestResolveAgentIDForSubscription_Found(t *testing.T) {
@@ -473,4 +476,413 @@ func TestDefaultTriggers(t *testing.T) {
 			t.Errorf("defaultTriggers[%d] = %q, want %q", i, defaultTriggers[i], v)
 		}
 	}
+}
+
+func TestNotificationsArgsValidators(t *testing.T) {
+	noArgCmds := []*cobra.Command{
+		notificationsCmd,
+		notificationsSubscribeCmd,
+		notificationsSubscriptionsCmd,
+	}
+	for _, cmd := range noArgCmds {
+		t.Run(cmd.Name()+"_no_args", func(t *testing.T) {
+			require.NotNil(t, cmd.Args, "%s must set Args to reject stray positional arguments", cmd.Name())
+			assert.NoError(t, cmd.Args(cmd, []string{}))
+			assert.Error(t, cmd.Args(cmd, []string{"bogus"}))
+		})
+	}
+
+	maxOneArgCmds := []*cobra.Command{
+		notificationsAckCmd,
+		notificationsUnsubscribeCmd,
+	}
+	for _, cmd := range maxOneArgCmds {
+		t.Run(cmd.Name()+"_max_one_arg", func(t *testing.T) {
+			require.NotNil(t, cmd.Args, "%s must set Args to reject extra positional arguments", cmd.Name())
+			assert.NoError(t, cmd.Args(cmd, []string{}))
+			assert.NoError(t, cmd.Args(cmd, []string{"id-1"}))
+			assert.Error(t, cmd.Args(cmd, []string{"id-1", "extra"}))
+		})
+	}
+}
+
+// TestNotificationsBareAndUnknownSubcommand covers ptone/scion#8831 through
+// rootCmd.Execute(): bare "scion notifications" (and its aliases) still lists
+// notifications, while unknown subcommands (e.g. "scion notifications bogus")
+// and stray positional arguments on subcommands fail fast without hitting the hub.
+func TestNotificationsBareAndUnknownSubcommand(t *testing.T) {
+	restoreAllSilenceUsage(t)
+	origProjectPath := projectPath
+	origJSON := notificationsJSON
+	origShowAll := notificationsShowAll
+	origOutputFormat := outputFormat
+	defer func() {
+		projectPath = origProjectPath
+		notificationsJSON = origJSON
+		notificationsShowAll = origShowAll
+		outputFormat = origOutputFormat
+	}()
+	clearHubContextEnv(t)
+
+	var sawRequest bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawRequest = true
+		if r.URL.Path == "/api/v1/notifications" && r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode([]hubclient.Notification{})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	t.Setenv("SCION_HUB_ENDPOINT", server.URL)
+	t.Setenv("SCION_PROJECT_ID", "agent-project-id")
+	t.Setenv("SCION_AUTH_TOKEN", "test-agent-token")
+
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	projectDir := filepath.Join(tmpHome, "agent-project", ".scion")
+	require.NoError(t, os.MkdirAll(projectDir, 0755))
+	projectPath = projectDir
+	notificationsJSON = false
+	notificationsShowAll = false
+	outputFormat = ""
+
+	execArgs := func(t *testing.T, args []string) (string, error) {
+		t.Helper()
+		t.Cleanup(func() {
+			resetCommandFlags(t, notificationsCmd)
+			resetCommandFlags(t, notificationsAckCmd)
+			resetCommandFlags(t, notificationsSubscribeCmd)
+			resetCommandFlags(t, notificationsUnsubscribeCmd)
+			resetCommandFlags(t, notificationsSubscriptionsCmd)
+		})
+		var buf bytes.Buffer
+		rootCmd.SetArgs(args)
+		rootCmd.SetOut(&buf)
+		rootCmd.SetErr(&buf)
+		defer func() {
+			rootCmd.SetArgs(nil)
+			rootCmd.SetOut(nil)
+			rootCmd.SetErr(nil)
+		}()
+		var execErr error
+		stdout := captureStdout(t, func() {
+			execErr = rootCmd.Execute()
+		})
+		return stdout + buf.String(), execErr
+	}
+
+	for _, bare := range [][]string{{"notifications"}, {"notification"}, {"notif"}} {
+		t.Run("bare_"+bare[0], func(t *testing.T) {
+			sawRequest = false
+			out, err := execArgs(t, bare)
+			require.NoError(t, err)
+			assert.True(t, sawRequest, "bare %v must call the hub list endpoint", bare)
+			assert.Contains(t, out, "No notifications")
+		})
+	}
+
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{
+			name:    "unknown_subcommand",
+			args:    []string{"notifications", "bogus"},
+			wantErr: `unknown command "bogus" for "scion notifications"`,
+		},
+		{
+			name:    "notification_alias_unknown_subcommand",
+			args:    []string{"notification", "bogus"},
+			wantErr: `unknown command "bogus" for "scion notifications"`,
+		},
+		{
+			name:    "notif_alias_unknown_subcommand",
+			args:    []string{"notif", "bogus"},
+			wantErr: `unknown command "bogus" for "scion notifications"`,
+		},
+		{
+			name:    "subscribe_stray_arg",
+			args:    []string{"notifications", "subscribe", "extra"},
+			wantErr: `unknown command "extra" for "scion notifications subscribe"`,
+		},
+		{
+			name:    "subscriptions_stray_arg",
+			args:    []string{"notifications", "subscriptions", "extra"},
+			wantErr: `unknown command "extra" for "scion notifications subscriptions"`,
+		},
+		{
+			name:    "subs_alias_stray_arg",
+			args:    []string{"notifications", "subs", "extra"},
+			wantErr: `unknown command "extra" for "scion notifications subscriptions"`,
+		},
+		{
+			name:    "ack_extra_arg",
+			args:    []string{"notifications", "ack", "notif-1", "extra"},
+			wantErr: `accepts at most 1 arg(s), received 2`,
+		},
+		{
+			name:    "unsubscribe_extra_arg",
+			args:    []string{"notifications", "unsubscribe", "sub-1", "extra"},
+			wantErr: `accepts at most 1 arg(s), received 2`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sawRequest = false
+			_, err := execArgs(t, tc.args)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+			assert.False(t, sawRequest, "unknown subcommand/arg must fail fast before calling the hub")
+		})
+	}
+}
+
+func TestResolveSubscriptionID(t *testing.T) {
+	const (
+		subA = "a1b2c3d4-1111-4000-8000-000000000001"
+		subB = "a1b2c3d4-2222-4000-8000-000000000002"
+		subC = "deadbeef-3333-4000-8000-000000000003"
+	)
+
+	var listCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/notifications/subscriptions" && r.Method == http.MethodGet {
+			listCalls++
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]hubclient.Subscription{
+				{ID: subA},
+				{ID: subB},
+				{ID: subC},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	client, err := hubclient.New(server.URL)
+	require.NoError(t, err)
+
+	t.Run("full UUID skips list", func(t *testing.T) {
+		listCalls = 0
+		got, err := resolveSubscriptionID(context.Background(), client, subA)
+		require.NoError(t, err)
+		assert.Equal(t, subA, got)
+		assert.Equal(t, 0, listCalls)
+	})
+
+	t.Run("unique 8-char prefix", func(t *testing.T) {
+		listCalls = 0
+		got, err := resolveSubscriptionID(context.Background(), client, "deadbeef")
+		require.NoError(t, err)
+		assert.Equal(t, subC, got)
+		assert.Equal(t, 1, listCalls)
+	})
+
+	t.Run("unique 12-char table prefix", func(t *testing.T) {
+		listCalls = 0
+		got, err := resolveSubscriptionID(context.Background(), client, "a1b2c3d4-111")
+		require.NoError(t, err)
+		assert.Equal(t, subA, got)
+		assert.Equal(t, 1, listCalls)
+	})
+
+	t.Run("ambiguous prefix returns clear error", func(t *testing.T) {
+		_, err := resolveSubscriptionID(context.Background(), client, "a1b2c3d4")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "ambiguous subscription ID prefix")
+		assert.Contains(t, err.Error(), subA)
+		assert.Contains(t, err.Error(), subB)
+	})
+
+	t.Run("not found prefix returns clear error", func(t *testing.T) {
+		_, err := resolveSubscriptionID(context.Background(), client, "ffffffff")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no subscription found matching")
+	})
+
+	t.Run("empty ref returns usage error", func(t *testing.T) {
+		_, err := resolveSubscriptionID(context.Background(), client, "   ")
+		require.Error(t, err)
+		assert.True(t, isUsageError(err))
+	})
+}
+
+func TestResolveIDPrefix_CaseInsensitiveExactMatch(t *testing.T) {
+	got, err := resolveIDPrefix("ABC", []string{"abc", "abcdef"}, "subscription", "subscriptions")
+	require.NoError(t, err)
+	assert.Equal(t, "abc", got)
+}
+
+func TestResolveNotificationID(t *testing.T) {
+	const (
+		unackedA = "a1b2c3d4-1111-4000-8000-000000000001"
+		unackedB = "a1b2c3d4-2222-4000-8000-000000000002"
+		ackedC   = "cafebabe-3333-4000-8000-000000000003"
+	)
+
+	var listQueries []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/notifications" && r.Method == http.MethodGet {
+			ackParam := r.URL.Query().Get("acknowledged")
+			listQueries = append(listQueries, ackParam)
+			w.Header().Set("Content-Type", "application/json")
+			if ackParam == "true" {
+				_ = json.NewEncoder(w).Encode([]hubclient.Notification{
+					{ID: unackedA},
+					{ID: unackedB},
+					{ID: ackedC, Acknowledged: true},
+				})
+				return
+			}
+			_ = json.NewEncoder(w).Encode([]hubclient.Notification{
+				{ID: unackedA},
+				{ID: unackedB},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	client, err := hubclient.New(server.URL)
+	require.NoError(t, err)
+
+	t.Run("full UUID skips list", func(t *testing.T) {
+		listQueries = nil
+		got, err := resolveNotificationID(context.Background(), client, unackedA)
+		require.NoError(t, err)
+		assert.Equal(t, unackedA, got)
+		assert.Empty(t, listQueries)
+	})
+
+	t.Run("unique 12-char prefix in unacknowledged", func(t *testing.T) {
+		listQueries = nil
+		got, err := resolveNotificationID(context.Background(), client, "a1b2c3d4-111")
+		require.NoError(t, err)
+		assert.Equal(t, unackedA, got)
+		assert.Equal(t, []string{""}, listQueries)
+	})
+
+	t.Run("ambiguous prefix in unacknowledged fails immediately", func(t *testing.T) {
+		listQueries = nil
+		_, err := resolveNotificationID(context.Background(), client, "a1b2c3d4")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "ambiguous notification ID prefix")
+		assert.Equal(t, []string{""}, listQueries)
+	})
+
+	t.Run("falls back to acknowledged notifications", func(t *testing.T) {
+		listQueries = nil
+		got, err := resolveNotificationID(context.Background(), client, "cafebabe")
+		require.NoError(t, err)
+		assert.Equal(t, ackedC, got)
+		assert.Equal(t, []string{"", "true"}, listQueries)
+	})
+
+	t.Run("not found returns clear error", func(t *testing.T) {
+		listQueries = nil
+		_, err := resolveNotificationID(context.Background(), client, "ffffffff")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no notification found matching")
+	})
+}
+
+func TestNotificationsPrefixCommandsEndToEnd(t *testing.T) {
+	const (
+		subA   = "1111aaaa-1111-4000-8000-000000000001"
+		subB   = "1111bbbb-2222-4000-8000-000000000002"
+		notifA = "2222aaaa-1111-4000-8000-000000000001"
+	)
+
+	origProjectPath := projectPath
+	origUpdateTriggers := updateTriggers
+	origUnsubAll := unsubscribeAll
+	origAckAll := notificationsAckAll
+	origOutputFormat := outputFormat
+	defer func() {
+		projectPath = origProjectPath
+		updateTriggers = origUpdateTriggers
+		unsubscribeAll = origUnsubAll
+		notificationsAckAll = origAckAll
+		outputFormat = origOutputFormat
+	}()
+	clearHubContextEnv(t)
+
+	var patchedID, deletedID, ackedID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/notifications/subscriptions":
+			_ = json.NewEncoder(w).Encode([]hubclient.Subscription{
+				{ID: subA, TriggerActivities: []string{"COMPLETED"}},
+				{ID: subB, TriggerActivities: []string{"COMPLETED"}},
+			})
+		case r.Method == http.MethodPatch && r.URL.Path == "/api/v1/notifications/subscriptions/"+subA:
+			patchedID = subA
+			_ = json.NewEncoder(w).Encode(hubclient.Subscription{
+				ID:                subA,
+				TriggerActivities: []string{"COMPLETED", "ERROR"},
+			})
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/v1/notifications/subscriptions/"+subB:
+			deletedID = subB
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/notifications":
+			_ = json.NewEncoder(w).Encode([]hubclient.Notification{
+				{ID: notifA},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/notifications/"+notifA+"/ack":
+			ackedID = notifA
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	t.Setenv("SCION_HUB_ENDPOINT", server.URL)
+	t.Setenv("SCION_PROJECT_ID", "proj-1")
+	t.Setenv("SCION_AUTH_TOKEN", "test-token")
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	projectDir := filepath.Join(tmpHome, "proj", ".scion")
+	require.NoError(t, os.MkdirAll(projectDir, 0o755))
+	projectPath = projectDir
+	outputFormat = ""
+
+	// Update by unique 8-char prefix
+	updateTriggers = []string{"COMPLETED,ERROR"}
+	out := captureStdout(t, func() {
+		require.NoError(t, runNotificationsUpdate(nil, []string{"1111aaaa"}))
+	})
+	assert.Equal(t, subA, patchedID)
+	assert.Contains(t, out, subA)
+
+	// Update by ambiguous 4-char prefix fails before PATCH
+	patchedID = ""
+	err := runNotificationsUpdate(nil, []string{"1111"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ambiguous subscription ID prefix")
+	assert.Empty(t, patchedID)
+
+	// Unsubscribe by unique 12-char prefix
+	unsubscribeAll = false
+	out = captureStdout(t, func() {
+		require.NoError(t, runNotificationsUnsubscribe(nil, []string{"1111bbbb-222"}))
+	})
+	assert.Equal(t, subB, deletedID)
+	assert.Contains(t, out, subB)
+
+	// Ack by unique 8-char prefix
+	notificationsAckAll = false
+	out = captureStdout(t, func() {
+		require.NoError(t, runNotificationsAck(nil, []string{"2222aaaa"}))
+	})
+	assert.Equal(t, notifA, ackedID)
+	assert.Contains(t, out, notifA)
 }

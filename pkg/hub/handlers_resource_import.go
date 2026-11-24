@@ -23,6 +23,7 @@ import (
 	"sync"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
+	"github.com/GoogleCloudPlatform/scion/pkg/hostedguard"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/permissions"
 	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
@@ -39,7 +40,22 @@ type ImportTemplatesRequest struct {
 // ImportFailure pairs a resource name with the reason it failed to import.
 type ImportFailure struct {
 	Name   string `json:"name"`
+	Code   string `json:"code,omitempty"`
 	Reason string `json:"reason"`
+}
+
+// allFailuresHaveCode reports whether failures is non-empty and every entry
+// carries the given error code.
+func allFailuresHaveCode(failures []ImportFailure, code string) bool {
+	if len(failures) == 0 {
+		return false
+	}
+	for _, f := range failures {
+		if f.Code != code {
+			return false
+		}
+	}
+	return true
 }
 
 // ImportTemplatesResponse is returned after a direct template import completes.
@@ -153,6 +169,16 @@ func (s *Server) handleProjectImportResources(
 		return
 	}
 
+	if req.WorkspacePath == "" && s.refuseImportSource(w, config.NormalizeTemplateSourceURL(req.SourceURL)) {
+		return
+	}
+
+	// Agents can only create new project templates; existing templates and
+	// bundled harness-configs are refused without writing.
+	if options.authzResourceType == "template" && GetAgentIdentityFromContext(ctx) != nil {
+		options.kind.createOnly = true
+	}
+
 	run := func(progress importProgressFunc) ([]string, error) {
 		if req.WorkspacePath != "" {
 			return s.importFromWorkspace(ctx, project, req.WorkspacePath, options.scope, options.kind, progress, req.Names)
@@ -172,7 +198,7 @@ func (s *Server) handleProjectImportResources(
 		if writeWorkspaceStorageUnavailable(w, err) {
 			return
 		}
-		if writeUnusableProvisionerImportError(w, err) {
+		if writeImportContentRefusal(w, err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "import_failed", err.Error(), nil)
@@ -183,6 +209,11 @@ func (s *Server) handleProjectImportResources(
 		reasons := make([]string, len(failures))
 		for i, f := range failures {
 			reasons[i] = f.Name + ": " + f.Reason
+		}
+		if allFailuresHaveCode(failures, ErrCodeInvalidAgentConfig) {
+			writeError(w, http.StatusUnprocessableEntity, ErrCodeInvalidAgentConfig,
+				strings.Join(reasons, "; "), nil)
+			return
 		}
 		writeError(w, http.StatusBadRequest, "import_failed",
 			options.validationFailurePrefix+strings.Join(reasons, "; "), nil)
@@ -349,6 +380,14 @@ func (s *Server) handleResourcesImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.refuseImportSource(w, sourceURL) {
+		return
+	}
+
+	if authzType == "template" && scope == store.TemplateScopeProject && GetAgentIdentityFromContext(ctx) != nil {
+		kind.createOnly = true
+	}
+
 	run := func(progress importProgressFunc) ([]string, error) {
 		return s.importFromRemote(ctx, projectID, sourceURL, scope, kind, progress, req.Names)
 	}
@@ -364,7 +403,7 @@ func (s *Server) handleResourcesImport(w http.ResponseWriter, r *http.Request) {
 		if writeWorkspaceStorageUnavailable(w, err) {
 			return
 		}
-		if writeUnusableProvisionerImportError(w, err) {
+		if writeImportContentRefusal(w, err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "import_failed", err.Error(), nil)
@@ -375,6 +414,11 @@ func (s *Server) handleResourcesImport(w http.ResponseWriter, r *http.Request) {
 		reasons := make([]string, len(failures))
 		for i, f := range failures {
 			reasons[i] = f.Name + ": " + f.Reason
+		}
+		if allFailuresHaveCode(failures, ErrCodeInvalidAgentConfig) {
+			writeError(w, http.StatusUnprocessableEntity, ErrCodeInvalidAgentConfig,
+				strings.Join(reasons, "; "), nil)
+			return
 		}
 		writeError(w, http.StatusBadRequest, "import_failed",
 			"config validation failed: "+strings.Join(reasons, "; "), nil)
@@ -396,7 +440,7 @@ func (s *Server) handleResourcesImport(w http.ResponseWriter, r *http.Request) {
 func failureCollector(failures *[]ImportFailure) importProgressFunc {
 	return func(ev ResourceImportEvent) {
 		if ev.Type == ImportEventFailed {
-			*failures = append(*failures, ImportFailure{Name: ev.Name, Reason: ev.Reason})
+			*failures = append(*failures, ImportFailure{Name: ev.Name, Code: ev.Code, Reason: ev.Reason})
 		}
 	}
 }
@@ -446,12 +490,21 @@ func (s *Server) streamImport(w http.ResponseWriter, run func(progress importPro
 
 // importErrorEvent builds the in-band error event for a failed streaming
 // import. A refused harness-config event also carries the error code of the
-// non-streaming 422 answer (ptone/scion#4214); its Reason is the same public
-// message err.Error() already gave.
+// non-streaming answer (422 harness_config_unusable, ptone/scion#4214, or
+// 400 hosted_config_refused); its Reason is the same public message
+// err.Error() already gave.
 func importErrorEvent(err error) ResourceImportEvent {
 	var ierr *unusableProvisionerImportError
 	if errors.As(err, &ierr) {
 		return ResourceImportEvent{Type: ImportEventError, Code: harnessConfigUnusableErrorCode, Reason: ierr.publicMessage()}
+	}
+	var herr *hostedHarnessConfigImportError
+	if errors.As(err, &herr) {
+		return ResourceImportEvent{Type: ImportEventError, Code: hostedguard.ErrorCode, Reason: herr.Error()}
+	}
+	var invalidCfg *invalidAgentConfigError
+	if errors.As(err, &invalidCfg) {
+		return ResourceImportEvent{Type: ImportEventError, Code: ErrCodeInvalidAgentConfig, Reason: invalidCfg.PublicMessage()}
 	}
 	return ResourceImportEvent{Type: ImportEventError, Reason: err.Error()}
 }
@@ -461,6 +514,14 @@ func importErrorEvent(err error) ResourceImportEvent {
 // response and returns false when access is denied.
 func (s *Server) authorizeProjectImport(ctx context.Context, w http.ResponseWriter, projectID, noun, authzResourceType string) bool {
 	if agentIdent := GetAgentIdentityFromContext(ctx); agentIdent != nil {
+		if authzResourceType == "template" {
+			decision := s.projectImportDecision(ctx, agentIdent, projectID, authzResourceType)
+			if !decision.Allowed {
+				writeError(w, http.StatusForbidden, ErrCodeForbidden, decision.Reason, nil)
+				return false
+			}
+			return true
+		}
 		if !agentIdent.HasScope(ScopeAgentCreate) {
 			writeError(w, http.StatusForbidden, ErrCodeForbidden, "Missing required scope: project:agent:create", nil)
 			return false
@@ -483,13 +544,13 @@ func (s *Server) authorizeProjectImport(ctx context.Context, w http.ResponseWrit
 	return false
 }
 
-// projectImportDecision decides whether a user may discover or import
-// resources of authzResourceType ("template" or "harness_config") into an
-// existing project. Both actions create catalog records in the project, so
-// the check is the resource's create permission (template.create or
-// harness_config.create) on a collection-level request inside that project.
-// Any other resource type is refused.
-func (s *Server) projectImportDecision(ctx context.Context, user UserIdentity, projectID, authzResourceType string) Decision {
+// projectImportDecision decides whether an identity (user or agent) may
+// discover or import resources of authzResourceType ("template" or
+// "harness_config") into an existing project. Both actions create catalog
+// records in the project, so the check is the resource's create permission
+// (template.create or harness_config.create) on a collection-level request
+// inside that project. Any other resource type is refused.
+func (s *Server) projectImportDecision(ctx context.Context, ident Identity, projectID, authzResourceType string) Decision {
 	var target Resource
 	var permissionID string
 	switch authzResourceType {
@@ -500,7 +561,7 @@ func (s *Server) projectImportDecision(ctx context.Context, user UserIdentity, p
 	default:
 		return Decision{Allowed: false, Reason: "unsupported import resource type"}
 	}
-	return s.authzService.CheckAccessWithEvidence(ctx, user, target, ActionCreate,
+	return s.authzService.CheckAccessWithEvidence(ctx, ident, target, ActionCreate,
 		projectCollectionEvidence(permissionID, projectID))
 }
 
@@ -573,24 +634,7 @@ func (s *Server) handleProjectDiscoverResources(
 
 	ctx := r.Context()
 
-	if agentIdent := GetAgentIdentityFromContext(ctx); agentIdent != nil {
-		if !agentIdent.HasScope(ScopeAgentCreate) {
-			writeError(w, http.StatusForbidden, ErrCodeForbidden, "Missing required scope: project:agent:create", nil)
-			return
-		}
-		if projectID != agentIdent.ProjectID() {
-			writeError(w, http.StatusForbidden, ErrCodeForbidden,
-				"Agents can only discover "+kind.noun+" within their own project", nil)
-			return
-		}
-	} else if userIdent := GetUserIdentityFromContext(ctx); userIdent != nil {
-		if !s.projectImportDecision(ctx, userIdent, projectID, authzResourceType).Allowed {
-			writeError(w, http.StatusForbidden, ErrCodeForbidden,
-				"You don't have permission to discover "+kind.noun+" in this project", nil)
-			return
-		}
-	} else {
-		writeError(w, http.StatusUnauthorized, ErrCodeUnauthorized, "Authentication required", nil)
+	if !s.authorizeProjectImport(ctx, w, projectID, kind.noun, authzResourceType) {
 		return
 	}
 
@@ -625,6 +669,9 @@ func (s *Server) handleProjectDiscoverResources(
 		names, skipped, err = s.discoverFromWorkspace(ctx, project, req.WorkspacePath, kind)
 	} else {
 		req.SourceURL = config.NormalizeTemplateSourceURL(req.SourceURL)
+		if s.refuseImportSource(w, req.SourceURL) {
+			return
+		}
 		names, skipped, err = s.discoverFromRemote(ctx, store.TemplateScopeProject, projectID, req.SourceURL, kind)
 	}
 	if err != nil {
@@ -753,6 +800,10 @@ func (s *Server) handleResourcesDiscover(w http.ResponseWriter, r *http.Request)
 	default:
 		writeError(w, http.StatusBadRequest, "invalid_request",
 			"scope must be 'global', 'project', or 'user'", nil)
+		return
+	}
+
+	if s.refuseImportSource(w, sourceURL) {
 		return
 	}
 

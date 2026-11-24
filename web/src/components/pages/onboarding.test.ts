@@ -19,6 +19,7 @@ import { apiFetch } from '../../client/api.js';
 import {
   BROKER_RESTART_HINT,
   registryPrefill,
+  registryPreviewImage,
   welcomeProjectLabel,
   welcomeResultNote,
   type WelcomePhase,
@@ -55,6 +56,7 @@ interface OnboardingPage extends HTMLElement {
   handleSaveRegistryAndNext(): Promise<void>;
   handleHarnessesNext(): Promise<void>;
   registryInput: string;
+  imageTag: string;
   brokerRestartNeeded: boolean;
   handleSaveRegistry(): Promise<void>;
   welcomePhase: WelcomePhase;
@@ -322,6 +324,58 @@ describe('onboarding registry step: pre-fill', () => {
     const p = registryPrefill({ imageRegistry: 'old.example/scion' });
     expect(p.input).toBe('old.example/scion');
     expect(p.fromNodeEnv).toBe(false);
+  });
+});
+
+describe('onboarding registry step: preview image tag', () => {
+  afterEach(() => {
+    sessionStorage.clear();
+  });
+
+  it('uses the hub imageTag when reported and falls back to latest otherwise', () => {
+    expect(registryPreviewImage('ghcr.io/homebrew-scion', 'v0.4.0-preview.3')).toBe(
+      'ghcr.io/homebrew-scion/scion-claude:v0.4.0-preview.3'
+    );
+    expect(registryPreviewImage('ghcr.io/homebrew-scion', '')).toBe(
+      'ghcr.io/homebrew-scion/scion-claude:latest'
+    );
+    expect(registryPreviewImage('ghcr.io/homebrew-scion')).toBe(
+      'ghcr.io/homebrew-scion/scion-claude:latest'
+    );
+    expect(registryPreviewImage('  ', 'v0.4.0')).toBe('your-registry/scion-claude:v0.4.0');
+  });
+
+  it('renders the release tag from /api/v1/system/status in the registry step preview', async () => {
+    vi.mocked(apiFetch).mockImplementation((path) => {
+      if (path === '/api/v1/system/status') {
+        return Promise.resolve(
+          jsonResponse({
+            initialized: true,
+            identitySet: true,
+            runtimeOK: true,
+            harnessesSeeded: false,
+            hasWorkspace: false,
+            complete: false,
+            imageTag: 'v0.4.0-preview.3',
+          })
+        );
+      }
+      return Promise.resolve(jsonResponse({}, 404));
+    });
+    const el = createPage();
+    document.body.appendChild(el);
+    try {
+      await vi.waitFor(() => {
+        expect(el.loading).toBe(false);
+      });
+      el.currentStep = 3;
+      await el.updateComplete;
+      const text = el.shadowRoot?.textContent ?? '';
+      expect(text).toContain('ghcr.io/homebrew-scion/scion-claude:v0.4.0-preview.3');
+      expect(text).not.toContain('scion-claude:latest');
+    } finally {
+      el.remove();
+    }
   });
 });
 
@@ -681,5 +735,89 @@ describe('onboarding welcome project step', () => {
     expect(welcomeResultNote({ state: 'pending_broker' })).toContain('no runtime broker');
     expect(welcomeResultNote({ state: 'started' })).toBe('');
     expect(welcomeResultNote(null)).toBe('');
+  });
+});
+
+describe('onboarding system check step: runtime daemon reachability', () => {
+  async function mountStep1(el: OnboardingPage): Promise<void> {
+    document.body.appendChild(el);
+    await vi.waitFor(() => {
+      expect(el.shadowRoot?.querySelector('.wizard')).not.toBeNull();
+    });
+    el.loading = false;
+    el.currentStep = 1;
+    await el.updateComplete;
+  }
+
+  it('shows fail pill and disables Next when daemon is unreachable, then passes on Re-check', async () => {
+    const el = createPage();
+    let checkCalls = 0;
+    vi.mocked(apiFetch).mockImplementation((path: string): Promise<Response> => {
+      if (path === '/api/v1/system/check') {
+        checkCalls++;
+        if (checkCalls === 1) {
+          return Promise.resolve(
+            jsonResponse({
+              ready: false,
+              results: [
+                { name: 'git', status: 'pass', message: 'git version 2.48.0' },
+                {
+                  name: 'runtime',
+                  status: 'fail',
+                  message:
+                    'docker daemon is not running or not accessible — start the docker daemon and click Re-check',
+                },
+              ],
+            })
+          );
+        }
+        return Promise.resolve(
+          jsonResponse({
+            ready: true,
+            results: [
+              { name: 'git', status: 'pass', message: 'git version 2.48.0' },
+              { name: 'runtime', status: 'pass', message: 'detected runtime: docker' },
+            ],
+          })
+        );
+      }
+      return Promise.resolve(jsonResponse({}, 404));
+    });
+
+    try {
+      await mountStep1(el);
+      await (el as unknown as { loadSystemCheck: () => Promise<void> }).loadSystemCheck();
+      await el.updateComplete;
+
+      const pills = Array.from(el.shadowRoot?.querySelectorAll('.check-item .pill') ?? []).map(
+        (p) => p.textContent?.trim()
+      );
+      expect(pills).toEqual(['pass', 'fail']);
+      const messages = Array.from(
+        el.shadowRoot?.querySelectorAll('.check-item .message') ?? []
+      ).map((m) => m.textContent?.trim());
+      expect(messages[1]).toContain('docker daemon is not running');
+
+      const findBtn = (label: string): Element | undefined =>
+        Array.from(el.shadowRoot?.querySelectorAll('sl-button') ?? []).find(
+          (b) => b.textContent?.trim() === label
+        );
+      expect(findBtn('Next')?.hasAttribute('disabled')).toBe(true);
+
+      // Click Re-check and verify live state update
+      findBtn('Re-check')?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      await vi.waitFor(async () => {
+        await el.updateComplete;
+        expect(findBtn('Next')?.hasAttribute('disabled')).toBe(false);
+      });
+
+      const updatedPills = Array.from(
+        el.shadowRoot?.querySelectorAll('.check-item .pill') ?? []
+      ).map((p) => p.textContent?.trim());
+      expect(updatedPills).toEqual(['pass', 'pass']);
+      expect(checkCalls).toBe(2);
+    } finally {
+      el.remove();
+    }
   });
 });

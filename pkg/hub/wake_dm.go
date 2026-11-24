@@ -94,6 +94,9 @@ func wakeDeleteWonError(agentID string) *AgentDMError {
 // Returns (*WakeResult, nil) on success or (nil, *AgentDMError) on failure.
 // On failure, no message should be dispatched (AC-4).
 func (s *Server) wakeAgentForDM(ctx context.Context, agent *store.Agent) (*WakeResult, *AgentDMError) {
+	if isShellAgent(agent) {
+		return nil, shellAgentNotMessageableError(agent)
+	}
 	if agent != nil && agent.IdleSuspendClaimActive {
 		if err := s.waitForIdleSuspendToSettle(ctx, agent); err != nil {
 			return nil, startInProgressDMError(agent, err)
@@ -163,6 +166,18 @@ func (s *Server) wakeAgentForDM(ctx context.Context, agent *store.Agent) (*WakeR
 		// own status and details.
 		if err := s.checkPinnedPlacement(agent); err != nil {
 			return nil, runtimeTargetDMError(err)
+		}
+		// Admin-managed broker policy pre-check (ptone/scion#7829 §4.3.D):
+		// refused wake leaves the agent suspended with a non-retryable 403.
+		if err := s.checkBrokerPolicyForStart(ctx, agent); err != nil {
+			if dmErr := brokerPolicyDMError(ctx, err); dmErr != nil {
+				return nil, dmErr
+			}
+			return nil, &AgentDMError{
+				Code:       ErrCodeInternalError,
+				Message:    "Failed to wake agent: " + err.Error(),
+				HTTPStatus: http.StatusInternalServerError,
+			}
 		}
 
 		// Resume the suspended agent (continue=true restores its prior
@@ -320,6 +335,9 @@ func (s *Server) wakeAgentForDM(ctx context.Context, agent *store.Agent) (*WakeR
 			return nil
 		}})
 		if err != nil {
+			if dmErr := brokerPolicyDMError(launchCtx, err); dmErr != nil {
+				return nil, dmErr
+			}
 			var quotaErr *startQuotaError
 			if errors.As(err, &quotaErr) {
 				var conflict *ReservationScopeConflictError
@@ -490,7 +508,7 @@ func (s *Server) wakeAgentForDM(ctx context.Context, agent *store.Agent) (*WakeR
 	case state.PhaseHalted:
 		return nil, &AgentDMError{
 			Code:       ErrCodeValidationError,
-			Message:    "Agent was halted by the platform — use 'scion start' to restart it",
+			Message:    "Agent was halted by the platform — use 'scion resume' to restart it",
 			HTTPStatus: http.StatusBadRequest,
 		}
 
@@ -550,13 +568,31 @@ func agentTargetLabel(agent *store.Agent) string {
 	return agent.ID
 }
 
-// validateAgentDeliverable checks that the target agent is in a state that
-// can accept message delivery when wake was NOT requested. Returns nil when
-// the agent is running, or a typed error describing why delivery is not
-// possible.
+// validateAgentDeliverable checks that the target agent can accept message
+// delivery when wake was NOT requested. Shell execution containers are always
+// refused with ErrCodeAgentNotMessageable (ptone/scion#8812 §3.4 S5).
+// Returns nil when the agent is running and messageable, or a typed error.
 func validateAgentDeliverable(agent *store.Agent) *AgentDMError {
+	if isShellAgent(agent) {
+		return shellAgentNotMessageableError(agent)
+	}
+	return validateAgentRunning(agent)
+}
+
+// validateAgentRunning checks only whether the target agent is in a running
+// phase (not suspended, stopped, etc.), without applying messageability rules.
+// Used by validateAgentDeliverable and by exec-action preflight (which is
+// allowed to target shell execution containers when authored by a human).
+func validateAgentRunning(agent *store.Agent) *AgentDMError {
+	if agent == nil {
+		return &AgentDMError{
+			Code:       ErrCodeAgentNotRunning,
+			Message:    "agent is not running",
+			HTTPStatus: http.StatusConflict,
+		}
+	}
 	label := agentTargetLabel(agent)
-	if agent != nil && agent.IdleSuspendClaimActive {
+	if agent.IdleSuspendClaimActive {
 		return &AgentDMError{
 			Code:       ErrCodeAgentNotRunning,
 			Message:    fmt.Sprintf("agent %q is suspended; use --wake to resume and deliver", label),
@@ -589,7 +625,7 @@ func validateAgentDeliverable(agent *store.Agent) *AgentDMError {
 	case state.PhaseHalted:
 		return &AgentDMError{
 			Code:       ErrCodeAgentNotRunning,
-			Message:    fmt.Sprintf("agent %q is halted; use 'scion start' to restart it", label),
+			Message:    fmt.Sprintf("agent %q is halted; use 'scion resume' to restart it", label),
 			HTTPStatus: http.StatusConflict,
 		}
 	default:

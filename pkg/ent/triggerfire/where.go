@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"entgo.io/ent/dialect/sql"
+	"entgo.io/ent/dialect/sql/sqlgraph"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/predicate"
 	"github.com/google/uuid"
 )
@@ -145,6 +146,11 @@ func RuleTrace(v string) predicate.TriggerFire {
 	return predicate.TriggerFire(sql.FieldEQ(FieldRuleTrace, v))
 }
 
+// TargetAgentID applies equality check predicate on the "target_agent_id" field. It's identical to TargetAgentIDEQ.
+func TargetAgentID(v uuid.UUID) predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldEQ(FieldTargetAgentID, v))
+}
+
 // ExecutorKind applies equality check predicate on the "executor_kind" field. It's identical to ExecutorKindEQ.
 func ExecutorKind(v string) predicate.TriggerFire {
 	return predicate.TriggerFire(sql.FieldEQ(FieldExecutorKind, v))
@@ -158,6 +164,16 @@ func ExecutorID(v string) predicate.TriggerFire {
 // LeaseUntil applies equality check predicate on the "lease_until" field. It's identical to LeaseUntilEQ.
 func LeaseUntil(v time.Time) predicate.TriggerFire {
 	return predicate.TriggerFire(sql.FieldEQ(FieldLeaseUntil, v))
+}
+
+// NotBefore applies equality check predicate on the "not_before" field. It's identical to NotBeforeEQ.
+func NotBefore(v time.Time) predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldEQ(FieldNotBefore, v))
+}
+
+// DeferredAt applies equality check predicate on the "deferred_at" field. It's identical to DeferredAtEQ.
+func DeferredAt(v time.Time) predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldEQ(FieldDeferredAt, v))
 }
 
 // StartedAt applies equality check predicate on the "started_at" field. It's identical to StartedAtEQ.
@@ -1340,6 +1356,56 @@ func RuleTraceContainsFold(v string) predicate.TriggerFire {
 	return predicate.TriggerFire(sql.FieldContainsFold(FieldRuleTrace, v))
 }
 
+// TargetAgentIDEQ applies the EQ predicate on the "target_agent_id" field.
+func TargetAgentIDEQ(v uuid.UUID) predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldEQ(FieldTargetAgentID, v))
+}
+
+// TargetAgentIDNEQ applies the NEQ predicate on the "target_agent_id" field.
+func TargetAgentIDNEQ(v uuid.UUID) predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldNEQ(FieldTargetAgentID, v))
+}
+
+// TargetAgentIDIn applies the In predicate on the "target_agent_id" field.
+func TargetAgentIDIn(vs ...uuid.UUID) predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldIn(FieldTargetAgentID, vs...))
+}
+
+// TargetAgentIDNotIn applies the NotIn predicate on the "target_agent_id" field.
+func TargetAgentIDNotIn(vs ...uuid.UUID) predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldNotIn(FieldTargetAgentID, vs...))
+}
+
+// TargetAgentIDGT applies the GT predicate on the "target_agent_id" field.
+func TargetAgentIDGT(v uuid.UUID) predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldGT(FieldTargetAgentID, v))
+}
+
+// TargetAgentIDGTE applies the GTE predicate on the "target_agent_id" field.
+func TargetAgentIDGTE(v uuid.UUID) predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldGTE(FieldTargetAgentID, v))
+}
+
+// TargetAgentIDLT applies the LT predicate on the "target_agent_id" field.
+func TargetAgentIDLT(v uuid.UUID) predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldLT(FieldTargetAgentID, v))
+}
+
+// TargetAgentIDLTE applies the LTE predicate on the "target_agent_id" field.
+func TargetAgentIDLTE(v uuid.UUID) predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldLTE(FieldTargetAgentID, v))
+}
+
+// TargetAgentIDIsNil applies the IsNil predicate on the "target_agent_id" field.
+func TargetAgentIDIsNil() predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldIsNull(FieldTargetAgentID))
+}
+
+// TargetAgentIDNotNil applies the NotNil predicate on the "target_agent_id" field.
+func TargetAgentIDNotNil() predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldNotNull(FieldTargetAgentID))
+}
+
 // ExecutorKindEQ applies the EQ predicate on the "executor_kind" field.
 func ExecutorKindEQ(v string) predicate.TriggerFire {
 	return predicate.TriggerFire(sql.FieldEQ(FieldExecutorKind, v))
@@ -1510,6 +1576,106 @@ func LeaseUntilLTE(v time.Time) predicate.TriggerFire {
 	return predicate.TriggerFire(sql.FieldLTE(FieldLeaseUntil, v))
 }
 
+// NotBeforeEQ applies the EQ predicate on the "not_before" field.
+func NotBeforeEQ(v time.Time) predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldEQ(FieldNotBefore, v))
+}
+
+// NotBeforeNEQ applies the NEQ predicate on the "not_before" field.
+func NotBeforeNEQ(v time.Time) predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldNEQ(FieldNotBefore, v))
+}
+
+// NotBeforeIn applies the In predicate on the "not_before" field.
+func NotBeforeIn(vs ...time.Time) predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldIn(FieldNotBefore, vs...))
+}
+
+// NotBeforeNotIn applies the NotIn predicate on the "not_before" field.
+func NotBeforeNotIn(vs ...time.Time) predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldNotIn(FieldNotBefore, vs...))
+}
+
+// NotBeforeGT applies the GT predicate on the "not_before" field.
+func NotBeforeGT(v time.Time) predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldGT(FieldNotBefore, v))
+}
+
+// NotBeforeGTE applies the GTE predicate on the "not_before" field.
+func NotBeforeGTE(v time.Time) predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldGTE(FieldNotBefore, v))
+}
+
+// NotBeforeLT applies the LT predicate on the "not_before" field.
+func NotBeforeLT(v time.Time) predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldLT(FieldNotBefore, v))
+}
+
+// NotBeforeLTE applies the LTE predicate on the "not_before" field.
+func NotBeforeLTE(v time.Time) predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldLTE(FieldNotBefore, v))
+}
+
+// NotBeforeIsNil applies the IsNil predicate on the "not_before" field.
+func NotBeforeIsNil() predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldIsNull(FieldNotBefore))
+}
+
+// NotBeforeNotNil applies the NotNil predicate on the "not_before" field.
+func NotBeforeNotNil() predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldNotNull(FieldNotBefore))
+}
+
+// DeferredAtEQ applies the EQ predicate on the "deferred_at" field.
+func DeferredAtEQ(v time.Time) predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldEQ(FieldDeferredAt, v))
+}
+
+// DeferredAtNEQ applies the NEQ predicate on the "deferred_at" field.
+func DeferredAtNEQ(v time.Time) predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldNEQ(FieldDeferredAt, v))
+}
+
+// DeferredAtIn applies the In predicate on the "deferred_at" field.
+func DeferredAtIn(vs ...time.Time) predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldIn(FieldDeferredAt, vs...))
+}
+
+// DeferredAtNotIn applies the NotIn predicate on the "deferred_at" field.
+func DeferredAtNotIn(vs ...time.Time) predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldNotIn(FieldDeferredAt, vs...))
+}
+
+// DeferredAtGT applies the GT predicate on the "deferred_at" field.
+func DeferredAtGT(v time.Time) predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldGT(FieldDeferredAt, v))
+}
+
+// DeferredAtGTE applies the GTE predicate on the "deferred_at" field.
+func DeferredAtGTE(v time.Time) predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldGTE(FieldDeferredAt, v))
+}
+
+// DeferredAtLT applies the LT predicate on the "deferred_at" field.
+func DeferredAtLT(v time.Time) predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldLT(FieldDeferredAt, v))
+}
+
+// DeferredAtLTE applies the LTE predicate on the "deferred_at" field.
+func DeferredAtLTE(v time.Time) predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldLTE(FieldDeferredAt, v))
+}
+
+// DeferredAtIsNil applies the IsNil predicate on the "deferred_at" field.
+func DeferredAtIsNil() predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldIsNull(FieldDeferredAt))
+}
+
+// DeferredAtNotNil applies the NotNil predicate on the "deferred_at" field.
+func DeferredAtNotNil() predicate.TriggerFire {
+	return predicate.TriggerFire(sql.FieldNotNull(FieldDeferredAt))
+}
+
 // StartedAtEQ applies the EQ predicate on the "started_at" field.
 func StartedAtEQ(v time.Time) predicate.TriggerFire {
 	return predicate.TriggerFire(sql.FieldEQ(FieldStartedAt, v))
@@ -1638,6 +1804,29 @@ func CreatedLT(v time.Time) predicate.TriggerFire {
 // CreatedLTE applies the LTE predicate on the "created" field.
 func CreatedLTE(v time.Time) predicate.TriggerFire {
 	return predicate.TriggerFire(sql.FieldLTE(FieldCreated, v))
+}
+
+// HasExecRun applies the HasEdge predicate on the "exec_run" edge.
+func HasExecRun() predicate.TriggerFire {
+	return predicate.TriggerFire(func(s *sql.Selector) {
+		step := sqlgraph.NewStep(
+			sqlgraph.From(Table, FieldID),
+			sqlgraph.Edge(sqlgraph.O2O, false, ExecRunTable, ExecRunColumn),
+		)
+		sqlgraph.HasNeighbors(s, step)
+	})
+}
+
+// HasExecRunWith applies the HasEdge predicate on the "exec_run" edge with a given conditions (other predicates).
+func HasExecRunWith(preds ...predicate.ScheduledExecRun) predicate.TriggerFire {
+	return predicate.TriggerFire(func(s *sql.Selector) {
+		step := newExecRunStep()
+		sqlgraph.HasNeighborsWith(s, step, func(s *sql.Selector) {
+			for _, p := range preds {
+				p(s)
+			}
+		})
+	})
 }
 
 // And groups predicates with the AND operator between them.

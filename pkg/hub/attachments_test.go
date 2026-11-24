@@ -84,6 +84,68 @@ func TestSanitizeFilename_TruncateLong(t *testing.T) {
 	assert.True(t, strings.HasSuffix(name, ".txt"))
 }
 
+func TestSanitizeFilename_LongNamesPreserveExtensionAndCheckFinalName(t *testing.T) {
+	t.Run("long safe name preserves extension when reduced", func(t *testing.T) {
+		input := strings.Repeat("x", 117) + ".sh_notes.txt"
+		safe, err := SanitizeFilename(input)
+		require.NoError(t, err)
+		reduced := reduceAttachmentName(safe)
+		assert.Equal(t, strings.Repeat("x", 116)+".txt", reduced)
+	})
+
+	t.Run("over-255 safe name preserves extension through sanitize and reduce", func(t *testing.T) {
+		input := strings.Repeat("x", 252) + ".sh_notes.txt"
+		safe, err := SanitizeFilename(input)
+		require.NoError(t, err)
+		assert.LessOrEqual(t, len(safe), MaxFilenameLength)
+		assert.True(t, strings.HasSuffix(safe, ".txt"))
+		assert.True(t, strings.HasSuffix(reduceAttachmentName(safe), ".txt"))
+	})
+
+	t.Run("overlong extension is capped at MaxFilenameLength", func(t *testing.T) {
+		input := "report." + strings.Repeat("b", MaxFilenameLength+50)
+		safe, err := SanitizeFilename(input)
+		require.NoError(t, err)
+		assert.Equal(t, MaxFilenameLength, len(safe))
+	})
+
+	t.Run("truncation or reduction exposing refused extension is rejected", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			input   string
+			wantExt string
+		}{
+			{
+				name:    "stored-name truncation exposes .sh before trailing dot",
+				input:   strings.Repeat("y", 251) + ".sh" + "zzzz" + ".",
+				wantExt: ".sh",
+			},
+			{
+				name:    "overlong extension falls back onto .sh",
+				input:   strings.Repeat("x", 117) + ".sh." + strings.Repeat("b", 125),
+				wantExt: ".sh",
+			},
+			{
+				name:    "overlong extension falls back onto .html",
+				input:   strings.Repeat("x", 115) + ".html." + strings.Repeat("b", 125),
+				wantExt: ".html",
+			},
+			{
+				name:    "leading dot prefix shifts fallback onto .sh",
+				input:   "." + strings.Repeat("x", 105) + ".sh." + strings.Repeat("b", 125),
+				wantExt: ".sh",
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				_, err := SanitizeFilename(tc.input)
+				require.Error(t, err, "SanitizeFilename(%q) was accepted", tc.input)
+				assert.Equal(t, "files with a "+tc.wantExt+" extension are not accepted", err.Error())
+			})
+		}
+	})
+}
+
 // ---------------------------------------------------------------------------
 // attachmentExt / blocklist normalisation tests
 // ---------------------------------------------------------------------------
@@ -137,6 +199,104 @@ func TestSanitizeFilename_TrailingCharactersDoNotDefeatTheBlocklist(t *testing.T
 	}
 }
 
+func TestAttachmentExt_StripsStreamSuffixes(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"a.lnk::$DATA", ".lnk"},
+		{"a.lnk:stream", ".lnk"},
+		{"a.lnk:Zone.Identifier", ".lnk"},
+		{"a.lnk:stream.txt", ".lnk"},
+		{"a.LNK::$DATA", ".lnk"},
+		{"a.lnk. :$DATA", ".lnk"},
+		{"a.lnk..:stream", ".lnk"},
+		{"a.sh\u200b:$DATA", ".sh"},
+		{"a.s\u200bh::$DATA", ".sh"},
+		{"a.exe:stream::$DATA", ".exe"},
+		{"notes.txt:stream", ".txt"},
+		{"notes.txt", ".txt"},
+	}
+	for _, tt := range tests {
+		assert.Equal(t, tt.want, attachmentExt(tt.input), "attachmentExt(%q)", tt.input)
+	}
+}
+
+func TestSanitizeFilename_StreamSuffixesDoNotDefeatTheBlocklist(t *testing.T) {
+	blocked := []struct {
+		input   string
+		wantExt string
+	}{
+		// NTFS alternate data stream spellings across blocked extensions.
+		{"shortcut.lnk::$DATA", ".lnk"},
+		{"shortcut.lnk:stream", ".lnk"},
+		{"shortcut.lnk:Zone.Identifier", ".lnk"},
+		{"shortcut.lnk:benign.txt", ".lnk"},
+		{"SHORTCUT.LNK::$DATA", ".lnk"},
+		{"shortcut.lnk. :$DATA", ".lnk"},
+		{"shortcut.lnk..:stream", ".lnk"},
+		{"payload.exe::$DATA", ".exe"},
+		{"PAYLOAD.EXE:stream", ".exe"},
+		{"payload.exe. :stream.txt", ".exe"},
+		{"run.bat::$DATA", ".bat"},
+		{"run.b\u200bat::$DATA", ".bat"},
+		{"deploy.sh:stream", ".sh"},
+		{"deploy.sh .:$DATA", ".sh"},
+		{"script.ps1::$DATA", ".ps1"},
+		{"app.js:stream.txt", ".js"},
+		{"page.html::$DATA", ".html"},
+		{"diagram.svg:stream", ".svg"},
+		// Colon in the stem before a blocked extension (POSIX filename).
+		{"log:12.sh", ".sh"},
+		{":evil.exe", ".exe"},
+		{"2026-11-21T14:58:10.html", ".html"},
+	}
+	for _, tc := range blocked {
+		wantErr := "files with a " + tc.wantExt + " extension are not accepted"
+
+		_, err := SanitizeFilename(tc.input)
+		require.Error(t, err, "SanitizeFilename(%q) was accepted", tc.input)
+		assert.Equal(t, wantErr, err.Error(), "SanitizeFilename(%q)", tc.input)
+
+		_, err = ClassifyAttachment(tc.input, []byte("plain text content\n"))
+		require.Error(t, err, "ClassifyAttachment(%q) was accepted", tc.input)
+		assert.Equal(t, wantErr, err.Error(), "ClassifyAttachment(%q)", tc.input)
+	}
+
+	// Normal filenames and harmless colon-bearing names remain accepted.
+	allowed := []string{
+		"notes.txt",
+		"archive.tar.gz",
+		"notes.lnk.txt",
+		"2026-11-21T14:58:10.txt",
+		"report:2026.log",
+		"notes.txt:stream",
+	}
+	for _, name := range allowed {
+		got, err := SanitizeFilename(name)
+		require.NoError(t, err, "SanitizeFilename(%q)", name)
+		assert.Equal(t, name, got)
+
+		_, err = ClassifyAttachment(name, []byte("plain text content\n"))
+		require.NoError(t, err, "ClassifyAttachment(%q)", name)
+	}
+
+	// POSIX filenames with a colon in the stem retain their text-like
+	// classification rather than losing their extension to stream stripping.
+	gotMime, err := ClassifyAttachment("notes:v2.md", []byte("# Heading\n"))
+	require.NoError(t, err)
+	assert.Equal(t, "text/markdown", gotMime)
+
+	gotMime, err = ClassifyAttachment("data:1.json", []byte(`{"ok":true}`))
+	require.NoError(t, err)
+	assert.Equal(t, "text/plain", gotMime)
+
+	png := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0, 0, 0, 0}
+	_, err = ClassifyAttachment("data:1.json", png)
+	require.Error(t, err, "binary payload under data:1.json should still be refused as non-text")
+	assert.Contains(t, err.Error(), ".json content does not look like text")
+}
+
 // The blocklist should have no hole immediately beside an entry it already
 // carries: the same code, the same interpreter, a different suffix.
 func TestSanitizeFilename_RejectsPeersOfBlockedExtensions(t *testing.T) {
@@ -151,6 +311,87 @@ func TestSanitizeFilename_RejectsPeersOfBlockedExtensions(t *testing.T) {
 	for _, f := range peers {
 		_, err := SanitizeFilename(f)
 		require.Error(t, err, "SanitizeFilename(%q) was accepted", f)
+	}
+}
+
+// Windows shell-integration files trigger system actions (shortcut resolution,
+// registry merge, setup/console execution, Explorer search/library handlers) on
+// open rather than acting as passive documents. Pin the full class across
+// case variants, double extensions, and trailing-character normalisation.
+func TestSanitizeFilename_RejectsWindowsShellIntegrationExtensions(t *testing.T) {
+	cases := []struct {
+		name    string
+		wantExt string
+	}{
+		// Base extensions (existing and newly added).
+		{"shortcut.lnk", ".lnk"},
+		{"bookmark.url", ".url"},
+		{"pinned.website", ".website"},
+		{"desktop.scf", ".scf"},
+		{"merge.reg", ".reg"},
+		{"setup.inf", ".inf"},
+		{"applet.cpl", ".cpl"},
+		{"console.msc", ".msc"},
+		{"prefs.settingcontent-ms", ".settingcontent-ms"},
+		{"docs.library-ms", ".library-ms"},
+		{"connector.searchconnector-ms", ".searchconnector-ms"},
+		{"saved.search-ms", ".search-ms"},
+		{"clickonce.application", ".application"},
+		{"clickonce.appref-ms", ".appref-ms"},
+		{"desktop.theme", ".theme"},
+		{"winter.themepack", ".themepack"},
+		{"corporate.desktopthemepackfile", ".desktopthemepackfile"},
+		{"network.diagcab", ".diagcab"},
+		// Case-insensitivity.
+		{"SHORTCUT.LNK", ".lnk"},
+		{"Setup.INF", ".inf"},
+		{"Console.MSC", ".msc"},
+		{"Docs.Library-MS", ".library-ms"},
+		{"Query.searchConnector-ms", ".searchconnector-ms"},
+		{"Saved.SEARCH-MS", ".search-ms"},
+		{"Pinned.Website", ".website"},
+		{"Desktop.THEME", ".theme"},
+		{"Winter.ThemePack", ".themepack"},
+		{"Corp.DesktopThemePackFile", ".desktopthemepackfile"},
+		{"Network.DIAGCAB", ".diagcab"},
+		// Double extensions.
+		{"report.pdf.lnk", ".lnk"},
+		{"invoice.docx.url", ".url"},
+		{"setup.txt.inf", ".inf"},
+		{"admin.log.msc", ".msc"},
+		{"archive.zip.library-ms", ".library-ms"},
+		{"results.pdf.searchConnector-ms", ".searchconnector-ms"},
+		{"notes.md.scf", ".scf"},
+		{"export.csv.reg", ".reg"},
+		{"photo.jpg.theme", ".theme"},
+		{"logs.txt.diagcab", ".diagcab"},
+		// Trailing/invisible normalisation.
+		{"setup.inf ", ".inf"},
+		{"console.msc.", ".msc"},
+		{"docs.library-ms\u200b", ".library-ms"},
+		{"desktop.theme ", ".theme"},
+		{"network.diagcab.", ".diagcab"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := SanitizeFilename(tc.name)
+			require.Error(t, err, "SanitizeFilename(%q) was accepted", tc.name)
+			assert.Equal(t, "files with a "+tc.wantExt+" extension are not accepted", err.Error(), "for %q", tc.name)
+
+			_, err = ClassifyAttachment(tc.name, []byte("plain text content\n"))
+			require.Error(t, err, "ClassifyAttachment(%q) was accepted", tc.name)
+			assert.Equal(t, "files with a "+tc.wantExt+" extension are not accepted", err.Error(), "for %q", tc.name)
+		})
+	}
+
+	// Only the effective final extension is blocked; benign files that happen
+	// to contain a blocked token earlier in the name remain accepted.
+	for _, allowed := range []string{"notes.lnk.txt", "readme.inf.md", "audit.msc.log", "colors.theme.json"} {
+		t.Run(allowed, func(t *testing.T) {
+			name, err := SanitizeFilename(allowed)
+			require.NoError(t, err, "SanitizeFilename(%q) should be accepted", allowed)
+			assert.Equal(t, allowed, name)
+		})
 	}
 }
 

@@ -446,12 +446,14 @@ func (s *Server) finishPendingRun(ctx context.Context, p PendingUpdate, status, 
 		line = fmt.Sprintf("\n==> Hub restarted on %s at %s: update verified.\n", running, now.UTC().Format(time.RFC3339))
 	} else if status == LastUpdateRolledBack {
 		run.Status = store.MaintenanceStatusFailed
+		result["aborted"] = true
 		result["error"] = fmt.Sprintf("%q failed to start; the boot-failure guard rolled back and the hub restarted on %q",
 			p.To, displayRunningVersion(running))
 		line = fmt.Sprintf("\n==> %s failed to start; the boot-failure guard rolled back. Hub restarted on %s at %s.\n",
 			p.To, displayRunningVersion(running), now.UTC().Format(time.RFC3339))
 	} else {
 		run.Status = store.MaintenanceStatusFailed
+		result["aborted"] = true
 		result["error"] = fmt.Sprintf("the hub restarted on %q, not the installed %q", displayRunningVersion(running), p.To)
 		line = fmt.Sprintf("\n==> Hub restarted on %s at %s, expected %s: update failed.\n",
 			displayRunningVersion(running), now.UTC().Format(time.RFC3339), p.To)
@@ -494,9 +496,13 @@ func (s *Server) failStaleRestartingRuns(ctx context.Context) error {
 		now := time.Now()
 		run.Status = store.MaintenanceStatusFailed
 		run.CompletedAt = &now
-		resultJSON, _ := json.Marshal(map[string]string{
-			"error": "the hub restarted without a pending update record for this run; the update could not be verified",
-		})
+		result := map[string]any{}
+		if run.Result != "" {
+			_ = json.Unmarshal([]byte(run.Result), &result)
+		}
+		result["aborted"] = true
+		result["error"] = "the hub restarted without a pending update record for this run; the update could not be verified"
+		resultJSON, _ := json.Marshal(result)
 		run.Result = string(resultJSON)
 		if err := s.store.UpdateMaintenanceRun(ctx, run); err != nil {
 			return fmt.Errorf("fail stale restarting run %s: %w", run.ID, err)
@@ -521,6 +527,7 @@ type updateStatusResponse struct {
 	Pin           string                      `json:"pin"`
 	Installer     maintenance.InstallerStatus `json:"installer"`
 	UpdatePolicy  string                      `json:"updatePolicy"`
+	AutoUpdate    updateStatusAutoUpdate      `json:"autoUpdate"`
 	Downgrade     updateStatusDowngrade       `json:"downgrade"`
 	PendingUpdate *PendingUpdate              `json:"pendingUpdate"`
 	LastUpdate    *LastUpdate                 `json:"lastUpdate"`
@@ -575,6 +582,10 @@ func (s *Server) buildUpdateStatus(ctx context.Context, cur runningBuild) (*upda
 	if err != nil {
 		return nil, err
 	}
+	autoUpdateSetting, _, err := s.readAutoUpdateSetting(ctx)
+	if err != nil {
+		return nil, err
+	}
 	channel, source := effectiveReleaseChannel(mc, cur.Version, sel)
 	isGit := !update.IsReleaseTag(cur.Version)
 	displayVersion := cur.Version
@@ -587,6 +598,10 @@ func (s *Server) buildUpdateStatus(ctx context.Context, cur runningBuild) (*upda
 		}
 	}
 
+	modeEff := effectiveUpdateMode(mc, sel)
+	pinEff := effectivePin(sel)
+	instStatus := redactInstallerStatus(s.updateInstaller().Status(), mc.RepoPath)
+
 	resp := &updateStatusResponse{
 		Current: updateStatusCurrent{
 			Version:    displayVersion,
@@ -596,7 +611,7 @@ func (s *Server) buildUpdateStatus(ctx context.Context, cur runningBuild) (*upda
 			IsGitBuild: isGit,
 		},
 		Mode: updateStatusMode{
-			Effective:      effectiveUpdateMode(mc, sel),
+			Effective:      modeEff,
 			RepoConfigured: mc.RepoPath != "",
 			RepoBranch:     mc.RepoBranch,
 		},
@@ -605,9 +620,18 @@ func (s *Server) buildUpdateStatus(ctx context.Context, cur runningBuild) (*upda
 			Configured: mc.ReleaseChannel,
 			Source:     source,
 		},
-		Pin:          effectivePin(sel),
-		Installer:    redactInstallerStatus(s.updateInstaller().Status(), mc.RepoPath),
+		Pin:          pinEff,
+		Installer:    instStatus,
 		UpdatePolicy: mc.UpdatePolicy,
+		AutoUpdate: buildAutoUpdateStatus(
+			mc,
+			autoUpdateSetting,
+			modeEff,
+			channel,
+			pinEff,
+			instStatus.Supported,
+			s.maintenance != nil && s.maintenance.IsEnabled(),
+		),
 		Downgrade: updateStatusDowngrade{
 			Floor:              downgradeFloor,
 			SnapshotsSupported: s.updateSnapshotter(ctx).SnapshotStatus().Supported,

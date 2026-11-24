@@ -36,6 +36,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/envpolicy"
 	"github.com/GoogleCloudPlatform/scion/pkg/k8s"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectfs"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectkeys"
@@ -149,6 +150,37 @@ type KubernetesRuntime struct {
 // do not cause the API server to reject the exec request with an
 // "a container name must be specified" error.
 const agentContainerName = "agent"
+
+// k8sMetadataModeLabel is the pod label recording the resolved metadata mode
+// on Kubernetes ("block" or "passthrough", where "passthrough" includes
+// Workload Identity assign pods because the Runtime Broker rewrites assign to
+// passthrough before emitting SCION_METADATA_MODE). Cluster NetworkPolicy
+// objects can select on scion.metadata-mode=block without affecting
+// passthrough or assign pods.
+const k8sMetadataModeLabel = "scion.metadata-mode"
+
+// k8sMetadataModeLabelValue returns the canonical Kubernetes metadata mode for
+// the pod label ("block" or "passthrough"), or "" when none is configured.
+// KubernetesBlockIdentity takes precedence over env entries, and only those
+// canonical mode names are accepted so arbitrary values never become
+// Kubernetes label values.
+func k8sMetadataModeLabelValue(config RunConfig) string {
+	if config.KubernetesBlockIdentity {
+		return "block"
+	}
+	var mode string
+	for _, e := range config.Env {
+		if k, v, ok := strings.Cut(e, "="); ok && k == "SCION_METADATA_MODE" {
+			mode = v
+		}
+	}
+	switch mode {
+	case "block", "passthrough":
+		return mode
+	default:
+		return ""
+	}
+}
 
 var serviceAccountNamespacePath = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
 
@@ -2041,8 +2073,9 @@ func storageClassMismatch(pvc *corev1.PersistentVolumeClaim, requested string) (
 // RWX PVCs. It creates a PVC with a deterministic name if one does not already
 // exist. Used by both shared-dir and (future) workspace claim paths.
 //
-// An existing claim is reused as it is, with no policy needed, unless it is
-// labelled for a different project, which refuses the start. An existing
+// An existing claim (including one created concurrently by another agent start
+// between Get and Create) is reused as it is, with no policy needed, unless it
+// is labelled for a different project, which refuses the start. An existing
 // claim without a project ID label (one made by hand) is reused with a
 // warning. A claim that does not exist is created only when policy allows
 // it (sharedDirClaimPolicy.createSpec); otherwise the start is refused with
@@ -2058,18 +2091,7 @@ func (r *KubernetesRuntime) ensureProjectRWXClaim(
 	// Check if PVC already exists (project-scoped, may have been created by another agent)
 	existing, err := r.Client.Clientset.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, pvcName, metav1.GetOptions{})
 	if err == nil {
-		claimProjectID := projectkeys.ProjectIDFromLabels(existing.Labels)
-		switch {
-		case claimProjectID == "":
-			runtimeLog().Warn("Reusing shared-dir claim without a project ID label; it is used as is",
-				"pvc", pvcName, "namespace", namespace, "dir", dirName, "project_id", projectID)
-		case projectID != "" && claimProjectID != projectID:
-			return sharedDirClaimOtherProjectError(dirName, namespace, pvcName, claimProjectID, projectID)
-		default:
-			runtimeLog().Info("Project RWX PVC already exists, reusing", "pvc", pvcName, "dir", dirName)
-		}
-		warnOnStorageClassMismatch(existing, policy.Class)
-		return nil
+		return reuseProjectRWXClaim(existing, namespace, pvcName, projectID, dirName, policy)
 	}
 	if !k8serrors.IsNotFound(err) {
 		return fmt.Errorf("checking shared-dir claim %s/%s: %w", namespace, pvcName, err)
@@ -2111,9 +2133,35 @@ func (r *KubernetesRuntime) ensureProjectRWXClaim(
 
 	runtimeLog().Info("Creating project RWX PVC", "pvc", pvcName, "dir", dirName, "storage", storageQuantity.String())
 	if _, err := r.Client.Clientset.CoreV1().PersistentVolumeClaims(namespace).Create(ctx, pvc, metav1.CreateOptions{}); err != nil {
+		if k8serrors.IsAlreadyExists(err) {
+			existing, getErr := r.Client.Clientset.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, pvcName, metav1.GetOptions{})
+			if getErr != nil {
+				return fmt.Errorf("reading concurrently created shared-dir claim %s/%s: %w", namespace, pvcName, getErr)
+			}
+			return reuseProjectRWXClaim(existing, namespace, pvcName, projectID, dirName, policy)
+		}
 		return fmt.Errorf("failed to create project RWX PVC %q: %w", pvcName, err)
 	}
 
+	return nil
+}
+
+func reuseProjectRWXClaim(
+	existing *corev1.PersistentVolumeClaim,
+	namespace, pvcName, projectID, dirName string,
+	policy sharedDirClaimPolicy,
+) error {
+	claimProjectID := projectkeys.ProjectIDFromLabels(existing.Labels)
+	switch {
+	case claimProjectID == "":
+		runtimeLog().Warn("Reusing shared-dir claim without a project ID label; it is used as is",
+			"pvc", pvcName, "namespace", namespace, "dir", dirName, "project_id", projectID)
+	case projectID != "" && claimProjectID != projectID:
+		return sharedDirClaimOtherProjectError(dirName, namespace, pvcName, claimProjectID, projectID)
+	default:
+		runtimeLog().Info("Project RWX PVC already exists, reusing", "pvc", pvcName, "dir", dirName)
+	}
+	warnOnStorageClassMismatch(existing, policy.Class)
 	return nil
 }
 
@@ -2176,7 +2224,7 @@ func (r *KubernetesRuntime) buildPod(namespace string, config RunConfig) (*corev
 	// tmuxAgentWindowCmd for rationale). `sciontool init` reads this to
 	// report crashes accurately. K8s provides PID 1 a TTY, so attach like
 	// Docker/Podman (see buildCommonRunArgs).
-	agentWindowCmd := tmuxAgentWindowCmd("sh", cmdLine)
+	agentWindowCmd := tmuxAgentWindowCmdForConfig("sh", cmdLine, config)
 	tmuxCmd := buildTmuxStartCmd(agentWindowCmd, tmuxAttachSession)
 	// --- K8s Startup Gate ---
 	//
@@ -2213,23 +2261,27 @@ func (r *KubernetesRuntime) buildPod(namespace string, config RunConfig) (*corev
 	// the env-type secrets. The runtime keys set further down win over all
 	// of them, and the template fallback fills only names none of them set.
 	var envVars []corev1.EnvVar
+	withheld := newHookWithheldTracker(config)
+	appendEnv := func(ev corev1.EnvVar, isWithheld bool) {
+		envVars = append(envVars, ev)
+		withheld.Record(ev.Name, isWithheld)
+	}
 
 	// Resolved auth env is the lowest source (resolvedAuthEnvEntries: sorted,
 	// an empty value skipped).
 	for _, e := range resolvedAuthEnvEntries(config.ResolvedAuth, nil) {
 		k, v, _ := strings.Cut(e, "=")
-		envVars = append(envVars, corev1.EnvVar{Name: k, Value: v})
+		appendEnv(corev1.EnvVar{Name: k, Value: v}, false)
 	}
 
 	// The real startup command, consumed by the gate script above.
-	envVars = append(envVars, corev1.EnvVar{Name: k8sStartCmdEnv, Value: tmuxCmd})
+	appendEnv(corev1.EnvVar{Name: k8sStartCmdEnv, Value: tmuxCmd}, false)
 
 	// Harness env (system prompt, agent name, etc.) with the Docker rules
-	// (harnessEnvEntries): GetTelemetryEnv wins over GetEnv when telemetry
-	// is enabled, and an empty value is skipped.
-	for _, e := range harnessEnvEntries(config, config.HomeDir) {
-		k, v, _ := strings.Cut(e, "=")
-		envVars = append(envVars, corev1.EnvVar{Name: k, Value: v})
+	// (harnessEnvEntriesWithSource): GetTelemetryEnv wins over GetEnv when
+	// telemetry is enabled, and an empty value is skipped.
+	for _, e := range harnessEnvEntriesWithSource(config, config.HomeDir) {
+		appendEnv(corev1.EnvVar{Name: e.Key, Value: e.Value}, e.FromTemplate)
 	}
 
 	for _, e := range config.Env {
@@ -2240,7 +2292,7 @@ func (r *KubernetesRuntime) buildPod(namespace string, config RunConfig) (*corev
 			if name == k8sStartCmdEnv {
 				continue
 			}
-			envVars = append(envVars, corev1.EnvVar{Name: name, Value: value})
+			appendEnv(corev1.EnvVar{Name: name, Value: value}, withheld.IsConfigHC(name))
 		}
 	}
 
@@ -2339,7 +2391,7 @@ func (r *KubernetesRuntime) buildPod(namespace string, config RunConfig) (*corev
 					if _, collides := envVarNames[s.Target]; collides || reservedAgentEnvName(s.Target) {
 						continue
 					}
-					envVars = append(envVars, corev1.EnvVar{
+					appendEnv(corev1.EnvVar{
 						Name: s.Target,
 						ValueFrom: &corev1.EnvVarSource{
 							SecretKeyRef: &corev1.SecretKeySelector{
@@ -2347,7 +2399,7 @@ func (r *KubernetesRuntime) buildPod(namespace string, config RunConfig) (*corev
 								Key:                  s.Name,
 							},
 						},
-					})
+					}, false)
 					envVarNames[s.Target] = struct{}{}
 					if s.Target == provision.GitTokenEnv {
 						gitTokenRef = &corev1.SecretKeySelector{
@@ -2366,7 +2418,7 @@ func (r *KubernetesRuntime) buildPod(namespace string, config RunConfig) (*corev
 					if _, collides := envVarNames[s.Target]; collides || reservedAgentEnvName(s.Target) {
 						continue
 					}
-					envVars = append(envVars, corev1.EnvVar{
+					appendEnv(corev1.EnvVar{
 						Name: s.Target,
 						ValueFrom: &corev1.EnvVarSource{
 							SecretKeyRef: &corev1.SecretKeySelector{
@@ -2374,7 +2426,7 @@ func (r *KubernetesRuntime) buildPod(namespace string, config RunConfig) (*corev
 								Key:                  s.Name,
 							},
 						},
-					})
+					}, false)
 					envVarNames[s.Target] = struct{}{}
 					if s.Target == provision.GitTokenEnv {
 						gitTokenRef = &corev1.SecretKeySelector{
@@ -2433,7 +2485,7 @@ func (r *KubernetesRuntime) buildPod(namespace string, config RunConfig) (*corev
 		if staged := r.k8sStagedPathFor(config, telemetryGCPCredentialsSecretName); nfsHome && staged != "" {
 			credPath = staged
 		}
-		envVars = append(envVars, corev1.EnvVar{Name: telemetryGCPCredentialsEnvVar, Value: credPath})
+		appendEnv(corev1.EnvVar{Name: telemetryGCPCredentialsEnvVar, Value: credPath}, false)
 	}
 
 	// NFS-home pods: the memory-backed directory and the env vars that
@@ -2446,17 +2498,17 @@ func (r *KubernetesRuntime) buildPod(namespace string, config RunConfig) (*corev
 		if err != nil {
 			return nil, err
 		}
-		envVars = append(envVars, nfsEnv...)
+		for _, ev := range nfsEnv {
+			appendEnv(ev, false)
+		}
 	}
 
 	// Pass host user UID/GID for container user synchronization
-	envVars = append(envVars, corev1.EnvVar{Name: "SCION_HOST_UID", Value: fmt.Sprintf("%d", os.Getuid())})
-	envVars = append(envVars, corev1.EnvVar{Name: "SCION_HOST_GID", Value: fmt.Sprintf("%d", os.Getgid())})
-	envVars = append(envVars,
-		corev1.EnvVar{Name: "HOME", Value: containerHome},
-		corev1.EnvVar{Name: "USER", Value: config.UnixUsername},
-		corev1.EnvVar{Name: "LOGNAME", Value: config.UnixUsername},
-	)
+	appendEnv(corev1.EnvVar{Name: "SCION_HOST_UID", Value: fmt.Sprintf("%d", os.Getuid())}, false)
+	appendEnv(corev1.EnvVar{Name: "SCION_HOST_GID", Value: fmt.Sprintf("%d", os.Getgid())}, false)
+	appendEnv(corev1.EnvVar{Name: "HOME", Value: containerHome}, false)
+	appendEnv(corev1.EnvVar{Name: "USER", Value: config.UnixUsername}, false)
+	appendEnv(corev1.EnvVar{Name: "LOGNAME", Value: config.UnixUsername}, false)
 
 	// Worktree-per-agent on NFS: the agent works in its own worktree at
 	// /repo-root/worktrees/<agent name>, not at /workspace. Point sciontool
@@ -2465,7 +2517,7 @@ func (r *KubernetesRuntime) buildPod(namespace string, config RunConfig) (*corev
 	// own directory. Appended last so it wins over any earlier value.
 	nfsWorktree := config.NFSWorktreeName != "" && nfsInitContainerInjected(config)
 	if nfsWorktree {
-		envVars = append(envVars, corev1.EnvVar{Name: "SCION_WORKSPACE_PATH", Value: NFSWorktreeContainerPath(config.NFSWorktreeName)})
+		appendEnv(corev1.EnvVar{Name: "SCION_WORKSPACE_PATH", Value: NFSWorktreeContainerPath(config.NFSWorktreeName)}, false)
 	}
 
 	// Resolve the container's resource requests/limits from the resolved
@@ -2525,6 +2577,7 @@ func (r *KubernetesRuntime) buildPod(namespace string, config RunConfig) (*corev
 	// as the agent user via runAsUser, so sciontool does no privilege drop
 	// here; the variable only drives the umask.
 	envVars = withSupplementalGIDsEnv(envVars, sharedDirGroups(config))
+	withheld.Record(SupplementalGIDsEnvVar, false)
 
 	// The template env fallback (ptone/scion#4524) is the last env step that
 	// adds entries: only names no source above set (plain or secret-backed),
@@ -2533,6 +2586,12 @@ func (r *KubernetesRuntime) buildPod(namespace string, config RunConfig) (*corev
 	// A reserved name never reaches the container, whatever its source: the
 	// drop runs after every step that adds entries.
 	envVars = slices.DeleteFunc(envVars, func(ev corev1.EnvVar) bool { return reservedAgentEnvName(ev.Name) })
+	withheld.DeleteReserved()
+	// Emit the runtime-owned hook-withheld marker last, derived directly from
+	// the winning provenance of the entries emitted above.
+	if marker := withheld.Marker(); marker != "" {
+		envVars = append(envVars, corev1.EnvVar{Name: envpolicy.HookWithheldEnvVar, Value: marker})
+	}
 
 	// Determine image pull policy
 	pullPolicy := corev1.PullIfNotPresent
@@ -2707,11 +2766,20 @@ func (r *KubernetesRuntime) buildPod(namespace string, config RunConfig) (*corev
 		agentVolumeMounts = append(agentVolumeMounts, homeParts.mount)
 	}
 
+	podLabels := maps.Clone(config.Labels)
+	delete(podLabels, k8sMetadataModeLabel)
+	if mode := k8sMetadataModeLabelValue(config); mode != "" {
+		if podLabels == nil {
+			podLabels = make(map[string]string, 1)
+		}
+		podLabels[k8sMetadataModeLabel] = mode
+	}
+
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        config.Name,
 			Namespace:   namespace,
-			Labels:      config.Labels,
+			Labels:      podLabels,
 			Annotations: withScionAnnotation(withScionAnnotation(config.Annotations, k8sHomeStorageAnnotation, HomeStorageNFS, nfsHome), k8sWorkspaceAgentsAnnotation, "true", agentsExcluded),
 		},
 		Spec: corev1.PodSpec{
@@ -4257,7 +4325,7 @@ func (r *KubernetesRuntime) Attach(ctx context.Context, id string) error {
 
 	// For Kubernetes, we want to ensure it is in Running phase
 	if agent.Phase != string(state.PhaseRunning) {
-		return fmt.Errorf("agent '%s' is not running (status: %s), use 'scion start %s' to resume it", id, agent.ContainerStatus, id)
+		return fmt.Errorf("agent '%s' is not running (status: %s), use 'scion resume %s' to resume it", id, agent.ContainerStatus, id)
 	}
 
 	fmt.Printf("Attaching to pod '%s' (use Ctrl-b d to detach)...\n", podName)

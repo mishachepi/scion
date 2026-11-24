@@ -25,6 +25,7 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"sync"
@@ -34,6 +35,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/experiments"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/hubfire"
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/trigger"
 	"github.com/GoogleCloudPlatform/scion/pkg/labels"
 	"github.com/GoogleCloudPlatform/scion/pkg/secret"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
@@ -630,6 +632,7 @@ func TestHeadlessCreate_LabelsAndDataChannels(t *testing.T) {
 	require.NoError(t, err)
 
 	baseHC := func(name string) HeadlessCreate {
+		rr := headlessResolvedRole{preCapRole: AgentRoleFull}
 		return HeadlessCreate{
 			ProjectID:      f.proj.ID,
 			Authority:      auth,
@@ -637,6 +640,7 @@ func TestHeadlessCreate_LabelsAndDataChannels(t *testing.T) {
 			EdgeCeiling:    edgeCeiling,
 			EdgeProvenance: edgeProv,
 			AgentRole:      "",
+			resolvedRole:   &rr,
 			Name:           name,
 			GitHubToken:    "",
 			Detached:       true,
@@ -650,8 +654,9 @@ func TestHeadlessCreate_LabelsAndDataChannels(t *testing.T) {
 			"env":               "staging",
 		}
 		hc.EventEnv = map[string]string{
-			EventEnvKeyTriggerEventID: "tevt-123",
-			EventEnvKeyTriggerID:      "trig-456",
+			EventEnvKeyTriggerEventID:   "tevt-123",
+			EventEnvKeyTriggerID:        "trig-456",
+			EventEnvKeyTriggerEventFile: HeadlessEventFileContainerPath,
 		}
 		agent, err := f.srv.createAgentHeadless(ctx, hc)
 		require.NoError(t, err)
@@ -661,12 +666,47 @@ func TestHeadlessCreate_LabelsAndDataChannels(t *testing.T) {
 		assert.Equal(t, hc.Labels, stored.Labels)
 		assert.Equal(t, "tevt-123", stored.AppliedConfig.Env[EventEnvKeyTriggerEventID])
 		assert.Equal(t, "trig-456", stored.AppliedConfig.Env[EventEnvKeyTriggerID])
+		assert.Equal(t, HeadlessEventFileContainerPath, stored.AppliedConfig.Env[EventEnvKeyTriggerEventFile])
 
 		req := client.lastCreateReq
 		assert.Equal(t, "tevt-123", req.ResolvedEnv[EventEnvKeyTriggerEventID])
 		assert.Equal(t, "trig-456", req.ResolvedEnv[EventEnvKeyTriggerID])
+		assert.Equal(t, HeadlessEventFileContainerPath, req.ResolvedEnv[EventEnvKeyTriggerEventFile])
 		assert.NotContains(t, resolvedSecretMap(req.ResolvedSecrets), EventEnvKeyTriggerEventID)
 		assert.NotContains(t, resolvedSecretMap(req.ResolvedSecrets), EventEnvKeyTriggerID)
+		assert.NotContains(t, resolvedSecretMap(req.ResolvedSecrets), EventEnvKeyTriggerEventFile)
+	})
+
+	t.Run("nil_resolved_role_fails_closed", func(t *testing.T) {
+		hc := baseHC("nil-resolved-role")
+		hc.resolvedRole = nil
+		agent, err := f.srv.createAgentHeadless(ctx, hc)
+		require.ErrorIs(t, err, errHeadlessMissingResolvedRole)
+		assert.Nil(t, agent)
+		f.assertNoChild(t, hc.Name)
+	})
+
+	t.Run("no_dispatcher_with_event_file_fails_and_rolls_back", func(t *testing.T) {
+		broker, err := f.store.GetRuntimeBroker(ctx, f.broker.ID)
+		require.NoError(t, err)
+		prevCaps := broker.Capabilities
+		broker.Capabilities = &store.BrokerCapabilities{HomeFiles: true}
+		require.NoError(t, f.store.UpdateRuntimeBroker(ctx, broker))
+		t.Cleanup(func() {
+			broker.Capabilities = prevCaps
+			_ = f.store.UpdateRuntimeBroker(ctx, broker)
+		})
+
+		prevDispatcher := f.srv.GetDispatcher()
+		f.srv.SetDispatcher(nil)
+		t.Cleanup(func() { f.srv.SetDispatcher(prevDispatcher) })
+
+		hc := baseHC("no-disp-homefiles")
+		hc.EventFile = []byte(`{"event_id":"evt-nodisp"}`)
+		agent, err := f.srv.createAgentHeadless(ctx, hc)
+		require.ErrorIs(t, err, errHeadlessNoDispatcherForHomeFiles)
+		assert.Nil(t, agent)
+		f.assertNoChild(t, hc.Name)
 	})
 
 	t.Run("invalid_labels_rejected_before_commit", func(t *testing.T) {
@@ -764,12 +804,24 @@ func TestHeadlessCreate_LabelsAndDataChannels(t *testing.T) {
 		f.assertNoChild(t, hcMissingEnv.Name)
 	})
 
-	t.Run("non_empty_github_token_and_mismatched_edge_provenance_rejected", func(t *testing.T) {
-		hcToken := baseHC("gh-token-unsupported")
-		hcToken.GitHubToken = "installation"
-		_, err := f.srv.createAgentHeadless(ctx, hcToken)
-		require.ErrorIs(t, err, errHeadlessGitHubTokenUnsupported)
-		f.assertNoChild(t, hcToken.Name)
+	t.Run("github_token_preference_and_mismatched_edge_provenance", func(t *testing.T) {
+		hcBadToken := baseHC("gh-token-invalid")
+		hcBadToken.GitHubToken = "magic"
+		_, err := f.srv.createAgentHeadless(ctx, hcBadToken)
+		require.ErrorIs(t, err, errHeadlessInvalidGitHubToken)
+		f.assertNoChild(t, hcBadToken.Name)
+
+		hcInst := baseHC("gh-token-installation")
+		hcInst.GitHubToken = DispatchAgentGitHubTokenInstallation
+		agInst, err := f.srv.createAgentHeadless(ctx, hcInst)
+		require.NoError(t, err)
+		require.NotNil(t, agInst.AppliedConfig)
+		assert.Equal(t, DispatchAgentGitHubTokenInstallation, agInst.AppliedConfig.GitHubTokenPreference)
+		require.NotNil(t, agInst.AppliedConfig.CreateInputs)
+		assert.Equal(t, DispatchAgentGitHubTokenInstallation, agInst.AppliedConfig.CreateInputs.GitHubTokenPreference)
+		audits := agentAudits(t, f.store, mutationTypeAgentDelegation, agInst.ID)
+		require.Len(t, audits, 1)
+		assert.Contains(t, audits[0].AfterSummary, `"github_token_preference":"installation"`)
 
 		hcBadID := baseHC("prov-bad-id")
 		hcBadID.EdgeProvenance.SourcePrincipalID = api.NewUUID()
@@ -1643,6 +1695,7 @@ func TestHeadlessCreate_GetAgentBySlugErrorFailsClosed(t *testing.T) {
 	fault.Arm()
 
 	// 1. Direct createAgentHeadless returns a wrapped error and creates nothing.
+	rr := headlessResolvedRole{preCapRole: AgentRoleFull}
 	agent, err := srv.createAgentHeadless(ctx, HeadlessCreate{
 		ProjectID:      project.ID,
 		Authority:      auth,
@@ -1650,6 +1703,7 @@ func TestHeadlessCreate_GetAgentBySlugErrorFailsClosed(t *testing.T) {
 		CreatorName:    fireCreatorName(auth),
 		EdgeCeiling:    edgeCeiling,
 		EdgeProvenance: edgeProvenance,
+		resolvedRole:   &rr,
 		Name:           targetSlug,
 		Detached:       true,
 	})
@@ -1665,4 +1719,490 @@ func TestHeadlessCreate_GetAgentBySlugErrorFailsClosed(t *testing.T) {
 
 	_, err = s.GetAgentBySlug(ctx, project.ID, targetSlug)
 	assert.ErrorIs(t, err, store.ErrNotFound)
+}
+
+// TestHeadlessCreate_HubDefaultMessageMode verifies that createAgentHeadless
+// applies server.hub.default_message_mode when neither template nor parent sets
+// a message mode, while preserving template precedence and refusing "hub".
+func TestHeadlessCreate_HubDefaultMessageMode(t *testing.T) {
+	cases := []struct {
+		name       string
+		hubDefault string
+		tmplMode   string
+		wantMode   string
+	}{
+		{name: "unset hub default: project", wantMode: store.MessageModeProject},
+		{name: "hub default applies", hubDefault: store.MessageModeNone, wantMode: store.MessageModeNone},
+		{name: "template wins over hub default", hubDefault: store.MessageModeNone, tmplMode: store.MessageModeBranch, wantMode: store.MessageModeBranch},
+		{name: "hub value never applies as a default", hubDefault: store.MessageModeHub, wantMode: store.MessageModeProject},
+	}
+
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			f := newSchedFire(t, fmt.Sprintf("hc-dmm-%d", i))
+			_ = installHeadlessGatherDispatcher(t, f)
+			f.srv.config.DefaultMessageMode = tc.hubDefault
+
+			tmplSlug := fmt.Sprintf("hc-dmm-tmpl-%d", i)
+			require.NoError(t, f.store.CreateTemplate(ctx, &store.Template{
+				ID:          tid(tmplSlug),
+				Name:        tmplSlug,
+				Slug:        tmplSlug,
+				Harness:     "claude",
+				ContentHash: "d00dfeed",
+				Scope:       store.TemplateScopeGlobal,
+				Status:      store.TemplateStatusActive,
+				AgentConfig: &api.ScionConfig{MessageMode: tc.tmplMode},
+			}))
+
+			evt := withSessionRevision(f.event(fmt.Sprintf("dmm-agent-%d", i)), f.creator.ID)
+			auth, identity, err := f.srv.resolveRecordedAuthority(ctx, scheduledRecordedAuthority(evt), f.proj.ID, "agent.create")
+			require.NoError(t, err)
+			edgeCeiling, edgeProv, err := f.srv.fireEffectCeiling(ctx, auth)
+			require.NoError(t, err)
+
+			rr := headlessResolvedRole{preCapRole: AgentRoleFull}
+			agent, err := f.srv.createAgentHeadless(ctx, HeadlessCreate{
+				ProjectID:      f.proj.ID,
+				Authority:      auth,
+				Identity:       identity,
+				EdgeCeiling:    edgeCeiling,
+				EdgeProvenance: edgeProv,
+				resolvedRole:   &rr,
+				Name:           fmt.Sprintf("dmm-agent-%d", i),
+				Template:       tmplSlug,
+				Detached:       true,
+			})
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantMode, agent.MessageMode)
+
+			stored, err := f.store.GetAgent(ctx, agent.ID)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantMode, stored.MessageMode)
+		})
+	}
+}
+
+// TestHeadlessCreate_HomeFilesPendingBlocksConcurrentStart verifies the
+// structural fix for the held start claim race (P1c-1 O-C / sec L2):
+//   - While create-time HomeFiles have not yet been delivered, CreateInputs.HomeFilesPending
+//     is true on the committed agent row, and both startAgentCore and DispatchAgentStart
+//     refuse concurrent manual starts with a clear retryable 409 Conflict error.
+//   - Once createAgentHeadless delivers the HomeFiles, HomeFilesPending is cleared
+//     and subsequent starts proceed normally.
+//   - A normal headless create without EventFile never sets HomeFilesPending and is
+//     unaffected.
+func TestHeadlessCreate_HomeFilesPendingBlocksConcurrentStart(t *testing.T) {
+	ctx := context.Background()
+	f := newSchedFire(t, "hf-race")
+	client := installHeadlessGatherDispatcher(t, f)
+
+	broker, err := f.store.GetRuntimeBroker(ctx, f.broker.ID)
+	require.NoError(t, err)
+	broker.Capabilities = &store.BrokerCapabilities{HomeFiles: true}
+	require.NoError(t, f.store.UpdateRuntimeBroker(ctx, broker))
+
+	evt := withSessionRevision(f.event("hf-race-agent"), f.creator.ID)
+	auth, identity, err := f.srv.resolveRecordedAuthority(ctx, scheduledRecordedAuthority(evt), f.proj.ID, "agent.create")
+	require.NoError(t, err)
+	edgeCeiling, edgeProv, err := f.srv.fireEffectCeiling(ctx, auth)
+	require.NoError(t, err)
+	rr := headlessResolvedRole{preCapRole: AgentRoleFull}
+
+	t.Run("concurrent_manual_start_refused_until_home_files_delivered", func(t *testing.T) {
+		var (
+			callbackRan     bool
+			startCoreErr    error
+			dispatcherErr   error
+			restartErr      error
+			httpStatus      int
+			httpBody        string
+			pendingAtCommit bool
+		)
+		created, err := f.srv.createAgentHeadless(ctx, HeadlessCreate{
+			ProjectID:      f.proj.ID,
+			Authority:      auth,
+			Identity:       identity,
+			EdgeCeiling:    edgeCeiling,
+			EdgeProvenance: edgeProv,
+			resolvedRole:   &rr,
+			Name:           "hf-race-agent",
+			Detached:       true,
+			EventFile:      []byte(`{"event_id":"ev-race-1"}`),
+			OnCommitted: func(agentID string) {
+				callbackRan = true
+				committed, gerr := f.store.GetAgent(ctx, agentID)
+				if gerr != nil {
+					t.Errorf("GetAgent in OnCommitted: %v", gerr)
+					return
+				}
+				pendingAtCommit = agentHomeFilesPending(committed)
+
+				// Simulate a concurrent manual start via startAgentCore during
+				// the window between commitAgentCreate and createUnderClaim.
+				startCoreErr = f.srv.startAgentCore(ctx, committed, StartOpts{
+					Kind: store.StartClaimUser,
+				})
+				rec := httptest.NewRecorder()
+				if f.srv.writeStartClaimError(ctx, rec, startCoreErr, agentID) {
+					httpStatus = rec.Code
+					httpBody = rec.Body.String()
+				}
+
+				// Direct DispatchAgentStart and DispatchAgentRestart backstops must also refuse.
+				dispatcherErr = f.srv.GetDispatcher().DispatchAgentStart(ctx, committed, "", false)
+				restartErr = f.srv.GetDispatcher().DispatchAgentRestart(ctx, committed)
+			},
+		})
+		require.NoError(t, err)
+		require.NotNil(t, created)
+		require.True(t, callbackRan, "OnCommitted must run between commit and dispatch")
+		assert.True(t, pendingAtCommit, "HomeFilesPending must be true immediately after commit")
+		require.ErrorIs(t, startCoreErr, errHomeFilesNotDelivered)
+		assert.Equal(t, http.StatusConflict, httpStatus)
+		assert.Contains(t, httpBody, "home files")
+		assert.Contains(t, httpBody, "if creation failed, delete and re-create the agent")
+		require.ErrorIs(t, dispatcherErr, errHomeFilesNotDelivered)
+		require.ErrorIs(t, restartErr, errHomeFilesNotDelivered)
+		assert.Equal(t, []api.HomeFile{{
+			Path:    HeadlessEventFilePath,
+			Mode:    0o600,
+			Content: []byte(`{"event_id":"ev-race-1"}`),
+		}}, client.lastCreateReq.HomeFiles)
+
+		// After create dispatch completes, HomeFilesPending is cleared in store.
+		afterCreate, err := f.store.GetAgent(ctx, created.ID)
+		require.NoError(t, err)
+		assert.False(t, agentHomeFilesPending(afterCreate), "HomeFilesPending must be cleared after create dispatch delivers HomeFiles")
+
+		// A subsequent manual start is no longer blocked by HomeFilesPending.
+		startAfterErr := f.srv.startAgentCore(ctx, afterCreate, StartOpts{
+			Kind: store.StartClaimUser,
+		})
+		assert.NotErrorIs(t, startAfterErr, errHomeFilesNotDelivered)
+	})
+
+	t.Run("start_agent_core_refuses_pending_without_dispatcher_backstop", func(t *testing.T) {
+		// Replace the dispatcher with a stub that has no HomeFilesPending check,
+		// proving startAgentCore itself blocks pending starts (kills mutant m1).
+		origDisp := f.srv.GetDispatcher()
+		stubDisp := &noopStartTrackingDispatcher{AgentDispatcher: origDisp}
+		f.srv.SetDispatcher(stubDisp)
+		t.Cleanup(func() { f.srv.SetDispatcher(origDisp) })
+
+		pendingAgent := &store.Agent{
+			ID:              api.NewUUID(),
+			Name:            "hf-pending-core-only",
+			Slug:            "hf-pending-core-only",
+			ProjectID:       f.proj.ID,
+			RuntimeBrokerID: f.broker.ID,
+			AppliedConfig: &store.AgentAppliedConfig{
+				CreateInputs: &store.AgentCreateInputs{HomeFilesPending: true},
+			},
+		}
+		err := f.srv.startAgentCore(ctx, pendingAgent, StartOpts{Kind: store.StartClaimUser})
+		require.ErrorIs(t, err, errHomeFilesNotDelivered)
+		assert.Zero(t, stubDisp.startCalls, "startAgentCore must refuse before calling dispatcher")
+	})
+
+	t.Run("async_launch_report_clears_pending_and_persist_accepted_launch_preserves_clear", func(t *testing.T) {
+		// Simulates the R1 race: broker accepts an async launch and sends its
+		// succeeded launch report (through handleAgentLaunchReport) BEFORE
+		// createAgentHeadless runs persistAcceptedLaunch.
+		origDisp := f.srv.GetDispatcher()
+		inner := origDisp.(*HTTPAgentDispatcher)
+		earlyDisp := &earlyLaunchReportDispatcher{
+			HTTPAgentDispatcher: inner,
+			srv:                 f.srv,
+			t:                   t,
+			brokerID:            f.broker.ID,
+		}
+		f.srv.SetDispatcher(earlyDisp)
+		t.Cleanup(func() { f.srv.SetDispatcher(origDisp) })
+
+		created, err := f.srv.createAgentHeadless(ctx, HeadlessCreate{
+			ProjectID:      f.proj.ID,
+			Authority:      auth,
+			Identity:       identity,
+			EdgeCeiling:    edgeCeiling,
+			EdgeProvenance: edgeProv,
+			resolvedRole:   &rr,
+			Name:           "hf-async-early-report",
+			Detached:       true,
+			EventFile:      []byte(`{"event_id":"ev-async-1"}`),
+		})
+		require.NoError(t, err)
+		require.NotNil(t, created)
+		require.True(t, earlyDisp.reportSent, "launch report must have been posted")
+
+		// Stored row must remain cleared (persistAcceptedLaunch must NOT resurrect HomeFilesPending).
+		row, err := f.store.GetAgent(ctx, created.ID)
+		require.NoError(t, err)
+		assert.False(t, agentHomeFilesPending(row), "persistAcceptedLaunch must preserve cleared HomeFilesPending")
+
+		// mergeDispatchedAgent must also preserve cleared HomeFilesPending.
+		staleSrc := &store.Agent{
+			AppliedConfig: &store.AgentAppliedConfig{
+				CreateInputs: &store.AgentCreateInputs{HomeFilesPending: true},
+			},
+		}
+		mergeDispatchedAgent(row, staleSrc)
+		assert.False(t, agentHomeFilesPending(row), "mergeDispatchedAgent must not resurrect HomeFilesPending")
+		assert.True(t, agentHomeFilesPending(staleSrc), "mergeDispatchedAgent must not mutate src")
+
+		// Agent is startable (not blocked by errHomeFilesNotDelivered).
+		startErr := f.srv.startAgentCore(ctx, row, StartOpts{Kind: store.StartClaimUser})
+		assert.NotErrorIs(t, startErr, errHomeFilesNotDelivered)
+	})
+
+	t.Run("claim_held_during_home_files_create_rolls_back_and_releases_subject_claim", func(t *testing.T) {
+		trigID := api.NewUUID()
+		evID := api.NewUUID()
+		fireID := api.NewUUID()
+		now := time.Now().UTC()
+		claimed, existing, err := f.store.ClaimTriggerSubject(ctx, trigID, "pr-held-1", evID, fireID, now, now.Add(-5*time.Minute))
+		require.NoError(t, err)
+		require.Nil(t, existing)
+		require.NotNil(t, claimed)
+
+		var (
+			createdID string
+			heldRun   *startClaimRun
+		)
+		defer func() {
+			if heldRun != nil {
+				heldRun.finish(startReleased)
+			}
+		}()
+		_, err = f.srv.createAgentHeadless(ctx, HeadlessCreate{
+			ProjectID:      f.proj.ID,
+			Authority:      auth,
+			Identity:       identity,
+			EdgeCeiling:    edgeCeiling,
+			EdgeProvenance: edgeProv,
+			resolvedRole:   &rr,
+			Name:           "hf-held-claim-agent",
+			Detached:       true,
+			EventFile:      []byte(`{"event_id":"ev-held-1"}`),
+			OnCommitTx: func(txCtx context.Context, tx store.Store, agentID string) error {
+				bound, bErr := tx.BindTriggerSubjectClaim(txCtx, claimed.ID, fireID, agentID, time.Now().UTC())
+				if bErr != nil {
+					return bErr
+				}
+				if !bound {
+					return errors.New("bind failed")
+				}
+				return nil
+			},
+			OnCommitted: func(agentID string) {
+				createdID = agentID
+				committed, gErr := f.store.GetAgent(ctx, agentID)
+				require.NoError(t, gErr)
+				// Acquire a competing start claim directly so createUnderClaim
+				// encounters ClaimHeldError.
+				var acqErr error
+				heldRun, acqErr = f.srv.acquireStartClaim(ctx, committed, store.StartClaimUser)
+				require.NoError(t, acqErr)
+			},
+		})
+		require.Error(t, err)
+		var held *store.ClaimHeldError
+		require.ErrorAs(t, err, &held, "ClaimHeldError must be returned (kills mutant m5)")
+		require.NotEmpty(t, createdID)
+
+		// The pending orphan agent must have been rolled back.
+		_, gErr := f.store.GetAgent(ctx, createdID)
+		assert.ErrorIs(t, gErr, store.ErrNotFound, "pending orphan agent must be rolled back on ClaimHeldError")
+
+		// Because the orphan agent row was rolled back, Live() sees the missing
+		// agent and lazily releases the bound subject claim so later events are
+		// not stuck busy (preserving P1c-2's post-commit claim invariant).
+		claims := trigger.NewSubjectClaims(f.store, f.store, time.Now)
+		live, liveErr := claims.Live(ctx, trigID, "pr-held-1")
+		require.NoError(t, liveErr)
+		assert.Nil(t, live, "Live must see rolled-back agent is gone and release the claim")
+		_, claimErr := f.store.GetActiveTriggerSubjectClaim(ctx, trigID, "pr-held-1")
+		assert.ErrorIs(t, claimErr, store.ErrNotFound, "bound subject claim must be lazily released after rollback")
+	})
+
+	t.Run("finalize_env_and_create_family_refused_while_home_files_pending", func(t *testing.T) {
+		var (
+			httpCode       int
+			httpBody       string
+			finalizeErr    error
+			createErr      error
+			gatherErr      error
+			provisionErr   error
+			callsDuringWin []*RemoteCreateAgentRequest
+		)
+		created, err := f.srv.createAgentHeadless(ctx, HeadlessCreate{
+			ProjectID:      f.proj.ID,
+			Authority:      auth,
+			Identity:       identity,
+			EdgeCeiling:    edgeCeiling,
+			EdgeProvenance: edgeProv,
+			resolvedRole:   &rr,
+			Name:           "hf-finalize-env-race",
+			Detached:       true,
+			EventFile:      []byte(`{"event_id":"ev-finalize-race"}`),
+			OnCommitted: func(agentID string) {
+				committed, gErr := f.store.GetAgent(ctx, agentID)
+				require.NoError(t, gErr)
+				require.True(t, agentHomeFilesPending(committed))
+
+				client.mu.Lock()
+				beforeCalls := len(client.calls)
+				client.mu.Unlock()
+
+				// 1. Real HTTP POST .../env during the commit->claim window must be
+				// refused with 409 Conflict and must not launch the agent without HomeFiles.
+				rec := doRequest(t, f.srv, http.MethodPost,
+					fmt.Sprintf("/api/v1/projects/%s/agents/%s/env", f.proj.ID, committed.Slug),
+					map[string]interface{}{"env": map[string]string{"FOO": "bar"}})
+				httpCode = rec.Code
+				httpBody = rec.Body.String()
+
+				// 2. Direct create-family dispatcher entry points without HomeFiles on ctx
+				// must all refuse with errHomeFilesNotDelivered.
+				disp := f.srv.GetDispatcher()
+				_, finalizeErr = disp.DispatchFinalizeEnv(ctx, committed, map[string]string{"FOO": "bar"})
+				_, createErr = disp.DispatchAgentCreate(ctx, committed)
+				_, gatherErr = disp.DispatchAgentCreateWithGather(ctx, committed)
+				provisionErr = disp.DispatchAgentProvision(ctx, committed)
+
+				client.mu.Lock()
+				callsDuringWin = append(callsDuringWin, client.calls[beforeCalls:]...)
+				client.mu.Unlock()
+			},
+		})
+		require.NoError(t, err, "trigger create must still succeed with its HomeFiles after env-submit refusal")
+		require.NotNil(t, created)
+		assert.Equal(t, http.StatusConflict, httpCode, "POST .../env body: %s", httpBody)
+		assert.Contains(t, httpBody, "home files")
+		assert.Contains(t, httpBody, "if creation failed, delete and re-create the agent")
+		require.ErrorIs(t, finalizeErr, errHomeFilesNotDelivered)
+		require.ErrorIs(t, createErr, errHomeFilesNotDelivered)
+		require.ErrorIs(t, gatherErr, errHomeFilesNotDelivered)
+		require.ErrorIs(t, provisionErr, errHomeFilesNotDelivered)
+		assert.Empty(t, callsDuringWin, "no broker create/start request may be sent during the commit->claim window without HomeFiles")
+		require.Equal(t, []api.HomeFile{{
+			Path:    HeadlessEventFilePath,
+			Mode:    0o600,
+			Content: []byte(`{"event_id":"ev-finalize-race"}`),
+		}}, client.lastCreateReq.HomeFiles)
+	})
+
+	t.Run("clear_agent_home_files_pending_retries_on_version_conflict", func(t *testing.T) {
+		srv, rawStore, wrapper, fault := testServerWithStoreFault(t, func(inner store.Store, sw *storeFaultSwitch) *conflictUpdateAgentStore {
+			return &conflictUpdateAgentStore{Store: inner, fault: sw, conflictsRemaining: 2}
+		})
+		proj := &store.Project{ID: api.NewUUID(), Name: "hf-retry-proj", Slug: "hf-retry-proj"}
+		require.NoError(t, rawStore.CreateProject(ctx, proj))
+		ag := &store.Agent{
+			ID:        api.NewUUID(),
+			Name:      "hf-clear-retry",
+			Slug:      "hf-clear-retry",
+			ProjectID: proj.ID,
+			AppliedConfig: &store.AgentAppliedConfig{
+				CreateInputs: &store.AgentCreateInputs{HomeFilesPending: true},
+			},
+		}
+		require.NoError(t, rawStore.CreateAgent(ctx, ag))
+		wrapper.targetID = ag.ID
+		fault.Arm()
+
+		srv.clearAgentHomeFilesPending(ctx, ag)
+		assert.Equal(t, 3, wrapper.attempts, "expected 2 version conflicts followed by success on 3rd attempt")
+		assert.False(t, agentHomeFilesPending(ag), "in-memory flag must be cleared")
+
+		stored, gErr := rawStore.GetAgent(ctx, ag.ID)
+		require.NoError(t, gErr)
+		assert.False(t, agentHomeFilesPending(stored), "persisted flag must be cleared after version-conflict retry")
+	})
+
+	t.Run("normal_create_without_event_file_unaffected", func(t *testing.T) {
+		var pendingAtCommit bool
+		created, err := f.srv.createAgentHeadless(ctx, HeadlessCreate{
+			ProjectID:      f.proj.ID,
+			Authority:      auth,
+			Identity:       identity,
+			EdgeCeiling:    edgeCeiling,
+			EdgeProvenance: edgeProv,
+			resolvedRole:   &rr,
+			Name:           "hf-normal-agent",
+			Detached:       true,
+			OnCommitted: func(agentID string) {
+				committed, gerr := f.store.GetAgent(ctx, agentID)
+				if gerr == nil {
+					pendingAtCommit = agentHomeFilesPending(committed)
+				}
+			},
+		})
+		require.NoError(t, err)
+		require.NotNil(t, created)
+		assert.False(t, pendingAtCommit, "normal create without EventFile must not set HomeFilesPending")
+		stored, err := f.store.GetAgent(ctx, created.ID)
+		require.NoError(t, err)
+		assert.False(t, agentHomeFilesPending(stored))
+	})
+}
+
+type noopStartTrackingDispatcher struct {
+	AgentDispatcher
+	startCalls int
+}
+
+func (d *noopStartTrackingDispatcher) DispatchAgentStart(_ context.Context, _ *store.Agent, _ string, _ bool) error {
+	d.startCalls++
+	return nil
+}
+
+type earlyLaunchReportDispatcher struct {
+	*HTTPAgentDispatcher
+	srv        *Server
+	t          *testing.T
+	brokerID   string
+	reportSent bool
+}
+
+func (d *earlyLaunchReportDispatcher) DispatchAgentCreateWithGather(ctx context.Context, agent *store.Agent) (*CreateDispatchResult, error) {
+	if _, err := d.HTTPAgentDispatcher.DispatchAgentCreateWithGather(ctx, agent); err != nil {
+		return nil, err
+	}
+	launchID, err := d.srv.store.BeginLaunch(ctx, agent.ID, store.LaunchKindCreate, 5*time.Minute)
+	if err != nil {
+		return nil, err
+	}
+	// Drive the real HTTP launch-report handler (state=succeeded) BEFORE
+	// createAgentHeadless reaches persistAcceptedLaunch.
+	rec := postLaunchReport(d.t, d.srv, d.brokerID, agent.ID, d.brokerID, AgentLaunchReport{
+		LaunchID:   launchID,
+		InstanceID: "broker-inst-1",
+		Seq:        1,
+		State:      store.LaunchReportStateSucceeded,
+		Phase:      "running",
+	})
+	require.Equal(d.t, http.StatusOK, rec.Code, "launch report body: %s", rec.Body.String())
+	d.reportSent = true
+	return &CreateDispatchResult{Launch: &LaunchAccepted{ID: launchID}}, nil
+}
+
+type conflictUpdateAgentStore struct {
+	store.Store
+	fault              *storeFaultSwitch
+	targetID           string
+	conflictsRemaining int
+	attempts           int
+}
+
+func (s *conflictUpdateAgentStore) UpdateAgent(ctx context.Context, agent *store.Agent) error {
+	if s.fault.Active() && agent.ID == s.targetID {
+		s.attempts++
+		if s.conflictsRemaining > 0 {
+			s.conflictsRemaining--
+			return store.ErrVersionConflict
+		}
+	}
+	return s.Store.UpdateAgent(ctx, agent)
 }

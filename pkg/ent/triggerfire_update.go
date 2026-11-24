@@ -12,7 +12,9 @@ import (
 	"entgo.io/ent/dialect/sql/sqlgraph"
 	"entgo.io/ent/schema/field"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/predicate"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/scheduledexecrun"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/triggerfire"
+	"github.com/google/uuid"
 )
 
 // TriggerFireUpdate is the builder for updating TriggerFire entities.
@@ -296,6 +298,26 @@ func (_u *TriggerFireUpdate) ClearRuleTrace() *TriggerFireUpdate {
 	return _u
 }
 
+// SetTargetAgentID sets the "target_agent_id" field.
+func (_u *TriggerFireUpdate) SetTargetAgentID(v uuid.UUID) *TriggerFireUpdate {
+	_u.mutation.SetTargetAgentID(v)
+	return _u
+}
+
+// SetNillableTargetAgentID sets the "target_agent_id" field if the given value is not nil.
+func (_u *TriggerFireUpdate) SetNillableTargetAgentID(v *uuid.UUID) *TriggerFireUpdate {
+	if v != nil {
+		_u.SetTargetAgentID(*v)
+	}
+	return _u
+}
+
+// ClearTargetAgentID clears the value of the "target_agent_id" field.
+func (_u *TriggerFireUpdate) ClearTargetAgentID() *TriggerFireUpdate {
+	_u.mutation.ClearTargetAgentID()
+	return _u
+}
+
 // SetExecutorKind sets the "executor_kind" field.
 func (_u *TriggerFireUpdate) SetExecutorKind(v string) *TriggerFireUpdate {
 	_u.mutation.SetExecutorKind(v)
@@ -338,6 +360,46 @@ func (_u *TriggerFireUpdate) SetNillableLeaseUntil(v *time.Time) *TriggerFireUpd
 	return _u
 }
 
+// SetNotBefore sets the "not_before" field.
+func (_u *TriggerFireUpdate) SetNotBefore(v time.Time) *TriggerFireUpdate {
+	_u.mutation.SetNotBefore(v)
+	return _u
+}
+
+// SetNillableNotBefore sets the "not_before" field if the given value is not nil.
+func (_u *TriggerFireUpdate) SetNillableNotBefore(v *time.Time) *TriggerFireUpdate {
+	if v != nil {
+		_u.SetNotBefore(*v)
+	}
+	return _u
+}
+
+// ClearNotBefore clears the value of the "not_before" field.
+func (_u *TriggerFireUpdate) ClearNotBefore() *TriggerFireUpdate {
+	_u.mutation.ClearNotBefore()
+	return _u
+}
+
+// SetDeferredAt sets the "deferred_at" field.
+func (_u *TriggerFireUpdate) SetDeferredAt(v time.Time) *TriggerFireUpdate {
+	_u.mutation.SetDeferredAt(v)
+	return _u
+}
+
+// SetNillableDeferredAt sets the "deferred_at" field if the given value is not nil.
+func (_u *TriggerFireUpdate) SetNillableDeferredAt(v *time.Time) *TriggerFireUpdate {
+	if v != nil {
+		_u.SetDeferredAt(*v)
+	}
+	return _u
+}
+
+// ClearDeferredAt clears the value of the "deferred_at" field.
+func (_u *TriggerFireUpdate) ClearDeferredAt() *TriggerFireUpdate {
+	_u.mutation.ClearDeferredAt()
+	return _u
+}
+
 // SetFinishedAt sets the "finished_at" field.
 func (_u *TriggerFireUpdate) SetFinishedAt(v time.Time) *TriggerFireUpdate {
 	_u.mutation.SetFinishedAt(v)
@@ -358,9 +420,34 @@ func (_u *TriggerFireUpdate) ClearFinishedAt() *TriggerFireUpdate {
 	return _u
 }
 
+// SetExecRunID sets the "exec_run" edge to the ScheduledExecRun entity by ID.
+func (_u *TriggerFireUpdate) SetExecRunID(id uuid.UUID) *TriggerFireUpdate {
+	_u.mutation.SetExecRunID(id)
+	return _u
+}
+
+// SetNillableExecRunID sets the "exec_run" edge to the ScheduledExecRun entity by ID if the given value is not nil.
+func (_u *TriggerFireUpdate) SetNillableExecRunID(id *uuid.UUID) *TriggerFireUpdate {
+	if id != nil {
+		_u = _u.SetExecRunID(*id)
+	}
+	return _u
+}
+
+// SetExecRun sets the "exec_run" edge to the ScheduledExecRun entity.
+func (_u *TriggerFireUpdate) SetExecRun(v *ScheduledExecRun) *TriggerFireUpdate {
+	return _u.SetExecRunID(v.ID)
+}
+
 // Mutation returns the TriggerFireMutation object of the builder.
 func (_u *TriggerFireUpdate) Mutation() *TriggerFireMutation {
 	return _u.mutation
+}
+
+// ClearExecRun clears the "exec_run" edge to the ScheduledExecRun entity.
+func (_u *TriggerFireUpdate) ClearExecRun() *TriggerFireUpdate {
+	_u.mutation.ClearExecRun()
+	return _u
 }
 
 // Save executes the query and returns the number of nodes affected by the update operation.
@@ -503,6 +590,12 @@ func (_u *TriggerFireUpdate) sqlSave(ctx context.Context) (_node int, err error)
 	if _u.mutation.RuleTraceCleared() {
 		_spec.ClearField(triggerfire.FieldRuleTrace, field.TypeString)
 	}
+	if value, ok := _u.mutation.TargetAgentID(); ok {
+		_spec.SetField(triggerfire.FieldTargetAgentID, field.TypeUUID, value)
+	}
+	if _u.mutation.TargetAgentIDCleared() {
+		_spec.ClearField(triggerfire.FieldTargetAgentID, field.TypeUUID)
+	}
 	if value, ok := _u.mutation.ExecutorKind(); ok {
 		_spec.SetField(triggerfire.FieldExecutorKind, field.TypeString, value)
 	}
@@ -512,11 +605,52 @@ func (_u *TriggerFireUpdate) sqlSave(ctx context.Context) (_node int, err error)
 	if value, ok := _u.mutation.LeaseUntil(); ok {
 		_spec.SetField(triggerfire.FieldLeaseUntil, field.TypeTime, value)
 	}
+	if value, ok := _u.mutation.NotBefore(); ok {
+		_spec.SetField(triggerfire.FieldNotBefore, field.TypeTime, value)
+	}
+	if _u.mutation.NotBeforeCleared() {
+		_spec.ClearField(triggerfire.FieldNotBefore, field.TypeTime)
+	}
+	if value, ok := _u.mutation.DeferredAt(); ok {
+		_spec.SetField(triggerfire.FieldDeferredAt, field.TypeTime, value)
+	}
+	if _u.mutation.DeferredAtCleared() {
+		_spec.ClearField(triggerfire.FieldDeferredAt, field.TypeTime)
+	}
 	if value, ok := _u.mutation.FinishedAt(); ok {
 		_spec.SetField(triggerfire.FieldFinishedAt, field.TypeTime, value)
 	}
 	if _u.mutation.FinishedAtCleared() {
 		_spec.ClearField(triggerfire.FieldFinishedAt, field.TypeTime)
+	}
+	if _u.mutation.ExecRunCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2O,
+			Inverse: false,
+			Table:   triggerfire.ExecRunTable,
+			Columns: []string{triggerfire.ExecRunColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(scheduledexecrun.FieldID, field.TypeUUID),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.ExecRunIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2O,
+			Inverse: false,
+			Table:   triggerfire.ExecRunTable,
+			Columns: []string{triggerfire.ExecRunColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(scheduledexecrun.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
 	}
 	if _node, err = sqlgraph.UpdateNodes(ctx, _u.driver, _spec); err != nil {
 		if _, ok := err.(*sqlgraph.NotFoundError); ok {
@@ -806,6 +940,26 @@ func (_u *TriggerFireUpdateOne) ClearRuleTrace() *TriggerFireUpdateOne {
 	return _u
 }
 
+// SetTargetAgentID sets the "target_agent_id" field.
+func (_u *TriggerFireUpdateOne) SetTargetAgentID(v uuid.UUID) *TriggerFireUpdateOne {
+	_u.mutation.SetTargetAgentID(v)
+	return _u
+}
+
+// SetNillableTargetAgentID sets the "target_agent_id" field if the given value is not nil.
+func (_u *TriggerFireUpdateOne) SetNillableTargetAgentID(v *uuid.UUID) *TriggerFireUpdateOne {
+	if v != nil {
+		_u.SetTargetAgentID(*v)
+	}
+	return _u
+}
+
+// ClearTargetAgentID clears the value of the "target_agent_id" field.
+func (_u *TriggerFireUpdateOne) ClearTargetAgentID() *TriggerFireUpdateOne {
+	_u.mutation.ClearTargetAgentID()
+	return _u
+}
+
 // SetExecutorKind sets the "executor_kind" field.
 func (_u *TriggerFireUpdateOne) SetExecutorKind(v string) *TriggerFireUpdateOne {
 	_u.mutation.SetExecutorKind(v)
@@ -848,6 +1002,46 @@ func (_u *TriggerFireUpdateOne) SetNillableLeaseUntil(v *time.Time) *TriggerFire
 	return _u
 }
 
+// SetNotBefore sets the "not_before" field.
+func (_u *TriggerFireUpdateOne) SetNotBefore(v time.Time) *TriggerFireUpdateOne {
+	_u.mutation.SetNotBefore(v)
+	return _u
+}
+
+// SetNillableNotBefore sets the "not_before" field if the given value is not nil.
+func (_u *TriggerFireUpdateOne) SetNillableNotBefore(v *time.Time) *TriggerFireUpdateOne {
+	if v != nil {
+		_u.SetNotBefore(*v)
+	}
+	return _u
+}
+
+// ClearNotBefore clears the value of the "not_before" field.
+func (_u *TriggerFireUpdateOne) ClearNotBefore() *TriggerFireUpdateOne {
+	_u.mutation.ClearNotBefore()
+	return _u
+}
+
+// SetDeferredAt sets the "deferred_at" field.
+func (_u *TriggerFireUpdateOne) SetDeferredAt(v time.Time) *TriggerFireUpdateOne {
+	_u.mutation.SetDeferredAt(v)
+	return _u
+}
+
+// SetNillableDeferredAt sets the "deferred_at" field if the given value is not nil.
+func (_u *TriggerFireUpdateOne) SetNillableDeferredAt(v *time.Time) *TriggerFireUpdateOne {
+	if v != nil {
+		_u.SetDeferredAt(*v)
+	}
+	return _u
+}
+
+// ClearDeferredAt clears the value of the "deferred_at" field.
+func (_u *TriggerFireUpdateOne) ClearDeferredAt() *TriggerFireUpdateOne {
+	_u.mutation.ClearDeferredAt()
+	return _u
+}
+
 // SetFinishedAt sets the "finished_at" field.
 func (_u *TriggerFireUpdateOne) SetFinishedAt(v time.Time) *TriggerFireUpdateOne {
 	_u.mutation.SetFinishedAt(v)
@@ -868,9 +1062,34 @@ func (_u *TriggerFireUpdateOne) ClearFinishedAt() *TriggerFireUpdateOne {
 	return _u
 }
 
+// SetExecRunID sets the "exec_run" edge to the ScheduledExecRun entity by ID.
+func (_u *TriggerFireUpdateOne) SetExecRunID(id uuid.UUID) *TriggerFireUpdateOne {
+	_u.mutation.SetExecRunID(id)
+	return _u
+}
+
+// SetNillableExecRunID sets the "exec_run" edge to the ScheduledExecRun entity by ID if the given value is not nil.
+func (_u *TriggerFireUpdateOne) SetNillableExecRunID(id *uuid.UUID) *TriggerFireUpdateOne {
+	if id != nil {
+		_u = _u.SetExecRunID(*id)
+	}
+	return _u
+}
+
+// SetExecRun sets the "exec_run" edge to the ScheduledExecRun entity.
+func (_u *TriggerFireUpdateOne) SetExecRun(v *ScheduledExecRun) *TriggerFireUpdateOne {
+	return _u.SetExecRunID(v.ID)
+}
+
 // Mutation returns the TriggerFireMutation object of the builder.
 func (_u *TriggerFireUpdateOne) Mutation() *TriggerFireMutation {
 	return _u.mutation
+}
+
+// ClearExecRun clears the "exec_run" edge to the ScheduledExecRun entity.
+func (_u *TriggerFireUpdateOne) ClearExecRun() *TriggerFireUpdateOne {
+	_u.mutation.ClearExecRun()
+	return _u
 }
 
 // Where appends a list predicates to the TriggerFireUpdate builder.
@@ -1043,6 +1262,12 @@ func (_u *TriggerFireUpdateOne) sqlSave(ctx context.Context) (_node *TriggerFire
 	if _u.mutation.RuleTraceCleared() {
 		_spec.ClearField(triggerfire.FieldRuleTrace, field.TypeString)
 	}
+	if value, ok := _u.mutation.TargetAgentID(); ok {
+		_spec.SetField(triggerfire.FieldTargetAgentID, field.TypeUUID, value)
+	}
+	if _u.mutation.TargetAgentIDCleared() {
+		_spec.ClearField(triggerfire.FieldTargetAgentID, field.TypeUUID)
+	}
 	if value, ok := _u.mutation.ExecutorKind(); ok {
 		_spec.SetField(triggerfire.FieldExecutorKind, field.TypeString, value)
 	}
@@ -1052,11 +1277,52 @@ func (_u *TriggerFireUpdateOne) sqlSave(ctx context.Context) (_node *TriggerFire
 	if value, ok := _u.mutation.LeaseUntil(); ok {
 		_spec.SetField(triggerfire.FieldLeaseUntil, field.TypeTime, value)
 	}
+	if value, ok := _u.mutation.NotBefore(); ok {
+		_spec.SetField(triggerfire.FieldNotBefore, field.TypeTime, value)
+	}
+	if _u.mutation.NotBeforeCleared() {
+		_spec.ClearField(triggerfire.FieldNotBefore, field.TypeTime)
+	}
+	if value, ok := _u.mutation.DeferredAt(); ok {
+		_spec.SetField(triggerfire.FieldDeferredAt, field.TypeTime, value)
+	}
+	if _u.mutation.DeferredAtCleared() {
+		_spec.ClearField(triggerfire.FieldDeferredAt, field.TypeTime)
+	}
 	if value, ok := _u.mutation.FinishedAt(); ok {
 		_spec.SetField(triggerfire.FieldFinishedAt, field.TypeTime, value)
 	}
 	if _u.mutation.FinishedAtCleared() {
 		_spec.ClearField(triggerfire.FieldFinishedAt, field.TypeTime)
+	}
+	if _u.mutation.ExecRunCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2O,
+			Inverse: false,
+			Table:   triggerfire.ExecRunTable,
+			Columns: []string{triggerfire.ExecRunColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(scheduledexecrun.FieldID, field.TypeUUID),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.ExecRunIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2O,
+			Inverse: false,
+			Table:   triggerfire.ExecRunTable,
+			Columns: []string{triggerfire.ExecRunColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(scheduledexecrun.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
 	}
 	_node = &TriggerFire{config: _u.config}
 	_spec.Assign = _node.assignValues

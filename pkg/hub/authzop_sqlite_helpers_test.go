@@ -478,8 +478,8 @@ func seedLiveInventoryFixtures(t *testing.T, ctx context.Context, srv *Server, s
 	require.NoError(t, s.CreateHarnessConfig(ctx, &store.HarnessConfig{ID: f.harnessConfig, Name: "li-hc", Slug: "li-hc", Harness: "claude", Scope: store.HarnessConfigScopeGlobal, Status: store.HarnessConfigStatusActive, Created: now, Updated: now}))
 	require.NoError(t, s.CreateHarnessConfig(ctx, &store.HarnessConfig{ID: f.harnessConfigDel, Name: "li-hc-del", Slug: "li-hc-del", Harness: "claude", Scope: store.HarnessConfigScopeGlobal, Status: store.HarnessConfigStatusActive, Created: now, Updated: now}))
 
-	require.NoError(t, s.CreateSchedule(ctx, &store.Schedule{ID: f.schedule, ProjectID: f.project, Name: "li-schedule", CronExpr: "0 0 * * *", EventType: "message", Payload: "{}", Status: store.ScheduleStatusActive, CreatedAt: now, UpdatedAt: now}))
-	require.NoError(t, s.CreateScheduledEvent(ctx, &store.ScheduledEvent{ID: f.scheduledEvent, ProjectID: f.project, EventType: "message", FireAt: now.Add(time.Hour), Payload: "{}", Status: store.ScheduledEventPending, CreatedAt: now}))
+	require.NoError(t, s.CreateSchedule(ctx, &store.Schedule{ID: f.schedule, ProjectID: f.project, Name: "li-schedule", CronExpr: "0 0 * * *", EventType: "message", Payload: `{"agentId":"` + f.agent + `","message":"ping"}`, Status: store.ScheduleStatusActive, CreatedAt: now, UpdatedAt: now}))
+	require.NoError(t, s.CreateScheduledEvent(ctx, &store.ScheduledEvent{ID: f.scheduledEvent, ProjectID: f.project, EventType: "message", FireAt: now.Add(time.Hour), Payload: `{"agentId":"` + f.agent + `","message":"ping"}`, Status: store.ScheduledEventPending, CreatedAt: now}))
 
 	for _, epSeed := range []struct {
 		id   string
@@ -824,7 +824,7 @@ func seedLiveInventoryFixtures(t *testing.T, ctx context.Context, srv *Server, s
 		if e.Name == conduitExperiment || e.Name == experiments.AgentDelegation || e.Name == experiments.FederationProjectVisitors ||
 			e.Name == experiments.ChatStarredMessages || e.Name == experiments.AgentEditHeld ||
 			e.Name == experiments.UserDeleteForceCascade || e.Name == experiments.ArtifactArchive ||
-			e.Name == experiments.ArtifactsOpenReviewCheck ||
+			e.Name == experiments.ArtifactsOpenReviewCheck || e.Name == experiments.ArtifactsReviewDrafts ||
 			e.Name == experiments.ProjectSelfLeave || e.Name == experiments.RuntimeOrphanReconcile ||
 			e.Name == experiments.Triggers {
 			e.Default = true
@@ -843,6 +843,7 @@ func seedLiveInventoryFixtures(t *testing.T, ctx context.Context, srv *Server, s
 	require.True(t, srv.experimentEnabled(experiments.UserDeleteForceCascade))
 	require.True(t, srv.experimentEnabled(experiments.ArtifactArchive))
 	require.True(t, srv.experimentEnabled(experiments.ArtifactsOpenReviewCheck))
+	require.True(t, srv.experimentEnabled(experiments.ArtifactsReviewDrafts))
 	require.True(t, srv.experimentEnabled(experiments.ProjectSelfLeave))
 	require.True(t, srv.experimentEnabled(experiments.RuntimeOrphanReconcile))
 	require.True(t, srv.experimentEnabled(experiments.Triggers))
@@ -1058,9 +1059,11 @@ func opPatternOverrides(f idFixtures) map[overrideKey]map[string]string {
 		{"project.conversation.read", "/api/v1/conversations/{id}"}:                           {"id": f.inbox.groupConversation},
 		{"project.conversation.read", "/api/v1/conversations/{id}/messages"}:                  {"id": f.inbox.groupConversation},
 		{"project.conversation.read", "/api/v1/conversations/{id}/messages/{messageId}"}:      {"id": f.inbox.groupConversation, "messageId": f.inbox.groupMessage},
+		{"project.conversation.read", "/api/v1/conversations/{id}/watch"}:                     {"id": f.inbox.groupConversation},
 		{"inbox.conversation.direct.read", "/api/v1/conversations/{id}"}:                      {"id": f.inbox.directConversation},
 		{"inbox.conversation.direct.read", "/api/v1/conversations/{id}/messages"}:             {"id": f.inbox.directConversation},
 		{"inbox.conversation.direct.read", "/api/v1/conversations/{id}/messages/{messageId}"}: {"id": f.inbox.directConversation, "messageId": f.inbox.directMessage},
+		{"inbox.conversation.direct.read", "/api/v1/conversations/{id}/watch"}:                {"id": f.inbox.directConversation},
 
 		// Thread group delete uses its disposable twin.
 		{"inbox.threadgroup.delete", "/api/v1/thread-groups/{id}"}: {"id": f.inbox.threadGroupDel},
@@ -1098,6 +1101,7 @@ func patternOverrides(f idFixtures) map[string]map[string]string {
 		"/api/v1/artifacts/{id}/versions/{seq}/view":         {"id": f.artifact, "seq": "1"},
 		"/api/v1/artifacts/{id}/versions/{seq}/archive":      {"id": f.artifact, "seq": "1"},
 		"/api/v1/artifacts/{id}/review-sessions/{sid}":       {"id": f.artifact, "sid": "AAAAAAAAAAAAAAAAAAAAAA"},
+		"/api/v1/artifacts/{id}/review-draft":                {"id": f.artifact},
 
 		// --- test identity family ---
 		"/api/v1/test-identities/{id}/token":          {"id": f.testIdentity},
@@ -1128,6 +1132,8 @@ func patternOverrides(f idFixtures) map[string]map[string]string {
 		"/api/v1/agents/{id}/workspace/sync-to/finalize":                       {"id": f.agent},
 		"/api/v1/agents/{id}/logs":                                             {"id": f.agent},
 		"/api/v1/projects/{projectId}/agents/{id}/logs":                        {"projectId": f.project, "id": f.agent},
+		"/api/v1/agents/{id}/screen":                                           {"id": f.agent},
+		"/api/v1/projects/{projectId}/agents/{id}/screen":                      {"projectId": f.project, "id": f.agent},
 		"/api/v1/agents/{id}/cloud-logs":                                       {"id": f.agent},
 		"/api/v1/projects/{projectId}/agents/{id}/cloud-logs":                  {"projectId": f.project, "id": f.agent},
 		"/api/v1/agents/{id}/messages":                                         {"id": f.agent},
@@ -1283,10 +1289,11 @@ func patternOverrides(f idFixtures) map[string]map[string]string {
 		"/api/v1/harness-configs/{id}/reimport":     {"id": f.harnessConfig},
 
 		// --- schedule family ---
-		"/api/v1/projects/{projectId}/scheduled-events/{id}": {"projectId": f.project, "id": f.scheduledEvent},
-		"/api/v1/projects/{projectId}/schedules/{id}":        {"projectId": f.project, "id": f.schedule},
-		"/api/v1/projects/{projectId}/scheduled-events":      {"projectId": f.project},
-		"/api/v1/projects/{projectId}/schedules":             {"projectId": f.project},
+		"/api/v1/projects/{projectId}/scheduled-events/{id}":        {"projectId": f.project, "id": f.scheduledEvent},
+		"/api/v1/projects/{projectId}/scheduled-events/{id}/output": {"projectId": f.project, "id": f.scheduledEvent},
+		"/api/v1/projects/{projectId}/schedules/{id}":               {"projectId": f.project, "id": f.schedule},
+		"/api/v1/projects/{projectId}/scheduled-events":             {"projectId": f.project},
+		"/api/v1/projects/{projectId}/schedules":                    {"projectId": f.project},
 
 		// Schedule sub-actions on the seeded schedule.
 		"/api/v1/projects/{projectId}/schedules/{id}/history": {"projectId": f.project, "id": f.schedule},
@@ -1299,6 +1306,7 @@ func patternOverrides(f idFixtures) map[string]map[string]string {
 		"/api/v1/projects/{projectId}/triggers":               {"projectId": f.project},
 		"/api/v1/projects/{projectId}/triggers/{id}":          {"projectId": f.project, "id": f.trigger},
 		"/api/v1/projects/{projectId}/triggers/{id}/history":  {"projectId": f.project, "id": f.trigger},
+		"/api/v1/projects/{projectId}/triggers/{id}/render":   {"projectId": f.project, "id": f.trigger},
 		"/api/v1/projects/{projectId}/triggers/{id}/pause":    {"projectId": f.project, "id": f.trigger},
 		"/api/v1/projects/{projectId}/triggers/{id}/resume":   {"projectId": f.project, "id": f.triggerPaused},
 		"/api/v1/projects/{projectId}/trigger-events":         {"projectId": f.project},
@@ -1437,6 +1445,9 @@ func queryOverrides(f idFixtures) map[string]string {
 		"/api/v1/artifacts": "name=live-inventory.txt&scope=" + f.project,
 		// handleConversationResolve 400s without a reference.
 		"/api/v1/conversations/resolve": "reference=conv:" + f.inbox.groupConversation,
+		// handleConvWatch defaults to a 30s long-poll wait; pass wait=0 so
+		// live-inventory and bearer-matrix probes return immediately.
+		"/api/v1/conversations/{id}/watch": "wait=0",
 		// handleAdminEffectiveAccess 400s without a principal.
 		"/api/v1/admin/effective-access": "principalType=user&principalId=" + f.user,
 		// handleAdminEffectivePermissions 400s without a principal.

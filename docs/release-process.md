@@ -320,7 +320,8 @@ notifications without implementing a separate release-discovery path.
 [`build-release.yml`](../.github/workflows/build-release.yml) runs when a stable, preview,
 release-candidate, or nightly tag is pushed. It:
 
-1. Builds the web UI and cross-compiles Scion for all supported platforms.
+1. Builds the web UI, cross-compiles Scion for all supported platforms, and builds `sciontool`
+   for Linux.
 2. Builds the Linux plugin binaries.
 3. Packages and uploads the build artifacts.
 4. Generates a `SHA256SUMS` checksums file covering every published asset.
@@ -447,7 +448,9 @@ After `build-release.yml` publishes a `vX.Y.Z-preview.N` release, its `publish-h
 [`publish-homebrew.yml`](../.github/workflows/publish-homebrew.yml), which:
 
 1. Checks that the tag is a preview tag and that the `HOMEBREW_SCION_TOKEN` secret is set. Without
-   the secret it skips both steps below with a notice and does not fail the release.
+   the secret the job fails with an error and skips both steps below. The release itself is
+   already published, so only the `Publish to Homebrew` job is red; see "Rerunning a failed
+   publish" below.
 2. Checks out the release tag. The "Verify checkout is the release tag" step fails the job unless
    `git describe --tags --exact-match` prints exactly the tag and the tree's `hack/version.sh`
    stamps exactly that tag, so the images never carry binaries that report `dev`. The job then
@@ -493,6 +496,15 @@ an edited branch cannot read the secret:
 - **Environment secret only:** jobs in an environment also see repository secrets, so a
   `HOMEBREW_SCION_TOKEN` repository secret would bypass the branch and tag rules. Never add it at
   repository level.
+- **Callers pass the secret:** a reusable workflow sees an environment secret only when its caller
+  passes that secret, at every level of nesting. `build-preview-weekly.yml` calls
+  `build-release.yml` and `build-release.yml` calls `publish-homebrew.yml`, both passing
+  `HOMEBREW_SCION_TOKEN` by name (declared under `on.workflow_call.secrets`; the environment's
+  value takes precedence; `publish-homebrew.yml` marks it required). A new caller on the preview
+  path must pass it too. A direct caller of `publish-homebrew.yml` that omits it fails before any
+  job starts. A caller higher up the chain that omits it passes an empty value, and the gate job
+  fails. Pass it by name rather than with `secrets: inherit`, which the GitHub Actions scan flags.
+  A manual run of `publish-homebrew.yml` from `main` is not nested, so it always sees the secret.
 - **Required reviewers (optional):** GitHub applies them to every run that uses the environment,
   not only to manual dispatches, so each of the three jobs then waits for approval, including on
   the scheduled weekly run.
@@ -573,6 +585,13 @@ The main `scion` binary is published for:
 Linux and macOS artifacts are gzip-compressed tar archives (`.tar.gz`) containing `scion`. Windows
 artifacts are zip archives (`.zip`) containing `scion.exe`. The Telegram, Discord, Slack, and Teams
 plugins are built for Linux on both amd64 and arm64; plugin builds are not published for macOS.
+
+`sciontool`, the in-container helper that runs as PID 1 in agent images, is published for Linux
+only, as `sciontool-linux-amd64.tar.gz` and `sciontool-linux-arm64.tar.gz` (each containing
+`sciontool`). It is built the same way `image-build/scion-base/Dockerfile` builds it: without cgo,
+with `-tags no_embed_web`, stamped with the release version, and checked by
+`image-build/lib/assert-no-cgo.sh`, so it can stand in for the `sciontool` that image builds
+compile. Releases cut before this asset was added do not have it.
 
 ## Release notes
 

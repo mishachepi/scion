@@ -84,6 +84,7 @@ var compressBypassedUntagged = map[string]string{
 	// responses carry metadata only, and env deletes carry no value.
 	"GET /api/v1/agents/{id}/secrets":                   "env/secrets segment",
 	"PUT /api/v1/agents/{id}/secrets/{key}":             "env/secrets segment",
+	"DELETE /api/v1/agents/{id}/secrets/{key}":          "env/secrets segment",
 	"DELETE /api/v1/projects/{id}/env/{key}":            "env/secrets segment",
 	"GET /api/v1/projects/{id}/secrets":                 "env/secrets segment",
 	"GET /api/v1/projects/{id}/secrets/{key}":           "env/secrets segment",
@@ -103,18 +104,23 @@ var compressBypassedUntagged = map[string]string{
 	"pending DELETE /api/v1/env/{key}":                  "env/secrets segment",
 	"pending PATCH /api/v1/secrets/{key}":               "env/secrets segment",
 	// The session-only user- and hub-scope variants of the same routes.
-	"DELETE /api/v1/env/{key} #scope=user":     "env/secrets segment",
-	"GET /api/v1/secrets #scope=user":          "env/secrets segment",
-	"GET /api/v1/secrets/{key} #scope=user":    "env/secrets segment",
-	"PUT /api/v1/secrets/{key} #scope=user":    "env/secrets segment",
-	"PATCH /api/v1/secrets/{key} #scope=user":  "env/secrets segment",
-	"DELETE /api/v1/secrets/{key} #scope=user": "env/secrets segment",
-	"DELETE /api/v1/env/{key} #scope=hub":      "env/secrets segment",
-	"GET /api/v1/secrets #scope=hub":           "env/secrets segment",
-	"GET /api/v1/secrets/{key} #scope=hub":     "env/secrets segment",
-	"PUT /api/v1/secrets/{key} #scope=hub":     "env/secrets segment",
-	"PATCH /api/v1/secrets/{key} #scope=hub":   "env/secrets segment",
-	"DELETE /api/v1/secrets/{key} #scope=hub":  "env/secrets segment",
+	"DELETE /api/v1/env/{key} #scope=user":      "env/secrets segment",
+	"GET /api/v1/secrets #scope=user":           "env/secrets segment",
+	"GET /api/v1/secrets/{key} #scope=user":     "env/secrets segment",
+	"PUT /api/v1/secrets/{key} #scope=user":     "env/secrets segment",
+	"PATCH /api/v1/secrets/{key} #scope=user":   "env/secrets segment",
+	"DELETE /api/v1/secrets/{key} #scope=user":  "env/secrets segment",
+	"DELETE /api/v1/env/{key} #scope=hub":       "env/secrets segment",
+	"GET /api/v1/secrets #scope=hub":            "env/secrets segment",
+	"GET /api/v1/secrets/{key} #scope=hub":      "env/secrets segment",
+	"PUT /api/v1/secrets/{key} #scope=hub":      "env/secrets segment",
+	"PATCH /api/v1/secrets/{key} #scope=hub":    "env/secrets segment",
+	"DELETE /api/v1/secrets/{key} #scope=hub":   "env/secrets segment",
+	"GET /api/v1/secrets #scope=agent":          "env/secrets segment",
+	"GET /api/v1/secrets/{key} #scope=agent":    "env/secrets segment",
+	"PUT /api/v1/secrets/{key} #scope=agent":    "env/secrets segment",
+	"PATCH /api/v1/secrets/{key} #scope=agent":  "env/secrets segment",
+	"DELETE /api/v1/secrets/{key} #scope=agent": "env/secrets segment",
 	// The merged user secret list returns metadata and provenance only,
 	// never a value, like the plain user secret list.
 	"GET /api/v1/secrets #scope=user&includePending=true": "env/secrets segment",
@@ -181,11 +187,21 @@ var compressBypassedUntagged = map[string]string{
 	// Agent auth reset: the path ends in agents/{segment} like an agent item.
 	"POST /api/v1/admin/agents/reset-auth-all": "item route",
 
-	// Agent-token decision routes: /api/v1/agent/ is bypassed as a whole for
-	// secrets and GCP tokens; decision list, show, and interpreted record
-	// carry decision state only, never a credential.
+	// Agent-token decision and hub-metadata routes: /api/v1/agent/ is bypassed
+	// as a whole for secrets and GCP tokens; these routes carry decision state
+	// or non-secret hub_id only, never a credential.
 	"exemption /api/v1/agent/decisions":  "agent prefix",
 	"exemption /api/v1/agent/decisions/": "agent prefix",
+	"exemption GET /api/v1/agent/hub":    "agent prefix",
+
+	// Secret-request routes: /api/v1/secret-requests/ matches the "secret"
+	// bypass rule and /api/v1/agent/ is bypassed as a whole; none of these
+	// responses carry secret values (only request metadata and status).
+	"GET /api/v1/secret-requests/{messageId}":          "secret path substring",
+	"POST /api/v1/secret-requests/{messageId}/fulfill": "secret path substring",
+	"POST /api/v1/secret-requests/{messageId}/dismiss": "secret path substring",
+	"exemption /api/v1/agent/secret-requests":          "agent prefix",
+	"exemption /api/v1/agent/secret-requests/":         "agent prefix",
 }
 
 // compressRequestBypassed mirrors the MountHubAPI decision: the request

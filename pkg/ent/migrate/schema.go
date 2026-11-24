@@ -823,6 +823,35 @@ var (
 			},
 		},
 	}
+	// AgentSuspendScreensColumns holds the columns for the "agent_suspend_screens" table.
+	AgentSuspendScreensColumns = []*schema.Column{
+		{Name: "id", Type: field.TypeUUID},
+		{Name: "content", Type: field.TypeString, Size: 2147483647},
+		{Name: "truncated", Type: field.TypeBool, Default: false},
+		{Name: "captured_at", Type: field.TypeTime},
+		{Name: "agent_id", Type: field.TypeUUID, Unique: true},
+	}
+	// AgentSuspendScreensTable holds the schema information for the "agent_suspend_screens" table.
+	AgentSuspendScreensTable = &schema.Table{
+		Name:       "agent_suspend_screens",
+		Columns:    AgentSuspendScreensColumns,
+		PrimaryKey: []*schema.Column{AgentSuspendScreensColumns[0]},
+		ForeignKeys: []*schema.ForeignKey{
+			{
+				Symbol:     "agent_suspend_screens_agents_suspend_screen",
+				Columns:    []*schema.Column{AgentSuspendScreensColumns[4]},
+				RefColumns: []*schema.Column{AgentsColumns[0]},
+				OnDelete:   schema.Cascade,
+			},
+		},
+		Indexes: []*schema.Index{
+			{
+				Name:    "agentsuspendscreen_agent_id",
+				Unique:  true,
+				Columns: []*schema.Column{AgentSuspendScreensColumns[4]},
+			},
+		},
+	}
 	// AllowListColumns holds the columns for the "allow_list" table.
 	AllowListColumns = []*schema.Column{
 		{Name: "id", Type: field.TypeUUID},
@@ -1193,6 +1222,7 @@ var (
 		{Name: "default_agent_id", Type: field.TypeUUID, Nullable: true},
 		{Name: "drift_state", Type: field.TypeEnum, Enums: []string{"active", "orphaned", "unresolvable"}, Default: "active"},
 		{Name: "last_activity_at", Type: field.TypeTime},
+		{Name: "last_message_seq", Type: field.TypeInt64, Default: 0},
 		{Name: "created_at", Type: field.TypeTime},
 		{Name: "archived_at", Type: field.TypeTime, Nullable: true},
 		{Name: "deleted_at", Type: field.TypeTime, Nullable: true},
@@ -1224,7 +1254,7 @@ var (
 			{
 				Name:    "conversation_deleted_at",
 				Unique:  false,
-				Columns: []*schema.Column{ConversationsColumns[12]},
+				Columns: []*schema.Column{ConversationsColumns[13]},
 				Annotation: &entsql.IndexAnnotation{
 					Where: "deleted_at IS NOT NULL",
 				},
@@ -1282,6 +1312,7 @@ var (
 		{Name: "other_placeholder", Type: field.TypeString, Nullable: true, Size: 100},
 		{Name: "intro_length", Type: field.TypeInt, Default: 0},
 		{Name: "status", Type: field.TypeEnum, Enums: []string{"pending", "decided", "replaced", "withdrawn", "dismissed"}, Default: "pending"},
+		{Name: "settled", Type: field.TypeBool, Default: false},
 		{Name: "replaced_by_id", Type: field.TypeUUID, Nullable: true},
 		{Name: "created_at", Type: field.TypeTime},
 		{Name: "decided_at", Type: field.TypeTime, Nullable: true},
@@ -1317,6 +1348,14 @@ var (
 				Columns: []*schema.Column{DecisionsColumns[1], DecisionsColumns[3], DecisionsColumns[20]},
 			},
 			{
+				Name:    "decision_project_id_chat_key",
+				Unique:  false,
+				Columns: []*schema.Column{DecisionsColumns[1], DecisionsColumns[3]},
+				Annotation: &entsql.IndexAnnotation{
+					Where: "settled = false",
+				},
+			},
+			{
 				Name:    "decision_message_id_position",
 				Unique:  false,
 				Columns: []*schema.Column{DecisionsColumns[4], DecisionsColumns[5]},
@@ -1348,7 +1387,7 @@ var (
 		{Name: "dismiss_reason", Type: field.TypeString, Nullable: true, Size: 2147483647},
 		{Name: "interpreted_by_agent_id", Type: field.TypeUUID, Nullable: true},
 		{Name: "source_message_id", Type: field.TypeUUID, Nullable: true},
-		{Name: "surface", Type: field.TypeEnum, Enums: []string{"native", "decisions_page", "slack", "google_chat", "discord", "telegram", "teams", "other"}},
+		{Name: "surface", Type: field.TypeEnum, Enums: []string{"native", "decisions_page", "inbox", "slack", "google_chat", "discord", "telegram", "teams", "other"}},
 		{Name: "response_message_id", Type: field.TypeUUID},
 		{Name: "authorizing_user_id", Type: field.TypeString, Nullable: true},
 		{Name: "delegation_grant_id", Type: field.TypeString, Nullable: true},
@@ -1658,6 +1697,28 @@ var (
 			},
 		},
 	}
+	// ExecRunOutputsColumns holds the columns for the "exec_run_outputs" table.
+	ExecRunOutputsColumns = []*schema.Column{
+		{Name: "run_id", Type: field.TypeUUID},
+		{Name: "owner_kind", Type: field.TypeEnum, Enums: []string{"scheduled_exec"}},
+		{Name: "project_id", Type: field.TypeUUID},
+		{Name: "capture_mode", Type: field.TypeString},
+		{Name: "content", Type: field.TypeBytes, Size: 65536},
+		{Name: "created_at", Type: field.TypeTime},
+	}
+	// ExecRunOutputsTable holds the schema information for the "exec_run_outputs" table.
+	ExecRunOutputsTable = &schema.Table{
+		Name:       "exec_run_outputs",
+		Columns:    ExecRunOutputsColumns,
+		PrimaryKey: []*schema.Column{ExecRunOutputsColumns[0]},
+		Indexes: []*schema.Index{
+			{
+				Name:    "execrunoutput_owner_kind_project_id",
+				Unique:  false,
+				Columns: []*schema.Column{ExecRunOutputsColumns[1], ExecRunOutputsColumns[2]},
+			},
+		},
+	}
 	// ExternalIdentitiesColumns holds the columns for the "external_identities" table.
 	ExternalIdentitiesColumns = []*schema.Column{
 		{Name: "id", Type: field.TypeUUID},
@@ -1872,6 +1933,11 @@ var (
 				Name:    "groupmembership_issuance_id",
 				Unique:  false,
 				Columns: []*schema.Column{GroupMembershipsColumns[5]},
+			},
+			{
+				Name:    "groupmembership_user_id",
+				Unique:  false,
+				Columns: []*schema.Column{GroupMembershipsColumns[7]},
 			},
 			{
 				Name:    "groupmembership_group_id_user_id",
@@ -2298,6 +2364,7 @@ var (
 		{Name: "channel", Type: field.TypeString, Nullable: true, Size: 64},
 		{Name: "thread_id", Type: field.TypeString, Nullable: true, Size: 256},
 		{Name: "conversation_id", Type: field.TypeUUID, Nullable: true},
+		{Name: "conversation_seq", Type: field.TypeInt64, Nullable: true},
 		{Name: "sender_project_id", Type: field.TypeUUID, Nullable: true},
 		{Name: "recipient_project_id", Type: field.TypeUUID, Nullable: true},
 		{Name: "authorizing_user_id", Type: field.TypeString, Nullable: true},
@@ -2324,7 +2391,7 @@ var (
 			{
 				Name:    "message_created",
 				Unique:  false,
-				Columns: []*schema.Column{MessagesColumns[31]},
+				Columns: []*schema.Column{MessagesColumns[32]},
 			},
 			{
 				Name:    "message_conversation_id",
@@ -2332,39 +2399,44 @@ var (
 				Columns: []*schema.Column{MessagesColumns[25]},
 			},
 			{
+				Name:    "message_conversation_id_conversation_seq",
+				Unique:  false,
+				Columns: []*schema.Column{MessagesColumns[25], MessagesColumns[26]},
+			},
+			{
 				Name:    "message_conversation_id_channel_created_id",
 				Unique:  false,
-				Columns: []*schema.Column{MessagesColumns[25], MessagesColumns[23], MessagesColumns[31], MessagesColumns[0]},
+				Columns: []*schema.Column{MessagesColumns[25], MessagesColumns[23], MessagesColumns[32], MessagesColumns[0]},
 			},
 			{
 				Name:    "message_thread_id_channel_created_id",
 				Unique:  false,
-				Columns: []*schema.Column{MessagesColumns[24], MessagesColumns[23], MessagesColumns[31], MessagesColumns[0]},
+				Columns: []*schema.Column{MessagesColumns[24], MessagesColumns[23], MessagesColumns[32], MessagesColumns[0]},
 			},
 			{
 				Name:    "message_project_id_created_id",
 				Unique:  false,
-				Columns: []*schema.Column{MessagesColumns[1], MessagesColumns[31], MessagesColumns[0]},
+				Columns: []*schema.Column{MessagesColumns[1], MessagesColumns[32], MessagesColumns[0]},
 			},
 			{
 				Name:    "message_sender_id_created_id",
 				Unique:  false,
-				Columns: []*schema.Column{MessagesColumns[3], MessagesColumns[31], MessagesColumns[0]},
+				Columns: []*schema.Column{MessagesColumns[3], MessagesColumns[32], MessagesColumns[0]},
 			},
 			{
 				Name:    "message_recipient_id_created_id",
 				Unique:  false,
-				Columns: []*schema.Column{MessagesColumns[5], MessagesColumns[31], MessagesColumns[0]},
+				Columns: []*schema.Column{MessagesColumns[5], MessagesColumns[32], MessagesColumns[0]},
 			},
 			{
 				Name:    "message_project_id_sender_created_id",
 				Unique:  false,
-				Columns: []*schema.Column{MessagesColumns[1], MessagesColumns[2], MessagesColumns[31], MessagesColumns[0]},
+				Columns: []*schema.Column{MessagesColumns[1], MessagesColumns[2], MessagesColumns[32], MessagesColumns[0]},
 			},
 			{
 				Name:    "message_created_id",
 				Unique:  false,
-				Columns: []*schema.Column{MessagesColumns[31], MessagesColumns[0]},
+				Columns: []*schema.Column{MessagesColumns[32], MessagesColumns[0]},
 				Annotation: &entsql.IndexAnnotation{
 					Where: "dispatch_state = 'pending'",
 				},
@@ -2372,7 +2444,7 @@ var (
 			{
 				Name:    "message_failed_created_id",
 				Unique:  false,
-				Columns: []*schema.Column{MessagesColumns[31], MessagesColumns[0]},
+				Columns: []*schema.Column{MessagesColumns[32], MessagesColumns[0]},
 				Annotation: &entsql.IndexAnnotation{
 					Where: "dispatch_state = 'failed'",
 				},
@@ -2388,7 +2460,7 @@ var (
 			{
 				Name:    "message_awaiting_session_created_id",
 				Unique:  false,
-				Columns: []*schema.Column{MessagesColumns[31], MessagesColumns[0]},
+				Columns: []*schema.Column{MessagesColumns[32], MessagesColumns[0]},
 				Annotation: &entsql.IndexAnnotation{
 					Where: "dispatch_state = 'awaiting_session'",
 				},
@@ -2396,7 +2468,7 @@ var (
 			{
 				Name:    "message_awaiting_session_recipient_created_id",
 				Unique:  false,
-				Columns: []*schema.Column{MessagesColumns[5], MessagesColumns[31], MessagesColumns[0]},
+				Columns: []*schema.Column{MessagesColumns[5], MessagesColumns[32], MessagesColumns[0]},
 				Annotation: &entsql.IndexAnnotation{
 					Where: "dispatch_state = 'awaiting_session'",
 				},
@@ -2404,7 +2476,7 @@ var (
 			{
 				Name:    "message_sender_id_recipient_id_created_id",
 				Unique:  false,
-				Columns: []*schema.Column{MessagesColumns[3], MessagesColumns[5], MessagesColumns[31], MessagesColumns[0]},
+				Columns: []*schema.Column{MessagesColumns[3], MessagesColumns[5], MessagesColumns[32], MessagesColumns[0]},
 				Annotation: &entsql.IndexAnnotation{
 					Where: "recipient_id IS NOT NULL",
 				},
@@ -2412,7 +2484,7 @@ var (
 			{
 				Name:    "message_thread_id_created_id",
 				Unique:  false,
-				Columns: []*schema.Column{MessagesColumns[24], MessagesColumns[31], MessagesColumns[0]},
+				Columns: []*schema.Column{MessagesColumns[24], MessagesColumns[32], MessagesColumns[0]},
 			},
 		},
 	}
@@ -2566,6 +2638,7 @@ var (
 		{Name: "actor_kind", Type: field.TypeString, Nullable: true},
 		{Name: "agent_delegation_code", Type: field.TypeString, Nullable: true},
 		{Name: "provenance_basis", Type: field.TypeString, Nullable: true},
+		{Name: "session_mode", Type: field.TypeString, Nullable: true},
 	}
 	// MutationAuditsTable holds the schema information for the "mutation_audits" table.
 	MutationAuditsTable = &schema.Table{
@@ -3115,6 +3188,7 @@ var (
 		{Name: "endpoint", Type: field.TypeString, Nullable: true},
 		{Name: "created_by", Type: field.TypeString, Nullable: true},
 		{Name: "auto_provide", Type: field.TypeBool, Default: false},
+		{Name: "admin_managed", Type: field.TypeBool, Default: false},
 		{Name: "gcp_host_service_account_email", Type: field.TypeString, Nullable: true},
 		{Name: "gcp_host_project_id", Type: field.TypeString, Nullable: true},
 		{Name: "gcp_host_source", Type: field.TypeString, Nullable: true, Default: ""},
@@ -3158,7 +3232,7 @@ var (
 			{
 				Name:    "runtimebroker_runtime_target_id",
 				Unique:  true,
-				Columns: []*schema.Column{RuntimeBrokersColumns[31]},
+				Columns: []*schema.Column{RuntimeBrokersColumns[32]},
 			},
 		},
 	}
@@ -3337,6 +3411,7 @@ var (
 	ScheduledExecRunsColumns = []*schema.Column{
 		{Name: "id", Type: field.TypeUUID},
 		{Name: "schedule_id", Type: field.TypeUUID, Nullable: true},
+		{Name: "overlap_key", Type: field.TypeString, Size: 128, Default: ""},
 		{Name: "project_id", Type: field.TypeUUID},
 		{Name: "target_agent_id", Type: field.TypeUUID},
 		{Name: "initiator_principal_kind", Type: field.TypeString, Default: ""},
@@ -3357,11 +3432,14 @@ var (
 		{Name: "exit_code", Type: field.TypeInt, Nullable: true},
 		{Name: "duration_ms", Type: field.TypeInt64, Nullable: true},
 		{Name: "output_bytes", Type: field.TypeInt64, Nullable: true},
+		{Name: "capture_mode", Type: field.TypeString, Default: ""},
+		{Name: "output_status", Type: field.TypeString, Default: ""},
 		{Name: "runtime", Type: field.TypeString, Default: ""},
 		{Name: "launch_id", Type: field.TypeString, Default: ""},
 		{Name: "last_polled_at", Type: field.TypeTime},
 		{Name: "poll_seq", Type: field.TypeInt64, Default: 0},
-		{Name: "event_id", Type: field.TypeUUID, Unique: true},
+		{Name: "event_id", Type: field.TypeUUID, Unique: true, Nullable: true},
+		{Name: "fire_id", Type: field.TypeUUID, Unique: true, Nullable: true},
 	}
 	// ScheduledExecRunsTable holds the schema information for the "scheduled_exec_runs" table.
 	ScheduledExecRunsTable = &schema.Table{
@@ -3371,8 +3449,14 @@ var (
 		ForeignKeys: []*schema.ForeignKey{
 			{
 				Symbol:     "scheduled_exec_runs_scheduled_events_exec_run",
-				Columns:    []*schema.Column{ScheduledExecRunsColumns[26]},
+				Columns:    []*schema.Column{ScheduledExecRunsColumns[29]},
 				RefColumns: []*schema.Column{ScheduledEventsColumns[0]},
+				OnDelete:   schema.Cascade,
+			},
+			{
+				Symbol:     "scheduled_exec_runs_trigger_fires_exec_run",
+				Columns:    []*schema.Column{ScheduledExecRunsColumns[30]},
+				RefColumns: []*schema.Column{TriggerFiresColumns[0]},
 				OnDelete:   schema.Cascade,
 			},
 		},
@@ -3380,32 +3464,37 @@ var (
 			{
 				Name:    "scheduledexecrun_schedule_id_finished_at",
 				Unique:  false,
-				Columns: []*schema.Column{ScheduledExecRunsColumns[1], ScheduledExecRunsColumns[17]},
+				Columns: []*schema.Column{ScheduledExecRunsColumns[1], ScheduledExecRunsColumns[18]},
+			},
+			{
+				Name:    "scheduledexecrun_overlap_key_finished_at",
+				Unique:  false,
+				Columns: []*schema.Column{ScheduledExecRunsColumns[2], ScheduledExecRunsColumns[18]},
 			},
 			{
 				Name:    "scheduledexecrun_target_agent_id_finished_at",
 				Unique:  false,
-				Columns: []*schema.Column{ScheduledExecRunsColumns[3], ScheduledExecRunsColumns[17]},
+				Columns: []*schema.Column{ScheduledExecRunsColumns[4], ScheduledExecRunsColumns[18]},
 			},
 			{
 				Name:    "scheduledexecrun_target_agent_id_finished_at_poll_seq",
 				Unique:  false,
-				Columns: []*schema.Column{ScheduledExecRunsColumns[3], ScheduledExecRunsColumns[17], ScheduledExecRunsColumns[25]},
+				Columns: []*schema.Column{ScheduledExecRunsColumns[4], ScheduledExecRunsColumns[18], ScheduledExecRunsColumns[28]},
 			},
 			{
 				Name:    "scheduledexecrun_project_id",
 				Unique:  false,
-				Columns: []*schema.Column{ScheduledExecRunsColumns[2]},
+				Columns: []*schema.Column{ScheduledExecRunsColumns[3]},
 			},
 			{
 				Name:    "scheduledexecrun_finished_at_lease_until",
 				Unique:  false,
-				Columns: []*schema.Column{ScheduledExecRunsColumns[17], ScheduledExecRunsColumns[16]},
+				Columns: []*schema.Column{ScheduledExecRunsColumns[18], ScheduledExecRunsColumns[17]},
 			},
 			{
 				Name:    "scheduledexecrun_finished_at_last_polled_at",
 				Unique:  false,
-				Columns: []*schema.Column{ScheduledExecRunsColumns[17], ScheduledExecRunsColumns[24]},
+				Columns: []*schema.Column{ScheduledExecRunsColumns[18], ScheduledExecRunsColumns[27]},
 			},
 		},
 	}
@@ -3443,6 +3532,79 @@ var (
 				Name:    "secret_scope_scope_id",
 				Unique:  false,
 				Columns: []*schema.Column{SecretsColumns[6], SecretsColumns[7]},
+			},
+		},
+	}
+	// SecretRequestsColumns holds the columns for the "secret_requests" table.
+	SecretRequestsColumns = []*schema.Column{
+		{Name: "id", Type: field.TypeUUID},
+		{Name: "project_id", Type: field.TypeUUID},
+		{Name: "agent_id", Type: field.TypeUUID},
+		{Name: "agent_name", Type: field.TypeString},
+		{Name: "key", Type: field.TypeString, Size: 128},
+		{Name: "key_norm", Type: field.TypeString, Size: 128},
+		{Name: "version", Type: field.TypeInt},
+		{Name: "description", Type: field.TypeString, Size: 2147483647, Default: ""},
+		{Name: "secret_type", Type: field.TypeEnum, Enums: []string{"environment", "file", "variable"}, Default: "environment"},
+		{Name: "target", Type: field.TypeString, Nullable: true, Size: 256},
+		{Name: "message_id", Type: field.TypeUUID},
+		{Name: "position", Type: field.TypeInt},
+		{Name: "intro_length", Type: field.TypeInt, Default: 0},
+		{Name: "conversation_id", Type: field.TypeUUID, Nullable: true},
+		{Name: "chat_key", Type: field.TypeString, Nullable: true, Size: 256},
+		{Name: "status", Type: field.TypeEnum, Enums: []string{"pending", "fulfilling", "fulfilled", "replaced", "withdrawn", "dismissed", "expired"}, Default: "pending"},
+		{Name: "replaced_by_id", Type: field.TypeUUID, Nullable: true},
+		{Name: "replaced_at", Type: field.TypeTime, Nullable: true},
+		{Name: "withdrawn_reason", Type: field.TypeString, Nullable: true, Size: 2147483647},
+		{Name: "withdrawn_by", Type: field.TypeString, Nullable: true, Size: 32},
+		{Name: "resolved_by_user_id", Type: field.TypeString, Nullable: true, Size: 128},
+		{Name: "resolved_by_name", Type: field.TypeString, Nullable: true, Size: 256},
+		{Name: "resolved_by_email", Type: field.TypeString, Nullable: true, Size: 256},
+		{Name: "dismiss_reason", Type: field.TypeString, Nullable: true, Size: 2147483647},
+		{Name: "surface", Type: field.TypeEnum, Nullable: true, Enums: []string{"native", "standalone_page"}},
+		{Name: "idempotency_key", Type: field.TypeString, Nullable: true, Size: 128},
+		{Name: "response_message_id", Type: field.TypeUUID, Nullable: true},
+		{Name: "secret_version", Type: field.TypeInt, Nullable: true},
+		{Name: "claimed_at", Type: field.TypeTime, Nullable: true},
+		{Name: "created_at", Type: field.TypeTime},
+		{Name: "expires_at", Type: field.TypeTime},
+		{Name: "resolved_at", Type: field.TypeTime, Nullable: true},
+	}
+	// SecretRequestsTable holds the schema information for the "secret_requests" table.
+	SecretRequestsTable = &schema.Table{
+		Name:       "secret_requests",
+		Columns:    SecretRequestsColumns,
+		PrimaryKey: []*schema.Column{SecretRequestsColumns[0]},
+		Indexes: []*schema.Index{
+			{
+				Name:    "secretrequest_agent_id_key_norm_version",
+				Unique:  true,
+				Columns: []*schema.Column{SecretRequestsColumns[2], SecretRequestsColumns[5], SecretRequestsColumns[6]},
+			},
+			{
+				Name:    "secretrequest_agent_id_status",
+				Unique:  false,
+				Columns: []*schema.Column{SecretRequestsColumns[2], SecretRequestsColumns[15]},
+			},
+			{
+				Name:    "secretrequest_status_expires_at",
+				Unique:  false,
+				Columns: []*schema.Column{SecretRequestsColumns[15], SecretRequestsColumns[30]},
+			},
+			{
+				Name:    "secretrequest_status_claimed_at",
+				Unique:  false,
+				Columns: []*schema.Column{SecretRequestsColumns[15], SecretRequestsColumns[28]},
+			},
+			{
+				Name:    "secretrequest_message_id_position",
+				Unique:  false,
+				Columns: []*schema.Column{SecretRequestsColumns[10], SecretRequestsColumns[11]},
+			},
+			{
+				Name:    "secretrequest_project_id_created_at",
+				Unique:  false,
+				Columns: []*schema.Column{SecretRequestsColumns[1], SecretRequestsColumns[29]},
 			},
 		},
 	}
@@ -3681,6 +3843,7 @@ var (
 		{Name: "created_by", Type: field.TypeString, Nullable: true},
 		{Name: "updated_by", Type: field.TypeString, Nullable: true},
 		{Name: "source_url", Type: field.TypeString, Nullable: true},
+		{Name: "source_commit", Type: field.TypeString, Nullable: true},
 		{Name: "created", Type: field.TypeTime},
 		{Name: "updated", Type: field.TypeTime},
 	}
@@ -3883,6 +4046,7 @@ var (
 		{Name: "subject_dialect", Type: field.TypeString, Default: "cel"},
 		{Name: "subject_rule", Type: field.TypeString, Size: 2147483647, Default: ""},
 		{Name: "subject_mode", Type: field.TypeString, Default: "new"},
+		{Name: "coalesce_window_seconds", Type: field.TypeInt, Default: 0},
 		{Name: "status", Type: field.TypeString, Default: "active"},
 		{Name: "status_reason", Type: field.TypeString, Nullable: true},
 		{Name: "last_fire_at", Type: field.TypeTime, Nullable: true},
@@ -3918,7 +4082,7 @@ var (
 			{
 				Name:    "trigger_project_id_source_kind_source_id_status",
 				Unique:  false,
-				Columns: []*schema.Column{TriggersColumns[16], TriggersColumns[19], TriggersColumns[20], TriggersColumns[31]},
+				Columns: []*schema.Column{TriggersColumns[16], TriggersColumns[19], TriggersColumns[20], TriggersColumns[32]},
 			},
 			{
 				Name:    "trigger_initiator_principal_id",
@@ -4003,9 +4167,12 @@ var (
 		{Name: "matched_through", Type: field.TypeString, Nullable: true, Size: 16},
 		{Name: "decided_dialect", Type: field.TypeString, Nullable: true, Size: 32},
 		{Name: "rule_trace", Type: field.TypeString, Nullable: true, Size: 4096},
+		{Name: "target_agent_id", Type: field.TypeUUID, Nullable: true},
 		{Name: "executor_kind", Type: field.TypeString, Default: ""},
 		{Name: "executor_id", Type: field.TypeString, Default: ""},
 		{Name: "lease_until", Type: field.TypeTime},
+		{Name: "not_before", Type: field.TypeTime, Nullable: true},
+		{Name: "deferred_at", Type: field.TypeTime, Nullable: true},
 		{Name: "started_at", Type: field.TypeTime},
 		{Name: "finished_at", Type: field.TypeTime, Nullable: true},
 		{Name: "created", Type: field.TypeTime},
@@ -4019,7 +4186,7 @@ var (
 			{
 				Name:    "triggerfire_trigger_id_created",
 				Unique:  false,
-				Columns: []*schema.Column{TriggerFiresColumns[9], TriggerFiresColumns[24]},
+				Columns: []*schema.Column{TriggerFiresColumns[9], TriggerFiresColumns[27]},
 			},
 			{
 				Name:    "triggerfire_event_id_trigger_id",
@@ -4034,7 +4201,54 @@ var (
 			{
 				Name:    "triggerfire_status_lease_until",
 				Unique:  false,
-				Columns: []*schema.Column{TriggerFiresColumns[13], TriggerFiresColumns[21]},
+				Columns: []*schema.Column{TriggerFiresColumns[13], TriggerFiresColumns[22]},
+			},
+			{
+				Name:    "triggerfire_target_agent_id_status",
+				Unique:  false,
+				Columns: []*schema.Column{TriggerFiresColumns[19], TriggerFiresColumns[13]},
+			},
+			{
+				Name:    "triggerfire_result_ref",
+				Unique:  false,
+				Columns: []*schema.Column{TriggerFiresColumns[15]},
+			},
+		},
+	}
+	// TriggerSubjectClaimsColumns holds the columns for the "trigger_subject_claims" table.
+	TriggerSubjectClaimsColumns = []*schema.Column{
+		{Name: "id", Type: field.TypeUUID},
+		{Name: "trigger_id", Type: field.TypeUUID},
+		{Name: "subject", Type: field.TypeString, Size: 256},
+		{Name: "state", Type: field.TypeString, Default: "active"},
+		{Name: "agent_id", Type: field.TypeUUID, Nullable: true},
+		{Name: "event_id", Type: field.TypeUUID},
+		{Name: "fire_id", Type: field.TypeUUID},
+		{Name: "claimed_at", Type: field.TypeTime},
+		{Name: "bound_at", Type: field.TypeTime, Nullable: true},
+		{Name: "released_at", Type: field.TypeTime, Nullable: true},
+		{Name: "release_reason", Type: field.TypeString, Nullable: true},
+	}
+	// TriggerSubjectClaimsTable holds the schema information for the "trigger_subject_claims" table.
+	TriggerSubjectClaimsTable = &schema.Table{
+		Name:       "trigger_subject_claims",
+		Columns:    TriggerSubjectClaimsColumns,
+		PrimaryKey: []*schema.Column{TriggerSubjectClaimsColumns[0]},
+		Indexes: []*schema.Index{
+			{
+				Name:    "triggersubjectclaim_trigger_id_subject",
+				Unique:  true,
+				Columns: []*schema.Column{TriggerSubjectClaimsColumns[1], TriggerSubjectClaimsColumns[2]},
+			},
+			{
+				Name:    "triggersubjectclaim_agent_id",
+				Unique:  false,
+				Columns: []*schema.Column{TriggerSubjectClaimsColumns[4]},
+			},
+			{
+				Name:    "triggersubjectclaim_state_released_at",
+				Unique:  false,
+				Columns: []*schema.Column{TriggerSubjectClaimsColumns[3], TriggerSubjectClaimsColumns[9]},
 			},
 		},
 	}
@@ -4241,6 +4455,35 @@ var (
 			},
 		},
 	}
+	// UserExecContainersColumns holds the columns for the "user_exec_containers" table.
+	UserExecContainersColumns = []*schema.Column{
+		{Name: "id", Type: field.TypeUUID},
+		{Name: "agent_id", Type: field.TypeUUID},
+		{Name: "created_at", Type: field.TypeTime},
+		{Name: "updated_at", Type: field.TypeTime},
+		{Name: "user_id", Type: field.TypeUUID, Unique: true},
+	}
+	// UserExecContainersTable holds the schema information for the "user_exec_containers" table.
+	UserExecContainersTable = &schema.Table{
+		Name:       "user_exec_containers",
+		Columns:    UserExecContainersColumns,
+		PrimaryKey: []*schema.Column{UserExecContainersColumns[0]},
+		ForeignKeys: []*schema.ForeignKey{
+			{
+				Symbol:     "user_exec_containers_users_exec_container",
+				Columns:    []*schema.Column{UserExecContainersColumns[4]},
+				RefColumns: []*schema.Column{UsersColumns[0]},
+				OnDelete:   schema.Cascade,
+			},
+		},
+		Indexes: []*schema.Index{
+			{
+				Name:    "userexeccontainer_agent_id",
+				Unique:  false,
+				Columns: []*schema.Column{UserExecContainersColumns[1]},
+			},
+		},
+	}
 	// UserTerminalWorkspacesColumns holds the columns for the "user_terminal_workspaces" table.
 	UserTerminalWorkspacesColumns = []*schema.Column{
 		{Name: "id", Type: field.TypeUUID},
@@ -4352,6 +4595,7 @@ var (
 		AgentReincarnationsTable,
 		AgentServiceAccountAssignmentsTable,
 		AgentSessionMetricsTable,
+		AgentSuspendScreensTable,
 		AllowListTable,
 		APIKeysTable,
 		BrokerDispatchTable,
@@ -4375,6 +4619,7 @@ var (
 		DurableQueueItemsTable,
 		EntitlementBindingsTable,
 		EnvVarsTable,
+		ExecRunOutputsTable,
 		ExternalIdentitiesTable,
 		GcpServiceAccountsTable,
 		GithubResolutionCacheTable,
@@ -4422,6 +4667,7 @@ var (
 		ScheduledExecPollCursorsTable,
 		ScheduledExecRunsTable,
 		SecretsTable,
+		SecretRequestsTable,
 		SkillsTable,
 		SkillInjectionsTable,
 		SkillRegistriesTable,
@@ -4437,11 +4683,13 @@ var (
 		TriggersTable,
 		TriggerEventsTable,
 		TriggerFiresTable,
+		TriggerSubjectClaimsTable,
 		UsageReservationsTable,
 		UsersTable,
 		UserAccessTokensTable,
 		UserDeletionsTable,
 		UserDeletionAgentsTable,
+		UserExecContainersTable,
 		UserTerminalWorkspacesTable,
 		WebhookEndpointsTable,
 		GroupChildGroupsTable,
@@ -4483,6 +4731,10 @@ func init() {
 	}
 	AgentSessionMetricsTable.Annotation = &entsql.Annotation{
 		Table: "agent_session_metrics",
+	}
+	AgentSuspendScreensTable.ForeignKeys[0].RefTable = AgentsTable
+	AgentSuspendScreensTable.Annotation = &entsql.Annotation{
+		Table: "agent_suspend_screens",
 	}
 	AllowListTable.Annotation = &entsql.Annotation{
 		Table: "allow_list",
@@ -4540,6 +4792,9 @@ func init() {
 	EntitlementBindingsTable.ForeignKeys[0].RefTable = LimitDefinitionsTable
 	EnvVarsTable.Annotation = &entsql.Annotation{
 		Table: "env_vars",
+	}
+	ExecRunOutputsTable.Annotation = &entsql.Annotation{
+		Table: "exec_run_outputs",
 	}
 	ExternalIdentitiesTable.ForeignKeys[0].RefTable = UsersTable
 	ExternalIdentitiesTable.Annotation = &entsql.Annotation{
@@ -4661,11 +4916,18 @@ func init() {
 		Table: "scheduled_exec_poll_cursors",
 	}
 	ScheduledExecRunsTable.ForeignKeys[0].RefTable = ScheduledEventsTable
+	ScheduledExecRunsTable.ForeignKeys[1].RefTable = TriggerFiresTable
 	ScheduledExecRunsTable.Annotation = &entsql.Annotation{
 		Table: "scheduled_exec_runs",
 	}
+	ScheduledExecRunsTable.Annotation.Checks = map[string]string{
+		"scheduled_exec_runs_single_owner": "((event_id IS NOT NULL AND fire_id IS NULL) OR (event_id IS NULL AND fire_id IS NOT NULL))",
+	}
 	SecretsTable.Annotation = &entsql.Annotation{
 		Table: "secrets",
+	}
+	SecretRequestsTable.Annotation = &entsql.Annotation{
+		Table: "secret_requests",
 	}
 	SkillsTable.Annotation = &entsql.Annotation{
 		Table: "skills",
@@ -4710,6 +4972,9 @@ func init() {
 	TriggerFiresTable.Annotation = &entsql.Annotation{
 		Table: "trigger_fires",
 	}
+	TriggerSubjectClaimsTable.Annotation = &entsql.Annotation{
+		Table: "trigger_subject_claims",
+	}
 	UsageReservationsTable.ForeignKeys[0].RefTable = LimitDefinitionsTable
 	UsersTable.Annotation = &entsql.Annotation{
 		Table: "users",
@@ -4731,6 +4996,10 @@ func init() {
 	UserDeletionAgentsTable.ForeignKeys[0].RefTable = UserDeletionsTable
 	UserDeletionAgentsTable.Annotation = &entsql.Annotation{
 		Table: "user_deletion_agents",
+	}
+	UserExecContainersTable.ForeignKeys[0].RefTable = UsersTable
+	UserExecContainersTable.Annotation = &entsql.Annotation{
+		Table: "user_exec_containers",
 	}
 	UserTerminalWorkspacesTable.ForeignKeys[0].RefTable = UsersTable
 	UserTerminalWorkspacesTable.Annotation = &entsql.Annotation{

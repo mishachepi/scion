@@ -39,8 +39,9 @@ const windowsHubTokenPath = "hub" + ".token"
 // unsupported on Windows until someone adds it here deliberately, after
 // checking that it touches no local file path that is not protected on
 // Windows. The server, the Runtime Broker and agent-mode commands are
-// deliberately absent (whoami, expose and unexpose read in-container token
-// files). Widening the set is a product decision.
+// deliberately absent (whoami, expose, unexpose, and secret / secret.request.*
+// require an in-container agent identity and token). Widening the set is a
+// product decision.
 var windowsAllowed = map[string]bool{
 	"list":          true,
 	"ssh":           true,
@@ -65,6 +66,7 @@ var windowsAllowed = map[string]bool{
 	"conversation.join":         true,
 	"conversation.leave":        true,
 	"conversation.catch-up":     true,
+	"conversation.watch":        true,
 	"conversation.group":        true,
 	"conversation.group.list":   true,
 	"conversation.group.get":    true,
@@ -82,15 +84,21 @@ var windowsAllowed = map[string]bool{
 	"decisions.record":   true,
 	"decisions.withdraw": true,
 
+	// Inbox summary (ptone/scion#9008, parent ptone/scion#8962): pure Hub API
+	// call, no local writes.
+	"inbox": true,
+
 	// Event triggers and webhook endpoints (ptone/scion#8028): pure Hub API
 	// calls, no local writes.
 	"trigger":                true,
 	"trigger.create":         true,
+	"trigger.update":         true,
 	"trigger.get":            true,
 	"trigger.list":           true,
 	"trigger.delete":         true,
 	"trigger.pause":          true,
 	"trigger.resume":         true,
+	"trigger.render":         true,
 	"trigger.history":        true,
 	"trigger.event":          true,
 	"trigger.event.list":     true,
@@ -104,6 +112,15 @@ var windowsAllowed = map[string]bool{
 	"trigger.preset.list":    true,
 	"trigger.preset.show":    true,
 	"trigger.preset.apply":   true,
+	// GitHub trigger source status, settings, and primary routing
+	// (ptone/scion#8092): pure Hub API calls, no local writes.
+	"trigger.github":               true,
+	"trigger.github.status":        true,
+	"trigger.github.settings":      true,
+	"trigger.github.primary":       true,
+	"trigger.github.primary.list":  true,
+	"trigger.github.primary.set":   true,
+	"trigger.github.primary.unset": true,
 
 	// Project message policies (ptone/scion#8047): pure Hub API calls and
 	// read-only user input files (--file, --rule-file, --body-file); no local

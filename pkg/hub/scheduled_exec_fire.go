@@ -229,20 +229,49 @@ func scheduledExecFinalOutcome(res agentcontrol.ExecResult, timeoutSeconds int) 
 // (purged), and needs nothing more. A non-nil error means the write failed:
 // the run is still unfinished and must be retried.
 func (s *Server) finishScheduledExecRun(ctx context.Context, run store.ScheduledExecRun, outcome string, res *agentcontrol.ExecResult, eventStatus, eventError string) (bool, error) {
+	return s.finishScheduledExecRunWithOutputStatus(ctx, run, outcome, res, "", eventStatus, eventError)
+}
+
+func (s *Server) finishScheduledExecRunWithOutputStatus(ctx context.Context, run store.ScheduledExecRun, outcome string, res *agentcontrol.ExecResult, fallbackOutputStatus, eventStatus, eventError string) (bool, error) {
 	fin := store.ScheduledExecRunFinish{
-		EventID:     run.EventID,
-		FinishedAt:  time.Now(),
-		Outcome:     outcome,
-		EventStatus: eventStatus,
-		EventError:  eventError,
+		FinishedAt: time.Now(),
+		Outcome:    outcome,
+	}
+	if run.IsTriggerOwned() {
+		fin.FireID = run.FireID
+		switch eventStatus {
+		case "":
+			fin.FireStatus = store.TriggerFireStatusFired
+		case store.ScheduledEventSkipped:
+			fin.FireStatus = store.TriggerFireStatusSkipped
+		default:
+			fin.FireStatus = store.TriggerFireStatusFailed
+		}
+		fin.FireError = eventError
+	} else {
+		fin.EventID = run.EventID
+		fin.EventStatus = eventStatus
+		fin.EventError = eventError
 	}
 	if res != nil && res.Finished() && res.Outcome != agentcontrol.ExecOutcomeStartFailed {
 		code, dur, out := res.ExitCode, res.DurationMS, res.OutputBytes
 		fin.ExitCode, fin.DurationMS, fin.OutputBytes = &code, &dur, &out
+		if run.CaptureMode != "" {
+			if err := agentcontrol.ValidateCapturedOutput(run.CaptureMode, res.OutputStatus, res.Output); err != nil {
+				slog.Warn("Scheduler: captured exec output failed validation; recording lost",
+					"eventID", run.EventID, "capture_mode", run.CaptureMode, "output_status", res.OutputStatus, "error", err)
+				fin.OutputStatus = agentcontrol.ExecOutputLost
+			} else {
+				fin.OutputStatus = res.OutputStatus
+				fin.Output = res.Output
+			}
+		}
+	} else if run.CaptureMode != "" && fallbackOutputStatus != "" {
+		fin.OutputStatus = fallbackOutputStatus
 	}
 	won, err := s.store.FinishScheduledExecRun(ctx, fin)
 	if err != nil {
-		slog.Warn("Scheduler: exec run outcome not recorded", "eventID", run.EventID, "outcome", outcome, "error", err)
+		slog.Warn("Scheduler: exec run outcome not recorded", "runID", run.RunID(), "outcome", outcome, "error", err)
 		return false, err
 	}
 	if !won {
@@ -251,10 +280,11 @@ func (s *Server) finishScheduledExecRun(ctx context.Context, run store.Scheduled
 	a := newScheduledExecRunAudit(run)
 	a.Outcome = outcome
 	a.ExitCode, a.DurationMS, a.OutputBytes = fin.ExitCode, fin.DurationMS, fin.OutputBytes
+	a.OutputStatus = fin.OutputStatus
 	a.Reason = eventError
 	s.auditScheduledExec(ctx, a)
-	slog.Info("Scheduler: exec run finished", "eventID", run.EventID, "agent_id", run.TargetAgentID,
-		"outcome", outcome, "event_status", eventStatus)
+	slog.Info("Scheduler: exec run finished", "runID", run.RunID(), "agent_id", run.TargetAgentID,
+		"outcome", outcome, "event_status", eventStatus, "capture_mode", run.CaptureMode, "output_status", fin.OutputStatus)
 	return true, nil
 }
 
@@ -263,11 +293,12 @@ func (s *Server) finishScheduledExecRun(ctx context.Context, run store.Scheduled
 // down no tracker starts and the sweeper records the outcome after the
 // restart.
 func (s *Server) trackScheduledExecRun(run store.ScheduledExecRun) {
+	runID := run.RunID()
 	if !s.execRuns.work.goTracked(func(ctx context.Context) {
-		defer s.execRuns.release(run.EventID)
+		defer s.execRuns.release(runID)
 		s.pollScheduledExecRun(ctx, run)
 	}) {
-		s.execRuns.release(run.EventID)
+		s.execRuns.release(runID)
 	}
 }
 
@@ -302,14 +333,18 @@ func (s *Server) pollScheduledExecRun(ctx context.Context, run store.ScheduledEx
 // returns (R3): a status answer that took most of the call budget can still
 // be recorded.
 func (s *Server) pollScheduledExecRunOnce(ctx context.Context, run *store.ScheduledExecRun, unavailable *bool) bool {
-	record := func(outcome string, res *agentcontrol.ExecResult, eventStatus, reason string) bool {
+	record := func(outcome string, res *agentcontrol.ExecResult, fallbackOutputStatus, eventStatus, reason string) bool {
 		recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), scheduledEventRecordTimeout)
 		defer cancel()
-		_, err := s.finishScheduledExecRun(recordCtx, *run, outcome, res, eventStatus, reason)
+		_, err := s.finishScheduledExecRunWithOutputStatus(recordCtx, *run, outcome, res, fallbackOutputStatus, eventStatus, reason)
 		return err == nil
 	}
 	failed := func(outcome, reason string) bool {
-		return record(outcome, nil, store.ScheduledEventFailed, reason)
+		fallback := ""
+		if run.CaptureMode != "" {
+			fallback = agentcontrol.ExecOutputLost
+		}
+		return record(outcome, nil, fallback, store.ScheduledEventFailed, reason)
 	}
 	if time.Now().After(run.LeaseUntil) {
 		reason := execReasonOutcomeUnknown
@@ -319,7 +354,8 @@ func (s *Server) pollScheduledExecRunOnce(ctx context.Context, run *store.Schedu
 		return failed(store.ScheduledExecOutcomeAbandoned, reason)
 	}
 
-	res, err := s.AgentExecRunStatus(ctx, run.TargetAgentID, run.LaunchID, run.EventID)
+	runID := run.RunID()
+	res, err := s.AgentExecRunStatus(ctx, run.TargetAgentID, run.LaunchID, runID, run.CaptureMode)
 	if err != nil {
 		switch {
 		case ctx.Err() != nil:
@@ -334,7 +370,7 @@ func (s *Server) pollScheduledExecRunOnce(ctx context.Context, run *store.Schedu
 			*unavailable = true
 			return false
 		case errors.Is(err, agentcontrol.ErrExecSchema):
-			slog.Warn("Scheduler: exec-status answer outside the schema", "eventID", run.EventID, "error", err)
+			slog.Warn("Scheduler: exec-status answer outside the schema", "runID", runID, "error", err)
 			return failed(store.ScheduledExecOutcomeError, execReasonOutcomeUnknown)
 		default:
 			*unavailable = false
@@ -345,11 +381,11 @@ func (s *Server) pollScheduledExecRunOnce(ctx context.Context, run *store.Schedu
 	switch res.State {
 	case agentcontrol.ExecStateFinished:
 		outcome, status, reason := scheduledExecFinalOutcome(res, run.TimeoutSeconds)
-		return record(outcome, &res, status, reason)
+		return record(outcome, &res, "", status, reason)
 	case agentcontrol.ExecStateRunning:
 		if run.Outcome == store.ScheduledExecOutcomeStarting {
 			recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), scheduledEventRecordTimeout)
-			if _, err := s.store.MarkScheduledExecRunRunning(recordCtx, run.EventID); err == nil {
+			if _, err := s.store.MarkScheduledExecRunRunning(recordCtx, runID); err == nil {
 				run.Outcome = store.ScheduledExecOutcomeRunning
 			}
 			cancel()
@@ -450,7 +486,7 @@ func (s *Server) sweepScheduledExecRuns(ctx context.Context) {
 			return
 		}
 		for _, r := range runs {
-			claimedThisSweep = append(claimedThisSweep, r.EventID)
+			claimedThisSweep = append(claimedThisSweep, r.RunID())
 			wg.Add(1)
 			go func(r store.ScheduledExecRun) {
 				defer wg.Done()

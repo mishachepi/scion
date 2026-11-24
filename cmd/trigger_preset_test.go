@@ -73,6 +73,7 @@ func resetTriggerPresetFlags(t *testing.T) {
 	origWake := triggerPresetApplyWake
 	origPlain := triggerPresetApplyPlain
 	origDispatch := triggerPresetApplyDispatch
+	origDispatchFlags := triggerPresetApplyDispatchFlags
 	origComment := triggerPresetApplyComment
 	origDryRun := triggerPresetApplyDryRun
 	t.Cleanup(func() {
@@ -89,6 +90,7 @@ func resetTriggerPresetFlags(t *testing.T) {
 		triggerPresetApplyWake = origWake
 		triggerPresetApplyPlain = origPlain
 		triggerPresetApplyDispatch = origDispatch
+		triggerPresetApplyDispatchFlags = origDispatchFlags
 		triggerPresetApplyComment = origComment
 		triggerPresetApplyDryRun = origDryRun
 	})
@@ -105,6 +107,7 @@ func resetTriggerPresetFlags(t *testing.T) {
 	triggerPresetApplyWake = false
 	triggerPresetApplyPlain = false
 	triggerPresetApplyDispatch = false
+	triggerPresetApplyDispatchFlags = dispatchAgentFlagValues{}
 	triggerPresetApplyComment = ""
 	triggerPresetApplyDryRun = false
 }
@@ -249,26 +252,28 @@ func TestTriggerPresetCLI_ApplyDryRunFieldCoercionAndActionValidation(t *testing
 	assert.Contains(t, dryOut, "Compiled preset: github.command (v1)")
 	assert.Contains(t, dryOut, `1/1 [cel] "event.attributes.command == 'review'"`)
 
-	// 2. Reject unavailable actions clearly.
+	// 2. Reject unavailable github.comment action clearly, and validate dispatch-agent required flags.
 	triggerPresetApplyDryRun = false
-	triggerPresetApplyDispatch = true
-	err := runTriggerPresetApply(triggerPresetApplyCmd, []string{"github.command"})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "dispatch_agent")
-	assert.Contains(t, err.Error(), "not yet available")
-
-	triggerPresetApplyDispatch = false
 	triggerPresetApplyComment = "hello"
-	err = runTriggerPresetApply(triggerPresetApplyCmd, []string{"github.command"})
+	err := runTriggerPresetApply(triggerPresetApplyCmd, []string{"github.command"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "github.comment")
 	assert.Contains(t, err.Error(), "not yet available")
 
 	triggerPresetApplyComment = ""
-	triggerPresetApplyAction = "dispatch_agent"
+	triggerPresetApplyAction = "github.comment"
 	err = runTriggerPresetApply(triggerPresetApplyCmd, []string{"github.command"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not yet available")
+
+	triggerPresetApplyAction = "message"
+	triggerPresetApplyDispatch = true
+	triggerPresetApplyName = "pr-dispatch"
+	err = runTriggerPresetApply(triggerPresetApplyCmd, []string{"github.command"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--template is required")
+	triggerPresetApplyDispatch = false
+	triggerPresetApplyName = ""
 
 	// 3. Invalid --field syntax and invalid bool value return usage errors.
 	triggerPresetApplyAction = "message"
@@ -284,10 +289,13 @@ func TestTriggerPresetCLI_ApplyDryRunFieldCoercionAndActionValidation(t *testing
 	assert.Contains(t, err.Error(), "invalid boolean value")
 }
 
-func TestTriggerPresetCLI_ApplyRefusesReuseAndCoalesceWindow(t *testing.T) {
+func TestTriggerPresetCLI_ApplyCarriesReuseAndCoalesceWindow(t *testing.T) {
 	resetTriggerPresetFlags(t)
 
-	var createCalled bool
+	var (
+		createCalled bool
+		seenCreate   hubclient.CreateTriggerRequest
+	)
 	schema := hubclient.TriggerPreset{
 		ID:      "github.pr_updated",
 		Source:  "github",
@@ -321,14 +329,23 @@ func TestTriggerPresetCLI_ApplyRefusesReuseAndCoalesceWindow(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(compiledResp)
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/projects/proj-1/triggers":
 			createCalled = true
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&seenCreate))
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(hubclient.Trigger{ID: "tr-1"})
+			_ = json.NewEncoder(w).Encode(hubclient.Trigger{
+				ID:      "tr-1",
+				Name:    seenCreate.Name,
+				Source:  seenCreate.Source,
+				Match:   *seenCreate.Match,
+				Action:  seenCreate.Action,
+				Subject: *seenCreate.Subject,
+				Status:  "active",
+			})
 		default:
 			http.NotFound(w, r)
 		}
 	}, hubsync.CredentialKindOAuth)
 
-	// --dry-run still works to preview the compiled rule.
+	// --dry-run previews the compiled rule with reuse and coalesce_window.
 	triggerPresetApplyDryRun = true
 	dryOut := captureStdout(t, func() {
 		require.NoError(t, runTriggerPresetApply(triggerPresetApplyCmd, []string{"github.pr_updated"}))
@@ -336,15 +353,18 @@ func TestTriggerPresetCLI_ApplyRefusesReuseAndCoalesceWindow(t *testing.T) {
 	assert.Contains(t, dryOut, "mode=reuse, coalesce_window=30s")
 	assert.False(t, createCalled)
 
-	// Applying without --dry-run refuses client-side before calling Create.
+	// Applying without --dry-run carries mode=reuse and coalesce_window=30s into Create.
 	triggerPresetApplyDryRun = false
 	triggerPresetApplyName = "pr-updated-trigger"
 	triggerPresetApplyAgent = "lead"
 	triggerPresetApplyMessage = "Handle PR update"
-	err := runTriggerPresetApply(triggerPresetApplyCmd, []string{"github.pr_updated"})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not yet supported")
-	assert.Contains(t, err.Error(), "reuse")
-	assert.Contains(t, err.Error(), "30s")
-	assert.False(t, createCalled, "apply must refuse client-side before calling Create")
+	applyOut := captureStdout(t, func() {
+		require.NoError(t, runTriggerPresetApply(triggerPresetApplyCmd, []string{"github.pr_updated"}))
+	})
+	require.True(t, createCalled, "apply must call Create with compiled subject policy")
+	require.NotNil(t, seenCreate.Subject)
+	assert.Equal(t, "reuse", seenCreate.Subject.Mode)
+	assert.Equal(t, "30s", seenCreate.Subject.CoalesceWindow)
+	assert.Contains(t, applyOut, "Trigger created: tr-1")
+	assert.Contains(t, applyOut, "Coalesce: 30s")
 }

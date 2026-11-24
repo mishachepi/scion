@@ -53,6 +53,9 @@ import {
   RESUME_BEST_EFFORT_CONFIRM_MESSAGE,
   lifecycleActionRequestInit,
 } from '../../shared/types.js';
+import { agentParentTrail, current, type Named } from '../../client/crumbs.js';
+import { projectDisplayName, projectLabelNow } from '../../client/project-label.js';
+import { isZeroDurationLimit } from '../../shared/duration-limit.js';
 
 interface AgentNotificationsResponse {
   userNotifications: Notification[];
@@ -96,9 +99,16 @@ import '../shared/agent-log-viewer.js';
 import type { ScionAgentLogViewer } from '../shared/agent-log-viewer.js';
 import '../shared/agent-message-viewer.js';
 import type { ScionAgentMessageViewer } from '../shared/agent-message-viewer.js';
+import '../shared/agent-suspend-screen.js';
 import '../shared/chat/chat-thread.js';
 import type { ScionChatThread } from '../shared/chat/chat-thread.js';
-import { idleSuspendEnabled, isFeatureEnabled } from '../../utils/feature-flags.js';
+import {
+  AGENT_SECRETS_FLAG,
+  FEATURE_FLAGS_CHANGED_EVENT,
+  idleSuspendEnabled,
+  isFeatureEnabled,
+} from '../../utils/feature-flags.js';
+import '../shared/secret-list.js';
 import { REINCARNATE_CONFIRM_MESSAGE } from '../../shared/agent-reincarnate.js';
 import '../shared/hash-display.js';
 import '../shared/quick-message-dialog.js';
@@ -108,6 +118,10 @@ import '../shared/effective-access-boundary-notice.js';
 import { showToast } from '../../utils/toast.js';
 import { showConfirm } from '../shared/confirm-dialog.js';
 import { terminalHref } from '../../client/open-terminal.js';
+import {
+  getAgentPageCurrentAgent,
+  setAgentPageCurrentAgent,
+} from '../../client/terminal-workspace-events.js';
 import { formatInstantWithZone, formatRelative } from '../../utils/time.js';
 import { formatNumber } from '../../utils/format-number.js';
 import { DisplayZoneController } from '../../utils/display-zone-controller.js';
@@ -196,13 +210,13 @@ function formatDurationHMS(totalSeconds: number): string {
 
 /**
  * A stored config limit as Limits card text, matching the Edit page: a count
- * limit of 0 or a duration of "0" is Unlimited; an absent limit is Inherited
- * (the hub fills it from the template, hub or broker defaults); otherwise the
- * stored value.
+ * limit of 0 or any Go zero-duration spelling ("0", "0s", "0m", "0h", etc.) is
+ * Unlimited; an absent limit is Inherited (the hub fills it from the template,
+ * hub or broker defaults); otherwise the stored value.
  */
 function formatConfigLimit(value: number | string | undefined): string {
   if (value == null || value === '') return 'Inherited';
-  if (value === 0 || value === '0') return 'Unlimited';
+  if (value === 0 || isZeroDurationLimit(value)) return 'Unlimited';
   return String(value);
 }
 
@@ -304,6 +318,15 @@ export class ScionPageAgentDetail extends LitElement {
   private get nativeChatEnabled(): boolean {
     return isFeatureEnabled('web.native_chat');
   }
+
+  /** Whether the agent-scoped secrets experiment is enabled. */
+  private get agentSecretsEnabled(): boolean {
+    return isFeatureEnabled(AGENT_SECRETS_FLAG);
+  }
+
+  private readonly boundOnFeatureFlagsChanged = (): void => {
+    this.requestUpdate();
+  };
 
   @state()
   private metricsSummary: AgentMetricsSummary | null = null;
@@ -661,16 +684,21 @@ export class ScionPageAgentDetail extends LitElement {
       color: var(--scion-text, #1e293b);
       font-weight: 500;
     }
+    .limit-inherited {
+      font-size: 0.875rem;
+      font-weight: 400;
+      color: var(--scion-text-muted, #64748b);
+    }
     .progress-bar-track {
       width: 100%;
       height: 6px;
       background: var(--scion-bg-subtle, #f1f5f9);
-      border-radius: 3px;
+      border-radius: var(--scion-radius-full);
       overflow: hidden;
     }
     .progress-bar-fill {
       height: 100%;
-      border-radius: 3px;
+      border-radius: var(--scion-radius-full);
       transition: width 0.3s ease;
     }
     .progress-bar-fill.normal {
@@ -748,7 +776,7 @@ export class ScionPageAgentDetail extends LitElement {
       font-size: 0.6875rem;
       font-weight: 700;
       line-height: 1.25rem;
-      border-radius: 0.5rem;
+      border-radius: var(--scion-radius);
       background: var(--scion-bg-subtle, #f1f5f9);
       color: var(--scion-text-muted, #64748b);
       cursor: pointer;
@@ -878,15 +906,24 @@ export class ScionPageAgentDetail extends LitElement {
     stateManager.addEventListener('agents-changed', this.boundOnAgentsChanged);
     stateManager.addEventListener('projects-updated', this.boundOnProjectsUpdated);
     stateManager.addEventListener('agents-resync', this.boundOnAgentsResync);
+    if (typeof window !== 'undefined') {
+      window.addEventListener(FEATURE_FLAGS_CHANGED_EVENT, this.boundOnFeatureFlagsChanged);
+    }
 
     this.stopRelativeTimeTick = visibleInterval(() => this.requestUpdate(), 15000);
   }
 
   override disconnectedCallback(): void {
     super.disconnectedCallback();
+    if (this.agentId && getAgentPageCurrentAgent()?.agentId === this.agentId) {
+      setAgentPageCurrentAgent(null);
+    }
     stateManager.removeEventListener('agents-changed', this.boundOnAgentsChanged);
     stateManager.removeEventListener('projects-updated', this.boundOnProjectsUpdated);
     stateManager.removeEventListener('agents-resync', this.boundOnAgentsResync);
+    if (typeof window !== 'undefined') {
+      window.removeEventListener(FEATURE_FLAGS_CHANGED_EVENT, this.boundOnFeatureFlagsChanged);
+    }
     this.stopRelativeTimeTick?.();
     this.stopRelativeTimeTick = null;
     if (this.deleteRedirectTimer) {
@@ -915,6 +952,10 @@ export class ScionPageAgentDetail extends LitElement {
     const updatedAgent = stateManager.getAgent(this.agentId);
     if (updatedAgent && this.agent) {
       this.agent = { ...this.agent, ...updatedAgent };
+      setAgentPageCurrentAgent({
+        agentId: this.agentId,
+        name: this.agent.name || this.agentId,
+      });
       return;
     }
     // The agent is missing from stateManager's map. That alone does not
@@ -959,17 +1000,42 @@ export class ScionPageAgentDetail extends LitElement {
   }
 
   /**
-   * Where the deleted-state redirect (and its link/back-link fallbacks) go:
-   * the agent's project page if known, otherwise the agents list. Shared by
-   * the deferred redirect timer, `renderDeletedState` and `renderError` so
-   * they cannot disagree about the destination computed from the same
-   * `this.project`. Deliberately *not* captured at schedule time: the timer
-   * re-reads this getter when it fires, so a project that finishes loading
-   * after the delete but before the 1s redirect still wins. The two can only
-   * differ in that window, and both destinations are valid.
+   * Parent project for the breadcrumb trail and deleted-state redirect:
+   * prefers the fetched `this.project`, falls back to `agent.project` /
+   * `agent.projectSlug`, or `null` (which yields the `Agents` root).
+   * Deliberately *not* captured at timer schedule time so a project that
+   * finishes loading before the 1s redirect still wins.
    */
+  private get projectNamed(): Named | null {
+    const projectLabel =
+      projectDisplayName(this.project) ||
+      projectDisplayName({
+        name: this.agent?.project,
+        slug: this.agent?.projectSlug,
+      });
+    if (this.project) {
+      return {
+        id: this.project.id,
+        label: projectLabel || this.project.id,
+      };
+    }
+    if (this.agent?.projectId) {
+      if (projectLabel) {
+        return {
+          id: this.agent.projectId,
+          label: projectLabel,
+        };
+      }
+      const cached = projectLabelNow(this.agent.projectId);
+      if (!cached.pending) {
+        return cached;
+      }
+    }
+    return null;
+  }
+
   private get redirectTarget(): string {
-    return this.project ? `/projects/${this.project.id}` : '/agents';
+    return this.projectNamed ? `/projects/${encodeURIComponent(this.projectNamed.id)}` : '/agents';
   }
 
   /**
@@ -1242,6 +1308,10 @@ export class ScionPageAgentDetail extends LitElement {
       void this.loadMetricsSummary();
 
       this.seedAgent(this.agent, agentId, epoch, epochGeneration);
+      setAgentPageCurrentAgent({
+        agentId: this.agentId,
+        name: this.agent.name || this.agentId,
+      });
       if (this.project) {
         stateManager.seedProjects([this.project]);
         dispatchPageTitle(this, this.agent.name, this.project.name || this.agent.projectId);
@@ -1744,6 +1814,11 @@ export class ScionPageAgentDetail extends LitElement {
         <sl-tab slot="nav" panel="logs">Logs</sl-tab>
         <sl-tab slot="nav" panel="messages">Messages</sl-tab>
         <sl-tab slot="nav" panel="configuration">Configuration</sl-tab>
+        ${this.agentSecretsEnabled
+          ? html`<sl-tab slot="nav" panel="secrets" data-testid="agent-secrets-tab"
+              >Secrets</sl-tab
+            >`
+          : nothing}
 
         <sl-tab-panel name="status">${this.renderStatusTab()}</sl-tab-panel>
         <sl-tab-panel name="metrics">${this.renderMetricsTab()}</sl-tab-panel>
@@ -1761,6 +1836,16 @@ export class ScionPageAgentDetail extends LitElement {
         </sl-tab-panel>
         <sl-tab-panel name="messages"> ${this.renderMessagesPanel()} </sl-tab-panel>
         <sl-tab-panel name="configuration">${this.renderConfigurationTab()}</sl-tab-panel>
+        ${this.agentSecretsEnabled
+          ? html`<sl-tab-panel name="secrets" data-testid="agent-secrets-panel">
+              <scion-secret-list
+                scope="agent"
+                scopeId=${this.agent.id}
+                compact
+                ?readonly=${!!this.agent._capabilities && !can(this.agent._capabilities, 'update')}
+              ></scion-secret-list>
+            </sl-tab-panel>`
+          : nothing}
       </sl-tab-group>
 
       <scion-quick-message-dialog
@@ -1787,7 +1872,7 @@ export class ScionPageAgentDetail extends LitElement {
         ? html`
             <div
               class="alert alert-warning"
-              style="margin-bottom: 0.5em; padding: 0.75em; border-radius: 4px; background: var(--sl-color-warning-100); border: 1px solid var(--sl-color-warning-300);"
+              style="margin-bottom: 0.5em; padding: 0.75em; border-radius: var(--scion-radius-sm); background: var(--sl-color-warning-100); border: 1px solid var(--sl-color-warning-300);"
             >
               <sl-icon name="exclamation-triangle" style="margin-right: 0.5em;"></sl-icon>
               ${getDenialMessage(agent._messageability.reason, agent.name)}
@@ -1798,7 +1883,7 @@ export class ScionPageAgentDetail extends LitElement {
         ? html`
             <div
               class="alert alert-danger"
-              style="margin-bottom: 0.5em; padding: 0.75em; border-radius: 4px; background: var(--sl-color-danger-100); border: 1px solid var(--sl-color-danger-300);"
+              style="margin-bottom: 0.5em; padding: 0.75em; border-radius: var(--scion-radius-sm); background: var(--sl-color-danger-100); border: 1px solid var(--sl-color-danger-300);"
             >
               <sl-icon name="shield-lock" style="margin-right: 0.5em;"></sl-icon>
               This agent is sealed (mode: none). Only super-admins can message it.
@@ -1901,11 +1986,10 @@ export class ScionPageAgentDetail extends LitElement {
     const startOk = lifecycleOk && !isAgentLaunching(agent) && !isIncompleteCreate(agent);
     return html`
       <scion-detail-header heading=${agent.name}>
-        <scion-back-link
+        <scion-breadcrumb
           slot="back"
-          href="${this.project ? `/projects/${this.project.id}` : '/agents'}"
-          >${this.project ? `To ${this.project.name}` : 'Back to Agents'}</scion-back-link
-        >
+          .crumbs=${[...agentParentTrail(this.projectNamed), current(agent.name)]}
+        ></scion-breadcrumb>
         <sl-icon slot="icon" name="cpu"></sl-icon>
         ${agentStatusBadge(agent)}
         <scion-deletion-badge .deletion=${this.deletingView(agent)} live></scion-deletion-badge>
@@ -2110,10 +2194,23 @@ export class ScionPageAgentDetail extends LitElement {
   private renderStatusTab() {
     const agent = this.agent!;
     return html`
-      ${this.renderCurrentStateCard(agent)} ${this.renderCurrentTaskCard(agent)}
-      ${this.renderLimitsUsageCard(agent)} ${this.renderPlacementCard(agent)}
-      ${this.renderConnectivityCard(agent)} ${this.renderExposedPortsCard(agent)}
-      ${this.renderNotificationsCard()}
+      ${this.renderCurrentStateCard(agent)} ${this.renderLastScreenCard(agent)}
+      ${this.renderCurrentTaskCard(agent)} ${this.renderLimitsUsageCard(agent)}
+      ${this.renderPlacementCard(agent)} ${this.renderConnectivityCard(agent)}
+      ${this.renderExposedPortsCard(agent)} ${this.renderNotificationsCard()}
+    `;
+  }
+
+  private renderLastScreenCard(agent: Agent) {
+    if (agent.phase !== 'suspended' || !can(agent._capabilities, 'attach')) {
+      return nothing;
+    }
+    return html`
+      <scion-agent-suspend-screen
+        .agentId=${agent.id}
+        .projectId=${agent.projectId || ''}
+        .phase=${agent.phase}
+      ></scion-agent-suspend-screen>
     `;
   }
 
@@ -2164,23 +2261,22 @@ export class ScionPageAgentDetail extends LitElement {
             <span class="info-label">Activity</span>
             <span class="info-value">
               ${agent.activity
-                ? html`<scion-status-badge
-                      status=${agent.activity}
-                      label=${stateLabel(agent.activity)}
-                      size="small"
-                    ></scion-status-badge
-                    >${(agent.lastActivityEvent && !this.isZeroDate(agent.lastActivityEvent)) ||
-                    agent.updated ||
-                    agent.updatedAt
-                      ? html`<span
-                          style="color: var(--scion-text-muted, #64748b); font-size: 0.85em; margin-left: 0.5em;"
-                          >${this.formatRelativeTime(
-                            (agent.lastActivityEvent && !this.isZeroDate(agent.lastActivityEvent)
-                              ? agent.lastActivityEvent
-                              : agent.updated || agent.updatedAt)!
-                          )}</span
-                        >`
-                      : ''}`
+                ? html`${agentStatusBadge(agent, {
+                    status: agent.activity,
+                    label: stateLabel(agent.activity),
+                    size: 'small',
+                  })}${(agent.lastActivityEvent && !this.isZeroDate(agent.lastActivityEvent)) ||
+                  agent.updated ||
+                  agent.updatedAt
+                    ? html`<span
+                        style="color: var(--scion-text-muted, #64748b); font-size: 0.85em; margin-left: 0.5em;"
+                        >${this.formatRelativeTime(
+                          (agent.lastActivityEvent && !this.isZeroDate(agent.lastActivityEvent)
+                            ? agent.lastActivityEvent
+                            : agent.updated || agent.updatedAt)!
+                        )}</span
+                      >`
+                    : ''}`
                 : html`<span style="color: var(--scion-text-muted, #64748b);">—</span>`}
             </span>
           </div>
@@ -2219,34 +2315,63 @@ export class ScionPageAgentDetail extends LitElement {
 
   private renderLimitsUsageCard(agent: Agent) {
     const cfg = agent.appliedConfig?.inlineConfig;
-    const maxTurns = cfg?.max_turns ?? 0;
-    const maxModelCalls = cfg?.max_model_calls ?? 0;
-    const maxDurationStr = cfg?.max_duration ?? '';
-    const maxDurationSec = parseDuration(maxDurationStr);
+    const rawTurns = cfg?.max_turns;
+    const rawModelCalls = cfg?.max_model_calls;
+    const rawDuration = cfg?.max_duration;
 
-    if (!maxTurns && !maxModelCalls && !maxDurationSec) return nothing;
+    // Distinguish unset (inherited from template/hub/broker defaults, cap
+    // unknown to the hub) from explicit 0 / "0" (Unlimited, no cap applies).
+    const turnsInherited = rawTurns == null;
+    const modelCallsInherited = rawModelCalls == null;
+    const durationInherited = !rawDuration;
+
+    const maxTurns = turnsInherited ? 0 : rawTurns;
+    const maxModelCalls = modelCallsInherited ? 0 : rawModelCalls;
+    const maxDurationSec =
+      durationInherited || rawDuration === '0' ? 0 : parseDuration(rawDuration);
+
+    const showTurns = turnsInherited || maxTurns > 0;
+    const showModelCalls = modelCallsInherited || maxModelCalls > 0;
+    const showDuration = durationInherited || maxDurationSec > 0;
+
+    if (!showTurns && !showModelCalls && !showDuration) return nothing;
 
     const currentTurns = agent.currentTurns ?? 0;
     const currentModelCalls = agent.currentModelCalls ?? 0;
 
     let timeRemainingSec = 0;
     let elapsedSec = 0;
-    if (maxDurationSec > 0 && agent.startedAt) {
-      elapsedSec = (Date.now() - new Date(agent.startedAt).getTime()) / 1000;
-      timeRemainingSec = Math.max(0, maxDurationSec - elapsedSec);
+    const startedAt =
+      agent.startedAt && !this.isZeroDate(agent.startedAt) ? agent.startedAt : undefined;
+    if (startedAt) {
+      elapsedSec = Math.max(0, (Date.now() - new Date(startedAt).getTime()) / 1000);
+      if (maxDurationSec > 0) {
+        timeRemainingSec = Math.max(0, maxDurationSec - elapsedSec);
+      }
     }
+
+    const showInheritedElapsed =
+      Boolean(startedAt) && (agent.phase === 'running' || agent.phase === 'stopping');
 
     return html`
       <div class="card">
         <h3 class="card-title">Limits & Usage</h3>
         <div class="limits-grid">
-          ${maxTurns > 0 ? this.renderLimitItem('Turns', currentTurns, maxTurns) : nothing}
-          ${maxModelCalls > 0
-            ? this.renderLimitItem('Model Calls', currentModelCalls, maxModelCalls)
-            : nothing}
-          ${maxDurationSec > 0
-            ? this.renderTimeLimitItem(timeRemainingSec, elapsedSec, maxDurationSec)
-            : nothing}
+          ${turnsInherited
+            ? this.renderInheritedLimitItem('Turns', currentTurns)
+            : maxTurns > 0
+              ? this.renderLimitItem('Turns', currentTurns, maxTurns)
+              : nothing}
+          ${modelCallsInherited
+            ? this.renderInheritedLimitItem('Model Calls', currentModelCalls)
+            : maxModelCalls > 0
+              ? this.renderLimitItem('Model Calls', currentModelCalls, maxModelCalls)
+              : nothing}
+          ${durationInherited
+            ? this.renderInheritedTimeLimitItem(showInheritedElapsed ? elapsedSec : null)
+            : maxDurationSec > 0
+              ? this.renderTimeLimitItem(timeRemainingSec, elapsedSec, maxDurationSec)
+              : nothing}
         </div>
       </div>
     `;
@@ -2266,6 +2391,15 @@ export class ScionPageAgentDetail extends LitElement {
     `;
   }
 
+  private renderInheritedLimitItem(label: string, current: number) {
+    return html`
+      <div class="limit-item">
+        <span class="limit-label">${label}</span>
+        <span class="limit-value">${current} <span class="limit-inherited">/ Inherited</span></span>
+      </div>
+    `;
+  }
+
   private renderTimeLimitItem(remainingSec: number, elapsedSec: number, totalSec: number) {
     const pct = Math.min(100, (elapsedSec / totalSec) * 100);
     const remainPct = 100 - pct;
@@ -2277,6 +2411,20 @@ export class ScionPageAgentDetail extends LitElement {
         <div class="progress-bar-track">
           <div class="progress-bar-fill ${colorClass}" style="width: ${pct}%"></div>
         </div>
+      </div>
+    `;
+  }
+
+  private renderInheritedTimeLimitItem(elapsedSec: number | null) {
+    return html`
+      <div class="limit-item">
+        <span class="limit-label">${elapsedSec !== null ? 'Elapsed' : 'Max Duration'}</span>
+        <span class="limit-value"
+          >${elapsedSec !== null
+            ? html`${formatDurationHMS(elapsedSec)}
+                <span class="limit-inherited">/ Inherited</span>`
+            : html`<span class="limit-inherited">Inherited</span>`}</span
+        >
       </div>
     `;
   }
@@ -3160,7 +3308,7 @@ export class ScionPageAgentDetail extends LitElement {
     const maxModelCalls = inline?.max_model_calls;
     const maxDuration = inline?.max_duration;
 
-    // A stored 0 (or "0" for the duration) is Unlimited, so the card hides
+    // A stored 0 (or any zero duration spelling) is Unlimited, so the card hides
     // only when no limit is stored at all.
     if (maxTurns == null && maxModelCalls == null && !maxDuration) return nothing;
 
@@ -3456,6 +3604,7 @@ export class ScionPageAgentDetail extends LitElement {
 
   private renderLoading() {
     return html`
+      <scion-breadcrumb .crumbs=${agentParentTrail(this.projectNamed)}></scion-breadcrumb>
       <div class="loading-state">
         <sl-spinner></sl-spinner>
         <p>Loading agent...</p>
@@ -3472,27 +3621,25 @@ export class ScionPageAgentDetail extends LitElement {
    * skipped — hidden behind `/terminals`, see `isOnThisAgentRoute` — or
    * never re-armed after a disconnect/reconnect while deleted), the copy
    * drops back to a plain statement so the page never claims a redirect
-   * that is not actually coming. The link covers all of those cases, so
+   * that is not actually coming. The breadcrumb covers all of those cases, so
    * the user always has a way out.
    */
   private renderDeletedState(): TemplateResult {
-    const targetLabel = this.project ? `Go to ${this.project.name}` : 'Go to Agents';
     return html`
+      <scion-breadcrumb
+        data-testid="agent-deleted-link"
+        .crumbs=${agentParentTrail(this.projectNamed)}
+      ></scion-breadcrumb>
       <div class="loading-state" data-testid="agent-deleted-state">
         <sl-icon name="trash"></sl-icon>
         <p>Agent deleted.${this.deleteRedirectTimer ? ' Redirecting…' : ''}</p>
-        <scion-back-link href="${this.redirectTarget}" data-testid="agent-deleted-link"
-          >${targetLabel}</scion-back-link
-        >
       </div>
     `;
   }
 
   private renderError() {
     return html`
-      <scion-back-link href="${this.redirectTarget}"
-        >${this.project ? `To ${this.project.name}` : 'Back to Agents'}</scion-back-link
-      >
+      <scion-breadcrumb .crumbs=${agentParentTrail(this.projectNamed)}></scion-breadcrumb>
 
       <div class="error-state">
         <sl-icon name="exclamation-triangle"></sl-icon>

@@ -808,6 +808,70 @@ func TestFormatCloneError(t *testing.T) {
 			t.Errorf("expected stderr in error, got: %v", err)
 		}
 	})
+
+	t.Run("ADO TF401019 not misclassified as auth or GitHub", func(t *testing.T) {
+		stderr := "remote: TF401019: The Git repository with name or identifier repo.git does not exist or you do not have permissions for the operation you are attempting.\nfatal: repository 'https://dev.azure.com/org/proj/_git/repo.git/' not found"
+		if isAuthError(stderr) {
+			t.Fatalf("isAuthError(%q) = true, want false (TF401019 must not match 401)", stderr)
+		}
+		for _, tok := range []string{"", "ado-pat-token"} {
+			err := formatCloneErrorForURL(stderr, "https://dev.azure.com/org/proj/_git/repo", tok)
+			if strings.Contains(err.Error(), "GITHUB_TOKEN") || strings.Contains(err.Error(), "GitHub") {
+				t.Errorf("token=%q: ADO not-found error must not mention GitHub/GITHUB_TOKEN, got: %v", tok, err)
+			}
+			if !strings.Contains(err.Error(), "dev.azure.com") {
+				t.Errorf("token=%q: ADO error should name dev.azure.com, got: %v", tok, err)
+			}
+		}
+	})
+
+	t.Run("ADO auth error names dev.azure.com without GitHub hint", func(t *testing.T) {
+		stderr := "fatal: Authentication failed for 'https://dev.azure.com/org/proj/_git/repo/'"
+		err := formatCloneErrorForURL(stderr, "https://dev.azure.com/org/proj/_git/repo", "ado-pat-token")
+		if strings.Contains(err.Error(), "GITHUB_TOKEN") || strings.Contains(err.Error(), "GitHub") {
+			t.Errorf("ADO auth error must not mention GitHub/GITHUB_TOKEN, got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "dev.azure.com") {
+			t.Errorf("ADO auth error should name dev.azure.com, got: %v", err)
+		}
+
+		noTokErr := formatCloneErrorForURL("fatal: could not read Username for 'https://dev.azure.com'", "https://dev.azure.com/org/proj/_git/repo", "")
+		if strings.Contains(noTokErr.Error(), "GITHUB_TOKEN") || strings.Contains(noTokErr.Error(), "GitHub") {
+			t.Errorf("ADO no-token error must not mention GitHub/GITHUB_TOKEN, got: %v", noTokErr)
+		}
+		if !strings.Contains(noTokErr.Error(), "dev.azure.com") {
+			t.Errorf("ADO no-token error should name dev.azure.com, got: %v", noTokErr)
+		}
+	})
+
+	t.Run("prefers clone URL host over host in remote stderr", func(t *testing.T) {
+		stderr := "remote: See https://docs.github.com/en/authentication for help.\nfatal: Authentication failed for 'https://dev.azure.com/org/proj/_git/repo/'"
+
+		for _, tc := range []struct {
+			name  string
+			token string
+		}{
+			{name: "with token", token: "ado-pat-token"},
+			{name: "without token", token: ""},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				err := formatCloneErrorForURL(stderr, "https://dev.azure.com/org/proj/_git/repo", tc.token)
+				hint, _, ok := strings.Cut(err.Error(), "): ")
+				if !ok {
+					t.Fatalf("unexpected error format: %v", err)
+				}
+				if !strings.Contains(hint, "dev.azure.com") {
+					t.Errorf("expected hint to name dev.azure.com, got: %s", hint)
+				}
+				if strings.Contains(hint, "docs.github.com") {
+					t.Errorf("hint must not name host from remote stderr, got: %s", hint)
+				}
+				if strings.Contains(hint, "GITHUB_TOKEN") || strings.Contains(hint, "GitHub") {
+					t.Errorf("hint must not mention GitHub/GITHUB_TOKEN, got: %s", hint)
+				}
+			})
+		}
+	})
 }
 
 func TestIsClaude(t *testing.T) {
@@ -1190,12 +1254,8 @@ func TestConfigureGitCommand_SkipsCredentialOverrideForNonRootDifferentTarget(t 
 }
 
 // TestConfigureGitCommand_PropagatesTrustBundleEnv proves configureGitCommand
-// passes GIT_SSL_CAINFO through to the `git` subprocess it configures:
-// configureGitCommand (init.go) builds cmd.Env as
-// append(os.Environ(), "GIT_TERMINAL_PROMPT=0") — a full copy of the process
-// environment, not an allowlisted subset — so any CA-bundle var already set
-// in this process's own environment reaches the `git` subprocess unchanged,
-// with no code change needed here to carry it through.
+// passes operator-supplied GIT_SSL_CAINFO through to the `git` subprocess it
+// configures when not withheld (built via initenv.Policy.StartupChildEnv).
 func TestConfigureGitCommand_PropagatesTrustBundleEnv(t *testing.T) {
 	t.Setenv("GIT_SSL_CAINFO", "/run/ate/trust-bundle.pem")
 
@@ -3972,6 +4032,9 @@ func TestGitCloneWorkspace_NoTokenInArgvOrConfig(t *testing.T) {
 	if err := os.MkdirAll(workspace, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	origResolve := resolveGitForInit
+	resolveGitForInit = func(string) (string, error) { return filepath.Join(binDir, "git"), nil }
+	t.Cleanup(func() { resolveGitForInit = origResolve })
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("HOME", root)
 	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(root, "gc"))
@@ -4041,6 +4104,9 @@ func TestGitCloneWorkspace_FetchUsesHostScopedCredential(t *testing.T) {
 	if err := os.MkdirAll(workspace, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	origResolve := resolveGitForInit
+	resolveGitForInit = func(string) (string, error) { return filepath.Join(binDir, "git"), nil }
+	t.Cleanup(func() { resolveGitForInit = origResolve })
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("HOME", root)
 	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(root, "gc"))

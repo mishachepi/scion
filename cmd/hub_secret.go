@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,6 +34,7 @@ import (
 var (
 	secretProjectScope string
 	secretBrokerScope  string
+	secretAgentScope   string
 	secretScope        string
 	secretOutputJSON   bool
 	secretType         string
@@ -98,8 +100,13 @@ Secret types control how the value is projected into agent containers:
 For file secrets, prefix the value with @ to read from a file:
   scion hub secret set --type file --target /etc/ssl/cert.pem TLS_CERT @cert.pem
 
+To read the value from stdin without exposing it in shell history or process
+listings, pass '-' as VALUE (trailing CR/LF is trimmed; type is unchanged):
+  printf %s "$V" | scion hub secret set --agent my-agent API_KEY -
+
 Examples:
   scion hub secret set API_KEY sk-abc123
+  printf %s "$V" | scion hub secret set API_KEY -
   scion hub secret set --scope hub API_KEY sk-abc123
   scion hub secret set --project DATABASE_PASSWORD mypassword
   scion hub secret set --type variable CONFIG_JSON '{"key":"val"}'
@@ -171,14 +178,16 @@ Examples:
 
 // hubSecretClearCmd clears a secret
 var hubSecretClearCmd = &cobra.Command{
-	Use:   "clear KEY",
-	Short: "Clear a secret",
+	Use:     "clear KEY",
+	Aliases: []string{"delete"},
+	Short:   "Clear a secret",
 	Long: `Remove a secret from the Hub.
 
 Examples:
   scion hub secret clear API_KEY
   scion hub secret clear --project API_KEY
-  scion hub secret clear --broker API_KEY`,
+  scion hub secret clear --broker API_KEY
+  scion hub secret delete --agent my-agent API_KEY`,
 	Args: cobra.ExactArgs(1),
 	RunE: runSecretClear,
 }
@@ -194,7 +203,8 @@ func init() {
 	// Add scope flags to all subcommands.
 	// --scope selects the scope level (hub, user). --project/--broker select their
 	// respective scopes and support both bare usage (infer from settings) and
-	// explicit name/ID via --project=<name|id>.
+	// explicit name/ID via --project=<name|id>. --agent selects agent scope and
+	// requires an agent name or ID.
 	for _, cmd := range []*cobra.Command{hubSecretSetCmd, hubSecretGetCmd, hubSecretListCmd, hubSecretClearCmd, hubSecretUpdateCmd} {
 		cmd.Flags().StringVar(&secretScope, "scope", "", "Scope level: hub, user (default: user)")
 		cmd.Flags().StringVar(&secretProjectScope, "project", "", "Project scope (bare flag infers current project, or use --project=<name|id>)")
@@ -202,6 +212,8 @@ func init() {
 
 		cmd.Flags().StringVar(&secretBrokerScope, "broker", "", "Broker scope (bare flag infers current broker, or use --broker=<name|id>)")
 		cmd.Flags().Lookup("broker").NoOptDefVal = scopeInferSentinel
+
+		cmd.Flags().StringVar(&secretAgentScope, "agent", "", "Agent scope (--agent <name|id>)")
 	}
 
 	hubSecretGetCmd.Flags().BoolVar(&secretOutputJSON, "json", false, "Output in JSON format")
@@ -229,6 +241,7 @@ func resolveSecretScope(cmd *cobra.Command, settings *config.Settings) (hubScope
 	scopeSet := cmd.Flags().Changed("scope")
 	projectSet := cmd.Flags().Changed("project")
 	brokerSet := cmd.Flags().Changed("broker")
+	agentSet := cmd.Flags().Changed("agent")
 
 	// Enforce mutual exclusivity
 	setCount := 0
@@ -241,8 +254,18 @@ func resolveSecretScope(cmd *cobra.Command, settings *config.Settings) (hubScope
 	if brokerSet {
 		setCount++
 	}
+	if agentSet {
+		setCount++
+	}
 	if setCount > 1 {
-		return hubScopeTarget{}, newUsageError("cannot specify more than one of --scope, --project, and --broker")
+		return hubScopeTarget{}, newUsageError("cannot specify more than one of --scope, --project, --broker, and --agent")
+	}
+
+	if agentSet {
+		if strings.TrimSpace(secretAgentScope) == "" {
+			return hubScopeTarget{}, newUsageError("--agent requires an agent name or ID")
+		}
+		return hubScopeTarget{scope: "agent", id: secretAgentScope}, nil
 	}
 
 	if scopeSet {
@@ -308,9 +331,29 @@ func runSecretSet(cmd *cobra.Command, args []string) error {
 		return newUsageError("key cannot contain spaces, tabs, newlines, or '='")
 	}
 
-	// Handle @filename prefix for file secrets: read file content and base64-encode
-	isFileValue := strings.HasPrefix(value, "@")
-	if isFileValue {
+	// Handle '-' to read secret value from stdin without changing the secret type,
+	// or '@filename' to read file content and base64-encode. Using else-if ensures
+	// a stdin secret value that happens to begin with '@' is never misinterpreted
+	// as a file path.
+	isFileValue := false
+	if value == "-" {
+		const maxStdinSecretBytes = 64 * 1024
+		b, err := io.ReadAll(io.LimitReader(cmd.InOrStdin(), maxStdinSecretBytes+1))
+		if err != nil {
+			return fmt.Errorf("failed to read secret value from stdin: %w", err)
+		}
+		if len(b) > maxStdinSecretBytes {
+			return newUsageError("secret value from stdin exceeds 64KB limit")
+		}
+		value = string(b)
+		if secretType != "file" {
+			value = strings.TrimRight(value, "\r\n")
+		}
+		if value == "" {
+			return newUsageError("secret value from stdin is empty")
+		}
+	} else if strings.HasPrefix(value, "@") {
+		isFileValue = true
 		filePath := value[1:]
 		// Expand ~ in source file path for reading
 		if strings.HasPrefix(filePath, "~/") {

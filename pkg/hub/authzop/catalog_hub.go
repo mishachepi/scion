@@ -306,6 +306,7 @@ var hubOperations = []OperationSpec{
 			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/admin/maintenance/update-available", Method: "GET"},
 			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/admin/maintenance/update-available", Method: "DELETE"},
 			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/admin/maintenance/update-status", Method: "GET"},
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/admin/maintenance/auto-update", Method: "PUT"},
 			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/admin/maintenance/releases", Method: "GET"},
 		},
 		Principals:       []PrincipalKind{PrincipalUser},
@@ -1167,6 +1168,7 @@ var hubOperations = []OperationSpec{
 		Domain:      "systemone.instance",
 		Description: "List and read hub-scoped System One provider instances (redacted; stored API keys are never returned); interactive session only",
 		EntryPoints: []EntryPoint{
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/admin/system-one/adapters", Method: "GET"},
 			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/admin/system-one/instances", Method: "GET"},
 			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/admin/system-one/instances/{name}", Method: "GET"},
 		},

@@ -13,7 +13,15 @@
  */
 
 import { test, expect, type Page } from '@playwright/test';
-import { agentA, apiAgent, defaultAgents, projectId, setup, switchView } from './fixtures.js';
+import {
+  agentA,
+  agentB,
+  apiAgent,
+  defaultAgents,
+  projectId,
+  setup,
+  switchView,
+} from './fixtures.js';
 
 // ---------------------------------------------------------------------------
 // Table-driven entry point: href verification
@@ -455,4 +463,270 @@ test('browser back/forward preserves retained terminal session', async ({ page }
   await expect(page).toHaveURL(`/terminals/${agentA}`);
   expect(socket.attaches).toBe(1);
   expect(socket.closes).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// Wide-tier header Terminals chevron dropdown (ptone/scion#8284)
+// ---------------------------------------------------------------------------
+
+test('wide header Terminals chevron lists current agent and rail sessions, opens via keyboard, and hides on medium/narrow widths', async ({
+  page,
+}) => {
+  const socket = await setup(page);
+  await page.setViewportSize({ width: 1280, height: 800 });
+
+  // 1. Empty state on dashboard before any terminal session is opened.
+  await page.goto('/');
+  const appChevron = page
+    .locator('scion-app scion-header .wide-center')
+    .getByRole('button', { name: 'Open terminals menu' });
+  await expect(appChevron).toBeVisible({ timeout: 15000 });
+  await expect(appChevron).toHaveAttribute('aria-haspopup', 'menu');
+  await expect(appChevron).toHaveAttribute('aria-expanded', 'false');
+
+  await appChevron.click();
+  await expect(page).toHaveURL('/');
+  await expect(appChevron).toHaveAttribute('aria-expanded', 'true');
+  const emptyItem = page.locator(
+    'scion-app scion-header .wide-center .terminals-menu sl-menu-item[disabled]'
+  );
+  await expect(emptyItem).toBeVisible();
+  await expect(emptyItem).toContainText('No open terminals');
+
+  await page.keyboard.press('Escape');
+  await expect(appChevron).toHaveAttribute('aria-expanded', 'false');
+
+  // 2. Open alpha-agent in the terminal workspace so the rail holds one live session.
+  await page.goto(`/terminals/${agentA}`);
+  await expect.poll(() => socket.attaches).toBe(1);
+
+  // 3. Navigate to beta-agent's detail page (not yet open in the rail).
+  await page.evaluate(
+    (path) => document.dispatchEvent(new CustomEvent('nav-click', { detail: { path } })),
+    `/agents/${agentB}`
+  );
+  await expect(page).toHaveURL(`/agents/${agentB}`);
+  // Wait until agent-detail loads beta-agent's name and publishes it.
+  await expect(page.locator('scion-page-agent-detail')).toContainText('beta-agent');
+
+  // Natural Tab order: Tab from main Terminals button lands on the chevron trigger.
+  const appTerminalsBtn = page.locator(
+    'scion-app scion-header .wide-center .mode-switch button[data-mode="terminals"]'
+  );
+  await appTerminalsBtn.focus();
+  await page.keyboard.press('Tab');
+  await expect(appChevron).toBeFocused();
+
+  // Enter on the chevron opens the real Shoelace dropdown and focuses row 1 ("not open").
+  await page.keyboard.press('Enter');
+  await expect(appChevron).toHaveAttribute('aria-expanded', 'true');
+  const rows = page.locator('scion-app scion-header .wide-center .terminals-menu sl-menu-item');
+  await expect(rows).toHaveCount(2);
+  await expect(rows.nth(0)).toContainText('beta-agent');
+  await expect(rows.nth(0)).toContainText('not open');
+  await expect(rows.nth(1)).toContainText('alpha-agent');
+  await expect(rows.nth(0)).toBeFocused();
+
+  // Real Shoelace menu roving keyboard navigation: ArrowDown -> End -> Home -> ArrowDown -> ArrowUp.
+  await page.keyboard.press('ArrowDown');
+  await expect(rows.nth(1)).toBeFocused();
+  await page.keyboard.press('Home');
+  await expect(rows.nth(0)).toBeFocused();
+  await page.keyboard.press('End');
+  await expect(rows.nth(1)).toBeFocused();
+  await page.keyboard.press('ArrowUp');
+  await expect(rows.nth(0)).toBeFocused();
+
+  // Escape closes the dropdown without navigating and restores focus to the chevron trigger.
+  await page.keyboard.press('Escape');
+  await expect(appChevron).toHaveAttribute('aria-expanded', 'false');
+  await expect(appChevron).toBeFocused();
+  await expect(page).toHaveURL(`/agents/${agentB}`);
+
+  // ArrowUp on the chevron opens the dropdown and focuses the last item; Escape closes again.
+  await page.keyboard.press('ArrowUp');
+  await expect(appChevron).toHaveAttribute('aria-expanded', 'true');
+  await expect(rows.nth(1)).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(appChevron).toHaveAttribute('aria-expanded', 'false');
+
+  // ArrowDown on the chevron opens and focuses row 1 (beta-agent); Enter activates it.
+  await page.keyboard.press('ArrowDown');
+  await expect(rows.nth(0)).toBeFocused();
+  await page.keyboard.press('Enter');
+  await expect(page).toHaveURL(`/terminals/${agentB}`);
+  await expect.poll(() => socket.attaches).toBe(2);
+
+  // Inside /terminals/<agentB>, opening the workspace header chevron lists the focused pane
+  // (beta-agent) first and deduplicated.
+  const wsChevron = page
+    .locator('#terminal-workspace scion-header .wide-center')
+    .getByRole('button', { name: 'Open terminals menu' });
+  await wsChevron.click();
+  const wsRows = page.locator(
+    '#terminal-workspace scion-header .wide-center .terminals-menu sl-menu-item'
+  );
+  await expect(wsRows).toHaveCount(2);
+  await expect(wsRows.nth(0)).toContainText('beta-agent');
+  await expect(wsRows.nth(0)).not.toContainText('not open');
+  await expect(wsRows.nth(1)).toContainText('alpha-agent');
+  await page.keyboard.press('Escape');
+
+  // 4. Medium (<=1100px) and narrow (<=768px) tiers hide the wide chevron.
+  await page.setViewportSize({ width: 1000, height: 800 });
+  await expect(
+    page
+      .locator('#terminal-workspace scion-header .wide-center')
+      .getByRole('button', { name: 'Open terminals menu' })
+  ).toBeHidden();
+
+  await page.setViewportSize({ width: 600, height: 800 });
+  await expect(
+    page
+      .locator('#terminal-workspace scion-header .wide-center')
+      .getByRole('button', { name: 'Open terminals menu' })
+  ).toBeHidden();
+});
+
+test('medium (900px) and phone (390px) mode switchers expose open terminals with current agent first (ptone/scion#8440)', async ({
+  page,
+}) => {
+  const socket = await setup(page);
+
+  // --- Medium tier (900x800): icon-only split-button chevron ---
+  await page.setViewportSize({ width: 900, height: 800 });
+  await page.goto('/');
+
+  const wideChevron = page
+    .locator('scion-app scion-header .wide-center')
+    .getByRole('button', { name: 'Open terminals menu' });
+  const medChevron = page
+    .locator('scion-app scion-header .compact-mode-segments')
+    .getByRole('button', { name: 'Open terminals menu' });
+
+  await expect(medChevron).toBeVisible({ timeout: 15000 });
+  await expect(wideChevron).toBeHidden();
+  await expect(medChevron).toHaveAttribute('aria-haspopup', 'menu');
+  await expect(medChevron).toHaveAttribute('aria-expanded', 'false');
+
+  // Empty state + first-click focus retention.
+  await medChevron.click();
+  await expect(medChevron).toHaveAttribute('aria-expanded', 'true');
+  await expect(medChevron).toBeFocused();
+  const medEmpty = page.locator(
+    'scion-app scion-header .compact-mode-segments .terminals-menu sl-menu-item[disabled]'
+  );
+  await expect(medEmpty).toBeVisible();
+  await expect(medEmpty).toContainText('No open terminals');
+  await page.keyboard.press('Escape');
+  await expect(medChevron).toHaveAttribute('aria-expanded', 'false');
+
+  // Open alpha-agent so the rail holds one open session, then visit beta-agent's detail page.
+  await page.goto(`/terminals/${agentA}`);
+  await expect.poll(() => socket.attaches).toBe(1);
+  await page.evaluate(
+    (path) => document.dispatchEvent(new CustomEvent('nav-click', { detail: { path } })),
+    `/agents/${agentB}`
+  );
+  await expect(page).toHaveURL(`/agents/${agentB}`);
+  await expect(page.locator('scion-page-agent-detail')).toContainText('beta-agent');
+
+  // Tab from medium Terminals icon button -> chevron, Enter opens & focuses beta-agent ("not open").
+  const medTerminalsBtn = page.locator(
+    'scion-app scion-header .compact-mode-segments .mode-switch button[data-mode="terminals"]'
+  );
+  await medTerminalsBtn.focus();
+  await page.keyboard.press('Tab');
+  await expect(medChevron).toBeFocused();
+  await page.keyboard.press('Enter');
+  await expect(medChevron).toHaveAttribute('aria-expanded', 'true');
+
+  const medRows = page.locator(
+    'scion-app scion-header .compact-mode-segments .terminals-menu sl-menu-item'
+  );
+  await expect(medRows).toHaveCount(2);
+  await expect(medRows.nth(0)).toContainText('beta-agent');
+  await expect(medRows.nth(0)).toContainText('not open');
+  await expect(medRows.nth(1)).toContainText('alpha-agent');
+  await expect(medRows.nth(0)).toBeFocused();
+
+  // Keyboard selection activates beta-agent and attaches its terminal.
+  await page.keyboard.press('Enter');
+  await expect(page).toHaveURL(`/terminals/${agentB}`);
+  await expect.poll(() => socket.attaches).toBe(2);
+
+  // --- Narrow / phone tier (390x844): inline Open terminals section in mode dropdown ---
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(medChevron).toBeHidden();
+
+  // Navigate back to beta-agent's detail page to check narrow dropdown with both sessions open.
+  await page.evaluate(
+    (path) => document.dispatchEvent(new CustomEvent('nav-click', { detail: { path } })),
+    `/agents/${agentB}`
+  );
+  await expect(page).toHaveURL(`/agents/${agentB}`);
+  await expect(page.locator('scion-page-agent-detail')).toContainText('beta-agent');
+
+  const modeTrigger = page.locator('scion-app scion-header .compact-mode-dropdown .mode-trigger');
+  await expect(modeTrigger).toBeVisible();
+  await modeTrigger.click();
+
+  const narrowMenu = page.locator('scion-app scion-header .compact-mode-dropdown sl-menu');
+  await expect(narrowMenu.locator('sl-menu-label')).toContainText('Open terminals');
+  const narrowTerminalRows = narrowMenu.locator('sl-menu-item[value^="terminal:"]');
+  await expect(narrowTerminalRows).toHaveCount(2);
+  await expect(narrowTerminalRows.nth(0)).toContainText('beta-agent');
+  await expect(narrowTerminalRows.nth(0)).not.toContainText('not open');
+  await expect(narrowTerminalRows.nth(1)).toContainText('alpha-agent');
+
+  // Verify >=44px mobile touch target on narrow menu items (poll past Shoelace's open scale-in).
+  await expect
+    .poll(async () => (await narrowTerminalRows.nth(0).boundingBox())?.height ?? 0)
+    .toBeGreaterThanOrEqual(44);
+
+  // Selecting alpha-agent from the narrow Open terminals section switches directly to it.
+  await narrowTerminalRows.nth(1).click();
+  await expect(page).toHaveURL(`/terminals/${agentA}`);
+
+  // Fresh reload at phone width on `/` shows the disabled empty state inside Open terminals.
+  await page.goto('/');
+  const freshTrigger = page.locator('scion-app scion-header .compact-mode-dropdown .mode-trigger');
+  await expect(freshTrigger).toBeVisible({ timeout: 15000 });
+  await freshTrigger.click();
+  const freshEmpty = page.locator(
+    'scion-app scion-header .compact-mode-dropdown sl-menu sl-menu-item.terminals-empty-item[disabled]'
+  );
+  await expect(freshEmpty).toBeVisible();
+  await expect(freshEmpty).toContainText('No open terminals');
+});
+
+test('first click on wide header Terminals chevron keeps focus on trigger so keyboard reaches menu', async ({
+  page,
+}) => {
+  await setup(page);
+  await page.setViewportSize({ width: 1280, height: 800 });
+
+  await page.goto(`/agents/${agentB}`);
+  await expect(page.locator('scion-page-agent-detail')).toContainText('beta-agent', {
+    timeout: 15000,
+  });
+
+  const appChevron = page
+    .locator('scion-app scion-header .wide-center')
+    .getByRole('button', { name: 'Open terminals menu' });
+  await expect(appChevron).toBeVisible();
+
+  await appChevron.click();
+  await expect(appChevron).toHaveAttribute('aria-expanded', 'true');
+  await expect(appChevron).toBeFocused();
+
+  await page.keyboard.press('ArrowDown');
+  const rows = page.locator('scion-app scion-header .wide-center .terminals-menu sl-menu-item');
+  await expect(rows).toHaveCount(1);
+  await expect(rows.nth(0)).toContainText('beta-agent');
+  await expect(rows.nth(0)).toBeFocused();
+
+  await page.keyboard.press('Escape');
+  await expect(appChevron).toHaveAttribute('aria-expanded', 'false');
+  await expect(appChevron).toBeFocused();
 });

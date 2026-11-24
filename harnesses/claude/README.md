@@ -45,11 +45,63 @@ claude/
 ## Egress Firewall
 
 `init-firewall.sh` restricts outbound traffic to GitHub, the npm registry,
-Anthropic endpoints and the host network. It runs only at container start:
-set `SCION_INIT_FIREWALL=1` in the agent or template environment and
-`sciontool init` runs the script as root before anything else starts. If the
-script fails, the agent does not start. Unset, empty or a false value
-(`0`, `false`) means no firewall; any other value is an error.
+Anthropic endpoints, Visual Studio update/marketplace endpoints, and the
+container's default gateway host (`/32`) plus any distinct broker-written host
+alias (`host.docker.internal` / `host.containers.internal`). It runs only at
+container start: when the agent's environment has `SCION_INIT_FIREWALL=1`,
+`sciontool` runs the script as root before anything else starts. If the script
+fails, the agent does not start. Unset, empty or a false value (`0`, `false`)
+means no firewall; any other value is an error.
+
+Key rules enforced by `init-firewall.sh`:
+
+- **IPv6 default drop:** When `ip6tables` is available, IPv6 `INPUT`, `FORWARD`,
+  and `OUTPUT` default policies are set to `DROP` (allowing loopback,
+  established/related traffic, and IPv6 DNS nameservers from `/etc/resolv.conf`)
+  with an explicit `OUTPUT` `REJECT` (`icmp6-adm-prohibited`) so dual-stack
+  clients fall back to IPv4 immediately. If IPv6 is enabled on any non-loopback
+  interface and `ip6tables` is unavailable, the script fails closed and refuses
+  startup.
+- **Gateway `/32` only:** Only the default gateway's `/32` address (and any
+  distinct `/32` address resolved for `host.docker.internal` or
+  `host.containers.internal`) is permitted. Sibling containers on the same
+  Docker bridge `/24` are not reachable.
+- **Outbound `tcp/22` off by default:** Arbitrary outbound SSH (`tcp/22`) is no
+  longer unconditionally allowed. SSH to allowlisted hosts (such as GitHub)
+  continues to work because the `allowed-domains` ipset rule permits all ports
+  to allowlisted IPs. Operators can restore outbound `tcp/22` to any IPv4 host
+  by setting `server.broker.init_firewall.allow_ssh: true` in the broker's
+  `settings.yaml`.
+- **Operator domain allowlist:** Operators can add extra allowed hostnames
+  without rebuilding the image via `server.broker.init_firewall.allow_domains`
+  in the broker's `settings.yaml` (up to 64 unique lowercase DNS hostnames;
+  wildcards, IP literals, CIDRs, `localhost`, and metacharacters are rejected
+  at broker startup). The allowlist is operator-authoritative: the runtime
+  passes `SCION_INIT_FIREWALL_ALLOW_DOMAINS` and `SCION_INIT_FIREWALL_ALLOW_SSH`
+  only into the short-lived `sciontool netns-setup` container's argv from
+  broker configuration, strips all `SCION_INIT_FIREWALL_*` variables from the
+  agent container environment, and ignores them on in-container `sciontool init`
+  fallback paths. Users, templates, harness-configs, secrets, and parent agents
+  cannot widen the allowlist.
+- **IP-set limitation and CDN warning:** Domain names are resolved at container
+  startup via `getent ahostsv4` into an IPv4 ipset (IPv6 AAAA records are not
+  allowlisted). Adding a domain hosted behind a shared CDN or multi-tenant
+  front-end (for example Cloudflare, Fastly, or CloudFront) permits traffic to
+  any other service sharing those resolved edge IPs, and DNS rotation after
+  startup is not refreshed until the container restarts.
+
+Set the variable in one of these places:
+
+- the agent's own config: the `env` of an inline `--config` file, or
+  `config.env` in the agent-create request;
+- harness-config env: the `env:` block of this harness-config's
+  `config.yaml`, `harness_configs.<name>.env` in `settings.yaml`, or
+  `profiles.<profile>.harness_overrides.<name>.env`.
+
+A template's `env:` block cannot set it: templates may not set `SCION_*`
+keys, so the key is dropped with a warning and the firewall stays off. Hub
+env (`scion hub env set`) and environment-type secrets cannot set it either,
+because the Hub refuses and drops every `SCION_*` name.
 
 With native identity (the agent uses its runtime platform's own GCP
 identity, for example a Cloud Run service account) the metadata mode is
@@ -70,8 +122,10 @@ firewall was installed, before any workload runs. If the firewall or
 metadata interception was installed and that removal fails, the agent does
 not start; otherwise a failed removal is only logged.
 
-The allow-list covers the host's /24 network but no other Hub address, so an
-agent whose Hub is elsewhere cannot reach it with the firewall on.
+The allow-list covers only the default gateway's `/32` address (and distinct
+host-alias `/32` addresses), not the wider `/24` subnet or any other Hub
+address, so sibling containers on the same bridge and a Hub elsewhere cannot
+be reached with the firewall on.
 
 ## Build the Image
 

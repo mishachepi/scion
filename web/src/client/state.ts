@@ -472,6 +472,7 @@ export type StateEventType =
   | 'disconnected'
   | 'scope-changed'
   | 'notification-created'
+  | 'inbox-changed'
   | 'chat-message-received'
   | 'chat-topic-updated'
   | 'chat-thread-group-updated'
@@ -484,6 +485,7 @@ export type StateEventType =
   | 'chat-scheduled-updated'
   | 'chat-stars-updated'
   | 'decision-updated'
+  | 'message-action-updated'
   | 'agent-created';
 
 /**
@@ -740,9 +742,10 @@ export class StateManager extends EventTarget {
   /**
    * Map view scope to event subject patterns.
    * Matches the subscription tiers defined in §12.2.
-   * notification.> is always included so the notification tray shares the
-   * single SSE connection rather than opening its own (avoids exhausting
-   * the browser's 6-connection-per-origin HTTP/1.1 limit).
+   * Per-user notification subscriptions (`user.<id>.notification`) are added
+   * below so the notification tray shares the single SSE connection rather
+   * than opening its own (avoids exhausting the browser's 6-connection-per-origin
+   * HTTP/1.1 limit).
    */
   private subjectsForScope(scope: ViewScope): string[] {
     // The agent feed is a dedicated connection for agent rows only; it must
@@ -751,10 +754,10 @@ export class StateManager extends EventTarget {
     const subs = ((): string[] => {
       switch (scope.type) {
         case 'dashboard':
-          return ['project.>', 'notification.>'];
+          return ['project.>'];
 
         case 'profile': {
-          const profileSubs = ['project.>', 'notification.>'];
+          const profileSubs = ['project.>'];
           const profileUid = scope.userId || this.currentUserId;
           if (profileUid) {
             profileSubs.push(`user.${profileUid}.chat.>`);
@@ -763,16 +766,16 @@ export class StateManager extends EventTarget {
         }
 
         case 'project':
-          return [`project.${scope.projectId}.>`, 'notification.>'];
+          return [`project.${scope.projectId}.>`];
 
         case 'agent-detail':
-          return [`project.${scope.projectId}.>`, `agent.${scope.agentId}.>`, 'notification.>'];
+          return [`project.${scope.projectId}.>`, `agent.${scope.agentId}.>`];
 
         case 'brokers-list':
-          return ['broker.>', 'notification.>'];
+          return ['broker.>'];
 
         case 'broker-detail':
-          return ['broker.>', 'notification.>'];
+          return ['broker.>'];
 
         case 'chat': {
           const chatSubs: string[] = [];
@@ -782,7 +785,6 @@ export class StateManager extends EventTarget {
             chatSubs.push(`project.${spaceId}.agent.>`);
           }
           chatSubs.push(`user.${scope.userId}.chat.>`);
-          chatSubs.push('notification.>');
           return chatSubs;
         }
       }
@@ -795,11 +797,10 @@ export class StateManager extends EventTarget {
     // The same subject also carries DM typing, edit and delete events; pages
     // without a chat view have no listener for those and ignore them.
     //
-    // The subscriber-scoped notification subject carries bell rows addressed
-    // to this user alone, such as SCHEDULE_BLOCKED, which name the user's
-    // agents and schedules and so never go out on `notification.*`. The
-    // chat subject's `chat.>` does not cover it: `notification` is not under
-    // `chat`. It is added in every scope so the bell hears about them live.
+    // The subscriber-scoped notification subject carries all bell rows
+    // addressed to this user. The chat subject's `chat.>` does not cover it:
+    // `notification` is not under `chat`. It is added in every scope so the
+    // bell receives updates live.
     const userId =
       this.currentUserId ||
       (scope.type === 'chat' ? scope.userId : '') ||
@@ -809,6 +810,8 @@ export class StateManager extends EventTarget {
       if (!subs.includes(own)) subs.push(own);
       const ownNotifications = `user.${userId}.notification`;
       if (!subs.includes(ownNotifications)) subs.push(ownNotifications);
+      const ownInbox = `user.${userId}.inbox`;
+      if (!subs.includes(ownInbox)) subs.push(ownInbox);
     }
     return subs;
   }
@@ -845,18 +848,17 @@ export class StateManager extends EventTarget {
     const { subject, data } = update;
     const parts = subject.split('.');
 
-    // Notification events: notification.created
-    if (parts[0] === 'notification') {
-      this.notify('notification-created');
-      return;
-    }
-
-    // User-scoped notifications: user.{userId}.notification, bell rows
-    // addressed to this user alone (such as SCHEDULE_BLOCKED). Without an
+    // User-scoped notifications: user.{userId}.notification. Without an
     // explicit case the subject is dropped: it has three tokens, and the
     // user-scoped chat branch below requires four.
     if (parts[0] === 'user' && parts.length === 3 && parts[2] === 'notification') {
       this.notifyWithData('notification-created', data);
+      return;
+    }
+
+    // User-scoped inbox invalidation hints: user.{userId}.inbox.
+    if (parts[0] === 'user' && parts.length === 3 && parts[2] === 'inbox') {
+      this.notifyWithData('inbox-changed', data);
       return;
     }
 
@@ -889,6 +891,12 @@ export class StateManager extends EventTarget {
         } else if (subType === 'deleted') {
           this.notifyWithData('chat-message-deleted', data);
         }
+      } else if (parts.length >= 5 && parts[4] === 'updated') {
+        // user.{userId}.chat.<kind>.updated: a kind-agnostic message-action card updated.
+        this.notifyWithData('message-action-updated', {
+          ...(data as Record<string, unknown>),
+          kind: parts[3],
+        });
       } else {
         // Marked as addressed to this user: only conversations the user
         // takes part in are published on their own subject.
@@ -968,6 +976,12 @@ export class StateManager extends EventTarget {
           this.notifyWithData('chat-presence-updated', chatDetail);
         } else if (chatEventType === 'typing') {
           this.notifyWithData('chat-typing-received', chatDetail);
+        } else if (parts.length >= 5 && parts[4] === 'updated') {
+          // project.{projectId}.chat.<kind>.updated: a kind-agnostic message-action card updated.
+          this.notifyWithData('message-action-updated', {
+            ...chatDetail,
+            kind: chatEventType,
+          });
         }
         return;
       }

@@ -150,6 +150,8 @@ if [[ -z "$PROJECT_ID" ]]; then
     exit 1
 fi
 
+require_non_service_ssh_user
+
 # IMAGE_REGISTRY (hub-config.sh) is written into settings.yaml (--full) as a
 # quoted YAML string, so it must be a plain registry path. With ENABLE_GKE=true
 # the registry that takes effect must not be a loopback address.
@@ -237,6 +239,9 @@ SETTINGS_EOF
     # the other config files and lands in /tmp on the instance.
     cp "${SCRIPT_DIR}/merge-settings.py" "$UPLOAD_DIR/scion-merge-settings.py"
 
+    # Root-owned helper that validates and installs /home/scion/scion/scion.rebuild.
+    cp "${SCRIPT_DIR}/scion-install-rebuild.sh" "$UPLOAD_DIR/scion-install-rebuild.sh"
+
     # systemd service file, rendered from scion-hub.service.tmpl. Rebuild
     # from git compares the installed unit against that template, so the
     # unit text lives only there. Lines starting with ## are template notes.
@@ -268,7 +273,7 @@ EOF
     # Upload all config files to /tmp/ on the instance; they are placed into
     # their final locations at the start of the main remote SSH session.
     substep "Uploading files to instance..."
-    gcloud compute scp "$UPLOAD_DIR"/* "${INSTANCE_NAME}:/tmp/" --zone="${ZONE}"
+    gcloud compute scp "$UPLOAD_DIR"/* "${SSH_TARGET}:/tmp/" --zone="${ZONE}"
 
     substep "Files uploaded to instance"
 fi
@@ -371,7 +376,7 @@ if $FULL_DEPLOY; then
     fi
     if [ ! -d /usr/local/go ]; then
         echo "  -> Installing Go..."
-        curl -L https://go.dev/dl/go1.26.1.linux-amd64.tar.gz -o /tmp/go.tar.gz
+        curl -L https://go.dev/dl/go1.26.11.linux-amd64.tar.gz -o /tmp/go.tar.gz
         sudo tar -C /usr/local -xzf /tmp/go.tar.gz
         sudo ln -sf /usr/local/go/bin/go /usr/bin/go
         sudo ln -sf /usr/local/go/bin/gofmt /usr/bin/gofmt
@@ -423,33 +428,57 @@ FULL_POST_INSTALL_COMMANDS=""
 if $FULL_DEPLOY; then
     # shellcheck disable=SC2016 # remote script: $vars must expand on the remote host, not locally
     FULL_POST_INSTALL_COMMANDS='
-    # Update systemd unit file if changed
+    # Update systemd unit file if changed (or if ownership/mode drifted from root:root 0644)
     echo ""
     echo "==> Installing infrastructure config..."
     if ! diff -q /tmp/scion-hub.service /etc/systemd/system/scion-hub.service >/dev/null 2>&1; then
-        sudo mv /tmp/scion-hub.service /etc/systemd/system/scion-hub.service
+        sudo install -o root -g root -m 0644 /tmp/scion-hub.service /etc/systemd/system/scion-hub.service
+        rm -f /tmp/scion-hub.service
         echo "  -> Systemd unit file updated, reloading daemon..."
         sudo systemctl daemon-reload
+    elif [ "$(sudo stat -c "%u:%g:%a" /etc/systemd/system/scion-hub.service 2>/dev/null || true)" != "0:0:644" ]; then
+        sudo install -o root -g root -m 0644 /tmp/scion-hub.service /etc/systemd/system/scion-hub.service
+        rm -f /tmp/scion-hub.service
+        echo "  -> Systemd unit file ownership/permissions repaired (root:root 0644)"
     else
+        rm -f /tmp/scion-hub.service
         echo "  -> Systemd unit file unchanged"
     fi
 
-    # Install sudoers rules for the "Rebuild Server from Git" maintenance task.
+    # Install the root-owned rebuild helper and sudoers rules for the
+    # "Rebuild Server from Git" and binary update maintenance tasks.
+    # Invariant: scion-hub.service runs as User=scion and must never run as root.
     # The scion service user needs elevated privileges for two operations:
-    #   1. Installing the rebuilt binary into /usr/local/bin/
+    #   1. Installing the rebuilt binary into /usr/local/bin/scion via a
+    #      root-owned helper that validates the source is a regular, non-symlink
+    #      file owned by scion before copying it
     #   2. Restarting the scion-hub systemd service
     # Each rule is scoped to the exact command used by the executor.
+    REBUILD_HELPER="/usr/local/libexec/scion/scion-install-rebuild.sh"
+    sudo install -d -m 0755 -o root -g root /usr/local/libexec/scion
+    if ! diff -q /tmp/scion-install-rebuild.sh "$REBUILD_HELPER" >/dev/null 2>&1; then
+        sudo install -m 0755 -o root -g root /tmp/scion-install-rebuild.sh "$REBUILD_HELPER"
+        echo "  -> Rebuild install helper installed at ${REBUILD_HELPER}"
+    else
+        echo "  -> Rebuild install helper unchanged"
+    fi
+    sudo rm -f /tmp/scion-install-rebuild.sh
+
     SUDOERS_RULE="/etc/sudoers.d/scion-rebuild-server"
     cat > /tmp/scion-rebuild-server <<SUDOERS_EOF
 # Scion rebuild-server maintenance task privileges.
-scion ALL=(root) NOPASSWD: /usr/bin/install -m 755 /home/scion/scion/scion.rebuild /usr/local/bin/scion
+scion ALL=(root) NOPASSWD: /usr/local/libexec/scion/scion-install-rebuild.sh ""
 scion ALL=(root) NOPASSWD: /usr/bin/systemctl restart scion-hub
 scion ALL=(root) NOPASSWD: /usr/bin/systemctl restart --no-block scion-hub
 SUDOERS_EOF
-    if ! diff -q /tmp/scion-rebuild-server "$SUDOERS_RULE" >/dev/null 2>&1; then
-        sudo install -m 440 -o root -g root /tmp/scion-rebuild-server "$SUDOERS_RULE"
+    if ! sudo diff -q /tmp/scion-rebuild-server "$SUDOERS_RULE" >/dev/null 2>&1; then
+        sudo install -o root -g root -m 0440 /tmp/scion-rebuild-server "$SUDOERS_RULE"
         rm -f /tmp/scion-rebuild-server
         echo "  -> Sudoers rules installed (scion user can install binary and restart service)"
+    elif [ "$(sudo stat -c "%u:%g:%a" "$SUDOERS_RULE" 2>/dev/null || true)" != "0:0:440" ]; then
+        sudo install -o root -g root -m 0440 /tmp/scion-rebuild-server "$SUDOERS_RULE"
+        rm -f /tmp/scion-rebuild-server
+        echo "  -> Sudoers rules ownership/permissions repaired (root:root 0440)"
     else
         rm -f /tmp/scion-rebuild-server
         echo "  -> Sudoers rules unchanged"
@@ -500,8 +529,10 @@ fi
 
 step "Remote: pull, build, restart..."
 
+CHECK_PERMS_SCRIPT="$(cat "${SCRIPT_DIR}/check-install-perms.sh")"
+
 # shellcheck disable=SC2016 # remote script: $vars must expand on the remote host, not locally
-gcloud compute ssh "${INSTANCE_NAME}" --zone="${ZONE}" --command '
+gcloud compute ssh "${SSH_TARGET}" --zone="${ZONE}" --command '
     set -euo pipefail
     RESET_DB='"${RESET_DB}"'
     FULL_DEPLOY='"${FULL_DEPLOY}"'
@@ -564,12 +595,36 @@ gcloud compute ssh "${INSTANCE_NAME}" --zone="${ZONE}" --command '
         echo "  -> Database deleted"
     fi
 
-    # Install binary
+    # Install binary as root:root 0755 (not writable by the scion service user)
     echo "  -> Installing binary..."
-    sudo mv /home/scion/scion/scion /usr/local/bin/scion
-    sudo chmod +x /usr/local/bin/scion
+    sudo install -o root -g root -m 0755 /home/scion/scion/scion /usr/local/bin/scion
+    sudo rm -f /home/scion/scion/scion
 
     '"${FULL_POST_INSTALL_COMMANDS}"'
+
+    # Repair drifted ownership/mode on the systemd unit file on every run
+    # (existing VMs provisioned before install -o root -g root may still have
+    # an operator-owned scion-hub.service left by the old sudo mv). Do not
+    # follow symlinks here; let check-install-perms.sh reject a symlinked unit.
+    if [ -f /etc/systemd/system/scion-hub.service ] && [ ! -L /etc/systemd/system/scion-hub.service ] && \
+       [ "$(sudo stat -c "%u:%g:%a" /etc/systemd/system/scion-hub.service 2>/dev/null || true)" != "0:0:644" ]; then
+        sudo chown root:root /etc/systemd/system/scion-hub.service
+        sudo chmod 0644 /etc/systemd/system/scion-hub.service
+        echo "  -> Systemd unit file ownership/permissions repaired (root:root 0644)"
+    fi
+
+    # Verify installed binary, systemd unit, sudoers drop-in, and every command
+    # and destination path in the sudoers rules (plus all parent directories)
+    # before starting the service. Refuses to continue on any failure.
+    echo ""
+    echo "==> Verifying installed binary, unit, and sudoers permissions..."
+    CHECK_PERMS_ARGS=()
+    if [ "$FULL_DEPLOY" = "true" ]; then
+        CHECK_PERMS_ARGS+=(--require-sudoers)
+    fi
+    sudo bash -s -- ${CHECK_PERMS_ARGS[@]+"${CHECK_PERMS_ARGS[@]}"} <<'\''SCION_CHECK_INSTALL_PERMS_EOF'\''
+'"${CHECK_PERMS_SCRIPT}"'
+SCION_CHECK_INSTALL_PERMS_EOF
 
     # Start service
     echo ""

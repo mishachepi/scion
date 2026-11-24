@@ -154,13 +154,21 @@ func TestScheduledEventService_ExecRoundTrip(t *testing.T) {
 				Error:     "exit status 2",
 				Payload:   `{"agentId":"a-1","agentName":"worker","timeoutSeconds":120,"commandRedacted":true,"argc":2,"commandSha256":"abc123"}`,
 				ExecSummary: &ExecSummary{
-					Outcome:     "nonzero",
-					ExitCode:    &exitCode,
-					DurationMS:  &durationMS,
-					OutputBytes: &outputBytes,
-					StartedAt:   startedAt,
-					FinishedAt:  &finishedAt,
+					Outcome:      "nonzero",
+					ExitCode:     &exitCode,
+					DurationMS:   &durationMS,
+					OutputBytes:  &outputBytes,
+					CaptureMode:  "json",
+					OutputStatus: "captured",
+					StartedAt:    startedAt,
+					FinishedAt:   &finishedAt,
 				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/projects/proj-1/scheduled-events/evt-1/output":
+			_ = json.NewEncoder(w).Encode(ExecOutput{
+				CaptureMode:  "json",
+				OutputStatus: "captured",
+				Output:       json.RawMessage(`{"a":1}`),
 			})
 		default:
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
@@ -237,5 +245,45 @@ func TestScheduledEventService_ExecRoundTrip(t *testing.T) {
 	}
 	if got.ExecSummary.OutputBytes == nil || *got.ExecSummary.OutputBytes != 42 {
 		t.Errorf("unexpected OutputBytes: %v", got.ExecSummary.OutputBytes)
+	}
+	if got.ExecSummary.CaptureMode != "json" || got.ExecSummary.OutputStatus != "captured" {
+		t.Errorf("unexpected CaptureMode/OutputStatus: %+v", got.ExecSummary)
+	}
+
+	out, err := svc.GetOutput(context.Background(), "evt-1")
+	if err != nil {
+		t.Fatalf("GetOutput failed: %v", err)
+	}
+	if out.CaptureMode != "json" || out.OutputStatus != "captured" || string(out.Output) != `{"a":1}` {
+		t.Errorf("unexpected ExecOutput: %+v", out)
+	}
+}
+
+func TestScheduledEventService_ListGroupAndSort(t *testing.T) {
+	var gotQuery string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ListScheduledEventsResponse{
+			Events:     []ScheduledEvent{},
+			TotalCount: 0,
+		})
+	}))
+	defer server.Close()
+
+	c, err := New(server.URL)
+	if err != nil {
+		t.Fatalf("New client: %v", err)
+	}
+
+	_, err = c.ScheduledEvents("proj-1").List(context.Background(), &ListScheduledEventsOptions{
+		Group: "pending",
+		Sort:  "fire_at_asc",
+	})
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	if gotQuery != "group=pending&sort=fire_at_asc" {
+		t.Errorf("query = %q, want %q", gotQuery, "group=pending&sort=fire_at_asc")
 	}
 }

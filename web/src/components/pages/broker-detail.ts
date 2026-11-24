@@ -38,10 +38,19 @@ import {
   runtimeTargetRows,
 } from '../../shared/runtime-target.js';
 import { apiFetch, extractApiError } from '../../client/api.js';
+import { loadAdminStatus } from '../../client/admin-status.js';
+import type { AdminStatus } from '../../lib/admin-permissions.js';
 import { dispatchPageTitle } from '../../client/page-title.js';
 import { stateManager } from '../../client/state.js';
 import { visibleInterval } from '../../client/visible-interval.js';
 import { brokerTypeBadgeStyles } from '../shared/resource-styles.js';
+import {
+  brokerPolicyStyles,
+  canManageBrokerApproval,
+  renderAdminManagedBadge,
+  renderPolicyBlockedTag,
+  updateBrokerAdminManaged,
+} from '../shared/broker-policy-badges.js';
 import { showConfirm } from '../shared/confirm-dialog.js';
 import { showToast } from '../../utils/toast.js';
 import '../shared/status-badge.js';
@@ -103,11 +112,17 @@ export class ScionPageBrokerDetail extends LitElement {
   @state()
   private brokerSettingsError: string | null = null;
 
+  @state()
+  private adminStatus: AdminStatus | null = null;
+
+  private adminStatusUserId: string | null = null;
+
   private boundOnBrokersUpdated = this.onBrokersUpdated.bind(this);
   private stopRelativeTimeTick: (() => void) | null = null;
 
   static override styles = [
     brokerTypeBadgeStyles,
+    brokerPolicyStyles,
     css`
       :host {
         display: block;
@@ -496,6 +511,7 @@ export class ScionPageBrokerDetail extends LitElement {
     }
 
     void this.loadData();
+    void this.loadAdminStatusForUser();
 
     if (this.brokerId) {
       stateManager.setScope({ type: 'broker-detail', brokerId: this.brokerId });
@@ -638,8 +654,48 @@ export class ScionPageBrokerDetail extends LitElement {
     return (dateString && formatInstantWithZone(dateString)) || '—';
   }
 
+  override updated(changedProperties: Map<string, unknown>): void {
+    if (changedProperties.has('pageData')) {
+      void this.loadAdminStatusForUser();
+    }
+  }
+
+  private async loadAdminStatusForUser(): Promise<void> {
+    const userId = this.pageData?.user?.id ?? null;
+    if (!userId) {
+      this.adminStatusUserId = null;
+      this.adminStatus = null;
+      return;
+    }
+    if (userId === this.adminStatusUserId) return;
+    this.adminStatusUserId = userId;
+    const status = await loadAdminStatus(userId);
+    if (this.adminStatusUserId === userId) {
+      this.adminStatus = status;
+    }
+  }
+
   private get isAdmin(): boolean {
-    return this.pageData?.user?.role === 'admin';
+    return this.adminStatus?.isAdmin === true;
+  }
+
+  @state()
+  private approvalLoading = false;
+
+  private async handleToggleApproval(): Promise<void> {
+    if (!this.broker || this.approvalLoading) return;
+    const next = !this.broker.adminManaged;
+    this.approvalLoading = true;
+    try {
+      const updated = await updateBrokerAdminManaged(this.broker.id, next);
+      this.broker = { ...this.broker, ...updated };
+      stateManager.seedBrokers([this.broker]);
+    } catch (err) {
+      console.error('Failed to update broker approval:', err);
+      showToast(err instanceof Error ? err.message : 'Failed to update broker approval', 'danger');
+    } finally {
+      this.approvalLoading = false;
+    }
   }
 
   private async handleUnregister(): Promise<void> {
@@ -707,7 +763,8 @@ export class ScionPageBrokerDetail extends LitElement {
       <scion-detail-header heading=${this.broker.name}>
         <scion-back-link slot="back" href="/brokers">Back to Brokers</scion-back-link>
         <sl-icon slot="icon" name="hdd-rack"></sl-icon>
-        ${this.renderBrokerTypeBadge()}
+        ${this.renderBrokerTypeBadge()} ${renderAdminManagedBadge(this.broker)}
+        ${renderPolicyBlockedTag(this.broker)}
         <scion-status-badge
           status=${this.getBrokerStatusVariant(this.broker.status)}
           label=${this.broker.status}
@@ -716,19 +773,41 @@ export class ScionPageBrokerDetail extends LitElement {
         ${subtitleParts.length > 0
           ? html`<div slot="meta" class="header-subtitle">${subtitleParts.join(' · ')}</div>`
           : ''}
-        ${this.isAdmin
+        ${this.isAdmin || canManageBrokerApproval(this.broker)
           ? html`
               <div slot="actions" class="header-actions">
-                <sl-button
-                  variant="danger"
-                  size="small"
-                  ?loading=${this.unregisterLoading}
-                  ?disabled=${this.unregisterLoading}
-                  @click=${() => this.handleUnregister()}
-                >
-                  <sl-icon slot="prefix" name="trash"></sl-icon>
-                  Unregister
-                </sl-button>
+                ${canManageBrokerApproval(this.broker)
+                  ? html`
+                      <sl-button
+                        variant=${this.broker.adminManaged ? 'default' : 'primary'}
+                        size="small"
+                        data-testid="broker-approval-action"
+                        ?loading=${this.approvalLoading}
+                        ?disabled=${this.approvalLoading}
+                        @click=${() => this.handleToggleApproval()}
+                      >
+                        <sl-icon
+                          slot="prefix"
+                          name=${this.broker.adminManaged ? 'shield-x' : 'shield-check'}
+                        ></sl-icon>
+                        ${this.broker.adminManaged ? 'Revoke' : 'Approve'}
+                      </sl-button>
+                    `
+                  : nothing}
+                ${this.isAdmin
+                  ? html`
+                      <sl-button
+                        variant="danger"
+                        size="small"
+                        ?loading=${this.unregisterLoading}
+                        ?disabled=${this.unregisterLoading}
+                        @click=${() => this.handleUnregister()}
+                      >
+                        <sl-icon slot="prefix" name="trash"></sl-icon>
+                        Unregister
+                      </sl-button>
+                    `
+                  : nothing}
               </div>
             `
           : ''}

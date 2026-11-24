@@ -19,8 +19,7 @@ schedules within its own project.
 For full command syntax: `scion schedule --help` and its subcommands.
 
 Use `scion schedule create` for every delayed message, including a simple
-self-callback. The `--in` and `--at` flags of `scion message` are deprecated;
-do not use them for callbacks.
+self-callback. The `--in` and `--at` flags have been removed from `scion message`.
 
 ## Waiting on external processes — the blocked-wait pairing rule
 
@@ -78,7 +77,11 @@ if it holds lifecycle permission (the `full` agent role); with the
 ### One-shot events
 
 Fire once, then done. Specify timing with `--in` (relative delay: `30m`,
-`2h`) or `--at` (absolute ISO 8601 timestamp, UTC).
+`2h`) or `--at` (absolute ISO 8601 timestamp, UTC). Pending one-shot events are
+automatically cancelled if their target agent (`target agent deleted`) or the
+agent whose recorded creating authority they run under (`creating agent deleted`)
+is deleted; already-fired events keep their status, and restoring a soft-deleted
+agent does not revive cancelled one-shot events (recreate them instead).
 
 ### Recurring schedules
 
@@ -187,6 +190,18 @@ a user, to read it back.
 
 ## Gotchas
 
+- **Target agent must exist at authoring:** Creating a message event or
+  schedule, resuming a paused message schedule, or making a dispatch-changing
+  `PATCH` update (`payload`, `cronExpr`, `timeZone`, `eventType`, or
+  re-enabling) requires a live, resolvable target agent: `404` if missing,
+  deleted, a payload `agentId`/`agentName` disagrees with the agent's slug, or
+  unreadable and not permitted to message (an unreadable target you may message
+  is accepted); `400` if the raw `payload` target conflicts with convenience
+  target fields; `403` if the target is readable (including an existing target
+  on resume or dispatch-changing update) but you are not authorized to message
+  it or cross-project messaging is disabled. Re-target a schedule whose target
+  was deleted before resuming it. Metadata-only edits (such as renaming),
+  pausing, and deleting remain allowed regardless of target state.
 - **Cron defaults to UTC.** For a local time, pass `--time-zone` rather than
   converting to UTC; a fixed UTC time shifts by an hour against local time
   across DST changes. Zone prefixes in the expression (`CRON_TZ=`, `TZ=`) are

@@ -859,9 +859,10 @@ func TestIdleSuspend_OwnershipMatrix_SystemStopsAndSweeps(t *testing.T) {
 	assert.ErrorIs(t, err, store.ErrClaimPredicate)
 
 	// Row 14: MarkStaleAgentsOffline and MarkStalledAgents preserve active idle claim.
-	_, err = s.MarkStaleAgentsOffline(ctx, time.Now().Add(time.Hour))
+	future := time.Now().Add(time.Hour)
+	_, err = s.MarkStaleAgentsOffline(ctx, future)
 	require.NoError(t, err)
-	_, err = s.MarkStalledAgents(ctx, time.Now().Add(time.Hour), time.Time{})
+	_, err = s.MarkStalledAgents(ctx, store.StallCutoffs{Activity: future, Thinking: future}, time.Time{})
 	require.NoError(t, err)
 
 	// Row 15: stalled autoSuspendAgent (even with a stale pre-claim snapshot where
@@ -1315,8 +1316,9 @@ func TestIdleSuspend_UserStartDuringActiveClaimSettlesOrPreempts(t *testing.T) {
 		_, _, claimUntil := isoClaimIdleDirectly(t, s, agent, 45*time.Second)
 
 		rec := doRequest(t, srvB, http.MethodPost, "/api/v1/projects/"+proj.ID+"/agents", CreateAgentRequest{
-			Name: agent.Slug,
-			Task: "resume-via-create",
+			Name:   agent.Slug,
+			Task:   "resume-via-create",
+			Resume: true,
 		})
 		require.Contains(t, []int{http.StatusOK, http.StatusCreated}, rec.Code, rec.Body.String())
 		assert.True(t, sawResume.Load(), "preempting an active idle claim must pass resume=true")
@@ -2207,7 +2209,6 @@ func TestIdleSuspend_PostCommitLateAgentAndRuntimeReportsKeepSuspendedIdleAndAut
 		}
 	})
 	isoEnableIdleSweep(t, srvA, 15*time.Minute)
-	grantDevUserRuntimeBrokerAccess(t, s)
 
 	dispB := &isoCallbackDispatcher{st: s, autoReadyOnStart: true}
 	srvB := isoSecondReplica(t, s, dispB)

@@ -100,6 +100,28 @@ This applies to Hub-scoped secrets only. Hub-scoped environment variables (`scio
 
 An agent reading Hub-scoped secrets (`GET /api/v1/secrets?scope=hub`, `GET /api/v1/env?scope=hub` and their single-key routes) sees only the `environment` secrets with the `always` mode. Every other Hub-scoped secret, including the telemetry credential file, is left out of those lists, and a request for it by name answers as for a key that does not exist. Hub administrators see every Hub-scoped secret.
 
+### Agent-Scoped Secrets
+
+:::note[Experimental]
+Agent-scoped secrets require the `hub.agent_secrets` [experiment](/scion/reference/experiments/), which is off by default. While it is off, the Hub rejects the `agent` scope with `400 invalid scope: agent` and delivers no agent-scoped secrets.
+:::
+
+An agent-scoped secret belongs to a single agent. Only that agent receives it at start and restart, and only that agent can read its value at runtime. When the experiment is on, it takes precedence over a secret of the same name at Runtime Broker, Hub, Project or User scope (`runtime_broker < hub < project < user < agent`), and it is deleted when the agent is hard-deleted or purged. The scope exists for secrets only; environment variables cannot be agent-scoped.
+
+- **You** set, list, update and clear an agent's secrets with `scion hub secret --agent <name|id>` (or on the agent's **Secrets** tab in the Web UI). Listing and reading metadata need read access to the agent, and writing or clearing needs update access. As at every scope, values are never returned to you.
+- **The agent** stores and removes its own agent-scoped secrets with `sciontool secret set --scope agent` and `sciontool secret delete --scope agent` (see [Writing secrets with `sciontool`](#writing-secrets-with-sciontool)), and reads them with `scion secret get --value`. An agent cannot read or write another agent's agent-scoped secrets.
+
+```bash
+# Store a secret for one agent (a name is resolved in the current project)
+printf %s "$TOKEN" | scion hub secret set --agent my-agent API_TOKEN -
+
+# List that agent's secrets (metadata only)
+scion hub secret list --agent my-agent
+
+# Remove it
+scion hub secret clear --agent my-agent API_TOKEN
+```
+
 ---
 ## Injection Modes
 
@@ -298,7 +320,7 @@ From inside an agent container, read secrets with `scion secret`. The calls are 
     # Set a user-scoped (personal) secret
     sciontool secret set MY_PERSONAL_TOKEN "token-xyz" --scope user
     ```
-    *Note: `--scope` accepts `project` (default) or `user`.*
+    *Note: `--scope` accepts `project` (default), `user`, or `agent`. `--scope agent` stores a secret private to the calling agent and needs the `hub.agent_secrets` experiment; the agent removes it with `sciontool secret delete KEY --scope agent`. See [Agent-Scoped Secrets](#agent-scoped-secrets).*
 
     *Hub admins can restrict agents to writing user (profile) scope only. If the "Restrict
     agent-written secrets to profile scope" setting is on (Admin > Server Config), a project-scope
@@ -549,6 +571,7 @@ Other scopes use the same names, read from their own credentials only:
 | :--- | :--- |
 | Global scope (Hub-level) | Hub-scope `GH_{OWNER}__{REPO}`, `GH_{OWNER}`, then `GITHUB_TOKEN`. There is no GitHub App step: App installations belong to projects. |
 | User scope | Your own user-scope `GH_{OWNER}__{REPO}`, `GH_{OWNER}`, then `GITHUB_TOKEN`. An import uses them only when you are the user it imports for, never for another user. |
+| `scion templates import-url` | Runs on the Hub (`POST /api/v1/resources/import`) and uses the target scope's Hub secrets in the same order above (project, global, or user). No GitHub token is sent from the CLI. |
 | `scion harness-config install` and `scion templates import` | The `GH_{OWNER}__{REPO}`, `GH_{OWNER}`, then `GITHUB_TOKEN` environment variables of the shell running the CLI. The CLI fetches the source itself. |
 
 In every scope the first match wins, and with no match the fetch is unauthenticated, which works for public repos only. A global or user-scope import never reads project credentials.
@@ -556,6 +579,8 @@ In every scope the first match wins, and with no match the fetch is unauthentica
 Reimporting an existing template (`POST /api/v1/templates/{id}/reimport`) uses the same lookup order for the template's own scope: a project template's project credentials and App token, a global template's Hub credentials, and a user template's credentials only when you are that user. With a credential, the Hub requests the archive from `api.github.com`. When an import runs `git` instead (`git ls-remote` to resolve a branch name that contains `/`, or a sparse checkout when the archive download fails), the credential reaches `git` only through a credential helper scoped to `https://github.com`, with terminal prompts off (and `GIT_LFS_SKIP_SMUDGE=1` for the checkout); it is never put in the repository URL. `git` offers no credential of the Hub host's own (its git config, `~/.netrc`, ssh or Kerberos credentials), so without a credential it runs anonymously. The CLI's own imports work the same way.
 
 Only GitHub folder URLs use a credential. Archive URLs (`.tar.gz`, `.tgz`, `.zip`, including `github.com/.../archive/...` links), rclone sources and other hosts are always fetched without one.
+
+On a hosted Hub, archive URLs that redirect (for example `github.com/.../archive/...` links and release assets) are refused; give the final URL.
 
 ### Injection Mode Behavior
 

@@ -180,6 +180,7 @@ func serverConfigResponseFromSettings(vs *config.VersionedSettings) ServerConfig
 		AutoExposePorts:      vs.AutoExposePorts,
 		Quotas:               vs.Quotas,
 		AgentSecrets:         vs.AgentSecrets,
+		BrokerPolicy:         vs.BrokerPolicy,
 
 		DefaultGCPIdentityMode:             vs.DefaultGCPIdentityMode,
 		DefaultGCPIdentityServiceAccountID: vs.DefaultGCPIdentityServiceAccountID,
@@ -206,13 +207,27 @@ func hideNeverShownServerKeys(srv *config.V1ServerConfig) {
 		return
 	}
 	if srv.Hub != nil {
-		srv.Hub.HubClass = ""
-		srv.Hub.TestIdentities = nil
-		srv.Hub.GCPProjectID = ""
-		srv.Hub.InternalURL = ""
-		if c := srv.Hub.Conduit; c != nil {
-			c.PeerSecret = ""
+		hubCopy := *srv.Hub
+		hubCopy.HubClass = ""
+		hubCopy.TestIdentities = nil
+		hubCopy.GCPProjectID = ""
+		hubCopy.InternalURL = ""
+		hubCopy.AllowedImportSources = nil
+		if c := hubCopy.Conduit; c != nil {
+			cCopy := *c
+			cCopy.PeerSecret = ""
+			hubCopy.Conduit = &cCopy
 		}
+		if so := hubCopy.SystemOne; so != nil {
+			soCopy := *so
+			soCopy.SecretNames = nil
+			if soCopy.MaxEvalTime == "" {
+				hubCopy.SystemOne = nil
+			} else {
+				hubCopy.SystemOne = &soCopy
+			}
+		}
+		srv.Hub = &hubCopy
 	}
 	hideNeverAPIWritableProxyKeys(srv)
 	srv.KeyringFile = ""

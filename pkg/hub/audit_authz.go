@@ -34,9 +34,8 @@ import (
 // Decision Audit Emitter
 // =============================================================================
 
-// auditWriteTimeout is the maximum time an async mutation audit INSERT may
-// take before the goroutine abandons the attempt and releases its store
-// reference.
+// auditWriteTimeout is the maximum time a best-effort mutation audit INSERT
+// (async or synchronous) may take before abandoning the attempt.
 const auditWriteTimeout = 1 * time.Second
 
 // auditCancelDrainGrace bounds how long CloseAuditWriter waits after cancelling
@@ -131,6 +130,8 @@ func BuildDecisionAuditRecord(ctx context.Context, request AuthzRequest, decisio
 		record.ExecutorKind = ec.Kind
 		record.ExecutorID = ec.ID
 	}
+
+	record.SessionMode = viewAsMemberSessionModeFor(ctx, principalID)
 
 	return record
 }
@@ -277,17 +278,40 @@ func (t *mutationAuditTracker) stop(ctx context.Context, grace, cancelGrace time
 // bound or arriving after admission closes can be lost at shutdown rather than
 // hanging shutdown or writing to a closed store.
 func (s *Server) emitMutationAudit(ctx context.Context, record *store.MutationAuditRecord) {
+	s.recordMutationAudit(ctx, record, true)
+}
+
+// emitMutationAuditSync creates and stores a mutation audit record
+// synchronously through the same record preparation, bounded timeout, and
+// best-effort logging path as emitMutationAudit, detached from request
+// cancellation so the write completes before the caller returns without
+// changing the caller's response on store errors.
+func (s *Server) emitMutationAuditSync(ctx context.Context, record *store.MutationAuditRecord) {
+	s.recordMutationAudit(ctx, record, false)
+}
+
+// recordMutationAudit builds and persists a best-effort mutation audit record,
+// shared between emitMutationAudit (async) and emitMutationAuditSync (sync).
+func (s *Server) recordMutationAudit(ctx context.Context, record *store.MutationAuditRecord, async bool) {
+	if record == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	// E.2a: consolidated actor/credential-snapshot/correlation helper (plan
 	// §3.3), replacing this function's own copy of the extraction logic.
 	// ApplyActor only fills fields the caller has not already set explicitly.
 	auditActorFromContext(ctx).ApplyActor(record)
 
 	if record.Timestamp.IsZero() {
-		record.Timestamp = time.Now()
+		record.Timestamp = time.Now().UTC()
 	}
 
+	st := s.store
 	logger := slog.Default()
-	if !s.mutationAuditWork.goTracked(auditWriteTimeout, func(writeCtx context.Context) {
+	write := func(writeCtx context.Context) {
 		defer func() {
 			if r := recover(); r != nil {
 				logger.Warn("recovered panic in mutation audit emit",
@@ -296,13 +320,29 @@ func (s *Server) emitMutationAudit(ctx context.Context, record *store.MutationAu
 					"panic", r)
 			}
 		}()
-		if err := s.store.CreateMutationAudit(writeCtx, record); err != nil {
+		if st == nil {
+			logger.Warn("failed to emit mutation audit record",
+				"mutation_type", record.MutationType,
+				"target_id", record.TargetID,
+				"error", "no store")
+			return
+		}
+		if err := st.CreateMutationAudit(writeCtx, record); err != nil {
 			logger.Warn("failed to emit mutation audit record",
 				"mutation_type", record.MutationType,
 				"target_id", record.TargetID,
 				"error", err)
 		}
-	}) {
+	}
+
+	if !async {
+		writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), auditWriteTimeout)
+		defer cancel()
+		write(writeCtx)
+		return
+	}
+
+	if !s.mutationAuditWork.goTracked(auditWriteTimeout, write) {
 		logger.Warn("dropped mutation audit record after audit shutdown",
 			"mutation_type", record.MutationType,
 			"target_id", record.TargetID)
@@ -1004,9 +1044,50 @@ func newAgentIdentityFromStore(agent *store.Agent) AgentIdentity {
 // Audit Retention Controls
 // =============================================================================
 
-// CleanupAuditRecords removes audit records older than the specified retention period.
+// auditRecordCleanupTimeout bounds one run of the periodic audit record cleanup.
+const auditRecordCleanupTimeout = 30 * time.Second
+
+// auditRetentionDays returns the effective mutation audit retention window in
+// days: DefaultAuditRetentionDays (90) when unset, or the configured value
+// (0 disables automatic cleanup).
+func (s *Server) auditRetentionDays() int {
+	if s.config.AuditRetentionDays == nil {
+		return DefaultAuditRetentionDays
+	}
+	return *s.config.AuditRetentionDays
+}
+
+// auditRecordCleanupHandler returns the recurring singleton handler that
+// deletes mutation audit records older than server.hub.audit_retention_days.
+// When retention is 0 (disabled), the handler is a no-op.
+func (s *Server) auditRecordCleanupHandler() func(ctx context.Context) {
+	return func(ctx context.Context) {
+		retentionDays := s.auditRetentionDays()
+		if retentionDays <= 0 {
+			return
+		}
+		ctx, cancel := context.WithTimeout(ctx, auditRecordCleanupTimeout)
+		defer cancel()
+		if err := s.CleanupAuditRecords(ctx, retentionDays); err != nil {
+			slog.Error("audit-record-cleanup: failed to clean up audit records",
+				"error", err,
+				"retention_days", retentionDays)
+		}
+	}
+}
+
+// CleanupAuditRecords removes mutation audit records older than the specified
+// retention period in days. A retentionDays of 0 disables cleanup (no-op);
+// negative values return an error.
 func (s *Server) CleanupAuditRecords(ctx context.Context, retentionDays int) error {
-	cutoff := time.Now().AddDate(0, 0, -retentionDays)
+	if retentionDays < 0 {
+		return fmt.Errorf("invalid audit retention days %d: must be >= 0", retentionDays)
+	}
+	if retentionDays == 0 {
+		return nil
+	}
+
+	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays)
 
 	mutationCount, err := s.store.DeleteMutationAuditsBefore(ctx, cutoff)
 	if err != nil {

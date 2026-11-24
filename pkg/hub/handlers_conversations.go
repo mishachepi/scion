@@ -55,6 +55,8 @@ type conversationPeer struct {
 // conversationListResponse is the response for listing conversations.
 type conversationListResponse struct {
 	Conversations []conversationResponse `json:"conversations"`
+	Total         int                    `json:"total"`
+	Truncated     bool                   `json:"truncated"`
 	Cursor        string                 `json:"cursor,omitempty"`
 }
 
@@ -104,7 +106,7 @@ func (s *Server) handleListConversations(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	principalKind := identity.Type()
+	principalKind := normalizeFeedPrincipalKind(identity.Type())
 	principalID := identity.ID()
 
 	// Get all conversations for the caller.
@@ -243,14 +245,19 @@ func (s *Server) handleListConversations(w http.ResponseWriter, r *http.Request)
 	})
 
 	// Apply limit.
-	if limit > 0 && len(filtered) > limit {
+	total := len(filtered)
+	truncated := false
+	if limit > 0 && total > limit {
 		filtered = filtered[:limit]
+		truncated = true
 	}
 
 	// Build response WITHOUT participants (available via GET /conversations/{id}).
 	// This avoids an N+1 query — one ListParticipants call per conversation.
 	result := conversationListResponse{
 		Conversations: make([]conversationResponse, 0, len(filtered)),
+		Total:         total,
+		Truncated:     truncated,
 	}
 	for _, conv := range filtered {
 		result.Conversations = append(result.Conversations, conversationResponse{
@@ -390,6 +397,8 @@ func (s *Server) handleConversationRoutes(w http.ResponseWriter, r *http.Request
 		s.handleGetConversation(w, r, id)
 	case "messages":
 		s.handleConvListMessages(w, r, id)
+	case "watch":
+		s.handleConvWatch(w, r, id)
 	case "default-agent":
 		s.handleSetDefaultAgent(w, r, id)
 	case "participants":
@@ -483,41 +492,12 @@ func (s *Server) handleConvListMessages(w http.ResponseWriter, r *http.Request, 
 	}
 
 	ctx := r.Context()
-	identity := GetIdentityFromContext(ctx)
-	if identity == nil {
-		Forbidden(w)
-		return
-	}
-	cls, token, ok := requireInboxCredential(w, r)
-	if !ok {
-		return
-	}
-
-	// Authorization: for direct conversations, use canonical DM key (kind+ID).
-	// For group conversations, project membership is the gate (design doc
-	// §3.2, Q2 = b) — participant rows are a listing index only.
-	conv, err := s.store.GetConversation(ctx, id)
+	// Authorization: shared with handleConvWatch via authorizeConversationReadByID
+	// (DM canonical key + cross-project read gate, group project membership,
+	// and UAT token scope rules).
+	conv, err := s.authorizeConversationReadByID(ctx, r, id)
 	if err != nil {
-		writeErrorFromErr(w, err, "Conversation")
-		return
-	}
-
-	if conv.Kind == "direct" {
-		if !authorizeDMRead(conv, identity.Type(), identity.ID()) {
-			Forbidden(w)
-			return
-		}
-		// Hub-off guard: deny agent callers from reading cross-project DMs
-		// when the feature is disabled (design §7).
-		if !s.enforceCrossProjectReadGate(w, r, conv, nil) {
-			return
-		}
-	} else {
-		if !s.authorizeGroupConversationAccess(w, r, conv, ActionRead) {
-			return
-		}
-	}
-	if cls == inboxCredentialToken && !s.authorizeTokenConversationRead(w, r, token, conv) {
+		s.writeConvReadError(w, r, err)
 		return
 	}
 
@@ -1086,7 +1066,9 @@ func (s *Server) handleAddParticipant(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 
-	if req.PrincipalKind == "" || req.PrincipalID == "" {
+	rawPrincipal := strings.TrimSpace(req.PrincipalID)
+	principalRef := strings.TrimPrefix(rawPrincipal, "@")
+	if req.PrincipalKind == "" || principalRef == "" {
 		BadRequest(w, "principalKind and principalId are required")
 		return
 	}
@@ -1096,41 +1078,21 @@ func (s *Server) handleAddParticipant(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 
-	// For agent principals, verify the agent exists and belongs to the
-	// conversation's project. Without this check, a cross-project agent
-	// could be added as a participant and read messages via ListMessages
-	// (which uses participant-based auth only, no project check).
+	resolvedPrincipalID := rawPrincipal
+
+	// For agent principals, resolve by slug, ID, or name within the
+	// conversation's project (or by ID for legacy projectless groups).
+	// Without the project check, a cross-project agent could be added as a
+	// participant and read messages via ListMessages (which uses
+	// participant-based auth only, no project check).
 	if req.PrincipalKind == "agent" {
-		agent, agentErr := s.store.GetAgent(ctx, req.PrincipalID)
-		if agentErr != nil {
-			if errors.Is(agentErr, store.ErrNotFound) {
-				writeError(w, http.StatusNotFound, "not_found", "agent not found", nil)
-				return
-			}
-			writeErrorFromErr(w, agentErr, "")
+		agent, resErr, err := s.resolveAddParticipantAgent(ctx, r, identity, conv, principalRef)
+		if err != nil {
+			writeErrorFromErr(w, err, "")
 			return
 		}
-
-		if agent == nil {
-			writeError(w, http.StatusNotFound, "not_found", "agent not found", nil)
-			return
-		}
-
-		// An agent of another project gets the same answer as an
-		// unknown agent; the reason is logged. This runs before the
-		// soft-deleted check, so the reason is logged for a soft-deleted
-		// agent of another project too.
-		if conv.ProjectID != nil && agent.ProjectID != *conv.ProjectID {
-			logReferenceRefused(ctx, logging.RequestPath(r), "agent belongs to another project than the conversation", identity)
-			writeError(w, http.StatusNotFound, "not_found", "agent not found", nil)
-			return
-		}
-
-		// A soft-deleted agent is refused as an unknown agent, as group
-		// create and the default-agent path refuse it
-		// (validateDefaultAgent, handleSetDefaultAgent).
-		if !agent.DeletedAt.IsZero() {
-			writeError(w, http.StatusNotFound, "not_found", "agent not found", nil)
+		if resErr != nil {
+			writeError(w, resErr.status, resErr.code, resErr.message, nil)
 			return
 		}
 
@@ -1140,21 +1102,23 @@ func (s *Server) handleAddParticipant(w http.ResponseWriter, r *http.Request, id
 			writeGroupModeDenied(w, joinReason, agent.MessageMode)
 			return
 		}
+		resolvedPrincipalID = agent.ID
 	}
 
 	// A user added to a project group must currently be a member of the
-	// conversation's project.
+	// conversation's project. Resolve by ID, email, or handle against project
+	// members only so non-members and unknown inputs are indistinguishable.
 	if req.PrincipalKind == "user" && conv.ProjectID != nil && *conv.ProjectID != "" {
-		member, _, memberErr := s.authzService.ProjectMembershipEvidence(ctx,
-			PrincipalContext{Kind: PrincipalKindUser, ID: req.PrincipalID}, *conv.ProjectID)
-		if memberErr != nil && isProjectAccessLookupFault(memberErr) {
-			writeErrorFromErr(w, memberErr, "")
+		userID, resErr, err := s.resolveAddParticipantProjectUser(ctx, *conv.ProjectID, principalRef)
+		if err != nil {
+			writeErrorFromErr(w, err, "")
 			return
 		}
-		if !member {
-			BadRequest(w, "user is not a member of the conversation's project")
+		if resErr != nil {
+			writeError(w, resErr.status, resErr.code, resErr.message, nil)
 			return
 		}
+		resolvedPrincipalID = userID
 	}
 
 	now := time.Now().UTC()
@@ -1162,7 +1126,7 @@ func (s *Server) handleAddParticipant(w http.ResponseWriter, r *http.Request, id
 		ID:             api.NewUUID(),
 		ConversationID: id,
 		PrincipalKind:  req.PrincipalKind,
-		PrincipalID:    req.PrincipalID,
+		PrincipalID:    resolvedPrincipalID,
 		Role:           "member",
 		JoinedAt:       now,
 	}
@@ -1177,6 +1141,255 @@ func (s *Server) handleAddParticipant(w http.ResponseWriter, r *http.Request, id
 	}
 
 	writeJSON(w, http.StatusCreated, participant)
+}
+
+type participantResolveError struct {
+	status  int
+	code    string
+	message string
+}
+
+// resolveAddParticipantAgent resolves ref to a live agent for handleAddParticipant.
+// For project-scoped conversations it accepts slug, ID, or case-insensitive
+// name/slug within the project; cross-project, soft-deleted, and unknown agents
+// all return the same 404 so existence outside the project is not leaked.
+func (s *Server) resolveAddParticipantAgent(
+	ctx context.Context, r *http.Request, identity Identity, conv *store.Conversation, ref string,
+) (*store.Agent, *participantResolveError, error) {
+	notFound := &participantResolveError{
+		status:  http.StatusNotFound,
+		code:    "not_found",
+		message: "agent not found",
+	}
+
+	if conv.ProjectID == nil || *conv.ProjectID == "" {
+		agent, err := s.store.GetAgent(ctx, ref)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return nil, notFound, nil
+			}
+			return nil, nil, err
+		}
+		if agent == nil || !agent.DeletedAt.IsZero() {
+			return nil, notFound, nil
+		}
+		return agent, nil, nil
+	}
+
+	projectID := *conv.ProjectID
+
+	// 1. Exact slug lookup in the conversation's project (excludes soft-deleted).
+	agent, err := s.store.GetAgentBySlug(ctx, projectID, ref)
+	if err == nil && agent != nil && agent.ProjectID == projectID && agent.DeletedAt.IsZero() {
+		return agent, nil, nil
+	}
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, nil, err
+	}
+
+	// 2. Exact ID lookup. Out-of-scope (other project) and soft-deleted hits
+	// fall through to Step 3 rather than short-circuiting, so a caller cannot
+	// distinguish a cross-project or deleted agent UUID from an unknown UUID
+	// by naming a local agent after it. If Step 3 also finds no local match,
+	// we still log the cross-project refusal.
+	refusedOtherProject := false
+	agent, err = s.store.GetAgent(ctx, ref)
+	if err == nil && agent != nil {
+		if agent.ProjectID != projectID {
+			refusedOtherProject = true
+		} else if agent.DeletedAt.IsZero() {
+			return agent, nil, nil
+		}
+	}
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, nil, err
+	}
+
+	// 3. Case-insensitive name/slug match among live agents in this project.
+	var matches []store.Agent
+	cursor := ""
+	for {
+		res, listErr := s.store.ListAgents(ctx, store.AgentFilter{ProjectID: projectID}, store.ListOptions{
+			Limit:          1000,
+			Cursor:         cursor,
+			SkipTotalCount: true,
+		})
+		if listErr != nil {
+			return nil, nil, listErr
+		}
+		if res == nil {
+			break
+		}
+		for i := range res.Items {
+			a := &res.Items[i]
+			if !a.DeletedAt.IsZero() || a.ProjectID != projectID {
+				continue
+			}
+			if strings.EqualFold(a.Name, ref) || strings.EqualFold(a.Slug, ref) {
+				matches = append(matches, *a)
+				if len(matches) > 1 {
+					break
+				}
+			}
+		}
+		if len(matches) > 1 || res.NextCursor == "" {
+			break
+		}
+		cursor = res.NextCursor
+	}
+
+	switch len(matches) {
+	case 0:
+		if refusedOtherProject {
+			logReferenceRefused(ctx, logging.RequestPath(r), "agent belongs to another project than the conversation", identity)
+		}
+		return nil, notFound, nil
+	case 1:
+		return &matches[0], nil, nil
+	default:
+		return nil, &participantResolveError{
+			status:  http.StatusConflict,
+			code:    "ambiguous_reference",
+			message: fmt.Sprintf("multiple agents match %q; specify an agent slug or ID", ref),
+		}, nil
+	}
+}
+
+// resolveAddParticipantProjectUser resolves ref to a user ID who is an active
+// member of projectID. Accepts a user ID, email, or handle (display name,
+// hyphenated display-name slug, or email local part). Unknown users and
+// non-member users produce the exact same error so user existence outside the
+// project is not leaked.
+func (s *Server) resolveAddParticipantProjectUser(
+	ctx context.Context, projectID, ref string,
+) (string, *participantResolveError, error) {
+	notFound := &participantResolveError{
+		status:  http.StatusBadRequest,
+		code:    ErrCodeInvalidRequest,
+		message: "user not found in the conversation's project",
+	}
+
+	isMember := func(userID string) (bool, error) {
+		member, _, memberErr := s.authzService.ProjectMembershipEvidence(ctx,
+			PrincipalContext{Kind: PrincipalKindUser, ID: userID}, projectID)
+		if memberErr != nil && isProjectAccessLookupFault(memberErr) {
+			return false, memberErr
+		}
+		return member, nil
+	}
+
+	// 1. Direct user ID lookup. Non-members and inactive users fall through
+	// rather than short-circuiting so an outsider's UUID cannot be probed by
+	// setting a project member's displayName to it.
+	u, err := s.store.GetUser(ctx, ref)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return "", nil, err
+	}
+	if err == nil && u != nil {
+		member, memberErr := isMember(u.ID)
+		if memberErr != nil {
+			return "", nil, memberErr
+		}
+		if member {
+			return u.ID, nil, nil
+		}
+	}
+
+	// 2. Email lookup (handles both direct and group-derived project members).
+	// Non-members and inactive users fall through to Step 3 so an outsider's
+	// email cannot be probed via a project member's displayName, and so a
+	// federated project member's FederatedEmail can still match in Step 3.
+	if strings.Contains(ref, "@") {
+		u, err = s.store.GetUserByEmail(ctx, ref)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return "", nil, err
+		}
+		if err == nil && u != nil {
+			member, memberErr := isMember(u.ID)
+			if memberErr != nil {
+				return "", nil, memberErr
+			}
+			if member {
+				return u.ID, nil, nil
+			}
+		}
+	}
+
+	// 3. Handle lookup among the project's human members (direct and
+	// group-derived). Each matching candidate is still verified through
+	// ProjectMembershipEvidence (which enforces active user status, active
+	// bindings, and test-identity clamps).
+	userIDs, err := s.projectMemberCandidateUserIDs(ctx, projectID)
+	if err != nil {
+		return "", nil, err
+	}
+	if len(userIDs) == 0 {
+		return "", notFound, nil
+	}
+
+	users, err := s.store.GetUsersByIDs(ctx, userIDs)
+	if err != nil {
+		return "", nil, err
+	}
+
+	var matches []string
+	for _, uid := range userIDs {
+		candidate := users[uid]
+		if candidate == nil || !userMatchesParticipantHandle(candidate, ref) {
+			continue
+		}
+		member, memberErr := isMember(candidate.ID)
+		if memberErr != nil {
+			return "", nil, memberErr
+		}
+		if !member {
+			continue
+		}
+		matches = append(matches, candidate.ID)
+		if len(matches) > 1 {
+			break
+		}
+	}
+
+	switch len(matches) {
+	case 0:
+		return "", notFound, nil
+	case 1:
+		return matches[0], nil, nil
+	default:
+		return "", &participantResolveError{
+			status:  http.StatusConflict,
+			code:    "ambiguous_reference",
+			message: fmt.Sprintf("multiple users match %q; specify an email address or user ID", ref),
+		}, nil
+	}
+}
+
+func userMatchesParticipantHandle(u *store.User, ref string) bool {
+	email := u.Email
+	if u.FederatedEmail != nil && *u.FederatedEmail != "" {
+		if strings.EqualFold(*u.FederatedEmail, ref) {
+			return true
+		}
+		email = *u.FederatedEmail
+	}
+	if email != "" {
+		if strings.EqualFold(email, ref) {
+			return true
+		}
+		if at := strings.IndexByte(email, '@'); at > 0 && strings.EqualFold(email[:at], ref) {
+			return true
+		}
+	}
+	if dn := strings.TrimSpace(u.DisplayName); dn != "" {
+		if strings.EqualFold(dn, ref) {
+			return true
+		}
+		if slug := strings.ReplaceAll(dn, " ", "-"); strings.EqualFold(slug, ref) {
+			return true
+		}
+	}
+	return false
 }
 
 // handleLeaveConversation handles POST /api/v1/conversations/{id}/leave.
@@ -1380,55 +1593,11 @@ func (s *Server) canUserReadMessage(ctx context.Context, user Identity, msg *sto
 // authorizeDMRead + enforceCrossProjectReadGate and is untouched.
 func (s *Server) authorizeGroupConversationAccess(w http.ResponseWriter, r *http.Request, conv *store.Conversation, action Action) bool {
 	ctx := r.Context()
-
-	// Legacy projectless groups (pre-#1846, chat-thread-bridge design) have
-	// no project to gate on. Fall back to the participant check — today's
-	// behavior, preserved rather than widened.
-	if conv.ProjectID == nil || *conv.ProjectID == "" {
-		identity := GetIdentityFromContext(ctx)
-		if identity == nil {
-			Forbidden(w)
-			return false
-		}
-		allowed, err := s.canReadGroupConversation(ctx, identity, conv)
-		if err != nil {
-			writeErrorFromErr(w, err, "")
-			return false
-		}
-		if !allowed {
-			Forbidden(w)
-			return false
-		}
-		return true
-	}
-
-	// Strict cross-project rule (ptone decision, design §3.2): an agent from
-	// project B can never read a group in project A, whatever cross-project
-	// messaging settings say. This explicit equality check makes the rule
-	// independent of how authorize/CheckAccess treats agent tokens — it
-	// mirrors the DEF-138/DEF-49 checks already on the send paths.
-	if agentIdent := GetAgentIdentityFromContext(ctx); agentIdent != nil {
-		if agentIdent.ProjectID() != *conv.ProjectID {
-			Forbidden(w)
-			return false
-		}
-	}
-
-	project, err := s.store.GetProject(ctx, *conv.ProjectID)
-	if err != nil {
-		// Review round 1 finding #6: a missing project fails closed (403),
-		// but any other error (transient DB failure, timeout, ...) is not
-		// an authorization decision — surfacing it as 403 would be
-		// misleading to debug. Distinguish the two.
-		if errors.Is(err, store.ErrNotFound) {
-			Forbidden(w)
-			return false
-		}
-		writeErrorFromErr(w, err, "")
+	if err := s.checkGroupConversationAccess(ctx, GetIdentityFromContext(ctx), conv, action); err != nil {
+		s.writeConvReadError(w, r, err)
 		return false
 	}
-
-	return s.authorize(w, r, projectResource(project), action)
+	return true
 }
 
 // canReadProject reports whether identity may read the given project,
@@ -1502,15 +1671,17 @@ func (s *Server) listAllGroupConversations(ctx context.Context, projectID string
 // For direct conversations, authorization is derived from the canonical DM key
 // (principal kind AND ID), not from the participants table. This is strictly
 // tighter than a participant-table scan: a third principal cannot read a DM by
-// adding a participant row or knowing its UUID. A matching ID with the wrong
-// principal kind is denied.
+// adding a participant row or knowing its UUID. Principal kind is normalized
+// with normalizeFeedPrincipalKind ("dev" and "federated_user" -> "user",
+// matching authenticatedSender on DM creation), while preserving user/agent
+// separation so a matching ID with the wrong principal kind is still denied.
 //
 // For group conversations, authorization uses participant rows (existing
 // behavior). Group conversations have project-level authorization enforced
 // elsewhere; participant presence authorizes listing/reading.
 func authorizeDMRead(conv *store.Conversation, principalKind, principalID string) bool {
 	if conv.Kind == "direct" {
-		return isCanonicalDMParticipant(conv.ExternalRef, principalKind, principalID)
+		return isCanonicalDMParticipant(conv.ExternalRef, normalizeFeedPrincipalKind(principalKind), principalID)
 	}
 	// For non-direct conversations, caller must check participant rows separately.
 	// Return true here to fall through to the existing participant check.
@@ -1593,46 +1764,11 @@ func (s *Server) isCrossProjectReadAllowed(ctx context.Context, conv *store.Conv
 // allowed. The peer is derived from the canonical DM key (ExternalRef), not
 // from mutable participant rows.
 func (s *Server) enforceCrossProjectReadGate(w http.ResponseWriter, r *http.Request, conv *store.Conversation, msg *store.Message) bool {
-	agentIdent := GetAgentIdentityFromContext(r.Context())
-	if agentIdent == nil {
-		// Human callers always pass — authorized audit survives Hub disable.
-		return true
-	}
-
-	if conv.Kind != "direct" {
-		return true
-	}
-
-	peerKind, peerID, inKey, err := dmKeyPeer(conv, agentIdent.ID())
-	if err != nil {
-		writeError(w, http.StatusForbidden, ErrCodeForbidden,
-			"cross-project read denied: unparseable conversation key", nil)
+	if err := s.checkCrossProjectReadGate(r.Context(), conv, msg); err != nil {
+		s.writeConvReadError(w, r, err)
 		return false
 	}
-	if !inKey {
-		// Caller is not named in the key — authorizeDMRead should have
-		// caught this already. Allow through; the prior check is
-		// authoritative.
-		return true
-	}
-
-	var stampedPeerProject *string
-	if msg != nil {
-		stampedPeerProject = peerProjectFromRow(msg, peerKind, peerID)
-	}
-
-	decision, reason := s.crossProjectPeerAllowed(r.Context(), agentIdent.ProjectID(), peerKind, peerID, stampedPeerProject)
-	switch decision {
-	case peerAllowed:
-		return true
-	case peerDenied403:
-		writeError(w, http.StatusForbidden, ErrCodeForbidden, reason, nil)
-		return false
-	default:
-		writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
-			"Internal server error verifying peer agent", nil)
-		return false
-	}
+	return true
 }
 
 // peerDecision is the outcome of crossProjectPeerAllowed.

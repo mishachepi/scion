@@ -47,6 +47,10 @@ import {
 } from '../../shared/types.js';
 import { agentStatusBadge } from '../../shared/agent-state-display.js';
 import { apiFetch, extractApiError } from '../../client/api.js';
+import { loadAdminStatus } from '../../client/admin-status.js';
+import type { AdminStatus } from '../../lib/admin-permissions.js';
+import { current, projectsRoot } from '../../client/crumbs.js';
+import { projectDisplayName } from '../../client/project-label.js';
 import { showPendingSecretsStartHint } from '../../client/pending-secrets.js';
 import { dispatchPageTitle } from '../../client/page-title.js';
 import {
@@ -1201,7 +1205,7 @@ export class ScionPageProjectDetail extends LitElement {
 
     .scope-toggle button.active {
       background: var(--scion-primary, #3b82f6);
-      color: white;
+      color: var(--scion-primary-text, #ffffff);
     }
 
     th.sortable {
@@ -1255,6 +1259,11 @@ export class ScionPageProjectDetail extends LitElement {
       }
     }
   `;
+
+  @state()
+  private adminStatus: AdminStatus | null = null;
+
+  private adminStatusUserId: string | null = null;
 
   private boundOnProjectsUpdated = this.onProjectsUpdated.bind(this);
 
@@ -1344,6 +1353,7 @@ export class ScionPageProjectDetail extends LitElement {
 
     void this.loadData();
     void this.loadHubProjectCapabilities();
+    void this.loadAdminStatusForUser();
 
     // Listen for real-time updates
     window.addEventListener(FEATURE_FLAGS_CHANGED_EVENT, this.boundOnFeatureFlagsChanged);
@@ -1397,8 +1407,26 @@ export class ScionPageProjectDetail extends LitElement {
 
   override updated(changed: Map<string, unknown>): void {
     super.updated(changed);
+    if (changed.has('pageData')) {
+      void this.loadAdminStatusForUser();
+    }
     this.observeFilesSection();
     this.noteRowsReady();
+  }
+
+  private async loadAdminStatusForUser(): Promise<void> {
+    const userId = this.pageData?.user?.id ?? null;
+    if (!userId) {
+      this.adminStatusUserId = null;
+      this.adminStatus = null;
+      return;
+    }
+    if (userId === this.adminStatusUserId) return;
+    this.adminStatusUserId = userId;
+    const status = await loadAdminStatus(userId);
+    if (this.adminStatusUserId === userId) {
+      this.adminStatus = status;
+    }
   }
 
   /**
@@ -2842,7 +2870,13 @@ export class ScionPageProjectDetail extends LitElement {
 
     return html`
       <scion-detail-header heading=${this.project.name}>
-        <scion-back-link slot="back" href="/projects">Back to Projects</scion-back-link>
+        <scion-breadcrumb
+          slot="back"
+          .crumbs=${[
+            projectsRoot(),
+            current(projectDisplayName(this.project, this.projectId || this.project.id)),
+          ]}
+        ></scion-breadcrumb>
         ${this.renderProjectIcon()} ${this.renderLinkedBadge()}
         <div slot="meta" class="header-path">
           <scion-git-remote-display .project=${this.project}></scion-git-remote-display>
@@ -2874,7 +2908,7 @@ export class ScionPageProjectDetail extends LitElement {
               `
             : nothing}
           ${can(this.project?._capabilities, 'read') && can(this.hubProjectCapabilities, 'create')
-            ? this.pageData?.user?.role === 'admin'
+            ? this.adminStatus?.isAdmin === true
               ? html`
                   <sl-dropdown>
                     <sl-button slot="trigger" size="small" caret>
@@ -3353,6 +3387,7 @@ export class ScionPageProjectDetail extends LitElement {
 
   private renderLoading() {
     return html`
+      <scion-breadcrumb .crumbs=${[projectsRoot()]}></scion-breadcrumb>
       <div class="loading-state">
         <sl-spinner></sl-spinner>
         <p>Loading project...</p>
@@ -3414,7 +3449,7 @@ export class ScionPageProjectDetail extends LitElement {
   private renderError() {
     if (this.noAccess) {
       return html`
-        <scion-back-link href="/projects">Back to Projects</scion-back-link>
+        <scion-breadcrumb .crumbs=${[projectsRoot()]}></scion-breadcrumb>
 
         <div class="error-state" data-project-no-access>
           <sl-icon name="exclamation-triangle"></sl-icon>
@@ -3424,7 +3459,7 @@ export class ScionPageProjectDetail extends LitElement {
       `;
     }
     return html`
-      <scion-back-link href="/projects">Back to Projects</scion-back-link>
+      <scion-breadcrumb .crumbs=${[projectsRoot()]}></scion-breadcrumb>
 
       <div class="error-state">
         <sl-icon name="exclamation-triangle"></sl-icon>

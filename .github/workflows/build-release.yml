@@ -27,6 +27,10 @@ on:
         description: 'Git ref (tag) to build'
         required: true
         type: string
+    secrets:
+      HOMEBREW_SCION_TOKEN:
+        description: 'Homebrew tap and ghcr token; the called jobs read it from the homebrew environment, which takes precedence over the passed value'
+        required: false
 
 # Fork guard: forks (e.g. ptone/scion) mirror upstream tags, so without this every
 # upstream tag push would also run this pipeline on the fork, publishing a fork
@@ -132,8 +136,14 @@ jobs:
           BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           PKG="github.com/GoogleCloudPlatform/scion/pkg/version"
           LDFLAGS="-X ${PKG}.Commit=${COMMIT} -X ${PKG}.BuildTime=${BUILD_TIME} -X ${PKG}.Version=${VERSION}"
+          # sciontool keeps its version in its own package; flags match
+          # image-build/scion-base/Dockerfile so the release asset and the
+          # image's sciontool are built the same way.
+          TOOL_PKG="github.com/GoogleCloudPlatform/scion/cmd/sciontool/commands"
+          TOOL_LDFLAGS="-s -w -X ${TOOL_PKG}.Commit=${COMMIT} -X ${TOOL_PKG}.BuildTime=${BUILD_TIME} -X ${TOOL_PKG}.Version=${VERSION}"
 
           echo "ldflags=${LDFLAGS}" >> "$GITHUB_OUTPUT"
+          echo "sciontool_ldflags=${TOOL_LDFLAGS}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Build binary
@@ -175,6 +185,46 @@ jobs:
         with:
           name: ${{ matrix.output }}
           path: ${{ matrix.output }}.${{ matrix.archive || 'tar.gz' }}
+          if-no-files-found: error
+
+      # sciontool runs inside agent containers only, so it ships for Linux.
+      # It lets image builds install the release binary instead of compiling
+      # it (ptone/scion#9047). It must be built without cgo: sciontool init drops capabilities on every thread
+      # with syscall.AllThreadsSyscall, which fails in a cgo binary, and
+      # assert-no-cgo.sh enforces that here as it does in scion-base.
+      - name: Build sciontool
+        if: matrix.goos == 'linux'
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+          TOOL_LDFLAGS: ${{ steps.version.outputs.sciontool_ldflags }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist-sciontool
+          go build -tags no_embed_web -ldflags "${TOOL_LDFLAGS}" -o dist-sciontool/sciontool ./cmd/sciontool
+          bash image-build/lib/assert-no-cgo.sh dist-sciontool/sciontool
+          tar -czvf "sciontool-${GOOS}-${GOARCH}.tar.gz" -C dist-sciontool sciontool
+
+      - name: Verify sciontool version
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          OUT=$(cd "${RUNNER_TEMP:?}" && "${GITHUB_WORKSPACE:?}/dist-sciontool/sciontool" version)
+          printf '%s\n' "$OUT"
+          if [[ "$OUT" != "sciontool version ${VERSION:?}"$'\n'* ]]; then
+            echo "::error::Built sciontool does not report version '${VERSION}'."
+            exit 1
+          fi
+
+      - name: Upload sciontool artifact
+        if: matrix.goos == 'linux'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sciontool-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: sciontool-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
           if-no-files-found: error
 
   build-plugins:
@@ -378,10 +428,11 @@ jobs:
       - name: Generate checksums
         working-directory: release
         run: |
-          # Cover every published asset (scion-* binaries and scion-plugin-*
-          # binaries) with a single checksums file so deploy tooling can
-          # verify a download before extracting/installing it. Sort for a
-          # stable, reviewable diff between releases.
+          # Cover every published asset (scion-* binaries, sciontool-linux-*
+          # binaries and scion-plugin-* binaries) with a single checksums
+          # file so deploy tooling can verify a download before
+          # extracting/installing it. Sort for a stable, reviewable diff
+          # between releases.
           #
           # Write the sums outside this directory, then move them in: with
           # `> SHA256SUMS` the shell can create the empty file before the `*`
@@ -564,8 +615,14 @@ jobs:
 
   # Preview releases only: build the homebrew-scion images and update the
   # tap formula. The called jobs read HOMEBREW_SCION_TOKEN from the
-  # "homebrew" environment, so no secret is passed here; they skip with a
-  # notice when it is not set.
+  # "homebrew" environment, but a reusable workflow sees an environment
+  # secret only when its caller passes that secret, at every level of
+  # nesting. So this call passes it by name (the environment's value takes
+  # precedence over the passed one), and so does every caller of this
+  # workflow on the preview path (build-preview-weekly.yml). Without it the
+  # secret resolves to an empty string and the gate job fails. Passing it by
+  # name, not with `secrets: inherit`, keeps every other secret out of the
+  # called workflow.
   publish-homebrew:
     name: Publish to Homebrew
     needs: release
@@ -573,5 +630,7 @@ jobs:
     permissions:
       contents: read     # The called jobs only check out code
     uses: ./.github/workflows/publish-homebrew.yml
+    secrets:
+      HOMEBREW_SCION_TOKEN: ${{ secrets.HOMEBREW_SCION_TOKEN }}  # see above
     with:
       tag: ${{ needs.release.outputs.tag }}

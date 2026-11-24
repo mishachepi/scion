@@ -33,7 +33,7 @@ import (
 // expectedTableCount is the number of domain tables in the hub schema
 // (excluding the schema_migrations bookkeeping table). The fixture must cover
 // every one of them.
-const expectedTableCount = 109
+const expectedTableCount = 114
 
 // TestFixtureCoverage is the CI coverage gate: it generates the fixture and
 // fails if any domain table has zero rows.
@@ -109,8 +109,17 @@ func TestFixtureLoadable(t *testing.T) {
 	// field.UUID("id", ...) column.
 	workspace, err := entadapter.NewUserTerminalWorkspaceStore(client).GetUserTerminalWorkspace(ctx, userID)
 	require.NoError(t, err, "user_terminal_workspaces fixture row must be readable via UserTerminalWorkspaceStore")
+	execContainer, err := entadapter.NewUserExecContainerStore(client).GetUserExecContainer(ctx, userID)
+	require.NoError(t, err, "user_exec_containers fixture row must be readable via UserExecContainerStore")
+	require.Equal(t, agentID, execContainer.AgentID)
 	assert.Equal(t, []string{agentID}, workspace.AgentIDs)
 	assert.Equal(t, agentID, workspace.FrontmostAgentID)
+
+	// The exec_run_outputs row must be readable through the real store adapter
+	// (field.UUID run_id and project_id columns).
+	execOut, err := entadapter.NewScheduleStore(client).GetScheduledExecRunOutput(ctx, "5e000000-0000-0000-0000-000000000002")
+	require.NoError(t, err, "exec_run_outputs fixture row must be readable via ScheduleStore")
+	assert.Equal(t, `{"ok":true}`, string(execOut))
 
 	// The thread group rows must be readable through the real store adapter
 	// (field.UUID ids, the stored name_key matching the Go helper, and the
@@ -209,6 +218,12 @@ func TestFixtureLoadable(t *testing.T) {
 	hasDeliveryHold, err := composite.HasAgentDeliveryHold(ctx, agentID)
 	require.NoError(t, err, "agent_delivery_holds fixture row must be readable via MessageHoldStore")
 	assert.True(t, hasDeliveryHold)
+
+	savedScreen, err := composite.GetAgentSuspendScreen(ctx, agentID)
+	require.NoError(t, err, "agent_suspend_screens fixture row must be readable via AgentSuspendScreenStore")
+	assert.Equal(t, agentID, savedScreen.AgentID)
+	assert.Equal(t, "\x1b[32mready>\x1b[0m last pane\n", savedScreen.Content)
+	assert.False(t, savedScreen.Truncated)
 	heldMsg, err := composite.GetMessage(ctx, "88888888-8888-8888-8888-888888888889")
 	require.NoError(t, err)
 	assert.Equal(t, store.MessageDispatchAwaitingSession, heldMsg.DispatchState)
@@ -235,6 +250,12 @@ func TestFixtureLoadable(t *testing.T) {
 	assert.Equal(t, "1/1", trFire.MatchedThrough)
 	assert.Equal(t, "cel", trFire.DecidedDialect)
 	assert.Contains(t, trFire.RuleTrace, `"class":"matched"`)
+
+	trClaim, err := composite.GetActiveTriggerSubjectClaim(ctx, triggerID, "webhook:"+webhookEndpointID)
+	require.NoError(t, err, "trigger_subject_claims fixture row must be readable via TriggerStore")
+	assert.Equal(t, triggerSubjectClaimID, trClaim.ID)
+	assert.Equal(t, store.TriggerSubjectClaimStateActive, trClaim.State)
+	assert.Equal(t, agentID, trClaim.AgentID)
 
 	withdrawnDec, err := composite.GetDecision(ctx, "dc000000-0000-0000-0000-000000000003")
 	require.NoError(t, err)

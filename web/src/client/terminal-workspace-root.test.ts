@@ -18,8 +18,12 @@ import type { Agent } from '../shared/types.js';
 import { _appFrameRefCountForTests } from '../components/shared/app-frame.js';
 import {
   TERMINAL_DRAG_MIME,
+  TERMINAL_DROPDOWN_SELECT_EVENT,
   TERMINAL_PALETTE_NEW_AGENT_EVENT,
   TERMINAL_PANE_DIALOG_OPEN_EVENT,
+  getTerminalWorkspaceSnapshot,
+  resetTerminalWorkspaceEventsForTests,
+  type TerminalDropdownSelectDetail,
   type TerminalPaletteNewAgentDetail,
 } from './terminal-workspace-events.js';
 import type { ScionQuickPalette } from '../components/shared/palette/quick-palette.js';
@@ -1324,6 +1328,43 @@ describe('the SSE bridge re-arms auto-reconnect regardless of which agent-state 
     expect(session.reconnecting).toBe(false); // still crashed: foregrounding alone never dials
 
     // The agent restarts and SSE reports it running again.
+    agentPhase = 'running';
+    source.dispatchEvent(
+      new MessageEvent('update', {
+        data: JSON.stringify({ subject: `agent.${agentId}.status`, data: { phase: 'running' } }),
+      })
+    );
+    expect(session.reconnecting).toBe(true);
+  });
+
+  it('a suspended agent (SSE phase suspended) marks unavailable and re-arms once running again (ptone/scion#8954)', async () => {
+    const registry = new TerminalSessionRegistry({
+      hubUrl: window.location.origin,
+      accountId: 'r2-suspended-phase',
+    });
+    const { session } = await attachVisibleThenHide(registry);
+    expect(session.state.connection).toBe('connected');
+
+    await vi.waitFor(() => expect(mySource()).toBeDefined());
+    const source = mySource();
+    source.onopen?.();
+
+    agentPhase = 'suspended';
+    source.dispatchEvent(
+      new MessageEvent('update', {
+        data: JSON.stringify({
+          subject: `agent.${agentId}.status`,
+          data: { phase: 'suspended', suspendReason: 'idle' },
+        }),
+      })
+    );
+    expect(session.state.connection).toBe('unavailable');
+    expect(session.state.disconnectReason).toBe('agent-stopped');
+    expect(session.state.error).toContain('suspended');
+
+    session.setFrontmost(true);
+    expect(session.reconnecting).toBe(false);
+
     agentPhase = 'running';
     source.dispatchEvent(
       new MessageEvent('update', {
@@ -4502,5 +4543,265 @@ describe('open terminals rail: a click fills the next free slot (ptone/scion#432
     const state = root.layoutManager.getState();
     expect(state.active).toBe('single');
     expect(state.four).toEqual([null, null, null, null]);
+  });
+});
+
+describe('openPaletteIfEmpty (ptone/scion#8468)', () => {
+  let root: TerminalWorkspaceRoot;
+  let reg: TerminalSessionRegistry;
+
+  // Load the palette module up front so a wrongly-triggered lazy mount finishes
+  // quickly even if a negative test is run in isolation.
+  beforeAll(async () => {
+    await import('../components/shared/palette/quick-palette.js');
+  });
+
+  /** Wait past the lazy palette import and mount microtasks/macrotask. */
+  async function waitPastLazyPaletteMount(): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+
+  beforeEach(() => {
+    vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+      cb(0);
+      return 0;
+    });
+    stubWebSocketAndEventSource();
+    reg = new TerminalSessionRegistry({ hubUrl: window.location.origin, accountId: 'r-empty' });
+    root = new WorkspaceRoot();
+    document.body.append(root.element);
+  });
+
+  afterEach(() => {
+    paletteLoad.override = null;
+    root.dispose();
+    root.element.remove();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('opens the Jump to agent palette when shown with zero terminals and restores focus to the footer button on dismiss', async () => {
+    stubFetchForPalette([{ id: AGENT_A, name: 'alpha' }]);
+    root.show(true);
+
+    root.openPaletteIfEmpty();
+
+    const palette = await waitForPalette(root);
+    await vi.waitFor(() => {
+      expect(palette.open).toBe(true);
+      expect(palette.label).toBe('Jump to agent');
+      expect(palette.groups.agents?.status).toBe('ready');
+    });
+
+    palette.dispatchEvent(new CustomEvent('palette-dismiss', { detail: { reason: 'escape' } }));
+    fireFromDialog(palette, 'sl-after-hide');
+    expect(document.activeElement).toBe(jumpButton(root));
+  });
+
+  it('does not open the palette when at least one terminal session is open', async () => {
+    stubFetchForPalette([{ id: AGENT_A, name: 'alpha' }]);
+    root.show(true);
+    root.create(reg, AGENT_A);
+    await flush();
+
+    root.openPaletteIfEmpty();
+    await waitPastLazyPaletteMount();
+
+    expect(root.element.querySelector('scion-quick-palette')).toBeNull();
+    expect(agentListLoads()).toBe(0);
+  });
+
+  it('does not open the palette when a restored idle terminal entry is present', async () => {
+    stubFetchForPalette([{ id: AGENT_A, name: 'alpha' }]);
+    root.show(true);
+    root.withAutoSelectSuspended(() => root.create(reg, AGENT_A, { deferConnect: true }));
+    await flush();
+
+    root.openPaletteIfEmpty();
+    await waitPastLazyPaletteMount();
+
+    expect(root.element.querySelector('scion-quick-palette')).toBeNull();
+    expect(agentListLoads()).toBe(0);
+  });
+
+  it('does not open the palette when terminals are open in another window (status action active)', async () => {
+    stubFetchForPalette([{ id: AGENT_A, name: 'alpha' }]);
+    root.show(true);
+    root.setStatus(TERMINALS_OPEN_ELSEWHERE_STATUS, {
+      label: TERMINALS_OPEN_ELSEWHERE_HELP_LABEL,
+      text: TERMINALS_OPEN_ELSEWHERE_HELP,
+    });
+    root.setStatusAction({ label: 'Move terminals to this window', onClick: () => {} });
+    await flush();
+
+    root.openPaletteIfEmpty();
+    await waitPastLazyPaletteMount();
+
+    expect(root.element.querySelector('scion-quick-palette')).toBeNull();
+    expect(agentListLoads()).toBe(0);
+  });
+
+  it('does not open the palette when the workspace is hidden', async () => {
+    stubFetchForPalette([{ id: AGENT_A, name: 'alpha' }]);
+    root.show(false);
+
+    root.openPaletteIfEmpty();
+    await waitPastLazyPaletteMount();
+
+    expect(root.element.querySelector('scion-quick-palette')).toBeNull();
+    expect(agentListLoads()).toBe(0);
+  });
+});
+
+describe('published terminal workspace snapshot (ptone/scion#8284)', () => {
+  let root: TerminalWorkspaceRoot;
+  let reg: TerminalSessionRegistry;
+
+  beforeEach(() => {
+    resetTerminalWorkspaceEventsForTests();
+    vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+      cb(0);
+      return 0;
+    });
+    const metadataByAgent: Record<string, { id: string; name: string; lastActivityEvent: string }> =
+      {
+        [AGENT_A]: {
+          id: AGENT_A,
+          name: 'zeta-agent',
+          lastActivityEvent: '2026-11-19T10:00:00Z',
+        },
+        [AGENT_B]: {
+          id: AGENT_B,
+          name: 'alpha-agent',
+          lastActivityEvent: '2026-11-19T12:00:00Z',
+        },
+        [AGENT_C]: {
+          id: AGENT_C,
+          name: 'middle-agent',
+          lastActivityEvent: '2026-11-19T14:00:00Z',
+        },
+      };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url: string) => {
+        const id =
+          [AGENT_A, AGENT_B, AGENT_C].find((agent) => String(url).includes(agent)) ?? AGENT_A;
+        return Promise.resolve(
+          new Response(JSON.stringify({ ...metadataByAgent[id], phase: 'running' }), {
+            status: 200,
+          })
+        );
+      })
+    );
+    stubWebSocketAndEventSource();
+    vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(800);
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(500);
+    reg = new TerminalSessionRegistry({ hubUrl: window.location.origin, accountId: 'r8284' });
+    root = new WorkspaceRoot();
+    document.body.append(root.element);
+    root.show(true);
+  });
+
+  afterEach(() => {
+    root.dispose();
+    root.element.remove();
+    resetTerminalWorkspaceEventsForTests();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function selectSort(mode: 'added' | 'alpha' | 'activity'): void {
+    const menu = root.element.querySelector('.terminal-sort-menu')!;
+    const item = menu.querySelector(`sl-menu-item[value="${mode}"]`)!;
+    menu.dispatchEvent(new CustomEvent('sl-select', { detail: { item } }));
+  }
+
+  it('publishes sessions in the rail sort order with status dots and updates when sort changes', async () => {
+    root.create(reg, AGENT_A);
+    root.withAutoSelectSuspended(() => root.create(reg, AGENT_B, { deferConnect: true }));
+    root.withAutoSelectSuspended(() => root.create(reg, AGENT_C, { deferConnect: true }));
+    reg.metadata.seed(AGENT_B, {
+      id: AGENT_B,
+      name: 'alpha-agent',
+      lastActivityEvent: '2026-11-19T12:00:00Z',
+      phase: 'running',
+    } as Agent);
+    reg.metadata.seed(AGENT_C, {
+      id: AGENT_C,
+      name: 'middle-agent',
+      lastActivityEvent: '2026-11-19T14:00:00Z',
+      phase: 'running',
+    } as Agent);
+
+    await vi.waitFor(() => {
+      const snap = getTerminalWorkspaceSnapshot();
+      expect(snap.sessions.map((s) => s.name)).toEqual([
+        'zeta-agent',
+        'alpha-agent',
+        'middle-agent',
+      ]);
+    });
+
+    const initial = getTerminalWorkspaceSnapshot();
+    expect(initial.count).toBe(3);
+    expect(initial.focusedAgentId).toBe(AGENT_A);
+    expect(initial.sessions[1]?.dot).toEqual({ colour: 'grey', meaning: 'Not connected' });
+
+    selectSort('alpha');
+    expect(getTerminalWorkspaceSnapshot().sessions.map((s) => s.name)).toEqual([
+      'alpha-agent',
+      'middle-agent',
+      'zeta-agent',
+    ]);
+
+    selectSort('activity');
+    expect(getTerminalWorkspaceSnapshot().sessions.map((s) => s.name)).toEqual([
+      'middle-agent',
+      'alpha-agent',
+      'zeta-agent',
+    ]);
+  });
+
+  it('updates focusedAgentId on multi-pane focusin and zoom changes', async () => {
+    root.layoutManager.setLayout('two-columns');
+    const sessionA = root.create(reg, AGENT_A);
+    const sessionB = root.create(reg, AGENT_B);
+    await flush();
+
+    // No pane focused yet in multi-pane mode.
+    expect(getTerminalWorkspaceSnapshot().focusedAgentId).toBeNull();
+
+    const paneB = paneFor(root, AGENT_B);
+    paneB.dispatchEvent(new FocusEvent('focusin', { bubbles: true, composed: true }));
+    expect(getTerminalWorkspaceSnapshot().focusedAgentId).toBe(AGENT_B);
+
+    const paneA = paneFor(root, AGENT_A);
+    paneA.dispatchEvent(new FocusEvent('focusin', { bubbles: true, composed: true }));
+    expect(getTerminalWorkspaceSnapshot().focusedAgentId).toBe(AGENT_A);
+
+    // Zooming pane B makes B the focused agent regardless of prior multi-pane focus.
+    root.layoutManager.zoom(sessionB.state.key);
+    await flush();
+    expect(getTerminalWorkspaceSnapshot().focusedAgentId).toBe(AGENT_B);
+    expect(sessionA.state.agentId).toBe(AGENT_A);
+  });
+
+  it('places an unplaced rail session into the next free multi-pane slot on TERMINAL_DROPDOWN_SELECT_EVENT', async () => {
+    root.layoutManager.setLayout('two-columns');
+    const sessionA = root.create(reg, AGENT_A);
+    const sessionB = root.withAutoSelectSuspended(() =>
+      root.create(reg, AGENT_B, { deferConnect: true })
+    );
+    await flush();
+    expect(root.layoutManager.getVisibleSlots()).toEqual([sessionA.state.key, null]);
+
+    window.dispatchEvent(
+      new CustomEvent<TerminalDropdownSelectDetail>(TERMINAL_DROPDOWN_SELECT_EVENT, {
+        detail: { agentId: AGENT_B },
+      })
+    );
+    await flush();
+
+    expect(root.layoutManager.getVisibleSlots()).toEqual([sessionA.state.key, sessionB.state.key]);
   });
 });

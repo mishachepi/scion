@@ -238,7 +238,7 @@ func (s *Server) createWebhookEndpoint(w http.ResponseWriter, r *http.Request, p
 		if !ok {
 			return
 		}
-		subjectDialect, subjectRule, subjectMode, ok := s.writeAndValidateTriggerSubject(w, ctx, nil, false)
+		subjectDialect, subjectRule, subjectMode, _, ok := s.writeAndValidateTriggerSubject(w, ctx, nil, false)
 		if !ok {
 			return
 		}
@@ -246,7 +246,7 @@ func (s *Server) createWebhookEndpoint(w http.ResponseWriter, r *http.Request, p
 		if !ok {
 			return
 		}
-		ceiling, ok := s.triggerRevisionAuthorityCeiling(w, r, projectID, ActionCreate)
+		ceiling, _, ok := s.triggerRevisionAuthorityCeiling(w, r, projectID, ActionCreate)
 		if !ok {
 			return
 		}
@@ -385,7 +385,7 @@ func (s *Server) createWebhookEndpoint(w http.ResponseWriter, r *http.Request, p
 		Secret:                  rawSecret,
 	}
 	if defaultTr != nil {
-		trResp := buildTriggerResponse(*defaultTr)
+		trResp := buildTriggerResponse(s.newExecRevealer(r.Context()), *defaultTr)
 		resp.TriggerID = trResp.ID
 		resp.Trigger = &trResp
 	}

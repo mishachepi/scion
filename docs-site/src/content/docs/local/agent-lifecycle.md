@@ -19,7 +19,7 @@ different intent:
 | | `scion stop` | `scion suspend` |
 | :--- | :--- | :--- |
 | **Phase after** | `stopped` | `suspended` |
-| **Next `start`** | Fresh harness session | **Continues** the previous conversation |
+| **Next `resume`** | Fresh harness session | **Continues** the previous conversation |
 | **Use when** | The task is done, or you want a clean slate | You'll come back and want the agent to pick up where it left off |
 | **Harness requirement** | None | Harness must support session resume |
 
@@ -63,6 +63,8 @@ Suspending an agent also preserves a terminal or error-bearing activity (`comple
 
 **Auto-wake on new work (`lifecycle.idle_suspend`).** When the [`lifecycle.idle_suspend`](/scion/reference/experiments/#server-experiments-with-notes) experiment is enabled (alpha, off by default), an agent the Hub suspended on its own (`suspendReason` `idle` or `stalled`) is resumed automatically whenever a direct message, web chat message, `@`-mention, notification, or scheduled message arrives for it — no `--wake` flag or `agent.lifecycle` permission is required on the sender (messaging permission is enough). Direct messages, primary web chat targets, and scheduled messages wait for the resume and then deliver; `@`-mentions, secondary web chat targets, and notifications are accepted immediately and delivered after a background resume. Agents suspended explicitly (`suspendReason` `user`), agents suspended before `suspendReason` was recorded, and held agents are never woken automatically.
 
+**Last terminal screen (`hub.suspend_screen`).** While the [`hub.suspend_screen`](/scion/reference/experiments/#server-experiments-with-notes) experiment is enabled (alpha, on by default), the Hub makes a best-effort, timeout-bounded capture of the agent's visible `scion` tmux pane immediately before stopping the container on manual suspend and on stalled or idle auto-suspend (not on membership-loss holds). The saved screen (ANSI-preserving, capped at 64 KiB) is replaced on each subsequent suspend and deleted automatically with the agent. Callers with `agent.attach` permission can view it via `scion look <agent>` (which prints a "saved at" banner on stderr) or in the **Last screen** card on the agent's **Status** tab in the Web UI. Runtimes without an exec path simply record no saved screen.
+
 ### Resuming an agent
 
 ```bash
@@ -78,18 +80,21 @@ appended to the resumed session as a new prompt, if the harness supports it.
 | :--- | :--- |
 | `-a, --attach` | Attach to the agent's session immediately after resuming. |
 
-### `start` and `resume` are intent-aware
+### `start` vs. `resume`
 
-You do not have to remember which command to use — Scion looks at the agent's
-saved phase and does the right thing:
+`scion start` and `scion resume` have distinct responsibilities:
 
-- **`scion start` on a *suspended* agent** performs an **implicit resume**: the
-  harness session is continued, exactly as if you had run `scion resume`.
-- **`scion resume` on a *stopped* agent** starts a **fresh** session — there is
-  no prior conversation to continue, so it falls back to a clean start.
-
-In other words, the *agent's phase* decides whether the session is continued or
-started fresh; the command name is just a hint.
+- **`scion start` (and `scion create`)** creates and starts a new agent (or
+  starts an unstarted `created` / `provisioning` agent). If an agent with that
+  name already exists in a resumable phase — `suspended`, `stopped`, or `halted`
+  (including an `error` agent remembering one of those phases, or a running
+  agent with an active idle-suspend claim) — the Hub refuses the request with
+  `409 agent_exists_resumable` rather than silently reusing the existing agent.
+- **`scion resume`** explicitly brings an existing agent back in place:
+  - On a **`suspended`** agent, it continues the previous harness conversation.
+  - On a **`stopped`** or **`halted`** agent, it restarts the agent in place
+    with a **fresh** harness session (keeping its identity; the workspace is
+    kept unless it lived on the agent's pod storage).
 
 ### Harness support
 
@@ -99,7 +104,7 @@ Session resume is a per-harness capability:
 | :--- | :--- |
 | Claude Code | ✅ Yes (`--continue`) |
 | Gemini CLI | ✅ Yes (`--resume`) |
-| Generic | ❌ No — use `stop`/`start` |
+| Generic | ❌ No — use `stop`/`resume` |
 
 ## Crash Recovery: the `error` phase
 
@@ -393,11 +398,21 @@ stalled agents** in **Admin > Server Config**).
 An agent is marked `stalled` by the platform when it is `running`, its heartbeat
 arrived within the last 2 minutes (the process is alive), but no activity events
 have arrived within the stall threshold (`server.hub.stalled_threshold`, default
-**5 minutes**; a value under 2 minutes falls back to the default). The Hub
-checks every 5 minutes. With auto-suspend on, the Hub suspends an agent in the
-same check that marks it stalled, unless the agent's harness does not support
-session resume. Agents already `stalled` when you turn auto-suspend on are not
-suspended unless they become active and stall again.
+**5 minutes**; a value under 2 minutes falls back to the default). While an
+agent is in `thinking` (waiting on a model response), the Hub applies a longer
+**20-minute** cutoff (or `stalled_threshold`, whichever is larger) so slow model
+calls are not marked `stalled` prematurely. The Hub checks every 5 minutes. With
+auto-suspend on, the Hub suspends an agent in the same check that marks it
+stalled (including agents that stall past the 20-minute `thinking` cap), unless
+the agent's harness does not support session resume. Agents already `stalled`
+when you turn auto-suspend on are not suspended unless they become active and
+stall again.
+
+After a tool call finishes, the agent shows `thinking` until its next event
+(rather than `working`), because the harness's next step is a model call
+carrying the tool result. On a Hub with the 20-minute `thinking` stall cutoff,
+that cutoff therefore also covers the model call after each tool, while
+turn-end events continue to return the agent to `working`.
 
 A long build, a test run or a background job emits no activity events, so the
 Hub also looks for **live work**. On each 30-second heartbeat, `sciontool init`

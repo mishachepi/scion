@@ -17,6 +17,7 @@ package hub
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/artifacts"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/permissions"
@@ -24,19 +25,23 @@ import (
 	"github.com/go-jose/go-jose/v4/jwt"
 )
 
-// Send-time recipient warning (ptone/scion#4575): the hub side of
-// artifacts.RecipientAuthority.
+// Send-time recipient warning (ptone/scion#4575), open-review access filter
+// (ptone/scion#7650), and lost-access review-draft reaper (ptone/scion#8475):
+// the hub side of artifacts.RecipientAuthority.
 //
-// These methods answer for a NAMED principal, the direct recipient of a
-// message, not for the caller of ctx. They are WARNING-ONLY: their answers
-// reach the sender only as the count in artifactRefsRecipientWarning, and
-// nothing here grants access, serves content or is consulted by any read
-// route. The identity ResolveRecipient builds (recipientIdentity) is used
-// only as the subject of policy reads (CheckAccess, the delegation chain
-// walk and the agent scope check) and never enters a context, so it can
-// never be taken for the caller: the artifact service learns its caller
-// only from ctx (artifactHost.Principal), which still refuses every
-// in-process identity. TestRecipientIdentityNeverEntersAContext pins that.
+// These methods answer for a NAMED principal (the direct recipient of a
+// message, a reviewer with a recorded review session, or a reviewer with a
+// saved review draft), not for the caller of ctx. They are NON-ACCESS-GRANTING:
+// nothing here ever grants access, serves content, or is consulted by any read
+// route; besides advisory warnings and filtering, a recipient check may also
+// withhold or remove the principal's own data on a definitive deny. The
+// identity ResolveRecipient builds (recipientIdentity) is used only as the
+// subject of policy reads (CheckAccess, the delegation chain walk and the
+// agent scope check, all run under maskAllAuthzMemo) and never enters a
+// context, so it can never be taken for the caller: the artifact service
+// learns its caller only from ctx (artifactHost.Principal), which still
+// refuses every in-process identity. TestRecipientIdentityNeverEntersAContext
+// pins that.
 
 var _ artifacts.RecipientAuthority = (*artifactHost)(nil)
 
@@ -93,7 +98,7 @@ func (r *recipientSubject) Permits(ctx context.Context, scopeRef, permission str
 	if w, done := r.chain[perm.ID]; done {
 		return w.ok, w.err
 	}
-	ok, err := r.host.agentChainAllowsErr(ctx, agent, perm)
+	ok, err := r.host.agentChainAllowsErr(maskAllAuthzMemo(ctx), agent, perm)
 	if r.chain == nil {
 		r.chain = map[string]chainWalk{}
 	}
@@ -105,20 +110,24 @@ func (r *recipientSubject) Permits(ctx context.Context, scopeRef, permission str
 // principal exercise permission on artifacts in scopeRef, decided by
 // AuthzService.CheckAccess with the principal as the subject, the same
 // question Authorize asks for a caller (without the credential step, which
-// Permits answers). CheckAccess reports no lookup error: a policy
-// evaluation that cannot complete is a deny, so it may count toward the
-// warning.
+// Permits answers), under maskAllAuthzMemo so nothing memoized for the
+// caller's request is observed. An indeterminate decision (a store or
+// resolution fault) is returned as an error so callers can distinguish a
+// transient lookup failure from a policy deny and fail safe.
 func (r *recipientSubject) Authorize(ctx context.Context, scopeRef, permission string) (bool, error) {
 	perm, ok := artifactPermission(permission)
 	h := r.host
 	if !ok || scopeRef == "" || h.server == nil || h.server.authzService == nil {
 		return false, nil
 	}
-	decision := h.server.authzService.CheckAccess(ctx, r.identity, Resource{
+	decision := h.server.authzService.CheckAccess(maskAllAuthzMemo(ctx), r.identity, Resource{
 		Type:       permissions.ResourceArtifact,
 		ParentType: permissions.ResourceProject,
 		ParentID:   scopeRef,
 	}, Action(perm.Action))
+	if decision.IsIndeterminate() {
+		return false, fmt.Errorf("artifacts: authorization check indeterminate: %s", decision.Reason)
+	}
 	return decision.Allowed, nil
 }
 
@@ -129,8 +138,9 @@ func (r *recipientSubject) Authorize(ctx context.Context, scopeRef, permission s
 // carrying the scopes a mint would issue now (as scheduled authority
 // builds one). It returns nil and no error, which every caller treats as
 // "not readable", for an unknown kind, a missing, deleted or inactive
-// principal, or an agent whose chain ceiling structurally refuses a mint;
-// an error only for a failed lookup.
+// principal, an expired or disabled test fixture user, the local development
+// user while local-development authority is off, or an agent whose chain
+// ceiling structurally refuses a mint; an error only for a failed lookup.
 //
 // It is called once per recipient check (ResolveRecipient). The result
 // must only ever be used as the subject of a policy read and never be
@@ -151,6 +161,12 @@ func (h *artifactHost) recipientIdentity(ctx context.Context, kind, ref string) 
 		if user == nil || user.Status != store.UserStatusActive {
 			return nil, nil
 		}
+		if testFixtureRejection(user, h.server.testIdentities.enabled, h.server.testIdentities.clock()) != "" {
+			return nil, nil
+		}
+		if user.ID == DevUserID && !h.server.authzService.devLocalAuthorityEnabled() {
+			return nil, nil
+		}
 		return NewAuthenticatedUser(user.ID, user.Email, user.DisplayName, user.Role, "api"), nil
 	case artifacts.PrincipalKindAgent:
 		agent, err := h.server.store.GetAgent(ctx, ref)
@@ -164,7 +180,7 @@ func (h *artifactHost) recipientIdentity(ctx context.Context, kind, ref string) 
 			return nil, nil
 		}
 		authz := h.server.authzService
-		scopes, err := authz.ceilingFilteredAgentScopes(ctx, agent, authz.mintCandidateScopes(agent))
+		scopes, err := authz.ceilingFilteredAgentScopes(maskAllAuthzMemo(ctx), agent, authz.mintCandidateScopes(agent))
 		if err != nil {
 			if _, structural := ceilingDenyCauseForError(err); structural {
 				return nil, nil

@@ -502,7 +502,10 @@ func (s *Server) canCreateSkillInScope(ctx context.Context, scope, scopeID strin
 	case store.SkillScopeProject:
 		if agentIdent := GetAgentIdentityFromContext(ctx); agentIdent != nil {
 			own := agentIdent.ProjectID()
-			return own != "" && agentIdent.HasScope(ScopeAgentCreate) && (scopeID == "" || scopeID == own)
+			if own == "" || (scopeID != "" && scopeID != own) {
+				return false
+			}
+			return s.authzService.CheckAccess(ctx, agentIdent, skillScopeResource(store.SkillScopeProject, own), ActionCreate).Allowed
 		}
 		userIdent := GetUserIdentityFromContext(ctx)
 		if userIdent == nil {
@@ -657,6 +660,10 @@ func (s *Server) createSkill(w http.ResponseWriter, r *http.Request) {
 	case store.SkillScopeGlobal:
 		userIdent := GetUserIdentityFromContext(ctx)
 		if userIdent == nil {
+			if GetIdentityFromContext(ctx) != nil {
+				writeError(w, http.StatusForbidden, ErrCodeForbidden, "You do not have permission to create global skills", nil)
+				return
+			}
 			writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required", nil)
 			return
 		}
@@ -676,29 +683,29 @@ func (s *Server) createSkill(w http.ResponseWriter, r *http.Request) {
 				"scopeId is required for project-scoped skills", nil)
 			return
 		}
-		if agentIdent := GetAgentIdentityFromContext(ctx); agentIdent != nil {
-			if !agentIdent.HasScope(ScopeAgentCreate) {
-				writeError(w, http.StatusForbidden, ErrCodeForbidden, "Missing required scope", nil)
-				return
-			}
-			if req.ScopeID != agentIdent.ProjectID() {
-				writeError(w, http.StatusForbidden, ErrCodeForbidden, "Agents can only manage resources within their own project", nil)
-				return
-			}
-		} else if userIdent := GetUserIdentityFromContext(ctx); userIdent != nil {
-			decision := s.authzService.CheckAccess(ctx, userIdent,
-				skillScopeResource(store.SkillScopeProject, req.ScopeID), ActionCreate)
-			if !decision.Allowed {
-				writeError(w, http.StatusForbidden, ErrCodeForbidden, "You do not have permission to create skills in this project", nil)
-				return
-			}
-		} else {
+		identity := GetIdentityFromContext(ctx)
+		if identity == nil {
 			writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required", nil)
 			return
+		}
+		decision := s.authzService.CheckAccess(ctx, identity,
+			skillScopeResource(store.SkillScopeProject, req.ScopeID), ActionCreate)
+		if !decision.Allowed {
+			writeError(w, http.StatusForbidden, ErrCodeForbidden, "You do not have permission to create skills in this project", nil)
+			return
+		}
+		if agentIdent, ok := identity.(AgentIdentity); ok {
+			if s.agentStandingForbidden(ctx, w, agentIdent.ID()) {
+				return
+			}
 		}
 	case store.SkillScopeUser:
 		userIdent := GetUserIdentityFromContext(ctx)
 		if userIdent == nil {
+			if GetIdentityFromContext(ctx) != nil {
+				writeError(w, http.StatusForbidden, ErrCodeForbidden, "You do not have permission to create skills in user scope", nil)
+				return
+			}
 			writeError(w, http.StatusUnauthorized, "unauthorized", "User authentication required for user-scoped skills", nil)
 			return
 		}
@@ -1068,6 +1075,11 @@ func (s *Server) publishSkillVersion(w http.ResponseWriter, r *http.Request, ski
 		writeError(w, http.StatusForbidden, ErrCodeForbidden, "You do not have permission to publish versions for this skill", nil)
 		return
 	}
+	if agentIdent, ok := identity.(AgentIdentity); ok {
+		if s.agentStandingForbidden(ctx, w, agentIdent.ID()) {
+			return
+		}
+	}
 
 	// Dispatch based on content type: multipart uploads are handled inline,
 	// while JSON requests go through the existing two-phase upload flow.
@@ -1399,6 +1411,11 @@ func (s *Server) handleSkillUpload(w http.ResponseWriter, r *http.Request, skill
 		writeError(w, http.StatusForbidden, ErrCodeForbidden, "You do not have permission to upload files for this skill", nil)
 		return
 	}
+	if agentIdent, ok := identity.(AgentIdentity); ok {
+		if s.agentStandingForbidden(ctx, w, agentIdent.ID()) {
+			return
+		}
+	}
 
 	stor := s.GetStorage()
 	if stor == nil {
@@ -1610,6 +1627,10 @@ func (s *Server) handleSkillDownload(w http.ResponseWriter, r *http.Request, ski
 		NotFound(w, "Skill")
 		return
 	}
+	if agentIdent, ok := identity.(AgentIdentity); ok && s.agentStanding(ctx, agentIdent.ID()) != nil {
+		NotFound(w, "Skill")
+		return
+	}
 
 	stor := s.GetStorage()
 	if stor == nil {
@@ -1698,6 +1719,12 @@ func (s *Server) handleSkillsResolve(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+
+	if agentIdent := GetAgentIdentityFromContext(ctx); agentIdent != nil {
+		if s.agentStandingForbidden(ctx, w, agentIdent.ID()) {
+			return
+		}
+	}
 
 	var req ResolveSkillsRequest
 	if err := readJSON(r, &req); err != nil {
@@ -1998,7 +2025,10 @@ func (s *Server) canUseProjectGitHubToken(ctx context.Context, projectID string)
 		return err == nil
 	}
 	if agentIdent := GetAgentIdentityFromContext(ctx); agentIdent != nil {
-		return agentIdent.ProjectID() == projectID
+		if agentIdent.ProjectID() != projectID {
+			return false
+		}
+		return s.agentStanding(ctx, agentIdent.ID()) == nil
 	}
 	// Last arm, and the only one left: anything that is not a broker or an agent
 	// must be a user holding read on the project's skills. The nil test is
@@ -2070,20 +2100,50 @@ func (s *Server) resolveGitHubToken(ctx context.Context, projectID string) (inst
 // upstream is unresponsive.
 const hubGitHubRefreshTimeout = 2 * time.Minute
 
-// ghRefreshFailureBackoff bounds how often a background stale-refresh is
-// retried for the same cache key after it fails. Without this, a
-// persistently failing ref (rate limit, outage) would start a brand new
-// refresh attempt on every single stale hit, while silently continuing to
+// ghRefreshFailureBackoff is the nominal duration a background stale-refresh
+// waits before retrying the same cache key after a failure (jittered via
+// agent.JitteredTTL so failed refreshes do not all retry together). Without
+// this, a persistently failing ref (rate limit, outage) would start a brand
+// new refresh attempt on every single stale hit, while silently continuing to
 // serve the stale value regardless.
 const ghRefreshFailureBackoff = 1 * time.Minute
 
+// hubGHRefreshConcurrency bounds how many background GitHub skill refreshes
+// may hit GitHub concurrently across distinct cache keys, so a burst of stale
+// entries (for example right after a rate-limit cooldown ends) drains smoothly
+// instead of stampeding GitHub's rate limit again.
+const hubGHRefreshConcurrency = 2
+
+func (s *Server) ghClockNow() time.Time {
+	if s.ghNow != nil {
+		return s.ghNow()
+	}
+	return time.Now()
+}
+
+func (s *Server) ghRand() func() float64 {
+	if s.ghRandFloat64 != nil {
+		return s.ghRandFloat64
+	}
+	return rand.Float64
+}
+
+func (s *Server) ghRefreshSemaphore() chan struct{} {
+	s.ghRefreshSemOnce.Do(func() {
+		if s.ghRefreshSem == nil {
+			s.ghRefreshSem = make(chan struct{}, hubGHRefreshConcurrency)
+		}
+	})
+	return s.ghRefreshSem
+}
+
 // recentGHRefreshFailure reports whether a background refresh for cacheKey
-// failed within the last ghRefreshFailureBackoff.
+// is still within its jittered failure backoff window.
 func (s *Server) recentGHRefreshFailure(cacheKey string) bool {
 	s.ghRefreshFailMu.Lock()
 	defer s.ghRefreshFailMu.Unlock()
-	t, ok := s.ghLastRefreshFailure[cacheKey]
-	return ok && time.Since(t) < ghRefreshFailureBackoff
+	retryAfter, ok := s.ghLastRefreshFailure[cacheKey]
+	return ok && s.ghClockNow().Before(retryAfter)
 }
 
 func (s *Server) recordGHRefreshFailure(cacheKey string) {
@@ -2092,7 +2152,8 @@ func (s *Server) recordGHRefreshFailure(cacheKey string) {
 	if s.ghLastRefreshFailure == nil {
 		s.ghLastRefreshFailure = make(map[string]time.Time)
 	}
-	s.ghLastRefreshFailure[cacheKey] = time.Now()
+	backoff := agent.JitteredTTL(ghRefreshFailureBackoff, s.ghRand())
+	s.ghLastRefreshFailure[cacheKey] = s.ghClockNow().Add(backoff)
 }
 
 func (s *Server) clearGHRefreshFailure(cacheKey string) {
@@ -2439,6 +2500,27 @@ func (s *Server) refreshGitHubSkillInBackground(cacheKey, rawURI string, ghRef *
 		if entry, hit, gerr := s.ghResolutionStore.Get(ctx, cacheKey); gerr == nil && hit {
 			return entry, nil
 		}
+		sem := s.ghRefreshSemaphore()
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		// Re-check after waiting for a refresh slot: another instance may have
+		// populated the cache, or an earlier refresh may have tripped a
+		// rate-limit cooldown.
+		if entry, hit, gerr := s.ghResolutionStore.Get(ctx, cacheKey); gerr == nil && hit {
+			return entry, nil
+		}
+		cooldownID := agent.GitHubCooldownIdentityForInstallation(installID)
+		if retryAt, cooling := s.githubCooldown().Active(cooldownID); cooling {
+			return nil, &agent.GitHubRateLimitError{
+				Ref:             rawURI,
+				RetryAt:         retryAt,
+				Unauthenticated: agent.GitHubCooldownIdentityIsAnonymous(cooldownID),
+			}
+		}
 		return s.fetchAndCacheGitHubSkill(ctx, cacheKey, rawURI, ghRef, token, installID, isBranchRef, nil)
 	})
 
@@ -2550,7 +2632,7 @@ func (s *Server) fetchAndCacheGitHubSkill(
 		FileEntries: fileEntries,
 		BundleHash:  bundleHash,
 		TokenScope:  installID,
-		ExpiresAt:   time.Now().Add(agent.JitteredTTL(ttl, rand.Float64)),
+		ExpiresAt:   s.ghClockNow().Add(agent.JitteredTTL(ttl, s.ghRand())),
 		OriginalURI: rawURI,
 	}
 

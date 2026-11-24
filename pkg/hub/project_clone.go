@@ -334,6 +334,15 @@ func (s *Server) handleProjectClone(w http.ResponseWriter, r *http.Request, proj
 	// ── Step 8: Deep-copy project-scoped harness configs ─────────────────
 
 	if err := s.cloneProjectHarnessConfigs(ctx, src.ID, clone, &rollback); err != nil {
+		var reserved *harnessConfigSlugReservedError
+		if errors.As(err, &reserved) {
+			slog.Info("project clone: source harness config uses a reserved global slug",
+				"source_id", src.ID, "slug", reserved.slug)
+			writeError(w, http.StatusConflict, ErrCodeHarnessConfigSlugReserved,
+				fmt.Sprintf("the source project's harness config %q uses a name reserved by a global harness config; rename it in the source project before cloning", reserved.slug),
+				map[string]interface{}{"field": "slug"})
+			return
+		}
 		slog.Error("project clone: harness config copy failed",
 			"source_id", src.ID, "clone_id", clone.ID, "error", err)
 		writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
@@ -568,6 +577,9 @@ func (s *Server) cloneProjectHarnessConfigs(ctx context.Context, srcProjectID st
 	})
 
 	for _, srcHC := range result.Items {
+		if err := s.checkHarnessConfigSlugNotGlobal(ctx, store.HarnessConfigScopeProject, srcHC.Slug); err != nil {
+			return err
+		}
 		// Harness is the fallback for a config.yaml that sets none; Config
 		// is never copied: the commit below re-derives Harness and Config
 		// from the copied files (ptone/scion#4219).
@@ -791,7 +803,15 @@ func (s *Server) cloneProjectGCPServiceAccounts(ctx context.Context, srcProjectI
 		}
 	})
 
+	srcToClonedID := make(map[string]string, len(accounts))
+	skippedIDs := make(map[string]bool)
 	for _, sa := range accounts {
+		if s.isHubOwnServiceAccountEmail(sa.Email) {
+			slog.Warn("project clone skipped reserved GCP service account",
+				"src_project_id", srcProjectID, "clone_id", clone.ID, "sa_id", sa.ID, "email", sa.Email)
+			skippedIDs[sa.ID] = true
+			continue
+		}
 		newSA := &store.GCPServiceAccount{
 			ID:            api.NewUUID(),
 			Scope:         store.ScopeProject,
@@ -810,19 +830,21 @@ func (s *Server) cloneProjectGCPServiceAccounts(ctx context.Context, srcProjectI
 			return err
 		}
 		clonedIDs = append(clonedIDs, newSA.ID)
+		srcToClonedID[sa.ID] = newSA.ID
 	}
 
 	// Remap the per-profile default SA map's entries that reference a
-	// source SA. Entries naming other (hub-scoped) accounts are kept.
+	// source SA. Entries naming other (hub-scoped) accounts are kept;
+	// entries naming a skipped reserved account are dropped.
 	if byProfile := profileDefaultSAIDsFromAnnotations(clone.Annotations); len(byProfile) > 0 {
 		changed := false
 		for profile, saID := range byProfile {
-			for i, srcSA := range accounts {
-				if srcSA.ID == saID {
-					byProfile[profile] = clonedIDs[i]
-					changed = true
-					break
-				}
+			if newID, ok := srcToClonedID[saID]; ok {
+				byProfile[profile] = newID
+				changed = true
+			} else if skippedIDs[saID] {
+				delete(byProfile, profile)
+				changed = true
 			}
 		}
 		if changed {
@@ -837,12 +859,12 @@ func (s *Server) cloneProjectGCPServiceAccounts(ctx context.Context, srcProjectI
 	if byBroker := brokerDefaultSAIDsFromAnnotations(clone.Annotations); len(byBroker) > 0 {
 		changed := false
 		for brokerID, saID := range byBroker {
-			for i, srcSA := range accounts {
-				if srcSA.ID == saID {
-					byBroker[brokerID] = clonedIDs[i]
-					changed = true
-					break
-				}
+			if newID, ok := srcToClonedID[saID]; ok {
+				byBroker[brokerID] = newID
+				changed = true
+			} else if skippedIDs[saID] {
+				delete(byBroker, brokerID)
+				changed = true
 			}
 		}
 		if changed {
@@ -856,14 +878,15 @@ func (s *Server) cloneProjectGCPServiceAccounts(ctx context.Context, srcProjectI
 	// Remap default SA annotation if it references a source SA.
 	defaultSAID, ok := clone.Annotations[projectSettingDefaultGCPIdentitySAID]
 	if ok && defaultSAID != "" {
-		for i, srcSA := range accounts {
-			if srcSA.ID == defaultSAID {
-				clone.Annotations[projectSettingDefaultGCPIdentitySAID] = clonedIDs[i]
-				// Update the persisted project row.
-				if err := s.store.UpdateProject(ctx, clone); err != nil {
-					return fmt.Errorf("remap default SA annotation: %w", err)
-				}
-				break
+		if newID, remapped := srcToClonedID[defaultSAID]; remapped {
+			clone.Annotations[projectSettingDefaultGCPIdentitySAID] = newID
+			if err := s.store.UpdateProject(ctx, clone); err != nil {
+				return fmt.Errorf("remap default SA annotation: %w", err)
+			}
+		} else if skippedIDs[defaultSAID] {
+			delete(clone.Annotations, projectSettingDefaultGCPIdentitySAID)
+			if err := s.store.UpdateProject(ctx, clone); err != nil {
+				return fmt.Errorf("clear skipped default SA annotation: %w", err)
 			}
 		}
 	}
@@ -1366,18 +1389,36 @@ func sanitizeSourceURLLabel(labels map[string]string) {
 	}
 }
 
+// normalizeADOCloneURLLabel strips an erroneous trailing ".git" from an Azure
+// DevOps clone-url label so the Hub stores canonical ADO URLs on create,
+// register, clone, and PATCH. Non-ADO labels are left unchanged.
+func normalizeADOCloneURLLabel(labels map[string]string) {
+	v, ok := labels[store.LabelCloneURL]
+	if !ok || v == "" {
+		return
+	}
+	if normalized := util.StripADOCloneURLGitSuffix(v); normalized != v {
+		labels[store.LabelCloneURL] = normalized
+	}
+}
+
 // sanitizeCopiedCloneURLLabel makes a clone-url label copied from another
 // project (which may predate write-time validation) acceptable to
 // validateCloneURLLabelValue: a value that fails validation is replaced by its
 // sanitized form, or removed when that is still not a plain repository URL.
+// Azure DevOps labels also have any trailing ".git" stripped.
 // labels is modified in place.
 func sanitizeCopiedCloneURLLabel(labels map[string]string) {
 	v, ok := labels[store.LabelCloneURL]
-	if !ok || util.ValidateCloneURLLabel(v) == nil {
+	if !ok {
+		return
+	}
+	if util.ValidateCloneURLLabel(v) == nil {
+		normalizeADOCloneURLLabel(labels)
 		return
 	}
 	if clean := util.SanitizeGitSourceURL(v); clean != "" && util.ValidateCloneURLLabel(clean) == nil {
-		labels[store.LabelCloneURL] = clean
+		labels[store.LabelCloneURL] = util.StripADOCloneURLGitSuffix(clean)
 	} else {
 		delete(labels, store.LabelCloneURL)
 	}

@@ -15,14 +15,20 @@
 package config
 
 import (
+	"bytes"
 	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/santhosh-tekuri/jsonschema/v6"
+	"github.com/santhosh-tekuri/jsonschema/v6/kind"
 	"gopkg.in/yaml.v3"
 )
 
@@ -245,6 +251,267 @@ func ValidateAgentConfig(data []byte, schemaVersion string) ([]ValidationError, 
 	return validateAgainstSchema(data, schemaVersion, agentSchemaFiles)
 }
 
+// jsonSchemaPropNode indexes the declared object properties, array item
+// schema, and map-value (additionalProperties) schema of a JSON Schema node
+// so JSON keys can be recursively canonicalized using Unicode simple case
+// folding (matching Go's encoding/json struct field matching).
+type jsonSchemaPropNode struct {
+	exact                map[string]*jsonSchemaPropNode
+	names                []string
+	items                *jsonSchemaPropNode
+	additionalProperties *jsonSchemaPropNode
+}
+
+func (n *jsonSchemaPropNode) canonicalKey(key string) (string, *jsonSchemaPropNode) {
+	if n == nil {
+		return key, nil
+	}
+	if child, ok := n.exact[key]; ok {
+		return key, child
+	}
+	for _, prop := range n.names {
+		if strings.EqualFold(key, prop) {
+			return prop, n.exact[prop]
+		}
+	}
+	return key, n.additionalProperties
+}
+
+func resolveSchemaDefRef(root, node map[string]any) map[string]any {
+	for i := 0; i < 16 && node != nil; i++ {
+		ref, ok := node["$ref"].(string)
+		if !ok {
+			return node
+		}
+		const prefix = "#/$defs/"
+		if !strings.HasPrefix(ref, prefix) {
+			return node
+		}
+		defs, _ := root["$defs"].(map[string]any)
+		next, _ := defs[strings.TrimPrefix(ref, prefix)].(map[string]any)
+		node = next
+	}
+	return node
+}
+
+func buildJSONSchemaPropNode(root, raw map[string]any, depth int) *jsonSchemaPropNode {
+	if raw == nil || depth > 32 {
+		return nil
+	}
+	node := resolveSchemaDefRef(root, raw)
+	if node == nil {
+		return nil
+	}
+
+	out := &jsonSchemaPropNode{}
+	hasStructure := false
+
+	if props, ok := node["properties"].(map[string]any); ok && len(props) > 0 {
+		out.exact = make(map[string]*jsonSchemaPropNode, len(props))
+		out.names = make([]string, 0, len(props))
+		for k, v := range props {
+			sub, _ := v.(map[string]any)
+			out.exact[k] = buildJSONSchemaPropNode(root, sub, depth+1)
+			out.names = append(out.names, k)
+		}
+		sort.Strings(out.names)
+		hasStructure = true
+	}
+	if items, ok := node["items"].(map[string]any); ok {
+		if child := buildJSONSchemaPropNode(root, items, depth+1); child != nil {
+			out.items = child
+			hasStructure = true
+		}
+	}
+	if addl, ok := node["additionalProperties"].(map[string]any); ok {
+		if child := buildJSONSchemaPropNode(root, addl, depth+1); child != nil {
+			out.additionalProperties = child
+			hasStructure = true
+		}
+	}
+	if !hasStructure {
+		return nil
+	}
+	return out
+}
+
+var agentV1PropTree = sync.OnceValue(func() *jsonSchemaPropNode {
+	schemaData, err := schemasFS.ReadFile(agentSchemaFiles["1"])
+	if err != nil {
+		return nil
+	}
+	var root map[string]any
+	if err := json.Unmarshal(schemaData, &root); err != nil {
+		return nil
+	}
+	return buildJSONSchemaPropNode(root, root, 0)
+})
+
+// maxJSONNestingDepth matches encoding/json's maxNestingDepth so
+// decodeJSONValue cannot recurse unboundedly on deeply nested JSON inputs.
+const maxJSONNestingDepth = 10000
+
+// decodeJSONValue recursively streams a JSON value using UseNumber,
+// canonicalizing object keys in document order against node's declared schema
+// properties so later colliding keys overwrite earlier ones — matching Go's
+// encoding/json unmarshaling into api.ScionConfig.
+func decodeJSONValue(dec *json.Decoder, node *jsonSchemaPropNode, depth int) (interface{}, error) {
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		return tok, nil
+	}
+	if depth >= maxJSONNestingDepth {
+		return nil, errors.New("exceeded max depth")
+	}
+	switch delim {
+	case '{':
+		m := make(map[string]interface{})
+		for dec.More() {
+			kTok, err := dec.Token()
+			if err != nil {
+				return nil, err
+			}
+			key, ok := kTok.(string)
+			if !ok {
+				return nil, fmt.Errorf("expected object key string, got %T", kTok)
+			}
+			canon, child := node.canonicalKey(key)
+			val, err := decodeJSONValue(dec, child, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			m[canon] = val
+		}
+		if _, err := dec.Token(); err != nil { // closing '}'
+			return nil, err
+		}
+		return m, nil
+	case '[':
+		arr := make([]interface{}, 0)
+		var elemNode *jsonSchemaPropNode
+		if node != nil {
+			elemNode = node.items
+		}
+		for dec.More() {
+			elem, err := decodeJSONValue(dec, elemNode, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			arr = append(arr, elem)
+		}
+		if _, err := dec.Token(); err != nil { // closing ']'
+			return nil, err
+		}
+		return arr, nil
+	default:
+		return nil, fmt.Errorf("unexpected JSON delimiter %q", delim)
+	}
+}
+
+// decodeJSONCanonical decodes a JSON document using UseNumber and recursively
+// canonicalizes object keys declared in agent-v1.schema.json in document order.
+func decodeJSONCanonical(data []byte) (interface{}, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+
+	doc, err := decodeJSONValue(dec, agentV1PropTree(), 0)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		if err == nil {
+			err = errors.New("unexpected trailing data")
+		}
+		return nil, err
+	}
+	return doc, nil
+}
+
+// ValidateTemplateAgentConfig validates a template's agent config file the way
+// the runtime reads it. name is the file name (selects YAML vs JSON).
+//
+// Empty, comments-only, or null-root files return no findings, matching
+// LoadConfig and ParseScionAgentConfig. YAML files normalize top-level
+// hyphenated keys to underscored keys before validation; JSON files recursively
+// canonicalize schema-declared object keys in document order using Unicode
+// simple case folding (strings.EqualFold), matching encoding/json.
+func ValidateTemplateAgentConfig(name string, data []byte) ([]ValidationError, error) {
+	const schemaVersion = "1"
+	schemaPath := agentSchemaFiles[schemaVersion]
+
+	var doc interface{}
+	ext := strings.ToLower(filepath.Ext(name))
+	if ext == ".yaml" || ext == ".yml" {
+		var node yaml.Node
+		if err := unmarshalSettingsYAML(data, &node); err != nil {
+			return nil, fmt.Errorf("failed to parse agent config %s: %w", name, err)
+		}
+		if node.Kind == 0 {
+			return nil, nil
+		}
+		normalizeYAMLMappingKeys(&node)
+		if err := decodeSettingsYAMLNode(&node, &doc); err != nil {
+			return nil, fmt.Errorf("failed to parse agent config %s: %w", name, err)
+		}
+		if doc == nil {
+			return nil, nil
+		}
+		doc = convertYAMLToJSON(doc)
+	} else {
+		if len(bytes.TrimSpace(data)) == 0 {
+			return nil, nil
+		}
+		var err error
+		doc, err = decodeJSONCanonical(data)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse agent config %s: %w", name, err)
+		}
+		if doc == nil {
+			return nil, nil
+		}
+	}
+
+	schemaData, err := schemasFS.ReadFile(schemaPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read embedded schema: %w", err)
+	}
+	return validateDocAgainstSchemaJSON(doc, schemaPath, schemaData)
+}
+
+const maxFormattedAgentConfigFindings = 5
+
+// FormatAgentConfigValidationError formats template agent config validation
+// findings in the canonical human-readable format:
+//
+//	template <name>: agent config <file> is invalid: <path>: <message>[; ...] [(+K more)]
+//
+// At most 5 findings are included in the summary; document-level findings
+// (empty Path) print as "(document)".
+func FormatAgentConfigValidationError(templateName, fileName string, findings []ValidationError) string {
+	limit := len(findings)
+	if limit > maxFormattedAgentConfigFindings {
+		limit = maxFormattedAgentConfigFindings
+	}
+	parts := make([]string, 0, limit)
+	for _, f := range findings[:limit] {
+		path := f.Path
+		if path == "" {
+			path = "(document)"
+		}
+		parts = append(parts, fmt.Sprintf("%s: %s", path, f.Message))
+	}
+	msg := fmt.Sprintf("template %s: agent config %s is invalid: %s",
+		templateName, fileName, strings.Join(parts, "; "))
+	if extra := len(findings) - limit; extra > 0 {
+		msg += fmt.Sprintf(" (+%d more)", extra)
+	}
+	return msg
+}
+
 // ValidateHarnessConfig validates a standalone harness-config config.yaml by
 // wrapping it in the versioned settings schema's harness_configs map.
 func ValidateHarnessConfig(data []byte) ([]ValidationError, error) {
@@ -346,34 +613,57 @@ func validateDocAgainstSchemaJSON(doc interface{}, schemaPath string, schemaData
 }
 
 // extractValidationErrors converts jsonschema validation errors into our
-// ValidationError type using the BasicOutput format.
+// ValidationError type using the DetailedOutput tree so wrapper units with
+// child errors (such as "validation failed") are dropped and leaf findings
+// name the specific failing field.
 func extractValidationErrors(err error) []ValidationError {
 	validationErr, ok := err.(*jsonschema.ValidationError)
 	if !ok {
 		return []ValidationError{{Message: err.Error()}}
 	}
 
-	basic := validationErr.BasicOutput()
-	return collectBasicErrors(basic)
+	detailed := validationErr.DetailedOutput()
+	return collectBasicErrors(detailed)
 }
 
-// collectBasicErrors extracts leaf validation errors from the BasicOutput tree.
+// collectBasicErrors extracts leaf validation errors from the OutputUnit tree.
+// Wrapper units that have child errors are skipped in favour of their children;
+// missing required property errors append the missing property name to Path.
 func collectBasicErrors(unit *jsonschema.OutputUnit) []ValidationError {
-	var result []ValidationError
-
-	if unit.Error != nil {
-		path := strings.TrimPrefix(unit.InstanceLocation, "/")
-		result = append(result, ValidationError{
-			Path:    path,
-			Message: unit.Error.String(),
-		})
+	if len(unit.Errors) > 0 {
+		var result []ValidationError
+		for i := range unit.Errors {
+			result = append(result, collectBasicErrors(&unit.Errors[i])...)
+		}
+		if len(result) > 0 {
+			return result
+		}
 	}
 
-	for i := range unit.Errors {
-		result = append(result, collectBasicErrors(&unit.Errors[i])...)
+	if unit.Error == nil {
+		return nil
 	}
 
-	return result
+	path := strings.TrimPrefix(unit.InstanceLocation, "/")
+	if req, ok := unit.Error.Kind.(*kind.Required); ok && len(req.Missing) > 0 {
+		result := make([]ValidationError, 0, len(req.Missing))
+		for _, prop := range req.Missing {
+			p := prop
+			if path != "" {
+				p = path + "/" + prop
+			}
+			result = append(result, ValidationError{
+				Path:    p,
+				Message: "missing required property",
+			})
+		}
+		return result
+	}
+
+	return []ValidationError{{
+		Path:    path,
+		Message: unit.Error.String(),
+	}}
 }
 
 // convertYAMLToJSON converts YAML-decoded values to JSON-compatible types.

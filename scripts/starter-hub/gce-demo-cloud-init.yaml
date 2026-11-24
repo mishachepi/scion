@@ -71,7 +71,7 @@ runcmd:
   # Install Go (latest stable)
   - |
     if [ ! -d /usr/local/go ]; then
-      curl -L https://go.dev/dl/go1.26.1.linux-amd64.tar.gz -o /tmp/go.tar.gz
+      curl -L https://go.dev/dl/go1.26.11.linux-amd64.tar.gz -o /tmp/go.tar.gz
       tar -C /usr/local -xzf /tmp/go.tar.gz
     fi
   - ln -sf /usr/local/go/bin/go /usr/bin/go
@@ -85,7 +85,8 @@ runcmd:
     fi
 
   # Setup scion user and directories (optional, but good practice)
-  - id scion &>/dev/null || useradd -m -s /bin/bash scion
-  - getent group docker &>/dev/null && usermod -aG docker scion || true
+  # runcmd executes under /bin/sh (dash on Ubuntu) -- POSIX redirections only (no &>).
+  - id scion >/dev/null 2>&1 || useradd -m -s /bin/bash scion
+  - getent group docker >/dev/null 2>&1 && usermod -aG docker scion || true
 
 final_message: "Scion Demo Server Provisioning Complete"

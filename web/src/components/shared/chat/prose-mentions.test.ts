@@ -14,7 +14,10 @@
  * limitations under the License.
  */
 
-import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { describe, it, expect, afterEach } from 'vitest';
 import {
   agentMentionSlug,
   extractProseMentionTokens,
@@ -23,6 +26,7 @@ import {
   userMentionSlug,
   type MentionRoster,
 } from './prose-mentions.js';
+import { CODE_SPAN_MENTIONS_FLAG, setFeatureFlag } from '../../../utils/feature-flags.js';
 
 describe('extractProseMentionTokens', () => {
   it('extracts lowercased tokens in first-appearance order and deduplicates repeats', () => {
@@ -82,6 +86,25 @@ describe('extractProseMentionTokens', () => {
       'alice.smith',
       'dave+dev@example.com',
     ]);
+  });
+
+  it('ignores bare numeric and hex ID/SHA tokens while keeping valid slugs and emails', () => {
+    const fullSha = '847772c4cf1e6e1a692cb12ebd06c718ebcb7d4e';
+    const body = `Reviewed @10 items at @5aaf533a and @847772c and @${fullSha} with @alice, @e2e, @abe, @agent-10, and @10@example.com.`;
+
+    expect(extractProseMentionTokens(body)).toEqual([
+      'alice',
+      'e2e',
+      'abe',
+      'agent-10',
+      '10@example.com',
+    ]);
+
+    expect(
+      extractProseMentionTokens('See `@10` and `@5aaf533a` and `@alice`', {
+        codeSpanMentions: true,
+      })
+    ).toEqual(['alice']);
   });
 });
 
@@ -256,5 +279,75 @@ describe('resolveReplyAllTargets', () => {
     );
 
     expect(targets).toEqual([{ kind: 'agent', id: 'a-noslug', insertSlug: 'bot-name' }]);
+  });
+});
+
+interface SharedVectorCase {
+  name: string;
+  text: string;
+  codeSpanOff: string[];
+  codeSpanOn: string[];
+}
+
+interface SharedVectorFile {
+  roster: {
+    agents: Array<{ id: string; slug: string; name: string }>;
+    users: Array<{ id: string; name: string; email: string }>;
+  };
+  cases: SharedVectorCase[];
+}
+
+const here = dirname(fileURLToPath(import.meta.url));
+const sharedVectors: SharedVectorFile = JSON.parse(
+  readFileSync(
+    resolve(here, '../../../../../pkg/messages/testdata/code_span_mentions_vectors.json'),
+    'utf8'
+  )
+);
+
+describe('extractProseMentionTokens — shared cross-language code-span vectors', () => {
+  afterEach(() => {
+    delete window.__SCION_FEATURES__;
+  });
+
+  for (const tc of sharedVectors.cases) {
+    it(`${tc.name} (off and on)`, () => {
+      expect(extractProseMentionTokens(tc.text, { codeSpanMentions: false })).toEqual(
+        tc.codeSpanOff.map((s) => s.toLowerCase())
+      );
+      expect(extractProseMentionTokens(tc.text, { codeSpanMentions: true })).toEqual(
+        tc.codeSpanOn.map((s) => s.toLowerCase())
+      );
+    });
+  }
+
+  it('resolveReplyAllTargets respects hub.code_span_mentions feature flag', () => {
+    const roster: MentionRoster = {
+      agentMembers: sharedVectors.roster.agents.map((a) => ({
+        id: a.id,
+        slug: a.slug,
+        displayName: a.name,
+      })),
+      members: sharedVectors.roster.users.map((u) => ({
+        id: u.id,
+        name: u.name,
+        email: u.email,
+        kind: 'user' as const,
+      })),
+    };
+    const msg = {
+      sender: 'agent:alice',
+      senderId: 'ag-alice',
+      msg: 'Please check with `@coordinator` and `@jane.doe@example.com`, not `` `@bob` ``.',
+    };
+
+    delete window.__SCION_FEATURES__;
+    expect(resolveReplyAllTargets(msg, roster, 'usr-other')).toEqual([]);
+
+    setFeatureFlag(CODE_SPAN_MENTIONS_FLAG, true);
+    expect(resolveReplyAllTargets(msg, roster, 'usr-other')).toEqual([
+      { kind: 'agent', id: 'ag-coord', insertSlug: 'coordinator' },
+      { kind: 'user', id: 'usr-jane', insertSlug: 'jane-doe' },
+    ]);
   });
 });

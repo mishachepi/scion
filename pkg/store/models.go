@@ -476,9 +476,11 @@ type AgentAppliedConfig struct {
 	Workspace     string              `json:"workspace,omitempty"` // Host path to mount as /workspace (overrides default project root)
 	GitClone      *api.GitCloneConfig `json:"gitClone,omitempty"`
 
-	// Template info for Runtime Broker hydration
-	TemplateID   string `json:"templateId,omitempty"`   // Hub template ID for fetching
-	TemplateHash string `json:"templateHash,omitempty"` // Content hash for cache validation
+	// Template info for Runtime Broker hydration and provenance
+	TemplateID           string `json:"templateId,omitempty"`           // Hub template ID for fetching
+	TemplateHash         string `json:"templateHash,omitempty"`         // Content hash for cache validation
+	TemplateSourceURL    string `json:"templateSourceUrl,omitempty"`    // Template source URL at agent create time
+	TemplateSourceCommit string `json:"templateSourceCommit,omitempty"` // Template source commit SHA at agent create time
 
 	// RuntimeTargetCandidate is a target reported by one heartbeat that
 	// differs from RuntimeTarget. It becomes RuntimeTarget only when the next
@@ -545,6 +547,16 @@ type AgentAppliedConfig struct {
 	// AgentRole is the effective authorization role resolved at creation time.
 	// Determines which JWT scopes the agent receives. Immutable after creation.
 	AgentRole string `json:"agentRole,omitempty"`
+
+	// GitHubTokenPreference controls GitHub token delivery precedence for
+	// trigger-dispatched agents (Stage 2 design §5.1a): "" or "user_preferred"
+	// keeps the default user-PAT-over-App precedence; "installation" drops all
+	// blocked GitHub token keys (GITHUB_TOKEN, GH_* aliases,
+	// SCION_USER_GITHUB_TOKEN) from every scope (user, project, hub, broker) so
+	// only the project's GitHub App installation token (or no GitHub token at
+	// all when none is installed) is delivered. Immutable after creation and
+	// preserved across reincarnation.
+	GitHubTokenPreference string `json:"githubTokenPreference,omitempty"`
 
 	// AgentRoleGrandfathered records that AgentRole was assigned by the
 	// pre-role backfill, not by an explicit grant. It is provenance only.
@@ -920,6 +932,19 @@ type AgentCreateInputs struct {
 	// (hub-managed workspace path, shared-workspace default branch) ran.
 	Branch    string `json:"branch,omitempty"`
 	Workspace string `json:"workspace,omitempty"`
+
+	// HomeFilesPending is true from agent row commit until the create dispatch
+	// delivers the agent's required create-time HomeFiles (e.g. a trigger's
+	// .scion/trigger-event.json). While true, generic start paths refuse to
+	// launch the agent so a concurrent start can never start it without its
+	// event file. Cleared once the create dispatch succeeds (or an accepted
+	// async create launch reports succeeded).
+	HomeFilesPending bool `json:"homeFilesPending,omitempty"`
+
+	// GitHubTokenPreference records the headless create's GitHub token
+	// delivery preference ("installation" | "user_preferred", or "" for
+	// interactive creates) so reincarnation preserves it (Stage 2 §5.1a).
+	GitHubTokenPreference string `json:"githubTokenPreference,omitempty"`
 }
 
 // Project type constants.
@@ -1347,6 +1372,14 @@ type RuntimeBroker struct {
 	// When true, this broker is automatically added as a provider for new projects
 	AutoProvide bool `json:"autoProvide,omitempty"`
 
+	// AdminManaged records whether a hub administrator explicitly registered or
+	// approved this broker as admin-managed (ptone/scion#7829).
+	//
+	// Written only by CreateRuntimeBroker and the dedicated
+	// SetRuntimeBrokerAdminManaged store method. UpdateRuntimeBroker leaves the
+	// stored value unchanged whatever this copy carries.
+	AdminManaged bool `json:"adminManaged,omitempty"`
+
 	// Timestamps
 	Created time.Time `json:"created"`
 	Updated time.Time `json:"updated"`
@@ -1748,10 +1781,11 @@ type Template struct {
 	Status string `json:"status"` // pending, active, archived
 
 	// Ownership
-	OwnerID   string `json:"ownerId,omitempty"`
-	CreatedBy string `json:"createdBy,omitempty"`
-	UpdatedBy string `json:"updatedBy,omitempty"`
-	SourceURL string `json:"sourceUrl,omitempty"`
+	OwnerID      string `json:"ownerId,omitempty"`
+	CreatedBy    string `json:"createdBy,omitempty"`
+	UpdatedBy    string `json:"updatedBy,omitempty"`
+	SourceURL    string `json:"sourceUrl,omitempty"`
+	SourceCommit string `json:"sourceCommit,omitempty"`
 
 	// Timestamps
 	Created time.Time `json:"created"`
@@ -1856,17 +1890,18 @@ const HarnessConfigLayoutBlobs = TemplateLayoutBlobs
 
 // HarnessConfigData holds the harness-specific configuration details.
 type HarnessConfigData struct {
-	Harness          string                   `json:"harness,omitempty"`
-	Image            string                   `json:"image,omitempty"`
-	User             string                   `json:"user,omitempty"`
-	Model            string                   `json:"model,omitempty"`
-	Args             []string                 `json:"args,omitempty"`
-	Env              map[string]string        `json:"env,omitempty"`
-	AuthSelectedType string                   `json:"authSelectedType,omitempty"`
-	Secrets          []api.RequiredSecret     `json:"secrets,omitempty"`
-	ModelAliases     map[string]string        `json:"modelAliases,omitempty"`
-	NoAuthBehavior   string                   `json:"noAuthBehavior,omitempty"`
-	AuthMeta         *api.HarnessAuthMetadata `json:"authMeta,omitempty"`
+	Harness          string                           `json:"harness,omitempty"`
+	Image            string                           `json:"image,omitempty"`
+	User             string                           `json:"user,omitempty"`
+	Model            string                           `json:"model,omitempty"`
+	Args             []string                         `json:"args,omitempty"`
+	Env              map[string]string                `json:"env,omitempty"`
+	AuthSelectedType string                           `json:"authSelectedType,omitempty"`
+	Secrets          []api.RequiredSecret             `json:"secrets,omitempty"`
+	ModelAliases     map[string]string                `json:"modelAliases,omitempty"`
+	NoAuthBehavior   string                           `json:"noAuthBehavior,omitempty"`
+	AuthMeta         *api.HarnessAuthMetadata         `json:"authMeta,omitempty"`
+	Capabilities     *api.HarnessAdvancedCapabilities `json:"capabilities,omitempty"`
 }
 
 // HarnessConfigStatus constants
@@ -3125,6 +3160,7 @@ const (
 	ScopeUser          = "user"
 	ScopeProject       = "project"
 	ScopeRuntimeBroker = "runtime_broker"
+	ScopeAgent         = "agent"
 )
 
 // ScopeIDHub was previously a fixed sentinel "hub". It is now the hub's
@@ -3754,6 +3790,11 @@ type Message struct {
 	NotReachedAt     *time.Time `json:"-"`
 	ScheduledEventID string     `json:"-"`
 
+	// ConversationSeq is the commit-ordered per-conversation sequence number
+	// allocated in CreateMessage (ptone/scion#8136). Internal store field only;
+	// API responses expose opaque cursors instead.
+	ConversationSeq int64 `json:"-"`
+
 	// DeferredAttachments is never stored. For a deferred message, the
 	// conversation messages route lists its attachments stored as
 	// artifacts here, to a reader only, so catch-up can say they were not
@@ -3805,6 +3846,38 @@ type MessageFilter struct {
 type LatestMessageOptions struct {
 	Channel     string // Only messages on this channel
 	ExcludeType string // Ignore messages of this type
+}
+
+// ConversationFeedFilter selects which messages in a conversation a feed query returns.
+type ConversationFeedFilter string
+
+const (
+	// ConversationFeedFilterOthers returns messages not sent by the caller.
+	ConversationFeedFilterOthers ConversationFeedFilter = "others"
+	// ConversationFeedFilterAll returns all messages, including the caller's own sends.
+	ConversationFeedFilterAll ConversationFeedFilter = "all"
+	// ConversationFeedFilterAddressed returns messages not sent by the caller
+	// where the caller is a recipient or addressee.
+	ConversationFeedFilterAddressed ConversationFeedFilter = "addressed"
+)
+
+// ConversationFeedQuery describes a feed read over a single conversation
+// ordered by ascending conversation_seq (ptone/scion#8136).
+type ConversationFeedQuery struct {
+	ConversationID string
+	AfterSeq       int64
+	Limit          int
+	Filter         ConversationFeedFilter
+	PrincipalKind  string // "user" or "agent"
+	PrincipalID    string // principal UUID
+}
+
+// ConversationFeedPage is the result of ListConversationFeed.
+type ConversationFeedPage struct {
+	Messages  []Message
+	ScannedTo int64 // highest seq scanned (last returned seq when HasMore, else head)
+	HasMore   bool  // more matching rows exist at or below head
+	Truncated bool  // rows between AfterSeq and first surviving seq > AfterSeq were deleted
 }
 
 // =============================================================================
@@ -3993,8 +4066,10 @@ const (
 // the outcome group (FinishedAt, Outcome, ExitCode, DurationMS, OutputBytes)
 // is fixed at insert.
 type ScheduledExecRun struct {
-	EventID       string
-	ScheduleID    string // empty for a one-shot event
+	EventID       string // non-empty for schedule-owned runs; empty for trigger-owned runs
+	FireID        string // non-empty for trigger-owned runs; empty for schedule-owned runs
+	ScheduleID    string // empty for a one-shot event or a trigger-owned run
+	OverlapKey    string // overlap scope ("schedule:<id>" or "trigger:<id>")
 	ProjectID     string
 	TargetAgentID string
 
@@ -4018,10 +4093,12 @@ type ScheduledExecRun struct {
 	LeaseUntil time.Time
 	FinishedAt *time.Time
 
-	Outcome     string // ScheduledExecOutcome*
-	ExitCode    *int
-	DurationMS  *int64
-	OutputBytes *int64
+	Outcome      string // ScheduledExecOutcome*
+	ExitCode     *int
+	DurationMS   *int64
+	OutputBytes  *int64
+	CaptureMode  string // "", "json", "tail" (immutable after insert)
+	OutputStatus string // "", "captured", "truncated", "too_large", "invalid_json", "empty", "expired", "lost"
 
 	Runtime  string
 	LaunchID string
@@ -4029,6 +4106,33 @@ type ScheduledExecRun struct {
 	// LastPolledAt is when the sweeper last claimed the run for a status
 	// poll (StartedAt at insert).
 	LastPolledAt time.Time
+}
+
+// RunID returns the stable exec run identifier sent as exec-start run_id:
+// EventID for schedule-owned runs, FireID for trigger-owned runs.
+func (r ScheduledExecRun) RunID() string {
+	if r.EventID != "" {
+		return r.EventID
+	}
+	return r.FireID
+}
+
+// IsTriggerOwned reports whether the run is owned by a trigger fire rather than
+// a scheduled event.
+func (r ScheduledExecRun) IsTriggerOwned() bool {
+	return r.FireID != ""
+}
+
+// EffectiveOverlapKey returns the overlap scope key for the run: OverlapKey
+// when set, or "schedule:"+ScheduleID for legacy schedule runs.
+func (r ScheduledExecRun) EffectiveOverlapKey() string {
+	if r.OverlapKey != "" {
+		return r.OverlapKey
+	}
+	if r.ScheduleID != "" {
+		return "schedule:" + r.ScheduleID
+	}
+	return ""
 }
 
 // Outcomes of a ScheduledExecRun. Starting and running are unfinished
@@ -4044,29 +4148,57 @@ const (
 	ScheduledExecOutcomeAbandoned = "abandoned"
 )
 
+// MaxExecRunOutputBytes bounds the captured output persisted in exec_run_outputs.
+const MaxExecRunOutputBytes = 64 * 1024
+
+// ExecRunOutputOwnerScheduledExec is the owner_kind of scheduled exec runs in
+// exec_run_outputs.
+const ExecRunOutputOwnerScheduledExec = "scheduled_exec"
+
 // ScheduledExecRunFinish is the final outcome FinishScheduledExecRun records
-// on a run, and the status it records on the run's event.
+// on a run, and the status it records on the run's owner (scheduled_events or
+// trigger_fires).
 type ScheduledExecRunFinish struct {
-	EventID     string
-	FinishedAt  time.Time
-	Outcome     string // a final ScheduledExecOutcome*
-	ExitCode    *int
-	DurationMS  *int64
-	OutputBytes *int64
-	// EventStatus, when not empty, is written to the run's event (with
-	// EventError) in the same transaction, but only while the event is still
+	EventID      string
+	FireID       string
+	FinishedAt   time.Time
+	Outcome      string // a final ScheduledExecOutcome*
+	ExitCode     *int
+	DurationMS   *int64
+	OutputBytes  *int64
+	OutputStatus string
+	// Output, when non-empty, is inserted into exec_run_outputs inside the
+	// same transaction only if the FinishScheduledExecRun CAS wins. Must not
+	// exceed MaxExecRunOutputBytes.
+	Output []byte
+	// EventStatus, when not empty, is written to the run's scheduled event
+	// (with EventError) in the same transaction, only while the event is still
 	// fired or expired: a run's outcome never overwrites a recorded event
 	// outcome.
 	EventStatus string
 	EventError  string
+	// FireStatus, when not empty, is written to the run's trigger_fires row
+	// (with FireError) in the same transaction, only while the fire is still
+	// firing or fired, along with trigger counters and subject-claim release.
+	FireStatus string
+	FireError  string
 }
+
+// ScheduledEventSort constants for ordering ListScheduledEvents results.
+const (
+	ScheduledEventSortCreatedDesc   = "created_desc"   // default: created DESC, id DESC
+	ScheduledEventSortFireAtAsc     = "fire_at_asc"    // pending: fire_at ASC, id ASC
+	ScheduledEventSortCompletedDesc = "completed_desc" // past: COALESCE(fired_at, created) DESC, id DESC
+)
 
 // ScheduledEventFilter for listing events.
 type ScheduledEventFilter struct {
 	ProjectID  string
 	EventType  string
 	Status     string
-	ScheduleID string // Filter events generated by a specific recurring schedule
+	Statuses   []string // When non-empty, matches status IN Statuses
+	Sort       string   // "", "created_desc", "fire_at_asc", "completed_desc"
+	ScheduleID string   // Filter events generated by a specific recurring schedule
 	// InitiatorAgentID, when set, keeps only rows whose current initiator
 	// principal is this agent with a recorded attribution (version 1 or
 	// later, credential kind neither empty nor legacy_unknown). It matches
@@ -4143,8 +4275,8 @@ const (
 	// supported. The expression must be edited to UTC before resuming.
 	ScheduleStatusReasonCronZoneUnsupported = "cron_zone_unsupported"
 	// ScheduleStatusReasonTargetDeleted: paused because the target agent of an
-	// exec schedule was deleted. Editing the schedule to name a live target and
-	// resuming re-records the authority and clears the reason.
+	// exec or message schedule was deleted. Editing the schedule to name a live
+	// target and resuming re-records the authority and clears the reason.
 	ScheduleStatusReasonTargetDeleted = "target_deleted"
 )
 
@@ -4965,24 +5097,29 @@ func ValidEdgeDeactivationCause(c EdgeDeactivationCause) bool {
 		EdgeDeactivationDelegatorDeleted,
 		EdgeDeactivationCreateCompensation,
 		EdgeDeactivationReincarnateReplaced,
+		EdgeDeactivationReincarnateFailed,
+		EdgeDeactivationReincarnatePendingSwept,
+		EdgeDeactivationReincarnateStaleSwept,
 		EdgeDeactivationUserDeleteCascade:
 		return true
 	}
 	return false
 }
 
-// Deactivation causes recorded only on service-account assignments. The edge
-// store rejects them.
+// Deactivation causes recorded on reincarnation failure rollback (both
+// delegation edges and service-account assignments), plus assignment-only
+// causes (sa_replaced, sa_cleared) which the edge store rejects.
 const (
 	// EdgeDeactivationSAReplaced marks an assignment replaced by a later
-	// write that set a service account on the same agent.
+	// write that set a service account on the same agent. Assignment-only.
 	EdgeDeactivationSAReplaced EdgeDeactivationCause = "sa_replaced"
 	// EdgeDeactivationSACleared marks an assignment ended by a write that
-	// removed the agent's assign-mode GCP identity.
+	// removed the agent's assign-mode GCP identity. Assignment-only.
 	EdgeDeactivationSACleared EdgeDeactivationCause = "sa_cleared"
-	// EdgeDeactivationReincarnateFailed marks the assignment a reincarnation
-	// claim recorded for a new account, ended when the reincarnation failed
-	// and the previous configuration was restored by the worker.
+	// EdgeDeactivationReincarnateFailed marks the delegation edge or
+	// service-account assignment a reincarnation claim recorded for a
+	// patched role or account, ended when the reincarnation failed and
+	// the previous configuration was restored by the worker.
 	EdgeDeactivationReincarnateFailed EdgeDeactivationCause = "reincarnate_failed"
 	// EdgeDeactivationReincarnatePendingSwept is EdgeDeactivationReincarnateFailed
 	// for a reincarnation the sweep failed because its worker never started.
@@ -5501,6 +5638,10 @@ type DecisionAuditRecord struct {
 	// ListFilter is the summary of a list request's item filter. Set only
 	// when RecordKind is DecisionAuditRecordKindListFilter.
 	ListFilter *DecisionAuditListFilter
+	// SessionMode marks a decision made while the caller's web session was
+	// operating in a restricted session mode (e.g. "view_as_member",
+	// ptone/scion#8648). Empty for ordinary sessions.
+	SessionMode string
 }
 
 // DecisionAuditRecordKindListFilter is the RecordKind of the one aggregated
@@ -5594,6 +5735,11 @@ type MutationAuditRecord struct {
 	// issuer cleanup (3c, ptone/scion#4240): the creation-time stamp the
 	// delete relied on and its run. Empty for every other record.
 	ProvenanceBasis string
+
+	// SessionMode marks a mutation performed while the caller's web session
+	// was operating in a restricted session mode (e.g. "view_as_member",
+	// ptone/scion#8648). Empty for ordinary sessions.
+	SessionMode string
 }
 
 // MutationAuditFilter defines query parameters for listing mutation audit records.
@@ -5608,10 +5754,12 @@ type MutationAuditFilter struct {
 	// ExecutorID, when set, keeps only records whose executor_id equals
 	// it (for example a test identity purge's test_identity:<id>).
 	ExecutorID string
-	Since      time.Time
-	Until      time.Time
-	Limit      int
-	Offset     int
+	// SessionMode, when set, keeps only records whose session_mode equals it.
+	SessionMode string
+	Since       time.Time
+	Until       time.Time
+	Limit       int
+	Offset      int
 }
 
 // =============================================================================
@@ -5669,6 +5817,7 @@ const (
 const (
 	QuotaScopeSystem  = "system"
 	QuotaScopeProject = "project"
+	QuotaScopeGroup   = "group"
 	// QuotaScopeBroker scopes a limit to a single runtime broker rather than a
 	// user, project, or the whole Hub. See LimitMaxAgentsPerBroker: a broker is
 	// where the resource-exhaustion risk actually lives (it is the process

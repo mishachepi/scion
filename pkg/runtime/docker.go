@@ -60,6 +60,9 @@ func (r *DockerRuntime) ExecUser() string {
 }
 
 func (r *DockerRuntime) Run(ctx context.Context, config RunConfig) (string, error) {
+	if err := checkFirewallWithoutMetadataInterception(config); err != nil {
+		return "", err
+	}
 	if err := prepareContainerSecretEnv(&config); err != nil {
 		return "", err
 	}
@@ -109,6 +112,9 @@ func (r *DockerRuntime) Run(ctx context.Context, config RunConfig) (string, erro
 	if err := hooks.checkpoint(ctx, CheckpointStepLaunching); err != nil {
 		return "", err
 	}
+	if config.MetadataInterception {
+		checkImageNetnsSetupSupport(ctx, r.Command, config.Image)
+	}
 	out, err := runSimpleCommand(ctx, r.Command, newArgs...)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -118,12 +124,28 @@ func (r *DockerRuntime) Run(ctx context.Context, config RunConfig) (string, erro
 			rollbackCancelledCreate(r.Command, config.Name, config.Labels[api.LabelRunID])
 			return "", ctx.Err()
 		}
-		return "", fmt.Errorf("container run failed: %w (output: %s)", err, out)
+		runErr := fmt.Errorf("container run failed: %w (output: %s)", err, out)
+		if code, step := classifyDockerRunError(out, err); code != "" {
+			if step == api.LaunchStepImagePull {
+				hooks.progress(api.LaunchStepImagePull)
+			}
+			return "", newLaunchFailure(code, step, "", runErr)
+		}
+		return "", runErr
 	}
 
 	// Run returns the whole trimmed output, as before; only the launch
 	// handle is restricted to a well-formed container ID line.
 	id := strings.TrimSpace(out)
+	if config.MetadataInterception {
+		if err := runNetnsSetup(ctx, r.Command, id, config); err != nil {
+			removeNetnsSetupContainers(ctx, r.Command, id)
+			if rmErr := removeCreatedContainer(r.Command, id); rmErr != nil {
+				return "", fmt.Errorf("metadata network setup failed: %w (container cleanup also failed: %v)", err, rmErr)
+			}
+			return "", fmt.Errorf("metadata network setup failed: %w", err)
+		}
+	}
 	reportContainerCreated(hooks, config.Name, out)
 	return id, nil
 }
@@ -169,10 +191,12 @@ func (r *DockerRuntime) Stop(ctx context.Context, ref RunRef) error {
 	return err
 }
 
-// Delete removes the container ref.ID. The engine container ID is already
+// Delete removes the container ref.ID and best-effort removes any leftover
+// netns-setup containers labelled for it. The engine container ID is already
 // unique per run, so ref.RunID needs no further check here; run targeting is
 // enforced by the caller resolving the ID from List.
 func (r *DockerRuntime) Delete(ctx context.Context, ref RunRef) error {
+	removeNetnsSetupContainers(ctx, r.Command, ref.ID)
 	_, err := runSimpleCommand(ctx, r.Command, "rm", "-f", ref.ID)
 	return err
 }
@@ -357,7 +381,7 @@ func (r *DockerRuntime) Attach(ctx context.Context, id string) error {
 
 	// Check if running
 	if agent.Phase != string(state.PhaseRunning) {
-		return fmt.Errorf("agent '%s' is not running (status: %s), use 'scion start %s' to resume it", id, agent.ContainerStatus, id)
+		return fmt.Errorf("agent '%s' is not running (status: %s), use 'scion resume %s' to resume it", id, agent.ContainerStatus, id)
 	}
 
 	// Ensure tmux uses the latest client's terminal size so the session
@@ -410,7 +434,13 @@ func (r *DockerRuntime) ImageExists(ctx context.Context, image string) (bool, er
 		if isImageNotFoundOutput(out) {
 			return false, nil
 		}
+		if ctx.Err() == nil && isDockerDaemonConnectError(out) {
+			return false, newLaunchFailure(api.LaunchCodeRuntimeUnavailable, api.LaunchStepLaunching, "", err)
+		}
 		return false, err
+	}
+	if ctx.Err() == nil && isRuntimeBinaryNotFound(err) {
+		return false, newLaunchFailure(api.LaunchCodeRuntimeUnavailable, api.LaunchStepLaunching, "", err)
 	}
 	return false, err
 }
@@ -429,12 +459,21 @@ func (r *DockerRuntime) RemoveImage(ctx context.Context, image string) error {
 }
 
 func (r *DockerRuntime) PullImage(ctx context.Context, image string) error {
+	reportLaunchProgress(ctx, api.LaunchStepImagePull)
 	out, err := runSimpleCommand(ctx, r.Command, "pull", image)
 	if err != nil {
+		var pullErr error
 		if trimmed := strings.TrimSpace(out); trimmed != "" {
-			return fmt.Errorf("pull %q: %w\n%s", image, err, trimmed)
+			pullErr = fmt.Errorf("pull %q: %w\n%s", image, err, trimmed)
+		} else {
+			pullErr = fmt.Errorf("pull %q: %w", image, err)
 		}
-		return fmt.Errorf("pull %q: %w", image, err)
+		if ctx.Err() == nil {
+			if code := classifyDockerPullError(image, out, err); code != "" {
+				return newLaunchFailure(code, api.LaunchStepImagePull, "", pullErr)
+			}
+		}
+		return pullErr
 	}
 	return nil
 }

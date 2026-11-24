@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -25,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/harness"
@@ -288,19 +290,62 @@ By default this does not activate container-script provisioning. Use
 	},
 }
 
+// resolveHarnessConfigTargetScope validates an explicit --scope flag value
+// against the harness-config sync scope vocabulary ("global", "project"),
+// enforces that root --global does not conflict with a non-global --scope, and
+// falls back to templateScopeFromGlobalFlag() when --scope is empty.
+func resolveHarnessConfigTargetScope(rawScope string) (string, error) {
+	switch rawScope {
+	case "", "project", "global":
+	default:
+		return "", newUsageError("--scope must be global or project")
+	}
+	if globalMode {
+		switch rawScope {
+		case "", "global":
+			return "global", nil
+		default:
+			return "", newUsageError("--global conflicts with --scope %s", rawScope)
+		}
+	}
+	if rawScope == "" {
+		return templateScopeFromGlobalFlag(), nil
+	}
+	return rawScope, nil
+}
+
+// harnessConfigSyncArgs validates arguments and --scope/--global conflicts for
+// 'harness-config sync' and 'harness-config push' before root's
+// PersistentPreRunE runs.
+func harnessConfigSyncArgs(cmd *cobra.Command, args []string) error {
+	if err := cobra.ExactArgs(1)(cmd, args); err != nil {
+		return err
+	}
+	rawScope, _ := cmd.Flags().GetString("scope")
+	_, err := resolveHarnessConfigTargetScope(rawScope)
+	return err
+}
+
 var harnessConfigSyncCmd = &cobra.Command{
 	Use:   "sync <name>",
 	Short: "Sync a local harness-config to the Hub",
 	Long: `Uploads a local harness-config directory to the Hub for use by remote Runtime Brokers.
 
 By default the config is synced to the current project's scope on the Hub.
-Use --global to sync it to the global scope (requires hub admin rights).
---global also reads the config from the global directory
-(~/.scion/harness-configs), so to publish a config globally it must live there.
+Use --scope global to publish a local config (including a project-local one) to
+the global scope (requires hub admin rights). Root --global both reads from the
+global directory (~/.scion/harness-configs) and targets the global Hub scope;
+--global conflicts with --scope project.
 An existing config with the same name in the target scope is updated to mirror
 the local directory: files deleted locally are removed from the Hub.`,
-	Args: cobra.ExactArgs(1),
+	Args: harnessConfigSyncArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		rawScope, _ := cmd.Flags().GetString("scope")
+		destScope, err := resolveHarnessConfigTargetScope(rawScope)
+		if err != nil {
+			return err
+		}
+
 		name := args[0]
 
 		gp := localProjectDir()
@@ -311,7 +356,7 @@ the local directory: files deleted locally are removed from the Hub.`,
 			return fmt.Errorf("harness-config %q not found: %w", name, err)
 		}
 
-		hubCtx, err := requireHubForUpload(projectPath)
+		hubCtx, err := requireHubWith(projectPath, destScope != "project")
 		if err != nil {
 			return err
 		}
@@ -322,14 +367,14 @@ the local directory: files deleted locally are removed from the Hub.`,
 			hubName = name
 		}
 
-		return syncLocalHarnessConfigToHub(hubCtx, hubName, hcDir.Path, hcDir.Config.Harness)
+		return syncLocalHarnessConfigToHubScope(hubCtx, hubName, hcDir.Path, hcDir.Config.Harness, destScope)
 	},
 }
 
 var harnessConfigPushCmd = &cobra.Command{
 	Use:   "push <name>",
 	Short: "Push a local harness-config to the Hub (alias for sync)",
-	Args:  cobra.ExactArgs(1),
+	Args:  harnessConfigSyncArgs,
 	RunE:  harnessConfigSyncCmd.RunE,
 }
 
@@ -387,20 +432,26 @@ var harnessConfigShowCmd = &cobra.Command{
 		// Try local first
 		hcDir, localErr := config.FindHarnessConfigDir(name, gp)
 		if localErr == nil {
+			caps := hcDir.Config.DeclaredCapabilities()
 			if isJSONOutput() {
-				return outputJSON(map[string]interface{}{
+				out := map[string]interface{}{
 					"source":  "local",
 					"name":    hcDir.Name,
 					"harness": hcDir.Config.Harness,
 					"image":   hcDir.Config.Image,
 					"path":    hcDir.Path,
-				})
+				}
+				if caps != nil {
+					out["capabilities"] = caps
+				}
+				return outputJSON(out)
 			}
 			fmt.Printf("Name:    %s\n", hcDir.Name)
 			fmt.Printf("Source:  local\n")
 			fmt.Printf("Harness: %s\n", hcDir.Config.Harness)
 			fmt.Printf("Image:   %s\n", hcDir.Config.Image)
 			fmt.Printf("Path:    %s\n", hcDir.Path)
+			printHarnessConfigCapabilities(os.Stdout, caps)
 			return nil
 		}
 
@@ -420,6 +471,9 @@ var harnessConfigShowCmd = &cobra.Command{
 		if err == nil {
 			for _, hc := range resp.HarnessConfigs {
 				if hc.Name == name || hc.Slug == name {
+					if full, getErr := hubCtx.Client.HarnessConfigs().Get(ctx, hc.ID); getErr == nil && full != nil {
+						hc = *full
+					}
 					if isJSONOutput() {
 						return outputJSON(hc)
 					}
@@ -434,6 +488,9 @@ var harnessConfigShowCmd = &cobra.Command{
 					if hc.SourceURL != "" {
 						fmt.Printf("Source URL:   %s\n", hc.SourceURL)
 					}
+					if hc.Config != nil {
+						printHarnessConfigCapabilities(os.Stdout, hc.Config.Capabilities)
+					}
 					return nil
 				}
 			}
@@ -441,6 +498,52 @@ var harnessConfigShowCmd = &cobra.Command{
 
 		return fmt.Errorf("harness-config %q not found", name)
 	},
+}
+
+func printHarnessConfigCapabilities(w io.Writer, caps *api.HarnessAdvancedCapabilities) {
+	if caps == nil {
+		return
+	}
+	type namedCap struct {
+		key   string
+		field api.CapabilityField
+	}
+	all := []namedCap{
+		{"limits.max_turns", caps.Limits.MaxTurns},
+		{"limits.max_model_calls", caps.Limits.MaxModelCalls},
+		{"limits.max_duration", caps.Limits.MaxDuration},
+		{"telemetry.enabled", caps.Telemetry.EnabledConfig},
+		{"telemetry.native_emitter", caps.Telemetry.NativeEmitter},
+		{"prompts.system_prompt", caps.Prompts.SystemPrompt},
+		{"prompts.agent_instructions", caps.Prompts.AgentInstructions},
+		{"auth.api_key", caps.Auth.APIKey},
+		{"auth.auth_file", caps.Auth.AuthFile},
+		{"auth.oauth_token", caps.Auth.OAuthToken},
+		{"auth.vertex_ai", caps.Auth.VertexAI},
+		{"mcp.stdio", caps.MCP.Stdio},
+		{"mcp.sse", caps.MCP.SSE},
+		{"mcp.streamable_http", caps.MCP.StreamableHTTP},
+		{"mcp.project_scope", caps.MCP.ProjectScope},
+		{"resume", caps.Resume},
+		{"agent_plugins", caps.AgentPlugins},
+	}
+	var declared []namedCap
+	for _, item := range all {
+		if item.field.Support != "" {
+			declared = append(declared, item)
+		}
+	}
+	if len(declared) == 0 {
+		return
+	}
+	_, _ = fmt.Fprintln(w, "Capabilities:")
+	for _, item := range declared {
+		val := string(item.field.Support)
+		if item.field.Reason != "" {
+			val += " (" + item.field.Reason + ")"
+		}
+		_, _ = fmt.Fprintf(w, "  %-27s %s\n", item.key+":", val)
+	}
 }
 
 var harnessConfigDeleteCmd = &cobra.Command{
@@ -501,30 +604,42 @@ var harnessConfigDeleteCmd = &cobra.Command{
 	},
 }
 
-// syncLocalHarnessConfigToHub implements 'harness-config sync/push': it
-// picks the scope (project by default, global with --global) and creates or
-// updates the named config there.
-func syncLocalHarnessConfigToHub(hubCtx *HubContext, name, localPath, harnessType string) error {
-	scope, scopeID, err := harnessConfigHubScope(hubCtx)
+// syncLocalHarnessConfigToHubScope implements 'harness-config sync/push' for an
+// explicit target Hub scope ("project" or "global", defaulting via --global
+// when empty) and creates or updates the named config there.
+func syncLocalHarnessConfigToHubScope(hubCtx *HubContext, name, localPath, harnessType, targetScope string) error {
+	scope, scopeID, err := harnessConfigHubScopeFor(hubCtx, targetScope)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to resolve project for Hub harness-config (use --scope global or --global for the global scope): %w", err)
 	}
 	return syncHarnessConfigToHub(hubCtx, name, localPath, scope, scopeID, harnessType, "")
 }
 
-// harnessConfigHubScope picks the Hub scope for harness-config sync, push and
-// install, the same way templates do: the current project by default, or
-// global with --global. For project scope it resolves the project ID.
+// harnessConfigHubScope picks the Hub scope for harness-config install, the
+// same way templates do: the current project by default, or global with
+// --global. For project scope it resolves the project ID.
 func harnessConfigHubScope(hubCtx *HubContext) (scope, scopeID string, err error) {
-	scope = templateScopeFromGlobalFlag()
-	if scope == "global" {
-		return scope, "", nil
-	}
-	projectID, err := GetProjectID(hubCtx)
+	scope, scopeID, err = harnessConfigHubScopeFor(hubCtx, templateScopeFromGlobalFlag())
 	if err != nil {
 		return "", "", fmt.Errorf("failed to resolve project for Hub harness-config (use --global for the global scope): %w", err)
 	}
-	return scope, projectID, nil
+	return scope, scopeID, nil
+}
+
+// harnessConfigHubScopeFor resolves the (scope, scopeID) pair for targetScope
+// ("global" or "project"; empty falls back to templateScopeFromGlobalFlag()).
+func harnessConfigHubScopeFor(hubCtx *HubContext, targetScope string) (scope, scopeID string, err error) {
+	if targetScope == "" {
+		targetScope = templateScopeFromGlobalFlag()
+	}
+	if targetScope == "global" {
+		return "global", "", nil
+	}
+	projectID, err := GetProjectID(hubCtx)
+	if err != nil {
+		return "", "", err
+	}
+	return targetScope, projectID, nil
 }
 
 // harnessConfigScopeLabel renders a Hub scope for user-facing output, e.g.
@@ -940,9 +1055,11 @@ func init() {
 
 	// Flags for sync command
 	harnessConfigSyncCmd.Flags().String("name", "", "Name for the harness-config on the Hub")
+	harnessConfigSyncCmd.Flags().String("scope", "", "Target scope on the Hub (project, global; defaults to project, or global with --global)")
 
 	// Flags for push command
 	harnessConfigPushCmd.Flags().String("name", "", "Name for the harness-config on the Hub")
+	harnessConfigPushCmd.Flags().String("scope", "", "Target scope on the Hub (project, global; defaults to project, or global with --global)")
 
 	// Flags for pull command
 	harnessConfigPullCmd.Flags().String("to", "", "Destination path for downloaded harness-config")

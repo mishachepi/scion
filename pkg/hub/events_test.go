@@ -728,26 +728,34 @@ func TestChannelEventPublisher_PublishNotification(t *testing.T) {
 	pub := NewChannelEventPublisher()
 	defer pub.Close()
 
-	ch, unsub := pub.Subscribe("notification.>")
-	defer unsub()
+	userCh, unsubUser := pub.Subscribe("user.u1.notification")
+	defer unsubUser()
+	broadcastCh, unsubBroadcast := pub.Subscribe("notification.>", "project.g1.notification")
+	defer unsubBroadcast()
 
 	notif := &store.Notification{
-		ID:        "n1",
-		AgentID:   "a1",
-		ProjectID: "g1",
-		Status:    "COMPLETED",
-		Message:   "test-agent has reached a state of COMPLETED",
-		CreatedAt: time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC),
+		ID:           "n1",
+		AgentID:      "a1",
+		ProjectID:    "g1",
+		SubscriberID: "u1",
+		Status:       "COMPLETED",
+		Message:      "test-agent has reached a state of COMPLETED",
+		CreatedAt:    time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC),
 	}
 
 	pub.PublishNotification(context.Background(), notif)
 
+	// Notifications without a SubscriberID are dropped.
+	unaddressed := *notif
+	unaddressed.SubscriberID = ""
+	pub.PublishNotification(context.Background(), &unaddressed)
+
 	select {
-	case evt := <-ch:
-		if evt.Subject != "notification.created" {
-			t.Errorf("got subject %q, want %q", evt.Subject, "notification.created")
+	case evt := <-userCh:
+		if evt.Subject != "user.u1.notification" {
+			t.Errorf("got subject %q, want %q", evt.Subject, "user.u1.notification")
 		}
-		var data NotificationCreatedEvent
+		var data UserNotificationEvent
 		if err := json.Unmarshal(evt.Data, &data); err != nil {
 			t.Fatalf("unmarshal: %v", err)
 		}
@@ -760,6 +768,9 @@ func TestChannelEventPublisher_PublishNotification(t *testing.T) {
 		if data.ProjectID != "g1" {
 			t.Errorf("got ProjectID %q, want %q", data.ProjectID, "g1")
 		}
+		if data.SubscriberID != "u1" {
+			t.Errorf("got SubscriberID %q, want %q", data.SubscriberID, "u1")
+		}
 		if data.Status != "COMPLETED" {
 			t.Errorf("got Status %q, want %q", data.Status, "COMPLETED")
 		}
@@ -771,6 +782,12 @@ func TestChannelEventPublisher_PublishNotification(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting for notification event")
+	}
+
+	select {
+	case evt := <-broadcastCh:
+		t.Fatalf("unexpected event on %q", evt.Subject)
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 
@@ -835,7 +852,7 @@ func TestChannelEventPublisher_PayloadsCarryProjectIDNotGroveID(t *testing.T) {
 	pub.PublishProjectDeleted(ctx, "p1")
 	pub.PublishBrokerConnected(ctx, "b1", "broker-one", []string{"p1"})
 	pub.PublishBrokerDisconnected(ctx, "b1", []string{"p1"})
-	pub.PublishNotification(ctx, &store.Notification{ID: "n1", ProjectID: "p1", Status: "COMPLETED"})
+	pub.PublishNotification(ctx, &store.Notification{ID: "n1", ProjectID: "p1", SubscriberID: "u1", Status: "COMPLETED"})
 	pub.PublishUserMessage(ctx, &store.Message{
 		ID: "m1", ProjectID: "p1", Sender: "agent:a1", SenderID: "a1",
 		Recipient: "user:alice", RecipientID: "u1", Msg: "hi", Type: "assistant-reply",
@@ -868,7 +885,7 @@ func TestChannelEventPublisher_PayloadsCarryProjectIDNotGroveID(t *testing.T) {
 		"project.p1.updated",
 		"project.p1.deleted",
 		"project.p1.broker.status", "project.p1.broker.status",
-		"notification.created", "project.p1.notification",
+		"user.u1.notification",
 		"user.u1.message", "project.p1.user.message",
 	}
 
@@ -1071,6 +1088,7 @@ func TestPublishUserMessage_NoChatMessageForNonWebChannel(t *testing.T) {
 // every other test green.
 func TestPublishUserMessage_DispatchFailureFields(t *testing.T) {
 	unreachableReason := "Agent unreachable"
+	deletedReason := agentDeletedReason
 	// Round 4, item 5: a stale reason left over from a prior failed attempt
 	// (e.g. a retried row that later dispatched). If PublishUserMessage
 	// dropped its `DispatchState == failed` gate and instead populated the
@@ -1091,6 +1109,13 @@ func TestPublishUserMessage_DispatchFailureFields(t *testing.T) {
 			dispatchState: store.MessageDispatchFailed,
 			failureReason: &unreachableReason,
 			wantReason:    unreachableReason,
+			wantCode:      dispatchFailureCodeAgentUnreachable,
+		},
+		{
+			name:          "failed row with deleted agent reason",
+			dispatchState: store.MessageDispatchFailed,
+			failureReason: &deletedReason,
+			wantReason:    deletedReason,
 			wantCode:      dispatchFailureCodeAgentUnreachable,
 		},
 		{
@@ -1365,4 +1390,81 @@ func TestPublishChatReadStateEvent_IgnoresTopics(t *testing.T) {
 		t.Fatalf("topic read state should not publish, got %s", evt.Subject)
 	case <-time.After(100 * time.Millisecond):
 	}
+}
+
+func TestChannelEventPublisher_PublishAgentStatus_InboxHintGate(t *testing.T) {
+	pub := NewChannelEventPublisher()
+	defer pub.Close()
+
+	ownerCh, unsubOwner := pub.Subscribe("user.owner-1.inbox")
+	defer unsubOwner()
+	otherCh, unsubOther := pub.Subscribe("user.owner-2.inbox")
+	defer unsubOther()
+
+	assertNoEvent := func(ch <-chan Event, label string) {
+		t.Helper()
+		select {
+		case evt := <-ch:
+			t.Fatalf("%s: unexpected event on %s: %s", label, evt.Subject, string(evt.Data))
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+
+	expectHint := func(wantAgentID, wantActivity string) {
+		t.Helper()
+		select {
+		case evt := <-ownerCh:
+			if evt.Subject != "user.owner-1.inbox" {
+				t.Fatalf("subject = %q, want user.owner-1.inbox", evt.Subject)
+			}
+			var hint InboxHint
+			if err := json.Unmarshal(evt.Data, &hint); err != nil {
+				t.Fatalf("unmarshal hint: %v", err)
+			}
+			if hint.Category != InboxCategoryWaiting || hint.AgentID != wantAgentID || hint.Activity != wantActivity {
+				t.Fatalf("hint = %+v, want {Category:%q AgentID:%q Activity:%q}", hint, InboxCategoryWaiting, wantAgentID, wantActivity)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for inbox hint (%s, %s)", wantAgentID, wantActivity)
+		}
+	}
+
+	ctx := context.Background()
+	agent := &store.Agent{
+		ID:        "agent-1",
+		ProjectID: "proj-1",
+		OwnerID:   "owner-1",
+		Phase:     "running",
+		Activity:  "waiting_for_input",
+	}
+
+	// Gate unset (nil): no inbox hint.
+	pub.PublishAgentStatus(ctx, agent)
+	assertNoEvent(ownerCh, "nil gate")
+
+	// Gate returns false: no inbox hint.
+	enabled := false
+	pub.SetInboxHintEnabled(func() bool { return enabled })
+	pub.PublishAgentStatus(ctx, agent)
+	assertNoEvent(ownerCh, "gate false")
+
+	// Gate returns true: emits to owner only, for entering and leaving waiting_for_input.
+	enabled = true
+	pub.PublishAgentStatus(ctx, agent)
+	expectHint("agent-1", "waiting_for_input")
+	assertNoEvent(otherCh, "non-owner on enter")
+
+	agent.Activity = "thinking"
+	pub.PublishAgentStatus(ctx, agent)
+	expectHint("agent-1", "thinking")
+	assertNoEvent(otherCh, "non-owner on leave")
+
+	// Agent with empty OwnerID emits no inbox hint.
+	pub.PublishAgentStatus(ctx, &store.Agent{ID: "agent-unowned", ProjectID: "proj-1", Phase: "running", Activity: "waiting_for_input"})
+	assertNoEvent(ownerCh, "empty owner")
+	assertNoEvent(otherCh, "empty owner other")
+
+	// PublishAgentDeleted emits no inbox hint.
+	pub.PublishAgentDeleted(ctx, "agent-1", "proj-1")
+	assertNoEvent(ownerCh, "agent deleted")
 }

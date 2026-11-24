@@ -32,6 +32,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentreincarnation"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentserviceaccountassignment"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentsessionmetrics"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentsuspendscreen"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/allowlistentry"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/apikey"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/brokerdispatch"
@@ -55,6 +56,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/durablequeueitem"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/entitlementbinding"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/envvar"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/execrunoutput"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/externalidentity"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/gcpserviceaccount"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/githubinstallation"
@@ -102,6 +104,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/scheduledexecpollcursor"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/scheduledexecrun"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/secret"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/secretrequest"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/skill"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/skillinjection"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/skillregistry"
@@ -117,11 +120,13 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/trigger"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/triggerevent"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/triggerfire"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/triggersubjectclaim"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/usagereservation"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/user"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/useraccesstoken"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/userdeletion"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/userdeletionagent"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/userexeccontainer"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/userterminalworkspace"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/webhookendpoint"
 )
@@ -163,6 +168,8 @@ type Client struct {
 	AgentServiceAccountAssignment *AgentServiceAccountAssignmentClient
 	// AgentSessionMetrics is the client for interacting with the AgentSessionMetrics builders.
 	AgentSessionMetrics *AgentSessionMetricsClient
+	// AgentSuspendScreen is the client for interacting with the AgentSuspendScreen builders.
+	AgentSuspendScreen *AgentSuspendScreenClient
 	// AllowListEntry is the client for interacting with the AllowListEntry builders.
 	AllowListEntry *AllowListEntryClient
 	// ApiKey is the client for interacting with the ApiKey builders.
@@ -209,6 +216,8 @@ type Client struct {
 	EntitlementBinding *EntitlementBindingClient
 	// EnvVar is the client for interacting with the EnvVar builders.
 	EnvVar *EnvVarClient
+	// ExecRunOutput is the client for interacting with the ExecRunOutput builders.
+	ExecRunOutput *ExecRunOutputClient
 	// ExternalIdentity is the client for interacting with the ExternalIdentity builders.
 	ExternalIdentity *ExternalIdentityClient
 	// GCPServiceAccount is the client for interacting with the GCPServiceAccount builders.
@@ -303,6 +312,8 @@ type Client struct {
 	ScheduledExecRun *ScheduledExecRunClient
 	// Secret is the client for interacting with the Secret builders.
 	Secret *SecretClient
+	// SecretRequest is the client for interacting with the SecretRequest builders.
+	SecretRequest *SecretRequestClient
 	// Skill is the client for interacting with the Skill builders.
 	Skill *SkillClient
 	// SkillInjection is the client for interacting with the SkillInjection builders.
@@ -333,6 +344,8 @@ type Client struct {
 	TriggerEvent *TriggerEventClient
 	// TriggerFire is the client for interacting with the TriggerFire builders.
 	TriggerFire *TriggerFireClient
+	// TriggerSubjectClaim is the client for interacting with the TriggerSubjectClaim builders.
+	TriggerSubjectClaim *TriggerSubjectClaimClient
 	// UsageReservation is the client for interacting with the UsageReservation builders.
 	UsageReservation *UsageReservationClient
 	// User is the client for interacting with the User builders.
@@ -343,6 +356,8 @@ type Client struct {
 	UserDeletion *UserDeletionClient
 	// UserDeletionAgent is the client for interacting with the UserDeletionAgent builders.
 	UserDeletionAgent *UserDeletionAgentClient
+	// UserExecContainer is the client for interacting with the UserExecContainer builders.
+	UserExecContainer *UserExecContainerClient
 	// UserTerminalWorkspace is the client for interacting with the UserTerminalWorkspace builders.
 	UserTerminalWorkspace *UserTerminalWorkspaceClient
 	// WebhookEndpoint is the client for interacting with the WebhookEndpoint builders.
@@ -374,6 +389,7 @@ func (c *Client) init() {
 	c.AgentReincarnation = NewAgentReincarnationClient(c.config)
 	c.AgentServiceAccountAssignment = NewAgentServiceAccountAssignmentClient(c.config)
 	c.AgentSessionMetrics = NewAgentSessionMetricsClient(c.config)
+	c.AgentSuspendScreen = NewAgentSuspendScreenClient(c.config)
 	c.AllowListEntry = NewAllowListEntryClient(c.config)
 	c.ApiKey = NewApiKeyClient(c.config)
 	c.BrokerDispatch = NewBrokerDispatchClient(c.config)
@@ -397,6 +413,7 @@ func (c *Client) init() {
 	c.DurableQueueItem = NewDurableQueueItemClient(c.config)
 	c.EntitlementBinding = NewEntitlementBindingClient(c.config)
 	c.EnvVar = NewEnvVarClient(c.config)
+	c.ExecRunOutput = NewExecRunOutputClient(c.config)
 	c.ExternalIdentity = NewExternalIdentityClient(c.config)
 	c.GCPServiceAccount = NewGCPServiceAccountClient(c.config)
 	c.GitHubResolutionCache = NewGitHubResolutionCacheClient(c.config)
@@ -444,6 +461,7 @@ func (c *Client) init() {
 	c.ScheduledExecPollCursor = NewScheduledExecPollCursorClient(c.config)
 	c.ScheduledExecRun = NewScheduledExecRunClient(c.config)
 	c.Secret = NewSecretClient(c.config)
+	c.SecretRequest = NewSecretRequestClient(c.config)
 	c.Skill = NewSkillClient(c.config)
 	c.SkillInjection = NewSkillInjectionClient(c.config)
 	c.SkillRegistry = NewSkillRegistryClient(c.config)
@@ -459,11 +477,13 @@ func (c *Client) init() {
 	c.Trigger = NewTriggerClient(c.config)
 	c.TriggerEvent = NewTriggerEventClient(c.config)
 	c.TriggerFire = NewTriggerFireClient(c.config)
+	c.TriggerSubjectClaim = NewTriggerSubjectClaimClient(c.config)
 	c.UsageReservation = NewUsageReservationClient(c.config)
 	c.User = NewUserClient(c.config)
 	c.UserAccessToken = NewUserAccessTokenClient(c.config)
 	c.UserDeletion = NewUserDeletionClient(c.config)
 	c.UserDeletionAgent = NewUserDeletionAgentClient(c.config)
+	c.UserExecContainer = NewUserExecContainerClient(c.config)
 	c.UserTerminalWorkspace = NewUserTerminalWorkspaceClient(c.config)
 	c.WebhookEndpoint = NewWebhookEndpointClient(c.config)
 }
@@ -574,6 +594,7 @@ func (c *Client) Tx(ctx context.Context) (*Tx, error) {
 		AgentReincarnation:            NewAgentReincarnationClient(cfg),
 		AgentServiceAccountAssignment: NewAgentServiceAccountAssignmentClient(cfg),
 		AgentSessionMetrics:           NewAgentSessionMetricsClient(cfg),
+		AgentSuspendScreen:            NewAgentSuspendScreenClient(cfg),
 		AllowListEntry:                NewAllowListEntryClient(cfg),
 		ApiKey:                        NewApiKeyClient(cfg),
 		BrokerDispatch:                NewBrokerDispatchClient(cfg),
@@ -597,6 +618,7 @@ func (c *Client) Tx(ctx context.Context) (*Tx, error) {
 		DurableQueueItem:              NewDurableQueueItemClient(cfg),
 		EntitlementBinding:            NewEntitlementBindingClient(cfg),
 		EnvVar:                        NewEnvVarClient(cfg),
+		ExecRunOutput:                 NewExecRunOutputClient(cfg),
 		ExternalIdentity:              NewExternalIdentityClient(cfg),
 		GCPServiceAccount:             NewGCPServiceAccountClient(cfg),
 		GitHubResolutionCache:         NewGitHubResolutionCacheClient(cfg),
@@ -644,6 +666,7 @@ func (c *Client) Tx(ctx context.Context) (*Tx, error) {
 		ScheduledExecPollCursor:       NewScheduledExecPollCursorClient(cfg),
 		ScheduledExecRun:              NewScheduledExecRunClient(cfg),
 		Secret:                        NewSecretClient(cfg),
+		SecretRequest:                 NewSecretRequestClient(cfg),
 		Skill:                         NewSkillClient(cfg),
 		SkillInjection:                NewSkillInjectionClient(cfg),
 		SkillRegistry:                 NewSkillRegistryClient(cfg),
@@ -659,11 +682,13 @@ func (c *Client) Tx(ctx context.Context) (*Tx, error) {
 		Trigger:                       NewTriggerClient(cfg),
 		TriggerEvent:                  NewTriggerEventClient(cfg),
 		TriggerFire:                   NewTriggerFireClient(cfg),
+		TriggerSubjectClaim:           NewTriggerSubjectClaimClient(cfg),
 		UsageReservation:              NewUsageReservationClient(cfg),
 		User:                          NewUserClient(cfg),
 		UserAccessToken:               NewUserAccessTokenClient(cfg),
 		UserDeletion:                  NewUserDeletionClient(cfg),
 		UserDeletionAgent:             NewUserDeletionAgentClient(cfg),
+		UserExecContainer:             NewUserExecContainerClient(cfg),
 		UserTerminalWorkspace:         NewUserTerminalWorkspaceClient(cfg),
 		WebhookEndpoint:               NewWebhookEndpointClient(cfg),
 	}, nil
@@ -701,6 +726,7 @@ func (c *Client) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) 
 		AgentReincarnation:            NewAgentReincarnationClient(cfg),
 		AgentServiceAccountAssignment: NewAgentServiceAccountAssignmentClient(cfg),
 		AgentSessionMetrics:           NewAgentSessionMetricsClient(cfg),
+		AgentSuspendScreen:            NewAgentSuspendScreenClient(cfg),
 		AllowListEntry:                NewAllowListEntryClient(cfg),
 		ApiKey:                        NewApiKeyClient(cfg),
 		BrokerDispatch:                NewBrokerDispatchClient(cfg),
@@ -724,6 +750,7 @@ func (c *Client) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) 
 		DurableQueueItem:              NewDurableQueueItemClient(cfg),
 		EntitlementBinding:            NewEntitlementBindingClient(cfg),
 		EnvVar:                        NewEnvVarClient(cfg),
+		ExecRunOutput:                 NewExecRunOutputClient(cfg),
 		ExternalIdentity:              NewExternalIdentityClient(cfg),
 		GCPServiceAccount:             NewGCPServiceAccountClient(cfg),
 		GitHubResolutionCache:         NewGitHubResolutionCacheClient(cfg),
@@ -771,6 +798,7 @@ func (c *Client) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) 
 		ScheduledExecPollCursor:       NewScheduledExecPollCursorClient(cfg),
 		ScheduledExecRun:              NewScheduledExecRunClient(cfg),
 		Secret:                        NewSecretClient(cfg),
+		SecretRequest:                 NewSecretRequestClient(cfg),
 		Skill:                         NewSkillClient(cfg),
 		SkillInjection:                NewSkillInjectionClient(cfg),
 		SkillRegistry:                 NewSkillRegistryClient(cfg),
@@ -786,11 +814,13 @@ func (c *Client) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) 
 		Trigger:                       NewTriggerClient(cfg),
 		TriggerEvent:                  NewTriggerEventClient(cfg),
 		TriggerFire:                   NewTriggerFireClient(cfg),
+		TriggerSubjectClaim:           NewTriggerSubjectClaimClient(cfg),
 		UsageReservation:              NewUsageReservationClient(cfg),
 		User:                          NewUserClient(cfg),
 		UserAccessToken:               NewUserAccessTokenClient(cfg),
 		UserDeletion:                  NewUserDeletionClient(cfg),
 		UserDeletionAgent:             NewUserDeletionAgentClient(cfg),
+		UserExecContainer:             NewUserExecContainerClient(cfg),
 		UserTerminalWorkspace:         NewUserTerminalWorkspaceClient(cfg),
 		WebhookEndpoint:               NewWebhookEndpointClient(cfg),
 	}, nil
@@ -826,13 +856,14 @@ func (c *Client) Use(hooks ...Hook) {
 		c.AgentCredential, c.AgentDelegatedCredential, c.AgentDelegationGrant,
 		c.AgentDeliveryHold, c.AgentHold, c.AgentIdentityKey, c.AgentLifecycleCursor,
 		c.AgentLifecycleOutbox, c.AgentRecovery, c.AgentReincarnation,
-		c.AgentServiceAccountAssignment, c.AgentSessionMetrics, c.AllowListEntry,
-		c.ApiKey, c.BrokerDispatch, c.BrokerJoinToken, c.BrokerReportedRun,
-		c.BrokerSecret, c.BrokerSetting, c.BrokerTargetInventory, c.ChatLinkCode,
-		c.ChatRetentionCursor, c.ChatRetentionRun, c.ConduitPrincipalEpoch,
-		c.ConduitSession, c.Conversation, c.ConversationParticipant, c.Decision,
-		c.DecisionAnswer, c.DecisionKeyCounter, c.DelegationAdoption, c.DelegationEdge,
-		c.DurableQueueItem, c.EntitlementBinding, c.EnvVar, c.ExternalIdentity,
+		c.AgentServiceAccountAssignment, c.AgentSessionMetrics, c.AgentSuspendScreen,
+		c.AllowListEntry, c.ApiKey, c.BrokerDispatch, c.BrokerJoinToken,
+		c.BrokerReportedRun, c.BrokerSecret, c.BrokerSetting, c.BrokerTargetInventory,
+		c.ChatLinkCode, c.ChatRetentionCursor, c.ChatRetentionRun,
+		c.ConduitPrincipalEpoch, c.ConduitSession, c.Conversation,
+		c.ConversationParticipant, c.Decision, c.DecisionAnswer, c.DecisionKeyCounter,
+		c.DelegationAdoption, c.DelegationEdge, c.DurableQueueItem,
+		c.EntitlementBinding, c.EnvVar, c.ExecRunOutput, c.ExternalIdentity,
 		c.GCPServiceAccount, c.GitHubResolutionCache, c.GithubInstallation, c.Group,
 		c.GroupMembership, c.HarnessConfig, c.HubEncryptionMigration,
 		c.HubEncryptionPolicy, c.HubInstance, c.HubSetting, c.IntegrationConfig,
@@ -845,12 +876,13 @@ func (c *Client) Use(hooks ...Hook) {
 		c.ProjectSyncState, c.ProjectVisitorExclusion, c.ProjectVisitorRule,
 		c.RelayInstance, c.RoleBinding, c.RoleDefinition, c.RuntimeBroker,
 		c.RuntimeOrphan, c.Schedule, c.ScheduledEvent, c.ScheduledExecPollCursor,
-		c.ScheduledExecRun, c.Secret, c.Skill, c.SkillInjection, c.SkillRegistry,
-		c.SkillVersion, c.SubscriptionTemplate, c.SystemOneInstance, c.Template,
-		c.TestIdentityDelegation, c.TestIdentityLoginCode, c.TestInfraMarker,
-		c.ThreadGroup, c.ThreadGroupMember, c.Trigger, c.TriggerEvent, c.TriggerFire,
-		c.UsageReservation, c.User, c.UserAccessToken, c.UserDeletion,
-		c.UserDeletionAgent, c.UserTerminalWorkspace, c.WebhookEndpoint,
+		c.ScheduledExecRun, c.Secret, c.SecretRequest, c.Skill, c.SkillInjection,
+		c.SkillRegistry, c.SkillVersion, c.SubscriptionTemplate, c.SystemOneInstance,
+		c.Template, c.TestIdentityDelegation, c.TestIdentityLoginCode,
+		c.TestInfraMarker, c.ThreadGroup, c.ThreadGroupMember, c.Trigger,
+		c.TriggerEvent, c.TriggerFire, c.TriggerSubjectClaim, c.UsageReservation,
+		c.User, c.UserAccessToken, c.UserDeletion, c.UserDeletionAgent,
+		c.UserExecContainer, c.UserTerminalWorkspace, c.WebhookEndpoint,
 	} {
 		n.Use(hooks...)
 	}
@@ -864,13 +896,14 @@ func (c *Client) Intercept(interceptors ...Interceptor) {
 		c.AgentCredential, c.AgentDelegatedCredential, c.AgentDelegationGrant,
 		c.AgentDeliveryHold, c.AgentHold, c.AgentIdentityKey, c.AgentLifecycleCursor,
 		c.AgentLifecycleOutbox, c.AgentRecovery, c.AgentReincarnation,
-		c.AgentServiceAccountAssignment, c.AgentSessionMetrics, c.AllowListEntry,
-		c.ApiKey, c.BrokerDispatch, c.BrokerJoinToken, c.BrokerReportedRun,
-		c.BrokerSecret, c.BrokerSetting, c.BrokerTargetInventory, c.ChatLinkCode,
-		c.ChatRetentionCursor, c.ChatRetentionRun, c.ConduitPrincipalEpoch,
-		c.ConduitSession, c.Conversation, c.ConversationParticipant, c.Decision,
-		c.DecisionAnswer, c.DecisionKeyCounter, c.DelegationAdoption, c.DelegationEdge,
-		c.DurableQueueItem, c.EntitlementBinding, c.EnvVar, c.ExternalIdentity,
+		c.AgentServiceAccountAssignment, c.AgentSessionMetrics, c.AgentSuspendScreen,
+		c.AllowListEntry, c.ApiKey, c.BrokerDispatch, c.BrokerJoinToken,
+		c.BrokerReportedRun, c.BrokerSecret, c.BrokerSetting, c.BrokerTargetInventory,
+		c.ChatLinkCode, c.ChatRetentionCursor, c.ChatRetentionRun,
+		c.ConduitPrincipalEpoch, c.ConduitSession, c.Conversation,
+		c.ConversationParticipant, c.Decision, c.DecisionAnswer, c.DecisionKeyCounter,
+		c.DelegationAdoption, c.DelegationEdge, c.DurableQueueItem,
+		c.EntitlementBinding, c.EnvVar, c.ExecRunOutput, c.ExternalIdentity,
 		c.GCPServiceAccount, c.GitHubResolutionCache, c.GithubInstallation, c.Group,
 		c.GroupMembership, c.HarnessConfig, c.HubEncryptionMigration,
 		c.HubEncryptionPolicy, c.HubInstance, c.HubSetting, c.IntegrationConfig,
@@ -883,12 +916,13 @@ func (c *Client) Intercept(interceptors ...Interceptor) {
 		c.ProjectSyncState, c.ProjectVisitorExclusion, c.ProjectVisitorRule,
 		c.RelayInstance, c.RoleBinding, c.RoleDefinition, c.RuntimeBroker,
 		c.RuntimeOrphan, c.Schedule, c.ScheduledEvent, c.ScheduledExecPollCursor,
-		c.ScheduledExecRun, c.Secret, c.Skill, c.SkillInjection, c.SkillRegistry,
-		c.SkillVersion, c.SubscriptionTemplate, c.SystemOneInstance, c.Template,
-		c.TestIdentityDelegation, c.TestIdentityLoginCode, c.TestInfraMarker,
-		c.ThreadGroup, c.ThreadGroupMember, c.Trigger, c.TriggerEvent, c.TriggerFire,
-		c.UsageReservation, c.User, c.UserAccessToken, c.UserDeletion,
-		c.UserDeletionAgent, c.UserTerminalWorkspace, c.WebhookEndpoint,
+		c.ScheduledExecRun, c.Secret, c.SecretRequest, c.Skill, c.SkillInjection,
+		c.SkillRegistry, c.SkillVersion, c.SubscriptionTemplate, c.SystemOneInstance,
+		c.Template, c.TestIdentityDelegation, c.TestIdentityLoginCode,
+		c.TestInfraMarker, c.ThreadGroup, c.ThreadGroupMember, c.Trigger,
+		c.TriggerEvent, c.TriggerFire, c.TriggerSubjectClaim, c.UsageReservation,
+		c.User, c.UserAccessToken, c.UserDeletion, c.UserDeletionAgent,
+		c.UserExecContainer, c.UserTerminalWorkspace, c.WebhookEndpoint,
 	} {
 		n.Intercept(interceptors...)
 	}
@@ -929,6 +963,8 @@ func (c *Client) Mutate(ctx context.Context, m Mutation) (Value, error) {
 		return c.AgentServiceAccountAssignment.mutate(ctx, m)
 	case *AgentSessionMetricsMutation:
 		return c.AgentSessionMetrics.mutate(ctx, m)
+	case *AgentSuspendScreenMutation:
+		return c.AgentSuspendScreen.mutate(ctx, m)
 	case *AllowListEntryMutation:
 		return c.AllowListEntry.mutate(ctx, m)
 	case *ApiKeyMutation:
@@ -975,6 +1011,8 @@ func (c *Client) Mutate(ctx context.Context, m Mutation) (Value, error) {
 		return c.EntitlementBinding.mutate(ctx, m)
 	case *EnvVarMutation:
 		return c.EnvVar.mutate(ctx, m)
+	case *ExecRunOutputMutation:
+		return c.ExecRunOutput.mutate(ctx, m)
 	case *ExternalIdentityMutation:
 		return c.ExternalIdentity.mutate(ctx, m)
 	case *GCPServiceAccountMutation:
@@ -1069,6 +1107,8 @@ func (c *Client) Mutate(ctx context.Context, m Mutation) (Value, error) {
 		return c.ScheduledExecRun.mutate(ctx, m)
 	case *SecretMutation:
 		return c.Secret.mutate(ctx, m)
+	case *SecretRequestMutation:
+		return c.SecretRequest.mutate(ctx, m)
 	case *SkillMutation:
 		return c.Skill.mutate(ctx, m)
 	case *SkillInjectionMutation:
@@ -1099,6 +1139,8 @@ func (c *Client) Mutate(ctx context.Context, m Mutation) (Value, error) {
 		return c.TriggerEvent.mutate(ctx, m)
 	case *TriggerFireMutation:
 		return c.TriggerFire.mutate(ctx, m)
+	case *TriggerSubjectClaimMutation:
+		return c.TriggerSubjectClaim.mutate(ctx, m)
 	case *UsageReservationMutation:
 		return c.UsageReservation.mutate(ctx, m)
 	case *UserMutation:
@@ -1109,6 +1151,8 @@ func (c *Client) Mutate(ctx context.Context, m Mutation) (Value, error) {
 		return c.UserDeletion.mutate(ctx, m)
 	case *UserDeletionAgentMutation:
 		return c.UserDeletionAgent.mutate(ctx, m)
+	case *UserExecContainerMutation:
+		return c.UserExecContainer.mutate(ctx, m)
 	case *UserTerminalWorkspaceMutation:
 		return c.UserTerminalWorkspace.mutate(ctx, m)
 	case *WebhookEndpointMutation:
@@ -1746,6 +1790,22 @@ func (c *AgentClient) QueryReportedRuns(_m *Agent) *BrokerReportedRunQuery {
 			sqlgraph.From(agent.Table, agent.FieldID, id),
 			sqlgraph.To(brokerreportedrun.Table, brokerreportedrun.FieldID),
 			sqlgraph.Edge(sqlgraph.O2M, false, agent.ReportedRunsTable, agent.ReportedRunsColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// QuerySuspendScreen queries the suspend_screen edge of a Agent.
+func (c *AgentClient) QuerySuspendScreen(_m *Agent) *AgentSuspendScreenQuery {
+	query := (&AgentSuspendScreenClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(agent.Table, agent.FieldID, id),
+			sqlgraph.To(agentsuspendscreen.Table, agentsuspendscreen.FieldID),
+			sqlgraph.Edge(sqlgraph.O2O, false, agent.SuspendScreenTable, agent.SuspendScreenColumn),
 		)
 		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
 		return fromV, nil
@@ -3387,6 +3447,155 @@ func (c *AgentSessionMetricsClient) mutate(ctx context.Context, m *AgentSessionM
 		return (&AgentSessionMetricsDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
 	default:
 		return nil, fmt.Errorf("ent: unknown AgentSessionMetrics mutation op: %q", m.Op())
+	}
+}
+
+// AgentSuspendScreenClient is a client for the AgentSuspendScreen schema.
+type AgentSuspendScreenClient struct {
+	config
+}
+
+// NewAgentSuspendScreenClient returns a client for the AgentSuspendScreen from the given config.
+func NewAgentSuspendScreenClient(c config) *AgentSuspendScreenClient {
+	return &AgentSuspendScreenClient{config: c}
+}
+
+// Use adds a list of mutation hooks to the hooks stack.
+// A call to `Use(f, g, h)` equals to `agentsuspendscreen.Hooks(f(g(h())))`.
+func (c *AgentSuspendScreenClient) Use(hooks ...Hook) {
+	c.hooks.AgentSuspendScreen = append(c.hooks.AgentSuspendScreen, hooks...)
+}
+
+// Intercept adds a list of query interceptors to the interceptors stack.
+// A call to `Intercept(f, g, h)` equals to `agentsuspendscreen.Intercept(f(g(h())))`.
+func (c *AgentSuspendScreenClient) Intercept(interceptors ...Interceptor) {
+	c.inters.AgentSuspendScreen = append(c.inters.AgentSuspendScreen, interceptors...)
+}
+
+// Create returns a builder for creating a AgentSuspendScreen entity.
+func (c *AgentSuspendScreenClient) Create() *AgentSuspendScreenCreate {
+	mutation := newAgentSuspendScreenMutation(c.config, OpCreate)
+	return &AgentSuspendScreenCreate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// CreateBulk returns a builder for creating a bulk of AgentSuspendScreen entities.
+func (c *AgentSuspendScreenClient) CreateBulk(builders ...*AgentSuspendScreenCreate) *AgentSuspendScreenCreateBulk {
+	return &AgentSuspendScreenCreateBulk{config: c.config, builders: builders}
+}
+
+// MapCreateBulk creates a bulk creation builder from the given slice. For each item in the slice, the function creates
+// a builder and applies setFunc on it.
+func (c *AgentSuspendScreenClient) MapCreateBulk(slice any, setFunc func(*AgentSuspendScreenCreate, int)) *AgentSuspendScreenCreateBulk {
+	rv := reflect.ValueOf(slice)
+	if rv.Kind() != reflect.Slice {
+		return &AgentSuspendScreenCreateBulk{err: fmt.Errorf("calling to AgentSuspendScreenClient.MapCreateBulk with wrong type %T, need slice", slice)}
+	}
+	builders := make([]*AgentSuspendScreenCreate, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		builders[i] = c.Create()
+		setFunc(builders[i], i)
+	}
+	return &AgentSuspendScreenCreateBulk{config: c.config, builders: builders}
+}
+
+// Update returns an update builder for AgentSuspendScreen.
+func (c *AgentSuspendScreenClient) Update() *AgentSuspendScreenUpdate {
+	mutation := newAgentSuspendScreenMutation(c.config, OpUpdate)
+	return &AgentSuspendScreenUpdate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOne returns an update builder for the given entity.
+func (c *AgentSuspendScreenClient) UpdateOne(_m *AgentSuspendScreen) *AgentSuspendScreenUpdateOne {
+	mutation := newAgentSuspendScreenMutation(c.config, OpUpdateOne, withAgentSuspendScreen(_m))
+	return &AgentSuspendScreenUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOneID returns an update builder for the given id.
+func (c *AgentSuspendScreenClient) UpdateOneID(id uuid.UUID) *AgentSuspendScreenUpdateOne {
+	mutation := newAgentSuspendScreenMutation(c.config, OpUpdateOne, withAgentSuspendScreenID(id))
+	return &AgentSuspendScreenUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// Delete returns a delete builder for AgentSuspendScreen.
+func (c *AgentSuspendScreenClient) Delete() *AgentSuspendScreenDelete {
+	mutation := newAgentSuspendScreenMutation(c.config, OpDelete)
+	return &AgentSuspendScreenDelete{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// DeleteOne returns a builder for deleting the given entity.
+func (c *AgentSuspendScreenClient) DeleteOne(_m *AgentSuspendScreen) *AgentSuspendScreenDeleteOne {
+	return c.DeleteOneID(_m.ID)
+}
+
+// DeleteOneID returns a builder for deleting the given entity by its id.
+func (c *AgentSuspendScreenClient) DeleteOneID(id uuid.UUID) *AgentSuspendScreenDeleteOne {
+	builder := c.Delete().Where(agentsuspendscreen.ID(id))
+	builder.mutation.id = &id
+	builder.mutation.op = OpDeleteOne
+	return &AgentSuspendScreenDeleteOne{builder}
+}
+
+// Query returns a query builder for AgentSuspendScreen.
+func (c *AgentSuspendScreenClient) Query() *AgentSuspendScreenQuery {
+	return &AgentSuspendScreenQuery{
+		config: c.config,
+		ctx:    &QueryContext{Type: TypeAgentSuspendScreen},
+		inters: c.Interceptors(),
+	}
+}
+
+// Get returns a AgentSuspendScreen entity by its id.
+func (c *AgentSuspendScreenClient) Get(ctx context.Context, id uuid.UUID) (*AgentSuspendScreen, error) {
+	return c.Query().Where(agentsuspendscreen.ID(id)).Only(ctx)
+}
+
+// GetX is like Get, but panics if an error occurs.
+func (c *AgentSuspendScreenClient) GetX(ctx context.Context, id uuid.UUID) *AgentSuspendScreen {
+	obj, err := c.Get(ctx, id)
+	if err != nil {
+		panic(err)
+	}
+	return obj
+}
+
+// QueryAgent queries the agent edge of a AgentSuspendScreen.
+func (c *AgentSuspendScreenClient) QueryAgent(_m *AgentSuspendScreen) *AgentQuery {
+	query := (&AgentClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(agentsuspendscreen.Table, agentsuspendscreen.FieldID, id),
+			sqlgraph.To(agent.Table, agent.FieldID),
+			sqlgraph.Edge(sqlgraph.O2O, true, agentsuspendscreen.AgentTable, agentsuspendscreen.AgentColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// Hooks returns the client hooks.
+func (c *AgentSuspendScreenClient) Hooks() []Hook {
+	return c.hooks.AgentSuspendScreen
+}
+
+// Interceptors returns the client interceptors.
+func (c *AgentSuspendScreenClient) Interceptors() []Interceptor {
+	return c.inters.AgentSuspendScreen
+}
+
+func (c *AgentSuspendScreenClient) mutate(ctx context.Context, m *AgentSuspendScreenMutation) (Value, error) {
+	switch m.Op() {
+	case OpCreate:
+		return (&AgentSuspendScreenCreate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdate:
+		return (&AgentSuspendScreenUpdate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdateOne:
+		return (&AgentSuspendScreenUpdateOne{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpDelete, OpDeleteOne:
+		return (&AgentSuspendScreenDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
+	default:
+		return nil, fmt.Errorf("ent: unknown AgentSuspendScreen mutation op: %q", m.Op())
 	}
 }
 
@@ -6494,6 +6703,139 @@ func (c *EnvVarClient) mutate(ctx context.Context, m *EnvVarMutation) (Value, er
 		return (&EnvVarDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
 	default:
 		return nil, fmt.Errorf("ent: unknown EnvVar mutation op: %q", m.Op())
+	}
+}
+
+// ExecRunOutputClient is a client for the ExecRunOutput schema.
+type ExecRunOutputClient struct {
+	config
+}
+
+// NewExecRunOutputClient returns a client for the ExecRunOutput from the given config.
+func NewExecRunOutputClient(c config) *ExecRunOutputClient {
+	return &ExecRunOutputClient{config: c}
+}
+
+// Use adds a list of mutation hooks to the hooks stack.
+// A call to `Use(f, g, h)` equals to `execrunoutput.Hooks(f(g(h())))`.
+func (c *ExecRunOutputClient) Use(hooks ...Hook) {
+	c.hooks.ExecRunOutput = append(c.hooks.ExecRunOutput, hooks...)
+}
+
+// Intercept adds a list of query interceptors to the interceptors stack.
+// A call to `Intercept(f, g, h)` equals to `execrunoutput.Intercept(f(g(h())))`.
+func (c *ExecRunOutputClient) Intercept(interceptors ...Interceptor) {
+	c.inters.ExecRunOutput = append(c.inters.ExecRunOutput, interceptors...)
+}
+
+// Create returns a builder for creating a ExecRunOutput entity.
+func (c *ExecRunOutputClient) Create() *ExecRunOutputCreate {
+	mutation := newExecRunOutputMutation(c.config, OpCreate)
+	return &ExecRunOutputCreate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// CreateBulk returns a builder for creating a bulk of ExecRunOutput entities.
+func (c *ExecRunOutputClient) CreateBulk(builders ...*ExecRunOutputCreate) *ExecRunOutputCreateBulk {
+	return &ExecRunOutputCreateBulk{config: c.config, builders: builders}
+}
+
+// MapCreateBulk creates a bulk creation builder from the given slice. For each item in the slice, the function creates
+// a builder and applies setFunc on it.
+func (c *ExecRunOutputClient) MapCreateBulk(slice any, setFunc func(*ExecRunOutputCreate, int)) *ExecRunOutputCreateBulk {
+	rv := reflect.ValueOf(slice)
+	if rv.Kind() != reflect.Slice {
+		return &ExecRunOutputCreateBulk{err: fmt.Errorf("calling to ExecRunOutputClient.MapCreateBulk with wrong type %T, need slice", slice)}
+	}
+	builders := make([]*ExecRunOutputCreate, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		builders[i] = c.Create()
+		setFunc(builders[i], i)
+	}
+	return &ExecRunOutputCreateBulk{config: c.config, builders: builders}
+}
+
+// Update returns an update builder for ExecRunOutput.
+func (c *ExecRunOutputClient) Update() *ExecRunOutputUpdate {
+	mutation := newExecRunOutputMutation(c.config, OpUpdate)
+	return &ExecRunOutputUpdate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOne returns an update builder for the given entity.
+func (c *ExecRunOutputClient) UpdateOne(_m *ExecRunOutput) *ExecRunOutputUpdateOne {
+	mutation := newExecRunOutputMutation(c.config, OpUpdateOne, withExecRunOutput(_m))
+	return &ExecRunOutputUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOneID returns an update builder for the given id.
+func (c *ExecRunOutputClient) UpdateOneID(id uuid.UUID) *ExecRunOutputUpdateOne {
+	mutation := newExecRunOutputMutation(c.config, OpUpdateOne, withExecRunOutputID(id))
+	return &ExecRunOutputUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// Delete returns a delete builder for ExecRunOutput.
+func (c *ExecRunOutputClient) Delete() *ExecRunOutputDelete {
+	mutation := newExecRunOutputMutation(c.config, OpDelete)
+	return &ExecRunOutputDelete{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// DeleteOne returns a builder for deleting the given entity.
+func (c *ExecRunOutputClient) DeleteOne(_m *ExecRunOutput) *ExecRunOutputDeleteOne {
+	return c.DeleteOneID(_m.ID)
+}
+
+// DeleteOneID returns a builder for deleting the given entity by its id.
+func (c *ExecRunOutputClient) DeleteOneID(id uuid.UUID) *ExecRunOutputDeleteOne {
+	builder := c.Delete().Where(execrunoutput.ID(id))
+	builder.mutation.id = &id
+	builder.mutation.op = OpDeleteOne
+	return &ExecRunOutputDeleteOne{builder}
+}
+
+// Query returns a query builder for ExecRunOutput.
+func (c *ExecRunOutputClient) Query() *ExecRunOutputQuery {
+	return &ExecRunOutputQuery{
+		config: c.config,
+		ctx:    &QueryContext{Type: TypeExecRunOutput},
+		inters: c.Interceptors(),
+	}
+}
+
+// Get returns a ExecRunOutput entity by its id.
+func (c *ExecRunOutputClient) Get(ctx context.Context, id uuid.UUID) (*ExecRunOutput, error) {
+	return c.Query().Where(execrunoutput.ID(id)).Only(ctx)
+}
+
+// GetX is like Get, but panics if an error occurs.
+func (c *ExecRunOutputClient) GetX(ctx context.Context, id uuid.UUID) *ExecRunOutput {
+	obj, err := c.Get(ctx, id)
+	if err != nil {
+		panic(err)
+	}
+	return obj
+}
+
+// Hooks returns the client hooks.
+func (c *ExecRunOutputClient) Hooks() []Hook {
+	return c.hooks.ExecRunOutput
+}
+
+// Interceptors returns the client interceptors.
+func (c *ExecRunOutputClient) Interceptors() []Interceptor {
+	return c.inters.ExecRunOutput
+}
+
+func (c *ExecRunOutputClient) mutate(ctx context.Context, m *ExecRunOutputMutation) (Value, error) {
+	switch m.Op() {
+	case OpCreate:
+		return (&ExecRunOutputCreate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdate:
+		return (&ExecRunOutputUpdate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdateOne:
+		return (&ExecRunOutputUpdateOne{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpDelete, OpDeleteOne:
+		return (&ExecRunOutputDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
+	default:
+		return nil, fmt.Errorf("ent: unknown ExecRunOutput mutation op: %q", m.Op())
 	}
 }
 
@@ -12926,6 +13268,22 @@ func (c *ScheduledExecRunClient) QueryEvent(_m *ScheduledExecRun) *ScheduledEven
 	return query
 }
 
+// QueryTriggerFire queries the trigger_fire edge of a ScheduledExecRun.
+func (c *ScheduledExecRunClient) QueryTriggerFire(_m *ScheduledExecRun) *TriggerFireQuery {
+	query := (&TriggerFireClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(scheduledexecrun.Table, scheduledexecrun.FieldID, id),
+			sqlgraph.To(triggerfire.Table, triggerfire.FieldID),
+			sqlgraph.Edge(sqlgraph.O2O, true, scheduledexecrun.TriggerFireTable, scheduledexecrun.TriggerFireColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
 // Hooks returns the client hooks.
 func (c *ScheduledExecRunClient) Hooks() []Hook {
 	return c.hooks.ScheduledExecRun
@@ -13081,6 +13439,139 @@ func (c *SecretClient) mutate(ctx context.Context, m *SecretMutation) (Value, er
 		return (&SecretDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
 	default:
 		return nil, fmt.Errorf("ent: unknown Secret mutation op: %q", m.Op())
+	}
+}
+
+// SecretRequestClient is a client for the SecretRequest schema.
+type SecretRequestClient struct {
+	config
+}
+
+// NewSecretRequestClient returns a client for the SecretRequest from the given config.
+func NewSecretRequestClient(c config) *SecretRequestClient {
+	return &SecretRequestClient{config: c}
+}
+
+// Use adds a list of mutation hooks to the hooks stack.
+// A call to `Use(f, g, h)` equals to `secretrequest.Hooks(f(g(h())))`.
+func (c *SecretRequestClient) Use(hooks ...Hook) {
+	c.hooks.SecretRequest = append(c.hooks.SecretRequest, hooks...)
+}
+
+// Intercept adds a list of query interceptors to the interceptors stack.
+// A call to `Intercept(f, g, h)` equals to `secretrequest.Intercept(f(g(h())))`.
+func (c *SecretRequestClient) Intercept(interceptors ...Interceptor) {
+	c.inters.SecretRequest = append(c.inters.SecretRequest, interceptors...)
+}
+
+// Create returns a builder for creating a SecretRequest entity.
+func (c *SecretRequestClient) Create() *SecretRequestCreate {
+	mutation := newSecretRequestMutation(c.config, OpCreate)
+	return &SecretRequestCreate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// CreateBulk returns a builder for creating a bulk of SecretRequest entities.
+func (c *SecretRequestClient) CreateBulk(builders ...*SecretRequestCreate) *SecretRequestCreateBulk {
+	return &SecretRequestCreateBulk{config: c.config, builders: builders}
+}
+
+// MapCreateBulk creates a bulk creation builder from the given slice. For each item in the slice, the function creates
+// a builder and applies setFunc on it.
+func (c *SecretRequestClient) MapCreateBulk(slice any, setFunc func(*SecretRequestCreate, int)) *SecretRequestCreateBulk {
+	rv := reflect.ValueOf(slice)
+	if rv.Kind() != reflect.Slice {
+		return &SecretRequestCreateBulk{err: fmt.Errorf("calling to SecretRequestClient.MapCreateBulk with wrong type %T, need slice", slice)}
+	}
+	builders := make([]*SecretRequestCreate, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		builders[i] = c.Create()
+		setFunc(builders[i], i)
+	}
+	return &SecretRequestCreateBulk{config: c.config, builders: builders}
+}
+
+// Update returns an update builder for SecretRequest.
+func (c *SecretRequestClient) Update() *SecretRequestUpdate {
+	mutation := newSecretRequestMutation(c.config, OpUpdate)
+	return &SecretRequestUpdate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOne returns an update builder for the given entity.
+func (c *SecretRequestClient) UpdateOne(_m *SecretRequest) *SecretRequestUpdateOne {
+	mutation := newSecretRequestMutation(c.config, OpUpdateOne, withSecretRequest(_m))
+	return &SecretRequestUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOneID returns an update builder for the given id.
+func (c *SecretRequestClient) UpdateOneID(id uuid.UUID) *SecretRequestUpdateOne {
+	mutation := newSecretRequestMutation(c.config, OpUpdateOne, withSecretRequestID(id))
+	return &SecretRequestUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// Delete returns a delete builder for SecretRequest.
+func (c *SecretRequestClient) Delete() *SecretRequestDelete {
+	mutation := newSecretRequestMutation(c.config, OpDelete)
+	return &SecretRequestDelete{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// DeleteOne returns a builder for deleting the given entity.
+func (c *SecretRequestClient) DeleteOne(_m *SecretRequest) *SecretRequestDeleteOne {
+	return c.DeleteOneID(_m.ID)
+}
+
+// DeleteOneID returns a builder for deleting the given entity by its id.
+func (c *SecretRequestClient) DeleteOneID(id uuid.UUID) *SecretRequestDeleteOne {
+	builder := c.Delete().Where(secretrequest.ID(id))
+	builder.mutation.id = &id
+	builder.mutation.op = OpDeleteOne
+	return &SecretRequestDeleteOne{builder}
+}
+
+// Query returns a query builder for SecretRequest.
+func (c *SecretRequestClient) Query() *SecretRequestQuery {
+	return &SecretRequestQuery{
+		config: c.config,
+		ctx:    &QueryContext{Type: TypeSecretRequest},
+		inters: c.Interceptors(),
+	}
+}
+
+// Get returns a SecretRequest entity by its id.
+func (c *SecretRequestClient) Get(ctx context.Context, id uuid.UUID) (*SecretRequest, error) {
+	return c.Query().Where(secretrequest.ID(id)).Only(ctx)
+}
+
+// GetX is like Get, but panics if an error occurs.
+func (c *SecretRequestClient) GetX(ctx context.Context, id uuid.UUID) *SecretRequest {
+	obj, err := c.Get(ctx, id)
+	if err != nil {
+		panic(err)
+	}
+	return obj
+}
+
+// Hooks returns the client hooks.
+func (c *SecretRequestClient) Hooks() []Hook {
+	return c.hooks.SecretRequest
+}
+
+// Interceptors returns the client interceptors.
+func (c *SecretRequestClient) Interceptors() []Interceptor {
+	return c.inters.SecretRequest
+}
+
+func (c *SecretRequestClient) mutate(ctx context.Context, m *SecretRequestMutation) (Value, error) {
+	switch m.Op() {
+	case OpCreate:
+		return (&SecretRequestCreate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdate:
+		return (&SecretRequestUpdate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdateOne:
+		return (&SecretRequestUpdateOne{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpDelete, OpDeleteOne:
+		return (&SecretRequestDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
+	default:
+		return nil, fmt.Errorf("ent: unknown SecretRequest mutation op: %q", m.Op())
 	}
 }
 
@@ -15070,6 +15561,22 @@ func (c *TriggerFireClient) GetX(ctx context.Context, id uuid.UUID) *TriggerFire
 	return obj
 }
 
+// QueryExecRun queries the exec_run edge of a TriggerFire.
+func (c *TriggerFireClient) QueryExecRun(_m *TriggerFire) *ScheduledExecRunQuery {
+	query := (&ScheduledExecRunClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(triggerfire.Table, triggerfire.FieldID, id),
+			sqlgraph.To(scheduledexecrun.Table, scheduledexecrun.FieldID),
+			sqlgraph.Edge(sqlgraph.O2O, false, triggerfire.ExecRunTable, triggerfire.ExecRunColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
 // Hooks returns the client hooks.
 func (c *TriggerFireClient) Hooks() []Hook {
 	return c.hooks.TriggerFire
@@ -15092,6 +15599,139 @@ func (c *TriggerFireClient) mutate(ctx context.Context, m *TriggerFireMutation) 
 		return (&TriggerFireDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
 	default:
 		return nil, fmt.Errorf("ent: unknown TriggerFire mutation op: %q", m.Op())
+	}
+}
+
+// TriggerSubjectClaimClient is a client for the TriggerSubjectClaim schema.
+type TriggerSubjectClaimClient struct {
+	config
+}
+
+// NewTriggerSubjectClaimClient returns a client for the TriggerSubjectClaim from the given config.
+func NewTriggerSubjectClaimClient(c config) *TriggerSubjectClaimClient {
+	return &TriggerSubjectClaimClient{config: c}
+}
+
+// Use adds a list of mutation hooks to the hooks stack.
+// A call to `Use(f, g, h)` equals to `triggersubjectclaim.Hooks(f(g(h())))`.
+func (c *TriggerSubjectClaimClient) Use(hooks ...Hook) {
+	c.hooks.TriggerSubjectClaim = append(c.hooks.TriggerSubjectClaim, hooks...)
+}
+
+// Intercept adds a list of query interceptors to the interceptors stack.
+// A call to `Intercept(f, g, h)` equals to `triggersubjectclaim.Intercept(f(g(h())))`.
+func (c *TriggerSubjectClaimClient) Intercept(interceptors ...Interceptor) {
+	c.inters.TriggerSubjectClaim = append(c.inters.TriggerSubjectClaim, interceptors...)
+}
+
+// Create returns a builder for creating a TriggerSubjectClaim entity.
+func (c *TriggerSubjectClaimClient) Create() *TriggerSubjectClaimCreate {
+	mutation := newTriggerSubjectClaimMutation(c.config, OpCreate)
+	return &TriggerSubjectClaimCreate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// CreateBulk returns a builder for creating a bulk of TriggerSubjectClaim entities.
+func (c *TriggerSubjectClaimClient) CreateBulk(builders ...*TriggerSubjectClaimCreate) *TriggerSubjectClaimCreateBulk {
+	return &TriggerSubjectClaimCreateBulk{config: c.config, builders: builders}
+}
+
+// MapCreateBulk creates a bulk creation builder from the given slice. For each item in the slice, the function creates
+// a builder and applies setFunc on it.
+func (c *TriggerSubjectClaimClient) MapCreateBulk(slice any, setFunc func(*TriggerSubjectClaimCreate, int)) *TriggerSubjectClaimCreateBulk {
+	rv := reflect.ValueOf(slice)
+	if rv.Kind() != reflect.Slice {
+		return &TriggerSubjectClaimCreateBulk{err: fmt.Errorf("calling to TriggerSubjectClaimClient.MapCreateBulk with wrong type %T, need slice", slice)}
+	}
+	builders := make([]*TriggerSubjectClaimCreate, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		builders[i] = c.Create()
+		setFunc(builders[i], i)
+	}
+	return &TriggerSubjectClaimCreateBulk{config: c.config, builders: builders}
+}
+
+// Update returns an update builder for TriggerSubjectClaim.
+func (c *TriggerSubjectClaimClient) Update() *TriggerSubjectClaimUpdate {
+	mutation := newTriggerSubjectClaimMutation(c.config, OpUpdate)
+	return &TriggerSubjectClaimUpdate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOne returns an update builder for the given entity.
+func (c *TriggerSubjectClaimClient) UpdateOne(_m *TriggerSubjectClaim) *TriggerSubjectClaimUpdateOne {
+	mutation := newTriggerSubjectClaimMutation(c.config, OpUpdateOne, withTriggerSubjectClaim(_m))
+	return &TriggerSubjectClaimUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOneID returns an update builder for the given id.
+func (c *TriggerSubjectClaimClient) UpdateOneID(id uuid.UUID) *TriggerSubjectClaimUpdateOne {
+	mutation := newTriggerSubjectClaimMutation(c.config, OpUpdateOne, withTriggerSubjectClaimID(id))
+	return &TriggerSubjectClaimUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// Delete returns a delete builder for TriggerSubjectClaim.
+func (c *TriggerSubjectClaimClient) Delete() *TriggerSubjectClaimDelete {
+	mutation := newTriggerSubjectClaimMutation(c.config, OpDelete)
+	return &TriggerSubjectClaimDelete{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// DeleteOne returns a builder for deleting the given entity.
+func (c *TriggerSubjectClaimClient) DeleteOne(_m *TriggerSubjectClaim) *TriggerSubjectClaimDeleteOne {
+	return c.DeleteOneID(_m.ID)
+}
+
+// DeleteOneID returns a builder for deleting the given entity by its id.
+func (c *TriggerSubjectClaimClient) DeleteOneID(id uuid.UUID) *TriggerSubjectClaimDeleteOne {
+	builder := c.Delete().Where(triggersubjectclaim.ID(id))
+	builder.mutation.id = &id
+	builder.mutation.op = OpDeleteOne
+	return &TriggerSubjectClaimDeleteOne{builder}
+}
+
+// Query returns a query builder for TriggerSubjectClaim.
+func (c *TriggerSubjectClaimClient) Query() *TriggerSubjectClaimQuery {
+	return &TriggerSubjectClaimQuery{
+		config: c.config,
+		ctx:    &QueryContext{Type: TypeTriggerSubjectClaim},
+		inters: c.Interceptors(),
+	}
+}
+
+// Get returns a TriggerSubjectClaim entity by its id.
+func (c *TriggerSubjectClaimClient) Get(ctx context.Context, id uuid.UUID) (*TriggerSubjectClaim, error) {
+	return c.Query().Where(triggersubjectclaim.ID(id)).Only(ctx)
+}
+
+// GetX is like Get, but panics if an error occurs.
+func (c *TriggerSubjectClaimClient) GetX(ctx context.Context, id uuid.UUID) *TriggerSubjectClaim {
+	obj, err := c.Get(ctx, id)
+	if err != nil {
+		panic(err)
+	}
+	return obj
+}
+
+// Hooks returns the client hooks.
+func (c *TriggerSubjectClaimClient) Hooks() []Hook {
+	return c.hooks.TriggerSubjectClaim
+}
+
+// Interceptors returns the client interceptors.
+func (c *TriggerSubjectClaimClient) Interceptors() []Interceptor {
+	return c.inters.TriggerSubjectClaim
+}
+
+func (c *TriggerSubjectClaimClient) mutate(ctx context.Context, m *TriggerSubjectClaimMutation) (Value, error) {
+	switch m.Op() {
+	case OpCreate:
+		return (&TriggerSubjectClaimCreate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdate:
+		return (&TriggerSubjectClaimUpdate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdateOne:
+		return (&TriggerSubjectClaimUpdateOne{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpDelete, OpDeleteOne:
+		return (&TriggerSubjectClaimDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
+	default:
+		return nil, fmt.Errorf("ent: unknown TriggerSubjectClaim mutation op: %q", m.Op())
 	}
 }
 
@@ -15425,6 +16065,22 @@ func (c *UserClient) QueryTerminalWorkspace(_m *User) *UserTerminalWorkspaceQuer
 			sqlgraph.From(user.Table, user.FieldID, id),
 			sqlgraph.To(userterminalworkspace.Table, userterminalworkspace.FieldID),
 			sqlgraph.Edge(sqlgraph.O2O, false, user.TerminalWorkspaceTable, user.TerminalWorkspaceColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// QueryExecContainer queries the exec_container edge of a User.
+func (c *UserClient) QueryExecContainer(_m *User) *UserExecContainerQuery {
+	query := (&UserExecContainerClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(user.Table, user.FieldID, id),
+			sqlgraph.To(userexeccontainer.Table, userexeccontainer.FieldID),
+			sqlgraph.Edge(sqlgraph.O2O, false, user.ExecContainerTable, user.ExecContainerColumn),
 		)
 		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
 		return fromV, nil
@@ -15904,6 +16560,155 @@ func (c *UserDeletionAgentClient) mutate(ctx context.Context, m *UserDeletionAge
 	}
 }
 
+// UserExecContainerClient is a client for the UserExecContainer schema.
+type UserExecContainerClient struct {
+	config
+}
+
+// NewUserExecContainerClient returns a client for the UserExecContainer from the given config.
+func NewUserExecContainerClient(c config) *UserExecContainerClient {
+	return &UserExecContainerClient{config: c}
+}
+
+// Use adds a list of mutation hooks to the hooks stack.
+// A call to `Use(f, g, h)` equals to `userexeccontainer.Hooks(f(g(h())))`.
+func (c *UserExecContainerClient) Use(hooks ...Hook) {
+	c.hooks.UserExecContainer = append(c.hooks.UserExecContainer, hooks...)
+}
+
+// Intercept adds a list of query interceptors to the interceptors stack.
+// A call to `Intercept(f, g, h)` equals to `userexeccontainer.Intercept(f(g(h())))`.
+func (c *UserExecContainerClient) Intercept(interceptors ...Interceptor) {
+	c.inters.UserExecContainer = append(c.inters.UserExecContainer, interceptors...)
+}
+
+// Create returns a builder for creating a UserExecContainer entity.
+func (c *UserExecContainerClient) Create() *UserExecContainerCreate {
+	mutation := newUserExecContainerMutation(c.config, OpCreate)
+	return &UserExecContainerCreate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// CreateBulk returns a builder for creating a bulk of UserExecContainer entities.
+func (c *UserExecContainerClient) CreateBulk(builders ...*UserExecContainerCreate) *UserExecContainerCreateBulk {
+	return &UserExecContainerCreateBulk{config: c.config, builders: builders}
+}
+
+// MapCreateBulk creates a bulk creation builder from the given slice. For each item in the slice, the function creates
+// a builder and applies setFunc on it.
+func (c *UserExecContainerClient) MapCreateBulk(slice any, setFunc func(*UserExecContainerCreate, int)) *UserExecContainerCreateBulk {
+	rv := reflect.ValueOf(slice)
+	if rv.Kind() != reflect.Slice {
+		return &UserExecContainerCreateBulk{err: fmt.Errorf("calling to UserExecContainerClient.MapCreateBulk with wrong type %T, need slice", slice)}
+	}
+	builders := make([]*UserExecContainerCreate, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		builders[i] = c.Create()
+		setFunc(builders[i], i)
+	}
+	return &UserExecContainerCreateBulk{config: c.config, builders: builders}
+}
+
+// Update returns an update builder for UserExecContainer.
+func (c *UserExecContainerClient) Update() *UserExecContainerUpdate {
+	mutation := newUserExecContainerMutation(c.config, OpUpdate)
+	return &UserExecContainerUpdate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOne returns an update builder for the given entity.
+func (c *UserExecContainerClient) UpdateOne(_m *UserExecContainer) *UserExecContainerUpdateOne {
+	mutation := newUserExecContainerMutation(c.config, OpUpdateOne, withUserExecContainer(_m))
+	return &UserExecContainerUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOneID returns an update builder for the given id.
+func (c *UserExecContainerClient) UpdateOneID(id uuid.UUID) *UserExecContainerUpdateOne {
+	mutation := newUserExecContainerMutation(c.config, OpUpdateOne, withUserExecContainerID(id))
+	return &UserExecContainerUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// Delete returns a delete builder for UserExecContainer.
+func (c *UserExecContainerClient) Delete() *UserExecContainerDelete {
+	mutation := newUserExecContainerMutation(c.config, OpDelete)
+	return &UserExecContainerDelete{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// DeleteOne returns a builder for deleting the given entity.
+func (c *UserExecContainerClient) DeleteOne(_m *UserExecContainer) *UserExecContainerDeleteOne {
+	return c.DeleteOneID(_m.ID)
+}
+
+// DeleteOneID returns a builder for deleting the given entity by its id.
+func (c *UserExecContainerClient) DeleteOneID(id uuid.UUID) *UserExecContainerDeleteOne {
+	builder := c.Delete().Where(userexeccontainer.ID(id))
+	builder.mutation.id = &id
+	builder.mutation.op = OpDeleteOne
+	return &UserExecContainerDeleteOne{builder}
+}
+
+// Query returns a query builder for UserExecContainer.
+func (c *UserExecContainerClient) Query() *UserExecContainerQuery {
+	return &UserExecContainerQuery{
+		config: c.config,
+		ctx:    &QueryContext{Type: TypeUserExecContainer},
+		inters: c.Interceptors(),
+	}
+}
+
+// Get returns a UserExecContainer entity by its id.
+func (c *UserExecContainerClient) Get(ctx context.Context, id uuid.UUID) (*UserExecContainer, error) {
+	return c.Query().Where(userexeccontainer.ID(id)).Only(ctx)
+}
+
+// GetX is like Get, but panics if an error occurs.
+func (c *UserExecContainerClient) GetX(ctx context.Context, id uuid.UUID) *UserExecContainer {
+	obj, err := c.Get(ctx, id)
+	if err != nil {
+		panic(err)
+	}
+	return obj
+}
+
+// QueryUser queries the user edge of a UserExecContainer.
+func (c *UserExecContainerClient) QueryUser(_m *UserExecContainer) *UserQuery {
+	query := (&UserClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(userexeccontainer.Table, userexeccontainer.FieldID, id),
+			sqlgraph.To(user.Table, user.FieldID),
+			sqlgraph.Edge(sqlgraph.O2O, true, userexeccontainer.UserTable, userexeccontainer.UserColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// Hooks returns the client hooks.
+func (c *UserExecContainerClient) Hooks() []Hook {
+	return c.hooks.UserExecContainer
+}
+
+// Interceptors returns the client interceptors.
+func (c *UserExecContainerClient) Interceptors() []Interceptor {
+	return c.inters.UserExecContainer
+}
+
+func (c *UserExecContainerClient) mutate(ctx context.Context, m *UserExecContainerMutation) (Value, error) {
+	switch m.Op() {
+	case OpCreate:
+		return (&UserExecContainerCreate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdate:
+		return (&UserExecContainerUpdate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdateOne:
+		return (&UserExecContainerUpdateOne{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpDelete, OpDeleteOne:
+		return (&UserExecContainerDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
+	default:
+		return nil, fmt.Errorf("ent: unknown UserExecContainer mutation op: %q", m.Op())
+	}
+}
+
 // UserTerminalWorkspaceClient is a client for the UserTerminalWorkspace schema.
 type UserTerminalWorkspaceClient struct {
 	config
@@ -16193,15 +16998,15 @@ type (
 		AgentDelegatedCredential, AgentDelegationGrant, AgentDeliveryHold, AgentHold,
 		AgentIdentityKey, AgentLifecycleCursor, AgentLifecycleOutbox, AgentRecovery,
 		AgentReincarnation, AgentServiceAccountAssignment, AgentSessionMetrics,
-		AllowListEntry, ApiKey, BrokerDispatch, BrokerJoinToken, BrokerReportedRun,
-		BrokerSecret, BrokerSetting, BrokerTargetInventory, ChatLinkCode,
-		ChatRetentionCursor, ChatRetentionRun, ConduitPrincipalEpoch, ConduitSession,
-		Conversation, ConversationParticipant, Decision, DecisionAnswer,
-		DecisionKeyCounter, DelegationAdoption, DelegationEdge, DurableQueueItem,
-		EntitlementBinding, EnvVar, ExternalIdentity, GCPServiceAccount,
-		GitHubResolutionCache, GithubInstallation, Group, GroupMembership,
-		HarnessConfig, HubEncryptionMigration, HubEncryptionPolicy, HubInstance,
-		HubSetting, IntegrationConfig, IntegrationUpdate, InviteCode,
+		AgentSuspendScreen, AllowListEntry, ApiKey, BrokerDispatch, BrokerJoinToken,
+		BrokerReportedRun, BrokerSecret, BrokerSetting, BrokerTargetInventory,
+		ChatLinkCode, ChatRetentionCursor, ChatRetentionRun, ConduitPrincipalEpoch,
+		ConduitSession, Conversation, ConversationParticipant, Decision,
+		DecisionAnswer, DecisionKeyCounter, DelegationAdoption, DelegationEdge,
+		DurableQueueItem, EntitlementBinding, EnvVar, ExecRunOutput, ExternalIdentity,
+		GCPServiceAccount, GitHubResolutionCache, GithubInstallation, Group,
+		GroupMembership, HarnessConfig, HubEncryptionMigration, HubEncryptionPolicy,
+		HubInstance, HubSetting, IntegrationConfig, IntegrationUpdate, InviteCode,
 		LaunchReaperState, LifecycleHook, LifecycleHookAgentPhase, LimitDefinition,
 		MaintenanceOperation, MaintenanceOperationRun, MembershipLossCheck, Message,
 		MessageAddressee, MessagePolicy, MessagePolicyDecision, MutationAudit,
@@ -16209,27 +17014,28 @@ type (
 		PolicyBinding, Project, ProjectContributor, ProjectPreStartHook,
 		ProjectSyncState, ProjectVisitorExclusion, ProjectVisitorRule, RelayInstance,
 		RoleBinding, RoleDefinition, RuntimeBroker, RuntimeOrphan, Schedule,
-		ScheduledEvent, ScheduledExecPollCursor, ScheduledExecRun, Secret, Skill,
-		SkillInjection, SkillRegistry, SkillVersion, SubscriptionTemplate,
-		SystemOneInstance, Template, TestIdentityDelegation, TestIdentityLoginCode,
-		TestInfraMarker, ThreadGroup, ThreadGroupMember, Trigger, TriggerEvent,
-		TriggerFire, UsageReservation, User, UserAccessToken, UserDeletion,
-		UserDeletionAgent, UserTerminalWorkspace, WebhookEndpoint []ent.Hook
+		ScheduledEvent, ScheduledExecPollCursor, ScheduledExecRun, Secret,
+		SecretRequest, Skill, SkillInjection, SkillRegistry, SkillVersion,
+		SubscriptionTemplate, SystemOneInstance, Template, TestIdentityDelegation,
+		TestIdentityLoginCode, TestInfraMarker, ThreadGroup, ThreadGroupMember,
+		Trigger, TriggerEvent, TriggerFire, TriggerSubjectClaim, UsageReservation,
+		User, UserAccessToken, UserDeletion, UserDeletionAgent, UserExecContainer,
+		UserTerminalWorkspace, WebhookEndpoint []ent.Hook
 	}
 	inters struct {
 		AccessConstraint, AccessConstraintHistory, AccessPolicy, Agent, AgentCredential,
 		AgentDelegatedCredential, AgentDelegationGrant, AgentDeliveryHold, AgentHold,
 		AgentIdentityKey, AgentLifecycleCursor, AgentLifecycleOutbox, AgentRecovery,
 		AgentReincarnation, AgentServiceAccountAssignment, AgentSessionMetrics,
-		AllowListEntry, ApiKey, BrokerDispatch, BrokerJoinToken, BrokerReportedRun,
-		BrokerSecret, BrokerSetting, BrokerTargetInventory, ChatLinkCode,
-		ChatRetentionCursor, ChatRetentionRun, ConduitPrincipalEpoch, ConduitSession,
-		Conversation, ConversationParticipant, Decision, DecisionAnswer,
-		DecisionKeyCounter, DelegationAdoption, DelegationEdge, DurableQueueItem,
-		EntitlementBinding, EnvVar, ExternalIdentity, GCPServiceAccount,
-		GitHubResolutionCache, GithubInstallation, Group, GroupMembership,
-		HarnessConfig, HubEncryptionMigration, HubEncryptionPolicy, HubInstance,
-		HubSetting, IntegrationConfig, IntegrationUpdate, InviteCode,
+		AgentSuspendScreen, AllowListEntry, ApiKey, BrokerDispatch, BrokerJoinToken,
+		BrokerReportedRun, BrokerSecret, BrokerSetting, BrokerTargetInventory,
+		ChatLinkCode, ChatRetentionCursor, ChatRetentionRun, ConduitPrincipalEpoch,
+		ConduitSession, Conversation, ConversationParticipant, Decision,
+		DecisionAnswer, DecisionKeyCounter, DelegationAdoption, DelegationEdge,
+		DurableQueueItem, EntitlementBinding, EnvVar, ExecRunOutput, ExternalIdentity,
+		GCPServiceAccount, GitHubResolutionCache, GithubInstallation, Group,
+		GroupMembership, HarnessConfig, HubEncryptionMigration, HubEncryptionPolicy,
+		HubInstance, HubSetting, IntegrationConfig, IntegrationUpdate, InviteCode,
 		LaunchReaperState, LifecycleHook, LifecycleHookAgentPhase, LimitDefinition,
 		MaintenanceOperation, MaintenanceOperationRun, MembershipLossCheck, Message,
 		MessageAddressee, MessagePolicy, MessagePolicyDecision, MutationAudit,
@@ -16237,11 +17043,12 @@ type (
 		PolicyBinding, Project, ProjectContributor, ProjectPreStartHook,
 		ProjectSyncState, ProjectVisitorExclusion, ProjectVisitorRule, RelayInstance,
 		RoleBinding, RoleDefinition, RuntimeBroker, RuntimeOrphan, Schedule,
-		ScheduledEvent, ScheduledExecPollCursor, ScheduledExecRun, Secret, Skill,
-		SkillInjection, SkillRegistry, SkillVersion, SubscriptionTemplate,
-		SystemOneInstance, Template, TestIdentityDelegation, TestIdentityLoginCode,
-		TestInfraMarker, ThreadGroup, ThreadGroupMember, Trigger, TriggerEvent,
-		TriggerFire, UsageReservation, User, UserAccessToken, UserDeletion,
-		UserDeletionAgent, UserTerminalWorkspace, WebhookEndpoint []ent.Interceptor
+		ScheduledEvent, ScheduledExecPollCursor, ScheduledExecRun, Secret,
+		SecretRequest, Skill, SkillInjection, SkillRegistry, SkillVersion,
+		SubscriptionTemplate, SystemOneInstance, Template, TestIdentityDelegation,
+		TestIdentityLoginCode, TestInfraMarker, ThreadGroup, ThreadGroupMember,
+		Trigger, TriggerEvent, TriggerFire, TriggerSubjectClaim, UsageReservation,
+		User, UserAccessToken, UserDeletion, UserDeletionAgent, UserExecContainer,
+		UserTerminalWorkspace, WebhookEndpoint []ent.Interceptor
 	}
 )

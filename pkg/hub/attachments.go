@@ -28,6 +28,8 @@ import (
 	"unicode"
 
 	"github.com/google/uuid"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/util/rootopen"
 )
 
 // ---------------------------------------------------------------------------
@@ -146,27 +148,44 @@ var DangerousExtensions = map[string]bool{
 	// double-click.
 	".sh": true, ".bash": true, ".zsh": true, ".ksh": true, ".csh": true,
 	".command": true, ".desktop": true,
-	// Windows shortcut and settings files that can execute commands or modify
-	// the system on open — none has a legitimate chat attachment use.
-	".lnk": true, ".url": true, ".scf": true, ".reg": true,
-	".settingcontent-ms": true, ".cpl": true,
+	// Windows shell-integration, shortcut, setup, console, and settings files
+	// that trigger system actions or execute commands on open — none has a
+	// legitimate chat attachment use.
+	".lnk": true, ".url": true, ".website": true, ".scf": true,
+	".reg": true, ".inf": true, ".cpl": true, ".msc": true,
+	".settingcontent-ms": true, ".library-ms": true,
+	".searchconnector-ms": true, ".search-ms": true,
 	".application": true, ".appref-ms": true,
+	".theme": true, ".themepack": true, ".desktopthemepackfile": true,
+	".diagcab": true,
 }
 
-// attachmentExt returns the lower-cased extension that the blocklist above and
-// the classifier's text-like list both judge. It is deliberately the only such
-// parse: two copies of "lower-case filepath.Ext" is how two answers to the same
-// question begin to disagree.
+// attachmentExt returns the lower-cased extension after stripping any NTFS
+// alternate data stream suffix (":" and everything after it).
 //
 // The name is normalised first, because the blocklist is a claim about the file
 // a recipient ends up with rather than about the exact bytes of the upload's
-// filename. Windows drops trailing dots and spaces when it creates a file, so
-// "payload.sh " arrives on disk as "payload.sh"; a zero-width space or a NUL
+// filename. Windows drops trailing dots and spaces when it creates a file, and
+// treats ":" as an NTFS alternate data stream separator (so "payload.lnk::$DATA"
+// or "payload.lnk:stream.txt" names "payload.lnk"); a zero-width space or a NUL
 // inside the extension is invisible in every UI that will ever show the name.
-// Both spellings reached the disk as an accepted text file before this. Trailing
-// noise is trimmed and invisible runes are dropped so that every spelling of an
-// extension is judged as the extension it will behave as.
+// Stream suffixes and trailing noise are stripped and invisible runes are
+// dropped so that every spelling of an extension is judged as the extension it
+// will behave as.
+//
+// Blocklist refusal goes through refusedAttachmentExt (the single refusal gate
+// shared by SanitizeFilename and ClassifyAttachment), while text-like MIME
+// classification uses normalizeAttachmentExt on the full name.
 func attachmentExt(name string) string {
+	if before, _, ok := strings.Cut(name, ":"); ok {
+		name = before
+	}
+	return normalizeAttachmentExt(name)
+}
+
+// normalizeAttachmentExt extracts and lower-cases the extension after trimming
+// trailing dots and ignorable runes, without stripping ":" stream suffixes.
+func normalizeAttachmentExt(name string) string {
 	name = strings.TrimRightFunc(name, func(r rune) bool {
 		return r == '.' || isIgnorableFilenameRune(r)
 	})
@@ -176,6 +195,22 @@ func attachmentExt(name string) string {
 		}
 		return unicode.ToLower(r)
 	}, filepath.Ext(name))
+}
+
+// refusedAttachmentExt returns the canonical blocked extension when name
+// matches DangerousExtensions or refusedMarkupExtensions, checking both the
+// stream-stripped name (for NTFS alternate data stream spellings) and the full
+// name (for POSIX filenames containing ":" before a blocked extension).
+func refusedAttachmentExt(name string) (string, bool) {
+	if ext := attachmentExt(name); DangerousExtensions[ext] || refusedMarkupExtensions[ext] {
+		return ext, true
+	}
+	if strings.Contains(name, ":") {
+		if ext := normalizeAttachmentExt(name); DangerousExtensions[ext] || refusedMarkupExtensions[ext] {
+			return ext, true
+		}
+	}
+	return "", false
 }
 
 // isIgnorableFilenameRune reports whether a rune carries no visible weight in a
@@ -218,8 +253,7 @@ func SanitizeFilename(name string) (string, error) {
 	// Both lists share one refusal message. Markup is refused because it
 	// would be served back as its own document type; #1098 tracks
 	// re-admitting it safely.
-	switch ext := attachmentExt(name); {
-	case DangerousExtensions[ext], refusedMarkupExtensions[ext]:
+	if ext, refused := refusedAttachmentExt(name); refused {
 		return "", fmt.Errorf("files with a %s extension are not accepted", ext)
 	}
 	// Truncate if too long (preserve extension). This parse is about keeping a
@@ -236,6 +270,16 @@ func SanitizeFilename(name string) (string, error) {
 			base = base[:maxBase]
 		}
 		name = base + ext
+		if len(name) > MaxFilenameLength {
+			name = name[:MaxFilenameLength]
+		}
+	}
+	// Re-check the blocklist on the final stored name and the reduced delivery
+	// name so truncation cannot expose a refused extension.
+	for _, candidate := range []string{name, reduceAttachmentName(name)} {
+		if ext, refused := refusedAttachmentExt(candidate); refused {
+			return "", fmt.Errorf("files with a %s extension are not accepted", ext)
+		}
 	}
 	return name, nil
 }
@@ -338,7 +382,7 @@ func (s *LocalDiskAttachmentStore) Get(_ context.Context, projectID, id string) 
 	}
 	defer func() { _ = root.Close() }()
 
-	dir, err := root.Open(rel)
+	dir, err := rootopen.OpenDir(root, filepath.ToSlash(rel))
 	if err != nil {
 		return nil, AttachmentMeta{}, fmt.Errorf("attachment not found: %s", id)
 	}
@@ -349,27 +393,14 @@ func (s *LocalDiskAttachmentStore) Get(_ context.Context, projectID, id string) 
 	}
 
 	filename := entries[0].Name()
-	filePath := filepath.Join(rel, filename)
+	filePath := filepath.ToSlash(filepath.Join(rel, filename))
 
-	// Use Lstat (not Stat) to detect symlinks — refuse to open anything
-	// that is not a regular file.
-	info, err := root.Lstat(filePath)
+	f, info, err := rootopen.OpenRegularForRead(root, filePath, nil)
 	if err != nil {
-		return nil, AttachmentMeta{}, fmt.Errorf("attachment stat: %w", err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return nil, AttachmentMeta{}, fmt.Errorf("attachment not a regular file: %s", id)
-	}
-
-	f, err := root.Open(filePath)
-	if err != nil {
+		if errors.Is(err, rootopen.ErrRefused) {
+			return nil, AttachmentMeta{}, fmt.Errorf("attachment not a regular file: %s", id)
+		}
 		return nil, AttachmentMeta{}, fmt.Errorf("attachment open: %w", err)
-	}
-	// The open itself is checked again: the name could have been replaced
-	// between the Lstat and the open.
-	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() || !os.SameFile(fi, info) {
-		_ = f.Close()
-		return nil, AttachmentMeta{}, fmt.Errorf("attachment not a regular file: %s", id)
 	}
 
 	meta := AttachmentMeta{

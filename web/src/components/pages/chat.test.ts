@@ -51,6 +51,7 @@ import { chatDMsLoad, chatSpacesLoad } from '../../client/chat-list-cache.js';
 import { chatUnread } from '../../client/chat-unread.js';
 import { chatNotifications } from '../../client/chat-notifications.js';
 import { FakeEventSource } from '../../client/__fixtures__/agent-store-harness.js';
+import { stateManager as realStateManager } from '../../client/state.js';
 import { RESUME_REFRESH_AFTER_MS } from '../../client/resume-refresh.js';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -2219,6 +2220,130 @@ describe('chat page — late route lookups', () => {
     expect(el.mobilePanel).toBe('center');
   });
 
+  it('falling through to /chat clears route-open state on both connect and layout-change paths', () => {
+    // Connect path (mobile with restored panel): /chat clears the pending state
+    // so a later route open falls back to 'center' instead of the stale panel.
+    const mobile = mountedPage();
+    mobile.isMobileLayout = true;
+    mobile._restoredPanel = 'right';
+    mobile.mobilePanel = 'right';
+    window.history.replaceState(
+      { scionInPage: { panel: 'right', below: ['left', 'center'], run: 1 } },
+      '',
+      '/chat'
+    );
+    mobile.parseV2Route();
+    expect(mobile._restoredPanel).toBeNull();
+    expect(mobile._routeOpenPending).toBe(false);
+
+    mobile._slugToProjectId.set('alpha', 'p1');
+    window.history.replaceState({}, '', '/chat/alpha/topic-1');
+    mobile.parseV2Route();
+    expect(mobile.mobilePanel).toBe('center');
+
+    // Layout-change path (created wide on /chat, then narrowed): nothing stays armed.
+    const wide = mountedPage();
+    window.history.replaceState(
+      { scionInPage: { panel: 'right', below: ['left', 'center'], run: 1 } },
+      '',
+      '/chat'
+    );
+    wide.parseV2Route();
+    expect(wide._routeOpenPending).toBe(false);
+    narrowed(wide);
+    expect(wide._restoredPanel).toBeNull();
+  });
+
+  it('a failed thread slug lookup clears route-open state on connect and layout-change paths', async () => {
+    vi.mocked(apiFetch).mockImplementation((path: string) => {
+      if (path.startsWith('/api/v1/projects?slug=')) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ projects: [], totalCount: 0 }), { status: 200 })
+        );
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }));
+    });
+
+    // Connect path: restored panel is cleared when the routed thread cannot be found.
+    const mobile = mountedPage();
+    mobile.isMobileLayout = true;
+    mobile._restoredPanel = 'right';
+    mobile.mobilePanel = 'right';
+    const mobileLookups = trackAsyncCalls(mobile, 'resolveSlugAndOpenThread');
+    window.history.replaceState({}, '', '/chat/missing/topic-1');
+    mobile.parseV2Route();
+    await mobileLookups.settled();
+
+    expect(mobile.v2Conversation).toBeNull();
+    expect(mobile._restoredPanel).toBeNull();
+    expect(mobile._routeOpenPending).toBe(false);
+
+    // A later route open falls back to 'center', not the stale 'right'.
+    mobile._slugToProjectId.set('alpha', 'p1');
+    window.history.replaceState({}, '', '/chat/alpha/topic-1');
+    mobile.parseV2Route();
+    expect(mobile.mobilePanel).toBe('center');
+
+    // Layout-change path: narrowing while the failing lookup is in flight also clears on failure.
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path.startsWith('/api/v1/projects?slug=')) {
+        await held;
+        return new Response(JSON.stringify({ projects: [], totalCount: 0 }), { status: 200 });
+      }
+      return new Response('{}', { status: 200 });
+    });
+
+    const wide = mountedPage();
+    const wideLookups = trackAsyncCalls(wide, 'resolveSlugAndOpenThread');
+    window.history.replaceState(
+      { scionInPage: { panel: 'left', below: [], run: 1 } },
+      '',
+      '/chat/missing/topic-1'
+    );
+    wide.parseV2Route();
+    narrowed(wide);
+    expect(wide._restoredPanel).toBe('left');
+
+    release();
+    await wideLookups.settled();
+
+    expect(wide._restoredPanel).toBeNull();
+    expect(wide._routeOpenPending).toBe(false);
+
+    wide._slugToProjectId.set('alpha', 'p1');
+    window.history.replaceState({}, '', '/chat/alpha/topic-1');
+    wide.parseV2Route();
+    expect(wide.mobilePanel).toBe('center');
+  });
+
+  it('a failed DM peer lookup from route clears route-open state', async () => {
+    vi.mocked(apiFetch).mockImplementation(() =>
+      Promise.resolve(new Response('{}', { status: 404 }))
+    );
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const el = mountedPage();
+      el.isMobileLayout = true;
+      el.pageData = { user: null };
+      el._restoredPanel = 'right';
+      el.mobilePanel = 'right';
+      const lookups = trackAsyncCalls(el, 'resolveDMByPeerId');
+      window.history.replaceState({}, '', '/chat/dm/peer-missing');
+      el.parseV2Route();
+      await lookups.settled();
+
+      expect(el.v2Conversation).toBeNull();
+      expect(el._restoredPanel).toBeNull();
+      expect(el._routeOpenPending).toBe(false);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
   it('a late slug lookup on a page that is no longer mounted does nothing', async () => {
     const release = holdSlugLookup();
     const el = mountedPage();
@@ -2427,6 +2552,94 @@ describe('chat page — late space lookups', () => {
     releases.slug();
     await vi.waitFor(() => expect(navigateTo).toHaveBeenCalledWith('/chat/alpha/general-1'));
     expect(el.v2Conversation).toMatchObject({ conversationKey: 'general-1', projectSlug: 'alpha' });
+  });
+
+  it('on desktop, opening a space consumes the route-open marker', async () => {
+    const releases = holdSpaceLookups();
+    releases.threads();
+    const el = createSpacePage(false);
+    const lookups = trackAsyncCalls(el, 'selectSpaceBySlug');
+    el._slugToProjectId.set('alpha', 'p1');
+    el._projectIdToSlug.set('p1', 'alpha');
+    window.history.replaceState(
+      { scionInPage: { panel: 'left', below: [], run: 1 } },
+      '',
+      '/chat/alpha'
+    );
+
+    el.parseV2Route();
+    await lookups.settled();
+
+    expect(el.v2Conversation).toMatchObject({ conversationKey: 'general-1', projectSlug: 'alpha' });
+    expect(el.mobilePanel).toBe('center');
+    expect(el._routeOpenPending).toBe(false);
+    expect(el._restoredPanel).toBeNull();
+
+    // Narrowing afterwards does not arm a restored panel for a later route open.
+    el._handleMobileLayoutChange({ matches: true } as MediaQueryListEvent);
+    expect(el._restoredPanel).toBeNull();
+  });
+
+  it('on desktop, a space with no threads clears the route-open marker', async () => {
+    vi.mocked(apiFetch).mockImplementation((path: string) => {
+      if (path === '/api/v1/chat/spaces/p1/threads') {
+        return Promise.resolve(new Response(JSON.stringify({ threads: [] }), { status: 200 }));
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }));
+    });
+    const el = createSpacePage(false);
+    const lookups = trackAsyncCalls(el, 'selectSpaceBySlug');
+    el._slugToProjectId.set('alpha', 'p1');
+    el._projectIdToSlug.set('p1', 'alpha');
+    window.history.replaceState({}, '', '/chat/alpha');
+
+    el.parseV2Route();
+    await lookups.settled();
+
+    expect(el.v2Conversation).toBeNull();
+    expect(el._routeOpenPending).toBe(false);
+    expect(el._restoredPanel).toBeNull();
+  });
+
+  it('a failed space slug lookup clears the route-open marker', async () => {
+    vi.mocked(apiFetch).mockImplementation((path: string) => {
+      if (path.startsWith('/api/v1/projects?slug=')) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ projects: [], totalCount: 0 }), { status: 200 })
+        );
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }));
+    });
+    const el = createSpacePage(true);
+    el._restoredPanel = 'right';
+    el.mobilePanel = 'right';
+    const lookups = trackAsyncCalls(el, 'resolveSlugAndOpenSpace');
+    window.history.replaceState({}, '', '/chat/missing-space');
+
+    el.parseV2Route();
+    await lookups.settled();
+
+    expect(el.v2Conversation).toBeNull();
+    expect(el._restoredPanel).toBeNull();
+    expect(el._routeOpenPending).toBe(false);
+  });
+
+  it('an unknown legacy space route clears the route-open marker once the rail has loaded', () => {
+    const el = createSpacePage(true);
+    el._restoredPanel = 'right';
+    el.mobilePanel = 'right';
+    window.history.replaceState({}, '', '/chat/space/missing-id');
+
+    // Before the rail populates the slug map, the route stays pending.
+    el.parseV2Route();
+    expect(el._restoredPanel).toBe('right');
+    expect(el._routeOpenPending).toBe(true);
+
+    // Once the rail has loaded with known spaces, an unknown legacy space ID clears the marker.
+    el._projectIdToSlug.set('p1', 'alpha');
+    el.parseV2Route();
+    expect(el._restoredPanel).toBeNull();
+    expect(el._routeOpenPending).toBe(false);
   });
 });
 
@@ -3192,6 +3405,347 @@ describe('chat page — startup after the page is removed', () => {
         vi.mocked(apiFetch).mockImplementation(() =>
           Promise.resolve(new Response('{}', { status: 200 }))
         );
+      }
+    });
+  });
+
+  describe('/chat/dms request deduplication', () => {
+    const SPACE_KEY = '6f1c2a54-0000-4000-8000-000000000001';
+    const DM_KEY = 'dm:user:user-me:user:user-1';
+    const OTHER_DM_KEY = 'dm:user:user-me:user:user-2';
+
+    function spacesListLoads(): number {
+      return vi.mocked(apiFetch).mock.calls.filter(([path]) => path === '/api/v1/chat/spaces')
+        .length;
+    }
+
+    /**
+     * Dispatch one SSE CustomEvent to both `chatUnread` (`client/state.js`)
+     * and the chat page (`client/main.js` stub), in `main.ts` listener order
+     * (`chatUnread` first, then `chat.ts`) with the same `timeStamp`.
+     */
+    function dispatchSSE(type: string, detail: unknown): void {
+      const ev = new CustomEvent(type, { detail });
+      realStateManager.dispatchEvent(ev);
+      stateManager.dispatchEvent(ev);
+    }
+
+    /**
+     * Start a connected chat page with the real `chatUnread` counter active
+     * (started before connecting the page, matching `main.ts` listener order)
+     * and a stub rail whose `reload`/`refresh` exercise the real shared loads
+     * and `rail-refresh` event.
+     */
+    async function connectedPageWithUnread(): Promise<{
+      el: any;
+      rail: { reload: MockInstance; refresh: MockInstance };
+      setDMs: (dms: Array<Record<string, unknown>>) => void;
+      setSpaces: (spaces: Array<Record<string, unknown>>) => void;
+    }> {
+      await loadLazyModules();
+      let currentDMs: Array<Record<string, unknown>> = [
+        {
+          conversationKey: DM_KEY,
+          peerId: 'user-1',
+          peerKind: 'user',
+          hasUnread: true,
+          lastMessageId: 'm1',
+        },
+      ];
+      let currentSpaces: Array<Record<string, unknown>> = [{ unreadCount: 1 }];
+      vi.mocked(apiFetch).mockImplementation((path) => {
+        const url = String(path);
+        if (url === '/api/v1/chat/dms') {
+          return Promise.resolve(
+            new Response(JSON.stringify({ dms: currentDMs }), { status: 200 })
+          );
+        }
+        if (url === '/api/v1/chat/spaces') {
+          return Promise.resolve(
+            new Response(JSON.stringify({ spaces: currentSpaces }), { status: 200 })
+          );
+        }
+        return Promise.resolve(new Response('{}', { status: 200 }));
+      });
+
+      const el = createUnrenderedPage();
+      const rail = {
+        reload: vi.fn((opts?: { startedAfter?: number }) =>
+          chatSpacesLoad.load(opts ? { startedAfter: opts.startedAfter } : {})
+        ),
+        refresh: vi.fn(async () => {
+          const waited: Promise<unknown>[] = [];
+          el.dispatchEvent(
+            new CustomEvent('rail-refresh', {
+              detail: { waitUntil: (p: Promise<unknown>) => waited.push(p) },
+            })
+          );
+          await Promise.all([chatSpacesLoad.load(), ...waited]);
+        }),
+      };
+      Object.defineProperty(el, 'shadowRoot', {
+        configurable: true,
+        get: () => ({
+          querySelector: (sel: string) => (sel === 'scion-chat-space-rail' ? rail : null),
+        }),
+      });
+      // Stub sidebar member loaders so poll ticks isolate /chat/dms behavior.
+      el.loadHubMembers = vi.fn(() => Promise.resolve());
+      el.refreshHubMemberPresence = vi.fn(() => Promise.resolve());
+
+      const startups = trackStartups(el);
+      window.history.replaceState({}, '', '/chat');
+      // Register chatUnread's SSE listeners BEFORE the page's, as main.ts does.
+      chatUnread.start({ immediate: false, userId: 'user-me' });
+      document.body.appendChild(el);
+      await startups.settled();
+      // Settle the initial badge refresh before clearing request counters.
+      await chatUnread.refresh();
+      expect(chatUnread.count).toBe(2);
+      vi.mocked(apiFetch).mockClear();
+      return {
+        el,
+        rail,
+        setDMs: (dms) => {
+          currentDMs = dms;
+        },
+        setSpaces: (spaces) => {
+          currentSpaces = spaces;
+        },
+      };
+    }
+
+    afterEach(() => {
+      chatUnread.stop();
+      localStorage.removeItem('scion-chat-unread-share');
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    });
+
+    it('space-thread message bursts with chatUnread running produce 0 /chat/dms fetches and refresh /chat/spaces', async () => {
+      vi.useFakeTimers();
+      const { el, setSpaces } = await connectedPageWithUnread();
+      try {
+        setSpaces([{ unreadCount: 4 }]);
+        for (let i = 0; i < 6; i++) {
+          dispatchSSE('chat-message-received', {
+            state: {},
+            data: { projectId: 'p1', threadId: SPACE_KEY, id: `m${i}` },
+          });
+          await vi.advanceTimersByTimeAsync(100);
+        }
+        await vi.advanceTimersByTimeAsync(5_000);
+
+        expect(dmListLoads()).toBe(0);
+        expect(spacesListLoads()).toBeGreaterThanOrEqual(1);
+        expect(chatUnread.count).toBe(5);
+      } finally {
+        el.remove();
+      }
+    });
+
+    it('a DM message with chatUnread running produces exactly 1 /chat/dms fetch', async () => {
+      vi.useFakeTimers();
+      const { el, setDMs } = await connectedPageWithUnread();
+      try {
+        setDMs([
+          {
+            conversationKey: DM_KEY,
+            peerId: 'user-1',
+            peerKind: 'user',
+            hasUnread: true,
+            lastMessageId: 'm1',
+          },
+          {
+            conversationKey: OTHER_DM_KEY,
+            peerId: 'user-2',
+            peerKind: 'user',
+            hasUnread: true,
+            lastMessageId: 'm2',
+          },
+        ]);
+        dispatchSSE('chat-message-received', {
+          state: {},
+          data: { threadId: OTHER_DM_KEY, id: 'dm-1' },
+        });
+        await vi.advanceTimersByTimeAsync(5_000);
+
+        expect(dmListLoads()).toBe(1);
+        expect(chatUnread.count).toBe(3);
+      } finally {
+        el.remove();
+      }
+    });
+
+    it('a poll tick during a DM message burst does not pin the badge to the pre-burst DM list', async () => {
+      vi.useFakeTimers();
+      const { el, setDMs } = await connectedPageWithUnread();
+      try {
+        // Event 1 at t=0: leading _dmDotsRefresh starts L1 (1 unread DM).
+        dispatchSSE('chat-message-received', {
+          state: {},
+          data: { threadId: DM_KEY, id: 'dm-1' },
+        });
+        await vi.advanceTimersByTimeAsync(300);
+
+        // Event 2 at t=300 ms (inside the 500 ms coalescing window): server now has 2 unread DMs.
+        setDMs([
+          {
+            conversationKey: DM_KEY,
+            peerId: 'user-1',
+            peerKind: 'user',
+            hasUnread: true,
+            lastMessageId: 'm1',
+          },
+          {
+            conversationKey: OTHER_DM_KEY,
+            peerId: 'user-2',
+            peerKind: 'user',
+            hasUnread: true,
+            lastMessageId: 'm2',
+          },
+        ]);
+        dispatchSSE('chat-message-received', {
+          state: {},
+          data: { threadId: OTHER_DM_KEY, id: 'dm-2' },
+        });
+        await vi.advanceTimersByTimeAsync(100);
+
+        // Fallback poll tick at t=400 ms joins L1 via maxAgeMs; must NOT mark L1 fresh for event 2.
+        await el.loadUnreadDMPeers({ maxAgeMs: 59_000 });
+        await vi.advanceTimersByTimeAsync(10_000);
+
+        expect(dmListLoads()).toBe(2);
+        expect(el.v2UnreadFromIds).toEqual(['user-1', 'user-2']);
+        expect(chatUnread.count).toBe(3);
+      } finally {
+        el.remove();
+      }
+    });
+
+    it('a local DM read plus its own SSE echo produces 1 /chat/dms fetch, while other-tab reads and mutes still reload', async () => {
+      vi.useFakeTimers();
+      const { el, setDMs } = await connectedPageWithUnread();
+      try {
+        setDMs([
+          {
+            conversationKey: DM_KEY,
+            peerId: 'user-1',
+            peerKind: 'user',
+            hasUnread: false,
+            lastMessageId: 'm1',
+          },
+        ]);
+        el.dispatchEvent(
+          new CustomEvent('read-state-updated', {
+            detail: { conversationKey: DM_KEY, messageId: 'm1' },
+          })
+        );
+        await vi.advanceTimersByTimeAsync(50);
+        dispatchSSE('chat-read-state-updated', {
+          data: { conversationKey: DM_KEY, userId: 'user-me', messageId: 'm1' },
+        });
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(dmListLoads()).toBe(1);
+        expect(chatUnread.count).toBe(1);
+
+        // Reading a different DM in another tab still reloads.
+        dispatchSSE('chat-read-state-updated', {
+          data: { conversationKey: OTHER_DM_KEY, userId: 'user-me', messageId: 'm2' },
+        });
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(dmListLoads()).toBe(2);
+
+        // A mute SSE event right after a local read is not suppressed as a read echo.
+        el.dispatchEvent(
+          new CustomEvent('read-state-updated', {
+            detail: { conversationKey: DM_KEY, messageId: 'm3' },
+          })
+        );
+        await vi.advanceTimersByTimeAsync(50);
+        expect(dmListLoads()).toBe(3);
+        dispatchSSE('chat-read-state-updated', {
+          data: { conversationKey: DM_KEY, userId: 'user-me', muted: true },
+        });
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(dmListLoads()).toBe(4);
+      } finally {
+        el.remove();
+      }
+    });
+
+    it('skips a 60 s poll tick after a recent DM-event load, and fetches once per 60 s when idle', async () => {
+      vi.useFakeTimers();
+      const { el } = await connectedPageWithUnread();
+      try {
+        // Idle first tick at 60 s fetches once.
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(dmListLoads()).toBe(1);
+
+        // Idle second tick at 120 s fetches once.
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(dmListLoads()).toBe(2);
+
+        // A DM message 20 s into the next interval refreshes immediately...
+        await vi.advanceTimersByTimeAsync(20_000);
+        dispatchSSE('chat-message-received', {
+          state: {},
+          data: { threadId: DM_KEY, id: 'dm-recent' },
+        });
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(dmListLoads()).toBe(3);
+
+        // ...so the 180 s poll tick (39 s after the DM load) issues no request.
+        await vi.advanceTimersByTimeAsync(39_000);
+        expect(dmListLoads()).toBe(3);
+
+        // The following idle 240 s poll tick fetches again.
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(dmListLoads()).toBe(4);
+      } finally {
+        el.remove();
+      }
+    });
+
+    it('tab resume after >= 60 s hidden shares 1 /chat/dms request between poll catch-up and rail catch-up', async () => {
+      let hidden = false;
+      vi.spyOn(document, 'hidden', 'get').mockImplementation(() => hidden);
+      vi.spyOn(document, 'visibilityState', 'get').mockImplementation(() =>
+        hidden ? 'hidden' : 'visible'
+      );
+      vi.useFakeTimers();
+      const { el, rail, setDMs } = await connectedPageWithUnread();
+      try {
+        hidden = true;
+        document.dispatchEvent(new Event('visibilitychange'));
+        await vi.advanceTimersByTimeAsync(90_000);
+        expect(dmListLoads()).toBe(0);
+
+        setDMs([
+          {
+            conversationKey: DM_KEY,
+            peerId: 'user-1',
+            peerKind: 'user',
+            hasUnread: true,
+            lastMessageId: 'm1',
+          },
+          {
+            conversationKey: OTHER_DM_KEY,
+            peerId: 'user-2',
+            peerKind: 'user',
+            hasUnread: true,
+            lastMessageId: 'm2',
+          },
+        ]);
+        hidden = false;
+        document.dispatchEvent(new Event('visibilitychange'));
+        await vi.advanceTimersByTimeAsync(5_000);
+
+        expect(rail.refresh).toHaveBeenCalledTimes(1);
+        expect(dmListLoads()).toBe(1);
+        expect(chatUnread.count).toBe(3);
+      } finally {
+        el.remove();
       }
     });
   });

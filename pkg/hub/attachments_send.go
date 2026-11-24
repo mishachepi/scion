@@ -324,7 +324,7 @@ func (s *Server) storeOutboundBeforeBroker(ctx context.Context, w http.ResponseW
 	}
 	structuredMsg.ConversationID = storeMsg.ConversationID
 	if err := storeRow(ctx); err != nil {
-		if writeDecisionStoreError(w, err) {
+		if writeDecisionStoreError(w, err) || s.writeSecretRequestStoreError(w, ctx, agent, err) {
 			return false, false
 		}
 		s.messageLog.Error("Failed to persist outbound message", "agent_id", agent.ID, "error", err)
@@ -408,7 +408,7 @@ func (s *Server) agentSendReachesAgents(ctx context.Context, sender *store.Agent
 	if toAgent || groupPost {
 		return true
 	}
-	names := dropSelfMentionName(messages.ExtractProseMentions(body), sender.Slug)
+	names := dropSelfMentionName(messages.ExtractProseMentionsWithOptions(body, s.mentionOptions()), sender.Slug)
 	if len(names) == 0 {
 		return false
 	}

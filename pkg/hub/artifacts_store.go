@@ -30,13 +30,96 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/secret"
 )
 
+// artifactStoreState tracks the startup lifecycle of the server's artifact
+// store so /readyz and artifact HTTP routes can distinguish "still
+// initializing at startup" from "not configured" or "initialization failed"
+// (ptone/scion#5712).
+type artifactStoreState int
+
+const (
+	// artifactStoreUnconfigured is the zero value: no store has been
+	// installed and startup has not committed to initializing one.
+	artifactStoreUnconfigured artifactStoreState = iota
+	// artifactStoreInitializing means startup has committed to initializing
+	// the artifact store (ExpectArtifactStore) and SetArtifactStore has not
+	// completed yet.
+	artifactStoreInitializing
+	// artifactStoreReady means SetArtifactStore installed a non-nil store.
+	artifactStoreReady
+	// artifactStoreFailed means startup attempted to initialize the artifact
+	// store and Init failed (ArtifactStoreInitFailed).
+	artifactStoreFailed
+)
+
+// ExpectArtifactStore records that this server will initialize an artifact
+// store during startup (after the HTTP listener binds). Until SetArtifactStore
+// or ArtifactStoreInitFailed runs, /readyz returns 503 when artifacts are
+// enabled and artifact HTTP routes answer 503 with a starting-up message and
+// Retry-After (ptone/scion#5712).
+func (s *Server) ExpectArtifactStore() {
+	s.mu.Lock()
+	if s.artifactStore == nil {
+		s.artifactStoreState = artifactStoreInitializing
+	}
+	s.mu.Unlock()
+}
+
+// ArtifactStoreInitFailed records that startup failed to initialize the
+// expected artifact store. Artifact HTTP routes stop reporting "starting up"
+// (no Retry-After), while /readyz remains 503 when artifacts are enabled.
+func (s *Server) ArtifactStoreInitFailed() {
+	s.mu.Lock()
+	if s.artifactStore == nil {
+		s.artifactStoreState = artifactStoreFailed
+	}
+	s.mu.Unlock()
+}
+
 // SetArtifactStore installs the artifact service's store. The store owns the
 // artifact_* tables, created by its Init outside the Ent migration graph
 // (design D3). Until a store is set the artifact routes answer 503.
 func (s *Server) SetArtifactStore(st artifacts.Store) {
 	s.mu.Lock()
 	s.artifactStore = st
+	if st != nil {
+		s.artifactStoreState = artifactStoreReady
+	} else {
+		s.artifactStoreState = artifactStoreUnconfigured
+	}
 	s.mu.Unlock()
+}
+
+// artifactsEnabled reports whether any artifact-store-backed feature is
+// enabled on this server (hub.artifacts or hub.attachment_artifacts, with the
+// artifacts operational settings section enabled).
+func (s *Server) artifactsEnabled() bool {
+	if !s.artifactsConfig().Enabled {
+		return false
+	}
+	return s.experimentEnabled(experiments.Artifacts) || s.experimentEnabled(experiments.AttachmentArtifacts)
+}
+
+// artifactStoreNotReadyReason returns the /readyz reason when this server
+// expects an artifact store, artifacts are enabled, and the store is not yet
+// ready. Returns "" when /readyz should not be blocked on the artifact store.
+func (s *Server) artifactStoreNotReadyReason() string {
+	s.mu.RLock()
+	st := s.artifactStoreState
+	s.mu.RUnlock()
+	switch st {
+	case artifactStoreInitializing:
+		if !s.artifactsEnabled() {
+			return ""
+		}
+		return "artifact store initializing"
+	case artifactStoreFailed:
+		if !s.artifactsEnabled() {
+			return ""
+		}
+		return "artifact store not available"
+	default:
+		return ""
+	}
 }
 
 // ArtifactStore returns the artifact store, or nil when none is set.
@@ -91,12 +174,13 @@ func (s *Server) artifactsHandler() http.Handler {
 	svc.SetLimits(s.artifactLimits)
 	svc.SetBackendProvider(s.artifactBackend)
 	svc.SetReviewNotifier(s.notifyArtifactReview)
+	svc.SetReviewWakeOfferer(s.offerArtifactReviewWake)
+	svc.SetReviewDeliveryNotifier(s.notifyArtifactReviewWithDelivery)
 	svc.SetLogger(s.artifactLog)
 	svc.SetArchiveEnabled(func(context.Context) bool { return s.experimentEnabled(experiments.ArtifactArchive) })
 	// Share-link reads are rate limited per client, read through the
 	// hub's trusted proxies the same way as its other pre-auth limits.
-	trusted := parseTrustedProxies(s.config.TrustedProxies)
-	svc.SetClientKey(func(r *http.Request) string { return shareLinkClientKey(r, trusted) })
+	svc.SetClientKey(func(r *http.Request) string { return shareLinkClientKey(r, s.clientIPTrustedNets) })
 	return svc.Handler()
 }
 
@@ -136,7 +220,13 @@ func (s *Server) attachmentService() *artifacts.Service {
 func (s *Server) artifactBackend() artifacts.Backend {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return artifacts.Backend{Store: s.artifactStore, Blobs: s.storage, HubID: s.hubID, ViewKeys: s.artifactViewKeys.viewKeys()}
+	return artifacts.Backend{
+		Store:        s.artifactStore,
+		Blobs:        s.storage,
+		HubID:        s.hubID,
+		ViewKeys:     s.artifactViewKeys.viewKeys(),
+		Initializing: s.artifactStoreState == artifactStoreInitializing,
+	}
 }
 
 // artifactReapInterval is how often the hub reaps abandoned pending
@@ -223,12 +313,25 @@ func (s *Server) reapArtifactVersions(ctx context.Context) {
 	if n > 0 {
 		slog.InfoContext(ctx, "artifacts: reaped abandoned pending versions", "count", n)
 	}
-	// Review sessions are reaped whether or not the open-review check is
-	// on, so turning it off never leaves rows behind.
+	// Review sessions and review drafts are reaped whether or not their
+	// experiments are on, so turning an experiment off never leaves rows
+	// behind.
 	if n, err := st.ReapReviewSessions(ctx, now.Add(-artifacts.ReviewSessionRetention), artifactReapBatch); err != nil {
 		slog.WarnContext(ctx, "artifacts: reaping review sessions failed", "error", err)
 	} else if n > 0 {
 		slog.InfoContext(ctx, "artifacts: reaped idle review sessions", "count", n)
+	}
+	if n, err := artifacts.ReapReviewDrafts(ctx, st, now, artifactReapBatch, s.artifactLog()); err != nil {
+		slog.WarnContext(ctx, "artifacts: reaping review drafts failed", "error", err)
+	} else if n > 0 {
+		slog.InfoContext(ctx, "artifacts: reaped expired review drafts", "count", n)
+	}
+	if res, err := artifacts.ReapLostAccessReviewDrafts(ctx, st, newArtifactHost(s), now, artifactReapBatch, s.artifactLog()); err != nil {
+		slog.WarnContext(ctx, "artifacts: reaping review drafts without access failed", "error", err,
+			"checked", res.Checked, "deleted", res.Deleted, "errors", res.Errors)
+	} else if res.Deleted > 0 {
+		slog.InfoContext(ctx, "artifacts: reaped review drafts without access",
+			"checked", res.Checked, "deleted", res.Deleted)
 	}
 	s.backfillArtifactSponsors(ctx, st)
 	s.reconcileArtifactOwners(ctx, st, now)
@@ -345,13 +448,13 @@ func (s *Server) initArtifactViewKey(ctx context.Context) error {
 }
 
 // shareLinkClientKey is the client a share-link read is charged to: the
-// client address as geExchangeClientIP reads it through trusted proxies,
+// client address as trustedClientIP reads it through trusted proxies,
 // with an IPv6 address keyed on its /64 prefix (the usual allocation to
 // one network interface) and an IPv4 address keyed as is. A larger IPv6
 // allocation still spans many /64 prefixes; the service's limit across all
 // clients bounds those.
 func shareLinkClientKey(r *http.Request, trusted []*net.IPNet) string {
-	key := geExchangeClientIP(r, trusted)
+	key := trustedClientIP(r, trusted)
 	ip := net.ParseIP(key)
 	if ip == nil || ip.To4() != nil {
 		return key

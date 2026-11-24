@@ -143,6 +143,20 @@ func (_u *ScheduledExecRunUpdate) ClearOutputBytes() *ScheduledExecRunUpdate {
 	return _u
 }
 
+// SetOutputStatus sets the "output_status" field.
+func (_u *ScheduledExecRunUpdate) SetOutputStatus(v string) *ScheduledExecRunUpdate {
+	_u.mutation.SetOutputStatus(v)
+	return _u
+}
+
+// SetNillableOutputStatus sets the "output_status" field if the given value is not nil.
+func (_u *ScheduledExecRunUpdate) SetNillableOutputStatus(v *string) *ScheduledExecRunUpdate {
+	if v != nil {
+		_u.SetOutputStatus(*v)
+	}
+	return _u
+}
+
 // SetLastPolledAt sets the "last_polled_at" field.
 func (_u *ScheduledExecRunUpdate) SetLastPolledAt(v time.Time) *ScheduledExecRunUpdate {
 	_u.mutation.SetLastPolledAt(v)
@@ -217,9 +231,6 @@ func (_u *ScheduledExecRunUpdate) check() error {
 			return &ValidationError{Name: "outcome", err: fmt.Errorf(`ent: validator failed for field "ScheduledExecRun.outcome": %w`, err)}
 		}
 	}
-	if _u.mutation.EventCleared() && len(_u.mutation.EventIDs()) > 0 {
-		return errors.New(`ent: clearing a required unique edge "ScheduledExecRun.event"`)
-	}
 	return nil
 }
 
@@ -273,6 +284,9 @@ func (_u *ScheduledExecRunUpdate) sqlSave(ctx context.Context) (_node int, err e
 	}
 	if _u.mutation.OutputBytesCleared() {
 		_spec.ClearField(scheduledexecrun.FieldOutputBytes, field.TypeInt64)
+	}
+	if value, ok := _u.mutation.OutputStatus(); ok {
+		_spec.SetField(scheduledexecrun.FieldOutputStatus, field.TypeString, value)
 	}
 	if value, ok := _u.mutation.LastPolledAt(); ok {
 		_spec.SetField(scheduledexecrun.FieldLastPolledAt, field.TypeTime, value)
@@ -418,6 +432,20 @@ func (_u *ScheduledExecRunUpdateOne) ClearOutputBytes() *ScheduledExecRunUpdateO
 	return _u
 }
 
+// SetOutputStatus sets the "output_status" field.
+func (_u *ScheduledExecRunUpdateOne) SetOutputStatus(v string) *ScheduledExecRunUpdateOne {
+	_u.mutation.SetOutputStatus(v)
+	return _u
+}
+
+// SetNillableOutputStatus sets the "output_status" field if the given value is not nil.
+func (_u *ScheduledExecRunUpdateOne) SetNillableOutputStatus(v *string) *ScheduledExecRunUpdateOne {
+	if v != nil {
+		_u.SetOutputStatus(*v)
+	}
+	return _u
+}
+
 // SetLastPolledAt sets the "last_polled_at" field.
 func (_u *ScheduledExecRunUpdateOne) SetLastPolledAt(v time.Time) *ScheduledExecRunUpdateOne {
 	_u.mutation.SetLastPolledAt(v)
@@ -505,9 +533,6 @@ func (_u *ScheduledExecRunUpdateOne) check() error {
 			return &ValidationError{Name: "outcome", err: fmt.Errorf(`ent: validator failed for field "ScheduledExecRun.outcome": %w`, err)}
 		}
 	}
-	if _u.mutation.EventCleared() && len(_u.mutation.EventIDs()) > 0 {
-		return errors.New(`ent: clearing a required unique edge "ScheduledExecRun.event"`)
-	}
 	return nil
 }
 
@@ -578,6 +603,9 @@ func (_u *ScheduledExecRunUpdateOne) sqlSave(ctx context.Context) (_node *Schedu
 	}
 	if _u.mutation.OutputBytesCleared() {
 		_spec.ClearField(scheduledexecrun.FieldOutputBytes, field.TypeInt64)
+	}
+	if value, ok := _u.mutation.OutputStatus(); ok {
+		_spec.SetField(scheduledexecrun.FieldOutputStatus, field.TypeString, value)
 	}
 	if value, ok := _u.mutation.LastPolledAt(); ok {
 		_spec.SetField(scheduledexecrun.FieldLastPolledAt, field.TypeTime, value)

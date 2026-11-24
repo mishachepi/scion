@@ -41,7 +41,7 @@ func newWebhookIngress(srv *Server, trustedProxies []string) *trigger.Ingress {
 		Queue:      srv.durableQueue,
 		LoadSecret: srv.loadWebhookEndpointSecret,
 		ClientIP: func(r *http.Request) string {
-			return geExchangeClientIP(r, trustedNets)
+			return trustedClientIP(r, trustedNets)
 		},
 		Enabled: func() bool {
 			return srv.experimentEnabled(experiments.Triggers)
@@ -49,7 +49,8 @@ func newWebhookIngress(srv *Server, trustedProxies []string) *trigger.Ingress {
 		Audit: trigger.NewSlogAuditSink(trigger.SlogAuditConfig{
 			Logger: logging.Subsystem("hub.audit"),
 		}),
-		Logger: logging.Subsystem("hub.triggers"),
+		Metrics: serverTriggerMetrics{srv: srv},
+		Logger:  logging.Subsystem("hub.triggers"),
 	})
 }
 

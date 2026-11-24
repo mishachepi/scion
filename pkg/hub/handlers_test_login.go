@@ -241,6 +241,15 @@ func (ws *WebServer) handleTestLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Keep the system-scoped super-admin binding in sync with the stored role
+	// (mirrors handleOAuthCallback and proxy auth in web.go). Best-effort:
+	// errors are logged by the helpers and the login continues.
+	if user.Role == store.UserRoleAdmin {
+		ensureSuperAdminRoleBinding(ctx, ws.store, user.ID)
+	} else if oldRole == store.UserRoleAdmin {
+		deleteSuperAdminRoleBinding(ctx, ws.store, user.ID)
+	}
+
 	// Make the hub-members group and hub-viewer binding match the stored role
 	// (mirrors the other login paths). Best-effort: a failure is logged and
 	// the login continues.
@@ -249,9 +258,14 @@ func (ws *WebServer) handleTestLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Generate tokens
-	accessToken, refreshToken, expiresIn, err := ws.userTokenSvc.MintTokenPair(
-		user.ID, user.Email, user.DisplayName, user.Role, user.SessionGeneration, ClientTypeWeb,
-	)
+	accessToken, refreshToken, expiresIn, err := ws.userTokenSvc.MintTokenPair(UserTokenSubject{
+		UserID:            user.ID,
+		Email:             user.Email,
+		DisplayName:       user.DisplayName,
+		Role:              user.Role,
+		SessionGeneration: user.SessionGeneration,
+		ClientType:        ClientTypeWeb,
+	})
 	if err != nil {
 		slog.Error("test-login: failed to generate tokens", "error", err)
 		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to generate tokens", nil)
@@ -265,6 +279,7 @@ func (ws *WebServer) handleTestLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ws.dropTestIdentityValues(w, session)
+	delete(session.Values, sessKeyViewAsMember)
 	session.Values[sessKeyUserID] = user.ID
 	session.Values[sessKeyUserEmail] = user.Email
 	session.Values[sessKeyUserName] = user.DisplayName

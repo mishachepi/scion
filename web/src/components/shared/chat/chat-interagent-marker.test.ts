@@ -5,6 +5,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { setPreferredTimeZone } from '../../../utils/time.js';
 
+const apiFetchMock = vi.fn();
+
+vi.mock('../../../client/api.js', () => ({
+  apiFetch: (...args: unknown[]) => apiFetchMock(...args),
+}));
+
 vi.mock('../../../utils/markdown.js', () => {
   const render = (markdown: string): string => `<p>${markdown}</p>`;
   return {
@@ -43,6 +49,7 @@ function makeMessage(overrides: Partial<Message> = {}): Message {
 describe('scion-chat-interagent-marker', () => {
   beforeEach(() => {
     document.body.innerHTML = '';
+    apiFetchMock.mockReset();
   });
 
   afterEach(() => {
@@ -64,29 +71,28 @@ describe('scion-chat-interagent-marker', () => {
 
   it('shows cross-project count in collapsed pill', async () => {
     const el = document.createElement('scion-chat-interagent-marker') as ScionChatInteragentMarker;
-    el.currentProjectId = 'proj-a';
     el.messageCount = 2;
     el.messages = [
-      makeMessage({ senderProjectId: 'proj-b' }),
-      makeMessage({ id: 'msg-2', senderProjectId: 'proj-a' }),
+      makeMessage({ senderProjectId: 'proj-b', recipientProjectId: 'proj-a' }),
+      makeMessage({ id: 'msg-2', senderProjectId: 'proj-a', recipientProjectId: 'proj-a' }),
     ];
     document.body.appendChild(el);
     await el.updateComplete;
 
-    const text = el.shadowRoot?.textContent || '';
-    expect(text).toContain('cross-project');
+    const pill = el.shadowRoot?.querySelector('.marker-pill');
+    expect(pill?.textContent).toContain('1');
+    expect(pill?.textContent).toContain('cross-project');
   });
 
   it('formats participant with project prefix for cross-project messages when expanded', async () => {
     const el = document.createElement('scion-chat-interagent-marker') as ScionChatInteragentMarker;
-    el.currentProjectId = 'proj-a';
     el.messageCount = 1;
     el.messages = [
       makeMessage({
         sender: 'agent:remote-bot',
         senderProjectId: 'proj-bbbb-cccc-dddd',
         recipient: 'agent:local-bot',
-        recipientProjectId: 'proj-a',
+        recipientProjectId: 'proj-aaaa-1111-2222',
       }),
     ];
     el.expanded = true;
@@ -94,13 +100,13 @@ describe('scion-chat-interagent-marker', () => {
     await el.updateComplete;
 
     const sender = el.shadowRoot?.querySelector('.ia-sender');
-    expect(sender?.textContent).toContain('proj-bbb'); // truncated project ID prefix
-    expect(sender?.textContent).toContain('remote-bot');
+    expect(sender?.textContent).toBe('proj-bbb / remote-bot');
+    const recipient = el.shadowRoot?.querySelector('.ia-recipient');
+    expect(recipient?.textContent).toBe('proj-aaa / local-bot');
   });
 
   it('does not add prefix for same-project participants', async () => {
     const el = document.createElement('scion-chat-interagent-marker') as ScionChatInteragentMarker;
-    el.currentProjectId = 'proj-a';
     el.messageCount = 1;
     el.messages = [
       makeMessage({
@@ -120,18 +126,101 @@ describe('scion-chat-interagent-marker', () => {
     expect(recipient?.textContent).toBe('other-bot');
   });
 
-  it('isCrossProject detects cross-project messages', async () => {
+  it('does not tag same-project messages as cross-project when current project differs (ptone/scion#8273)', async () => {
     const el = document.createElement('scion-chat-interagent-marker') as ScionChatInteragentMarker;
-    el.currentProjectId = 'proj-a';
+    el.setAttribute('current-project-id', 'proj-other');
     el.messageCount = 1;
-    el.messages = [makeMessage({ senderProjectId: 'proj-b' })];
+    el.messages = [
+      makeMessage({
+        sender: 'agent:local-bot',
+        senderProjectId: 'proj-aaaa-1111',
+        recipient: 'agent:other-bot',
+        recipientProjectId: 'proj-aaaa-1111',
+      }),
+    ];
+    document.body.appendChild(el);
+    await el.updateComplete;
+
+    // Collapsed pill must not show cross-project badge.
+    expect(el.shadowRoot?.querySelector('.ia-cross-project')).toBeNull();
+    expect(el.shadowRoot?.textContent).not.toContain('cross-project');
+
+    // Expanded view must not show cross-project badge or project prefixes.
+    el.expanded = true;
+    await el.updateComplete;
+
+    expect(el.shadowRoot?.querySelector('.ia-cross-project')).toBeNull();
+    expect(el.shadowRoot?.querySelector('.ia-sender')?.textContent).toBe('local-bot');
+    expect(el.shadowRoot?.querySelector('.ia-recipient')?.textContent).toBe('other-bot');
+
+    // Full-content preview dialog must also omit cross-project badge and prefixes.
+    const internals = el as unknown as {
+      openMessagePreview(msg: Message, e: Event): Promise<void>;
+    };
+    await internals.openMessagePreview(el.messages[0], new Event('click'));
+    await el.updateComplete;
+
+    const previewHeader = el.shadowRoot?.querySelector('.ia-full-header');
+    expect(previewHeader).toBeTruthy();
+    expect(previewHeader?.querySelector('.ia-cross-project')).toBeNull();
+    expect(previewHeader?.querySelector('.ia-sender')?.textContent).toBe('local-bot');
+    expect(previewHeader?.querySelector('.ia-recipient')?.textContent).toBe('other-bot');
+  });
+
+  it('tags messages with different sender and recipient projects as cross-project regardless of current project (ptone/scion#8273)', async () => {
+    const el = document.createElement('scion-chat-interagent-marker') as ScionChatInteragentMarker;
+    // No current-project-id set (e.g. cold-loaded DM or hub view), then switched across projects.
+    el.messageCount = 1;
+    el.messages = [
+      makeMessage({
+        sender: 'agent:sender-bot',
+        senderProjectId: 'proj-aaaa-1111',
+        recipient: 'agent:recip-bot',
+        recipientProjectId: 'proj-bbbb-2222',
+      }),
+    ];
+    document.body.appendChild(el);
+    await el.updateComplete;
+
+    // Collapsed pill shows cross-project count even without current-project-id.
+    expect(el.shadowRoot?.querySelector('.ia-cross-project')?.textContent).toMatch(
+      /1\s+cross-project/
+    );
+
+    // Expanded view shows cross-project badge and project prefixes on both participants.
+    el.expanded = true;
+    await el.updateComplete;
+
+    expect(el.shadowRoot?.querySelector('.ia-cross-project')).toBeTruthy();
+    expect(el.shadowRoot?.querySelector('.ia-sender')?.textContent).toBe('proj-aaa / sender-bot');
+    expect(el.shadowRoot?.querySelector('.ia-recipient')?.textContent).toBe('proj-bbb / recip-bot');
+
+    // Full-content preview dialog also shows cross-project badge and prefixes.
+    const internals = el as unknown as {
+      openMessagePreview(msg: Message, e: Event): Promise<void>;
+    };
+    await internals.openMessagePreview(el.messages[0], new Event('click'));
+    await el.updateComplete;
+
+    const previewHeader = el.shadowRoot?.querySelector('.ia-full-header');
+    expect(previewHeader?.querySelector('.ia-cross-project')).toBeTruthy();
+    expect(previewHeader?.querySelector('.ia-sender')?.textContent).toBe('proj-aaa / sender-bot');
+    expect(previewHeader?.querySelector('.ia-recipient')?.textContent).toBe('proj-bbb / recip-bot');
+  });
+
+  it('does not tag unstamped legacy messages as cross-project', async () => {
+    const el = document.createElement('scion-chat-interagent-marker') as ScionChatInteragentMarker;
+    el.setAttribute('current-project-id', 'proj-other');
+    el.messageCount = 2;
+    el.messages = [
+      makeMessage({ id: 'legacy-none' }),
+      makeMessage({ id: 'legacy-partial', senderProjectId: 'proj-a' }),
+    ];
     el.expanded = true;
     document.body.appendChild(el);
     await el.updateComplete;
 
-    // Cross-project badge should be present
-    const badge = el.shadowRoot?.querySelector('.ia-cross-project');
-    expect(badge).toBeTruthy();
+    expect(el.shadowRoot?.querySelector('.ia-cross-project')).toBeNull();
   });
 
   it('renders the shared date divider for each subsequent day when messages span multiple days', async () => {
@@ -248,5 +337,209 @@ describe('scion-chat-interagent-marker', () => {
     } finally {
       setPreferredTimeZone('');
     }
+  });
+
+  it('shows expand icon for msgTruncated without DOM overflow', async () => {
+    const el = document.createElement('scion-chat-interagent-marker') as ScionChatInteragentMarker;
+    el.messageCount = 2;
+    el.messages = [
+      makeMessage({ id: 'msg-trunc', msg: 'Preview text...', msgTruncated: true }),
+      makeMessage({ id: 'msg-short', msg: 'Short text' }),
+    ];
+    el.expanded = true;
+    document.body.appendChild(el);
+    await el.updateComplete;
+
+    const rows = el.shadowRoot?.querySelectorAll('.ia-msg');
+    expect(rows?.length).toBe(2);
+    expect(rows?.[0].querySelector('.ia-expand sl-icon-button')).toBeTruthy();
+    expect(rows?.[1].querySelector('.ia-expand sl-icon-button')).toBeNull();
+    expect(apiFetchMock).not.toHaveBeenCalled();
+  });
+
+  it('fetches full message on expand click only, showing preview + spinner first, then caches on reopen', async () => {
+    let resolveFetch!: (res: Response) => void;
+    apiFetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveFetch = resolve;
+        })
+    );
+
+    const el = document.createElement('scion-chat-interagent-marker') as ScionChatInteragentMarker;
+    el.setAttribute('conversation-key', 'dm:agent:agent-alpha-id:user:user-1');
+    el.messageCount = 1;
+    el.messages = [
+      makeMessage({
+        id: 'msg-trunc-1',
+        msg: 'Truncated preview...',
+        msgTruncated: true,
+      }),
+    ];
+    el.expanded = true;
+    document.body.appendChild(el);
+    await el.updateComplete;
+
+    // Expanding the pill must not fetch full bodies.
+    expect(apiFetchMock).not.toHaveBeenCalled();
+
+    const expandBtn = el.shadowRoot?.querySelector(
+      '.ia-expand sl-icon-button'
+    ) as HTMLElement | null;
+    expect(expandBtn).toBeTruthy();
+    expandBtn!.click();
+    await el.updateComplete;
+
+    // Dialog opens immediately with preview + spinner while fetch is in flight.
+    expect(apiFetchMock).toHaveBeenCalledTimes(1);
+    expect(apiFetchMock).toHaveBeenCalledWith(
+      '/api/v1/chat/conversations/dm%3Aagent%3Aagent-alpha-id%3Auser%3Auser-1/interagent?messageId=msg-trunc-1',
+      { suppressAccessDeniedToast: true }
+    );
+    const dialog = el.shadowRoot?.querySelector('sl-dialog.ia-full-preview');
+    expect(dialog).toBeTruthy();
+    expect(dialog?.textContent).toContain('Truncated preview...');
+    expect(dialog?.querySelector('sl-spinner')).toBeTruthy();
+
+    // Resolve full body response.
+    resolveFetch(
+      new Response(
+        JSON.stringify({
+          messages: [
+            makeMessage({
+              id: 'msg-trunc-1',
+              msg: 'Full markdown body content',
+              msgTruncated: false,
+            }),
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    await vi.waitFor(async () => {
+      await el.updateComplete;
+      expect(el.shadowRoot?.querySelector('.ia-full-body')?.textContent).toBe(
+        'Full markdown body content'
+      );
+    });
+    expect(el.shadowRoot?.querySelector('sl-dialog sl-spinner')).toBeNull();
+
+    // Close the dialog and reopen the same message -> served from cache without refetching.
+    const slDialog = el.shadowRoot?.querySelector('sl-dialog.ia-full-preview') as HTMLElement;
+    slDialog.dispatchEvent(new CustomEvent('sl-after-hide', { bubbles: false }));
+    await el.updateComplete;
+    expect(el.shadowRoot?.querySelector('sl-dialog.ia-full-preview')).toBeNull();
+
+    expandBtn!.click();
+    await vi.waitFor(async () => {
+      await el.updateComplete;
+      expect(el.shadowRoot?.querySelector('.ia-full-body')?.textContent).toBe(
+        'Full markdown body content'
+      );
+    });
+    expect(apiFetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows preview with fallback note on 403/404 failure without refetching toast', async () => {
+    apiFetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: { code: 'NOT_FOUND', message: 'not found' } }), {
+        status: 404,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    );
+
+    const el = document.createElement('scion-chat-interagent-marker') as ScionChatInteragentMarker;
+    el.setAttribute('conversation-key', 'dm:agent:agent-alpha-id:user:user-1');
+    el.messageCount = 1;
+    el.messages = [
+      makeMessage({
+        id: 'msg-missing',
+        msg: 'Saved preview text...',
+        msgTruncated: true,
+      }),
+    ];
+    el.expanded = true;
+    document.body.appendChild(el);
+    await el.updateComplete;
+
+    const expandBtn = el.shadowRoot?.querySelector('.ia-expand sl-icon-button') as HTMLElement;
+    expandBtn.click();
+
+    await vi.waitFor(async () => {
+      await el.updateComplete;
+      const dialogText =
+        el.shadowRoot?.querySelector('sl-dialog.ia-full-preview')?.textContent ?? '';
+      expect(dialogText).toContain("Couldn't load full message");
+      expect(dialogText).toContain('Saved preview text...');
+    });
+    expect(el.shadowRoot?.querySelector('sl-dialog sl-spinner')).toBeNull();
+    expect(apiFetchMock).toHaveBeenCalledWith(
+      '/api/v1/chat/conversations/dm%3Aagent%3Aagent-alpha-id%3Auser%3Auser-1/interagent?messageId=msg-missing',
+      { suppressAccessDeniedToast: true }
+    );
+  });
+
+  it('drops stale full-message response if dialog closed or switched to another message', async () => {
+    let resolveFirst!: (res: Response) => void;
+    let resolveSecond!: (res: Response) => void;
+    apiFetchMock
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveFirst = resolve;
+          })
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveSecond = resolve;
+          })
+      );
+
+    const el = document.createElement('scion-chat-interagent-marker') as ScionChatInteragentMarker;
+    el.setAttribute('conversation-key', 'dm:agent:agent-alpha-id:user:user-1');
+    el.messageCount = 2;
+    el.messages = [
+      makeMessage({ id: 'msg-1', msg: 'Preview 1...', msgTruncated: true }),
+      makeMessage({ id: 'msg-2', msg: 'Preview 2...', msgTruncated: true }),
+    ];
+    el.expanded = true;
+    document.body.appendChild(el);
+    await el.updateComplete;
+
+    const buttons = el.shadowRoot?.querySelectorAll('.ia-expand sl-icon-button');
+    expect(buttons?.length).toBe(2);
+
+    // Open msg-1, then switch to msg-2 before msg-1 resolves.
+    (buttons![0] as HTMLElement).click();
+    await el.updateComplete;
+    (buttons![1] as HTMLElement).click();
+    await el.updateComplete;
+
+    resolveSecond(
+      new Response(
+        JSON.stringify({
+          messages: [makeMessage({ id: 'msg-2', msg: 'Full body 2', msgTruncated: false })],
+        }),
+        { status: 200 }
+      )
+    );
+    await vi.waitFor(async () => {
+      await el.updateComplete;
+      expect(el.shadowRoot?.querySelector('.ia-full-body')?.textContent).toBe('Full body 2');
+    });
+
+    // Late resolution of msg-1 must not overwrite msg-2 in the dialog.
+    resolveFirst(
+      new Response(
+        JSON.stringify({
+          messages: [makeMessage({ id: 'msg-1', msg: 'Stale full body 1', msgTruncated: false })],
+        }),
+        { status: 200 }
+      )
+    );
+    await new Promise((r) => setTimeout(r, 10));
+    await el.updateComplete;
+    expect(el.shadowRoot?.querySelector('.ia-full-body')?.textContent).toBe('Full body 2');
   });
 });

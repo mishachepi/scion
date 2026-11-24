@@ -18,6 +18,9 @@ An isolated worker: one LLM-plus-harness loop in its own container with its own 
 ### Sub-agent
 An agent spawned by another agent; "sub" only from the orchestrating user's view, since it is a full agent in capability.
 
+### Execution container
+Any agent running the reserved built-in `shell` harness-config (no LLM harness). Users log into CLI tools inside it manually so credentials stay in the container's `$HOME` (never in `/workspace`) and are never exposed to LLM agents, and may register one in their user profile as their *default execution container* for approved commands.
+
 ### Reincarnation
 Migrating an existing agent to a new *generation*: the Hub re-resolves its template, image, and harness-config, then starts it again with the same agent ID and slug and a handoff as its first task. Done with [`scion reincarnate`](/scion/reference/cli/#scion-reincarnate). Distinct from *restart* (same config) and *resume* (same harness session).
 
@@ -241,7 +244,7 @@ A message mode that restricts messaging to users in the agent's ancestry chain �
 A message mode that behaves like Project mode within the agent's own project and additionally permits the agent to send direct messages across project boundaries (when cross-project messaging is enabled at the Hub and receiving-project level). A project-mode agent can receive a cross-project DM but cannot reply until granted Hub mode. Hub mode is subject to a non-escalation grant guard: an agent can only grant it to another agent if the granting agent is itself in Hub mode and has the `full` authorization role.
 
 ### Message Mode
-A per-agent setting that controls which actors (users and agents) can send messages to that agent. One of five values: `none`, `lineage`, `branch`, `project` (the default), or `hub`. Set by the agent's owner or a project admin via the `set_message_mode` action; changeable at any time with immediate effect. Stored on the agent record as `message_mode`.
+A per-agent setting that controls which actors (users and agents) can send messages to that agent. One of five values: `none`, `lineage`, `branch`, `project` (the built-in default unless the operator sets `server.hub.default_message_mode`), or `hub`. Set by the agent's owner or a project admin via the `set_message_mode` action; changeable at any time with immediate effect. Stored on the agent record as `message_mode`.
 
 ### Messageability
 A server-computed assessment of whether a specific viewer can message a specific agent, considering the agent's message mode, the viewer's identity, ancestry relationship, and permissions. Exposed in API responses as `_messageability` with `canMessage` and `canReachViewer` booleans. Used by the UI to gate message buttons and show reachability indicators.
@@ -256,7 +259,7 @@ A message mode that seals the agent from all messaging except system-plane notic
 The ability of a privileged user to bypass an agent's message mode restrictions. Super-admins pierce all modes including none. Project owners pierce lineage and branch modes. Piercing applies only to user identities — it is never inherited by an owner's agents.
 
 ### Project mode (message mode)
-The default message mode. Any user with the `agent:message` permission in the project scope can message the agent, and any same-project agent in project or branch mode can message it. The most permissive mode. Note that the default project-member role does not include `agent:message` — messaging requires an owner, admin, or ancestry relationship with the agent.
+The built-in default message mode (unless the operator sets `server.hub.default_message_mode`). Any user with the `agent:message` permission in the project scope can message the agent, and any same-project agent in project or branch mode can message it. The most permissive mode. Note that the default project-member role does not include `agent:message` — messaging requires an owner, admin, or ancestry relationship with the agent.
 
 ### Cross-project inbound policy
 A project-level setting (`crossProjectInbound`) that controls whether the project accepts agent messages originating from other projects. One of three values: `none` (default — reject all), `members` (accept only when the sender's originating human is a member of this project), or `any` (accept from any project on the Hub). One of three independent controls required for cross-project messaging.
@@ -351,7 +354,30 @@ Connecting an interactive terminal to a running agent's tmux session for human-i
 The Hub handing an agent lifecycle command to the appropriate runtime broker for execution.
 
 ### Schedule
-A time-based trigger that fires an action — sending a message or dispatching (starting) an agent from a template — either once (a one-shot *scheduled event*, via `--at <time>` or `--in <duration>`) or repeatedly (a recurring *schedule* on a 5-field cron expression). Backs `scion schedule`.
+A time-based schedule that fires an **Action** — sending a message, dispatching (starting) an agent from a template, or running a command (`exec`) — either once (a one-shot *scheduled event*, via `--at <time>` or `--in <duration>`) or repeatedly (a recurring *schedule* on a 5-field cron expression). Backs `scion schedule`. Shares the Hub's fire core with **Trigger**.
+
+## Triggers
+
+Event-driven automation gated by the `hub.triggers` experiment (`scion trigger`). An external **Source** delivers an **Event** into the Hub's durable inbox; matching **Trigger** definitions evaluate rules and execute an **Action**, recording each attempt as a **Fire**.
+
+:::note[Disambiguation]
+"Trigger" is overloaded across three Scion concepts. Here, **Trigger** is the canonical project-scoped automation rule (`scion trigger`). In **Notifications**, qualify the activity that fires a subscription as a *trigger activity* (or *notification trigger*). In container/harness **Lifecycle Hooks** (such as **Pre-Start Hook**), say *hook point* or *lifecycle hook event*.
+:::
+
+### Source (triggers)
+An origin that emits **Events** into a project's trigger inbox, identified by `(source_kind, source_id)` — in Stage 1, a project-owned webhook endpoint (`source_kind: "webhook"`, `scion trigger webhook`, receiving signed `POST /api/v1/hooks/{id}` requests).
+
+### Event (triggers)
+An immutable durable inbox record (`trigger_events`) captured when a **Source** delivers a payload, carrying `type`, `subject`, `dedup_key`, `attributes`, allow-listed `headers`, and a bounded JSON `payload`, processed asynchronously through the Hub's durable queue (`trigger.event`). Distinct from the internal **Event Bus** and from a one-shot *scheduled event*.
+
+### Trigger
+A project-scoped automation rule (`scion trigger`) attached to a **Source** that matches incoming **Events** and executes an **Action** under the authoring principal's recorded authority. May be paused by the Hub with a structured `status_reason` (`creator_deleted`, `target_deleted`, or `source_deleted`).
+
+### Action (triggers / schedules)
+The Hub-executed operation a **Trigger** or **Schedule** performs when it fires (`message`, `dispatch_agent`, or `exec`), sharing one fire core and recorded-authority check. Stage 1 triggers authorize `message` actions.
+
+### Fire (triggers / schedules)
+One execution attempt of a **Trigger** for a specific **Event** (unique per `(event_id, trigger_id)`), or one execution of a **Schedule**. Moves from `firing` to a terminal status (`fired`, `skipped`, `failed`, or `refused`), visible via `scion trigger history`.
 
 ## Observability
 

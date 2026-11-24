@@ -25,6 +25,8 @@ import { LitElement, html, css } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
 
 import type { PageData } from '../../shared/types.js';
+import { getBrandName } from '../../client/branding.js';
+import { observeBranding } from '../shared/brand-mark.js';
 
 @customElement('scion-page-unauthorized')
 export class ScionPageUnauthorized extends LitElement {
@@ -54,7 +56,7 @@ export class ScionPageUnauthorized extends LitElement {
       text-align: center;
       max-width: 480px;
       background: var(--scion-surface, #ffffff);
-      border-radius: 1rem;
+      border-radius: var(--scion-radius-xl, 1rem);
       box-shadow:
         0 4px 6px -1px rgba(0, 0, 0, 0.1),
         0 2px 4px -2px rgba(0, 0, 0, 0.1);
@@ -67,13 +69,13 @@ export class ScionPageUnauthorized extends LitElement {
 
     .illustration sl-icon {
       font-size: 5rem;
-      color: #f59e0b;
+      color: var(--scion-status-warning, #f59e0b);
     }
 
     .code {
       font-size: 1.5rem;
       font-weight: 700;
-      color: #f59e0b;
+      color: var(--scion-status-warning, #f59e0b);
       text-transform: uppercase;
       letter-spacing: 0.05em;
       margin-bottom: 0.5rem;
@@ -105,12 +107,12 @@ export class ScionPageUnauthorized extends LitElement {
 
     .help-text {
       font-size: 0.875rem;
-      color: var(--scion-text-muted, #64748b);
+      color: var(--scion-warning-text, #92400e);
       margin-bottom: 2rem;
       padding: 1rem;
-      background: #fef3c7;
-      border: 1px solid #fde68a;
-      border-radius: 0.5rem;
+      background: var(--scion-warning-bg, #fffbeb);
+      border: 1px solid var(--scion-warning-border, #fcd34d);
+      border-radius: var(--scion-radius, 0.5rem);
     }
 
     .actions {
@@ -124,6 +126,11 @@ export class ScionPageUnauthorized extends LitElement {
       font-weight: 500;
     }
   `;
+
+  constructor() {
+    super();
+    observeBranding(this);
+  }
 
   override connectedCallback() {
     super.connectedCallback();
@@ -144,7 +151,7 @@ export class ScionPageUnauthorized extends LitElement {
         </div>
         <div class="code">Access Denied</div>
         <h1>Domain Not Authorized</h1>
-        <p>Your email domain is not authorized to access this Scion instance.</p>
+        <p>Your email domain is not authorized to access this ${getBrandName()} instance.</p>
         ${this.email ? html`<div class="email-display">${this.email}</div>` : ''}
         <div class="help-text">
           If you believe this is an error, please contact your system administrator to request

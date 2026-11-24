@@ -100,6 +100,48 @@ func TestLoadAndReconcileConfig_RefusesDebugEndpointsInHostedMode(t *testing.T) 
 	}
 }
 
+// --enable-test-login is refused in proxy auth mode (even on a test hub) and
+// in hosted mode unless server.hub.class is "test", and accepted in
+// workstation mode outside proxy auth.
+func TestLoadAndReconcileConfig_RefusesTestLoginInHostedMode(t *testing.T) {
+	const hostedRefusal = "--enable-test-login is not allowed in hosted mode"
+	const proxyRefusal = "--enable-test-login is not allowed in proxy auth mode"
+	for _, tc := range []struct {
+		name, settings, envClass string
+		wantRefusal              string
+	}{
+		{name: "hosted", settings: "server:\n  mode: hosted\n", wantRefusal: hostedRefusal},
+		{name: "hosted test hub", settings: "server:\n  mode: hosted\n  hub:\n    class: test\n"},
+		{name: "hosted test hub via env", settings: "server:\n  mode: hosted\n", envClass: "test"},
+		{name: "hosted proxy mode", settings: "server:\n  mode: hosted\n  auth:\n    mode: proxy\n", wantRefusal: proxyRefusal},
+		{name: "hosted proxy mode test hub", settings: "server:\n  mode: hosted\n  hub:\n    class: test\n  auth:\n    mode: proxy\n", wantRefusal: proxyRefusal},
+		{name: "workstation proxy mode", settings: "server:\n  mode: workstation\n  auth:\n    mode: proxy\n", wantRefusal: proxyRefusal},
+		{name: "workstation", settings: "server:\n  mode: workstation\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			savedTestLogin := enableTestLogin
+			t.Cleanup(func() {
+				resetServerFlags()
+				enableTestLogin = savedTestLogin
+			})
+			resetServerFlags()
+			enableTestLogin = true
+			t.Setenv("SCION_SERVER_MODE", "")
+			t.Setenv("SCION_SERVER_HUB_CLASS", tc.envClass)
+			writeServerSettings(t, "schema_version: \"1\"\n"+tc.settings)
+
+			_, err := loadAndReconcileConfig(serverStartCmd)
+			if tc.wantRefusal != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantRefusal) {
+					t.Fatalf("%s: loadAndReconcileConfig err = %v, want refusal containing %q", tc.name, err, tc.wantRefusal)
+				}
+			} else if err != nil {
+				t.Fatalf("%s: loadAndReconcileConfig unexpected err = %v", tc.name, err)
+			}
+		})
+	}
+}
+
 // The daemon parent applies the same check before starting the child, so
 // the reason is reported directly.
 func TestResolveDaemonServerMode_DebugEndpoints(t *testing.T) {
@@ -155,6 +197,77 @@ func TestValidateDebugEndpoints(t *testing.T) {
 		err := validateDebugEndpoints(tc.hosted, tc.enabled)
 		if (err != nil) != tc.wantErr {
 			t.Errorf("validateDebugEndpoints(hosted=%v, enabled=%v) err = %v, wantErr %v", tc.hosted, tc.enabled, err, tc.wantErr)
+		}
+	}
+}
+
+// --enable-test-login bypasses authentication: proxy auth mode refuses it
+// unconditionally, and hosted mode refuses it unless the hub is declared a
+// test hub (server.hub.class: test).
+func TestValidateTestLogin(t *testing.T) {
+	for _, tc := range []struct {
+		hosted, enabled bool
+		class, authMode string
+		wantErr         bool
+	}{
+		{hosted: false, enabled: false},
+		{hosted: false, enabled: true},
+		{hosted: true, enabled: false},
+		{hosted: true, enabled: true, wantErr: true},
+		{hosted: true, enabled: true, class: "prod", wantErr: true},
+		{hosted: true, enabled: true, class: "Test", wantErr: true},
+		{hosted: true, enabled: true, class: config.HubClassTest},
+		{hosted: false, enabled: false, authMode: "proxy"},
+		{hosted: true, enabled: false, authMode: "proxy"},
+		{hosted: false, enabled: true, authMode: "proxy", wantErr: true},
+		{hosted: true, enabled: true, class: config.HubClassTest, authMode: "proxy", wantErr: true},
+		{hosted: true, enabled: true, class: config.HubClassTest, authMode: "PROXY", wantErr: true},
+		{hosted: true, enabled: true, class: config.HubClassTest, authMode: "oauth"},
+	} {
+		err := validateTestLogin(tc.hosted, tc.enabled, tc.class, tc.authMode)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("validateTestLogin(hosted=%v, enabled=%v, class=%q, authMode=%q) err = %v, wantErr %v", tc.hosted, tc.enabled, tc.class, tc.authMode, err, tc.wantErr)
+		}
+	}
+}
+
+func TestNewJWTProxyAuthenticator_IdentityHeaders(t *testing.T) {
+	auth, err := newJWTProxyAuthenticator(&config.JWTAuthConfig{
+		Header:          "X-Custom-JWT",
+		IdentityHeaders: []string{"X-Proxy-Email", " x-proxy-user-id "},
+		Algorithm:       "RS256",
+		JWKSURL:         "https://auth.example.com/.well-known/jwks.json",
+	})
+	if err != nil {
+		t.Fatalf("newJWTProxyAuthenticator unexpected err = %v", err)
+	}
+	got := auth.AssertionHeaders()
+	want := []string{"X-Custom-JWT", "X-Proxy-Email", "x-proxy-user-id"}
+	if len(got) != len(want) {
+		t.Fatalf("AssertionHeaders() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("AssertionHeaders()[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	for _, bad := range []string{
+		"",
+		"   ",
+		"X-Proxy-Email:",
+		"X-Proxy Email",
+		"X-Proxy\r\nInjected",
+		"X-Proxy/Email",
+	} {
+		_, err := newJWTProxyAuthenticator(&config.JWTAuthConfig{
+			Header:          "X-Custom-JWT",
+			IdentityHeaders: []string{"X-Valid-Header", bad},
+			Algorithm:       "RS256",
+			JWKSURL:         "https://auth.example.com/.well-known/jwks.json",
+		})
+		if err == nil || !strings.Contains(err.Error(), "identity_headers") {
+			t.Errorf("IdentityHeaders containing %q: err = %v, want error mentioning identity_headers", bad, err)
 		}
 	}
 }
@@ -225,6 +338,117 @@ func TestLoadAndReconcileConfig_WorkstationHostFlagKeepsBrokerLoopback(t *testin
 			}
 			if cfg.RuntimeBroker.Host != tc.wantBroker {
 				t.Errorf("broker host = %q, want %s", cfg.RuntimeBroker.Host, tc.wantBroker)
+			}
+		})
+	}
+}
+
+func TestValidateHostedDevAuth(t *testing.T) {
+	for _, tc := range []struct {
+		hosted, devAuth, wantErr bool
+	}{
+		{hosted: false, devAuth: false},
+		{hosted: false, devAuth: true},
+		{hosted: true, devAuth: false},
+		{hosted: true, devAuth: true, wantErr: true},
+	} {
+		err := validateHostedDevAuth(tc.hosted, tc.devAuth, false)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("validateHostedDevAuth(hosted=%v, devAuth=%v) err = %v, wantErr %v", tc.hosted, tc.devAuth, err, tc.wantErr)
+		}
+	}
+}
+
+// Dev auth stops a hosted server at startup, whether it comes from the
+// settings file, the environment or the --dev-auth flag. Workstation mode,
+// where dev auth is the default, is unchanged.
+func TestLoadAndReconcileConfig_RefusesDevAuthInHostedMode(t *testing.T) {
+	const refusal = "dev auth is not allowed in hosted mode"
+	for _, tc := range []struct {
+		name, settings, env string
+		args                []string
+		wantRefuse          bool
+	}{
+		{name: "hosted, dev_mode in settings", settings: "  mode: hosted\n  auth:\n    dev_mode: true\n", wantRefuse: true},
+		{name: "hosted, dev mode from env", settings: "  mode: hosted\n", env: "true", wantRefuse: true},
+		{name: "hosted, --dev-auth flag", settings: "  mode: hosted\n", args: []string{"--dev-auth"}, wantRefuse: true},
+		{name: "hosted, dev auth off", settings: "  mode: hosted\n"},
+		{name: "hosted, --dev-auth=false overrides settings", settings: "  mode: hosted\n  auth:\n    dev_mode: true\n", args: []string{"--dev-auth=false"}},
+		{name: "workstation default", settings: "  mode: workstation\n"},
+		{name: "workstation, --dev-auth flag", settings: "  mode: workstation\n", args: []string{"--dev-auth"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Cleanup(resetServerFlags)
+			resetServerFlags()
+			t.Setenv("SCION_SERVER_MODE", "")
+			t.Setenv("SCION_SERVER_AUTH_DEVMODE", tc.env)
+			writeServerSettings(t, "schema_version: \"1\"\nserver:\n"+tc.settings)
+			// A fresh command, so flag Changed state does not leak between
+			// cases the way it would on the shared serverStartCmd.
+			c := &cobra.Command{Use: "start"}
+			c.Flags().BoolVar(&hostedMode, "hosted", false, "")
+			c.Flags().Bool("production", false, "")
+			c.Flags().BoolVar(&enableDevAuth, "dev-auth", false, "")
+			if err := c.ParseFlags(tc.args); err != nil {
+				t.Fatalf("parse %v: %v", tc.args, err)
+			}
+
+			cfg, err := loadAndReconcileConfig(c)
+			refused := err != nil && strings.Contains(err.Error(), refusal)
+			if refused != tc.wantRefuse {
+				t.Fatalf("loadAndReconcileConfig err = %v, want refusal %v", err, tc.wantRefuse)
+			}
+			if !tc.wantRefuse && err != nil {
+				t.Fatalf("loadAndReconcileConfig err = %v", err)
+			}
+			if tc.wantRefuse {
+				return
+			}
+			if cfg == nil {
+				t.Fatal("loadAndReconcileConfig returned a nil config without an error")
+			}
+			if strings.HasPrefix(tc.name, "workstation") && !cfg.Auth.Enabled {
+				t.Errorf("workstation: cfg.Auth.Enabled = false, want dev auth on")
+			}
+		})
+	}
+}
+
+// The daemon parent refuses an explicit --dev-auth in hosted mode itself,
+// so the reason is reported directly instead of as a failed child start.
+func TestResolveDaemonServerMode_DevAuth(t *testing.T) {
+	for _, tc := range []struct {
+		name, mode string
+		args       []string
+		wantErr    bool
+	}{
+		{name: "hosted, --dev-auth", mode: "hosted", args: []string{"--dev-auth"}, wantErr: true},
+		{name: "hosted, --dev-auth=false", mode: "hosted", args: []string{"--dev-auth=false"}},
+		{name: "hosted, flag unset", mode: "hosted"},
+		{name: "workstation, --dev-auth", mode: "workstation", args: []string{"--dev-auth"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			savedHosted, savedDevAuth, savedEndpoints := hostedMode, enableDevAuth, enableDebugEndpoints
+			t.Cleanup(func() { hostedMode, enableDevAuth, enableDebugEndpoints = savedHosted, savedDevAuth, savedEndpoints })
+			hostedMode, enableDevAuth, enableDebugEndpoints = false, false, false
+			t.Setenv("SCION_SERVER_MODE", "")
+			writeServerSettings(t, "server:\n  mode: "+tc.mode+"\n")
+
+			c := &cobra.Command{Use: "start", RunE: func(*cobra.Command, []string) error { return nil }}
+			c.Flags().BoolVar(&hostedMode, "hosted", false, "")
+			c.Flags().Bool("production", false, "")
+			c.Flags().BoolVar(&enableDevAuth, "dev-auth", false, "")
+			c.SetArgs(tc.args)
+			if err := c.Execute(); err != nil {
+				t.Fatalf("parse %v: %v", tc.args, err)
+			}
+
+			err := resolveDaemonServerMode(c)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("resolveDaemonServerMode err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if err != nil && !strings.Contains(err.Error(), "dev auth is not allowed in hosted mode") {
+				t.Fatalf("resolveDaemonServerMode err = %v, want the hosted dev auth refusal", err)
 			}
 		})
 	}

@@ -39,10 +39,12 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/brokercontrol"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
+	"github.com/GoogleCloudPlatform/scion/pkg/envpolicy"
 	"github.com/GoogleCloudPlatform/scion/pkg/gcp"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectfs"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectkeys"
 	"github.com/GoogleCloudPlatform/scion/pkg/provision"
+	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/firewallpolicy"
 	stagedsecrets "github.com/GoogleCloudPlatform/scion/pkg/stagedsecrets"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
@@ -267,18 +269,33 @@ func tmuxAgentWindowCmd(shellPath, cmdLine string) string {
 	return shellPath + " -c " + shellQuote(harnessWrapperLine(cmdLine, state.HarnessTailFile, state.HarnessExitCodeFile))
 }
 
+// tmuxAgentWindowCmdForConfig is tmuxAgentWindowCmd with execution-container
+// (shell harness) pane-tail suppression: for the shell harness, the wrapper
+// still records the exit code but never captures the tmux pane tail so
+// credentials printed in the interactive shell cannot leave the container on
+// exit (ptone/scion#8812 §3.4 I1).
+func tmuxAgentWindowCmdForConfig(shellPath, cmdLine string, cfg RunConfig) string {
+	if cfg.Harness != nil && cfg.Harness.Name() == config.ShellHarnessConfigName {
+		return shellPath + " -c " + shellQuote(harnessWrapperLine(cmdLine, "", state.HarnessExitCodeFile))
+	}
+	return tmuxAgentWindowCmd(shellPath, cmdLine)
+}
+
 // harnessWrapperLine is the shell line tmuxAgentWindowCmd runs: cmdLine,
-// then the pane tail saved to tailFile, then cmdLine's exit status written
-// to exitCodeFile. The status is kept in scion_hrc right after cmdLine, so
-// a failing or missing tmux never changes the recorded code, and the
-// capture runs in a subshell with umask 077 and its errors discarded, so
-// the pane text (which may hold anything the harness printed) is readable
-// only by the agent user and root. The paths are written unquoted, so they
-// must be plain words (the fixed /tmp paths are); they are parameters only
-// so a test can run the line against temporary files.
+// then the pane tail saved to tailFile (when tailFile is non-empty), then
+// cmdLine's exit status written to exitCodeFile. The status is kept in
+// scion_hrc right after cmdLine, so a failing or missing tmux never changes
+// the recorded code, and the capture runs in a subshell with umask 077 and
+// its errors discarded, so the pane text (which may hold anything the harness
+// printed) is readable only by the agent user and root. The paths are written
+// unquoted, so they must be plain words (the fixed /tmp paths are); they are
+// parameters only so a test can run the line against temporary files.
 func harnessWrapperLine(cmdLine, tailFile, exitCodeFile string) string {
 	if strings.TrimSpace(cmdLine) == "" {
 		cmdLine = emptyHarnessCmdLine()
+	}
+	if tailFile == "" {
+		return cmdLine + "; scion_hrc=$?; echo $scion_hrc > " + exitCodeFile
 	}
 	return cmdLine + "; scion_hrc=$?; " +
 		`(umask 077; tmux capture-pane -p -J -S -40 -t "$TMUX_PANE" > ` + tailFile + ") 2>/dev/null; " +
@@ -361,6 +378,7 @@ var errWorktreeAdminUnresolved = errors.New("cannot resolve the broker-recorded 
 // buildCommonRunArgs constructs the common arguments for 'run' command across different runtimes.
 func buildCommonRunArgs(config RunConfig) ([]string, error) {
 	args := []string{"run", "-d", "-i"}
+	withheld := newHookWithheldTracker(config)
 	addArg := func(flag string, values ...string) {
 		for _, v := range values {
 			if flag == "-e" {
@@ -373,10 +391,21 @@ func buildCommonRunArgs(config RunConfig) ([]string, error) {
 			args = append(args, flag, v)
 		}
 	}
-	addEnv := func(name, value string) {
-		if value != "" {
-			addArg("-e", fmt.Sprintf("%s=%s", name, value))
+	addTrackedArgEnv := func(kv string, isWithheld bool) {
+		name, _, _ := strings.Cut(kv, "=")
+		if reservedAgentEnvName(name) {
+			return
 		}
+		args = append(args, "-e", kv)
+		withheld.Record(name, isWithheld)
+	}
+	addTrackedEnv := func(name, value string, isWithheld bool) {
+		if value != "" {
+			addTrackedArgEnv(fmt.Sprintf("%s=%s", name, value), isWithheld)
+		}
+	}
+	addEnv := func(name, value string) {
+		addTrackedEnv(name, value, false)
 	}
 
 	expandPath := func(path string, isTarget bool) string {
@@ -423,17 +452,17 @@ func buildCommonRunArgs(config RunConfig) ([]string, error) {
 
 		if v.Type == "gcs" {
 			// Do not register as docker bind mount
-			cmd := fmt.Sprintf("mkdir -p %q && gcsfuse ", tgt)
+			cmd := fmt.Sprintf("mkdir -p %s && gcsfuse ", shellQuote(tgt))
 			if v.Prefix != "" {
-				cmd += fmt.Sprintf("--only-dir %q ", v.Prefix)
+				cmd += fmt.Sprintf("--only-dir %s ", shellQuote(v.Prefix))
 			}
 			if v.Mode != "" {
-				cmd += fmt.Sprintf("-o %q ", v.Mode)
+				cmd += fmt.Sprintf("-o %s ", shellQuote(v.Mode))
 			}
 			// Add implicit dirs for better compatibility with folder structures created via UI/API
 			cmd += "--implicit-dirs "
 
-			cmd += fmt.Sprintf("%q %q", v.Bucket, tgt)
+			cmd += fmt.Sprintf("%s %s", shellQuote(v.Bucket), shellQuote(tgt))
 			fuseMounts = append(fuseMounts, cmd)
 
 			gcsVolumes = append(gcsVolumes, gcsVolumeInfo{
@@ -836,11 +865,11 @@ func buildCommonRunArgs(config RunConfig) ([]string, error) {
 		}
 		// Call GetEnv for non-auth env vars (system prompt, agent name, etc.)
 		for k, v := range config.Harness.GetEnv(config.Name, config.HomeDir, config.UnixUsername) {
-			addEnv(k, v)
+			addTrackedEnv(k, v, isHarnessTemplateEnvKey(k))
 		}
 		if config.TelemetryEnabled {
 			for k, v := range config.Harness.GetTelemetryEnv() {
-				addEnv(k, v)
+				addTrackedEnv(k, v, false)
 			}
 		}
 	}
@@ -887,16 +916,16 @@ func buildCommonRunArgs(config RunConfig) ([]string, error) {
 			// (ptone/scion#3155), never template or user env.
 			continue
 		}
-		if parts[0] == MetadataInterceptionEnvVar {
+		if parts[0] == MetadataInterceptionEnvVar || parts[0] == MetadataInterceptionSourceEnvVar {
 			// Runtime-owned: set below from config.MetadataInterception.
 			continue
 		}
 		if len(parts) == 2 {
-			addArg("-e", fmt.Sprintf("%s=%s", parts[0], parts[1]))
+			addTrackedArgEnv(fmt.Sprintf("%s=%s", parts[0], parts[1]), withheld.IsConfigHC(parts[0]))
 		} else if !util.IsAgentRefusedHostEnvName(e) {
 			// A bare name makes the container CLI copy the value from
 			// this process's env; names refused for agents never are.
-			addArg("-e", e)
+			addTrackedArgEnv(e, withheld.IsConfigHC(e))
 		}
 	}
 
@@ -914,10 +943,10 @@ func buildCommonRunArgs(config RunConfig) ([]string, error) {
 		if s.Type != "environment" && s.Type != "" {
 			continue
 		}
-		if _, collides := envKeys[s.Target]; collides || s.Target == SupplementalGIDsEnvVar || s.Target == MetadataInterceptionEnvVar || reservedAgentEnvName(s.Target) {
+		if _, collides := envKeys[s.Target]; collides || s.Target == SupplementalGIDsEnvVar || s.Target == MetadataInterceptionEnvVar || s.Target == MetadataInterceptionSourceEnvVar || reservedAgentEnvName(s.Target) {
 			continue
 		}
-		addArg("-e", fmt.Sprintf("%s=%s", s.Target, s.Value))
+		addTrackedArgEnv(fmt.Sprintf("%s=%s", s.Target, s.Value), false)
 	}
 
 	// Binary override: the runtime's `binaries` directory, or in dev mode
@@ -1030,20 +1059,26 @@ func buildCommonRunArgs(config RunConfig) ([]string, error) {
 		}
 	}
 
-	// Add NET_ADMIN capability for iptables-based metadata server interception,
-	// and tell sciontool whether that interception is required. The marker
-	// always comes from config.MetadataInterception, never from config.Env, a
-	// secret or the template fallback (all of which skip this key), so it
-	// cannot disagree with the capability. The Apple runtime drops --cap-add
-	// (stripUnsupportedAppleFlags), so it never reports the interception as
-	// required.
-	if config.MetadataInterception {
-		addArg("--cap-add", "NET_ADMIN")
-	}
+	// Tell sciontool whether runtime-managed metadata interception is required.
+	// The agent container itself receives no NET_ADMIN capability; the runtime
+	// installs the iptables rules from a short-lived setup container sharing
+	// the agent's network namespace. Both markers always come from
+	// config.MetadataInterception, never from config.Env, a secret or the
+	// template fallback. The Apple runtime does not run the setup container,
+	// so it never reports interception as required.
 	if config.MetadataInterception && config.RuntimeName != appleContainerRuntimeName {
-		addArg("-e", MetadataInterceptionEnvVar+"="+MetadataInterceptionRequired)
+		addTrackedArgEnv(MetadataInterceptionEnvVar+"="+MetadataInterceptionRequired, false)
+		addTrackedArgEnv(MetadataInterceptionSourceEnvVar+"="+MetadataInterceptionSourceRuntime, false)
 	} else {
-		addArg("-e", MetadataInterceptionEnvVar+"="+MetadataInterceptionOff)
+		addTrackedArgEnv(MetadataInterceptionEnvVar+"="+MetadataInterceptionOff, false)
+	}
+
+	// Drop CAP_NET_RAW on Docker and Podman agent containers as defense in
+	// depth: agents do not require raw sockets, and removing this unneeded
+	// default capability restricts raw packet access across all metadata and
+	// network modes. Apple Container does not accept --cap-drop flags.
+	if config.RuntimeName == "docker" || config.RuntimeName == "podman" {
+		addArg("--cap-drop", "NET_RAW")
 	}
 
 	// Add extra /etc/hosts entries (e.g. for host.docker.internal on Linux)
@@ -1107,7 +1142,7 @@ func buildCommonRunArgs(config RunConfig) ([]string, error) {
 	// running the harness, add a "shell" window, and attach (Docker/Podman
 	// provide PID 1 a TTY). See tmuxAgentWindowCmd/buildTmuxStartCmd for the
 	// shared definition across runtimes.
-	agentWindowCmd := tmuxAgentWindowCmd("sh", cmdLine)
+	agentWindowCmd := tmuxAgentWindowCmdForConfig("sh", cmdLine, config)
 	tmuxCmd := buildTmuxStartCmd(agentWindowCmd, tmuxAttachSession)
 
 	if len(fuseMounts) > 0 {
@@ -1116,14 +1151,20 @@ func buildCommonRunArgs(config RunConfig) ([]string, error) {
 		// interpretation, then safely expanded by sh via "$SCION_START_CMD".
 		// Must be added before the image name — Docker/Podman require all
 		// flags before the image argument.
-		addArg("-e", fmt.Sprintf("SCION_START_CMD=%s", tmuxCmd))
+		addTrackedArgEnv(fmt.Sprintf("SCION_START_CMD=%s", tmuxCmd), false)
 	}
 
-	// The template env fallback (ptone/scion#4524) is the LAST env step:
-	// only keys no source above emitted, never a suppressed key. Docker
-	// keeps the last -e for a key, so nothing may be added after this.
+	// The template env fallback (ptone/scion#4524) is the LAST user/template
+	// env step: only keys no source above emitted, never a suppressed key.
 	for _, e := range FallbackEnvEntries(config.FallbackEnv, config.SuppressedFallbackKeys, envKeysOfArgs(args)) {
-		addArg("-e", e)
+		addTrackedArgEnv(e, false)
+	}
+
+	// Emit the runtime-owned hook-withheld marker last, after every other env
+	// source (which addTrackedArgEnv filters through reservedAgentEnvName),
+	// derived directly from the winning provenance of the entries emitted above.
+	if marker := withheld.Marker(); marker != "" {
+		args = append(args, "-e", envpolicy.HookWithheldEnvVar+"="+marker)
 	}
 
 	args = append(args, config.Image)
@@ -2497,29 +2538,13 @@ func resolvedAuthEnvEntries(ra *api.ResolvedAuth, taken func(name string) bool) 
 // more for its init firewall check; this assumes they are deterministic and
 // side-effect free, as every in-tree harness is.
 func harnessEnvEntries(cfg RunConfig, agentHome string) []string {
-	if cfg.Harness == nil {
+	sourced := harnessEnvEntriesWithSource(cfg, agentHome)
+	if len(sourced) == 0 {
 		return nil
 	}
-	env := make(map[string]string)
-	add := func(src map[string]string) {
-		for k, v := range src {
-			if v != "" {
-				env[k] = v
-			}
-		}
-	}
-	add(cfg.Harness.GetEnv(cfg.Name, agentHome, cfg.UnixUsername))
-	if cfg.TelemetryEnabled {
-		add(cfg.Harness.GetTelemetryEnv())
-	}
-	names := make([]string, 0, len(env))
-	for k := range env {
-		names = append(names, k)
-	}
-	slices.Sort(names)
-	entries := make([]string, 0, len(names))
-	for _, k := range names {
-		entries = append(entries, k+"="+env[k])
+	entries := make([]string, 0, len(sourced))
+	for _, e := range sourced {
+		entries = append(entries, e.Key+"="+e.Value)
 	}
 	return entries
 }
@@ -2604,7 +2629,10 @@ const stagedSecretWarnThreshold = 100 * 1024
 // (stagedsecrets.ResolvedAuthStagedEnvVar). Each runtime drops it where it
 // assembles the container environment.
 func reservedAgentEnvName(name string) bool {
-	return name == stagedsecrets.HubTokenStagedEnvVar || name == stagedsecrets.ResolvedAuthStagedEnvVar
+	return name == stagedsecrets.HubTokenStagedEnvVar ||
+		name == stagedsecrets.ResolvedAuthStagedEnvVar ||
+		name == envpolicy.HookWithheldEnvVar ||
+		strings.HasPrefix(name, firewallpolicy.EnvPrefix)
 }
 
 // dropReservedAgentEnv deletes the reservedAgentEnvName entries from an
@@ -3076,18 +3104,369 @@ func nfsOwnerIDs(uid, gid int) (int, int) {
 const SupplementalGIDsEnvVar = "SCION_SUPPLEMENTAL_GIDS"
 
 // MetadataInterceptionEnvVar tells sciontool inside a Docker/Podman agent
-// whether the in-container GCP metadata interception is required
-// (MetadataInterceptionRequired) or not (MetadataInterceptionOff). It is set
-// only by buildCommonRunArgs, from RunConfig.MetadataInterception, the same
-// field that grants NET_ADMIN; template, user and secret values are dropped.
-// Mirrored in pkg/sciontool/metadata (InterceptionEnvVar).
-const MetadataInterceptionEnvVar = "SCION_METADATA_INTERCEPTION"
-
-// Values of MetadataInterceptionEnvVar.
+// whether GCP metadata interception is required (MetadataInterceptionRequired)
+// or not (MetadataInterceptionOff). MetadataInterceptionSourceEnvVar records
+// that the runtime installs the rules from a short-lived setup container
+// (MetadataInterceptionSourceRuntime). Both are set only by buildCommonRunArgs
+// from RunConfig.MetadataInterception; template, user and secret values are
+// dropped. Mirrored in pkg/sciontool/metadata.
 const (
-	MetadataInterceptionRequired = "required"
-	MetadataInterceptionOff      = "off"
+	MetadataInterceptionEnvVar        = "SCION_METADATA_INTERCEPTION"
+	MetadataInterceptionRequired      = "required"
+	MetadataInterceptionOff           = "off"
+	MetadataInterceptionSourceEnvVar  = "SCION_METADATA_INTERCEPTION_SOURCE"
+	MetadataInterceptionSourceRuntime = "runtime"
 )
+
+const (
+	netnsSetupLabelKey   = "scion.netns-setup"
+	netnsSetupNamePrefix = "scion-netns-setup-"
+	// Keep netnsSetupTimeout below sciontool's redirectProbeDeadline (210s in
+	// cmd/sciontool/commands/init_netadmin.go) so the verifier outlives the
+	// setup container.
+	netnsSetupTimeout        = 3 * time.Minute
+	netnsSetupCleanupTimeout = 10 * time.Second
+	initFirewallEnvVar       = "SCION_INIT_FIREWALL"
+
+	// ImageSciontoolCapabilitiesLabel is the image label written by
+	// image-build/scion-base/Dockerfile listing comma-separated capabilities
+	// supported by the image's sciontool binary.
+	ImageSciontoolCapabilitiesLabel = "scion.sciontool.capabilities"
+	// SciontoolCapNetnsSetup advertises that the image's sciontool supports
+	// the `sciontool netns-setup` sidecar subcommand.
+	SciontoolCapNetnsSetup = "netns-setup"
+)
+
+// ErrImageLacksNetnsSetup is returned when Docker or rootful Podman requires
+// runtime-managed metadata interception (netns-setup sidecar) but the agent
+// image does not support `sciontool netns-setup`.
+//
+//nolint:staticcheck // ST1005: fixed user-facing refusal text.
+var ErrImageLacksNetnsSetup = errors.New("agent start refused: metadata interception version skew (image_lacks_netns_setup): the agent image does not advertise sciontool netns-setup support required by this broker. Rebuild or update the agent image to a build matching this broker, or set the metadata mode to passthrough explicitly to opt out.")
+
+// ImageHasCapability reports whether labels contains capability in the
+// comma-separated ImageSciontoolCapabilitiesLabel value.
+func ImageHasCapability(labels map[string]string, capability string) bool {
+	return imageHasCapability(labels, capability)
+}
+
+// ErrFirewallRequiresMetadataInterception is returned when SCION_INIT_FIREWALL
+// is enabled on Docker or Podman without runtime-managed metadata interception
+// (block or assign mode).
+var ErrFirewallRequiresMetadataInterception = errors.New("the init firewall (SCION_INIT_FIREWALL) requires metadata mode block or assign on Docker/Podman (firewall-only mode is not supported)")
+
+// netnsCommandRunner executes a container CLI subcommand; runNetnsSetup and
+// removeNetnsSetupContainers use runSimpleCommand in production and a fake
+// runner in unit tests.
+type netnsCommandRunner func(ctx context.Context, command string, args ...string) (string, error)
+
+// netnsSetupContainerName returns the deterministic container name for the
+// netns-setup container associated with containerID.
+func netnsSetupContainerName(containerID string) string {
+	short := containerID
+	if len(short) > 12 {
+		short = short[:12]
+	}
+	return netnsSetupNamePrefix + short
+}
+
+// effectiveInitFirewall returns the SCION_INIT_FIREWALL value the agent
+// container will observe, from the same sources buildCommonRunArgs emits:
+// ResolvedAuth.EnvVars (when cfg.Harness != nil && cfg.ResolvedAuth != nil and
+// non-empty), cfg.Env "K=V", bare "K" (broker os.LookupEnv), and env-type
+// ResolvedSecrets. Precedence matches buildCommonRunArgs and the container
+// engine: ResolvedAuth is lowest precedence; cfg.Env entries are applied next
+// in order (later -e wins, and a bare entry whose host env var is unset clears
+// any earlier value, matching Docker/Podman `-e K` semantics), and any key
+// present in cfg.Env blocks ResolvedSecrets with the same target; otherwise
+// env-type ResolvedSecrets are applied in order (later -e wins, overriding
+// ResolvedAuth).
+func effectiveInitFirewall(cfg RunConfig) (value string, set bool) {
+	if cfg.Harness != nil && cfg.ResolvedAuth != nil {
+		if v := cfg.ResolvedAuth.EnvVars[initFirewallEnvVar]; v != "" {
+			value = v
+			set = true
+		}
+	}
+	inEnv := false
+	for _, e := range cfg.Env {
+		k, v, hasEq := strings.Cut(e, "=")
+		if k != initFirewallEnvVar {
+			continue
+		}
+		inEnv = true
+		if hasEq {
+			value = v
+			set = true
+		} else if !util.IsAgentRefusedHostEnvName(e) {
+			if envVal, ok := os.LookupEnv(k); ok {
+				value = envVal
+				set = true
+			} else {
+				value = ""
+				set = false
+			}
+		}
+	}
+	if inEnv {
+		return value, set
+	}
+	for _, s := range cfg.ResolvedSecrets {
+		if s.Type != "environment" && s.Type != "" {
+			continue
+		}
+		if s.Target != initFirewallEnvVar {
+			continue
+		}
+		value = s.Value
+		set = true
+	}
+	return value, set
+}
+
+// normalizeInitFirewallArg maps a resolved SCION_INIT_FIREWALL value to a
+// fixed canonical token ("true", "false", or "invalid") for the netns-setup
+// container argv so raw values (including secret-sourced values) are never
+// placed verbatim on the command line. Empty and whitespace-only values are
+// omitted. Forwarding "invalid" fails closed because sciontool parses the
+// value with strconv.ParseBool (cmd/sciontool/commands/init_netadmin.go),
+// which rejects it.
+func normalizeInitFirewallArg(raw string) (string, bool) {
+	if strings.TrimSpace(raw) == "" {
+		return "", false
+	}
+	on, err := CloudRunInitFirewallRequested(raw)
+	if err != nil {
+		return "invalid", true
+	}
+	if on {
+		return "true", true
+	}
+	return "false", true
+}
+
+// checkFirewallWithoutMetadataInterception refuses launches on Docker or
+// Podman that request SCION_INIT_FIREWALL without runtime-managed metadata
+// interception (e.g. passthrough, unset metadata mode, host network, or
+// rootless Podman) before container creation.
+func checkFirewallWithoutMetadataInterception(cfg RunConfig) error {
+	if cfg.MetadataInterception {
+		return nil
+	}
+	val, ok := effectiveInitFirewall(cfg)
+	if !ok {
+		return nil
+	}
+	on, err := CloudRunInitFirewallRequested(val)
+	if err != nil || !on {
+		return nil
+	}
+	return newLaunchFailure(
+		api.LaunchCodeFirewallRequiresMetadataInterception,
+		api.LaunchStepLaunching,
+		"",
+		ErrFirewallRequiresMetadataInterception,
+	)
+}
+
+func imageHasCapability(labels map[string]string, capability string) bool {
+	if len(labels) == 0 || capability == "" {
+		return false
+	}
+	raw := labels[ImageSciontoolCapabilitiesLabel]
+	for _, part := range strings.Split(raw, ",") {
+		if strings.TrimSpace(part) == capability {
+			return true
+		}
+	}
+	return false
+}
+
+// isUnknownNetnsSetupOutput reports whether a failed netns-setup sidecar
+// invocation failed because the image's sciontool lacks the netns-setup
+// subcommand (a pre-#5246 image).
+func isUnknownNetnsSetupOutput(output string) bool {
+	lower := strings.ToLower(output)
+	return strings.Contains(lower, `unknown command "netns-setup"`) ||
+		strings.Contains(lower, `unknown command 'netns-setup'`)
+}
+
+// checkImageNetnsSetupSupport inspects the local image's labels before
+// launching a container that requires runtime-managed metadata interception.
+//
+// This check is diagnostic only and is not a security control: fail-closed
+// enforcement lives in runNetnsSetup (which removes the container on failure)
+// and in sciontool init's redirect probe. Because images built between
+// GoogleCloudPlatform/scion#5246 and the introduction of
+// ImageSciontoolCapabilitiesLabel support `sciontool netns-setup` without
+// carrying the label, a missing label is treated as unknown (logged as a
+// warning) rather than refused pre-start; definitive skew is classified in
+// runNetnsSetup when `sciontool netns-setup` reports an unknown command.
+func checkImageNetnsSetupSupport(ctx context.Context, command, image string) {
+	if strings.TrimSpace(image) == "" {
+		return
+	}
+	out, err := runSimpleCommand(ctx, command, "image", "inspect", "--format", "{{json .Config.Labels}}", image)
+	if err != nil {
+		if isImageNotFoundOutput(out) || isImageNotFoundOutput(err.Error()) {
+			return
+		}
+		runtimeLog().Debug("image capability inspect skipped due to inspect error", "image", image, "error", err)
+		return
+	}
+	trimmed := strings.TrimSpace(out)
+	if trimmed == "" {
+		return
+	}
+	var labels map[string]string
+	if err := json.Unmarshal([]byte(trimmed), &labels); err != nil {
+		runtimeLog().Debug("image capability inspect output was not JSON labels", "image", image, "error", err)
+		return
+	}
+	if !imageHasCapability(labels, SciontoolCapNetnsSetup) {
+		runtimeLog().Warn("agent image does not advertise netns-setup capability label; continuing and relying on netns-setup sidecar to verify support",
+			"image", image, "label", ImageSciontoolCapabilitiesLabel)
+	}
+}
+
+// buildNetnsSetupArgs builds the container CLI argv for the short-lived
+// netns-setup container that joins the agent container's network namespace
+// with least-privilege capabilities, runs init-firewall.sh if requested,
+// installs the metadata iptables rules, and exits. It carries only the minimal
+// metadata/firewall environment subset and a non-agent label so List ignores
+// it.
+func buildNetnsSetupArgs(containerID string, cfg RunConfig) []string {
+	args := []string{
+		"run", "--rm",
+		"--name", netnsSetupContainerName(containerID),
+		"--network", "container:" + containerID,
+		"--cap-drop", "ALL",
+		"--cap-add", "NET_ADMIN",
+		"--cap-add", "NET_RAW",
+		"--security-opt", "no-new-privileges",
+		"--user", "0",
+		"--entrypoint", "/usr/local/bin/sciontool",
+	}
+	envVals := make(map[string]string, 2)
+	for _, e := range cfg.Env {
+		k, v, ok := strings.Cut(e, "=")
+		if !ok {
+			continue
+		}
+		switch k {
+		case "SCION_METADATA_MODE", "SCION_METADATA_PORT":
+			envVals[k] = v
+		}
+	}
+	for _, k := range []string{"SCION_METADATA_MODE", "SCION_METADATA_PORT"} {
+		if v := envVals[k]; v != "" {
+			args = append(args, "-e", k+"="+v)
+		}
+	}
+	if v, ok := effectiveInitFirewall(cfg); ok {
+		if norm, emit := normalizeInitFirewallArg(v); emit {
+			args = append(args, "-e", initFirewallEnvVar+"="+norm)
+			if norm == "true" {
+				for _, kv := range cfg.InitFirewall.Env() {
+					args = append(args, "-e", kv)
+				}
+			}
+		}
+	}
+	args = append(args,
+		"--label", netnsSetupLabelKey+"="+containerID,
+		cfg.Image,
+		"netns-setup",
+	)
+	return args
+}
+
+// runNetnsSetup runs the short-lived netns-setup container against
+// containerID with a 3-minute timeout, pre-clearing any leftover setup
+// container by name and force-removing it on any error.
+func runNetnsSetup(ctx context.Context, command, containerID string, cfg RunConfig) error {
+	return runNetnsSetupWith(ctx, runSimpleCommand, command, containerID, cfg)
+}
+
+func runNetnsSetupWith(ctx context.Context, run netnsCommandRunner, command, containerID string, cfg RunConfig) error {
+	name := netnsSetupContainerName(containerID)
+	setupCtx, cancel := context.WithTimeout(ctx, netnsSetupTimeout)
+	defer cancel()
+
+	// Best-effort pre-clear of any leftover setup container with the same
+	// deterministic name (for example after a broker crash).
+	preCleanCtx, preCleanCancel := context.WithTimeout(setupCtx, netnsSetupCleanupTimeout)
+	_, _ = run(preCleanCtx, command, "rm", "-f", name)
+	preCleanCancel()
+
+	args := buildNetnsSetupArgs(containerID, cfg)
+	out, err := run(setupCtx, command, args...)
+	if err != nil {
+		// Force-remove the named setup container on any error (timeout,
+		// cancel, or failure) with a fresh background context so cleanup still
+		// runs when the parent context is done.
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), netnsSetupCleanupTimeout)
+		_, _ = run(cleanupCtx, command, "rm", "-f", name)
+		cleanupCancel()
+
+		if setupCtx.Err() != nil {
+			return fmt.Errorf("netns-setup timed out or cancelled: %w", setupCtx.Err())
+		}
+		if trimmed := strings.TrimSpace(out); trimmed != "" {
+			if isUnknownNetnsSetupOutput(trimmed) {
+				return newLaunchFailure(
+					api.LaunchCodeImageLacksNetnsSetup,
+					api.LaunchStepContainerStart,
+					"",
+					fmt.Errorf("%w: %s", ErrImageLacksNetnsSetup, truncateForError(trimmed)),
+				)
+			}
+			return fmt.Errorf("netns-setup failed: %w (output: %s)", err, truncateForError(trimmed))
+		}
+		return fmt.Errorf("netns-setup failed: %w", err)
+	}
+	return nil
+}
+
+// removeNetnsSetupContainers best-effort removes any setup containers labelled
+// for agentContainerID. It is idempotent and never fails the caller.
+func removeNetnsSetupContainers(ctx context.Context, command, agentContainerID string) {
+	removeNetnsSetupContainersWith(ctx, runSimpleCommand, command, agentContainerID)
+}
+
+func removeNetnsSetupContainersWith(ctx context.Context, run netnsCommandRunner, command, agentContainerID string) {
+	if agentContainerID == "" {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), netnsSetupCleanupTimeout)
+	defer cancel()
+	out, err := run(cleanupCtx, command, "ps", "-aq", "--no-trunc", "--filter", "label="+netnsSetupLabelKey+"="+agentContainerID)
+	if err != nil {
+		runtimeLog().Debug("Could not list netns-setup containers for cleanup", "container_id", agentContainerID, "error", err)
+		return
+	}
+	var ids []string
+	for _, id := range strings.Fields(out) {
+		if containerIDRE.MatchString(id) {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+	if _, err := run(cleanupCtx, command, append([]string{"rm", "-f"}, ids...)...); err != nil {
+		runtimeLog().Debug("Could not remove netns-setup containers", "container_id", agentContainerID, "count", len(ids), "error", err)
+	}
+}
+
+// removeCreatedContainer best-effort force-removes a container by ID using a
+// fresh context so cleanup still runs when the caller context was cancelled.
+func removeCreatedContainer(command, containerID string) error {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := runSimpleCommand(cleanupCtx, command, "rm", "-f", containerID)
+	return err
+}
 
 // sharedDirGroups returns the guarded shared-dir leaf groups for config,
 // or nil when the agent mounts no shared dir from a shared backend.

@@ -62,10 +62,11 @@ const (
 	visitorIssuer = "https://issuer.fixture.example"
 	visitorDomain = "partner.example"
 
-	webhookEndpointID = "e0100000-0000-0000-0000-000000000001"
-	triggerID         = "e0200000-0000-0000-0000-000000000001"
-	triggerEventID    = "e0300000-0000-0000-0000-000000000001"
-	triggerFireID     = "e0400000-0000-0000-0000-000000000001"
+	webhookEndpointID     = "e0100000-0000-0000-0000-000000000001"
+	triggerID             = "e0200000-0000-0000-0000-000000000001"
+	triggerEventID        = "e0300000-0000-0000-0000-000000000001"
+	triggerFireID         = "e0400000-0000-0000-0000-000000000001"
+	triggerSubjectClaimID = "e0500000-0000-0000-0000-000000000001"
 )
 
 // baseTime is a fixed timestamp so the generated fixture is byte-reproducible
@@ -371,6 +372,13 @@ func Spec() []TableFixture {
 				"created": baseTime,
 			},
 		}},
+		{Table: "agent_suspend_screens", Rows: []row{
+			{ // saved terminal screen before suspend (ptone/scion#8530)
+				"id": "5c000000-0000-0000-0000-000000000001", "agent_id": agentID,
+				"content": "\x1b[32mready>\x1b[0m last pane\n", "truncated": false,
+				"captured_at": baseTime,
+			},
+		}},
 		// ---- Choice prompt decisions ----
 		{Table: "decisions", Rows: []row{
 			{ // decided version of a hub-numbered key, in a conversation, with a default and an intro
@@ -454,6 +462,32 @@ func Spec() []TableFixture {
 		{Table: "decision_key_counters", Rows: []row{
 			{"agent_id": agentID, "next": 2},
 		}},
+		// ---- Agent-to-human secret requests ----
+		{Table: "secret_requests", Rows: []row{
+			{
+				"id": "5f000000-0000-0000-0000-000000000001", "project_id": projectID,
+				"agent_id": agentID, "agent_name": "worker",
+				"key": "GITHUB_TOKEN", "key_norm": "GITHUB_TOKEN", "version": 1,
+				"description": "Token for pushing branch updates", "secret_type": "environment",
+				"target": "GITHUB_TOKEN", "message_id": messageID, "position": 0, "intro_length": 0,
+				"conversation_id": conversationID, "chat_key": "dm:agent:" + agentID + ":user:" + userID,
+				"status": "fulfilled", "resolved_by_user_id": userID, "resolved_by_name": "Alice",
+				"resolved_by_email": "alice@example.com", "surface": "standalone_page",
+				"idempotency_key": "sr-fulfill-1", "response_message_id": messageID,
+				"secret_version": 1, "created_at": baseTime,
+				"expires_at": baseTime.Add(7 * 24 * time.Hour), "resolved_at": baseTime.Add(2 * time.Minute),
+			},
+			{
+				"id": "5f000000-0000-0000-0000-000000000002", "project_id": projectID,
+				"agent_id": agentID, "agent_name": "worker",
+				"key": "DEPLOY_KEY", "key_norm": "DEPLOY_KEY", "version": 1,
+				"description": "SSH key for staging", "secret_type": "file",
+				"target": "~/.ssh/deploy_key", "message_id": messageID, "position": 1, "intro_length": 0,
+				"conversation_id": conversationID, "chat_key": "dm:agent:" + agentID + ":user:" + userID,
+				"status": "pending", "created_at": baseTime,
+				"expires_at": baseTime.Add(7 * 24 * time.Hour),
+			},
+		}},
 
 		// ---- Schedules ----
 		{Table: "schedules", Rows: []row{
@@ -491,8 +525,21 @@ func Spec() []TableFixture {
 				"started_at": baseTime.Add(-time.Hour), "not_after": baseTime.Add(-time.Hour + time.Minute),
 				"lease_until": baseTime.Add(-time.Hour + 3*time.Minute), "finished_at": baseTime.Add(-time.Hour + time.Second),
 				"last_polled_at": baseTime.Add(-time.Hour), "poll_seq": int64(1),
-				"outcome": "ok", "exit_code": 0, "duration_ms": 1000, "output_bytes": 0,
+				"outcome": "ok", "exit_code": 0, "duration_ms": 1000, "output_bytes": 11,
+				"capture_mode": "json", "output_status": "captured",
 				"runtime": "docker", "launch_id": "",
+			},
+		}},
+		// Bounded captured output for the finished exec run above
+		// (ptone/scion#8961); run_id matches scheduled_exec_runs.event_id.
+		{Table: "exec_run_outputs", Rows: []row{
+			{
+				"run_id":       "5e000000-0000-0000-0000-000000000002",
+				"owner_kind":   "scheduled_exec",
+				"project_id":   projectID,
+				"capture_mode": "json",
+				"content":      []byte(`{"ok":true}`),
+				"created_at":   baseTime.Add(-time.Hour + time.Second),
 			},
 		}},
 		// Persisted per-agent recovery-sweep turn cursor (ptone/scion#8096).
@@ -1072,6 +1119,16 @@ func Spec() []TableFixture {
 			},
 		}},
 
+		{Table: "user_exec_containers", Rows: []row{
+			{
+				"id":         "c1d00000-0000-0000-0000-000000000002",
+				"user_id":    userID,
+				"agent_id":   agentID,
+				"created_at": baseTime,
+				"updated_at": baseTime,
+			},
+		}},
+
 		// ---- Conduit session registry (relay_instances is the FK parent of
 		// conduit_sessions; conduit_principal_epochs is standalone) ----
 		{Table: "relay_instances", Rows: []row{
@@ -1345,6 +1402,14 @@ func Spec() []TableFixture {
 				"initiator_credential_snapshot": "", "attribution_version": 1, "authorization_revision": 1,
 				"lease_until": baseTime.Add(time.Minute), "started_at": baseTime,
 				"finished_at": baseTime.Add(time.Second), "created": baseTime,
+			},
+		}},
+		{Table: "trigger_subject_claims", Rows: []row{
+			{
+				"id": triggerSubjectClaimID, "trigger_id": triggerID,
+				"subject": "webhook:" + webhookEndpointID, "state": "active",
+				"agent_id": agentID, "event_id": triggerEventID, "fire_id": triggerFireID,
+				"claimed_at": baseTime, "bound_at": baseTime.Add(time.Second), "released_at": nil,
 			},
 		}},
 

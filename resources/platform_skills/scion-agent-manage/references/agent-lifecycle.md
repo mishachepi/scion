@@ -21,9 +21,10 @@ authorized user to reincarnate it, or to recreate it directly: a user's reincarn
 re-records the agent's delegation with that user as delegator, even without a role
 change. Reincarnating it yourself, or from another agent, keeps the chain and does not
 clear the denial. Run `--dry-run` first to catch unintended model or config fallback
-drift, and move any needed container-local `/tmp/` files to persistent storage beforehand
+drift, move any needed container-local `/tmp/` files to persistent storage beforehand
 (in-place container recreation wipes `/tmp/`, while keeping the agent home unless
-`--harness` or `--broker` rebuilds it). Because reincarnation returns before the
+`--harness` or `--broker` rebuilds it), and record active branch, `HEAD` SHA, and
+any backup ref in `--handoff-file` when workspace Git state matters. Because reincarnation returns before the
 replacement container finishes starting, verify that the agent reaches `running` (rather
 than `error`) and confirm a resumed-work receipt; this proves runtime continuity, whereas
 `resolvedVersion` in `~/.scion/resolved-skills.json` inside the container verifies
@@ -74,9 +75,16 @@ When an agent must remain available for follow-up — such as an unanswered huma
 open PR review, or an idle lead between assignments — and its harness supports session
 resume, ensure its state and handoff are durable and use `scion suspend <name>` (under the
 same creator/supervisor authority) to stop the container while keeping the harness session
-resumable. Suspension releases the active broker and project capacity slot without closing
-open human questions; human silence is not closure. `scion stop` ends the session (the next
-`start` begins a fresh session) and is justified only for short, time-boxed terminal or
+resumable. Because suspending stops the container and recreates it on resume,
+container-local `/tmp/` is wiped (keep reusable scripts, briefs, and handoffs in the
+workspace or a shared directory). Suspension releases the active broker and project capacity slot without closing
+open human questions; human silence is not closure. An agent you suspend receives nothing
+until someone with lifecycle permission on it (normally you) resumes it: messages without
+`--wake` fail (`scion-messaging`), and its own schedules fire only if they set `--wake`
+(`scion-scheduler`). Before suspending, confirm the agent has read any notice you sent; a
+message sent moments earlier can still fail delivery. Keep an agent running while it waits
+on a delivery from a peer that cannot wake it. `scion stop` ends the session (the next
+`scion resume` begins a fresh session) and is justified only for short, time-boxed terminal or
 incident inspection when resume is unsupported or unwanted; do not leave agents stopped
 indefinitely.
 
@@ -141,7 +149,12 @@ can delete it directly or explicit human instruction is required.
    sub-task transitions, not only on full-task completion. Before treating an agent as
    done, verify with `scion look <agent>` and confirm the artifact it owed — commit
    pushed, file written, PR opened. Acting on the notification alone causes premature
-   follow-up dispatch against a state that does not yet exist.
+   follow-up dispatch against a state that does not yet exist. For long-lived children
+   whose routine `IDLE` transitions create noisy wakeups, narrow the auto-subscription
+   to drop `IDLE` while keeping `WAITING_FOR_INPUT` and terminal or exception states:
+   `scion notifications update <subscription-id> --triggers COMPLETED,WAITING_FOR_INPUT,LIMITS_EXCEEDED,STALLED,SUSPENDED,ERROR,HARNESS_ERROR,HALTED`
+   (use the full `id` from `scion notifications subscriptions --json`, matching `agentId`
+   to the child's ID from `scion list --format json`).
 
 ## Anti-patterns
 

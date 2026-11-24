@@ -1564,9 +1564,12 @@ describe('<scion-page-project-decisions>', () => {
 
       expect(root.querySelector('.error-state')).toBeNull();
       expect(root.querySelector('[data-prompt-card="m-1"]')).not.toBeNull();
-      expect(root.querySelector('.crumbs a[href="/projects/p-1"]')?.textContent?.trim()).toBe(
-        'p-1'
-      );
+      const bc = root.querySelector('scion-breadcrumb');
+      expect(bc?.crumbs.map((c) => [c.label, c.href])).toEqual([
+        ['Projects', '/projects'],
+        ['p-1', '/projects/p-1'],
+        ['Decisions', undefined],
+      ]);
       expect(titleEvents).toContainEqual(['Decisions', 'p-1']);
     } finally {
       document.removeEventListener(PAGE_TITLE_EVENT, onTitle);
@@ -3157,5 +3160,121 @@ describe('<scion-page-project-decisions>', () => {
 
     await settle(el, 90);
     expect(root.querySelector('[data-empty="pending"]')).not.toBeNull();
+  });
+
+  it('opens and closes the Made detail panel on desktop and mobile from one toggle state (ptone/scion#8477)', async () => {
+    enableDecisionsFlag();
+    madeResponses = [
+      {
+        counts: { waitingOnYou: 0, waitingOnOthers: 0 },
+        entries: [
+          makeLogEntry({
+            answerId: 'ans-rec',
+            choiceId: 'no',
+            label: 'No',
+            outcome: 'answer',
+            matchedDefault: false,
+            decision: {
+              rowId: 'r-1',
+              promptMessageId: 'm-1',
+              promptAvailable: true,
+              key: 'D9',
+              ref: 'D9',
+              version: 1,
+              status: 'decided',
+              question: 'Cut the RC from main?',
+              choices: [
+                { id: 'yes', label: 'Yes', description: 'Cut today' },
+                { id: 'no', label: 'No' },
+              ],
+              defaultChoiceId: 'yes',
+              askerAgentId: 'a-rel',
+              askerAgentName: 'release-bot',
+            },
+          }),
+        ],
+        agents: [{ id: 'a-rel', name: 'release-bot' }],
+        answerers: [{ id: 'u-me', name: 'Alice' }],
+        conversations: [{ key: 'topic-release', label: '#release', projectId: 'p-1' }],
+      },
+    ];
+
+    const el = await mount({ path: '/projects/p-1/decisions?tab=made' });
+    const root = el.shadowRoot!;
+    const row = root.querySelector('[data-answer-row="ans-rec"]')!;
+    expect(row.querySelector('[data-rec-marker]')?.textContent?.trim()).toBe('recommended: Yes');
+    const toggle = row.querySelector<HTMLButtonElement>('button[data-made-toggle="ans-rec"]')!;
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(root.querySelector('[data-made-detail]')).toBeNull();
+
+    toggle.click();
+    await el.updateComplete;
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    const panels = Array.from(root.querySelectorAll<HTMLElement>('[data-made-detail="ans-rec"]'));
+    expect(panels.map((p) => p.id)).toEqual(['made-detail-ans-rec', 'made-detail-m-ans-rec']);
+    const desktop = panels[0]!;
+    expect(
+      Array.from(desktop.querySelectorAll('[data-detail-choice]')).map((li) =>
+        li.getAttribute('data-detail-choice')
+      )
+    ).toEqual(['yes', 'no']);
+    expect(desktop.querySelector('[data-detail-choice="no"]')?.hasAttribute('data-picked')).toBe(
+      true
+    );
+    expect(
+      desktop.querySelector<HTMLAnchorElement>('[data-detail-open-in-chat]')?.getAttribute('href')
+    ).toMatch(/#msg-m-1$/);
+    const mobileToggle = root.querySelector<HTMLButtonElement>(
+      '[data-mobile-answer="ans-rec"] button[data-made-toggle]'
+    )!;
+    expect(mobileToggle.getAttribute('aria-expanded')).toBe('true');
+
+    mobileToggle.click();
+    await el.updateComplete;
+    expect(root.querySelector('[data-made-detail]')).toBeNull();
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+  });
+
+  it('renders Other answers with bold label, quoted plain text, two-line clamp + title, and previousOtherText on Made tab', async () => {
+    enableDecisionsFlag();
+    const literalText = '<b>europe-west4</b>, only after 6 PM freeze lifts @bystander';
+    const otherEntry = makeLogEntry({
+      answerId: 'ans-other-1',
+      choiceId: '$other',
+      label: 'Another region',
+      otherText: literalText,
+      provenance: 'direct',
+      outcome: 'override',
+      previousChoiceLabel: 'Another region',
+      previousOtherText: 'europe-west1',
+    });
+    madeResponses = [
+      {
+        counts: { waitingOnYou: 0, waitingOnOthers: 0 },
+        entries: [otherEntry],
+        agents: [{ id: 'a-rel', name: 'release-bot' }],
+        answerers: [{ id: 'u-me', name: 'Alice' }],
+        conversations: [{ key: 'topic-release', label: '#release', projectId: 'p-1' }],
+      },
+    ];
+
+    const el = await mount({ path: '/projects/p-1/decisions?tab=made' });
+    const root = el.shadowRoot!;
+    const row = root.querySelector('[data-answer-row="ans-other-1"]')!;
+    expect(row).not.toBeNull();
+    const clamp = row.querySelector<HTMLElement>('td.ans .ans-clamp')!;
+    expect(clamp).not.toBeNull();
+    expect(clamp.getAttribute('title')).toBe(`Another region: “${literalText}”`);
+    expect(clamp.querySelector('b')?.textContent).toBe('Another region:');
+    expect(clamp.textContent).toContain(`“${literalText}”`);
+    // Literal plain text: no nested <b> element parsed from literalText.
+    expect(clamp.querySelectorAll('b').length).toBe(1);
+    expect(row.querySelector('[data-provenance]')?.textContent).toContain(
+      'from Another region “europe-west1”'
+    );
+
+    const mobile = root.querySelector('[data-mobile-answer="ans-other-1"]')!;
+    expect(mobile.textContent).toContain(`Another region: “${literalText}”`);
+    expect(mobile.textContent).toContain('from Another region “europe-west1”');
   });
 });

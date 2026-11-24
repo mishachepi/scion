@@ -72,6 +72,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/config/opsettings"
+	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/firewallpolicy"
 	yamlv3 "gopkg.in/yaml.v3"
 )
 
@@ -449,8 +450,13 @@ func workstationFileEdits(req *ServerConfigUpdateDBRequest, leaves []bodyLeaf, o
 			continue
 		}
 		if l.null {
+			preserved := append(append([][]string{}, hubOwnedBrokerPaths...), nullPreservedBrokerPaths...)
+			if origTyped != nil && origTyped.Server != nil && origTyped.Server.Hub != nil &&
+				origTyped.Server.Hub.SystemOne != nil && len(origTyped.Server.Hub.SystemOne.SecretNames) > 0 {
+				preserved = append(preserved, []string{"server", "hub", "system_one", "secret_names"})
+			}
 			var keep [][]string
-			for _, owned := range append(append([][]string{}, hubOwnedBrokerPaths...), nullPreservedBrokerPaths...) {
+			for _, owned := range preserved {
 				if len(owned) > len(l.path) && pathHasPrefixPath(owned, l.path) {
 					keep = append(keep, owned[len(l.path):])
 				}
@@ -657,6 +663,16 @@ func validateServerConfigFileKeys(req *ServerConfigUpdateRequest, fileKeys []str
 				entries: configValidationEntries(errs, "server.broker.instances")}
 		}
 	}
+	if under("server.broker.init_firewall") && req.Server != nil && req.Server.Broker != nil && req.Server.Broker.InitFirewall != nil {
+		// LoadGlobalConfig refuses an invalid server.broker.init_firewall at
+		// startup; validate and canonicalize before writing to settings.yaml.
+		policy, err := firewallpolicy.Normalize(req.Server.Broker.InitFirewall.AllowDomains, req.Server.Broker.InitFirewall.AllowSSH)
+		if err != nil {
+			return &serverConfigFileValidationError{msg: err.Error(),
+				entries: []settingsFieldError{{Field: "server.broker.init_firewall.allow_domains", Message: err.Error()}}}
+		}
+		req.Server.Broker.InitFirewall.AllowDomains = policy.AllowDomains
+	}
 	if req.Server != nil && (under("server.project_storage") || under("server.workspace_storage") ||
 		under("server.shared_dir_storage") || under("server.home_storage")) {
 		// Same check as the file-mode handler: the storage blocks must
@@ -695,11 +711,43 @@ var startupCheckedFileBlocks = []struct {
 	{[]string{"server", "hub", "port_proxy"}, func(gc *config.GlobalConfig) error { return gc.Hub.PortProxy.Validate() }},
 	{[]string{"server", "hub", "sse"}, func(gc *config.GlobalConfig) error { return gc.Hub.SSE.Validate() }},
 	{[]string{"server", "hub", "system_one"}, func(gc *config.GlobalConfig) error { return gc.Hub.SystemOne.Validate() }},
+	{[]string{"server", "hub", "schedules"}, func(gc *config.GlobalConfig) error { return gc.Hub.Schedules.Validate() }},
+	{[]string{"server", "hub", "default_message_mode"}, func(gc *config.GlobalConfig) error {
+		return config.ValidateDefaultMessageMode(gc.Hub.DefaultMessageMode)
+	}},
 	{[]string{"server", "hub", "platform_request_timeout"}, func(gc *config.GlobalConfig) error {
 		return config.ValidatePlatformRequestTimeout(gc.Hub.PlatformRequestTimeout)
 	}},
 	{[]string{"server", "hub", "chat"}, func(gc *config.GlobalConfig) error { return gc.Hub.Chat.Search.Validate() }},
 	{[]string{"server", "relay"}, func(gc *config.GlobalConfig) error { return gc.Relay.Validate() }},
+}
+
+// filterStartupFileBlockKeys returns the subset of keys (preserving order)
+// that fall under any startupCheckedFileBlocks prefix.
+func filterStartupFileBlockKeys(keys []string) []string {
+	var sent []string
+	for _, k := range keys {
+		for _, b := range startupCheckedFileBlocks {
+			if prefix := strings.Join(b.path, "."); k == prefix || strings.HasPrefix(k, prefix+".") {
+				sent = append(sent, k)
+				break
+			}
+		}
+	}
+	return sent
+}
+
+// startupFileBlockSentKeys returns the sorted koanf keys under
+// startupCheckedFileBlocks that rawServer (the PUT body's "server" object)
+// sends, matching keys with the same case-folding rule as encoding/json.
+func startupFileBlockSentKeys(rawServer json.RawMessage) []string {
+	var serverObj map[string]json.RawMessage
+	if json.Unmarshal(rawServer, &serverObj) != nil {
+		return nil
+	}
+	leaves := leafKeys(presentBodyLeaves(serverObj, reflect.TypeOf(config.V1ServerConfig{}), []string{"server"}, nil))
+	sort.Strings(leaves)
+	return filterStartupFileBlockKeys(leaves)
 }
 
 // validateStartupCheckedFileBlocks checks each startupCheckedFileBlocks
@@ -713,15 +761,7 @@ var startupCheckedFileBlocks = []struct {
 // only change the leaves this PUT does not send, and every sent leaf is
 // checked whatever the rest of the block holds.
 func validateStartupCheckedFileBlocks(req *ServerConfigUpdateRequest, fileKeys []string) error {
-	var sent []string
-	for _, k := range fileKeys {
-		for _, b := range startupCheckedFileBlocks {
-			if prefix := strings.Join(b.path, "."); k == prefix || strings.HasPrefix(k, prefix+".") {
-				sent = append(sent, k)
-				break
-			}
-		}
-	}
+	sent := filterStartupFileBlockKeys(fileKeys)
 	if len(sent) == 0 {
 		return nil
 	}

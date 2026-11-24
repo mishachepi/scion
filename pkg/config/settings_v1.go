@@ -1506,6 +1506,9 @@ type VersionedSettings struct {
 	// AgentSecrets controls hub-level policy for secrets written by agents.
 	AgentSecrets *AgentSecretsSettings `json:"agent_secrets,omitempty" yaml:"agent_secrets,omitempty" koanf:"agent_secrets"`
 
+	// BrokerPolicy controls hub-level policy for Runtime Brokers.
+	BrokerPolicy *BrokerPolicySettings `json:"broker_policy,omitempty" yaml:"broker_policy,omitempty" koanf:"broker_policy"`
+
 	// ProjectID is the top-level project ID of a migrated legacy settings
 	// file, kept verbatim. hub.project_id is the canonical v1 key and takes
 	// precedence when set.
@@ -1539,6 +1542,15 @@ type AgentSecretsSettings struct {
 	// scope secrets only. Default false (nil is false): agents may write
 	// project scope as they do today.
 	UserScopeOnly *bool `json:"user_scope_only,omitempty" yaml:"user_scope_only,omitempty" koanf:"user_scope_only"`
+}
+
+// BrokerPolicySettings holds the hub-level policy for Runtime Brokers in
+// settings.yaml (ptone/scion#7829).
+type BrokerPolicySettings struct {
+	// AdminManagedOnly, when true (and experiment hub.admin_managed_brokers is
+	// enabled), restricts Runtime Broker registration, attachment, placement,
+	// and agent starts to admin-managed brokers. Default false (nil is false).
+	AdminManagedOnly *bool `json:"admin_managed_only,omitempty" yaml:"admin_managed_only,omitempty" koanf:"admin_managed_only"`
 }
 
 // ProjectDefaultsSettings holds project creation defaults in settings.yaml.
@@ -1914,11 +1926,18 @@ type V1ServerHubConfig struct {
 	WriteTimeout           string        `json:"write_timeout,omitempty" yaml:"write_timeout,omitempty" koanf:"write_timeout"`
 	CORS                   *V1CORSConfig `json:"cors,omitempty" yaml:"cors,omitempty" koanf:"cors"`
 	AdminEmails            []string      `json:"admin_emails,omitempty" yaml:"admin_emails,omitempty" koanf:"admin_emails"`
+	// AllowedImportSources is server.hub.allowed_import_sources (see
+	// HubServerConfig.AllowedImportSources). It is settings-file only (no env):
+	// the server-config API refuses it in every mode (AllowedImportSourcesKey).
+	AllowedImportSources []string `json:"allowed_import_sources,omitempty" yaml:"allowed_import_sources,omitempty" koanf:"allowed_import_sources"`
 
 	// SoftDeleteRetention is how long soft-deleted agents are retained (e.g., "72h").
 	SoftDeleteRetention string `json:"soft_delete_retention,omitempty" yaml:"soft_delete_retention,omitempty" koanf:"soft_delete_retention"`
 	// SoftDeleteRetainFiles controls whether workspace files are preserved during soft-delete.
 	SoftDeleteRetainFiles *bool `json:"soft_delete_retain_files,omitempty" yaml:"soft_delete_retain_files,omitempty" koanf:"soft_delete_retain_files"`
+	// AuditRetentionDays is the number of days to retain mutation audit records
+	// in the Hub database (default 90; 0 disables cleanup; negative rejected).
+	AuditRetentionDays *int `json:"audit_retention_days,omitempty" yaml:"audit_retention_days,omitempty" koanf:"audit_retention_days"`
 	// Chat holds web chat server limits (server.hub.chat).
 	Chat *V1ServerHubChatConfig `json:"chat,omitempty" yaml:"chat,omitempty" koanf:"chat"`
 	// GCPIAMCheckMode controls whether IAM actAs permission is checked when
@@ -1991,6 +2010,24 @@ type V1ServerHubConfig struct {
 	SystemOne *V1ServerHubSystemOneConfig `json:"system_one,omitempty" yaml:"system_one,omitempty" koanf:"system_one"`
 	// Branding holds Hub-wide UI branding settings (server.hub.branding).
 	Branding *BrandingConfig `json:"branding,omitempty" yaml:"branding,omitempty" koanf:"branding"`
+	// Schedules holds the limits on recurring schedules
+	// (server.hub.schedules). Read at startup.
+	Schedules *V1ServerHubSchedulesConfig `json:"schedules,omitempty" yaml:"schedules,omitempty" koanf:"schedules"`
+	// DefaultMessageMode is the message mode of a new agent when neither the
+	// create request, its template nor its parent agent sets one ("" =
+	// "project"; one of none, lineage, branch, project). Read at startup.
+	DefaultMessageMode string `json:"default_message_mode,omitempty" yaml:"default_message_mode,omitempty" koanf:"default_message_mode"`
+}
+
+// V1ServerHubSchedulesConfig holds the limits on recurring schedules
+// (server.hub.schedules).
+type V1ServerHubSchedulesConfig struct {
+	// MinInterval is the shortest interval a recurring schedule may fire at
+	// (e.g. "5m"; default "5m", "0s" turns the check off, at most "24h").
+	MinInterval string `json:"min_interval,omitempty" yaml:"min_interval,omitempty" koanf:"min_interval"`
+	// MaxActivePerProject caps the active recurring schedules of one
+	// project (default 100; 0 = no cap).
+	MaxActivePerProject *int `json:"max_active_per_project,omitempty" yaml:"max_active_per_project,omitempty" koanf:"max_active_per_project"`
 }
 
 // V1ServerHubSystemOneConfig holds Hub-wide System One rule evaluation
@@ -1999,6 +2036,10 @@ type V1ServerHubSystemOneConfig struct {
 	// MaxEvalTime bounds wall-clock evaluation of System One rules on a
 	// single message (e.g. "3s"; default "3s", hard max "30s").
 	MaxEvalTime string `json:"max_eval_time,omitempty" yaml:"max_eval_time,omitempty" koanf:"max_eval_time"`
+	// SecretNames maps System One adapter IDs to extra permitted named-secret
+	// keys (server.hub.system_one.secret_names). Startup/operator-only: never
+	// writable or echoed through the server-config API.
+	SecretNames map[string][]string `json:"secret_names,omitempty" yaml:"secret_names,omitempty" koanf:"secret_names"`
 }
 
 // V1ServerHubObservabilityConfig holds the switches for the hub's own
@@ -2245,6 +2286,9 @@ type V1BrokerConfig struct {
 	// Must be absolute or start with ~/. Flat Runtime Broker instances do
 	// not use it. Read at startup.
 	StateDir string `json:"state_dir,omitempty" yaml:"state_dir,omitempty" koanf:"state_dir"`
+	// InitFirewall configures the operator-authoritative egress firewall
+	// policy applied when an agent opts into SCION_INIT_FIREWALL.
+	InitFirewall *V1InitFirewallConfig `json:"init_firewall,omitempty" yaml:"init_firewall,omitempty" koanf:"init_firewall"`
 	// Instances declares the flat (single-target) Runtime Broker instances
 	// this process hosts (.design/flat-runtime-brokers-contract.md section 2).
 	// Empty or absent means legacy hosting. Each key must be unique; there is
@@ -2254,6 +2298,13 @@ type V1BrokerConfig struct {
 	// Read only through LoadGlobalConfig / LoadRuntimeBrokerInstances; project
 	// settings never configure instances.
 	Instances []V1RuntimeBrokerInstanceConfig `json:"instances,omitempty" yaml:"instances,omitempty" koanf:"instances"`
+}
+
+// V1InitFirewallConfig holds the operator-authoritative egress firewall
+// policy (server.broker.init_firewall).
+type V1InitFirewallConfig struct {
+	AllowDomains []string `json:"allow_domains,omitempty" yaml:"allow_domains,omitempty" koanf:"allow_domains"`
+	AllowSSH     bool     `json:"allow_ssh,omitempty" yaml:"allow_ssh,omitempty" koanf:"allow_ssh"`
 }
 
 // V1RuntimeBrokerInstanceConfig is one flat Runtime Broker instance.
@@ -2454,7 +2505,7 @@ type V1TransportConfig struct {
 
 // V1ProxyConfig holds proxy authentication settings (consulted when auth.mode == "proxy").
 type V1ProxyConfig struct {
-	// Provider selects the proxy auth provider: "iap", "jwt", or "header".
+	// Provider selects the proxy auth provider: "iap" or "jwt".
 	Provider string `json:"provider,omitempty" yaml:"provider,omitempty" koanf:"provider"`
 	// IAP holds Google IAP-specific settings.
 	IAP *V1IAPConfig `json:"iap,omitempty" yaml:"iap,omitempty" koanf:"iap"`
@@ -2485,14 +2536,15 @@ type V1IAPConfig struct {
 // V1JWTAuthConfig holds settings for the generic JWT proxy auth provider
 // (V1/snake_case settings.yaml equivalent of JWTAuthConfig).
 type V1JWTAuthConfig struct {
-	Header        string             `json:"header,omitempty" yaml:"header,omitempty" koanf:"header"`
-	Algorithm     string             `json:"algorithm,omitempty" yaml:"algorithm,omitempty" koanf:"algorithm"`
-	Issuer        string             `json:"issuer,omitempty" yaml:"issuer,omitempty" koanf:"issuer"`
-	Audience      string             `json:"audience,omitempty" yaml:"audience,omitempty" koanf:"audience"`
-	JWKSURL       string             `json:"jwks_url,omitempty" yaml:"jwks_url,omitempty" koanf:"jwks_url"`
-	JWKSFile      string             `json:"jwks_file,omitempty" yaml:"jwks_file,omitempty" koanf:"jwks_file"`
-	PublicKeyFile string             `json:"public_key_file,omitempty" yaml:"public_key_file,omitempty" koanf:"public_key_file"`
-	Claims        *V1JWTClaimsConfig `json:"claims,omitempty" yaml:"claims,omitempty" koanf:"claims"`
+	Header          string             `json:"header,omitempty" yaml:"header,omitempty" koanf:"header"`
+	IdentityHeaders []string           `json:"identity_headers,omitempty" yaml:"identity_headers,omitempty" koanf:"identity_headers"`
+	Algorithm       string             `json:"algorithm,omitempty" yaml:"algorithm,omitempty" koanf:"algorithm"`
+	Issuer          string             `json:"issuer,omitempty" yaml:"issuer,omitempty" koanf:"issuer"`
+	Audience        string             `json:"audience,omitempty" yaml:"audience,omitempty" koanf:"audience"`
+	JWKSURL         string             `json:"jwks_url,omitempty" yaml:"jwks_url,omitempty" koanf:"jwks_url"`
+	JWKSFile        string             `json:"jwks_file,omitempty" yaml:"jwks_file,omitempty" koanf:"jwks_file"`
+	PublicKeyFile   string             `json:"public_key_file,omitempty" yaml:"public_key_file,omitempty" koanf:"public_key_file"`
+	Claims          *V1JWTClaimsConfig `json:"claims,omitempty" yaml:"claims,omitempty" koanf:"claims"`
 }
 
 // V1JWTClaimsConfig maps JWT claim names to identity fields (V1/snake_case
@@ -3543,6 +3595,9 @@ const (
 	// ReadyStrategyDelay means the harness is ready once its tmux session has
 	// existed for the settle period.
 	ReadyStrategyDelay = state.ReadyStrategyDelay
+	// ReadyStrategyIdle means the harness settles into idle rather than working
+	// (used by the built-in execution container).
+	ReadyStrategyIdle = state.ReadyStrategyIdle
 )
 
 // Ready and delivery limits and delivery defaults. The ready defaults are
@@ -4755,6 +4810,9 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 		if v1.Hub.AdminEmails != nil {
 			gc.Hub.AdminEmails = v1.Hub.AdminEmails
 		}
+		if v1.Hub.AllowedImportSources != nil {
+			gc.Hub.AllowedImportSources = v1.Hub.AllowedImportSources
+		}
 		if v1.Hub.SoftDeleteRetention != "" {
 			if d, err := time.ParseDuration(v1.Hub.SoftDeleteRetention); err == nil {
 				gc.Hub.SoftDeleteRetention = d
@@ -4762,6 +4820,10 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 		}
 		if v1.Hub.SoftDeleteRetainFiles != nil {
 			gc.Hub.SoftDeleteRetainFiles = *v1.Hub.SoftDeleteRetainFiles
+		}
+		if v1.Hub.AuditRetentionDays != nil {
+			v := *v1.Hub.AuditRetentionDays
+			gc.Hub.AuditRetentionDays = &v
 		}
 		if v1.Hub.Chat != nil && v1.Hub.Chat.Search != nil {
 			cs := v1.Hub.Chat.Search
@@ -4880,11 +4942,22 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 			}
 		}
 		if so := v1.Hub.SystemOne; so != nil {
-			gc.Hub.SystemOne = HubSystemOneConfig{MaxEvalTime: so.MaxEvalTime}
+			gc.Hub.SystemOne = HubSystemOneConfig{
+				MaxEvalTime: so.MaxEvalTime,
+				SecretNames: cloneStringSliceMap(so.SecretNames),
+			}
 		}
 		if b := v1.Hub.Branding; b != nil {
 			gc.Hub.Branding = b.CloneValue()
 		}
+		if sc := v1.Hub.Schedules; sc != nil {
+			gc.Hub.Schedules = HubSchedulesConfig{MinInterval: sc.MinInterval}
+			if sc.MaxActivePerProject != nil {
+				n := *sc.MaxActivePerProject
+				gc.Hub.Schedules.MaxActivePerProject = &n
+			}
+		}
+		gc.Hub.DefaultMessageMode = v1.Hub.DefaultMessageMode
 	}
 
 	if r := v1.Relay; r != nil {
@@ -4947,6 +5020,12 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 			gc.RuntimeBroker.AllowContainerScriptHarnesses = *v1.Broker.AllowContainerScriptHarnesses
 		} else {
 			gc.RuntimeBroker.AllowContainerScriptHarnesses = true
+		}
+		if v1.Broker.InitFirewall != nil {
+			gc.RuntimeBroker.InitFirewall = &InitFirewallConfig{
+				AllowDomains: append([]string(nil), v1.Broker.InitFirewall.AllowDomains...),
+				AllowSSH:     v1.Broker.InitFirewall.AllowSSH,
+			}
 		}
 		gc.RuntimeBroker.Instances = v1InstancesToGlobal(v1.Broker.Instances)
 	}
@@ -5013,13 +5092,14 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 			}
 			if v1.Auth.Proxy.JWT != nil {
 				gc.Auth.Proxy.JWT = &JWTAuthConfig{
-					Header:        v1.Auth.Proxy.JWT.Header,
-					Algorithm:     v1.Auth.Proxy.JWT.Algorithm,
-					Issuer:        v1.Auth.Proxy.JWT.Issuer,
-					Audience:      v1.Auth.Proxy.JWT.Audience,
-					JWKSURL:       v1.Auth.Proxy.JWT.JWKSURL,
-					JWKSFile:      v1.Auth.Proxy.JWT.JWKSFile,
-					PublicKeyFile: v1.Auth.Proxy.JWT.PublicKeyFile,
+					Header:          v1.Auth.Proxy.JWT.Header,
+					IdentityHeaders: append([]string(nil), v1.Auth.Proxy.JWT.IdentityHeaders...),
+					Algorithm:       v1.Auth.Proxy.JWT.Algorithm,
+					Issuer:          v1.Auth.Proxy.JWT.Issuer,
+					Audience:        v1.Auth.Proxy.JWT.Audience,
+					JWKSURL:         v1.Auth.Proxy.JWT.JWKSURL,
+					JWKSFile:        v1.Auth.Proxy.JWT.JWKSFile,
+					PublicKeyFile:   v1.Auth.Proxy.JWT.PublicKeyFile,
 				}
 				if v1.Auth.Proxy.JWT.Claims != nil {
 					gc.Auth.Proxy.JWT.Claims = &JWTClaimsConfig{
@@ -5235,6 +5315,7 @@ func ConvertGlobalToV1ServerConfig(gc *GlobalConfig) *V1ServerConfig {
 		ReadTimeout:            gc.Hub.ReadTimeout.String(),
 		WriteTimeout:           gc.Hub.WriteTimeout.String(),
 		AdminEmails:            gc.Hub.AdminEmails,
+		AllowedImportSources:   gc.Hub.AllowedImportSources,
 		CORS: &V1CORSConfig{
 			Enabled:        gc.Hub.CORSEnabled,
 			AllowedOrigins: gc.Hub.CORSAllowedOrigins,
@@ -5324,11 +5405,22 @@ func ConvertGlobalToV1ServerConfig(gc *GlobalConfig) *V1ServerConfig {
 		}
 	}
 	if so := gc.Hub.SystemOne; !so.IsZero() {
-		v1Hub.SystemOne = &V1ServerHubSystemOneConfig{MaxEvalTime: so.MaxEvalTime}
+		v1Hub.SystemOne = &V1ServerHubSystemOneConfig{
+			MaxEvalTime: so.MaxEvalTime,
+			SecretNames: so.CloneSecretNames(),
+		}
 	}
 	if b := gc.Hub.Branding; !b.IsZero() {
 		v1Hub.Branding = b.Clone()
 	}
+	if sc := gc.Hub.Schedules; !sc.IsZero() {
+		v1Hub.Schedules = &V1ServerHubSchedulesConfig{MinInterval: sc.MinInterval}
+		if sc.MaxActivePerProject != nil {
+			n := *sc.MaxActivePerProject
+			v1Hub.Schedules.MaxActivePerProject = &n
+		}
+	}
+	v1Hub.DefaultMessageMode = gc.Hub.DefaultMessageMode
 	if gc.Hub.StartClaimLeaseTTL > 0 {
 		v1Hub.StartClaimLeaseTTL = gc.Hub.StartClaimLeaseTTL.String()
 	}
@@ -5348,6 +5440,10 @@ func ConvertGlobalToV1ServerConfig(gc *GlobalConfig) *V1ServerConfig {
 	if gc.Hub.SoftDeleteRetainFiles {
 		retainFiles := true
 		v1Hub.SoftDeleteRetainFiles = &retainFiles
+	}
+	if gc.Hub.AuditRetentionDays != nil {
+		days := *gc.Hub.AuditRetentionDays
+		v1Hub.AuditRetentionDays = &days
 	}
 	if gc.Hub.DisableLegacyStorageFallback {
 		disableLegacy := true
@@ -5399,6 +5495,12 @@ func ConvertGlobalToV1ServerConfig(gc *GlobalConfig) *V1ServerConfig {
 		},
 		Instances: globalInstancesToV1(gc.RuntimeBroker.Instances),
 	}
+	if gc.RuntimeBroker.InitFirewall != nil {
+		v1.Broker.InitFirewall = &V1InitFirewallConfig{
+			AllowDomains: append([]string(nil), gc.RuntimeBroker.InitFirewall.AllowDomains...),
+			AllowSSH:     gc.RuntimeBroker.InitFirewall.AllowSSH,
+		}
+	}
 
 	// Database config
 	v1.Database = &V1DatabaseConfig{
@@ -5445,13 +5547,14 @@ func ConvertGlobalToV1ServerConfig(gc *GlobalConfig) *V1ServerConfig {
 		}
 		if gc.Auth.Proxy.JWT != nil {
 			v1.Auth.Proxy.JWT = &V1JWTAuthConfig{
-				Header:        gc.Auth.Proxy.JWT.Header,
-				Algorithm:     gc.Auth.Proxy.JWT.Algorithm,
-				Issuer:        gc.Auth.Proxy.JWT.Issuer,
-				Audience:      gc.Auth.Proxy.JWT.Audience,
-				JWKSURL:       gc.Auth.Proxy.JWT.JWKSURL,
-				JWKSFile:      gc.Auth.Proxy.JWT.JWKSFile,
-				PublicKeyFile: gc.Auth.Proxy.JWT.PublicKeyFile,
+				Header:          gc.Auth.Proxy.JWT.Header,
+				IdentityHeaders: append([]string(nil), gc.Auth.Proxy.JWT.IdentityHeaders...),
+				Algorithm:       gc.Auth.Proxy.JWT.Algorithm,
+				Issuer:          gc.Auth.Proxy.JWT.Issuer,
+				Audience:        gc.Auth.Proxy.JWT.Audience,
+				JWKSURL:         gc.Auth.Proxy.JWT.JWKSURL,
+				JWKSFile:        gc.Auth.Proxy.JWT.JWKSFile,
+				PublicKeyFile:   gc.Auth.Proxy.JWT.PublicKeyFile,
 			}
 			if gc.Auth.Proxy.JWT.Claims != nil {
 				v1.Auth.Proxy.JWT.Claims = &V1JWTClaimsConfig{

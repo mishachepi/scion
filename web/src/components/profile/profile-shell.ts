@@ -36,9 +36,14 @@ import {
   renderTestHubBanner,
   testHubBannerStyles,
 } from '../shared/test-hub-banner.js';
+import {
+  renderViewAsMemberBanner,
+  viewAsMemberBannerStyles,
+} from '../shared/view-as-member-banner.js';
 
 const PROFILE_TITLES: Record<string, string> = {
   '/profile': 'Profile',
+  '/profile/inbox': 'Inbox',
   '/profile/decisions': 'Decisions',
   '/profile/env': 'Environment Variables',
   '/profile/secrets': 'Secrets',
@@ -67,6 +72,7 @@ export class ScionProfileShell extends LitElement {
 
   static override styles = css`
     ${testHubBannerStyles}
+    ${viewAsMemberBannerStyles}
 
     :host {
       display: flex;
@@ -217,7 +223,10 @@ export class ScionProfileShell extends LitElement {
         class="mobile-drawer"
         ?open=${this._drawerOpen}
         placement="start"
-        @sl-hide=${(): void => this.handleDrawerClose()}
+        @sl-hide=${(e: Event): void => {
+          if (e.target !== e.currentTarget) return;
+          this.handleDrawerClose();
+        }}
       >
         <scion-profile-nav
           .user=${this.user}
@@ -228,6 +237,7 @@ export class ScionProfileShell extends LitElement {
 
       <main class="main">
         ${keyed(this.currentPath, renderTestHubBanner(this._testHubBanner.status))}
+        ${renderViewAsMemberBanner(this.user)}
         <scion-header
           .user=${this.user}
           .currentPath=${this.currentPath}

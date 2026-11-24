@@ -60,6 +60,14 @@ configurable — `cloud-init.yaml`'s Docker apt-repo setup is written for this
 specific image. This is not something the operator needs to prepare locally;
 it's noted here because it affects what the deployed VM looks like.
 
+> **Warning — never use `scion` as an SSH or OS Login username:** The Hub runs as
+> the `scion` Unix service account on the VM. On GCE, SSH or OS Login as `scion`
+> (or a `scion` key in project/instance SSH metadata) causes the Compute Engine
+> guest agent to add `scion` to `google-sudoers` (passwordless root). Never run
+> `gcloud compute ssh scion@...` or run `deploy.sh` from a local user named
+> `scion` without an OS Login / distinct SSH identity; `deploy.sh` warns if
+> `scion` is detected in `google-sudoers`.
+
 ---
 
 ## 2. GCP Preflight
@@ -607,8 +615,8 @@ VM tag.
 **Known limits.** See `docs/deploy/hybrid-tier.md`'s own Known limits
 section for `ptone/scion#1799` (image pinning: use `--image <digest>` at
 agent start, not a profile's `harness_overrides`, since a template's own
-image default wins over it for both Docker and GKE agents),
-`ptone/scion#1800`, and `ptone/scion#1801`. For hardening an NFS tree that
+image default wins over it for both Docker and GKE agents) and
+`ptone/scion#1800`. For hardening an NFS tree that
 was exported before a dedicated squash identity was in place, see that
 same page's manual fix-up recipe under "E2 hardening: dedicated squash
 identity + default ACL".
@@ -851,15 +859,14 @@ Phase 3 `settings.yaml` sets `server.auth.mode: dev`, but that setting alone doe
 not enable dev auth, so until the Phase 5 proxy settings are written every
 authenticated API call returns `401`. This is expected; do not treat it as a
 failed deploy. Dev auth is enabled only by `--dev-auth` or
-`server.auth.dev_mode: true`, and the server refuses to start with dev auth
-when the web server binds a non-loopback address. The Phase 3 bootstrap
-binds the Hub to `127.0.0.1` (the server refuses a non-loopback listener
-without an https base URL, which exists only once Phase 5 writes the IAP
-audience); from Phase 5 on the Hub binds `0.0.0.0` so the IAP proxy can
-reach it, so do not enable dev auth on the VM.
+`server.auth.dev_mode: true`, and the VM's server runs in hosted mode
+(`--hosted`), which refuses to start with dev auth enabled, so do not enable
+dev auth on the VM. The Phase 3 bootstrap binds the Hub to `127.0.0.1` (the
+server refuses a non-loopback listener without an https base URL, which
+exists only once Phase 5 writes the IAP audience); from Phase 5 on the Hub
+binds `0.0.0.0` so the IAP proxy can reach it.
 If the user needs authenticated access before Phase 5, configure OAuth
-instead, or, for a short-lived test only, bind the Hub to `127.0.0.1` with
-dev auth and use an SSH tunnel; see the `settings.yaml` section of
+instead; see the `settings.yaml` section of
 [single-node-vm.md](single-node-vm.md#settingsyaml).
 
 **If it fails:** Check service logs:

@@ -186,7 +186,7 @@ export class ScionAgentLogViewer extends LitElement {
     .sev {
       display: inline-block;
       padding: 0.0625rem 0.375rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
       font-size: 0.6875rem;
       font-weight: 600;
       text-transform: uppercase;
@@ -198,7 +198,7 @@ export class ScionAgentLogViewer extends LitElement {
       color: var(--scion-neutral-500, #64748b);
     }
     .sev-INFO {
-      background: var(--scion-primary-50, #eff6ff);
+      background: var(--scion-primary-tint, #eff6ff);
       color: var(--scion-primary-700, #1d4ed8);
     }
     .sev-WARNING {

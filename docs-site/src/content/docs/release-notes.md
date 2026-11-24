@@ -6,12 +6,41 @@ Scion release notes are published for each preview and stable release. Earlier n
 
 ## Releases
 
+- [v0.4.0-preview.4](/scion/release-notes/v0-4-0-preview-4/)
 - [v0.4.0-preview.3](/scion/release-notes/v0-4-0-preview-3/)
 - [v0.4.0-preview.2](/scion/release-notes/v0-4-0-preview-2/)
 - [v0.4.0-preview.1](/scion/release-notes/v0-4-0-preview-1/)
 - [v0.3.0](/scion/release-notes/v0-3-0/)
 - [v0.3.0-preview.7](/scion/release-notes/v0-3-0-preview-7/)
 - [v0.3.0-preview.6](/scion/release-notes/v0-3-0-preview-6/)
+
+## Default `server.hub.schedules.max_active_per_project` cap raised to 100
+
+The default per-project cap on active recurring schedules (`server.hub.schedules.max_active_per_project`) has been raised from `50` to `100` so projects with routine per-agent schedules (such as nightly retrospectives, heartbeats, and sweeps) have more headroom before new schedule creates are refused with `429` (`quota_exceeded`). Setting `0` still disables the cap, and the maximum allowed value (`10000`) is unchanged. See [Server Configuration — Recurring schedules](/scion/reference/server-config/#recurring-schedules-serverhubschedules).
+
+## Metadata interception: runtime-managed `netns-setup`, broker/image upgrade order, and skew guards
+
+For Docker and rootful Podman agents using `block` or `assign` metadata mode (outside `host` networking), metadata interception rules are now installed by a short-lived `sciontool netns-setup` setup container sharing the agent's network namespace rather than inside the agent container, so the agent container itself no longer receives `CAP_NET_ADMIN`.
+
+- **Upgrade order — update agent images before Runtime Brokers:** Newer agent images advertise `scion.sciontool.capabilities=netns-setup` and include a compatibility fallback in `sciontool init`. When launched by an older Runtime Broker (which grants `CAP_NET_ADMIN` without setting `SCION_METADATA_INTERCEPTION_SOURCE=runtime`), `sciontool init` installs the interception rules in-container and drops `CAP_NET_ADMIN` before any agent code runs, failing closed if setup or capability drop fails. Upgrading agent images first and Runtime Brokers second avoids start refusals during rolling upgrades.
+- **Broker-side version-skew classification:** Agent images advertise `scion.sciontool.capabilities=netns-setup`. Docker and rootful Podman Runtime Brokers log a warning when a local image lacks that label (allowing unlabeled images that already include `sciontool netns-setup` to continue working) and classify missing `sciontool netns-setup` support on container start as the typed launch failure code `image_lacks_netns_setup` instead of a generic `runtime_error`. Hub agent-status error logs classify in-container metadata interception refusals under `failure_stage=metadata_interception_marker_missing` and `metadata_protection_unavailable`.
+- **Pin image tags to your broker build:** Fleets that pull floating image tags (such as `:latest`) on a separate cadence from Runtime Broker binary rolls should pin agent image tags to the Runtime Broker's release tag or commit SHA so images and brokers do not cross contract boundaries independently. See [Security — Credentials Propagation](/scion/reference/security/#45-credentials-propagation).
+
+## GitHub App installation association authorization and refusal logging
+
+GitHub App installation associations are now re-validated on every token mint and refused unless the project's `gitRemote` is on the configured GitHub host, the installation is active and owned by the remote's account, and either an active Hub administrator bound the installation (`PUT /api/v1/projects/{id}/github-installation`, requiring `hub.github_app.update`) or the project creator's user-scope `GITHUB_TOKEN` secret has repository access on GitHub.
+
+- **Existing associations on upgrade:** Associations recorded before authorization enforcement are not migrated and stop yielding tokens (`association_unauthorized`) at their next mint if neither proof holds. Administrators holding `hub.github_app.read` can list all associated projects and see which ones are unauthorized via `GET /api/v1/github-app/installations/association-report` (optional `?refresh=true`).
+- **Automation-created projects and binder re-validation:** Projects created by service accounts or creators without a user-scope `GITHUB_TOKEN` cannot be auto-associated by `POST /api/v1/github-app/installations/discover` or webhooks and require an explicit admin binding via `PUT /api/v1/projects/{id}/github-installation`. Admin bindings are re-validated on every token mint—if the binder is deactivated, deleted, or loses `hub.github_app.update` (or the project's remote changes), minting stops until another authorized administrator re-binds the installation.
+- **Refusal log volume:** Repeated identical token-mint association refusals for the same project, installation, and reason are now logged once per state change rather than on every broker poll. See [GitHub App Integration — Project Association](/scion/hosted/single-node/auth/#project-association).
+
+## Message schedules now require a live target agent at authoring, resume, and dispatch-changing updates
+
+Creating a one-shot message scheduled event or a recurring message schedule for an agent that does not exist yet (or is deleted, has a payload `agentId` whose `agentName` disagrees with the agent's slug, or is unreadable and not permitted to message — including an unreadable cross-project target while cross-project messaging is disabled) now fails with `404` (`Agent not found`), matching the trigger authoring rule. An unreadable target that the caller *may* message is accepted, and a conflict between the raw `payload` target and the convenience target fields returns `400`. Previously, unresolved or unreadable targets were accepted at authoring and refused only at fire time.
+
+- **Resume and dispatch-changing updates:** Resuming a paused message schedule (`POST .../resume` or `PATCH` with `status: "active"`), or making any dispatch-changing `PATCH` update (changing `payload`, `cronExpr`, `timeZone`, or `eventType`), now fails with `404` when the target no longer resolves or is unreadable and not permitted to message. Re-target the schedule to a live agent via `PATCH` before resuming.
+- **Metadata-only updates, pause, and delete:** Name-only `PATCH` edits (which do not bump the authorization revision), pausing, and deleting remain accepted regardless of target state. A readable-but-unauthorized existing target (or a readable cross-project target with cross-project messaging disabled) still returns `403`.
+- **Existing schedules:** Stored schedules and scheduled events are not migrated or re-validated on upgrade, and fire-time checks are unchanged. See [Scheduling — Security & Authorization](/scion/hosted/user/scheduling/#security--authorization).
 
 ## Scheduled agent dispatch creates owned agents with credentials and environment gathering
 

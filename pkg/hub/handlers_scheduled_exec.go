@@ -60,7 +60,7 @@ func (s *Server) createScheduledExecEvent(w http.ResponseWriter, r *http.Request
 
 	var p *scheduledExecPayload
 	if req.Payload != "" {
-		if len(req.Command) > 0 || req.TimeoutSeconds != 0 || req.AgentID != "" || req.AgentName != "" {
+		if len(req.Command) > 0 || req.TimeoutSeconds != 0 || req.CaptureOutput != "" || req.AgentID != "" || req.AgentName != "" {
 			ValidationError(w, "give either payload or the exec convenience fields, not both", nil)
 			return
 		}
@@ -72,12 +72,17 @@ func (s *Server) createScheduledExecEvent(w http.ResponseWriter, r *http.Request
 			BadRequest(w, err.Error())
 			return
 		}
+		if len(p.ContextAttributes) > 0 {
+			ValidationError(w, "contextAttributes is not supported for schedules", nil)
+			return
+		}
 	} else {
 		p = &scheduledExecPayload{
 			AgentID:        req.AgentID,
 			AgentName:      req.AgentName,
 			Command:        req.Command,
 			TimeoutSeconds: req.TimeoutSeconds,
+			CaptureOutput:  req.CaptureOutput,
 		}
 		if err := p.validate(); err != nil {
 			ValidationError(w, err.Error(), nil)
@@ -168,7 +173,7 @@ func (s *Server) createExecSchedule(w http.ResponseWriter, r *http.Request, proj
 
 	var p *scheduledExecPayload
 	if req.Payload != "" {
-		if req.Command != nil || req.TimeoutSeconds != 0 || req.AgentID != "" || req.AgentName != "" {
+		if req.Command != nil || req.TimeoutSeconds != 0 || req.CaptureOutput != "" || req.AgentID != "" || req.AgentName != "" {
 			ValidationError(w, "give either payload or the exec convenience fields, not both", nil)
 			return
 		}
@@ -180,12 +185,17 @@ func (s *Server) createExecSchedule(w http.ResponseWriter, r *http.Request, proj
 			BadRequest(w, err.Error())
 			return
 		}
+		if len(p.ContextAttributes) > 0 {
+			ValidationError(w, "contextAttributes is not supported for schedules", nil)
+			return
+		}
 	} else {
 		p = &scheduledExecPayload{
 			AgentID:        req.AgentID,
 			AgentName:      req.AgentName,
 			Command:        req.Command,
 			TimeoutSeconds: req.TimeoutSeconds,
+			CaptureOutput:  req.CaptureOutput,
 		}
 		if err := p.validate(); err != nil {
 			ValidationError(w, err.Error(), nil)
@@ -195,6 +205,9 @@ func (s *Server) createExecSchedule(w http.ResponseWriter, r *http.Request, proj
 
 	if _, err := parseScheduleCron(req.CronExpr); err != nil {
 		writeCronParseError(w, err)
+		return
+	}
+	if !s.checkScheduleFrequency(w, req.CronExpr) {
 		return
 	}
 	timeZone, err := normalizeScheduleTimeZone(req.TimeZone)
@@ -247,11 +260,14 @@ func (s *Server) createExecSchedule(w http.ResponseWriter, r *http.Request, proj
 	}
 
 	targetID := p.AgentID
+	maxActive := s.config.ScheduleMaxActivePerProject
 	if err := s.store.CreateScheduleChecked(r.Context(), &schedule, scheduledExecMaxPerProject+1, func(snap store.ScheduledExecQuotaSnapshot) error {
-		return scheduledExecQuotaCheck(snap, targetID, "")
+		if err := scheduledExecQuotaCheck(snap, targetID, ""); err != nil {
+			return err
+		}
+		return scheduleQuotaCheck(snap, maxActive)
 	}); err != nil {
-		if errors.Is(err, errScheduledExecQuota) {
-			writeError(w, http.StatusTooManyRequests, ErrCodeQuotaExceeded, err.Error(), nil)
+		if writeScheduleQuotaError(w, err) {
 			return
 		}
 		if errors.Is(err, store.ErrAlreadyExists) {
@@ -303,6 +319,10 @@ func (s *Server) prepareExecScheduleUpdate(
 			BadRequest(w, err.Error())
 			return nil, "", false
 		}
+		if len(decoded.ContextAttributes) > 0 {
+			ValidationError(w, "contextAttributes is not supported for schedules", nil)
+			return nil, "", false
+		}
 		p = decoded
 	case hasExecFields:
 		var base scheduledExecPayload
@@ -323,6 +343,9 @@ func (s *Server) prepareExecScheduleUpdate(
 		}
 		if req.TimeoutSeconds != nil {
 			base.TimeoutSeconds = *req.TimeoutSeconds
+		}
+		if req.CaptureOutput != nil {
+			base.CaptureOutput = *req.CaptureOutput
 		}
 		if err := base.validate(); err != nil {
 			ValidationError(w, err.Error(), nil)

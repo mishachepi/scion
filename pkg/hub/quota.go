@@ -471,8 +471,9 @@ type TransferOpts struct {
 // ErrQuotaLockContention when enforcement is on, and proceeds unchecked when
 // it is off; with enforcement off the cap is not applied. Both unlocks are
 // deferred, so they run after the transaction has committed or rolled back.
-// A full target returns a *QuotaExceededError naming it, and the source
-// reservation is unchanged.
+// A full target returns a *QuotaExceededError naming it along with the
+// observed active count and effective limit, and the source reservation is
+// unchanged.
 func (qs *QuotaService) TransferBroker(ctx context.Context, agentID, toBroker string, o TransferOpts) (res store.BrokerReservationTransferResult, limited bool, err error) {
 	const limitName = store.LimitMaxAgentsPerBroker
 	req, limited, err := brokerTransferRequest(ctx, qs.store, agentID, toBroker, o)
@@ -514,7 +515,13 @@ func (qs *QuotaService) TransferBroker(ctx context.Context, agentID, toBroker st
 
 	res, err = qs.store.TransferBrokerReservation(ctx, req)
 	if errors.Is(err, store.ErrQuotaExceeded) {
-		return res, true, &QuotaExceededError{Limit: limitName, ScopeType: store.QuotaScopeBroker, ScopeID: toBroker}
+		return res, true, &QuotaExceededError{
+			Limit:     limitName,
+			ScopeType: store.QuotaScopeBroker,
+			ScopeID:   toBroker,
+			Count:     res.TargetCount,
+			Max:       effectiveLimit,
+		}
 	}
 	if err != nil {
 		return res, true, fmt.Errorf("quota: transfer reservation for %q: %w", limitName, err)
@@ -724,26 +731,43 @@ func (qs *QuotaService) resolveEffectiveLimitWithSource(ctx context.Context, lim
 // reservations under several limits (an agent holds both
 // max_agents_per_broker and max_agents_per_project), and releasing one must
 // not release the others (ptone/scion#1978). It is a no-op when the limit is
-// not defined or the resource holds no active reservation for it. Errors
-// are logged but not returned: deletion must not be blocked by quota
-// bookkeeping.
+// not defined or the resource holds no active reservation for it.
+//
+// It detaches from ctx's cancellation with a dedicated timeout
+// (quotaReleaseTimeout) so an expiring lifecycle budget does not leak
+// reservations until sweep, and recovers from panics so subsequent cleanup
+// steps still run (ptone/scion#8862). Errors are logged but not returned:
+// deletion and suspend must not be blocked by quota bookkeeping.
 func (qs *QuotaService) Release(ctx context.Context, limitName string, resourceID string) {
-	limitDef, err := qs.store.GetLimitDefinitionByName(ctx, limitName)
-	if err != nil {
-		if !errors.Is(err, store.ErrNotFound) {
-			qs.logger.Warn("failed to release quota reservation: limit lookup failed",
-				"limit", limitName, "resource_id", resourceID, "error", err)
-		}
+	if qs == nil || qs.store == nil {
 		return
 	}
-	if limitDef == nil {
-		// No limit defined — nothing to release.
-		return
+	logger := qs.logger
+	if logger == nil {
+		logger = slog.Default()
 	}
-	if err := qs.store.ReleaseReservation(ctx, limitDef.ID, resourceID); err != nil && !errors.Is(err, store.ErrNotFound) {
-		qs.logger.Warn("failed to release quota reservation",
-			"limit", limitName, "resource_id", resourceID, "error", err)
-	}
+	_ = runBestEffortCleanupStep(ctx, quotaReleaseTimeout, logger,
+		"quota_release", "recovered panic releasing quota reservation",
+		[]any{"limit", limitName, "resource_id", resourceID},
+		func(releaseCtx context.Context) error {
+			limitDef, err := qs.store.GetLimitDefinitionByName(releaseCtx, limitName)
+			if err != nil {
+				if !errors.Is(err, store.ErrNotFound) {
+					logger.Warn("failed to release quota reservation: limit lookup failed",
+						"limit", limitName, "resource_id", resourceID, "error", err)
+				}
+				return nil
+			}
+			if limitDef == nil {
+				// No limit defined — nothing to release.
+				return nil
+			}
+			if err := qs.store.ReleaseReservation(releaseCtx, limitDef.ID, resourceID); err != nil && !errors.Is(err, store.ErrNotFound) {
+				logger.Warn("failed to release quota reservation",
+					"limit", limitName, "resource_id", resourceID, "error", err)
+			}
+			return nil
+		})
 }
 
 // matchesScope checks whether a binding's scope matches the requested scope.

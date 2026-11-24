@@ -28,7 +28,13 @@ The agent will be created from a template and run in a detached container.
 
 The agent-name is required as the first argument. All subsequent arguments
 form the task prompt. The task is optional — if none is given, the agent
-starts interactively or uses its template's built-in prompt.`,
+starts interactively or uses its template's built-in prompt.
+
+If an agent with that name already exists in a suspended, stopped, or halted
+phase, start refuses to reuse it (409 agent_exists_resumable); run
+'scion resume <agent-name>' instead, delete it, or use another name.
+Agents in the created or provisioning phase (such as after 'scion create')
+or with a launch already in flight continue to be started or followed.`,
 	Args:              cobra.MinimumNArgs(1),
 	ValidArgsFunction: getAgentNames,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -52,7 +58,7 @@ func init() {
 
 	startCmd.Flags().StringVarP(&workspace, "workspace", "w", "", "Host path or project-relative subdirectory to mount as /workspace")
 
-	startCmd.Flags().StringVar(&runtimeBrokerID, "broker", "", "Preferred runtime broker ID, name, or slug")
+	startCmd.Flags().StringVar(&runtimeBrokerID, "broker", "", "Preferred runtime broker ID, name, slug, or unique prefix")
 	startCmd.Flags().StringVar(&harnessConfigFlag, "harness-config", "", "Named harness configuration to use")
 	startCmd.Flags().StringVar(&harnessConfigFlag, "harness", "", "Named harness configuration to use (alias for --harness-config)")
 
@@ -80,6 +86,7 @@ func init() {
 	// Inline config flag
 	startCmd.Flags().StringVar(&inlineConfigPath, "config", "", "Path to inline agent config file (YAML/JSON), or '-' for stdin")
 	startCmd.Flags().StringVar(&taskFilePath, "task-file", "", taskFileFlagUsage)
+	startCmd.Flags().StringVar(&secretsFilePath, secretsFileFlagName, "", secretsFileFlagUsage)
 
 	// Model flag
 	startCmd.Flags().StringVar(&modelFlag, "model", "", "Model to use: alias (small, medium, large, extra-large/xl) or explicit model ID")
@@ -100,7 +107,7 @@ func init() {
 	startCmd.Flags().StringVar(&messageModeFlag, "message-mode", "",
 		"Agent message mode: none, lineage, branch, project, hub\n"+
 			"Controls which agents and users this agent can message.\n"+
-			"Default: the template's mode, else the parent agent's, else 'project'.")
+			"Default: the template's mode, else the parent agent's, else the Hub's default message mode (server.hub.default_message_mode, 'project' unless the operator sets it).")
 
 	// Hub launch wait flags
 	startCmd.Flags().BoolVar(&startNoWait, "no-wait", false, "Return once the Hub accepts the agent, without waiting for it to be running")

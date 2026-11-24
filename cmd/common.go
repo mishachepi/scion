@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -441,6 +442,28 @@ func loadSettingsForTarget(resolvedPath string) (*config.Settings, error) {
 	return config.LoadSettings(resolvedPath)
 }
 
+// targetProjectIDFromSettings returns the effective Hub project ID from
+// settings loaded for the current CLI target (see loadSettingsForTarget).
+// When no explicit --project / --global flag was given and the CLI runs in
+// agent/container mode, SCION_HUB_PROJECT_ID / SCION_PROJECT_ID takes
+// precedence over any workspace .scion/project-id or hub.project_id file
+// (ptone/scion#8302). Otherwise hub.project_id (explicit Hub link) wins over
+// ProjectID.
+func targetProjectIDFromSettings(settings *config.Settings) string {
+	if !explicitProjectTarget() {
+		if envID := config.ContainerProjectIDFromEnv(); envID != "" {
+			return envID
+		}
+	}
+	if settings == nil {
+		return ""
+	}
+	if hgid := settings.GetHubProjectID(); hgid != "" {
+		return hgid
+	}
+	return settings.ProjectID
+}
+
 // requireHub returns a ready-to-use Hub context for projectPath. Every
 // agent operation goes through a hub, so it never returns a nil HubContext
 // without an error:
@@ -707,16 +730,63 @@ func wrapHubError(err error) error {
 		return &hubError{msg: msg, err: err}
 	}
 	var apiErr *apiclient.APIError
-	if errors.As(err, &apiErr) && apiErr.Code == api.ErrCodeRuntimeProfileUnsupported {
-		return &hubError{
-			msg: err.Error() + "; select the target Runtime Broker directly with --broker instead (--profile applies only to legacy profile-based Runtime Brokers)",
-			err: err,
+	if errors.As(err, &apiErr) {
+		if apiErr.StatusCode == http.StatusForbidden && apiErr.Code == apiclient.ErrCodeMissingScope {
+			return &hubError{
+				msg: err.Error() + missingScopeHint(apiErr.Details),
+				err: err,
+			}
+		}
+		if apiErr.Code == api.ErrCodeRuntimeProfileUnsupported {
+			return &hubError{
+				msg: err.Error() + "; select the target Runtime Broker directly with --broker instead (--profile applies only to legacy profile-based Runtime Brokers)",
+				err: err,
+			}
 		}
 	}
 	if config.IsHubManagedAgent() || !shouldSuggestHubCheck(err) {
 		return &hubError{msg: err.Error(), err: err}
 	}
 	return &hubError{msg: err.Error() + hubCheckHint(hintHubEndpoint()), err: err}
+}
+
+// missingScopeHint is the hint for a 403 missing_scope (ptone/scion#4571,
+// ptone/scion#8324). It names every scope the hub reported: details.scopes,
+// or the single details.scope an older hub sends. Any ceiling-optional role
+// scope may be omitted from an agent's token when the creator's scope ceiling
+// lacks its permission, so recreating the agent from the same parent does not
+// help; a scope re-issue by a hub super-admin does, once the creator holds
+// the scopes.
+func missingScopeHint(details map[string]any) string {
+	var scopes []string
+	if list, ok := details["scopes"].([]any); ok {
+		for _, v := range list {
+			if s, ok := v.(string); ok && s != "" && !slices.Contains(scopes, s) {
+				scopes = append(scopes, s)
+			}
+		}
+	}
+	if len(scopes) == 0 {
+		if v, ok := details["scope"].(string); ok && v != "" {
+			scopes = []string{v}
+		}
+	}
+	what := "a required scope"
+	switch len(scopes) {
+	case 0:
+	case 1:
+		what = "the " + scopes[0] + " scope"
+	default:
+		what = "the " + strings.Join(scopes, " and ") + " scopes"
+	}
+	agent := os.Getenv("SCION_AGENT_SLUG")
+	if agent == "" {
+		agent = "<agent>"
+	}
+	return "\nThis agent's credential does not carry " + what + ". The usual cause is the scope ceiling of the " +
+		"agent's creator; recreating the agent from the same parent gives it the same scopes. Ask the agent's user " +
+		"to have a hub super-admin re-issue its scopes once its creator holds them: scion reset-auth " + agent +
+		" --reissue-scopes (parents before children)."
 }
 
 // printDeleteInProgressWarnings writes each string in details.warnings of a
@@ -799,11 +869,8 @@ func resolveProjectIDByGitRemote(hubCtx *HubContext, failOnAmbiguousGitRemote bo
 
 	// Check if there's a hub project ID or local project_id in settings
 	if hubCtx.Settings != nil {
-		if hgid := hubCtx.Settings.GetHubProjectID(); hgid != "" {
-			return hgid, nil
-		}
-		if hubCtx.Settings.ProjectID != "" {
-			return hubCtx.Settings.ProjectID, nil
+		if id := targetProjectIDFromSettings(hubCtx.Settings); id != "" {
+			return id, nil
 		}
 	}
 
@@ -947,12 +1014,18 @@ func RunAgent(cmd *cobra.Command, args []string, resume bool) error {
 		return err
 	}
 
+	// Load create-time secrets from --secrets-file before any hub work.
+	createSecrets, err := loadSecretsFile(secretsFilePath, os.Stderr)
+	if err != nil {
+		return asUsageError(err)
+	}
+
 	hubCtx, err := requireHub(projectPath)
 	if err != nil {
 		return err
 	}
 
-	return startAgentViaHub(cmd, hubCtx, agentName, task, resume, inlineCfg)
+	return startAgentViaHubWithSecrets(cmd, hubCtx, agentName, task, resume, inlineCfg, createSecrets)
 }
 
 // applyModelFlags writes --model and --thinking-level into the request's
@@ -1090,55 +1163,7 @@ func hubCloneTransportNote(cloneURL string) string {
 	}
 }
 
-// hubStartImpliesResume reports whether `scion start` on an existing hub agent
-// in the given phase should be sent as a resume request. Suspended agents
-// resume their session; stopped agents restart in place with a fresh session
-// (the hub's resume-in-place path). Error-phase agents are deliberately not
-// included: the hub only restarts them in place with --force
-// (resumeInPlaceDecision), so `start` on them still reports a conflict.
-func hubStartImpliesResume(phase string) bool {
-	return phase == string(state.PhaseSuspended) || phase == string(state.PhaseStopped) || phase == string(state.PhaseHalted)
-}
-
-// hubCreateReusesExistingAgent mirrors the hub's handleExistingAgent decision
-// tree (pkg/hub/handlers_agent_create_helpers.go) and reports whether a create
-// request for an agent already in the given phase will start, resume or
-// restart that agent in place rather than create a new one. On those paths the
-// hub applies only the task and attach mode; all other create configuration
-// is ignored.
-func hubCreateReusesExistingAgent(phase string, resume, force bool) bool {
-	switch phase {
-	case string(state.PhaseSuspended), string(state.PhaseCreated):
-		return true
-	case string(state.PhaseStopped), string(state.PhaseHalted):
-		return resume
-	case string(state.PhaseError):
-		return resume && force
-	default:
-		// Not found, running (conflict), provisioning (deleted and
-		// re-created by env-gather, so flags do apply), or unknown.
-		return false
-	}
-}
-
-// hubStartActionWord returns the verb printed before a hub start request so it
-// reflects what the hub will actually do with an agent in the given phase.
-func hubStartActionWord(phase string, resume, force bool) string {
-	switch {
-	case (phase == string(state.PhaseStopped) || phase == string(state.PhaseHalted)) && resume:
-		// The hub restarts a stopped or halted agent with a fresh harness
-		// session.
-		return "Restarting"
-	case resume && force:
-		return "Force-resuming"
-	case resume:
-		return "Resuming"
-	default:
-		return "Starting"
-	}
-}
-
-// configFlagsNotAppliedToExistingAgent lists the start/resume flags that carry
+// configFlagsNotAppliedToExistingAgent lists the resume flags that carry
 // agent configuration. When the hub reuses an existing agent in place it
 // applies only the task and --attach, so explicitly setting any of these has
 // no effect.
@@ -1183,6 +1208,18 @@ func warnFlagsIgnoredForExistingAgent(cmd *cobra.Command, agentName, phase strin
 // the Hub. cmd is used only to detect which flags the user explicitly set (for
 // the "not applied to an existing agent" warning); it may be nil.
 func startAgentViaHub(cmd *cobra.Command, hubCtx *HubContext, agentName, task string, resume bool, inlineCfg *api.ScionConfig) error {
+	var createSecrets []hubclient.AgentSecretInput
+	if secretsFilePath != "" {
+		var err error
+		createSecrets, err = loadSecretsFile(secretsFilePath, os.Stderr)
+		if err != nil {
+			return asUsageError(err)
+		}
+	}
+	return startAgentViaHubWithSecrets(cmd, hubCtx, agentName, task, resume, inlineCfg, createSecrets)
+}
+
+func startAgentViaHubWithSecrets(cmd *cobra.Command, hubCtx *HubContext, agentName, task string, resume bool, inlineCfg *api.ScionConfig, createSecrets []hubclient.AgentSecretInput) error {
 	PrintUsingHub(hubCtx.Endpoint)
 
 	// Get the project ID for this project
@@ -1263,6 +1300,7 @@ func startAgentViaHub(cmd *cobra.Command, hubCtx *HubContext, agentName, task st
 		// Opt in to a non-blocking launch; the CLI waits for it below. A
 		// Hub without async launch ignores this and answers synchronously.
 		AcceptAsyncLaunch: true,
+		Secrets:           createSecrets,
 	}
 
 	// With a target-hub profile, nothing is gathered from the local
@@ -1369,10 +1407,11 @@ func startAgentViaHub(cmd *cobra.Command, hubCtx *HubContext, agentName, task st
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// Check whether the agent already exists on the hub. A suspended or
-	// stopped agent is resumed/restarted in place (parity with
-	// `scion resume`, ptone/scion#1911). This check is best-effort — if it
-	// fails (agent doesn't exist yet), we fall through to "Starting".
+	// Check whether the agent already exists on the hub (best-effort). This is
+	// used for transport-error unknown-outcome reporting, workspace bootstrap
+	// cleanup, and — on `scion resume` — the action verb and ignored-flags
+	// warning. `scion start` never implies resume; the hub refuses resumable
+	// existing agents with 409 agent_exists_resumable.
 	existingCheckStart := time.Now()
 	checkCtx, checkCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	existing, getErr := hubCtx.Client.ProjectAgents(projectID).Get(checkCtx, agentName)
@@ -1382,9 +1421,8 @@ func startAgentViaHub(cmd *cobra.Command, hubCtx *HubContext, agentName, task st
 	}
 	// existingPhase is the phase the hub decides from: the resume memory of
 	// a failed start (launch.resumePhase, ptone/scion#4669) when the hub
-	// reports one, else the stored phase. It must match the hub's
-	// store.EffectiveRestingPhase reads in classifyExistingAgent.
-	// existingPhaseText is what the flags warning shows.
+	// reports one, else the stored phase.
+	// existingPhaseText is what the flags warning on `scion resume` shows.
 	existingPhase, existingPhaseText := "", ""
 	if getErr == nil && existing != nil {
 		existingPhase, existingPhaseText = existing.Phase, existing.Phase
@@ -1393,17 +1431,22 @@ func startAgentViaHub(cmd *cobra.Command, hubCtx *HubContext, agentName, task st
 			existingPhaseText = fmt.Sprintf("%s, resumes as %s", existing.Phase, existing.Launch.ResumePhase)
 		}
 	}
-	if !resume && hubStartImpliesResume(existingPhase) {
-		resume = true
-		req.Resume = true
+
+	action := "Starting"
+	restarted := false
+	if resume {
+		switch {
+		case existingPhase == string(state.PhaseStopped) || existingPhase == string(state.PhaseHalted):
+			action = "Restarting"
+			restarted = true
+		case req.ForceResume:
+			action = "Force-resuming"
+		default:
+			action = "Resuming"
+		}
 	}
-	// Warn about flags the hub will not apply, but only once the hub has
-	// accepted the request: a refused start must not claim the agent was
-	// reused.
-	reusesExisting := hubCreateReusesExistingAgent(existingPhase, req.Resume, req.ForceResume)
 
 	if !isJSONOutput() {
-		action := hubStartActionWord(existingPhase, resume, req.ForceResume)
 		fmt.Printf("%s agent '%s'...\n", action, agentName)
 	}
 
@@ -1427,7 +1470,11 @@ func startAgentViaHub(cmd *cobra.Command, hubCtx *HubContext, agentName, task st
 		printDeleteInProgressWarnings(os.Stderr, err)
 		return wrapHubError(fmt.Errorf("failed to start agent via Hub: %w", err))
 	}
-	if reusesExisting {
+	// On `scion resume`, warn about config flags the hub does not apply to an
+	// existing agent reused in place (only once the hub has accepted the
+	// request). Exclude provisioning + GatherEnv because the env-gather branch
+	// deletes and recreates the agent, so creation flags do apply.
+	if resume && existingPhase != "" && (!req.GatherEnv || existingPhase != string(state.PhaseProvisioning)) {
 		warnFlagsIgnoredForExistingAgent(cmd, agentName, existingPhaseText)
 	}
 
@@ -1615,9 +1662,6 @@ func startAgentViaHub(cmd *cobra.Command, hubCtx *HubContext, agentName, task st
 		workspaceFinalized = true
 	}
 
-	// A stopped agent is restarted in place with a fresh session; report it
-	// with the same word as the "Restarting agent" line above.
-	restarted := hubStartActionWord(existingPhase, resume, req.ForceResume) == "Restarting"
 	return finishHubStart(hubCtx, projectID, agentName, resume, restarted, resp, remainingWarnings, workspaceFinalized)
 }
 

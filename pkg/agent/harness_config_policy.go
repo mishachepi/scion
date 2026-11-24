@@ -16,19 +16,25 @@ package agent
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
+	"strings"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agenthome"
 	"github.com/GoogleCloudPlatform/scion/pkg/agentplugin"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/harness"
+	"github.com/GoogleCloudPlatform/scion/pkg/util/privatefs"
 )
 
 // ErrHarnessConfigPolicy marks a launch refused by the harness-config policy
@@ -546,41 +552,472 @@ func copyRegularFiles(src, dst string) error {
 // to the home.
 const stagedSecretsRel = ".scion/harness/secrets"
 
+// bundleHooksRecordFileName is the broker-side record in agentDir listing
+// hook entries copied into the agent home from the harness-config bundle.
+const bundleHooksRecordFileName = "harness-bundle-hooks.json"
+
+const (
+	homeHooksRel           = ".scion/hooks"
+	provisionHookRel       = ".scion/hooks/pre-start.d/" + harness.HarnessProvisionHookFilename
+	projectPreStartHookRel = ".scion/hooks/pre-start.d/" + harness.ProjectPreStartHookFilename
+)
+
+type bundleHooksRecord struct {
+	Paths []string `json:"paths"`
+}
+
+func probeScriptedPolicyRefusal(policy config.HarnessConfigPolicyFunc, harnessConfigName string, hcDir *config.HarnessConfigDir) bool {
+	var probe config.HarnessConfigEntry
+	if hcDir != nil {
+		probe = hcDir.Config
+	}
+	probe.Provisioner = &config.HarnessProvisionerConfig{Type: "container-script"}
+	return policy(harnessConfigName, probe) != nil
+}
+
+// listHomeHooksEntries returns the sorted slash-separated relative paths of
+// non-directory entries below homeDir/.scion/hooks, confined to homeDir via
+// os.Root without following symlinks. Controlled hook wrappers
+// (20-harness-provision and 30-project-custom) are excluded.
+func listHomeHooksEntries(homeDir string) (present bool, rels []string, err error) {
+	if homeDir == "" {
+		return false, nil, nil
+	}
+	info, err := os.Lstat(homeDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil, nil
+		}
+		return false, nil, err
+	}
+	if !info.IsDir() {
+		return false, nil, fmt.Errorf("stat %s: not a directory", homeDir)
+	}
+	root, err := os.OpenRoot(homeDir)
+	if err != nil {
+		return false, nil, err
+	}
+	defer func() { _ = root.Close() }()
+
+	scionInfo, err := root.Lstat(".scion")
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil, nil
+		}
+		return false, nil, err
+	}
+	if !scionInfo.IsDir() {
+		return false, nil, fmt.Errorf("stat %s/.scion: not a directory", homeDir)
+	}
+
+	hooksOSRel := filepath.FromSlash(homeHooksRel)
+	hooksInfo, err := root.Lstat(hooksOSRel)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil, nil
+		}
+		return false, nil, err
+	}
+	if !hooksInfo.IsDir() {
+		return true, []string{homeHooksRel}, nil
+	}
+
+	var walk func(rel string) error
+	walk = func(rel string) error {
+		entries, err := readRootDir(root, rel)
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			child := filepath.Join(rel, e.Name())
+			fi, err := root.Lstat(child)
+			if err != nil {
+				return err
+			}
+			if fi.IsDir() {
+				if err := walk(child); err != nil {
+					return err
+				}
+				continue
+			}
+			slashRel := filepath.ToSlash(child)
+			if slashRel == provisionHookRel || slashRel == projectPreStartHookRel {
+				continue
+			}
+			rels = append(rels, slashRel)
+		}
+		return nil
+	}
+	if err := walk(hooksOSRel); err != nil {
+		return true, nil, err
+	}
+	slices.Sort(rels)
+	return true, rels, nil
+}
+
+// subtractTemplateHookPaths filters base to hook paths not overlaid by any
+// template in chain.
+func subtractTemplateHookPaths(base []string, chain []*config.Template) ([]string, error) {
+	if len(base) == 0 {
+		return nil, nil
+	}
+	overlaid := make(map[string]bool)
+	for _, tpl := range chain {
+		if tpl == nil || tpl.Path == "" {
+			continue
+		}
+		_, tplRels, err := listHomeHooksEntries(filepath.Join(tpl.Path, "home"))
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range tplRels {
+			overlaid[r] = true
+		}
+	}
+	var out []string
+	for _, r := range base {
+		if overlaid[r] || r == provisionHookRel || r == projectPreStartHookRel {
+			continue
+		}
+		out = append(out, r)
+	}
+	slices.Sort(out)
+	return slices.Compact(out), nil
+}
+
+func isValidRecordedHookRel(rel string) bool {
+	if !config.IsHomeRelPath(rel) {
+		return false
+	}
+	clean := filepath.ToSlash(filepath.Clean(filepath.FromSlash(rel)))
+	if clean == provisionHookRel || clean == projectPreStartHookRel {
+		return false
+	}
+	return clean == homeHooksRel || strings.HasPrefix(clean, homeHooksRel+"/")
+}
+
+func writeBundleHooksRecord(agentDir string, rels []string) error {
+	if agentDir == "" {
+		return nil
+	}
+	rec := bundleHooksRecord{Paths: slices.Clone(rels)}
+	if rec.Paths == nil {
+		rec.Paths = []string{}
+	}
+	return writeAgentRecordFile(agentDir, bundleHooksRecordFileName, rec)
+}
+
+func readBundleHooksRecord(agentDir string) (rels []string, exists bool, err error) {
+	if agentDir == "" {
+		return nil, false, nil
+	}
+	data, err := os.ReadFile(filepath.Join(agentDir, bundleHooksRecordFileName))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, true, err
+	}
+	var rec bundleHooksRecord
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return nil, true, err
+	}
+	for _, r := range rec.Paths {
+		if !isValidRecordedHookRel(r) {
+			return nil, true, fmt.Errorf("invalid bundle hook path %q in %s", r, bundleHooksRecordFileName)
+		}
+		rels = append(rels, filepath.ToSlash(filepath.Clean(filepath.FromSlash(r))))
+	}
+	slices.Sort(rels)
+	return slices.Compact(rels), true, nil
+}
+
+// reconcileBundleHooksOnProvision enforces the harness-config policy on hook
+// entries copied from hcDir/home/.scion/hooks before template home overlays
+// run. When container-script harnesses are disallowed, .scion/hooks is
+// cleared from agentHome via pkg/agenthome (failing closed on any error).
+func reconcileBundleHooksOnProvision(
+	ctx context.Context,
+	agentName, harnessConfigName string,
+	hcDir *config.HarnessConfigDir,
+	agentHome string,
+) (hcHookRels []string, suppressed bool, err error) {
+	var hcHome string
+	if hcDir != nil && hcDir.Path != "" {
+		hcHome = filepath.Join(hcDir.Path, "home")
+	}
+	present, rels, listErr := listHomeHooksEntries(hcHome)
+	if policy := config.HarnessConfigPolicyFromContext(ctx); policy != nil && (present || listErr != nil) {
+		if probeScriptedPolicyRefusal(policy, harnessConfigName, hcDir) {
+			if listErr != nil {
+				return nil, false, fmt.Errorf("inspect harness-config hooks: %w", listErr)
+			}
+			home, openErr := agenthome.OpenCreate(agentHome, 0o755)
+			if openErr != nil {
+				return nil, false, fmt.Errorf("open agent home to clear harness-config hooks: %w", openErr)
+			}
+			rmErr := home.RemoveAll(homeHooksRel)
+			_ = home.Close()
+			if rmErr != nil {
+				return nil, false, fmt.Errorf("clear harness-config hooks: %w", rmErr)
+			}
+			slog.Info("harness-config hook staging suppressed",
+				"agent", agentName,
+				"harness_config", harnessConfigName,
+				"reason", "container-script harnesses disallowed",
+			)
+			return nil, true, nil
+		}
+	}
+	if listErr != nil {
+		return nil, false, fmt.Errorf("inspect harness-config hooks: %w", listErr)
+	}
+	return rels, false, nil
+}
+
+// clearDisallowedBundleHooksOnStart removes any harness-config bundle hook
+// entries from agentHome when container-script harnesses are disallowed by
+// policy, leaving template-supplied hooks and 30-project-custom intact.
+func clearDisallowedBundleHooksOnStart(
+	ctx context.Context,
+	agentName, harnessConfigName string,
+	hcDir *config.HarnessConfigDir,
+	chain []*config.Template,
+	templatesUnresolvable bool,
+	agentDir, agentHome string,
+	writeHome func(func() error) error,
+) error {
+	policy := config.HarnessConfigPolicyFromContext(ctx)
+	if policy == nil {
+		return nil
+	}
+
+	recorded, hasRecord, recErr := readBundleHooksRecord(agentDir)
+	var toRemove []string
+	var listErr error
+	switch {
+	case hasRecord:
+		toRemove = slices.Clone(recorded)
+	case hcDir != nil && hcDir.Path != "":
+		_, hcRels, err := listHomeHooksEntries(filepath.Join(hcDir.Path, "home"))
+		if err != nil {
+			listErr = err
+		} else if len(hcRels) > 0 {
+			toRemove, listErr = subtractTemplateHookPaths(hcRels, chain)
+		}
+	default:
+		if !probeScriptedPolicyRefusal(policy, harnessConfigName, hcDir) {
+			return nil
+		}
+		if harnessConfigName != "" {
+			return fmt.Errorf("%w: %w", ErrHarnessConfigPolicy, &HarnessConfigNotEvaluatedError{
+				Name:  harnessConfigName,
+				Cause: errors.New("harness-config directory is not resolvable and no provision hooks record exists"),
+			})
+		}
+		if templatesUnresolvable {
+			return fmt.Errorf("%w: cannot verify agent hooks for %q: template is not resolvable and no provision hooks record exists", ErrHarnessConfigPolicy, agentName)
+		}
+		_, homeRels, err := listHomeHooksEntries(agentHome)
+		if err != nil {
+			return fmt.Errorf("inspect agent hooks: %w", err)
+		}
+		toRemove, err = subtractTemplateHookPaths(homeRels, chain)
+		if err != nil {
+			return fmt.Errorf("inspect template hooks: %w", err)
+		}
+		if len(toRemove) == 0 {
+			return nil
+		}
+		return stripAgentHomeHookPaths(agentName, harnessConfigName, agentHome, toRemove, writeHome)
+	}
+
+	slices.Sort(toRemove)
+	toRemove = slices.Compact(toRemove)
+
+	if recErr == nil && listErr == nil && len(toRemove) == 0 {
+		return nil
+	}
+	if !probeScriptedPolicyRefusal(policy, harnessConfigName, hcDir) {
+		return nil
+	}
+	if recErr != nil {
+		return fmt.Errorf("read harness-config hooks record: %w", recErr)
+	}
+	if listErr != nil {
+		return fmt.Errorf("inspect harness-config hooks: %w", listErr)
+	}
+	return stripAgentHomeHookPaths(agentName, harnessConfigName, agentHome, toRemove, writeHome)
+}
+
+func stripAgentHomeHookPaths(
+	agentName, harnessConfigName, agentHome string,
+	toRemove []string,
+	writeHome func(func() error) error,
+) error {
+	strip := func() error {
+		home, err := agenthome.Open(agentHome)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		defer func() { _ = home.Close() }()
+		for _, rel := range toRemove {
+			if err := home.RemoveAll(rel); err != nil {
+				return err
+			}
+		}
+		pruneEmptyHomeHooksDirs(home, toRemove)
+		return nil
+	}
+	var err error
+	if writeHome != nil {
+		err = writeHome(strip)
+	} else {
+		err = strip()
+	}
+	if err != nil {
+		return fmt.Errorf("clear harness-config hooks: %w", err)
+	}
+	slog.Info("harness-config hook staging suppressed",
+		"agent", agentName,
+		"harness_config", harnessConfigName,
+		"reason", "container-script harnesses disallowed",
+	)
+	return nil
+}
+
+func pruneEmptyHomeHooksDirs(home *agenthome.Home, removed []string) {
+	seen := map[string]bool{homeHooksRel: true}
+	for _, rel := range removed {
+		for d := path.Dir(rel); strings.HasPrefix(d, homeHooksRel+"/"); d = path.Dir(d) {
+			seen[d] = true
+		}
+	}
+	dirs := make([]string, 0, len(seen))
+	for d := range seen {
+		dirs = append(dirs, d)
+	}
+	slices.SortFunc(dirs, func(a, b string) int {
+		if len(a) != len(b) {
+			return len(b) - len(a)
+		}
+		return strings.Compare(a, b)
+	})
+	for _, d := range dirs {
+		entries, err := home.ReadDir(d)
+		if err == nil && len(entries) == 0 {
+			_ = home.Remove(d)
+		}
+	}
+}
+
 // stagedSecretsDir is the agent home's staged secrets directory.
 func stagedSecretsDir(agentHome string) string {
 	return filepath.Join(agentHome, filepath.FromSlash(stagedSecretsRel))
 }
 
-// ensureSecretsRecord creates an empty secrets record (mode 0700) in agentDir
-// when none exists, leaving an existing record as it is. An empty record
-// restores nothing; it is distinct from an absent record.
+const (
+	secretsRecordOldDirName = config.HarnessSecretsRecordDirName + ".old"
+	secretsRecordTmpPrefix  = config.HarnessSecretsRecordDirName + ".tmp-"
+)
+
+// ensureSecretsRecord creates an empty private secrets record (0700 on Unix,
+// owner-only DACL on Windows) in agentDir when none exists, after recovering
+// any harness-secrets.old left by an interrupted swap. An empty record restores
+// nothing and is distinct from an absent record. An existing record directory,
+// including its permissions, is left unchanged (privatefs.Tree.MkdirAll does
+// not re-chmod existing directories; every recordSecrets replacement installs a
+// fresh private directory via rename).
 func ensureSecretsRecord(agentDir string) error {
-	record := filepath.Join(agentDir, config.HarnessSecretsRecordDirName)
-	if err := os.MkdirAll(record, 0o700); err != nil {
+	if err := recoverSecretsRecordOld(agentDir); err != nil {
 		return err
 	}
-	return os.Chmod(record, 0o700)
+	tree, err := privatefs.OpenTree(agentDir, privatefs.TreeOptions{CreateAnchor: true})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tree.Close() }()
+	return tree.MkdirAll(config.HarnessSecretsRecordDirName, privatefs.Private)
 }
 
-// restoreSecretsRecord restores exactly the secret files in the control
-// plane's record (agentDir/harness-secrets) into the agent home's cleared
-// staged secrets directory (0700, files 0600), and returns their names for
-// ContainerScriptHarness.SetRecordedSecrets. Only regular files are restored.
+// recoverSecretsRecordOld renames harness-secrets.old back to harness-secrets
+// when an atomic swap was interrupted between its two renames.
+func recoverSecretsRecordOld(agentDir string) error {
+	if _, err := os.Lstat(filepath.Join(agentDir, config.HarnessSecretsRecordDirName)); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if _, err := os.Lstat(filepath.Join(agentDir, secretsRecordOldDirName)); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	tree, err := privatefs.OpenTree(agentDir, privatefs.TreeOptions{})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tree.Close() }()
+	return tree.Rename(secretsRecordOldDirName, config.HarnessSecretsRecordDirName)
+}
+
+// cleanupSecretsRecordTmp removes leftover harness-secrets.tmp-* directories in
+// agentDir from an earlier crashed recordSecrets call. Callers must ensure no
+// concurrent recordSecrets write for the same agent can be in flight.
+func cleanupSecretsRecordTmp(agentDir string) error {
+	fi, err := os.Lstat(agentDir)
+	if os.IsNotExist(err) || (err == nil && !fi.IsDir()) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(agentDir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), secretsRecordTmpPrefix) {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(agentDir, e.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+var restoreSecretsAllowTestHook func(name string) bool
+
+// restoreSecretsRecord restores recorded regular secret files from
+// agentDir/harness-secrets into the agent home's cleared staged secrets
+// directory (0700, files 0600), and returns their names for
+// ContainerScriptHarness.SetRecordedSecrets. Any harness-secrets.old left by an
+// interrupted recordSecrets swap is recovered first.
 //
-// Recorded secrets are restored only for the harness-config revision that
-// staged them: nothing is restored unless the record's identity matches
-// current, the identity of the harness-config this launch resolved. A record
-// without an identity, an unreadable identity, or an unknown current identity
-// restores nothing.
+// Exact identity matches restore every recorded regular file; same-lineage
+// revision changes (matching name, source, and hub record ID) with a non-nil
+// allow predicate restore only accepted names without writing filtered files to
+// the home; any other mismatch, missing or unreadable identity, or unknown
+// current identity restores nothing.
 //
 // With no record (an agent provisioned before harness secrets were recorded),
 // nothing is restored, a warning names the agent, and an empty record is
 // created so the warning is not repeated.
 //
-// The writes into the home are confined to it (pkg/agenthome), through one
-// handle opened on the home: a link at a secret file is replaced, never
-// written through, and a linked directory component is refused.
-func restoreSecretsRecord(agentDir, agentHome, agentID string, current *harnessConfigIdentity) ([]string, error) {
+// Writes into the home are confined via pkg/agenthome through one handle opened
+// on the home: a link at a secret file is replaced, never written through, and
+// a linked directory component is refused.
+func restoreSecretsRecord(agentDir, agentHome, agentID string, current *harnessConfigIdentity, allow func(name string) bool) ([]string, error) {
+	if err := recoverSecretsRecordOld(agentDir); err != nil {
+		return nil, err
+	}
+	if restoreSecretsAllowTestHook != nil {
+		allow = restoreSecretsAllowTestHook
+	}
 	record := filepath.Join(agentDir, config.HarnessSecretsRecordDirName)
 	entries, err := os.ReadDir(record)
 	if os.IsNotExist(err) {
@@ -591,7 +1028,9 @@ func restoreSecretsRecord(agentDir, agentHome, agentID string, current *harnessC
 		return nil, err
 	}
 	recorded := readSecretsIdentity(record)
-	if !recorded.matches(current) {
+	exactMatch := recorded.matches(current)
+	crossRevision := !exactMatch && recorded.sameLineage(current) && allow != nil
+	if !exactMatch && !crossRevision {
 		if recorded != nil {
 			slog.Info("recorded secrets are restored only for the harness-config revision that staged them; none restored", "agent_id", agentID)
 		}
@@ -603,9 +1042,13 @@ func restoreSecretsRecord(agentDir, agentHome, agentID string, current *harnessC
 			_ = home.Close()
 		}
 	}()
-	var names []string
+	var names, dropped []string
 	for _, e := range entries {
 		if !e.Type().IsRegular() || e.Name() == secretsIdentityFile {
+			continue
+		}
+		if crossRevision && !allow(e.Name()) {
+			dropped = append(dropped, e.Name())
 			continue
 		}
 		data, err := os.ReadFile(filepath.Join(record, e.Name()))
@@ -625,50 +1068,166 @@ func restoreSecretsRecord(agentDir, agentHome, agentID string, current *harnessC
 		}
 		names = append(names, e.Name())
 	}
+	if crossRevision {
+		slog.Info("restoring recorded secrets across a harness-config revision change",
+			"agent_id", agentID, "from_revision", recorded.Revision, "to_revision", current.Revision,
+			"restored", names, "dropped", dropped)
+	}
 	return names, nil
 }
 
-// recordSecrets replaces the control plane's secrets record with the staged
-// secret files ApplyAuthSettings referenced (names), copied by content from
-// the agent home's staged secrets directory (regular files only), together
-// with current, the identity of the harness-config that staged them (0600).
-// The record is written even when names is empty; with no current identity
-// no identity is written, so the record restores nothing.
-func recordSecrets(agentDir, agentHome string, names []string, current *harnessConfigIdentity) error {
+type recordUpdate struct {
+	Names          []string
+	Current        *harnessConfigIdentity
+	FreshSatisfied bool
+	Allow          func(name string) bool
+}
+
+var recordSecretsBetweenRenamesHook func() error
+
+// recordSecrets updates agentDir/harness-secrets from the regular secret files
+// referenced in u.Names (copied by content from the agent home's staged secrets
+// directory) together with u.Current (written last as .identity.json). It
+// returns replaced=true when a new record was installed, or replaced=false with
+// a nil error when an existing same-lineage record was preserved because
+// !u.FreshSatisfied and replacing would drop a recorded key still valid for the
+// target revision.
+//
+// At entry, any harness-secrets.old left by an interrupted swap is recovered
+// and any leftover harness-secrets.tmp-* directories from a prior crash are
+// removed. Replacements write a private harness-secrets.tmp-<hex> directory,
+// rename an existing harness-secrets aside to harness-secrets.old, rename the
+// populated temp directory into place, and remove .old; on a crash at any
+// point, recovery sees either the old or the new complete record.
+func recordSecrets(agentDir, agentHome, agentID string, u recordUpdate) (bool, error) {
+	if err := recoverSecretsRecordOld(agentDir); err != nil {
+		return false, err
+	}
+	if err := cleanupSecretsRecordTmp(agentDir); err != nil {
+		return false, err
+	}
 	record := filepath.Join(agentDir, config.HarnessSecretsRecordDirName)
-	if err := os.RemoveAll(record); err != nil {
-		return err
+	oldEntries, err := os.ReadDir(record)
+	if err != nil && !os.IsNotExist(err) {
+		return false, err
 	}
-	if err := ensureSecretsRecord(agentDir); err != nil {
-		return err
+	recordExists := err == nil
+	var oldID *harnessConfigIdentity
+	var oldNames []string
+	if recordExists {
+		oldID = readSecretsIdentity(record)
+		for _, e := range oldEntries {
+			if e.Type().IsRegular() && e.Name() != secretsIdentityFile {
+				oldNames = append(oldNames, e.Name())
+			}
+		}
 	}
+
+	type stagedSecret struct {
+		name string
+		data []byte
+	}
+	newSet := make(map[string]struct{}, len(u.Names))
+	var staged []stagedSecret
 	src := stagedSecretsDir(agentHome)
-	for _, name := range names {
+	for _, name := range u.Names {
 		if name == secretsIdentityFile {
 			continue
 		}
-		info, err := os.Lstat(filepath.Join(src, name))
+		if _, seen := newSet[name]; seen {
+			continue
+		}
+		p := filepath.Join(src, name)
+		info, err := os.Lstat(p)
 		if err != nil || info.Mode()&os.ModeType != 0 {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(src, name))
+		data, err := os.ReadFile(p)
 		if err != nil {
-			return err
+			return false, err
 		}
-		if err := os.WriteFile(filepath.Join(record, name), data, 0o600); err != nil {
-			return err
+		newSet[name] = struct{}{}
+		staged = append(staged, stagedSecret{name: name, data: data})
+	}
+
+	replace := oldID == nil || (u.Current != nil && !oldID.sameLineage(u.Current)) || u.FreshSatisfied
+	if !replace {
+		var lost []string
+		for _, n := range oldNames {
+			if _, ok := newSet[n]; ok {
+				continue
+			}
+			if u.Current == nil || oldID.matches(u.Current) || u.Allow == nil || u.Allow(n) {
+				lost = append(lost, n)
+			}
+		}
+		if len(lost) > 0 {
+			slog.Warn("kept the existing harness secrets record: this start staged fewer credentials than recorded for the same harness-config",
+				"agent_id", agentID,
+				"missing", lost,
+			)
+			return false, nil
 		}
 	}
-	if current != nil {
-		data, err := json.Marshal(current)
-		if err != nil {
-			return err
+
+	tree, err := privatefs.OpenTree(agentDir, privatefs.TreeOptions{CreateAnchor: true})
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tree.Close() }()
+
+	var rnd [8]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		return false, err
+	}
+	tmpRel := secretsRecordTmpPrefix + hex.EncodeToString(rnd[:])
+	tmpMoved := false
+	defer func() {
+		if !tmpMoved {
+			_ = os.RemoveAll(filepath.Join(agentDir, tmpRel))
 		}
-		if err := os.WriteFile(filepath.Join(record, secretsIdentityFile), data, 0o600); err != nil {
-			return err
+	}()
+	if err := tree.MkdirAll(tmpRel, privatefs.Private); err != nil {
+		return false, err
+	}
+	for _, s := range staged {
+		if err := tree.WriteFile(path.Join(tmpRel, s.name), s.data, privatefs.Private); err != nil {
+			return false, err
 		}
 	}
-	return nil
+	if u.Current != nil {
+		idData, err := json.Marshal(u.Current)
+		if err != nil {
+			return false, err
+		}
+		if err := tree.WriteFile(path.Join(tmpRel, secretsIdentityFile), idData, privatefs.Private); err != nil {
+			return false, err
+		}
+	}
+
+	oldPath := filepath.Join(agentDir, secretsRecordOldDirName)
+	if err := os.RemoveAll(oldPath); err != nil {
+		return false, err
+	}
+	if recordExists {
+		if err := tree.Rename(config.HarnessSecretsRecordDirName, secretsRecordOldDirName); err != nil {
+			return false, err
+		}
+	}
+	if recordSecretsBetweenRenamesHook != nil {
+		if err := recordSecretsBetweenRenamesHook(); err != nil {
+			return false, err
+		}
+	}
+	if err := tree.Rename(tmpRel, config.HarnessSecretsRecordDirName); err != nil {
+		if recordExists {
+			_ = tree.Rename(secretsRecordOldDirName, config.HarnessSecretsRecordDirName)
+		}
+		return false, err
+	}
+	tmpMoved = true
+	_ = os.RemoveAll(oldPath)
+	return true, nil
 }
 
 // secretsIdentityFile is the file in the secrets record holding the identity
@@ -726,15 +1285,21 @@ func (a *harnessConfigIdentity) matches(b *harnessConfigIdentity) bool {
 	return a != nil && b != nil && a.Name != "" && a.Revision != "" && *a == *b
 }
 
+func (a *harnessConfigIdentity) sameLineage(b *harnessConfigIdentity) bool {
+	return a != nil && b != nil &&
+		a.Name != "" && a.Revision != "" && b.Revision != "" &&
+		a.Name == b.Name && a.Source == b.Source && a.HubRecordID == b.HubRecordID
+}
+
 // readSecretsIdentity reads the identity recorded with the secrets record, or
-// nil when absent or unreadable.
+// nil when absent, unreadable, or incomplete.
 func readSecretsIdentity(record string) *harnessConfigIdentity {
 	data, err := os.ReadFile(filepath.Join(record, secretsIdentityFile))
 	if err != nil {
 		return nil
 	}
 	var id harnessConfigIdentity
-	if err := json.Unmarshal(data, &id); err != nil {
+	if err := json.Unmarshal(data, &id); err != nil || id.Name == "" || id.Revision == "" {
 		return nil
 	}
 	return &id

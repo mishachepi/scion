@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
@@ -57,9 +58,11 @@ type CreateScheduledEventRequest struct {
 	NoAuth   bool   `json:"noAuth,omitempty"`
 
 	// Convenience fields for "exec" events (ptone/scion#7883), with
-	// AgentID/AgentName: the argv and its timeout (0: 60 seconds).
+	// AgentID/AgentName: the argv, timeout (0: 60 seconds), and optional
+	// captureOutput ("none", "json", or "tail").
 	Command        []string `json:"command,omitempty"`
 	TimeoutSeconds int      `json:"timeoutSeconds,omitempty"`
+	CaptureOutput  string   `json:"captureOutput,omitempty"`
 }
 
 // ListScheduledEventsResponse is the API response for listing scheduled events.
@@ -83,6 +86,14 @@ func (s *Server) authorizeScheduledEventAccess(w http.ResponseWriter, r *http.Re
 // call it with the row they loaded, after their project check and before
 // any other work.
 func (s *Server) authorizeScheduledEventRow(w http.ResponseWriter, r *http.Request, projectID string, action Action, row *scheduledEventRow) bool {
+	return s.authorizeScheduledEventRowOr(w, r, projectID, action, row, nil)
+}
+
+// authorizeScheduledEventRowOr is authorizeScheduledEventRow with an
+// exception: when the decision denies the request, fallback (if non-nil) is
+// consulted before the denial is logged and the 403 written, and the
+// request is allowed if it returns true. The decision itself is made once.
+func (s *Server) authorizeScheduledEventRowOr(w http.ResponseWriter, r *http.Request, projectID string, action Action, row *scheduledEventRow, fallback func() bool) bool {
 	identity := GetIdentityFromContext(r.Context())
 	if identity == nil {
 		Unauthorized(w)
@@ -96,6 +107,9 @@ func (s *Server) authorizeScheduledEventRow(w http.ResponseWriter, r *http.Reque
 	}
 	d := s.scheduledEventAccessDecision(r.Context(), projectID, action, row)
 	if d.allowed {
+		return true
+	}
+	if fallback != nil && fallback() {
 		return true
 	}
 	logAuthzDenial(r, identity, scheduledEventResource(projectID), action, d.reason)
@@ -261,6 +275,16 @@ func (s *Server) handleScheduledEvents(w http.ResponseWriter, r *http.Request, p
 	}
 
 	// Determine the action for authorization based on method and path.
+	var eventID, subAction string
+	if eventPath != "" {
+		if idx := strings.IndexByte(eventPath, '/'); idx >= 0 {
+			eventID = eventPath[:idx]
+			subAction = eventPath[idx+1:]
+		} else {
+			eventID = eventPath
+		}
+	}
+
 	var action Action
 	if eventPath == "" {
 		switch r.Method {
@@ -272,6 +296,16 @@ func (s *Server) handleScheduledEvents(w http.ResponseWriter, r *http.Request, p
 			MethodNotAllowed(w, http.MethodGet, http.MethodPost)
 			return
 		}
+	} else if subAction != "" {
+		if subAction != "output" {
+			NotFound(w, "Scheduled event endpoint")
+			return
+		}
+		if r.Method != http.MethodGet {
+			MethodNotAllowed(w, http.MethodGet)
+			return
+		}
+		action = ActionRead
 	} else {
 		switch r.Method {
 		case http.MethodGet:
@@ -307,8 +341,12 @@ func (s *Server) handleScheduledEvents(w http.ResponseWriter, r *http.Request, p
 		return
 	}
 
+	if subAction == "output" {
+		s.getScheduledEventOutput(w, r, projectID, eventID)
+		return
+	}
+
 	// Individual event endpoint
-	eventID := eventPath
 	switch r.Method {
 	case http.MethodGet:
 		s.getScheduledEvent(w, r, projectID, eventID)
@@ -343,8 +381,8 @@ func (s *Server) createScheduledEvent(w http.ResponseWriter, r *http.Request, pr
 		s.createScheduledExecEvent(w, r, projectID, &req)
 		return
 	}
-	if len(req.Command) > 0 || req.TimeoutSeconds != 0 {
-		ValidationError(w, "command and timeoutSeconds apply to exec events only", nil)
+	if len(req.Command) > 0 || req.TimeoutSeconds != 0 || req.CaptureOutput != "" {
+		ValidationError(w, "command, timeoutSeconds and captureOutput apply to exec events only", nil)
 		return
 	}
 	if req.Wake && req.EventType != "message" {
@@ -373,16 +411,6 @@ func (s *Server) createScheduledEvent(w http.ResponseWriter, r *http.Request, pr
 			return
 		}
 	}
-	// C1 containment: for message events, validate the target agent belongs to
-	// this project and the caller is authorized to message it. Scheduled messages
-	// are request-derived (not system-plane) and must pass the same authorization
-	// as direct sends — both at authoring and again at fire time.
-	if req.EventType == "message" {
-		if !s.authorizeScheduledMessageAuthoring(w, r, projectID, req.Payload, req.AgentID, req.AgentName) {
-			return
-		}
-	}
-
 	fireAt, ok := parseScheduledFireTime(w, &req)
 	if !ok {
 		return
@@ -437,6 +465,16 @@ func (s *Server) createScheduledEvent(w http.ResponseWriter, r *http.Request, pr
 			return
 		}
 		payload = string(payloadBytes)
+	}
+	// C1 containment: for message events, validate that the target agent
+	// resolves, belongs to this project (or cross-project messaging is enabled),
+	// and the caller is authorized to message it. Scheduled messages are
+	// request-derived (not system-plane) and must pass the same authorization
+	// as direct sends — both at authoring and again at fire time.
+	if req.EventType == "message" {
+		if !s.authorizeScheduledMessageAuthoring(w, r, projectID, req.Payload, req.AgentID, req.AgentName) {
+			return
+		}
 	}
 
 	// The revision's frozen ceiling is computed before any write.
@@ -538,10 +576,71 @@ func (s *Server) listScheduledEvents(w http.ResponseWriter, r *http.Request, pro
 		})
 		return
 	}
+	rawStatus := strings.TrimSpace(query.Get("status"))
+	group := query.Get("group")
+	if rawStatus != "" && group != "" {
+		ValidationError(w, "cannot specify both status and group", nil)
+		return
+	}
+
+	var (
+		statusFilter   string
+		statusesFilter []string
+	)
+	switch group {
+	case "":
+		if rawStatus != "" {
+			if strings.Contains(rawStatus, ",") {
+				for _, part := range strings.Split(rawStatus, ",") {
+					trimmed := strings.TrimSpace(part)
+					if trimmed != "" {
+						statusesFilter = append(statusesFilter, trimmed)
+					}
+				}
+				if len(statusesFilter) == 0 {
+					ValidationError(w, "status must not be empty", nil)
+					return
+				}
+				if len(statusesFilter) == 1 {
+					statusFilter = statusesFilter[0]
+					statusesFilter = nil
+				}
+			} else {
+				statusFilter = rawStatus
+			}
+		}
+	case "pending":
+		statusesFilter = []string{store.ScheduledEventPending, store.ScheduledEventFiring}
+	case "past":
+		statusesFilter = []string{
+			store.ScheduledEventFired,
+			store.ScheduledEventFailed,
+			store.ScheduledEventCancelled,
+			store.ScheduledEventExpired,
+			store.ScheduledEventSkipped,
+		}
+	default:
+		ValidationError(w, `group must be "pending" or "past"`, nil)
+		return
+	}
+
+	sortParam := query.Get("sort")
+	switch sortParam {
+	case "",
+		store.ScheduledEventSortCreatedDesc,
+		store.ScheduledEventSortFireAtAsc,
+		store.ScheduledEventSortCompletedDesc:
+	default:
+		ValidationError(w, "sort must be one of created_desc, fire_at_asc, completed_desc", nil)
+		return
+	}
+
 	filter := store.ScheduledEventFilter{
 		ProjectID:        projectID,
 		EventType:        query.Get("eventType"),
-		Status:           query.Get("status"),
+		Status:           statusFilter,
+		Statuses:         statusesFilter,
+		Sort:             sortParam,
 		InitiatorAgentID: agentID,
 	}
 

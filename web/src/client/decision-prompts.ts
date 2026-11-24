@@ -324,6 +324,7 @@ function isDecisionView(v: unknown): v is DecisionView {
 export interface SetAnswer {
   rowId: string;
   choiceId: string;
+  otherText?: string;
 }
 
 /** The outcome of answering a set prompt. */
@@ -359,7 +360,11 @@ export async function answerDecisionSet(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         idempotency_key: idempotencyKey,
-        answers: answers.map((a) => ({ decision_row_id: a.rowId, choice_id: a.choiceId })),
+        answers: answers.map((a) => ({
+          decision_row_id: a.rowId,
+          choice_id: a.choiceId,
+          ...(a.otherText !== undefined ? { other_text: a.otherText } : {}),
+        })),
         ...(surface === 'decisions_page' ? { surface: 'decisions_page' } : {}),
       }),
     });
@@ -520,6 +525,33 @@ export function dismissAvailableAtMs(createdAt: string): number {
   const parsed = Date.parse(createdAt);
   if (!Number.isFinite(parsed)) return 0;
   return parsed + DISMISS_MIN_AGE_MS;
+}
+
+/**
+ * Epoch milliseconds at which a prompt's decisions reach the hub's dismissal
+ * threshold. Prefers hub-provided `DecisionView.dismissAvailableAt` (earliest
+ * among open rows, else earliest across all rows) so the client stays in sync
+ * with the hub, falling back to `dismissAvailableAtMs(fallbackCreatedAt)` when
+ * absent.
+ */
+export function dismissAvailableAtMsForDecisions(
+  decisions: readonly DecisionView[] | undefined,
+  fallbackCreatedAt: string
+): number {
+  if (decisions && decisions.length > 0) {
+    let earliestOpen = Infinity;
+    let earliestAny = Infinity;
+    for (const d of decisions) {
+      if (!d.dismissAvailableAt) continue;
+      const parsed = Date.parse(d.dismissAvailableAt);
+      if (!Number.isFinite(parsed)) continue;
+      if (parsed < earliestAny) earliestAny = parsed;
+      if (isOpenDecision(d) && parsed < earliestOpen) earliestOpen = parsed;
+    }
+    if (Number.isFinite(earliestOpen)) return earliestOpen;
+    if (Number.isFinite(earliestAny)) return earliestAny;
+  }
+  return dismissAvailableAtMs(fallbackCreatedAt);
 }
 
 /**

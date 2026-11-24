@@ -152,6 +152,12 @@ func (s *Server) handleTemplateReimport(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
+	if GetAgentIdentityFromContext(ctx) != nil && strings.TrimSpace(req.SourceURL) != "" {
+		writeError(w, http.StatusForbidden, "agent_source_override_forbidden",
+			"agents can refresh a template only from its stored source URL", nil)
+		return
+	}
+
 	src, sourceURL, srcErr := resolveTemplateReimportSource(tmpl.SourceURL, req.SourceURL)
 	if srcErr != nil {
 		writeError(w, http.StatusBadRequest, srcErr.code, srcErr.message, nil)
@@ -185,6 +191,10 @@ func (s *Server) handleTemplateReimport(w http.ResponseWriter, r *http.Request, 
 		reasons := make([]string, len(failures))
 		for i, f := range failures {
 			reasons[i] = f.Name + ": " + f.Reason
+		}
+		if allFailuresHaveCode(failures, ErrCodeInvalidAgentConfig) {
+			writeError(w, http.StatusUnprocessableEntity, ErrCodeInvalidAgentConfig, strings.Join(reasons, "; "), nil)
+			return
 		}
 		writeError(w, http.StatusBadRequest, "reimport_failed", strings.Join(reasons, "; "), nil)
 		return

@@ -101,7 +101,236 @@ describe('scion-chat-message @mentions', () => {
     expect(spans).toHaveLength(1);
     expect(spans[0].classList.contains('clickable')).toBe(true);
     expect(spans[0].getAttribute('data-mention')).toBe('native-chat-lead');
+    expect(spans[0].getAttribute('tabindex')).toBe('0');
+    expect(spans[0].getAttribute('role')).toBe('button');
     expect(spans[0].textContent).toBe('@native-chat-lead');
+  });
+
+  it('activates mention-click with Enter and Space from keyboard focus', async () => {
+    const el = await mount('hello @coder');
+    const seen: string[] = [];
+    const onMentionClick = (e: Event): void => {
+      seen.push((e as CustomEvent<{ slug: string }>).detail.slug);
+    };
+    document.addEventListener('mention-click', onMentionClick);
+    try {
+      const span = mentions(el)[0];
+      span.focus();
+      const enter = new KeyboardEvent('keydown', {
+        key: 'Enter',
+        bubbles: true,
+        composed: true,
+        cancelable: true,
+      });
+      span.dispatchEvent(enter);
+      expect(enter.defaultPrevented).toBe(true);
+
+      const space = new KeyboardEvent('keydown', {
+        key: ' ',
+        bubbles: true,
+        composed: true,
+        cancelable: true,
+      });
+      span.dispatchEvent(space);
+      expect(space.defaultPrevented).toBe(true);
+    } finally {
+      document.removeEventListener('mention-click', onMentionClick);
+    }
+
+    expect(seen).toEqual(['coder', 'coder']);
+  });
+
+  it('does not add button semantics to a mention nested inside a markdown link', async () => {
+    const el = await mount('see [@coder](https://example.com)');
+    const span = mentions(el)[0];
+    expect(span.getAttribute('data-mention')).toBe('coder');
+    expect(span.hasAttribute('tabindex')).toBe(false);
+    expect(span.hasAttribute('role')).toBe(false);
+  });
+
+  it('evaluates mention-contextmenu selection at pointerdown and only when covering the mention', async () => {
+    const el = await mount('check `token` and @coder');
+    const span = mentions(el)[0];
+    const code = el.shadowRoot!.querySelector('code')!;
+    const sel = window.getSelection()!;
+    const seen: string[] = [];
+    el.addEventListener('mention-contextmenu', (e): void => {
+      seen.push((e as CustomEvent<{ slug: string }>).detail.slug);
+    });
+
+    try {
+      // 1. Selection covering a sibling element does not suppress mention-contextmenu.
+      const siblingRange = document.createRange();
+      siblingRange.selectNodeContents(code);
+      sel.removeAllRanges();
+      sel.addRange(siblingRange);
+      span.dispatchEvent(
+        new PointerEvent('pointerdown', {
+          bubbles: true,
+          composed: true,
+          button: 2,
+          clientX: 10,
+          clientY: 10,
+        })
+      );
+      span.dispatchEvent(
+        new MouseEvent('contextmenu', {
+          bubbles: true,
+          composed: true,
+          cancelable: true,
+          button: 2,
+          clientX: 10,
+          clientY: 10,
+        })
+      );
+      expect(seen).toEqual(['coder']);
+
+      // 2. macOS word selection created after pointerdown does not suppress mention-contextmenu.
+      sel.removeAllRanges();
+      span.dispatchEvent(
+        new PointerEvent('pointerdown', {
+          bubbles: true,
+          composed: true,
+          button: 2,
+          clientX: 10,
+          clientY: 10,
+        })
+      );
+      const wordRange = document.createRange();
+      wordRange.selectNodeContents(span);
+      sel.addRange(wordRange);
+      span.dispatchEvent(
+        new MouseEvent('contextmenu', {
+          bubbles: true,
+          composed: true,
+          cancelable: true,
+          button: 2,
+          clientX: 10,
+          clientY: 10,
+        })
+      );
+      expect(seen).toEqual(['coder', 'coder']);
+
+      // 3. Selection already covering @coder at pointerdown suppresses mention-contextmenu.
+      span.dispatchEvent(
+        new PointerEvent('pointerdown', {
+          bubbles: true,
+          composed: true,
+          button: 2,
+          clientX: 10,
+          clientY: 10,
+        })
+      );
+      span.dispatchEvent(
+        new MouseEvent('contextmenu', {
+          bubbles: true,
+          composed: true,
+          cancelable: true,
+          button: 2,
+          clientX: 10,
+          clientY: 10,
+        })
+      );
+      expect(seen).toEqual(['coder', 'coder']);
+    } finally {
+      sel.removeAllRanges();
+    }
+  });
+
+  it('clears browser-created press selection when mention-contextmenu is handled and expires stale press snapshots', async () => {
+    vi.useFakeTimers();
+    try {
+      const el = await mount('hello @coder');
+      const span = mentions(el)[0];
+      const sel = window.getSelection()!;
+      const handled: string[] = [];
+      el.addEventListener('mention-contextmenu', (e): void => {
+        e.preventDefault();
+        handled.push((e as CustomEvent<{ slug: string }>).detail.slug);
+      });
+
+      // 1. Handled mention-contextmenu clears selection created after pointerdown so a repeat right-click still fires.
+      for (let i = 0; i < 2; i++) {
+        span.dispatchEvent(
+          new PointerEvent('pointerdown', {
+            bubbles: true,
+            composed: true,
+            button: 2,
+            clientX: 10,
+            clientY: 10,
+          })
+        );
+        const wordRange = document.createRange();
+        wordRange.selectNodeContents(span);
+        sel.removeAllRanges();
+        sel.addRange(wordRange);
+        const ctx = new MouseEvent('contextmenu', {
+          bubbles: true,
+          composed: true,
+          cancelable: true,
+          button: 2,
+          clientX: 10,
+          clientY: 10,
+        });
+        span.dispatchEvent(ctx);
+        expect(ctx.defaultPrevented).toBe(true);
+        expect(sel.rangeCount).toBe(0);
+      }
+      expect(handled).toEqual(['coder', 'coder']);
+
+      // 2. Once CONTEXT_PRESS_WINDOW_MS expires, an earlier uncovered press does not mask a live selection.
+      span.dispatchEvent(
+        new PointerEvent('pointerdown', {
+          bubbles: true,
+          composed: true,
+          button: 2,
+          clientX: 10,
+          clientY: 10,
+        })
+      );
+      vi.advanceTimersByTime(1100);
+      const laterRange = document.createRange();
+      laterRange.selectNodeContents(span);
+      sel.addRange(laterRange);
+      const staleCtx = new MouseEvent('contextmenu', {
+        bubbles: true,
+        composed: true,
+        cancelable: true,
+        button: 2,
+        clientX: 10,
+        clientY: 10,
+      });
+      span.dispatchEvent(staleCtx);
+      expect(staleCtx.defaultPrevented).toBe(false);
+      expect(handled).toEqual(['coder', 'coder']);
+      sel.removeAllRanges();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not treat a collapsed Caret selection as covering the message when getComposedRanges re-targets to a host', async () => {
+    const el = await mount('hello @coder');
+    // Chromium re-targets a collapsed Caret inside an unrelated shadow tree to
+    // a non-collapsed StaticRange spanning the shadow host in light DOM.
+    const retargeted = {
+      collapsed: false,
+      startContainer: document.body,
+      startOffset: 0,
+      endContainer: document.body,
+      endOffset: document.body.childNodes.length,
+    } as StaticRange;
+    const spy = vi.spyOn(window, 'getSelection').mockReturnValue({
+      type: 'Caret',
+      isCollapsed: true,
+      rangeCount: 1,
+      getComposedRanges: () => [retargeted],
+    } as unknown as Selection);
+    try {
+      expect(el.hasSelectionForContextMenu(el)).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it('emits a composed mention-click with the slug when a mention is clicked', async () => {
@@ -1145,6 +1374,109 @@ describe('scion-chat-message delivery state', () => {
     expect(state?.textContent).toContain('Agent unreachable');
   });
 
+  it('shows deleted-agent label and tooltip when reason ends in (deleted)', async () => {
+    const el = await mountOutbound({
+      dispatchState: 'failed',
+      dispatchFailureReason: 'Agent unreachable (deleted)',
+      dispatchFailureCode: 'agent_unreachable',
+      routedTo: 'worker-1',
+    });
+
+    const state = deliveryState(el);
+    expect(state?.textContent).toContain('Not delivered — @worker-1 was deleted');
+    expect(state?.classList.contains('failed')).toBe(true);
+    const tooltip = el.shadowRoot?.querySelector('sl-tooltip');
+    expect(tooltip?.getAttribute('content')).toBe('Mention a live agent with @ to resend.');
+  });
+
+  it('shows deleted-agent label on history rows without a dispatchFailureCode', async () => {
+    const el = await mountOutbound({
+      dispatchState: 'failed',
+      dispatchFailureReason: 'Agent unreachable (deleted)',
+      dispatchFailureCode: '',
+      routedTo: 'worker-2',
+    });
+
+    const state = deliveryState(el);
+    expect(state?.textContent).toContain('Not delivered — @worker-2 was deleted');
+  });
+
+  it('renders failed delivery state for other human viewers when sender is human', async () => {
+    const el = await mountOutbound({
+      fromAgent: true,
+      senderIsAgent: false,
+      sender: 'user:alice',
+      dispatchState: 'failed',
+      dispatchFailureReason: 'Agent unreachable (deleted)',
+      dispatchFailureCode: 'agent_unreachable',
+      routedTo: 'worker-1',
+    });
+
+    const state = deliveryState(el);
+    expect(state?.textContent).toContain('Not delivered — @worker-1 was deleted');
+  });
+
+  it('never renders failed delivery state on agent-sent messages', async () => {
+    const byFlag = await mountOutbound({
+      fromAgent: true,
+      senderIsAgent: true,
+      sender: 'agent:worker-1',
+      dispatchState: 'failed',
+      dispatchFailureReason: 'Agent unreachable (deleted)',
+      dispatchFailureCode: 'agent_unreachable',
+    });
+    expect(deliveryState(byFlag)).toBeNull();
+
+    const byPrefix = await mountOutbound({
+      fromAgent: true,
+      senderIsAgent: false,
+      sender: 'agent:worker-1',
+      dispatchState: 'failed',
+      dispatchFailureReason: 'Agent unreachable (deleted)',
+      dispatchFailureCode: 'agent_unreachable',
+    });
+    expect(deliveryState(byPrefix)).toBeNull();
+  });
+
+  it('keeps non-failed delivery states hidden for other human viewers', async () => {
+    for (const dispatchState of ['dispatched', 'deferred', 'no_recipient', 'pending']) {
+      const el = await mountOutbound({
+        fromAgent: true,
+        senderIsAgent: false,
+        sender: 'user:alice',
+        dispatchState,
+      });
+      expect(deliveryState(el)).toBeNull();
+    }
+  });
+
+  it('keeps failed delivery state hidden on deleted messages for all viewers', async () => {
+    const el = await mountOutbound({
+      fromAgent: true,
+      senderIsAgent: false,
+      sender: 'user:alice',
+      dispatchState: 'failed',
+      dispatchFailureReason: 'Agent unreachable (deleted)',
+      dispatchFailureCode: 'agent_unreachable',
+      routedTo: 'worker-1',
+      deletedAt: '2026-11-21T12:00:00Z',
+    });
+    expect(deliveryState(el)).toBeNull();
+  });
+
+  it('handles nullish sender and dispatchFailureReason safely on failed messages', async () => {
+    const el = await mountOutbound({
+      fromAgent: true,
+      senderIsAgent: false,
+      sender: undefined as unknown as string,
+      dispatchState: 'failed',
+      dispatchFailureReason: undefined as unknown as string,
+      dispatchFailureCode: 'agent_unreachable',
+    });
+    const state = deliveryState(el);
+    expect(state?.textContent).toContain('Agent unreachable');
+  });
+
   it('keeps the generic "Failed" label for a non-unreachable dispatch error', async () => {
     const el = await mountOutbound({
       dispatchState: 'failed',
@@ -1204,6 +1536,26 @@ describe('scion-chat-message delivery state', () => {
     );
   });
 
+  // ptone/scion#8678: unknown-outcome finalization (#5058 / #8667) records
+  // dispatch_failure_reason "dispatch outcome unknown"; render the same
+  // "Delivery unconfirmed" badge and tooltip rather than generic "Failed".
+  it('shows "Delivery unconfirmed" when dispatchFailureReason is dispatch outcome unknown', async () => {
+    const el = await mountOutbound({
+      dispatchState: 'failed',
+      dispatchFailureReason: 'dispatch outcome unknown',
+      dispatchFailureCode: '',
+    });
+
+    const state = deliveryState(el);
+    expect(state?.textContent).toContain('Delivery unconfirmed');
+    expect(state?.textContent).not.toContain('Failed');
+    expect(state?.classList.contains('failed')).toBe(true);
+    const tooltip = el.shadowRoot?.querySelector('sl-tooltip');
+    expect(tooltip?.getAttribute('content')).toBe(
+      'Delivery unconfirmed: it may have been delivered; check before resending'
+    );
+  });
+
   // ptone/scion#4480: a dispatched message was accepted by the agent's
   // runtime, not confirmed read, so the receipt never claims "Delivered".
   it('shows "Accepted" for dispatchState=dispatched', async () => {
@@ -1216,6 +1568,27 @@ describe('scion-chat-message delivery state', () => {
     expect(state?.classList.contains('dispatched')).toBe(true);
     expect(state?.textContent).toContain('Accepted');
     expect(state?.textContent).not.toContain('Delivered');
+  });
+
+  // ptone/scion#9015: once the broker confirms session injection succeeded,
+  // the receipt moves to "Delivered", and "Seen" still takes precedence once read.
+  it('shows "Delivered" for dispatchState=delivered and "Seen" when read', async () => {
+    const el = await mountOutbound({
+      dispatchState: 'delivered',
+    });
+
+    const state = deliveryState(el);
+    expect(state).toBeTruthy();
+    expect(state?.classList.contains('delivered')).toBe(true);
+    expect(state?.textContent).toContain('Delivered');
+    expect(state?.querySelector('sl-icon')?.getAttribute('name')).toBe('check2');
+
+    el.seen = true;
+    await el.updateComplete;
+    const seenState = deliveryState(el);
+    expect(seenState?.classList.contains('seen')).toBe(true);
+    expect(seenState?.textContent).toContain('Seen');
+    expect(seenState?.querySelector('sl-icon')?.getAttribute('name')).toBe('check2-all');
   });
 
   // F5 (p2a-r2 review): design agent-reincarnate §3.7 — a message to a

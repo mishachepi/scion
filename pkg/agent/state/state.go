@@ -27,6 +27,11 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 )
 
+// ShellHarnessName is the reserved name of the built-in shell execution
+// container harness (ptone/scion#8812). Defined in pkg/agent/state so
+// sciontool PID-1 paths can share it without importing pkg/config.
+const ShellHarnessName = "shell"
+
 // HarnessExitCodeFile is the container-local path where the tmux agent-window
 // wrapper records the harness's real exit code, read by `sciontool init`.
 // There is one agent per container, so a fixed path is safe. It is a shared
@@ -83,6 +88,9 @@ const (
 	// ReadySettleHook is how long the runtime waits after a fresh hook-mode
 	// ready marker before pasting, so the harness's input has mounted.
 	ReadySettleHook = 1500 * time.Millisecond
+	// ReadySettleIdle is how long an idle-strategy harness (e.g. the built-in
+	// execution container) settles before transitioning initializing -> idle.
+	ReadySettleIdle = 1 * time.Second
 )
 
 // Ready strategies, the values of a harness-config ready block's strategy
@@ -92,8 +100,12 @@ const (
 	// current run is written (by a session-start hook) plus the settle.
 	ReadyStrategyHook = "hook"
 	// ReadyStrategyDelay: the harness is ready once its tmux session has
-	// existed for the settle period.
+	// existed for the settle period (transitions initializing -> working).
 	ReadyStrategyDelay = "delay"
+	// ReadyStrategyIdle: the harness is ready once its tmux session has
+	// existed for the settle period, and transitions initializing -> idle
+	// rather than working (used by the built-in execution container).
+	ReadyStrategyIdle = "idle"
 )
 
 // Limits on ready spec values, shared by harness-config validation and by
@@ -119,14 +131,23 @@ const HarnessReadyEnv = "SCION_HARNESS_READY"
 // (ptone/scion#5196).
 const LivenessHarnessRootDepthEnv = "SCION_LIVENESS_HARNESS_ROOT_DEPTH"
 
+// LivenessHarnessRootDepthHintEnv is the harness-publishable hint equivalent
+// of LivenessHarnessRootDepthEnv. When both are set, LivenessHarnessRootDepthEnv
+// wins.
+const LivenessHarnessRootDepthHintEnv = "HARNESS_HINT_LIVENESS_ROOT_DEPTH"
+
 // DefaultReadySpec returns the ready spec used for strategy when no value is
 // configured: the readiness constants above. An unknown strategy gets the
 // delay defaults.
 func DefaultReadySpec(strategy string) api.ReadySpec {
-	if strategy == ReadyStrategyHook {
+	switch strategy {
+	case ReadyStrategyHook:
 		return api.ReadySpec{Strategy: ReadyStrategyHook, Settle: ReadySettleHook, Timeout: ReadyDeadline}
+	case ReadyStrategyIdle:
+		return api.ReadySpec{Strategy: ReadyStrategyIdle, Settle: ReadySettleIdle}
+	default:
+		return api.ReadySpec{Strategy: ReadyStrategyDelay, Settle: ReadySettleSession}
 	}
-	return api.ReadySpec{Strategy: ReadyStrategyDelay, Settle: ReadySettleSession}
 }
 
 // ReadyModeForStrategy returns the init-run line 1 mode for a ready
@@ -147,9 +168,9 @@ func CheckReadySpec(spec api.ReadySpec) error {
 		if spec.Timeout < MinReadyTimeout || spec.Timeout > MaxReadyTimeout {
 			return fmt.Errorf("ready timeout %s out of range [%s, %s]", spec.Timeout, MinReadyTimeout, MaxReadyTimeout)
 		}
-	case ReadyStrategyDelay:
+	case ReadyStrategyDelay, ReadyStrategyIdle:
 		if spec.Timeout != 0 {
-			return fmt.Errorf("ready timeout %s not allowed with strategy %q", spec.Timeout, ReadyStrategyDelay)
+			return fmt.Errorf("ready timeout %s not allowed with strategy %q", spec.Timeout, spec.Strategy)
 		}
 	default:
 		return fmt.Errorf("unknown ready strategy %q", spec.Strategy)
@@ -285,7 +306,7 @@ func ParseInitRunSpec(content string) (InitRunSpec, bool) {
 		}
 	}
 	res.HasSpec = strings.TrimSpace(line2) != ""
-	if s := fields["strategy"]; s == ReadyStrategyHook || s == ReadyStrategyDelay {
+	if s := fields["strategy"]; s == ReadyStrategyHook || s == ReadyStrategyDelay || s == ReadyStrategyIdle {
 		if ReadyModeForStrategy(s) == mode {
 			strategy = s
 		}
@@ -693,6 +714,43 @@ func RetainedSuspendActivity(activity, stalledFrom Activity) Activity {
 	return ""
 }
 
+// IsRetainedOnStop reports whether this non-terminal activity survives a
+// transition to PhaseStopped so a subsequent resume or restart knows the prior
+// run completed (ptone/scion#8900). Comparison is case-insensitive.
+func (a Activity) IsRetainedOnStop() bool {
+	return Activity(strings.ToLower(string(a))) == ActivityCompleted
+}
+
+// RetainedStopActivity returns the canonical lowercase activity to preserve on
+// transition to PhaseStopped (terminal activities or completed; computed from
+// stalledFrom when stalled), or "" when the activity should be cleared.
+func RetainedStopActivity(activity, stalledFrom Activity) Activity {
+	candidate := Activity(strings.ToLower(string(activity)))
+	if candidate == ActivityStalled {
+		candidate = Activity(strings.ToLower(string(stalledFrom)))
+	}
+	if candidate.IsTerminal() || candidate.IsRetainedOnStop() {
+		return candidate
+	}
+	return ""
+}
+
+// RetainedHaltActivity returns ActivityCompleted when the agent's prior
+// activity (or stalledFrom when stalled) was completed, or "" otherwise.
+// Terminal activities (crashed, limits_exceeded) are cleared on halt because
+// the halt exit reason explains how the run ended; completed is retained so a
+// subsequent resume or restart knows the prior run finished (ptone/scion#8900).
+func RetainedHaltActivity(activity, stalledFrom Activity) Activity {
+	candidate := Activity(strings.ToLower(string(activity)))
+	if candidate == ActivityStalled {
+		candidate = Activity(strings.ToLower(string(stalledFrom)))
+	}
+	if candidate.IsRetainedOnStop() {
+		return candidate
+	}
+	return ""
+}
+
 // IsTerminal reports whether this activity represents a terminal outcome that
 // survives the phase transition to stopped. Terminal activities carry
 // information about HOW the agent stopped and are valid when phase is stopped.
@@ -809,7 +867,9 @@ func IsPreHookStartupMessage(msg string) bool {
 
 // Validate checks cross-field constraints on the agent state.
 // Activity is meaningful when phase is running, when phase is stopped with a
-// terminal activity, or when phase is suspended with a retained activity.
+// terminal or retained-on-stop activity, when phase is halted with a
+// retained-on-stop activity, or when phase is suspended with a retained
+// activity.
 func (s AgentState) Validate() error {
 	if err := s.Phase.Validate(); err != nil {
 		return err
@@ -818,9 +878,10 @@ func (s AgentState) Validate() error {
 		return err
 	}
 	if s.Activity != "" && s.Phase != PhaseRunning {
-		validStopped := s.Phase == PhaseStopped && s.Activity.IsTerminal()
+		validStopped := s.Phase == PhaseStopped && (s.Activity.IsTerminal() || s.Activity.IsRetainedOnStop())
+		validHalted := s.Phase == PhaseHalted && s.Activity.IsRetainedOnStop()
 		validSuspended := s.Phase == PhaseSuspended && s.Activity.IsRetainedOnSuspend()
-		if !validStopped && !validSuspended {
+		if !validStopped && !validHalted && !validSuspended {
 			return fmt.Errorf("activity %q is not valid when phase is %q (must be %q)", s.Activity, s.Phase, PhaseRunning)
 		}
 	}

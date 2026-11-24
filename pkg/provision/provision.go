@@ -3054,12 +3054,21 @@ func cloneError(rawURL, output string, runErr error, withToken bool, token strin
 	if token != "" {
 		detail = strings.ReplaceAll(detail, token, redactedCredential)
 	}
-	kind := util.ClassifyGitError(detail).Kind
+	classified := util.ClassifyGitErrorForURL(detail, rawURL)
+	kind := classified.Kind
+	host := classified.RemoteHost
 	if withToken {
 		switch kind {
 		case util.GitErrAuth:
+			if host != "" && !util.IsGitHubHost(host) {
+				return fmt.Errorf("git clone %s: the repository on %s did not accept the project's git credential: %s", safeURL, host, detail)
+			}
 			return fmt.Errorf("git clone %s: the repository did not accept the project's git credential (GITHUB_TOKEN): %s", safeURL, detail)
 		case util.GitErrNotFound:
+			if host != "" && !util.IsGitHubHost(host) {
+				return fmt.Errorf("git clone %s: repository or branch not found on %s, "+
+					"or the project's git credential has no access to it: %s", safeURL, host, detail)
+			}
 			return fmt.Errorf("git clone %s: repository or branch not found, "+
 				"or the project's git credential (GITHUB_TOKEN) has no access to it: %s", safeURL, detail)
 		default:
@@ -3394,16 +3403,11 @@ func ensureWorktree(ctx context.Context, in ProvisionInput) (worktreeOutcome, er
 	// Derive a branch name from the agent name or ID. For MountedWorktree
 	// the branch is used exactly as given, as on the local runtimes, and
 	// must be a valid branch name.
-	branchName := in.AgentID
+	branchName := WorktreeBranchName(in)
 	if in.MountedWorktree {
-		if in.AgentName != "" {
-			branchName = in.AgentName
-		}
 		if err := checkBranchName(ctx, base, branchName); err != nil {
 			return worktreeOutcome{}, err
 		}
-	} else if in.AgentName != "" {
-		branchName = sanitizeBranchName(in.AgentName)
 	}
 	registered := func(path string) (worktreeOutcome, error) {
 		o := worktreeOutcome{branch: branchName}
@@ -4316,6 +4320,22 @@ func appendGitExclude(hostPath, pattern string) error {
 	}
 	_, err = f.WriteString(pattern + "\n")
 	return err
+}
+
+// WorktreeBranchName returns the git branch and sharer-registry key
+// ProvisionShared uses for in. For MountedWorktree a non-empty AgentName is
+// used as given; otherwise a non-empty AgentName is sanitized with
+// sanitizeBranchName, falling back to AgentID when AgentName is empty.
+func WorktreeBranchName(in ProvisionInput) string {
+	branchName := in.AgentID
+	if in.MountedWorktree {
+		if in.AgentName != "" {
+			branchName = in.AgentName
+		}
+	} else if in.AgentName != "" {
+		branchName = sanitizeBranchName(in.AgentName)
+	}
+	return branchName
 }
 
 // sanitizeBranchName produces a git-safe branch name from an agent name.

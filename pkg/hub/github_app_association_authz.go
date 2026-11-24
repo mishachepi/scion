@@ -401,20 +401,48 @@ func (c *githubRepoAccessCache) invalidateProject(projectID string) {
 	}
 }
 
+// hasUsableStoredGitHubPermissions reports whether stored names at least one
+// known permission field with a valid level ("read" or "write").
+func hasUsableStoredGitHubPermissions(stored *store.GitHubTokenPermissions) bool {
+	if stored == nil {
+		return false
+	}
+	for _, v := range []string{
+		stored.Contents,
+		stored.PullRequests,
+		stored.Issues,
+		stored.Metadata,
+		stored.Checks,
+		stored.Actions,
+	} {
+		if v == "read" || v == "write" {
+			return true
+		}
+	}
+	return false
+}
+
 // githubTokenPermissionsForGrant returns the permission set to request for
-// a token minted under grant, from the project's stored permissions:
+// a token minted under grant, from the project's stored permissions or (when
+// nothing usable is stored) DefaultTokenPermissions intersected with the App's
+// granted permissions:
 //
 //   - Only the six known fields are ever requested, each as "read" or
 //     "write"; any other stored value is dropped.
 //   - "write" survives only when grant.WriteAllowed; otherwise it is
-//     lowered to "read". Nothing is ever added above the stored value
-//     except by the fallback below.
-//   - The result is NEVER empty: GitHub grants every installation
-//     permission when a token request carries no permissions. With nothing
-//     usable stored, DefaultTokenPermissions intersected with the proven
-//     level is used (write fields lowered to read for a pull-only grant),
-//     and metadata:read if even that were empty.
-func githubTokenPermissionsForGrant(stored *store.GitHubTokenPermissions, grant githubAssociationGrant) githubapp.TokenPermissions {
+//     lowered to "read". Nothing is ever added above the stored value.
+//   - When nothing usable is stored, DefaultTokenPermissions is intersected
+//     with appPermissions (and write fields lowered to read for a pull-only
+//     grant). If appPermissions is nil/empty or shares no permissions with
+//     the defaults, ok is false with an empty TokenPermissions so the caller
+//     fails closed rather than minting an empty-permissions token (which
+//     GitHub treats as every installation permission) or requesting more than
+//     the App was granted.
+func githubTokenPermissionsForGrant(
+	stored *store.GitHubTokenPermissions,
+	grant githubAssociationGrant,
+	appPermissions map[string]string,
+) (perms githubapp.TokenPermissions, usedDefaults bool, ok bool) {
 	level := func(v string) string {
 		switch v {
 		case "write":
@@ -438,7 +466,6 @@ func githubTokenPermissionsForGrant(stored *store.GitHubTokenPermissions, grant 
 			Actions:      level(p.Actions),
 		}
 	}
-	var perms githubapp.TokenPermissions
 	if stored != nil {
 		perms = scope(githubapp.TokenPermissions{
 			Contents:     stored.Contents,
@@ -449,13 +476,14 @@ func githubTokenPermissionsForGrant(stored *store.GitHubTokenPermissions, grant 
 			Actions:      stored.Actions,
 		})
 	}
-	if perms == (githubapp.TokenPermissions{}) {
-		perms = scope(githubapp.DefaultTokenPermissions())
+	if perms != (githubapp.TokenPermissions{}) {
+		return perms, false, true
 	}
+	perms = scope(githubapp.IntersectTokenPermissions(githubapp.DefaultTokenPermissions(), appPermissions))
 	if perms == (githubapp.TokenPermissions{}) {
-		perms = githubapp.TokenPermissions{Metadata: "read"}
+		return githubapp.TokenPermissions{}, true, false
 	}
-	return perms
+	return perms, true, true
 }
 
 // validGitHubTokenPermissionLevel reports whether v may be stored for a
@@ -635,6 +663,7 @@ func (s *Server) invalidateGitHubAssociation(projectID string) {
 	s.githubAccessCache.invalidateProject(projectID)
 	s.githubTokenCache.invalidateProject(projectID)
 	s.githubAssociationReportCache.invalidate(projectID)
+	s.githubAssociationRefusalLog.clear(projectID)
 }
 
 // githubAssociationReportEntryFor evaluates p against
@@ -969,7 +998,7 @@ func (s *Server) clearProjectGitHubAssociationErrorStatus(ctx context.Context, p
 		LastTokenMint: project.GitHubAppStatus.LastTokenMint,
 		LastChecked:   now,
 	}
-	if err := s.store.UpdateProject(ctx, project); err != nil {
+	if err := s.store.UpdateProjectGitHubAppStatus(ctx, project.ID, project.GitHubAppStatus); err != nil {
 		slog.WarnContext(ctx, "Failed to clear project GitHub App association error status",
 			"project_id", project.ID, "error", err)
 		return
@@ -977,4 +1006,101 @@ func (s *Server) clearProjectGitHubAssociationErrorStatus(ctx context.Context, p
 	if s.events != nil {
 		s.events.PublishProjectUpdated(ctx, project)
 	}
+}
+
+const (
+	// githubAssociationRefusalLogMaxEntries caps the number of projects tracked
+	// for association-refusal log deduplication so memory stays bounded.
+	githubAssociationRefusalLogMaxEntries = 4096
+	// githubAssociationRefusalLogTTL prunes refusal state for projects that have
+	// stopped polling, preventing unbounded per-project retention.
+	githubAssociationRefusalLogTTL = 24 * time.Hour
+)
+
+type githubAssociationRefusalEntry struct {
+	installationID int64
+	reason         string
+	lastSeen       time.Time
+}
+
+// githubAssociationRefusalLog suppresses repeated identical association-refusal
+// warnings for the same (project, installation, reason) while logging on every
+// state change (first refusal, changed installation or reason, or re-refusal
+// after recovery/invalidation). The zero value is ready to use.
+type githubAssociationRefusalLog struct {
+	mu      sync.Mutex
+	entries map[string]githubAssociationRefusalEntry
+
+	// maxEntries and ttl override the package defaults when positive (tests).
+	maxEntries int
+	ttl        time.Duration
+}
+
+// shouldLog reports whether a refusal warning for (projectID, installationID, reason)
+// should be emitted now and updates the tracked state.
+func (l *githubAssociationRefusalLog) shouldLog(projectID string, installationID int64, reason string) bool {
+	now := timeNow()
+	maxEntries := l.maxEntries
+	if maxEntries <= 0 {
+		maxEntries = githubAssociationRefusalLogMaxEntries
+	}
+	ttl := l.ttl
+	if ttl <= 0 {
+		ttl = githubAssociationRefusalLogTTL
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if e, ok := l.entries[projectID]; ok {
+		if e.installationID == installationID && e.reason == reason && now.Sub(e.lastSeen) < ttl {
+			e.lastSeen = now
+			l.entries[projectID] = e
+			return false
+		}
+	}
+
+	if l.entries == nil {
+		l.entries = make(map[string]githubAssociationRefusalEntry)
+	}
+
+	// Prune idle entries on state-change writes so inactive/deleted projects
+	// do not accumulate indefinitely.
+	for k, e := range l.entries {
+		if now.Sub(e.lastSeen) >= ttl {
+			delete(l.entries, k)
+		}
+	}
+
+	// If still at capacity for a new project key, evict the least-recently-seen entry.
+	if _, exists := l.entries[projectID]; !exists && len(l.entries) >= maxEntries {
+		var oldestKey string
+		var oldestTime time.Time
+		first := true
+		for k, e := range l.entries {
+			if first || e.lastSeen.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = e.lastSeen
+				first = false
+			}
+		}
+		if !first {
+			delete(l.entries, oldestKey)
+		}
+	}
+
+	l.entries[projectID] = githubAssociationRefusalEntry{
+		installationID: installationID,
+		reason:         reason,
+		lastSeen:       now,
+	}
+	return true
+}
+
+// clear removes any tracked refusal state for projectID so a subsequent refusal
+// is logged again.
+func (l *githubAssociationRefusalLog) clear(projectID string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.entries, projectID)
 }

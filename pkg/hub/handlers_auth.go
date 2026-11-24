@@ -51,11 +51,12 @@ type AuthLoginResponse struct {
 
 // UserResponse is the user info returned in auth responses.
 type UserResponse struct {
-	ID          string `json:"id"`
-	Email       string `json:"email"`
-	DisplayName string `json:"displayName"`
-	Role        string `json:"role"`
-	AvatarURL   string `json:"avatarUrl,omitempty"`
+	ID           string `json:"id"`
+	Email        string `json:"email"`
+	DisplayName  string `json:"displayName"`
+	Role         string `json:"role"`
+	AvatarURL    string `json:"avatarUrl,omitempty"`
+	ViewAsMember bool   `json:"viewAsMember,omitempty"`
 
 	// Preferences is populated only by handleAuthMe, from a live store read.
 	Preferences *store.UserPreferences `json:"preferences,omitempty"`
@@ -345,9 +346,14 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	accessToken, refreshToken, expiresIn, err := s.userTokenService.MintTokenPair(
-		user.ID, user.Email, user.DisplayName, user.Role, user.SessionGeneration, ClientTypeWeb,
-	)
+	accessToken, refreshToken, expiresIn, err := s.userTokenService.MintTokenPair(UserTokenSubject{
+		UserID:            user.ID,
+		Email:             user.Email,
+		DisplayName:       user.DisplayName,
+		Role:              user.Role,
+		SessionGeneration: user.SessionGeneration,
+		ClientType:        ClientTypeWeb,
+	})
 	if err != nil {
 		InternalError(w)
 		return
@@ -460,9 +466,14 @@ func (s *Server) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	accessToken, refreshToken, expiresIn, err := s.userTokenService.MintTokenPair(
-		user.ID, user.Email, user.DisplayName, user.Role, user.SessionGeneration, clientType,
-	)
+	accessToken, refreshToken, expiresIn, err := s.userTokenService.MintTokenPair(UserTokenSubject{
+		UserID:            user.ID,
+		Email:             user.Email,
+		DisplayName:       user.DisplayName,
+		Role:              user.Role,
+		SessionGeneration: user.SessionGeneration,
+		ClientType:        clientType,
+	})
 	if err != nil {
 		InternalError(w)
 		return
@@ -603,12 +614,18 @@ func (s *Server) handleAuthRefresh(w http.ResponseWriter, r *http.Request) {
 			} else {
 				if oldRole == store.UserRoleAdmin {
 					s.deleteSuperAdminBinding(r.Context(), user.ID)
-				} else if role == store.UserRoleAdmin {
-					s.ensureSuperAdminBinding(r.Context(), user.ID)
-				}
-				if err := syncHubRoleGrants(r.Context(), s.store, user.ID, role, store.SystemReconcileCreatedBy); err != nil {
-					slog.Warn("failed to sync hub role grants on token refresh",
-						"email", claims.Email, "user_id", user.ID, "role", role, "error", err)
+					if err := applyDefaultUserRoleGrants(r.Context(), s.store, user.ID, role, s.DefaultUserRole(), s.CustomDefaultRoleEnabled()); err != nil {
+						slog.Warn("failed to apply default user role grants on token refresh",
+							"email", claims.Email, "user_id", user.ID, "role", role, "error", err)
+					}
+				} else {
+					if role == store.UserRoleAdmin {
+						s.ensureSuperAdminBinding(r.Context(), user.ID)
+					}
+					if err := syncHubRoleGrants(r.Context(), s.store, user.ID, role, store.SystemReconcileCreatedBy); err != nil {
+						slog.Warn("failed to sync hub role grants on token refresh",
+							"email", claims.Email, "user_id", user.ID, "role", role, "error", err)
+					}
 				}
 				s.publishConduitAuthzChanged(conduitAuthzMatch{UserID: user.ID})
 			}
@@ -625,9 +642,15 @@ func (s *Server) handleAuthRefresh(w http.ResponseWriter, r *http.Request) {
 	// The new pair carries the presented refresh token's own session
 	// generation, never a fresh row read, so a refresh cannot move a
 	// credential to a newer generation.
-	accessToken, refreshToken, expiresIn, err := s.userTokenService.MintTokenPair(
-		userID, claims.Email, claims.DisplayName, role, claims.SessionGeneration, claims.ClientType,
-	)
+	accessToken, refreshToken, expiresIn, err := s.userTokenService.MintTokenPair(UserTokenSubject{
+		UserID:            userID,
+		Email:             claims.Email,
+		DisplayName:       claims.DisplayName,
+		Role:              role,
+		SessionGeneration: claims.SessionGeneration,
+		ClientType:        claims.ClientType,
+		ViewAsMember:      claims.ViewAsMember && claims.ClientType == ClientTypeWeb,
+	})
 	if err != nil {
 		InternalError(w)
 		return
@@ -803,11 +826,12 @@ func (s *Server) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, UserResponse{
-		ID:          user.ID(),
-		Email:       user.Email(),
-		DisplayName: user.DisplayName(),
-		Role:        user.Role(),
-		Preferences: loadUserPreferences(r.Context(), s.store, user.ID()),
+		ID:           user.ID(),
+		Email:        user.Email(),
+		DisplayName:  user.DisplayName(),
+		Role:         user.Role(),
+		ViewAsMember: authUserViewAsMember(user),
+		Preferences:  loadUserPreferences(r.Context(), s.store, user.ID()),
 	})
 }
 
@@ -816,6 +840,7 @@ type AdminStatusResponse struct {
 	IsAdmin      bool     `json:"isAdmin"`
 	IsSuperAdmin bool     `json:"isSuperAdmin"`
 	Permissions  []string `json:"permissions"`
+	ViewAsMember bool     `json:"viewAsMember"`
 }
 
 // handleAuthAdminStatus handles GET /api/v1/auth/admin-status.
@@ -893,6 +918,7 @@ func (s *Server) handleAuthAdminStatus(w http.ResponseWriter, r *http.Request) {
 		IsAdmin:      isAdmin,
 		IsSuperAdmin: isSuperAdmin,
 		Permissions:  perms,
+		ViewAsMember: authUserViewAsMember(user),
 	})
 }
 
@@ -1405,9 +1431,14 @@ func (s *Server) handleCLIAuthToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	accessToken, refreshToken, expiresIn, err := s.userTokenService.MintTokenPair(
-		user.ID, user.Email, user.DisplayName, user.Role, user.SessionGeneration, ClientTypeCLI,
-	)
+	accessToken, refreshToken, expiresIn, err := s.userTokenService.MintTokenPair(UserTokenSubject{
+		UserID:            user.ID,
+		Email:             user.Email,
+		DisplayName:       user.DisplayName,
+		Role:              user.Role,
+		SessionGeneration: user.SessionGeneration,
+		ClientType:        ClientTypeCLI,
+	})
 	if err != nil {
 		InternalError(w)
 		return
@@ -1632,9 +1663,14 @@ func (s *Server) completeOAuthLogin(w http.ResponseWriter, r *http.Request, user
 		return
 	}
 
-	accessToken, refreshToken, expiresIn, err := s.userTokenService.MintTokenPair(
-		user.ID, user.Email, user.DisplayName, user.Role, user.SessionGeneration, ClientTypeCLI,
-	)
+	accessToken, refreshToken, expiresIn, err := s.userTokenService.MintTokenPair(UserTokenSubject{
+		UserID:            user.ID,
+		Email:             user.Email,
+		DisplayName:       user.DisplayName,
+		Role:              user.Role,
+		SessionGeneration: user.SessionGeneration,
+		ClientType:        ClientTypeCLI,
+	})
 	if err != nil {
 		InternalError(w)
 		return
@@ -1712,13 +1748,12 @@ func (s *Server) provisionUser(ctx context.Context, info *ExternalUserInfo) (*st
 		if user.Role == "admin" {
 			s.ensureSuperAdminBinding(ctx, user.ID)
 		}
-		// Make the hub-members group and hub-viewer binding match the role
-		// now, so the user's first request already has the right hub
-		// permissions. Best-effort: a grant write failure degrades the
-		// session but must not fail the login; the startup backfill repairs
-		// it.
-		if err := syncHubRoleGrants(ctx, s.store, user.ID, user.Role, store.SystemReconcileCreatedBy); err != nil {
-			slog.Warn("failed to sync hub role grants on login", "email", info.Email, "user_id", user.ID, "role", user.Role, "error", err)
+		// Apply initial default role grants (built-in or custom) now, so the
+		// user's first request already has the right hub permissions.
+		// Best-effort: a grant write failure degrades the session but must not
+		// fail the login; the startup backfill repairs built-in grants.
+		if err := applyDefaultUserRoleGrants(ctx, s.store, user.ID, user.Role, s.DefaultUserRole(), s.CustomDefaultRoleEnabled()); err != nil {
+			slog.Warn("failed to apply default user role grants on login", "email", info.Email, "user_id", user.ID, "role", user.Role, "error", err)
 		}
 		return user, nil
 	}
@@ -1770,6 +1805,9 @@ func (s *Server) signInPolicyDeps() signInPolicyDeps {
 		deleteSuperAdminBinding: s.deleteSuperAdminBinding,
 		syncGrants: func(ctx context.Context, userID, role string) error {
 			return syncHubRoleGrants(ctx, s.store, userID, role, store.SystemReconcileCreatedBy)
+		},
+		applyDefaultGrants: func(ctx context.Context, userID, role string) error {
+			return applyDefaultUserRoleGrants(ctx, s.store, userID, role, s.DefaultUserRole(), s.CustomDefaultRoleEnabled())
 		},
 		auditActivated: func(ctx context.Context, email, userID string) {
 			LogInviteAudit(ctx, s.auditLogger, InviteAuditUserActivated, email, "", userID, email, nil)

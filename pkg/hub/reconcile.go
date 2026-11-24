@@ -263,6 +263,7 @@ func (s *Server) execDispatchStart(ctx context.Context, d store.BrokerDispatch) 
 		opts.Async = args.Async
 		opts.Kind = args.Kind
 		opts.PriorPhase = args.PriorPhase
+		opts.PriorStatus = args.PriorStatus
 	}
 	// The warning for secrets the start goes without is worded for the
 	// requester, recorded on the row as its initiator (skippedSecretAudienceIsOwner).
@@ -366,7 +367,7 @@ func (s *Server) execDispatchStop(ctx context.Context, d store.BrokerDispatch) (
 	if intentAt != nil {
 		release, superseded := s.claimQueuedStop(ctx, agent, *intentAt, supersedes)
 		if superseded {
-			s.agentLifecycleLog.Info("reconcile: queued stop superseded by a newer run intent or start; not applied",
+			s.lifecycleLogger().Info("reconcile: queued stop superseded by a newer run intent or start; not applied",
 				"id", d.ID, "agent_id", agent.ID, "run_intent", agent.RunIntent)
 			return stopSupersededResult, nil
 		}
@@ -394,7 +395,7 @@ func (s *Server) execDispatchStop(ctx context.Context, d store.BrokerDispatch) (
 				ClearMessageIf:  offlineStopMessage,
 			})
 			if err != nil {
-				s.agentLifecycleLog.Warn("reconcile: failed to update container status after queued stop",
+				s.lifecycleLogger().Warn("reconcile: failed to update container status after queued stop",
 					"id", d.ID, "agent_id", agent.ID, "error", err)
 			}
 			if recorded {
@@ -428,6 +429,15 @@ func (s *Server) execDispatchRestart(ctx context.Context, d store.BrokerDispatch
 	dispatcher := s.GetDispatcher()
 	if dispatcher == nil {
 		return "", fmt.Errorf("no dispatcher available")
+	}
+	if d.Args != "" {
+		args, err := UnmarshalRestartArgs(d.Args)
+		if err != nil {
+			return "", fmt.Errorf("unmarshal restart args: %w", err)
+		}
+		if args.PriorStatus != nil {
+			ctx = withDispatchPriorStatus(ctx, args.PriorStatus)
+		}
 	}
 	// The warning for secrets the restart goes without is worded for the
 	// requester, recorded on the row as its initiator (skippedSecretAudienceIsOwner).

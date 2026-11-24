@@ -34,7 +34,7 @@ var (
 // messagesCmd is the top-level command group for message inbox management.
 var messagesCmd = &cobra.Command{
 	Use:     "messages",
-	Aliases: []string{"msgs", "inbox"},
+	Aliases: []string{"msgs"},
 	Short:   "View messages from agents",
 	Long: `View and manage messages sent to you by agents.
 
@@ -48,6 +48,7 @@ Commands:
   scion messages --agent <name>             Filter by agent
   scion messages read [id]                  Mark message(s) as read
   scion messages read --all                 Mark all messages as read`,
+	Args: cobra.NoArgs,
 	RunE: runMessagesList,
 }
 
@@ -63,6 +64,7 @@ With --all flag, marks all unread messages as read.
 Examples:
   scion messages read a1b2c3d4
   scion messages read --all`,
+	Args: cobra.MaximumNArgs(1),
 	RunE: runMessagesRead,
 }
 

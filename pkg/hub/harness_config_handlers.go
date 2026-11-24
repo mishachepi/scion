@@ -349,6 +349,15 @@ func (s *Server) createHarnessConfig(w http.ResponseWriter, r *http.Request) {
 		ValidationError(w, "slug is empty after normalization", nil)
 		return
 	}
+	if refuseReservedHarnessConfigSlug(w, slug) {
+		return
+	}
+	if refuseReservedHarnessType(w, req.Harness) {
+		return
+	}
+	if s.refuseGlobalHarnessConfigSlug(ctx, w, createScope, slug) {
+		return
+	}
 
 	// The row carries the requested harness until its first commit derives
 	// Harness and Config from config.yaml.
@@ -595,11 +604,81 @@ func (s *Server) getHarnessConfig(w http.ResponseWriter, r *http.Request, hc *st
 	// once, above the switch, in handleHarnessConfigByID.
 
 	resp := HarnessConfigWithCapabilities{HarnessConfig: *hc}
+	s.populateHarnessConfigCapabilities(ctx, &resp.HarnessConfig)
 	if identity := GetIdentityFromContext(ctx); identity != nil {
 		resp.Cap = s.authzService.ComputeCapabilities(ctx, identity, harnessConfigResource(hc))
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// populateHarnessConfigCapabilities backfills Config.Capabilities from stored
+// config.yaml and agent-plugins.yaml when a row predates Capabilities being
+// derived onto HarnessConfigData.
+func (s *Server) populateHarnessConfigCapabilities(ctx context.Context, hc *store.HarnessConfig) {
+	if hc == nil || (hc.Config != nil && hc.Config.Capabilities != nil) {
+		return
+	}
+	_, hasConfig := templateFileByPath(hc.Files, harnessConfigYAMLPath)
+	_, hasSidecar := templateFileByPath(hc.Files, config.AgentPluginsSidecarFile)
+	if !hasConfig && !hasSidecar {
+		return
+	}
+	stor := s.GetStorage()
+	if stor == nil || hc.StoragePath == "" {
+		return
+	}
+	missKey := hc.ID + "@" + hc.ContentHash
+	if _, missed := s.harnessConfigCapsMisses.Load(missKey); missed {
+		return
+	}
+
+	var entry config.HarnessConfigEntry
+	transientErr := false
+	if hasConfig {
+		data, err := s.readHarnessConfigFile(ctx, stor, hc, harnessConfigYAMLPath, maxHarnessConfigFileSize)
+		switch {
+		case err == nil:
+			if parsed, perr := config.ParseHarnessConfigYAML(data); perr == nil {
+				entry = parsed
+			}
+		case errors.Is(err, storage.ErrNotFound), errors.Is(err, errTemplateObjectTooLarge):
+		default:
+			transientErr = true
+		}
+	}
+	if hasSidecar {
+		where := hc.Name + "/" + config.AgentPluginsSidecarFile
+		data, err := s.readHarnessConfigFile(ctx, stor, hc, config.AgentPluginsSidecarFile, maxHarnessConfigFileSize)
+		switch {
+		case err == nil:
+			config.ApplyAgentPluginsSidecarBytes(&entry, data, where)
+		case errors.Is(err, errTemplateObjectTooLarge):
+			config.ApplyAgentPluginsSidecarError(&entry, errTemplateObjectTooLarge, where)
+		case errors.Is(err, storage.ErrNotFound):
+		default:
+			transientErr = true
+		}
+	}
+
+	caps := entry.DeclaredCapabilities()
+	if caps == nil {
+		if !transientErr && ctx.Err() == nil {
+			s.harnessConfigCapsMisses.Store(missKey, struct{}{})
+		}
+		return
+	}
+	if caps.Harness == "" {
+		caps.Harness = hc.Harness
+	}
+	var cfgCopy store.HarnessConfigData
+	if hc.Config != nil {
+		cfgCopy = *hc.Config
+	} else {
+		cfgCopy.Harness = hc.Harness
+	}
+	cfgCopy.Capabilities = caps
+	hc.Config = &cfgCopy
 }
 
 // harnessConfigImage is the image the image handlers show and check: the
@@ -657,6 +736,15 @@ func (s *Server) updateHarnessConfig(w http.ResponseWriter, r *http.Request, exi
 	if hc.Slug == "" {
 		hc.Slug = api.Slugify(hc.Name)
 	}
+	if refuseReservedHarnessConfigSlug(w, hc.Slug) {
+		return
+	}
+	if refuseReservedHarnessType(w, hc.Harness) {
+		return
+	}
+	if hc.Slug != existing.Slug && s.refuseGlobalHarnessConfigSlug(ctx, w, hc.Scope, hc.Slug) {
+		return
+	}
 
 	if err := s.store.UpdateHarnessConfig(ctx, &hc); err != nil {
 		writeErrorFromErr(w, err, "")
@@ -669,12 +757,22 @@ func (s *Server) updateHarnessConfig(w http.ResponseWriter, r *http.Request, exi
 func (s *Server) patchHarnessConfig(w http.ResponseWriter, r *http.Request, existing *store.HarnessConfig) {
 	ctx := r.Context()
 
+	prevSlug := existing.Slug
 	if !applyResourceMetadataPatch(w, r, resourceMetadataFields{
 		Name:        &existing.Name,
 		Slug:        &existing.Slug,
 		DisplayName: &existing.DisplayName,
 		Description: &existing.Description,
 	}) {
+		return
+	}
+	if refuseReservedHarnessConfigSlug(w, existing.Slug) {
+		return
+	}
+	if refuseReservedHarnessType(w, existing.Harness) {
+		return
+	}
+	if existing.Slug != prevSlug && s.refuseGlobalHarnessConfigSlug(ctx, w, existing.Scope, existing.Slug) {
 		return
 	}
 
@@ -827,18 +925,20 @@ func isDisallowedSourceURLRune(r rune) bool {
 }
 
 // invalidSourceURLMessage is the validation error for a sourceUrl that fails
-// validRecordedSourceURL (finalize) or validReimportSourceURL (reimport).
+// validRecordedSourceURL (finalize) or validReimportSourceURL (reimport). It
+// names only the forms a hosted Hub imports from (CheckHubImportSource).
 var invalidSourceURLMessage = fmt.Sprintf(
-	"sourceUrl must be a single-line remote URI (http://, https://, or rclone) of at most %d bytes",
+	"sourceUrl must be a single-line https://, gs://bucket/path or :gcs:bucket/path source of at most %d bytes",
 	maxRecordedSourceURLBytes)
 
 // validRecordedSourceURL reports whether s may be recorded as a harness
-// config's source URL: a single-line remote URI (http://, https://, or an
-// rclone URI) of at most maxRecordedSourceURLBytes, with no control or
+// config's source URL: a single-line remote URI (http://, https://, gs://,
+// or an rclone URI) of at most maxRecordedSourceURLBytes, with no control or
 // invisible formatting characters. Finalize and the reimport override share
-// it.
+// it. Whether a hosted Hub may fetch it is decided when it is fetched
+// (checkImportSource): an allowlisted gs:// source is accepted there.
 func validRecordedSourceURL(s string) bool {
-	return len(s) <= maxRecordedSourceURLBytes && config.IsRemoteURI(s) &&
+	return len(s) <= maxRecordedSourceURLBytes && (config.IsRemoteURI(s) || strings.HasPrefix(s, "gs://")) &&
 		!strings.ContainsFunc(s, isDisallowedSourceURLRune)
 }
 
@@ -1093,6 +1193,11 @@ func (s *Server) handleHarnessConfigDownload(w http.ResponseWriter, r *http.Requ
 
 	ctx := r.Context()
 
+	if agentIdent := GetAgentIdentityFromContext(ctx); agentIdent != nil && s.agentStanding(ctx, agentIdent.ID()) != nil {
+		NotFound(w, "HarnessConfig")
+		return
+	}
+
 	stor := s.GetStorage()
 	if stor == nil {
 		RuntimeError(w, "Storage not configured")
@@ -1289,11 +1394,20 @@ func (s *Server) handleHarnessConfigClone(w http.ResponseWriter, r *http.Request
 	// for why this must run ahead of the copy below rather than only being
 	// caught by CreateHarnessConfig's own uniqueness check, and why it is
 	// only a fast path rather than a full fix for concurrent requests.
+	if refuseReservedHarnessConfigSlug(w, clone.Slug) {
+		return
+	}
+	if refuseReservedHarnessType(w, clone.Harness) {
+		return
+	}
 	if existing, err := s.store.GetHarnessConfigBySlug(ctx, clone.Slug, clone.Scope, clone.ScopeID); err != nil && !errors.Is(err, store.ErrNotFound) {
 		writeErrorFromErr(w, err, "")
 		return
 	} else if existing != nil {
 		writeError(w, http.StatusConflict, "conflict", "A resource with this slug already exists in the target scope. Choose a different name.", nil)
+		return
+	}
+	if s.refuseGlobalHarnessConfigSlug(ctx, w, clone.Scope, clone.Slug) {
 		return
 	}
 
@@ -1442,6 +1556,10 @@ func (s *Server) handleHarnessConfigReimport(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	if s.refuseImportSource(w, sourceURL) {
+		return
+	}
+
 	// The slug filter selects the source entry (ptone/scion#4213); the
 	// target store writes it into the row with hc's ID, whatever the slug
 	// of the entry or the row is by the time it is persisted
@@ -1464,7 +1582,7 @@ func (s *Server) handleHarnessConfigReimport(w http.ResponseWriter, r *http.Requ
 	var failures []ImportFailure
 	imported, err := run(failureCollector(&failures))
 	if err != nil {
-		if writeUnusableProvisionerImportError(w, err) {
+		if writeImportContentRefusal(w, err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "reimport_failed", err.Error(), nil)
@@ -1717,6 +1835,10 @@ func (s *Server) handleHarnessConfigDeleteLocalImage(w http.ResponseWriter, r *h
 			return
 		}
 		if !s.canRunBrokerImageOps(ctx, broker) {
+			if s.brokerPolicyRefuses(broker) {
+				writeBrokerPolicyDenial(w, r, brokerPolicyOpDispatch, broker)
+				return
+			}
 			writeError(w, http.StatusForbidden, "forbidden", "You do not have permission to perform image operations on this broker", nil)
 			return
 		}
@@ -1787,6 +1909,10 @@ func (s *Server) handleHarnessConfigPullImage(w http.ResponseWriter, r *http.Req
 			return
 		}
 		if !s.canRunBrokerImageOps(ctx, broker) {
+			if s.brokerPolicyRefuses(broker) {
+				writeBrokerPolicyDenial(w, r, brokerPolicyOpDispatch, broker)
+				return
+			}
 			writeError(w, http.StatusForbidden, "forbidden", "You do not have permission to perform image operations on this broker", nil)
 			return
 		}

@@ -75,13 +75,18 @@ const (
 	// GrantProgeny is the runtime user read grant (check 8).
 	GrantProgeny GrantKind = "progeny"
 
-	// Delivery association grants (material_delivery.go): a project-, hub-
-	// or broker-scope item delivered at launch to an agent associated with
-	// that scope. Each names the relationship rule of the same name
+	// GrantAgentSelfRead is the runtime agent-scope read of an agent's own
+	// secrets (ptone/scion#8742).
+	GrantAgentSelfRead GrantKind = "agent_self_read"
+
+	// Delivery association grants (material_delivery.go): a project-, hub-,
+	// broker- or agent-scope item delivered at launch to an agent associated
+	// with that scope. Each names the relationship rule of the same name
 	// (authz_material_association.go). None is ever a runtime-read grant.
 	GrantProjectAssociation GrantKind = "project_association"
 	GrantHubAssociation     GrantKind = "hub_association"
 	GrantBrokerAssociation  GrantKind = "broker_association"
+	GrantAgentAssociation   GrantKind = "agent_association"
 )
 
 // ProvenanceRoot identifies the human ancestor a runtime read is evaluated
@@ -105,6 +110,11 @@ type TargetFacts struct {
 	Ancestry  []string       // Agent.Ancestry as stored; never extended
 	Root      ProvenanceRoot // ProvenanceRoot{Kind: "user", ID: Ancestry[0]} (check 3), confirmed by check 5
 	Project   *store.Project // loaded by ProjectID
+	// RootViewerOnly is true when check 5 admitted the root user solely via
+	// the built-in project-viewer role (not beyond-viewer membership or
+	// system authority). Non-user scopes must refuse requests with
+	// RootViewerOnly set (ptone/scion#8875).
+	RootViewerOnly bool
 }
 
 // SourceRef identifies the user or agent that authored a user-scoped item,
@@ -151,6 +161,11 @@ const (
 	// chain has no recorded provenance (it cannot be fully evaluated).
 	// Re-delegating the agent records the chain.
 	ReasonChainUnrecorded = "chain_unrecorded"
+	// ReasonGitHubTokenInstallationOnly: the requesting agent (descendants
+	// inherit the preference at create time) has GitHubTokenPreference ==
+	// "installation", so user/project GITHUB_TOKEN and GH_* alias secrets are
+	// withheld from runtime reads (Stage 2 §5.1a).
+	ReasonGitHubTokenInstallationOnly = "github_token_installation_only"
 )
 
 // selectRuntimeMaterial composes checks 7-9 for one candidate key in one
@@ -174,9 +189,55 @@ const (
 // check-7 Detail string (Decision.Reason verbatim; "" for user scope, which
 // makes no such decision).
 func (s *Server) selectRuntimeMaterial(ctx context.Context, ident AgentIdentity, facts *TargetFacts, scope, key string, decisionCache *projectDecisionCache) (item ItemResult, value *secret.SecretWithValue, permission, detail string) {
+	installationOnly := facts != nil && usesInstallationGitHubToken(facts.Agent)
+	if installationOnly && isBlockedInstallationGitHubEnvKey(key) {
+		switch scope {
+		case store.ScopeAgent:
+			return ItemResult{
+				Candidate: Candidate{Kind: MaterialKindSecret, Key: key, Scope: store.ScopeAgent, ScopeID: facts.Agent.ID, Grant: GrantAgentSelfRead},
+				Reason:    ReasonGitHubTokenInstallationOnly,
+			}, nil, "", ""
+		case store.ScopeProject:
+			return ItemResult{
+				Candidate: Candidate{Kind: MaterialKindSecret, Key: key, Scope: store.ScopeProject, ScopeID: facts.ProjectID, Grant: GrantProjectSecretRead},
+				Reason:    ReasonGitHubTokenInstallationOnly,
+			}, nil, "project.secret_read", ""
+		case store.ScopeUser:
+			return ItemResult{
+				Candidate: Candidate{Kind: MaterialKindSecret, Key: key, Scope: store.ScopeUser, ScopeID: facts.Root.ID, Grant: GrantProgeny},
+				Reason:    ReasonGitHubTokenInstallationOnly,
+			}, nil, "", ""
+		default:
+			return ItemResult{}, nil, "", ""
+		}
+	}
+
 	switch scope {
+	case store.ScopeAgent:
+		if facts != nil && facts.RootViewerOnly {
+			item = ItemResult{
+				Candidate: Candidate{Kind: MaterialKindSecret, Key: key, Scope: store.ScopeAgent, ScopeID: facts.Agent.ID, Grant: GrantAgentSelfRead},
+				Reason:    ReasonMembershipRequired,
+			}
+			return item, nil, permission, detail
+		}
+		item = s.authorizeRuntimeAgentItem(ctx, key, facts)
 	case store.ScopeProject:
 		permission = "project.secret_read"
+		if !ident.HasScope(ScopeProjectSecretRead) {
+			item = ItemResult{
+				Candidate: Candidate{Kind: MaterialKindSecret, Key: key, Scope: store.ScopeProject, ScopeID: facts.ProjectID, Grant: GrantProjectSecretRead},
+				Reason:    ReasonCapabilityRequired,
+			}
+			return item, nil, permission, detail
+		}
+		if facts != nil && facts.RootViewerOnly {
+			item = ItemResult{
+				Candidate: Candidate{Kind: MaterialKindSecret, Key: key, Scope: store.ScopeProject, ScopeID: facts.ProjectID, Grant: GrantProjectSecretRead},
+				Reason:    ReasonMembershipRequired,
+			}
+			return item, nil, permission, detail
+		}
 		decision, decErr := s.projectReadDecision(ctx, ident, facts, decisionCache)
 		if decErr != nil {
 			item = ItemResult{
@@ -187,6 +248,13 @@ func (s *Server) selectRuntimeMaterial(ctx context.Context, ident AgentIdentity,
 		}
 		item, detail = s.authorizeRuntimeProjectItem(ctx, key, facts, decision)
 	case store.ScopeUser:
+		if !ident.HasScope(ScopeProjectSecretRead) {
+			item = ItemResult{
+				Candidate: Candidate{Kind: MaterialKindSecret, Key: key, Scope: store.ScopeUser, ScopeID: facts.Root.ID, Grant: GrantProgeny},
+				Reason:    ReasonCapabilityRequired,
+			}
+			return item, nil, permission, detail
+		}
 		item = s.authorizeRuntimeUserItem(ctx, ident, facts, key)
 	default:
 		return ItemResult{}, nil, "", ""
@@ -194,6 +262,11 @@ func (s *Server) selectRuntimeMaterial(ctx context.Context, ident AgentIdentity,
 
 	if !item.Allowed {
 		return item, nil, permission, detail
+	}
+	if installationOnly && isBlockedInstallationGitHubEnvKey(item.Meta.Target) {
+		item.Allowed = false
+		item.Reason = ReasonGitHubTokenInstallationOnly
+		return item, nil, permission, ""
 	}
 
 	sv, valReason := s.fetchAuthorizedValue(ctx, item)

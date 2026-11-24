@@ -62,6 +62,38 @@ func brandLogoHTML(b *config.ResolvedBranding) string {
 	return fmt.Sprintf(`<img class="brand-logo" src="%s" alt="%s">`, light, alt)
 }
 
+func brandPageControlRadius(b *config.ResolvedBranding) string {
+	b = brandOrDefault(b)
+	switch b.Corners {
+	case config.BrandCornersSquare:
+		return "0"
+	case config.BrandCornersRounded:
+		return "10px"
+	default:
+		return "6px"
+	}
+}
+
+func brandPageNoAssetsRadii(b *config.ResolvedBranding) (codeRadius, hintRadius string) {
+	b = brandOrDefault(b)
+	switch b.Corners {
+	case config.BrandCornersSquare:
+		return "0", "0"
+	case config.BrandCornersRounded:
+		return "6px", "12px"
+	default:
+		return "4px", "8px"
+	}
+}
+
+func brandPageFontSansStack(b *config.ResolvedBranding) string {
+	b = brandOrDefault(b)
+	if b.FontSans != "" && b.FontSans != config.BrandFontSansDefault && b.FontSansStack != "" {
+		return b.FontSansStack
+	}
+	return "'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif"
+}
+
 func brandPageColorsCSS(b *config.ResolvedBranding) string {
 	b = brandOrDefault(b)
 	light := b.Light
@@ -115,7 +147,7 @@ func renderErrorPageWithBranding(b *config.ResolvedBranding, pageTitle, icon, ic
 
         html, body {
             height: 100%%;
-            font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+            font-family: %s;
             background: var(--bg);
             color: var(--text);
             -webkit-font-smoothing: antialiased;
@@ -189,6 +221,7 @@ func renderErrorPageWithBranding(b *config.ResolvedBranding, pageTitle, icon, ic
 </html>`,
 		html.EscapeString(pageTitle),
 		brandPageColorsCSS(b),
+		brandPageFontSansStack(b),
 		brandLogoHTML(b),
 		html.EscapeString(iconLabel),
 		icon, // icon is a raw HTML entity, not user input

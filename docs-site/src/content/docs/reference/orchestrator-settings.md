@@ -195,7 +195,7 @@ Tiers merge field by field: a field set at a higher tier wins, and fields it lea
 **Defaults.**
 
 - All runtimes: `limits.cpu: "2"` is applied when no tier sets a CPU limit, unless `runtime.enforce_resource_defaults` is `false` (default `true`). There is no default memory limit.
-- Cloud Run (`cloudrun`): each resource uses `resources.limits.cpu` / `resources.limits.memory`, falling back to `resources.requests.cpu` / `resources.requests.memory` when no limit is set (unless `runtime.enforce_resource_defaults` is `false`, `limits.cpu` is already set to the built-in `"2"`, raised to `requests.cpu` when `requests.cpu` is above `2`), and a resource left unset is checked at its platform default (`1` vCPU, `512Mi`). Values are validated before any workspace or home directory is provisioned on the NFS share: CPU must be `1`, `2`, `4`, `6` or `8` whole vCPU (`"a Cloud Run instance takes 1, 2, 4, 6 or 8 vCPU"`), and memory must be a whole number of `Mi` or `M` (`"memory must be a whole number of Mi or M on Cloud Run"`) from `512Mi` to `32768Mi` (`32Gi`) within the vCPU's allowed memory range (`1` vCPU: `512Mi` to `4096Mi`; `2` vCPU: `512Mi` to `8192Mi`; `4` vCPU: `2048Mi` to `16384Mi`; `6` vCPU: `4096Mi` to `24576Mi`; `8` vCPU: `4096Mi` to `32768Mi`). A value outside these limits (`ResourceLimitsError`) answers HTTP `400` (`validation_error`) on synchronous create, start, and restart, and ends an asynchronous launch with launch error code `container_config`. `resources.disk` is not mapped (logged as `disk_not_applied` when set).
+- Cloud Run (`cloudrun`): each resource uses `resources.limits.cpu` / `resources.limits.memory`, falling back to `resources.requests.cpu` / `resources.requests.memory` when no limit is set (unless `runtime.enforce_resource_defaults` is `false`, `limits.cpu` is already set to the built-in `"2"`, raised to `requests.cpu` when `requests.cpu` is above `2`), and a resource left unset is checked at its platform default (`2` vCPU, `2048Mi` (`2Gi`)). Values are validated before any workspace or home directory is provisioned on the NFS share: CPU must be `1`, `2`, `4`, `6` or `8` whole vCPU (`"a Cloud Run instance takes 1, 2, 4, 6 or 8 vCPU"`), and memory must be a whole number of `Mi` or `M` (`"memory must be a whole number of Mi or M on Cloud Run"`) from `512Mi` to `32768Mi` (`32Gi`) within the vCPU's allowed memory range (`1` vCPU: `512Mi` to `4096Mi`; `2` vCPU: `512Mi` to `8192Mi`; `4` vCPU: `2048Mi` to `16384Mi`; `6` vCPU: `4096Mi` to `24576Mi`; `8` vCPU: `4096Mi` to `32768Mi`). A value outside these limits (`ResourceLimitsError`) answers HTTP `400` (`validation_error`) on synchronous create, start, and restart, and ends an asynchronous launch with launch error code `container_config`. `resources.disk` is not mapped (logged as `disk_not_applied` when set).
 - Kubernetes only: `cpu`, `memory` and `ephemeral-storage` each get a default **request** (`250m`, `512Mi` and `10Gi`) only when neither a request nor a limit is set for that resource, in `resources` or in `kubernetes.resources`. When a limit is set without a request, the request is left unset and Kubernetes sets it equal to the limit. So with the built-in CPU limit a pod requests and is limited to 2 CPU, and a profile that sets only `limits.memory` is scheduled at that limit.
 - Kubernetes never adds a default memory or ephemeral-storage limit. Those limits apply only when you set `limits.memory` or `disk` (or the same key in `kubernetes.resources.limits`). With `runtime.enforce_resource_defaults: false` and no resources set, a Kubernetes pod gets the three default requests and no limits.
 - The built-in CPU limit never ends up below a larger CPU request. If `requests.cpu` is above `2` and no tier sets `limits.cpu`, the built-in limit is raised to the request, on every runtime. If `kubernetes.resources.requests.cpu` is above the resulting limit and `kubernetes.resources.limits.cpu` is unset, `kubernetes.resources.limits.cpu` is set to that request; Docker and Podman keep `--cpus 2`. A CPU limit you set yourself is never changed, so keep it at or above your CPU request.
@@ -281,7 +281,7 @@ The profile `timezone` field was removed. A request to `PUT /api/v1/admin/server
 
 ## Volume Source Restrictions
 
-A Runtime Broker refuses any agent mount whose host source reaches the Runtime Broker host's own control files. This applies to every `volumes:` entry, whatever sets it (settings, profiles, harness configs, templates, flat Runtime Broker instance `agent_defaults`, or a create or start request from the Hub). It applies equally to read-only and read-write mounts. It also applies to shared directories, workspaces, agent homes and harness auth files.
+A Runtime Broker refuses any agent mount whose host source reaches the Runtime Broker host's own control files or a host container-engine socket. This applies to every `volumes:` entry, whatever sets it (settings, profiles, harness configs, templates, flat Runtime Broker instance `agent_defaults`, or a create or start request from the Hub). It applies equally to read-only and read-write mounts. It also applies to shared directories, workspaces, agent homes and harness auth files.
 
 The protected paths are, in the Scion global directory (`~/.scion`):
 
@@ -294,6 +294,15 @@ The protected paths are, in the Scion global directory (`~/.scion`):
 | Hub state | `hub-id`, and `hub.db` with its `-wal`, `-shm` and `-journal` files |
 
 The Runtime Broker's configured state directory (`server.broker.state_dir`) and a co-located Hub's SQLite database file are protected wherever they are configured.
+
+Container-engine sockets on the host are also protected (class `container-engine socket`):
+
+- Standard rootful Docker and Podman sockets: `/var/run/docker.sock`, `/run/docker.sock`, `/run/podman/podman.sock`, `/var/run/podman/podman.sock`
+- Rootless Docker and Podman sockets under `$XDG_RUNTIME_DIR` and `/run/user/<uid>` (`docker.sock`, `podman/podman.sock`)
+- `~/.docker/run/docker.sock` (as a result, mounting `~/.docker` as a whole is refused, while mounting `~/.docker/config.json` directly as a file remains allowed)
+- Any local `unix://` socket path configured in `DOCKER_HOST` or `CONTAINER_HOST`
+
+Because parent directories of protected paths are refused, mounting `/run`, `/var/run`, `/run/podman`, `$XDG_RUNTIME_DIR`, or `~/.docker` is also refused. Non-existent socket paths and symlinks pointing to a socket are refused as well.
 
 A mount source is refused when:
 
@@ -328,6 +337,46 @@ The check runs at each of these points:
 - **Runtime listing.** If the Runtime Broker cannot list a runtime's containers, it cannot tell which agents to check, so it stops none and tries again at the next check.
 - **Hard links.** Directories are not walked. A hard link to a protected file, placed inside an allowed directory by a process on the host, is not detected. An agent cannot create such a link itself.
 
+### Volumes in agent config on a hosted server
+
+On a hosted server (one not running in workstation mode), volumes written by project members are restricted further. This covers:
+
+- the `config` of an agent create request, the agent's stored inline config (sent again with each start), and config changes saved later through an agent update, including held edits;
+- the `config.yaml` of a project-scope harness config stored in the Hub;
+- a harness config bundled in a project-scope template stored in the Hub (`harness-configs/<name>/config.yaml`);
+- on a Runtime Broker, a harness config in the project's own `harness-configs` directory, or one bundled in a template.
+
+A refused volume gets `400` with the code `hosted_config_refused`:
+
+| Volume `type` | On a hosted server |
+| :--- | :--- |
+| `local` or unset (a host file or directory) | Refused |
+| `nfs` | Refused |
+| `cloudrun-volume`, `gke-shared-volume` | Refused |
+| `gcs` (spelled exactly so, in lower case) | Allowed only for agents that run on Kubernetes |
+| Any other type | Refused |
+
+- **Where it is checked.** A hosted Hub checks agent create and update requests, and checks again before it sends each create, provision, start or restart to a Runtime Broker, whatever mode that Runtime Broker runs in. It checks a project-scope harness config whenever its files change (file writes and uploads, finalize, clone into project scope, and import or reimport, which is refused as a whole before anything is stored), and again at dispatch for the harness config the agent uses. A `config.yaml` too large for the Hub to read is refused, because it cannot be checked. Before a dispatch, and when an agent's config is updated, the Hub judges a `gcs` volume by the runtime type the target Runtime Broker reports for the agent's profile: it is refused unless that type is Kubernetes. When the Hub does not know the profile or its type, and when a harness config is stored, it leaves the `gcs` decision in agent config to the Runtime Broker. A hosted Runtime Broker checks the config and inline config of each create and start request before anything is saved. It also checks a project-level or template-bundled harness config when it provisions and when it starts an agent. It does not check a harness config the Hub sends with the dispatch, because the Hub checks it. So at dispatch the Hub refuses a `gcs` volume in a project-scope Hub harness config unless the runtime type is known to be Kubernetes: when the Hub cannot determine the agent's runtime type (the profile is not reported, has no type, or the Runtime Broker reports several profiles and none is named), the dispatch is refused.
+- **Harness configs bundled in Hub templates.** A hosted Hub checks every bundled `harness-configs/<name>/config.yaml` of a project-scope or user-scope template (any member can write templates in their own user scope) whenever the template's files change (file writes and uploads, finalize, clone, and import or reimport, which is refused as a whole before anything is stored), and again before each dispatch of an agent that uses the template. A file path that a Runtime Broker's filesystem could read under another name is refused: the path's top-level name, and under `harness-configs/` the harness config's name and the names in its top directory, must be plain ASCII, must not end with a dot or a space, must not contain `~`, and must spell `harness-configs` and `config.yaml` in lower case. Global templates are not checked by the Hub.
+- **Agents and harness configs created earlier.** An agent whose stored config, or whose project harness config, already holds a refused volume is refused at its next start or restart, with the same error. A running agent keeps its mounts until it stops. Remove the volume from the agent's config or the harness config's `config.yaml`, or create the agent again without it.
+- **Operator-configured volumes.** Volumes configured by the server operator are not affected: profiles, flat Runtime Broker instance `agent_defaults`, `harness_configs` in global settings, global harness-config directories and the Hub's global harness configs. A harness config bundled in a template is checked even when the template is global; move such volumes into one of the operator places above. To give agents a host directory on a hosted server, use a project shared directory, or ask the operator to configure the volume in one of those places.
+- **Workstation mode.** Nothing changes. Volumes in agent config are subject only to the control-path rules above.
+
+The error names the volume by its target and says where it came from (for example `agent config` or `harness config "name"`). It never includes the volume's source, server or bucket.
+
+### Environment and Hub settings in agent config on a hosted server
+
+On a hosted server, the same member-written config is also checked for environment variables and for a `hub` block. It is checked in the same places and at the same times as volumes (see above), with the same `400 hosted_config_refused` error:
+
+- **Host environment references.** An `env` name or value that the Runtime Broker would expand against its own environment (`$NAME`, `${NAME}`) is refused. Use a literal value, or store the value as a secret.
+- **Empty values.** An `env` entry with an empty value is refused, because an empty value takes the variable of the same name from the Runtime Broker's environment. The reserved names listed below that may be set may also be left empty.
+- **Reserved names.** An `env` name starting with `SCION_` or `GCE_METADATA_` is refused: these names are reserved for Scion's own variables. A few names may still be set, each only where it is needed: `SCION_AUTO_EXPOSE_PORTS`, `SCION_AUTO_EXPOSE_MODE`, `SCION_AUTO_EXPOSE_PORTS_LIST` and `SCION_AUTO_EXPOSE_INTERVAL` (port auto-expose) in agent config at create, in agent config updates and in harness configs; `SCION_LOG_LEVEL` and `SCION_TELEMETRY_ENABLED` (set by the CLI's `--agent-log-level`, `--enable-telemetry` and `--disable-telemetry`) in agent config at create only; and `SCION_LIVENESS_HARNESS_ROOT_DEPTH` (set by the bundled Codex harness config) and `SCION_AGENT_NAME` (set in `env_template` by bundled harness configs) in harness configs only. Any other reserved name is refused, including ones added in later releases.
+- **Hub endpoint.** A `hub` block with an endpoint in agent config is refused. The server sets the agent's Hub connection.
+
+Harness configs are checked for `env`, and for reserved names in `env_template` (its values are filled from the agent's own fields, never from the Runtime Broker's environment); they have no `hub` block. On a Runtime Broker, the `env` list in the `config` of a create request is not checked: its values are used as written, never expanded or taken from the Runtime Broker's environment, and the Runtime Broker drops the reserved names it reads from it: the in-container clone URL and depth, the git token remote, `SCION_AUTH_TOKEN` and the Cloud Run native identity marker. A template's `env` is not checked: its values are used literally, without expansion or passthrough, and its `SCION_*` names and `hub` block are already ignored. Env from operator sources (profiles, settings `harness_configs`, global harness-config directories, the Hub's global harness configs and environment variables and secrets the Hub resolves) is not affected. In workstation mode, nothing changes.
+
+The error names the env variable (or `hub "endpoint"`) and where it came from. It never includes the value.
+
 ## Telemetry Configuration (`telemetry`)
 
 Controls agent telemetry collection, forwarding, privacy filtering, and debug output. Telemetry settings can be defined at global or project scope and are merged across the hierarchy (last write wins). A template's `telemetry` block is ignored; the Hub telemetry configuration and project telemetry policy also apply, and an agent's own config can only turn telemetry on or off. See the [telemetry ladder](/scion/reference/settings-precedence/#the-telemetry-ladder).
@@ -336,13 +385,32 @@ See the [Metrics & OpenTelemetry guide](/scion/hosted/single-node/metrics/) for 
 
 ### Basic Example
 
+For Google Cloud (Cloud Monitoring, Cloud Trace, and Cloud Logging), set `provider: gcp` and `gcp_project_id` so `sciontool` uses the GCP-native SDKs. Do not point `endpoint` at `monitoring.googleapis.com:443` — that host does not accept OTLP and fails with `Unimplemented`.
+
 ```yaml
 telemetry:
   enabled: true
   cloud:
     enabled: true
-    endpoint: "monitoring.googleapis.com:443"
+    provider: gcp
+    gcp_project_id: "my-gcp-project"
+  filter:
+    events:
+      exclude:
+        - "agent.user.prompt"
+```
+
+For a generic OTLP collector (such as a local host OpenTelemetry Collector), omit `provider: gcp` and set `endpoint` and `protocol`:
+
+```yaml
+telemetry:
+  enabled: true
+  cloud:
+    enabled: true
+    endpoint: "host.docker.internal:4317"
     protocol: grpc
+    tls:
+      enabled: false
   filter:
     events:
       exclude:
@@ -351,14 +419,15 @@ telemetry:
 
 ### Cloud Forwarding (`telemetry.cloud`)
 
-Settings for forwarding telemetry to a cloud OTLP backend.
+Settings for forwarding telemetry to Google Cloud or a generic OTLP backend.
 
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `enabled` | bool | `true` | Enable cloud forwarding. |
-| `endpoint` | string | — | Cloud OTLP endpoint URL. |
-| `protocol` | string | `grpc` | Transport protocol: `grpc` or `http`. |
-| `provider` | string | — | Cloud provider name (for example `gcp`). |
+| `provider` | string | — | Cloud provider name. Set `gcp` to export via GCP-native SDKs (Cloud Monitoring, Cloud Trace, Cloud Logging); leave unset for generic OTLP export. |
+| `gcp_project_id` | string | — | GCP project ID for GCP-native export and the Hub metrics dashboard. |
+| `endpoint` | string | — | Generic OTLP gRPC collector address (for example `host.docker.internal:4317`). Ignored when `provider` is `gcp`. |
+| `protocol` | string | `grpc` | Transport protocol for generic OTLP export (`grpc` or `http`). |
 | `cloud_logging` | bool | `false` | Send the Scion server's (Hub's) own logs directly to Google Cloud Logging. Read once at server startup; `SCION_CLOUD_LOGGING`, when set (even to `false`), takes precedence over the file. Agents do not use it: the value is carried into the agent's resolved telemetry config (`telemetry.cloud.cloud_logging`) but is not passed to the agent as an environment variable. On a database-backed Hub it cannot be changed through `PUT /api/v1/admin/server-config` (`422 startup_only_key_rejected`). |
 | `headers` | map | — | Additional headers for OTLP export (e.g., `Authorization`). |
 | `tls.enabled` | bool | `true` | Enable TLS for the connection. |

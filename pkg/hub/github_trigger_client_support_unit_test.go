@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/githubapp"
+	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
 func TestAllowGitHubComment_BurstRefillAndBoundedMap(t *testing.T) {
@@ -110,6 +111,12 @@ func TestCanonicalGitHubTokenPermKey(t *testing.T) {
 func TestScopeRequestedGitHubTokenPermissions(t *testing.T) {
 	readOnlyGrant := githubAssociationGrant{Owner: "acme", Repo: "widgets", WriteAllowed: false}
 	writeGrant := githubAssociationGrant{Owner: "acme", Repo: "widgets", WriteAllowed: true}
+	defaultAppPerms := map[string]string{
+		"contents":      "write",
+		"pull_requests": "write",
+		"issues":        "write",
+		"metadata":      "read",
+	}
 
 	writeCases := []struct {
 		name  string
@@ -124,15 +131,28 @@ func TestScopeRequestedGitHubTokenPermissions(t *testing.T) {
 	}
 	for _, tc := range writeCases {
 		t.Run("read-only grant refuses "+tc.name, func(t *testing.T) {
-			_, err := scopeRequestedGitHubTokenPermissions(tc.perms, readOnlyGrant)
+			_, err := scopeRequestedGitHubTokenPermissions(tc.perms, nil, readOnlyGrant, defaultAppPerms)
 			if !errors.Is(err, ErrGitHubWriteNotPermitted) {
-				t.Fatalf("scopeRequestedGitHubTokenPermissions(%+v, readOnly) err = %v, want ErrGitHubWriteNotPermitted", tc.perms, err)
+				t.Fatalf("scopeRequestedGitHubTokenPermissions(%+v, nil, readOnly) err = %v, want ErrGitHubWriteNotPermitted", tc.perms, err)
 			}
 		})
-		t.Run("write grant allows "+tc.name, func(t *testing.T) {
-			got, err := scopeRequestedGitHubTokenPermissions(tc.perms, writeGrant)
+	}
+
+	// Default project limit (stored == nil) allows DefaultTokenPermissions intersected with appPermissions.
+	defaultWriteAllowed := []struct {
+		name  string
+		perms githubapp.TokenPermissions
+	}{
+		{"contents write", githubapp.TokenPermissions{Contents: "write"}},
+		{"pull_requests write", githubapp.TokenPermissions{PullRequests: "write"}},
+		{"issues write", githubapp.TokenPermissions{Issues: "write", Metadata: "read"}},
+		{"metadata read", githubapp.TokenPermissions{Metadata: "read"}},
+	}
+	for _, tc := range defaultWriteAllowed {
+		t.Run("write grant default limit allows "+tc.name, func(t *testing.T) {
+			got, err := scopeRequestedGitHubTokenPermissions(tc.perms, nil, writeGrant, defaultAppPerms)
 			if err != nil {
-				t.Fatalf("scopeRequestedGitHubTokenPermissions(%+v, write) err = %v", tc.perms, err)
+				t.Fatalf("scopeRequestedGitHubTokenPermissions(%+v, nil, write) err = %v", tc.perms, err)
 			}
 			if got != tc.perms {
 				t.Fatalf("got %+v, want %+v", got, tc.perms)
@@ -140,8 +160,89 @@ func TestScopeRequestedGitHubTokenPermissions(t *testing.T) {
 		})
 	}
 
+	// When stored == nil and appPermissions is unknown (nil), empty, or disjoint
+	// with defaults (ok == false), refuse EVERY request — including {Metadata: "read"} —
+	// with ErrGitHubPermissionNotPermitted before any implicit metadata:read bump.
+	for _, appGrant := range []struct {
+		name  string
+		perms map[string]string
+	}{
+		{"nil", nil},
+		{"empty", map[string]string{}},
+		{"disjoint", map[string]string{"deployments": "read"}},
+	} {
+		for _, req := range []githubapp.TokenPermissions{
+			{Issues: "write", Metadata: "read"},
+			{Metadata: "read"},
+		} {
+			if _, err := scopeRequestedGitHubTokenPermissions(req, nil, writeGrant, appGrant.perms); !errors.Is(err, ErrGitHubPermissionNotPermitted) {
+				t.Fatalf("%s appPermissions with stored=nil req=%+v err = %v, want ErrGitHubPermissionNotPermitted", appGrant.name, req, err)
+			}
+		}
+	}
+	// When stored == nil and App only grants issues:read, issues:write is refused while issues:read + metadata:read succeeds.
+	readOnlyIssuesApp := map[string]string{"issues": "read", "metadata": "read"}
+	if _, err := scopeRequestedGitHubTokenPermissions(githubapp.TokenPermissions{Issues: "write", Metadata: "read"}, nil, writeGrant, readOnlyIssuesApp); !errors.Is(err, ErrGitHubPermissionNotPermitted) {
+		t.Fatalf("issues:write against read-only App grant err = %v, want ErrGitHubPermissionNotPermitted", err)
+	}
+	if got, err := scopeRequestedGitHubTokenPermissions(githubapp.TokenPermissions{Issues: "read", Metadata: "read"}, nil, writeGrant, readOnlyIssuesApp); err != nil || got != (githubapp.TokenPermissions{Issues: "read", Metadata: "read"}) {
+		t.Fatalf("issues:read + metadata:read against read-only App grant = (%+v, %v)", got, err)
+	}
+
+	// G3 S3: explicit project permission limit intersects and refuses requests that exceed it.
+	storedReadOnlyIssues := &store.GitHubTokenPermissions{
+		Contents: "read",
+		Issues:   "read",
+		Metadata: "read",
+	}
+	if _, err := scopeRequestedGitHubTokenPermissions(githubapp.TokenPermissions{Issues: "write", Metadata: "read"}, storedReadOnlyIssues, writeGrant, nil); !errors.Is(err, ErrGitHubPermissionNotPermitted) {
+		t.Fatalf("write request exceeding stored issues:read limit err = %v, want ErrGitHubPermissionNotPermitted", err)
+	}
+	if _, err := scopeRequestedGitHubTokenPermissions(githubapp.TokenPermissions{PullRequests: "read", Metadata: "read"}, storedReadOnlyIssues, writeGrant, nil); !errors.Is(err, ErrGitHubPermissionNotPermitted) {
+		t.Fatalf("read request for ungranted pull_requests err = %v, want ErrGitHubPermissionNotPermitted", err)
+	}
+	gotWithinLimit, err := scopeRequestedGitHubTokenPermissions(githubapp.TokenPermissions{Issues: "read", Metadata: "read"}, storedReadOnlyIssues, writeGrant, nil)
+	if err != nil {
+		t.Fatalf("request within stored limit failed: %v", err)
+	}
+	if gotWithinLimit != (githubapp.TokenPermissions{Issues: "read", Metadata: "read"}) {
+		t.Fatalf("got %+v, want issues:read, metadata:read", gotWithinLimit)
+	}
+
+	// metadata:read is always within a project's stored limit (GitHub grants it implicitly),
+	// so {issues: write} without explicit metadata still allows comment fires, while metadata:write is refused.
+	storedIssuesOnly := &store.GitHubTokenPermissions{Issues: "write"}
+	gotIssuesWithMeta, err := scopeRequestedGitHubTokenPermissions(githubapp.TokenPermissions{Issues: "write", Metadata: "read"}, storedIssuesOnly, writeGrant, nil)
+	if err != nil {
+		t.Fatalf("issues:write + metadata:read against stored {issues:write} failed: %v", err)
+	}
+	if gotIssuesWithMeta != (githubapp.TokenPermissions{Issues: "write", Metadata: "read"}) {
+		t.Fatalf("got %+v, want issues:write, metadata:read", gotIssuesWithMeta)
+	}
+	if _, err := scopeRequestedGitHubTokenPermissions(githubapp.TokenPermissions{Metadata: "write"}, storedIssuesOnly, writeGrant, nil); !errors.Is(err, ErrGitHubPermissionNotPermitted) {
+		t.Fatalf("metadata:write against stored {issues:write} err = %v, want ErrGitHubPermissionNotPermitted", err)
+	}
+
+	// Stored custom limit with checks/actions write allows them under write grant.
+	storedBroad := &store.GitHubTokenPermissions{
+		Checks:  "write",
+		Actions: "write",
+	}
+	for _, tc := range []githubapp.TokenPermissions{
+		{Checks: "write"},
+		{Actions: "write"},
+	} {
+		got, err := scopeRequestedGitHubTokenPermissions(tc, storedBroad, writeGrant, nil)
+		if err != nil {
+			t.Fatalf("scopeRequestedGitHubTokenPermissions(%+v, broad, write) err = %v", tc, err)
+		}
+		if got != tc {
+			t.Fatalf("got %+v, want %+v", got, tc)
+		}
+	}
+
 	readPerms := githubapp.TokenPermissions{PullRequests: "read", Metadata: "read"}
-	gotRead, err := scopeRequestedGitHubTokenPermissions(readPerms, readOnlyGrant)
+	gotRead, err := scopeRequestedGitHubTokenPermissions(readPerms, nil, readOnlyGrant, defaultAppPerms)
 	if err != nil {
 		t.Fatalf("read request under read-only grant failed: %v", err)
 	}

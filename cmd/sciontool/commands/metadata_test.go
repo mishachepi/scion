@@ -16,6 +16,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/metadata"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/netcap"
 )
 
@@ -40,6 +41,7 @@ func TestRunMetadataStatus_NoEnv(t *testing.T) {
 	// (not configured) without panicking. The seams are stubbed so a root
 	// runner never reaches the real capability probe or iptables.
 	withMetadataStatusSeams(t, 0, false, nil, false)
+	clearMetadataInterceptionEnv(t)
 	t.Setenv("SCION_METADATA_MODE", "")
 	t.Setenv("GCE_METADATA_HOST", "")
 	t.Setenv("GCE_METADATA_ROOT", "")
@@ -55,6 +57,7 @@ func TestRunMetadataStatus_ConfiguredButNoServer(t *testing.T) {
 	// The seams are stubbed so a root runner never reaches the real
 	// capability probe or iptables.
 	withMetadataStatusSeams(t, 0, false, nil, false)
+	clearMetadataInterceptionEnv(t)
 	t.Setenv("SCION_METADATA_MODE", "assign")
 	t.Setenv("SCION_METADATA_PORT", "19999")
 	t.Setenv("GCE_METADATA_HOST", "localhost:19999")
@@ -96,11 +99,21 @@ func withMetadataStatusSeams(t *testing.T, uid int, usable bool, usableErr error
 	return s
 }
 
+// clearMetadataInterceptionEnv clears SCION_METADATA_INTERCEPTION* so tests
+// that exercise the non-runtime iptables branches do not inherit them from
+// an agent container's environment.
+func clearMetadataInterceptionEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv(metadata.InterceptionEnvVar, "")
+	t.Setenv(metadata.InterceptionSourceEnvVar, "")
+}
+
 // setNoServerEnv points the status check at a port nothing listens on, so
 // the connectivity checks fail (exit 1) and the run still reaches the
 // iptables section.
 func setNoServerEnv(t *testing.T) {
 	t.Helper()
+	clearMetadataInterceptionEnv(t)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -118,6 +131,7 @@ func setNoServerEnv(t *testing.T) {
 // shows whether the iptables section changed the result.
 func setHealthyServerEnv(t *testing.T) {
 	t.Helper()
+	clearMetadataInterceptionEnv(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -129,9 +143,13 @@ func setHealthyServerEnv(t *testing.T) {
 	t.Setenv("GCE_METADATA_ROOT", "localhost:"+port)
 }
 
-const notVerifiable = "[INFO] iptables rule not verifiable"
+const (
+	installedByRuntime = "[INFO] iptables rules installed by runtime; verified by probe"
+	notVerifiable      = "[INFO] iptables rule not verifiable"
+)
 
-// T1: root after the capability drop: a neutral INFO, no iptables call.
+// T1: root without CAP_NET_ADMIN and without runtime-managed interception: a
+// neutral INFO, no iptables call.
 func TestRunMetadataStatus_CapabilityDropped_NotVerifiable(t *testing.T) {
 	setNoServerEnv(t)
 	s := withMetadataStatusSeams(t, 0, false, nil, false)
@@ -140,19 +158,38 @@ func TestRunMetadataStatus_CapabilityDropped_NotVerifiable(t *testing.T) {
 	if !strings.Contains(out, notVerifiable) {
 		t.Errorf("output lacks %q:\n%s", notVerifiable, out)
 	}
-	wantLine := "[INFO] iptables rule not verifiable: " + netcap.CapabilityName +
-		" is not usable by this process (init drops it once network setup is done)\n"
+	wantLine := notVerifiable + ": " + netcap.CapabilityName + " is not usable by this process\n"
 	if !strings.Contains(out, wantLine) {
 		t.Errorf("output lacks the full not-verifiable line %q:\n%s", wantLine, out)
 	}
 	if strings.Contains(out, "REDIRECT rule not found") {
-		t.Errorf("output reports the rule missing after the capability drop:\n%s", out)
+		t.Errorf("output reports the rule missing:\n%s", out)
 	}
 	if s.iptablesCalls != 0 {
 		t.Errorf("iptables check called %d times, want 0", s.iptablesCalls)
 	}
 	if code != 1 {
 		t.Errorf("exit code = %d, want 1 (connectivity fails; the iptables section must not change it)", code)
+	}
+}
+
+// T1 with runtime source markers (even as non-root scion user): reports
+// installed by runtime; verified by probe, without consulting uid/netcap.
+func TestRunMetadataStatus_RuntimeSource_ReportsVerifiedByProbe(t *testing.T) {
+	setHealthyServerEnv(t)
+	t.Setenv("SCION_METADATA_INTERCEPTION", "required")
+	t.Setenv("SCION_METADATA_INTERCEPTION_SOURCE", "runtime")
+	s := withMetadataStatusSeams(t, 1000, false, nil, false)
+	var code int
+	out := captureStdout(t, func() { code = runMetadataStatus() })
+	if !strings.Contains(out, installedByRuntime) {
+		t.Errorf("output lacks %q:\n%s", installedByRuntime, out)
+	}
+	if s.usableCalls != 0 || s.iptablesCalls != 0 {
+		t.Errorf("usable calls %d, iptables calls %d; want 0 and 0", s.usableCalls, s.iptablesCalls)
+	}
+	if code != 0 {
+		t.Errorf("exit code = %d, want 0", code)
 	}
 }
 
@@ -278,5 +315,33 @@ func TestRunMetadataStatus_NonRoot_SkipsBeforeCapabilityCheck(t *testing.T) {
 	}
 	if code != 1 {
 		t.Errorf("exit code = %d, want 1", code)
+	}
+}
+
+// TestRunMetadataStatus_HelpersIsolateInterceptionEnv proves that the test env
+// helpers isolate runMetadataStatus from ambient SCION_METADATA_INTERCEPTION*
+// variables (such as those set inside Scion agent containers).
+func TestRunMetadataStatus_HelpersIsolateInterceptionEnv(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(*testing.T)
+	}{
+		{"setNoServerEnv", setNoServerEnv},
+		{"setHealthyServerEnv", setHealthyServerEnv},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(metadata.InterceptionEnvVar, metadata.InterceptionRequired)
+			t.Setenv(metadata.InterceptionSourceEnvVar, metadata.InterceptionSourceRuntime)
+			tc.setup(t)
+			withMetadataStatusSeams(t, 0, false, nil, false)
+			out := captureStdout(t, func() { _ = runMetadataStatus() })
+			if strings.Contains(out, installedByRuntime) {
+				t.Errorf("output inherited runtime interception marker %q:\n%s", installedByRuntime, out)
+			}
+			if !strings.Contains(out, notVerifiable) {
+				t.Errorf("output lacks %q:\n%s", notVerifiable, out)
+			}
+		})
 	}
 }

@@ -236,6 +236,14 @@ export const ARTIFACT_MANAGE_ACCESS_FLAG = 'web.artifact_manage_access';
 export const ARTIFACTS_OPEN_REVIEW_CHECK_FLAG = 'hub.artifacts_open_review_check';
 
 /**
+ * Durable artifact review drafts (ptone/scion#7116, ptone/scion#8470): saves
+ * in-progress reviews as private per-reviewer drafts on the hub and offers to
+ * resume them across browser sessions or devices. Presentation only: the hub
+ * checks the experiment on every review-draft route. Default OFF.
+ */
+export const ARTIFACTS_REVIEW_DRAFTS_FLAG = 'hub.artifacts_review_drafts';
+
+/**
  * Force user delete (ptone/scion#2143): the admin users page offers to
  * force-delete a user who has agents and shows a deletion in
  * progress. Presentation only: the hub checks the experiment on the force
@@ -321,6 +329,19 @@ export function idleSuspendEnabled(): boolean {
 }
 
 /**
+ * System One provider administration (hub.system_one, ptone/scion#8044 / #8779):
+ * gates the System One Providers admin navigation entry and page. Presentation
+ * only: the hub enforces the experiment (404 when off) and admin permissions on
+ * every /api/v1/admin/system-one/* route. Default OFF.
+ */
+export const SYSTEM_ONE_FLAG = 'hub.system_one';
+
+/** Whether System One admin UI surfaces are enabled in this session. */
+export function systemOneEnabled(): boolean {
+  return isFeatureEnabled(SYSTEM_ONE_FLAG);
+}
+
+/**
  * Effective permissions viewer (hub.effective_permissions, ptone/scion#8439):
  * shows the two-tab Roles dialog (Effective roles + Effective permissions) on
  * the admin Users page. Presentation only: the hub gates GET/HEAD
@@ -328,3 +349,72 @@ export function idleSuspendEnabled(): boolean {
  * Default OFF.
  */
 export const EFFECTIVE_PERMISSIONS_FLAG = 'hub.effective_permissions';
+
+/**
+ * Custom default user role (hub.custom_default_user_role): shows eligible
+ * custom system-scope roles in the Default User Role selector on Admin > Server
+ * Config and documents custom-role behavior. Presentation only: the hub
+ * enforces eligibility, CanDelegate, and experiment gating on save and at
+ * runtime. Default OFF.
+ */
+export const CUSTOM_DEFAULT_USER_ROLE_FLAG = 'hub.custom_default_user_role';
+
+/**
+ * Code-span mentions (hub.code_span_mentions, ptone/scion#8783): promotes
+ * standalone single-mention inline code spans (such as `` `@coordinator` ``)
+ * to mention pills when the token resolves to a known project agent or human
+ * member, and includes them in Reply all. Presentation only: the hub enforces
+ * notification dispatch, routing, and translation under the same flag.
+ * Default OFF.
+ */
+export const CODE_SPAN_MENTIONS_FLAG = 'hub.code_span_mentions';
+
+/** Whether standalone inline code-span mentions are enabled in this session. */
+export function codeSpanMentionsEnabled(): boolean {
+  return isFeatureEnabled(CODE_SPAN_MENTIONS_FLAG);
+}
+
+/**
+ * Admin-managed Runtime Brokers only (hub.admin_managed_brokers): shows the
+ * Runtime Broker Policy section in Admin > Server Config. Presentation only:
+ * the hub enforces broker_policy.admin_managed_only and experiment gating on
+ * save and at runtime. Default OFF.
+ */
+export const ADMIN_MANAGED_BROKERS_FLAG = 'hub.admin_managed_brokers';
+
+/**
+ * Agent-scoped secrets (hub.agent_secrets, ptone/scion#8742): shows the
+ * Secrets management tab on the agent detail and edit pages, the Secrets
+ * tab inside Additional Options on the create-agent page, and secret-request
+ * cards and standalone page. Presentation only: the hub enforces the
+ * experiment on every agent-scope secret route, create-time secrets field,
+ * and secret-request route. Default OFF.
+ */
+export const AGENT_SECRETS_FLAG = 'hub.agent_secrets';
+
+/** Whether agent-scoped secrets UI surfaces are enabled in this session. */
+export function agentSecretsEnabled(): boolean {
+  return isFeatureEnabled(AGENT_SECRETS_FLAG);
+}
+
+/**
+ * Top-level Inbox dashboard (web.inbox_dashboard, ptone/scion#8962):
+ * gates the Profile Inbox page, Inbox nav section/badge, and bell discovery
+ * link. Presentation only: the hub enforces the experiment on
+ * GET /api/v1/users/me/inbox/summary (404 while off) and user.*.inbox SSE
+ * invalidation hints. Default OFF.
+ */
+export const INBOX_DASHBOARD_FLAG = 'web.inbox_dashboard';
+
+/** Whether the Inbox dashboard UI surfaces are enabled in this session. */
+export function isInboxDashboardEnabled(): boolean {
+  return isFeatureEnabled(INBOX_DASHBOARD_FLAG);
+}
+
+/**
+ * View as member session toggle (hub.view_as_member, ptone/scion#8648):
+ * shows the "View as member" switch in the profile sidebar for hub admins.
+ * Presentation only: the hub enforces the experiment on enter; exit and the
+ * active-mode banner are always available regardless of this flag. Default OFF.
+ */
+export const VIEW_AS_MEMBER_FLAG = 'hub.view_as_member';

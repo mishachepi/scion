@@ -6,14 +6,20 @@ package commands
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/firewallpolicy"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/hub"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/log"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/metadata"
@@ -69,7 +75,21 @@ var (
 	// the metadata interception is required but cannot be set up. The
 	// text is fixed and pinned by a golden test.
 	//nolint:staticcheck // ST1005: fixed user-facing refusal text, pinned verbatim by the golden test.
-	errMetadataProtectionUnavailable = errors.New("agent start refused: the configured metadata protection could not be set up in this container. Provide the required host capabilities, or set the metadata mode to passthrough explicitly to opt out.")
+	errMetadataProtectionUnavailable = errors.New(metadata.ProtectionUnavailableRefusal)
+
+	// errMetadataInterceptionMarkerMissing is the Hub-visible refusal when
+	// interception is required, the runtime-managed source marker is missing
+	// or unrecognized, and the legacy in-container fallback cannot run. The
+	// text is fixed and pinned by a golden test.
+	//nolint:staticcheck // ST1005: fixed user-facing refusal text, pinned verbatim by the golden test.
+	errMetadataInterceptionMarkerMissing = errors.New(metadata.InterceptionMarkerMissingRefusal)
+)
+
+// Seams for metadataProtectionPreflight and legacy in-container rule install.
+var (
+	preflightEUID               = os.Geteuid
+	preflightNetAdminUsable     = netcap.Usable
+	runInstallInterceptionRules = metadata.InstallInterceptionRules
 )
 
 // initFirewallRequested reports whether SCION_INIT_FIREWALL asks for the
@@ -87,8 +107,9 @@ func initFirewallRequested() (bool, error) {
 }
 
 // runInitFirewall runs the egress firewall script as root. A package-level
-// func var only so tests can observe ordering and inject failure.
-var runInitFirewall = func() error {
+// func var only so tests can observe ordering, captured policy env, and inject
+// failure.
+var runInitFirewall = func(extraEnv []string) error {
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("%s requires init to run as root", initFirewallScript)
 	}
@@ -99,7 +120,7 @@ var runInitFirewall = func() error {
 	ctx, cancel := context.WithTimeout(context.Background(), initFirewallTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, path)
-	cmd.Env = rootexec.Env()
+	cmd.Env = rootexec.Env(extraEnv...)
 	out, err := procreap.CombinedOutputManaged(cmd)
 	if err != nil {
 		log.Error("%s output:\n%s", initFirewallScript, string(out))
@@ -112,7 +133,7 @@ var runInitFirewall = func() error {
 // setupInitFirewall runs the firewall when requested and reports whether
 // it was installed. A non-nil error is fatal: RunInit must not start
 // anything.
-func setupInitFirewall() (installed bool, err error) {
+func setupInitFirewall(policy firewallpolicy.Policy) (installed bool, err error) {
 	on, err := initFirewallRequested()
 	if err != nil {
 		log.Error("%v", err)
@@ -121,21 +142,34 @@ func setupInitFirewall() (installed bool, err error) {
 	if !on {
 		return false, nil
 	}
-	if err := runInitFirewall(); err != nil {
+	if err := runInitFirewall(policy.Env()); err != nil {
 		log.Error("Opt-in init firewall failed: %v", err)
 		return false, errInitFirewallFailed
 	}
 	return true, nil
 }
 
+// warnIgnoredFirewallPolicyEnv logs a single warning when any
+// SCION_INIT_FIREWALL_* policy variable is present in the agent container's
+// environment on the in-container init path (call site B). Operator firewall
+// allowlists are honoured only on the runtime-managed netns-setup path.
+func warnIgnoredFirewallPolicyEnv() {
+	var ignored []string
+	for _, key := range []string{firewallpolicy.EnvAllowDomains, firewallpolicy.EnvAllowSSH} {
+		if v, ok := os.LookupEnv(key); ok && v != "" {
+			ignored = append(ignored, key)
+		}
+	}
+	if len(ignored) == 0 {
+		return
+	}
+	log.Warn("Ignoring %s in in-container init: operator init-firewall allowlists apply only on runtime-managed netns-setup paths; running with built-in allowlist and SSH disabled",
+		strings.Join(ignored, ", "))
+}
+
 // runDropNetAdmin is netcap.DropNetAdmin behind a seam for tests. The
 // mutation tests replace it with a no-op and expect failures.
 var runDropNetAdmin = netcap.DropNetAdmin
-
-// metadataInterceptionInstalled is (*metadata.Server).InterceptionInstalled
-// behind a seam: tests stub the metadata server start, so the real method
-// would always report false there.
-var metadataInterceptionInstalled = (*metadata.Server).InterceptionInstalled
 
 // dropNetAdmin drops CAP_NET_ADMIN from init and everything it starts
 // later. RunInit calls it after network setup whenever a metadata server
@@ -164,60 +198,207 @@ func dropNetAdmin(required bool) error {
 	return nil
 }
 
-// Seams for metadataProtectionPreflight. Tests replace them; the defaults
-// check the real process.
-var (
-	preflightEUID = os.Geteuid
-	// preflightResolveIPTables resolves iptables the same way the install
-	// does (metadata's iptablesCmd: rootexec.Resolve, root-owned system
-	// directories only).
-	preflightResolveIPTables = func() error {
-		_, err := rootexec.Resolve("iptables")
-		return err
-	}
-	preflightNetAdminUsable = netcap.Usable
-)
-
 // metadataProtectionPreflight refuses the start, before any credential is
-// written or staged, when cfg requires the metadata interception (the
-// runtime granted the capability for it and set the required marker, in
-// block or assign mode) but this container cannot install it: init is not
-// root, the container shares the host network namespace, iptables does not
-// resolve, or CAP_NET_ADMIN is not in the effective and bounding sets.
+// written or staged, when cfg requires metadata interception
+// (SCION_METADATA_INTERCEPTION=required) but:
+//   - the container shares the host network namespace;
+//   - SCION_METADATA_INTERCEPTION_SOURCE is absent (legacy pre-#5246 broker)
+//     and init does not have root + usable CAP_NET_ADMIN for the in-container
+//     fallback; or
+//   - SCION_METADATA_INTERCEPTION_SOURCE holds an unrecognized value.
+//
+// When SCION_METADATA_INTERCEPTION_SOURCE=runtime, the broker installs rules
+// from a short-lived setup container and init verifies them via probe, so no
+// in-container CAP_NET_ADMIN is required.
 //
 // A nil cfg (passthrough, or no metadata mode) and a cfg without the
-// marker (Kubernetes, rootless Podman, the Apple runtime, host networking:
-// runtimes that never install the interception) pass unchanged.
-//
-// These are the failures init can see in advance. Anything only the real
-// install shows (a kernel without the nat table, say) is still caught by
-// the fatal metadata start in RunInit, after staging; see
-// removeTransportTokenOnRefusal for what that later exit cleans up.
+// required marker (Kubernetes, rootless Podman, the Apple runtime, host
+// networking) pass unchanged.
 func metadataProtectionPreflight(cfg *metadata.Config) error {
 	if cfg == nil || !cfg.InterceptionRequired {
 		return nil
 	}
-	reason := ""
-	switch {
-	case preflightEUID() != 0:
-		reason = "init is not running as root"
-	case cfg.NetworkMode == "host":
-		reason = "the container shares the host network namespace"
+	if cfg.NetworkMode == "host" {
+		log.Error("Metadata protection (mode=%s) cannot be set up: the container shares the host network namespace", cfg.Mode)
+		return errMetadataProtectionUnavailable
+	}
+	switch cfg.InterceptionSource {
+	case metadata.InterceptionSourceRuntime:
+		return nil
+	case "":
+		// Compatibility fallback for older (pre-#5246) brokers that grant
+		// CAP_NET_ADMIN to the agent container instead of running a
+		// netns-setup sidecar. Require root and usable CAP_NET_ADMIN before
+		// staging any credentials; fail closed otherwise.
+		if preflightEUID() != 0 {
+			log.Error("Metadata protection (mode=%s) cannot be set up: runtime-managed interception marker (%s=%s) is not set and init is not root (euid=%d)",
+				cfg.Mode, metadata.InterceptionSourceEnvVar, metadata.InterceptionSourceRuntime, preflightEUID())
+			return errMetadataInterceptionMarkerMissing
+		}
+		usable, err := preflightNetAdminUsable()
+		if err != nil {
+			log.Error("Metadata protection (mode=%s) cannot be set up: runtime-managed interception marker (%s=%s) is not set and %s check failed: %v",
+				cfg.Mode, metadata.InterceptionSourceEnvVar, metadata.InterceptionSourceRuntime, netcap.CapabilityName, err)
+			return errMetadataInterceptionMarkerMissing
+		}
+		if !usable {
+			log.Error("Metadata protection (mode=%s) cannot be set up: runtime-managed interception marker (%s=%s) is not set and %s is not usable",
+				cfg.Mode, metadata.InterceptionSourceEnvVar, metadata.InterceptionSourceRuntime, netcap.CapabilityName)
+			return errMetadataInterceptionMarkerMissing
+		}
+		return nil
 	default:
-		if err := preflightResolveIPTables(); err != nil {
-			reason = fmt.Sprintf("iptables is not available: %v", err)
-		} else if usable, err := preflightNetAdminUsable(); err != nil {
-			reason = fmt.Sprintf("cannot check %s: %v", netcap.CapabilityName, err)
-		} else if !usable {
-			reason = netcap.CapabilityName + " is not in the effective and bounding sets"
+		log.Error("Metadata protection (mode=%s) cannot be set up: unrecognized interception source %q (expected %s=%s)",
+			cfg.Mode, cfg.InterceptionSource, metadata.InterceptionSourceEnvVar, metadata.InterceptionSourceRuntime)
+		return errMetadataInterceptionMarkerMissing
+	}
+}
+
+// maxProbeBodyBytes bounds the response body read during redirect probe
+// verification so an unexpected responder cannot cause unbounded allocation.
+const maxProbeBodyBytes = 128
+
+// Seams and parameters for waitForRedirect and verifyIPv6MetadataBlocked.
+var (
+	redirectProbeBaseURL        = "http://169.254.169.254"
+	redirectProbeAttemptTimeout = time.Second
+	// redirectProbeDeadline must exceed pkg/runtime's netnsSetupTimeout (3m)
+	// so init does not time out before the setup container finishes installing
+	// rules.
+	redirectProbeDeadline = 210 * time.Second
+	// legacyRedirectProbeDeadline bounds the redirect probe on the legacy
+	// in-container path, where rules are installed synchronously before probing.
+	legacyRedirectProbeDeadline = 10 * time.Second
+	redirectProbeInterval       = 100 * time.Millisecond
+	runWaitForRedirect          = waitForRedirect
+
+	ipv6ProbeAddrs   = defaultIPv6ProbeAddrs()
+	ipv6ProbeTimeout = 2 * time.Second
+	ipv6ProbeDial    = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, network, addr)
+	}
+	runVerifyIPv6Blocked = verifyIPv6MetadataBlocked
+)
+
+func defaultIPv6ProbeAddrs() []string {
+	addrs := metadata.IPv6MetadataAddrs()
+	targets := make([]string, len(addrs))
+	for i, addr := range addrs {
+		targets[i] = net.JoinHostPort(addr, "80")
+	}
+	return targets
+}
+
+// waitForRedirect polls the metadata IP on the emulator's per-boot random
+// probe path until the emulator answers HTTP 200 OK with the expected per-boot
+// probe token, proving that the nat OUTPUT REDIRECT rule reaches this emulator
+// instance. Returns errMetadataProtectionUnavailable if the deadline expires
+// or ctx is cancelled.
+func waitForRedirect(ctx context.Context, probePath, probeToken string) error {
+	if probePath == "" || probeToken == "" {
+		log.Error("Metadata redirect probe path or token is empty")
+		return errMetadataProtectionUnavailable
+	}
+	wantToken := []byte(probeToken)
+	client := &http.Client{
+		Timeout: redirectProbeAttemptTimeout,
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+		},
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	url := redirectProbeBaseURL + probePath
+	deadline := time.Now().Add(redirectProbeDeadline)
+	var lastErr error
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			log.Error("Metadata redirect probe request build failed: %v", err)
+			return errMetadataProtectionUnavailable
+		}
+		resp, err := client.Do(req)
+		if err == nil {
+			body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxProbeBodyBytes+1))
+			_ = resp.Body.Close()
+			switch {
+			case resp.StatusCode != http.StatusOK:
+				lastErr = fmt.Errorf("unexpected status %d", resp.StatusCode)
+			case readErr != nil:
+				lastErr = fmt.Errorf("read probe body: %w", readErr)
+			case len(body) > maxProbeBodyBytes:
+				lastErr = fmt.Errorf("probe response body exceeded %d bytes", maxProbeBodyBytes)
+			case subtle.ConstantTimeCompare(body, wantToken) == 1:
+				log.Info("Metadata redirect verified via probe")
+				return nil
+			default:
+				lastErr = errors.New("probe response token mismatch")
+			}
+		} else {
+			lastErr = err
+		}
+		if ctx.Err() != nil {
+			log.Error("Metadata redirect verification cancelled: %v (last error: %v)", ctx.Err(), lastErr)
+			return errMetadataProtectionUnavailable
+		}
+		if time.Now().After(deadline) {
+			log.Error("Metadata redirect verification timed out after %s: %v", redirectProbeDeadline, lastErr)
+			return errMetadataProtectionUnavailable
+		}
+		timer := time.NewTimer(redirectProbeInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			log.Error("Metadata redirect verification cancelled: %v (last error: %v)", ctx.Err(), lastErr)
+			return errMetadataProtectionUnavailable
+		case <-timer.C:
 		}
 	}
-	if reason == "" {
-		return nil
+}
+
+// verifyIPv6MetadataBlocked performs a negative TCP connect probe against the
+// IPv6 cloud metadata endpoints unconditionally on both runtime and legacy
+// interception paths. When IPv6 is disabled in the network namespace, the dial
+// fails immediately (e.g., ENETUNREACH or EAFNOSUPPORT) and counts as a pass.
+// Connection refusal, reset, unreachability, unsupported address family, and
+// per-dial timeout all pass; a successful TCP connection or cancellation of
+// the parent context fails closed with errMetadataProtectionUnavailable.
+func verifyIPv6MetadataBlocked(ctx context.Context) error {
+	var (
+		wg        sync.WaitGroup
+		mu        sync.Mutex
+		reachable string
+	)
+	for _, addr := range ipv6ProbeAddrs {
+		wg.Add(1)
+		go func(target string) {
+			defer wg.Done()
+			dialCtx, cancel := context.WithTimeout(ctx, ipv6ProbeTimeout)
+			defer cancel()
+			conn, err := ipv6ProbeDial(dialCtx, "tcp", target)
+			if err == nil {
+				_ = conn.Close()
+				mu.Lock()
+				if reachable == "" {
+					reachable = target
+				}
+				mu.Unlock()
+			}
+		}(addr)
 	}
-	// The reason goes to the local log only; the Hub sees the fixed text.
-	log.Error("Metadata protection (mode=%s) cannot be set up: %s", cfg.Mode, reason)
-	return errMetadataProtectionUnavailable
+	wg.Wait()
+	if reachable != "" {
+		log.Error("IPv6 metadata endpoint %s is reachable; refusing to start the harness", reachable)
+		return errMetadataProtectionUnavailable
+	}
+	if ctx.Err() != nil {
+		log.Error("IPv6 metadata verification cancelled: %v", ctx.Err())
+		return errMetadataProtectionUnavailable
+	}
+	log.Info("IPv6 metadata endpoints verified unreachable")
+	return nil
 }
 
 // removeTransportTokenOnRefusal removes the transport token file and its

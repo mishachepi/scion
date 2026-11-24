@@ -55,6 +55,8 @@ export interface User {
   preferences?: UserPreferences | undefined;
   /** Set only for a test identity web session (GET /auth/me). */
   testIdentity?: TestIdentitySessionInfo | undefined;
+  /** True while a hub admin's browser session is in "View as member" mode (ptone/scion#8648). */
+  viewAsMember?: boolean | undefined;
 }
 
 /** The testIdentity member of GET /auth/me for a test identity web session. */
@@ -78,6 +80,7 @@ export interface AuthMeResponse {
   role?: UserRole;
   preferences?: UserPreferences;
   testIdentity?: TestIdentitySessionInfo;
+  viewAsMember?: boolean;
 }
 
 /**
@@ -190,6 +193,8 @@ export interface PublicBranding {
   shortName: string;
   subtitle?: string;
   attribution: 'shown' | 'hidden';
+  corners?: 'default' | 'square' | 'rounded';
+  fontSans?: string;
   logoLight?: string;
   logoDark?: string;
   faviconUrl?: string;
@@ -920,6 +925,8 @@ export interface AgentAppliedConfig {
   gitClone?: Record<string, unknown>;
   templateId?: string;
   templateHash?: string;
+  templateSourceUrl?: string;
+  templateSourceCommit?: string;
   harnessConfigId?: string;
   harnessConfigHash?: string;
   harnessConfigSource?: string;
@@ -1245,6 +1252,8 @@ export interface Template {
   contentHash?: string;
   /** URL the template was imported from, when it was imported. */
   sourceUrl?: string;
+  /** Full 40-char git commit SHA the template files were imported from. */
+  sourceCommit?: string;
   files?: TemplateFileInfo[];
   /** Read-only snapshot of the template's own scion-agent.yaml; see TemplateAgentConfig. */
   agentConfig?: TemplateAgentConfig;
@@ -1306,7 +1315,7 @@ export interface HarnessConfig {
 /**
  * Scope for environment variables and secrets
  */
-export type ResourceScope = 'user' | 'project' | 'runtime_broker' | 'hub';
+export type ResourceScope = 'user' | 'project' | 'runtime_broker' | 'hub' | 'agent';
 
 /**
  * Injection mode for environment variables
@@ -1357,6 +1366,20 @@ export interface Secret {
   updated: string;
   createdBy?: string;
   updatedBy?: string;
+}
+
+/**
+ * Agent-scoped secret supplied at agent creation time (behind hub.agent_secrets).
+ * Mirrors hub.AgentSecretInput in pkg/hub/agent_create_secrets.go.
+ */
+export interface AgentSecretInput {
+  key: string;
+  value: string;
+  encoding?: 'raw' | 'base64';
+  type?: SecretType;
+  target?: string;
+  injectionMode?: InjectionMode;
+  description?: string;
 }
 
 /**
@@ -1543,6 +1566,10 @@ export interface RuntimeBroker {
    */
   versionStatus?: 'match' | 'mismatch' | 'unknown';
   autoProvide: boolean;
+  /** Whether a hub administrator explicitly registered or approved this broker as admin-managed (ptone/scion#7829). */
+  adminManaged?: boolean;
+  /** Whether this broker is eligible for placement and attachment under broker_policy.admin_managed_only (true when the policy is off). */
+  policyEligible?: boolean;
   endpoint?: string;
   labels?: Record<string, string>;
   createdBy?: string;
@@ -1734,6 +1761,8 @@ export interface Message {
   recipient: string;
   recipientId: string;
   msg: string;
+  /** True when `msg` is a server-truncated preview (e.g. `/interagent` list mode). */
+  msgTruncated?: boolean;
   type: string;
   urgent?: boolean;
   broadcasted?: boolean;
@@ -1857,6 +1886,7 @@ export interface AnswerView {
   batchId?: string;
   matchedDefault?: boolean;
   previousChoiceLabel?: string;
+  previousOtherText?: string;
   at: string;
 }
 
@@ -1881,6 +1911,8 @@ export interface DecisionView {
   replacedBy?: DecisionReplacedBy;
   withdrawn?: DecisionWithdrawn;
   dismissed?: DecisionDismissed;
+  /** Hub-computed RFC3339 timestamp when this decision reaches the dismiss minimum age. */
+  dismissAvailableAt?: string;
   /** The effective answer; absent while pending, withdrawn, or dismissed. */
   decision?: AnswerView;
 }
@@ -1905,6 +1937,7 @@ export interface DecisionResponseView {
   promptMessageId: string;
   sourceMessageId?: string;
   previousChoiceLabel?: string;
+  previousOtherText?: string;
 }
 
 /** One answer of a DecisionResponseSetView. */
@@ -1916,6 +1949,7 @@ export interface DecisionResponseSetAnswer {
   question: string;
   choiceId: string;
   label: string;
+  otherText?: string;
   provenance: string;
   outcome: string;
   dismissReason?: string;
@@ -1926,6 +1960,7 @@ export interface DecisionResponseSetAnswer {
   sourceMessageId?: string;
   promptMessageId?: string;
   previousChoiceLabel?: string;
+  previousOtherText?: string;
 }
 
 /** What the decision-response row of a set submit carries, in position order. */
@@ -2599,4 +2634,17 @@ export interface ProjectSessionMetricsSummary {
   activeAgents: number;
   mostUsedTools: ToolUsageSummary[];
   mostUsedModels: ModelUsageSummary[];
+}
+
+/**
+ * Last terminal screen captured just before an agent was suspended (ptone/scion#8530).
+ * Response from GET /api/v1/agents/{id}/screen and
+ * GET /api/v1/projects/{projectId}/agents/{id}/screen.
+ */
+export interface AgentSuspendScreen {
+  agentId: string;
+  content: string;
+  capturedAt: string;
+  truncated: boolean;
+  phase: string;
 }

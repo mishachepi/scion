@@ -330,6 +330,7 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 		ValidationError(w, msg, cloneURLLabelErrorDetails())
 		return
 	}
+	normalizeADOCloneURLLabel(req.Labels)
 	sanitizeSourceURLLabel(req.Labels)
 
 	normalizedRemote, msg := normalizeRequestGitRemote(req.GitRemote)
@@ -1452,7 +1453,7 @@ func (s *Server) provisionSharedWorkspace(ctx context.Context, project *store.Pr
 		// No clone ran (a hub-native workspace): a storage failure, not a git one.
 		return fmt.Errorf("shared workspace provisioning: %w", errWorkspaceStorageUnavailable)
 	}
-	return sharedWorkspaceCloneError(err)
+	return sharedWorkspaceCloneError(err, cloneCfg.URL)
 }
 
 // provisionHubNativeWorkspace provisions the empty workspace of a hub-native
@@ -1581,8 +1582,9 @@ func (s *Server) deleteSharedProjectRoot(project *store.Project) error {
 // sharedWorkspaceCloneError maps a provisioning failure to a *util.GitError
 // with the classified kind and fixed text (no host path, no git output), so
 // the create handler keeps its status mapping and guidance.
-func sharedWorkspaceCloneError(err error) error {
-	kind := util.ClassifyGitError(err.Error()).Kind
+func sharedWorkspaceCloneError(err error, cloneURL string) error {
+	classified := util.ClassifyGitErrorForURL(err.Error(), cloneURL)
+	kind := classified.Kind
 	msg := "the repository could not be cloned into the shared workspace"
 	switch kind {
 	case util.GitErrAuth:
@@ -1592,7 +1594,7 @@ func sharedWorkspaceCloneError(err error) error {
 	case util.GitErrNetwork:
 		msg = "the repository could not be reached"
 	}
-	return &util.GitError{Kind: kind, Message: msg}
+	return &util.GitError{Kind: kind, Message: msg, RemoteHost: classified.RemoteHost}
 }
 
 // updateSharedProjectSlugFile rewrites <ProjectRoot>/.scion/project-slug
@@ -1919,6 +1921,7 @@ func (s *Server) handleProjectRegister(w http.ResponseWriter, r *http.Request) {
 		ValidationError(w, msg, cloneURLLabelErrorDetails())
 		return
 	}
+	normalizeADOCloneURLLabel(req.Labels)
 	sanitizeSourceURLLabel(req.Labels)
 
 	normalizedRemote, msg := normalizeRequestGitRemote(req.GitRemote)
@@ -2170,6 +2173,12 @@ func (s *Server) handleProjectRegister(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+
+		// Enforce broker_policy.admin_managed_only on the deprecated embedded
+		// broker registration path before any project mutation (ptone/scion#7829).
+		if !s.authorizeEmbeddedBrokerRegistrationPolicy(w, r, embeddedBroker) {
+			return
+		}
 	}
 
 	// RegisterProject with brokerId never links a flat Runtime Broker: flat
@@ -2400,7 +2409,7 @@ func (s *Server) handleProjectRegister(w http.ResponseWriter, r *http.Request) {
 			writeErrorFromErr(w, err, "")
 			return
 		}
-		LogLinkEvent(ctx, s.auditLogger, broker.ID, broker.Name, project.ID, provider.LinkedBy, getClientIP(r),
+		LogLinkEvent(ctx, s.auditLogger, broker.ID, broker.Name, project.ID, provider.LinkedBy, s.clientIP(r),
 			mergeBrokerAuditDetails(brokerAuditCredentialDetails(ctx), "path", "project_register"))
 		if !created {
 			s.backfillLinkedOrigin(ctx, project, broker.ID, priorProviderPath, req.Path)
@@ -2510,7 +2519,7 @@ func (s *Server) handleProjectRegister(w http.ResponseWriter, r *http.Request) {
 		// The embedded branch requires an authenticated session user, so the
 		// actor is that user (an empty ID is a bug path; the audit envelope
 		// is then dropped with a warning, R14).
-		LogEmbeddedRegistrationEvent(ctx, s.auditLogger, broker.ID, broker.Name, project.ID, linkedByForProvider(callerUser), getClientIP(r),
+		LogEmbeddedRegistrationEvent(ctx, s.auditLogger, broker.ID, broker.Name, project.ID, linkedByForProvider(callerUser), s.clientIP(r),
 			registerOperation, mergeBrokerAuditDetails(brokerAuditCredentialDetails(ctx), "operation", string(registerOperation), "path", "embedded"))
 
 		// Add as project provider.
@@ -2537,7 +2546,7 @@ func (s *Server) handleProjectRegister(w http.ResponseWriter, r *http.Request) {
 			writeErrorFromErr(w, err, "")
 			return
 		}
-		LogLinkEvent(ctx, s.auditLogger, broker.ID, broker.Name, project.ID, provider.LinkedBy, getClientIP(r),
+		LogLinkEvent(ctx, s.auditLogger, broker.ID, broker.Name, project.ID, provider.LinkedBy, s.clientIP(r),
 			mergeBrokerAuditDetails(brokerAuditCredentialDetails(ctx), "path", "embedded"))
 
 		// Set as default runtime broker if project doesn't have one
@@ -3087,6 +3096,7 @@ func (s *Server) handleProjectAgents(w http.ResponseWriter, r *http.Request, pro
 // action name handleProjectAgentAction dispatches on.
 var projectAgentRouteActions = map[AgentSubRouteID]string{
 	ProjectAgentRouteLogs:              api.AgentActionLogs,
+	ProjectAgentRouteScreen:            api.AgentActionScreen,
 	ProjectAgentRouteCloudLogs:         "cloud-logs",
 	ProjectAgentRouteCloudLogsStream:   "cloud-logs/stream",
 	ProjectAgentRouteMessageLogs:       api.AgentActionMessageLogs,
@@ -3165,10 +3175,10 @@ func (s *Server) listProjectAgents(w http.ResponseWriter, r *http.Request, proje
 		// A user identity (or no identity) reached no gate at all here before
 		// this fix: any authenticated hub user, project member or not, got
 		// every agent record in the project. Require agent.list on the
-		// project, matching what listAgents (handlers_agents_core.go) already
-		// enforces for the global list.
+		// project, returning 404 ("Project not found") on deny to match a
+		// missing project (consistent with authorizeRead, ptone/scion#2084).
 		gateDone := perfPhaseStart(ctx, perfPhaseListScopeAuthz)
-		allowed := s.authorize(w, r, Resource{Type: "agent", ParentType: "project", ParentID: projectID}, ActionList)
+		allowed := s.authorizeReadAction(w, r, Resource{Type: "agent", ParentType: "project", ParentID: projectID}, ActionList, "Project")
 		gateDone()
 		if !allowed {
 			return
@@ -3348,11 +3358,11 @@ func (s *Server) createProjectAgent(w http.ResponseWriter, r *http.Request, proj
 // (TestReadEndpoint_ProjectScopedAgents_WithReadScope_Allowed): agent.read
 // has no AgentScopes mapping, so the strict check would otherwise deny even
 // an agent reading its own record. getAgent applies the same exemption.
-// Reading a *different* agent in the caller's project goes through the
-// same agent.read check as getAgent (authorizeSingleAgentRead), which
-// denies it unless the caller launched that agent, directly or through
-// its descendants (authz_launcher_read.go). An agent caller that is denied, or that names
-// an agent in another project, gets the same 404 as for a missing agent.
+// Reading a *different* agent in the caller's project goes through
+// authorizeRead with agentStatusReadResource (which still enforces the
+// launcher status-read rule for agent callers in authz_launcher_read.go).
+// Both user/PAT and agent callers that are denied receive the same 404
+// ("Resource not found") as a missing agent (ptone/scion#2084).
 func (s *Server) getProjectAgent(w http.ResponseWriter, r *http.Request, projectID, agentID string) {
 	// A project visitor gets the visitor view only (routeGuard admitted it
 	// through admitVisitorSubRoute for this request).
@@ -3380,7 +3390,7 @@ func (s *Server) getProjectAgent(w http.ResponseWriter, r *http.Request, project
 		isSelf = agentIdent.ID() == agent.ID
 	}
 	if !isSelf {
-		if !s.authorizeSingleAgentRead(w, r, agent) {
+		if !s.authorizeRead(w, r, agentStatusReadResource(agent), "Resource") {
 			return
 		}
 	}
@@ -3444,6 +3454,12 @@ func (s *Server) handleProjectAgentAction(w http.ResponseWriter, r *http.Request
 			return
 		}
 		s.handleAgentLogs(w, r, resolvedAgent.ID)
+		return
+	}
+
+	// Saved suspend screen (GET); handle before the POST-only gate.
+	if action == api.AgentActionScreen {
+		s.handleProjectAgentScreen(w, r, projectID, agentID)
 		return
 	}
 
@@ -3807,6 +3823,7 @@ func (s *Server) updateProject(w http.ResponseWriter, r *http.Request, id string
 				return
 			}
 		}
+		normalizeADOCloneURLLabel(updates.Labels)
 		sanitizeSourceURLLabel(updates.Labels)
 		// PATCH replaces the labels map wholesale; keep the server-owned
 		// workspace-mode label and refuse attempts to change it (design
@@ -4029,6 +4046,11 @@ func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request, id string
 	s.invalidateGitHubAssociation(id)
 	// Release the held values of the project's deleted pending secrets.
 	s.dropPendingValues(ctx, result.PendingSecretValueRefs)
+	// Best-effort external backend cleanup of deleted agents' agent-scoped
+	// secrets (DB rows were deleted in the project deletion transaction).
+	for agentID, keys := range result.AgentSecretKeys {
+		s.removeAgentScopedSecrets(ctx, agentID, keys)
+	}
 	kept := s.executePostDeletionEffects(ctx, id, deletedProject, effectInputs)
 
 	// The Hub is the only remover of the project's tree on shared project

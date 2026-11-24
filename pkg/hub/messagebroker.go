@@ -607,9 +607,12 @@ func (p *MessageBrokerProxy) subscribeProjectUserMessages(projectID string) bool
 	sub, err := p.bus.Subscribe(topic, func(hctx context.Context, t string, msg *messages.StructuredMessage) {
 		ctx, cancel := context.WithTimeout(context.Background(), brokerCallbackTimeout)
 		defer cancel()
-		// Carry only the notification ID (log correlation) from the
+		// Carry only the notification ID and already-recorded marker from the
 		// publisher's ctx; delivery keeps its own lifetime.
 		ctx = withNotificationID(ctx, notificationIDFromContext(hctx))
+		if userRecordLoggedFromContext(hctx) {
+			ctx = withUserRecordLogged(ctx)
+		}
 		p.deliverToUser(ctx, projectID, t, msg)
 	})
 	if err != nil {
@@ -652,6 +655,24 @@ func notificationIDFromContext(ctx context.Context) string {
 	return id
 }
 
+// userRecordLoggedKey marks an in-process user-message publish whose message
+// record was already written by the caller (e.g. createInboxMessage in the
+// federated G2 write-deny corner), so deliverToUser's early-return defer does
+// not write a duplicate record.
+type userRecordLoggedKey struct{}
+
+func withUserRecordLogged(ctx context.Context) context.Context {
+	return context.WithValue(ctx, userRecordLoggedKey{}, true)
+}
+
+func userRecordLoggedFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	logged, _ := ctx.Value(userRecordLoggedKey{}).(bool)
+	return logged
+}
+
 // canPersistUserDM reports whether deliverToUser can persist a DM addressed
 // to recipientID. Under G2 write-deny a DM row needs a resolved conversation,
 // and DM conversation keys only accept canonical UUIDs
@@ -674,8 +695,8 @@ func canPersistUserDM(recipientID string, writeDeny bool) bool {
 func (p *MessageBrokerProxy) deliverToUser(ctx context.Context, projectID, topic string, msg *messages.StructuredMessage) {
 	// One message record per message: the success path below writes it;
 	// an early return (conversation or persist failure) writes it here so
-	// the message still appears once.
-	recorded := false
+	// the message still appears once, unless the caller already logged it.
+	recorded := userRecordLoggedFromContext(ctx)
 	defer func() {
 		if recorded || p.messageLog == nil {
 			return
@@ -1064,10 +1085,12 @@ func (p *MessageBrokerProxy) deliverToAgent(ctx context.Context, projectID, agen
 	// msg may be a pointer shared across broker event-bus subscribers, so it
 	// is never mutated in place — a private copy is made once here (cheap:
 	// struct fields only, no deep copy needed unless a field below is
-	// reassigned) and both the "!" rewrite and the #2257 P2 metadata strip
-	// (design auto-offload-large-dm §4.2 item 1) apply to that copy.
+	// reassigned) and the inbound client-event clear (S4-6), the #2257 P2
+	// metadata strip (design auto-offload-large-dm §4.2 item 1), and the "!"
+	// rewrite apply to that copy.
 	copied := *msg
 	msg = &copied
+	clearInboundClientEvent(msg)
 	msg.Metadata = messaging.StripReservedMetadata(msg.Metadata)
 
 	// A leading "!" in the message body acts as an inline interrupt signal:
@@ -1144,6 +1167,17 @@ func (p *MessageBrokerProxy) deliverToAgent(ctx context.Context, projectID, agen
 	// `scion conversation catch-up`. A broadcast to a migrating agent keeps
 	// the pre-existing #1820 rejection instead of a silently-unreachable
 	// deferred row.
+	// Shell execution containers cannot receive messages, even while
+	// reincarnating (so nothing is persisted for later redrive; §3.4 S5).
+	if isShellAgent(agent) {
+		p.log.Warn("Rejecting broker message to execution container",
+			"agentSlug", agentSlug, "projectID", projectID)
+		if !msg.Broadcasted {
+			p.publishDeliveryFailed(ctx, projectID, agentSlug, msg, errors.New(shellAgentNotMessageableError(agent).Message))
+		}
+		return
+	}
+
 	deferred := reincarnationInFlight(agent) && !msg.Broadcasted
 
 	// #1820: admission gate — mirror the phase check applied to direct
@@ -1396,6 +1430,10 @@ func (p *MessageBrokerProxy) fanOutToProject(ctx context.Context, projectID stri
 		if msg.SenderID != "" && msg.SenderID == agent.ID {
 			continue
 		}
+		// Broadcast fan-out silently skips shell execution containers (§3.4 S5).
+		if isShellAgent(&agent) {
+			continue
+		}
 		agentMsg := *msg // copy to set per-agent recipient
 		agentMsg.Recipient = "agent:" + agent.Slug
 		agentMsg.RecipientID = agent.ID
@@ -1424,6 +1462,10 @@ func (p *MessageBrokerProxy) fanOutGlobal(ctx context.Context, msg *messages.Str
 	for _, agent := range result.Items {
 		// B5/R1: skip the sender by ID, not by the display-label Sender field.
 		if msg.SenderID != "" && msg.SenderID == agent.ID {
+			continue
+		}
+		// Global broadcast fan-out silently skips shell execution containers (§3.4 S5).
+		if isShellAgent(&agent) {
 			continue
 		}
 		agentMsg := *msg
@@ -1515,12 +1557,13 @@ func newDeliveryNotice(recipient, recipientID, text, status, category string) *m
 	return notice
 }
 
-// publishDeliveryUnconfirmed tells an agent sender that a message row to
-// agentSlug expired in dispatch_state="pending" without dispatch confirmation
-// (ptone/scion#7405): because existing row data cannot distinguish a never-sent
-// pending row from an AC-3 (broker accepted, MarkMessageDispatched failed) or
-// AC-4 (deadline-ambiguous) row, delivery may have occurred and the sender
-// should check before resending rather than blindly duplicating the message.
+// publishDeliveryUnconfirmed tells an agent sender that delivery to agentSlug
+// could not be confirmed — either because a pending row expired past
+// stuckMessageExpireTTL (ptone/scion#7405, e.g. AC-3 or an interrupted
+// dispatch) or because a background auto-wake dispatch timed out or was
+// cancelled with an unknown outcome. Because delivery may have occurred, the
+// sender should check before resending rather than blindly duplicating the
+// message.
 func (p *MessageBrokerProxy) publishDeliveryUnconfirmed(ctx context.Context, agentSlug string, msg *messages.StructuredMessage) {
 	if !strings.HasPrefix(msg.Sender, "agent:") || msg.SenderID == "" {
 		return

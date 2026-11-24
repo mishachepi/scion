@@ -49,7 +49,8 @@ jobs:
   changes:
     name: Detect changed paths
     if: ${{ (github.event_name != 'push' && github.event_name != 'schedule') || github.repository == 'GoogleCloudPlatform/scion' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && vars.SCION_LARGE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 5
     outputs:
       single_node_vm: ${{ steps.diff.outputs.single_node_vm }}
       starter_hub: ${{ steps.diff.outputs.starter_hub }}
@@ -130,9 +131,11 @@ jobs:
           #     harnesses/ directory (harnesses/*/config.yaml).
           #   - web/src/components/pages/admin-server-config-env-keys.test.ts
           #     reads pkg/config/schemas/settings-v1.schema.json.
+          #   - web/src/shared/filter-query/filter-query.test.ts reads
+          #     docs-site/src/content/docs/reference/filter-queries.md.
           # Keep this regex in sync when web/ starts reading anything else
           # outside web/.
-          if grep -qE '^(web/|harnesses/|pkg/(.+/)?testdata/|pkg/config/schemas/|\.github/workflows/ci\.yml$)' <<<"$changed"; then
+          if grep -qE '^(web/|harnesses/|pkg/(.+/)?testdata/|pkg/config/schemas/|docs-site/src/content/docs/reference/filter-queries\.md$|\.github/workflows/ci\.yml$)' <<<"$changed"; then
             echo "web_checks=true" >> "$GITHUB_OUTPUT"
           else
             echo "web_checks=false" >> "$GITHUB_OUTPUT"
@@ -176,7 +179,7 @@ jobs:
   # here does not touch the path detection in changes (which fails open).
   runner-routing-check:
     name: Runner routing check
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && vars.SCION_LARGE_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 5
     if: ${{ ((github.event_name != 'push' && github.event_name != 'schedule') || github.repository == 'GoogleCloudPlatform/scion') && (github.event_name == 'pull_request') }}
     steps:
@@ -196,7 +199,7 @@ jobs:
   # schedule-triggered workflow carrying the gate in its if:.
   fork-ci-gate-check:
     name: Fork CI gate check
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && vars.SCION_LARGE_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 5
     if: ${{ ((github.event_name != 'push' && github.event_name != 'schedule') || github.repository == 'GoogleCloudPlatform/scion') && (github.event_name == 'pull_request') }}
     steps:
@@ -728,6 +731,24 @@ jobs:
           esac
           exit "$rc"
 
+      - name: Check Raw SQL Predicates
+        run: |
+          # Invoked directly rather than via `make check-raw-sql-predicates`,
+          # for the same reason as Check Authorization Guards above: make would
+          # collapse the script's exit 1 (violations) and exit 3/4 (nothing was
+          # analysed).
+          ./hack/check-raw-sql-predicates.sh --self-test
+          set +e
+          ./hack/check-raw-sql-predicates.sh
+          rc=$?
+          set -e
+          case "$rc" in
+            0) ;;
+            1) echo "::error title=Raw SQL predicates::An entsql.P or entsql.ExprP predicate emits a top-level OR without enclosing parentheses (ptone/scion#8531, ptone/scion#8533). Wrap the predicate in outer parentheses or add a justified entry to hack/raw-sql-predicates-allowlist.txt; details are in the step log above." ;;
+            *) echo "::error title=Raw SQL predicates NOT checked::check-raw-sql-predicates.sh could not run (exit $rc) — NOTHING WAS ANALYSED. This is an environment failure, not a statement about the codebase." ;;
+          esac
+          exit "$rc"
+
       - name: Check Debug Defaults
         run: |
           # Invoked directly rather than via `make check-debug-defaults`, for the
@@ -1036,9 +1057,9 @@ jobs:
         run: |
           GOOS=windows GOARCH=amd64 go build -buildvcs=false -o /dev/null ./cmd/scion
           GOOS=windows GOARCH=arm64 go build -buildvcs=false -o /dev/null ./cmd/scion
-          # pkg/hub/maintenance: its unix-only symlink installer and tests
-          # must keep the package (tests included) compiling for Windows.
-          GOOS=windows GOARCH=amd64 go vet ./pkg/util/privatefs/... ./pkg/util/pathcanon/... ./pkg/util/filelock/... ./pkg/tunnelclient/... ./pkg/hub/maintenance/...
+          # pkg/hub/maintenance and pkg/runtimebroker: unix-only code and tests
+          # must keep the packages (tests included) compiling for Windows.
+          GOOS=windows GOARCH=amd64 go vet ./pkg/util/privatefs/... ./pkg/util/pathcanon/... ./pkg/util/filelock/... ./pkg/tunnelclient/... ./pkg/hub/maintenance/... ./pkg/runtimebroker/...
 
       - name: Save Go cache
         uses: ./.github/actions/save-go-cache
@@ -1049,8 +1070,8 @@ jobs:
   sqlite-nonhub-tests:
     name: SQLite Tests (non-hub)
     if: ${{ (github.event_name != 'push' && github.event_name != 'schedule') || github.repository == 'GoogleCloudPlatform/scion' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 70
+    runs-on: ${{ (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && vars.SCION_LARGE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: ${{ (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && vars.SCION_LARGE_RUNNER && 35 || 70 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -1129,7 +1150,7 @@ jobs:
   hub-shard-plan:
     name: pkg/hub shard plan
     if: ${{ (github.event_name != 'push' && github.event_name != 'schedule') || github.repository == 'GoogleCloudPlatform/scion' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && vars.SCION_LARGE_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 10
     outputs:
       shards: ${{ steps.plan.outputs.shards }}
@@ -1369,7 +1390,7 @@ jobs:
     name: pkg/hub SQLite Tests
     needs: [hub-shard-plan, hub-shard, hub-shard-postgres-integration]
     if: ${{ ((github.event_name != 'push' && github.event_name != 'schedule') || github.repository == 'GoogleCloudPlatform/scion') && (always()) }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && vars.SCION_LARGE_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Check shard results
@@ -1577,7 +1598,7 @@ jobs:
     name: T1 Launch Store PostgreSQL Tests
     needs: [launch-store-postgres-entadapter, launch-store-postgres-others]
     if: ${{ ((github.event_name != 'push' && github.event_name != 'schedule') || github.repository == 'GoogleCloudPlatform/scion') && (always()) }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && vars.SCION_LARGE_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Check T1 part results
@@ -2108,7 +2129,7 @@ jobs:
     name: Chat mobile E2E
     needs: [changes, chat-mobile-e2e]
     if: ${{ ((github.event_name != 'push' && github.event_name != 'schedule') || github.repository == 'GoogleCloudPlatform/scion') && (always()) }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && vars.SCION_LARGE_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Check shard results

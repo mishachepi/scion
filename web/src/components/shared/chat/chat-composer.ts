@@ -259,6 +259,10 @@ export class ScionChatComposer extends LitElement {
   @property({ type: Object })
   replyTo: { messageId: string; senderName: string; content: string } | null = null;
 
+  /** Optional non-blocking inline warning displayed in the reply bar (e.g. deleted reply target). */
+  @property({ type: String })
+  replyTargetWarning = '';
+
   /** Edit mode: populates the textarea with existing content. */
   @property({ type: Object })
   editMessage: { messageId: string; content: string } | null = null;
@@ -438,7 +442,7 @@ export class ScionChatComposer extends LitElement {
 
     sl-textarea::part(base) {
       font-size: var(--chat-fs-lg);
-      border-radius: 0.75rem;
+      border-radius: var(--scion-radius-lg);
       background: var(--scion-surface-raised, #ffffff);
       border-color: var(--scion-border, #e2e8f0);
     }
@@ -608,7 +612,7 @@ export class ScionChatComposer extends LitElement {
       margin-bottom: 0.25rem;
       background: var(--scion-surface, #ffffff);
       border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: 0.5rem;
+      border-radius: var(--scion-radius);
       box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
       min-width: 180px;
       padding: 0.25rem 0;
@@ -702,7 +706,7 @@ export class ScionChatComposer extends LitElement {
       font-size: var(--chat-fs-base);
       color: var(--scion-text-muted, #64748b);
       background: var(--scion-bg-subtle, #f1f5f9);
-      border-radius: 0.5rem 0.5rem 0 0;
+      border-radius: var(--scion-radius) var(--scion-radius) 0 0;
       border: 1px solid var(--scion-border, #e2e8f0);
       border-bottom: none;
       /* Keep the tab over the composer's content, which moves in by the
@@ -744,7 +748,7 @@ export class ScionChatComposer extends LitElement {
     }
 
     .destination-chip.dm {
-      background: var(--scion-primary-50, #eff6ff);
+      background: var(--scion-primary-tint, #eff6ff);
     }
 
     /* In a narrow composer the chip keeps to one line: a long agent name is
@@ -785,7 +789,7 @@ export class ScionChatComposer extends LitElement {
       padding: 0.125rem 0.25rem 0.125rem 0.5rem;
       border: 1px solid var(--sl-color-primary-200, #bfdbfe);
       background: var(--sl-color-primary-50, #eff6ff);
-      border-radius: 0.5rem;
+      border-radius: var(--scion-radius);
       font-size: var(--chat-fs-sm);
       max-width: 100%;
     }
@@ -824,7 +828,7 @@ export class ScionChatComposer extends LitElement {
       padding: 0.25rem 0.5rem;
       background: var(--scion-bg-subtle, #f1f5f9);
       border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: 0.375rem;
+      border-radius: calc(var(--scion-radius) * 0.75);
       font-size: var(--chat-fs-sm);
       color: var(--scion-text, #1e293b);
       max-width: 200px;
@@ -834,7 +838,7 @@ export class ScionChatComposer extends LitElement {
       width: 24px;
       height: 24px;
       object-fit: cover;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
     }
 
     .pending-file .file-name {
@@ -901,14 +905,38 @@ export class ScionChatComposer extends LitElement {
        same height whatever the frame, so the field's cap stays monotonic. */
     .reply-bar {
       display: flex;
-      align-items: center;
-      gap: 0.5rem;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 0.25rem;
       padding: calc(0.375rem - 0.25rem * var(--scion-chat-kb-open, 0)) 0.75rem;
       background: var(--scion-bg, #f8fafc);
       border-left: 3px solid var(--scion-primary-400, #60a5fa);
-      border-radius: 0 0.25rem 0.25rem 0;
+      border-radius: 0 var(--scion-radius-sm) var(--scion-radius-sm) 0;
       font-size: var(--chat-fs-base);
       color: var(--scion-text-secondary, #475569);
+    }
+
+    .reply-bar.has-warning {
+      border-left-color: var(--scion-warning-400, #fbbf24);
+    }
+
+    .reply-bar-main {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .reply-warning {
+      display: flex;
+      align-items: center;
+      gap: 0.375rem;
+      font-size: var(--chat-fs-xs);
+      color: var(--scion-warning-600, #d97706);
+    }
+
+    .reply-warning sl-icon {
+      flex-shrink: 0;
+      font-size: var(--chat-fs-sm);
     }
 
     /* The sender and a one-line excerpt: on two lines normally, side by
@@ -959,7 +987,7 @@ export class ScionChatComposer extends LitElement {
       padding: calc(0.375rem - 0.25rem * var(--scion-chat-kb-open, 0)) 0.75rem;
       background: var(--scion-warning-50, #fffbeb);
       border-left: 3px solid var(--scion-warning-400, #fbbf24);
-      border-radius: 0 0.25rem 0.25rem 0;
+      border-radius: 0 var(--scion-radius-sm) var(--scion-radius-sm) 0;
       font-size: var(--chat-fs-base);
       color: var(--scion-neutral-600, #475569);
     }
@@ -987,9 +1015,9 @@ export class ScionChatComposer extends LitElement {
       display: flex;
       align-items: center;
       justify-content: center;
-      background: rgba(59, 130, 246, 0.08);
+      background: color-mix(in srgb, var(--scion-primary, #3b82f6) 8%, transparent);
       border: 2px dashed var(--scion-primary, #3b82f6);
-      border-radius: 0.75rem;
+      border-radius: var(--scion-radius-lg);
       pointer-events: none;
     }
 
@@ -1367,16 +1395,26 @@ export class ScionChatComposer extends LitElement {
   private renderReplyBar() {
     if (!this.replyTo) return nothing;
     return html`
-      <div class="reply-bar">
-        <div class="reply-info">
-          <span class="reply-sender">${this.replyTo.senderName}</span>
-          <span class="reply-content">${this.replyTo.content}</span>
+      <div class="reply-bar${this.replyTargetWarning ? ' has-warning' : ''}">
+        <div class="reply-bar-main">
+          <div class="reply-info">
+            <span class="reply-sender">${this.replyTo.senderName}</span>
+            <span class="reply-content">${this.replyTo.content}</span>
+          </div>
+          <sl-icon-button
+            name="x-lg"
+            label="Cancel reply"
+            @click=${this.cancelReply}
+          ></sl-icon-button>
         </div>
-        <sl-icon-button
-          name="x-lg"
-          label="Cancel reply"
-          @click=${this.cancelReply}
-        ></sl-icon-button>
+        ${this.replyTargetWarning
+          ? html`
+              <div class="reply-warning" role="status">
+                <sl-icon name="exclamation-triangle"></sl-icon>
+                <span>${this.replyTargetWarning}</span>
+              </div>
+            `
+          : nothing}
       </div>
     `;
   }

@@ -112,9 +112,28 @@ type TriggerMatchPatchSpec struct {
 
 // TriggerSubjectPatchSpec holds partial updates to a trigger's subject block.
 type TriggerSubjectPatchSpec struct {
-	Dialect *string `json:"dialect,omitempty"`
-	Expr    *string `json:"expr,omitempty"`
-	Mode    *string `json:"mode,omitempty"`
+	Dialect        *string `json:"dialect,omitempty"`
+	Expr           *string `json:"expr,omitempty"`
+	Mode           *string `json:"mode,omitempty"`
+	CoalesceWindow *string `json:"coalesce_window,omitempty"`
+}
+
+// authorizeTriggerReuseSubject enforces Stage 3 §6.2: authoring a reuse trigger
+// requires wake authority (agent.lifecycle) in the author's hop ceiling,
+// returning HTTP 400 "reuse requires wake authority" when absent.
+func authorizeTriggerReuseSubject(w http.ResponseWriter, subjectMode string, ceiling store.EffectCeiling, prov store.AuthorityProvenance) bool {
+	if subjectMode != store.TriggerSubjectModeReuse {
+		return true
+	}
+	if !EffectCeilingAllows(
+		uatHopEffectCeiling(prov.SourcePrincipalKind, prov.SourcePrincipalID, prov, ceiling),
+		scheduledWakePermission,
+		false,
+	) {
+		ValidationError(w, "reuse requires wake authority", nil)
+		return false
+	}
+	return true
 }
 
 // UpdateTriggerRequest is the request body for PATCH /triggers/{id}.
@@ -193,6 +212,12 @@ func (s *Server) handleTriggers(w http.ResponseWriter, r *http.Request, projectI
 					return
 				}
 				authzAction = ActionRead
+			case "render":
+				if r.Method != http.MethodPost {
+					MethodNotAllowed(w, http.MethodPost)
+					return
+				}
+				authzAction = ActionRead
 			default:
 				NotFound(w, "Trigger action")
 				return
@@ -237,6 +262,8 @@ func (s *Server) handleTriggers(w http.ResponseWriter, r *http.Request, projectI
 			s.resumeTrigger(w, r, projectID, triggerID)
 		case "history":
 			s.getTriggerHistory(w, r, projectID, triggerID)
+		case "render":
+			s.renderTrigger(w, r, projectID, triggerID)
 		}
 	})(w, r)
 }
@@ -323,6 +350,118 @@ func triggerSourceLimitMessage(sourceKind string) string {
 
 func setTriggerETag(w http.ResponseWriter, rev int) {
 	w.Header().Set("ETag", fmt.Sprintf("%q", fmt.Sprintf("%d", rev)))
+}
+
+// validateTriggerActionCrossFields refuses action payloads carrying fields
+// that do not belong to actionType rather than silently dropping them
+// (P1c-1 rev-3 N2). Unknown action types return true here so the caller's
+// action-type switch reports the unsupported action type error.
+func validateTriggerActionCrossFields(w http.ResponseWriter, actionType string, spec *TriggerActionSpec) bool {
+	if spec == nil {
+		return true
+	}
+	var badField string
+	switch actionType {
+	case store.TriggerActionMessage:
+		switch {
+		case spec.NameConflict != "":
+			badField = "nameConflict"
+		case spec.Template != "":
+			badField = "template"
+		case spec.Task != "":
+			badField = "task"
+		case spec.Branch != "":
+			badField = "branch"
+		case len(spec.Labels) > 0:
+			badField = "labels"
+		case spec.Ephemeral:
+			badField = "ephemeral"
+		case spec.GithubToken != "":
+			badField = "githubToken"
+		case spec.AgentRole != "":
+			badField = "agentRole"
+		case spec.ReuseMessage != "":
+			badField = "reuseMessage"
+		case spec.AckComment != nil:
+			badField = "ackComment"
+		case len(spec.UntrustedVars) > 0:
+			badField = "untrustedVars"
+		case spec.NoAuth:
+			badField = "noAuth"
+		case spec.Body != "":
+			badField = "body"
+		case spec.Target != "":
+			badField = "target"
+		case spec.ReplyInThread:
+			badField = "replyInThread"
+		}
+	case store.TriggerActionDispatchAgent:
+		switch {
+		case spec.AgentID != "":
+			badField = "agentId"
+		case spec.Message != "":
+			badField = "message"
+		case spec.Interrupt:
+			badField = "interrupt"
+		case spec.Plain:
+			badField = "plain"
+		case spec.Wake:
+			badField = "wake"
+		case spec.Body != "":
+			badField = "body"
+		case spec.Target != "":
+			badField = "target"
+		case spec.ReplyInThread:
+			badField = "replyInThread"
+		}
+	case store.TriggerActionGitHubComment:
+		switch {
+		case spec.AgentID != "":
+			badField = "agentId"
+		case spec.AgentName != "":
+			badField = "agentName"
+		case spec.Message != "":
+			badField = "message"
+		case spec.Interrupt:
+			badField = "interrupt"
+		case spec.Plain:
+			badField = "plain"
+		case spec.Wake:
+			badField = "wake"
+		case spec.NameConflict != "":
+			badField = "nameConflict"
+		case spec.Template != "":
+			badField = "template"
+		case spec.Task != "":
+			badField = "task"
+		case spec.Branch != "":
+			badField = "branch"
+		case len(spec.Labels) > 0:
+			badField = "labels"
+		case spec.Ephemeral:
+			badField = "ephemeral"
+		case spec.GithubToken != "":
+			badField = "githubToken"
+		case spec.AgentRole != "":
+			badField = "agentRole"
+		case spec.ReuseMessage != "":
+			badField = "reuseMessage"
+		case spec.AckComment != nil:
+			badField = "ackComment"
+		case spec.NoAuth:
+			badField = "noAuth"
+		}
+	default:
+		return true
+	}
+	if badField != "" {
+		ValidationError(w, fmt.Sprintf("action.%s is not supported for action type %q", badField, actionType), map[string]any{
+			"field":      "action." + badField,
+			"actionType": actionType,
+		})
+		return false
+	}
+	return true
 }
 
 // readTriggerRequestJSON caps trigger and webhook-endpoint write request bodies
@@ -422,15 +561,17 @@ func (s *Server) createTrigger(w http.ResponseWriter, r *http.Request, projectID
 		}
 	}
 	explicitSubjectDialect := req.Subject != nil && strings.TrimSpace(req.Subject.Dialect) != ""
-	subjectDialect, subjectRule, subjectMode, ok := s.writeAndValidateTriggerSubject(w, ctx, req.Subject, explicitSubjectDialect)
+	subjectDialect, subjectRule, subjectMode, coalesceSeconds, ok := s.writeAndValidateTriggerSubject(w, ctx, req.Subject, explicitSubjectDialect)
 	if !ok {
 		return
 	}
 
 	var resolvedSourceID string
+	var ep *store.WebhookEndpoint
 	switch sourceKind {
 	case store.TriggerSourceKindWebhook:
-		ep, ok := s.resolveTriggerWebhookSource(w, r, projectID, req.Source.ID)
+		var ok bool
+		ep, ok = s.resolveTriggerWebhookSource(w, r, projectID, req.Source.ID)
 		if !ok {
 			return
 		}
@@ -442,40 +583,58 @@ func (s *Server) createTrigger(w http.ResponseWriter, r *http.Request, projectID
 		resolvedSourceID = ""
 	}
 
-	actionType := strings.TrimSpace(req.Action.Type)
-	if actionType != store.TriggerActionMessage {
-		ValidationError(w, fmt.Sprintf("unsupported action type %q (supported: %s)", actionType, store.TriggerActionMessage), nil)
-		return
-	}
-	actionPayload, ok := s.authorizeTriggerMessageAuthoring(w, r, projectID, sourceKind, &req.Action)
+	ceiling, prov, ok := s.triggerRevisionAuthorityCeiling(w, r, projectID, ActionCreate)
 	if !ok {
 		return
 	}
+	if !authorizeTriggerReuseSubject(w, subjectMode, ceiling, prov) {
+		return
+	}
 
-	ceiling, ok := s.triggerRevisionAuthorityCeiling(w, r, projectID, ActionCreate)
+	actionType := strings.TrimSpace(req.Action.Type)
+	if !validateTriggerActionCrossFields(w, actionType, &req.Action) {
+		return
+	}
+	var actionPayload string
+	var execTargetID string
+	switch actionType {
+	case store.TriggerActionMessage:
+		actionPayload, ok = s.authorizeTriggerMessageAuthoring(w, r, projectID, sourceKind, &req.Action)
+	case store.TriggerActionDispatchAgent:
+		actionPayload, ok = s.authorizeTriggerDispatchAgentAuthoring(w, r, projectID, sourceKind, ep, &req.Action, ceiling, prov)
+	case store.TriggerActionExec:
+		actionPayload, execTargetID, ok = s.authorizeTriggerExecAuthoring(w, r, projectID, sourceKind, ep, subjectMode, &req.Action, ceiling, prov)
+	case store.TriggerActionGitHubComment:
+		actionPayload, ok = s.authorizeTriggerGitHubCommentAuthoring(w, r, projectID, sourceKind, matchTypes, &req.Action)
+	default:
+		ValidationError(w, fmt.Sprintf("unsupported action type %q (supported: %s, %s, %s, %s)",
+			actionType, store.TriggerActionMessage, store.TriggerActionDispatchAgent, store.TriggerActionExec, store.TriggerActionGitHubComment), nil)
+		return
+	}
 	if !ok {
 		return
 	}
 
 	trigger := store.Trigger{
-		ID:                   api.NewUUID(),
-		ProjectID:            projectID,
-		Name:                 name,
-		Description:          req.Description,
-		SourceKind:           sourceKind,
-		SourceID:             resolvedSourceID,
-		MatchTypes:           matchTypes,
-		MatchRules:           matchRules,
-		MatchForm:            matchForm,
-		ActionType:           store.TriggerActionMessage,
-		ActionPayload:        actionPayload,
-		SubjectDialect:       subjectDialect,
-		SubjectRule:          subjectRule,
-		SubjectMode:          subjectMode,
-		Status:               store.TriggerStatusActive,
-		CreatedBy:            identity.ID(),
-		InitiatorAttribution: newInitiatorAttribution(ctx),
-		AuthorityCeiling:     ceiling,
+		ID:                    api.NewUUID(),
+		ProjectID:             projectID,
+		Name:                  name,
+		Description:           req.Description,
+		SourceKind:            sourceKind,
+		SourceID:              resolvedSourceID,
+		MatchTypes:            matchTypes,
+		MatchRules:            matchRules,
+		MatchForm:             matchForm,
+		ActionType:            actionType,
+		ActionPayload:         actionPayload,
+		SubjectDialect:        subjectDialect,
+		SubjectRule:           subjectRule,
+		SubjectMode:           subjectMode,
+		CoalesceWindowSeconds: coalesceSeconds,
+		Status:                store.TriggerStatusActive,
+		CreatedBy:             identity.ID(),
+		InitiatorAttribution:  newInitiatorAttribution(ctx),
+		AuthorityCeiling:      ceiling,
 	}
 
 	fp := fixturePrincipalFromContext(ctx)
@@ -510,6 +669,11 @@ func (s *Server) createTrigger(w http.ResponseWriter, r *http.Request, projectID
 		if srcCount >= store.MaxActiveTriggersPerSource {
 			return errTriggerSourceLimitExceeded
 		}
+		if trigger.ActionType == store.TriggerActionExec {
+			if capErr := checkTriggerExecCapsInTx(ctx, tx, projectID, execTargetID, false, false); capErr != nil {
+				return capErr
+			}
+		}
 		return tx.CreateTrigger(ctx, &trigger)
 	})
 	if err != nil {
@@ -525,6 +689,12 @@ func (s *Server) createTrigger(w http.ResponseWriter, r *http.Request, projectID
 		case errors.Is(err, errTriggerSourceLimitExceeded):
 			writeError(w, http.StatusConflict, ErrCodeLimitExceeded,
 				triggerSourceLimitMessage(trigger.SourceKind), nil)
+		case errors.Is(err, errTriggerExecProjectCapExceeded):
+			writeError(w, http.StatusConflict, ErrCodeLimitExceeded,
+				fmt.Sprintf("project has reached the maximum of %d active exec triggers", triggerExecMaxActivePerProject), nil)
+		case errors.Is(err, errTriggerExecTargetCapExceeded):
+			writeError(w, http.StatusConflict, ErrCodeLimitExceeded,
+				fmt.Sprintf("target agent has reached the maximum of %d active exec triggers", triggerExecMaxActivePerTarget), nil)
 		case errors.Is(err, store.ErrAlreadyExists):
 			writeError(w, http.StatusConflict, ErrCodeConflict,
 				"a trigger with this name already exists in this project", nil)
@@ -535,7 +705,7 @@ func (s *Server) createTrigger(w http.ResponseWriter, r *http.Request, projectID
 	}
 
 	setTriggerETag(w, trigger.AuthorizationRevision)
-	writeJSON(w, http.StatusCreated, buildTriggerResponse(trigger))
+	writeJSON(w, http.StatusCreated, buildTriggerResponse(s.newExecRevealer(ctx), trigger))
 }
 
 func (s *Server) listTriggers(w http.ResponseWriter, r *http.Request, projectID string) {
@@ -571,7 +741,7 @@ func (s *Server) listTriggers(w http.ResponseWriter, r *http.Request, projectID 
 
 	writeJSON(w, http.StatusOK, ListTriggersResponse{
 		Scope:      scope,
-		Triggers:   buildTriggerResponses(result.Items),
+		Triggers:   buildTriggerResponses(s.newExecRevealer(ctx), result.Items),
 		NextCursor: result.NextCursor,
 		TotalCount: result.TotalCount,
 		ServerTime: time.Now().UTC(),
@@ -604,16 +774,38 @@ func (s *Server) getTrigger(w http.ResponseWriter, r *http.Request, projectID, t
 		return
 	}
 	setTriggerETag(w, tr.AuthorizationRevision)
-	writeJSON(w, http.StatusOK, buildTriggerResponse(*tr))
+	writeJSON(w, http.StatusOK, buildTriggerResponse(s.newExecRevealer(r.Context()), *tr))
 }
 
-func (s *Server) authorizeStoredTriggerAction(w http.ResponseWriter, r *http.Request, projectID, sourceKind, actionType, rawPayload string) (string, bool) {
-	if actionType != store.TriggerActionMessage {
-		ValidationError(w, fmt.Sprintf("unsupported action type %q (supported: %s)", actionType, store.TriggerActionMessage), nil)
+func (s *Server) authorizeStoredTriggerAction(
+	w http.ResponseWriter,
+	r *http.Request,
+	projectID string,
+	sourceKind string,
+	ep *store.WebhookEndpoint,
+	matchTypes []string,
+	subjectMode string,
+	actionType string,
+	rawPayload string,
+	ceiling store.EffectCeiling,
+	prov store.AuthorityProvenance,
+) (string, bool) {
+	spec := buildTriggerActionSpecRaw(actionType, rawPayload)
+	switch actionType {
+	case store.TriggerActionMessage:
+		return s.authorizeTriggerMessageAuthoring(w, r, projectID, sourceKind, &spec)
+	case store.TriggerActionDispatchAgent:
+		return s.authorizeTriggerDispatchAgentAuthoring(w, r, projectID, sourceKind, ep, &spec, ceiling, prov)
+	case store.TriggerActionExec:
+		payload, _, ok := s.authorizeTriggerExecAuthoring(w, r, projectID, sourceKind, ep, subjectMode, &spec, ceiling, prov)
+		return payload, ok
+	case store.TriggerActionGitHubComment:
+		return s.authorizeTriggerGitHubCommentAuthoring(w, r, projectID, sourceKind, matchTypes, &spec)
+	default:
+		ValidationError(w, fmt.Sprintf("unsupported action type %q (supported: %s, %s, %s, %s)",
+			actionType, store.TriggerActionMessage, store.TriggerActionDispatchAgent, store.TriggerActionExec, store.TriggerActionGitHubComment), nil)
 		return "", false
 	}
-	spec := buildTriggerActionSpec(actionType, rawPayload)
-	return s.authorizeTriggerMessageAuthoring(w, r, projectID, sourceKind, &spec)
 }
 
 func (s *Server) updateTrigger(w http.ResponseWriter, r *http.Request, projectID, triggerID string) {
@@ -651,11 +843,15 @@ func (s *Server) updateTrigger(w http.ResponseWriter, r *http.Request, projectID
 
 	oldSourceID := tr.SourceID
 	oldSourceKind := tr.SourceKind
+	oldActionType := tr.ActionType
+	oldActionPayload := tr.ActionPayload
+	oldStatus := tr.Status
 	prevRevision := tr.AuthorizationRevision
 	prevRevisionKnown := tr.AuthorizationRevision != 0
 
 	var fields store.TriggerFieldMask
 	changesFutureDispatch := false
+	var resolvedEP *store.WebhookEndpoint
 
 	if req.Name != nil {
 		name, err := validateTriggerName(*req.Name)
@@ -682,6 +878,7 @@ func (s *Server) updateTrigger(w http.ResponseWriter, r *http.Request, projectID
 			if !ok {
 				return
 			}
+			resolvedEP = ep
 			tr.SourceKind = store.TriggerSourceKindWebhook
 			tr.SourceID = ep.ID
 		case store.TriggerSourceKindGitHub:
@@ -816,9 +1013,10 @@ func (s *Server) updateTrigger(w http.ResponseWriter, r *http.Request, projectID
 	}
 	if req.Subject != nil {
 		merged := TriggerSubjectSpec{
-			Dialect: tr.SubjectDialect,
-			Expr:    tr.SubjectRule,
-			Mode:    tr.SubjectMode,
+			Dialect:        tr.SubjectDialect,
+			Expr:           tr.SubjectRule,
+			Mode:           tr.SubjectMode,
+			CoalesceWindow: formatTriggerCoalesceWindow(tr.CoalesceWindowSeconds),
 		}
 		if req.Subject.Dialect != nil {
 			merged.Dialect = *req.Subject.Dialect
@@ -832,30 +1030,34 @@ func (s *Server) updateTrigger(w http.ResponseWriter, r *http.Request, projectID
 			merged.Mode = *req.Subject.Mode
 			fields.SubjectMode = true
 		}
+		if req.Subject.CoalesceWindow != nil {
+			merged.CoalesceWindow = *req.Subject.CoalesceWindow
+			fields.CoalesceWindowSeconds = true
+		}
 		explicitSubjectDialect := req.Subject.Dialect != nil && strings.TrimSpace(*req.Subject.Dialect) != ""
-		subjectDialect, subjectRule, subjectMode, ok := s.writeAndValidateTriggerSubject(w, ctx, &merged, explicitSubjectDialect)
+		subjectDialect, subjectRule, subjectMode, coalesceSeconds, ok := s.writeAndValidateTriggerSubject(w, ctx, &merged, explicitSubjectDialect)
 		if !ok {
 			return
 		}
 		tr.SubjectDialect = subjectDialect
 		tr.SubjectRule = subjectRule
 		tr.SubjectMode = subjectMode
-		if fields.SubjectDialect || fields.SubjectRule || fields.SubjectMode {
+		tr.CoalesceWindowSeconds = coalesceSeconds
+		if fields.SubjectDialect || fields.SubjectRule || fields.SubjectMode || fields.CoalesceWindowSeconds {
 			changesFutureDispatch = true
 		}
 	}
 	if req.Action != nil {
 		actionType := strings.TrimSpace(req.Action.Type)
-		if actionType != store.TriggerActionMessage {
-			ValidationError(w, fmt.Sprintf("unsupported action type %q (supported: %s)", actionType, store.TriggerActionMessage), nil)
+		if actionType != store.TriggerActionMessage &&
+			actionType != store.TriggerActionDispatchAgent &&
+			actionType != store.TriggerActionExec &&
+			actionType != store.TriggerActionGitHubComment {
+			ValidationError(w, fmt.Sprintf("unsupported action type %q (supported: %s, %s, %s, %s)",
+				actionType, store.TriggerActionMessage, store.TriggerActionDispatchAgent, store.TriggerActionExec, store.TriggerActionGitHubComment), nil)
 			return
 		}
-		actionPayload, ok := s.authorizeTriggerMessageAuthoring(w, r, projectID, tr.SourceKind, req.Action)
-		if !ok {
-			return
-		}
-		tr.ActionType = store.TriggerActionMessage
-		tr.ActionPayload = actionPayload
+		tr.ActionType = actionType
 		fields.ActionType = true
 		fields.ActionPayload = true
 		changesFutureDispatch = true
@@ -869,9 +1071,11 @@ func (s *Server) updateTrigger(w http.ResponseWriter, r *http.Request, projectID
 		if req.Source == nil {
 			switch tr.SourceKind {
 			case store.TriggerSourceKindWebhook:
-				if _, ok := s.resolveTriggerWebhookSource(w, r, projectID, tr.SourceID); !ok {
+				ep, ok := s.resolveTriggerWebhookSource(w, r, projectID, tr.SourceID)
+				if !ok {
 					return
 				}
+				resolvedEP = ep
 			case store.TriggerSourceKindGitHub:
 				project, pErr := s.store.GetProject(ctx, projectID)
 				if pErr != nil {
@@ -905,25 +1109,68 @@ func (s *Server) updateTrigger(w http.ResponseWriter, r *http.Request, projectID
 			}
 		}
 		if req.Subject == nil {
-			if _, _, _, ok := s.writeAndValidateTriggerSubject(w, ctx, &TriggerSubjectSpec{
-				Dialect: tr.SubjectDialect,
-				Expr:    tr.SubjectRule,
-				Mode:    tr.SubjectMode,
+			if _, _, _, _, ok := s.writeAndValidateTriggerSubject(w, ctx, &TriggerSubjectSpec{
+				Dialect:        tr.SubjectDialect,
+				Expr:           tr.SubjectRule,
+				Mode:           tr.SubjectMode,
+				CoalesceWindow: formatTriggerCoalesceWindow(tr.CoalesceWindowSeconds),
 			}, false); !ok {
 				return
 			}
 		}
-		if req.Action == nil {
-			normalizedPayload, ok := s.authorizeStoredTriggerAction(w, r, projectID, tr.SourceKind, tr.ActionType, tr.ActionPayload)
+		ceiling, prov, ok := s.triggerRevisionAuthorityCeiling(w, r, projectID, ActionUpdate)
+		if !ok {
+			return
+		}
+		if !authorizeTriggerReuseSubject(w, tr.SubjectMode, ceiling, prov) {
+			return
+		}
+		if oldSourceKind != store.TriggerSourceKindGitHub &&
+			tr.SourceKind == store.TriggerSourceKindGitHub &&
+			oldActionType == store.TriggerActionDispatchAgent &&
+			tr.ActionType == store.TriggerActionDispatchAgent &&
+			req.Action == nil {
+			writeError(w, http.StatusBadRequest, "github_token_required",
+				"set action.githubToken explicitly to installation or user_preferred when changing a dispatch_agent trigger source to github without an action payload",
+				map[string]any{"field": "action.githubToken"})
+			return
+		}
+		if oldActionType == store.TriggerActionExec {
+			prevLive, ok := s.authorizeStoredExecTargetForUpdate(w, r, projectID, execPayloadTarget(oldActionPayload))
+			if !ok {
+				return
+			}
+			if !prevLive && tr.ActionType == store.TriggerActionExec && (req.Action == nil || len(req.Action.Command) == 0) {
+				ValidationError(w, "retargeting an exec trigger whose previous target was deleted requires command", nil)
+				return
+			}
+		}
+		if req.Action != nil {
+			if !validateTriggerActionCrossFields(w, tr.ActionType, req.Action) {
+				return
+			}
+			var actionPayload string
+			switch tr.ActionType {
+			case store.TriggerActionMessage:
+				actionPayload, ok = s.authorizeTriggerMessageAuthoring(w, r, projectID, tr.SourceKind, req.Action)
+			case store.TriggerActionDispatchAgent:
+				actionPayload, ok = s.authorizeTriggerDispatchAgentAuthoring(w, r, projectID, tr.SourceKind, resolvedEP, req.Action, ceiling, prov)
+			case store.TriggerActionExec:
+				actionPayload, _, ok = s.authorizeTriggerExecAuthoring(w, r, projectID, tr.SourceKind, resolvedEP, tr.SubjectMode, req.Action, ceiling, prov)
+			case store.TriggerActionGitHubComment:
+				actionPayload, ok = s.authorizeTriggerGitHubCommentAuthoring(w, r, projectID, tr.SourceKind, tr.MatchTypes, req.Action)
+			}
+			if !ok {
+				return
+			}
+			tr.ActionPayload = actionPayload
+		} else {
+			normalizedPayload, ok := s.authorizeStoredTriggerAction(w, r, projectID, tr.SourceKind, resolvedEP, tr.MatchTypes, tr.SubjectMode, tr.ActionType, tr.ActionPayload, ceiling, prov)
 			if !ok {
 				return
 			}
 			tr.ActionPayload = normalizedPayload
 			fields.ActionPayload = true
-		}
-		ceiling, ok := s.triggerRevisionAuthorityCeiling(w, r, projectID, ActionUpdate)
-		if !ok {
-			return
 		}
 		attr := reattributeInitiator(ctx, tr.InitiatorAttribution)
 		newAttr = &attr
@@ -956,6 +1203,15 @@ func (s *Server) updateTrigger(w http.ResponseWriter, r *http.Request, projectID
 					return errTriggerSourceLimitExceeded
 				}
 			}
+			if tr.Status == store.TriggerStatusActive && tr.ActionType == store.TriggerActionExec {
+				newTarget := execPayloadTarget(tr.ActionPayload)
+				oldTarget := execPayloadTarget(oldActionPayload)
+				alreadyProj := oldStatus == store.TriggerStatusActive && oldActionType == store.TriggerActionExec
+				alreadyTarget := alreadyProj && oldTarget != "" && oldTarget == newTarget
+				if capErr := checkTriggerExecCapsInTx(ctx, tx, projectID, newTarget, alreadyProj, alreadyTarget); capErr != nil {
+					return capErr
+				}
+			}
 		}
 		return tx.UpdateTrigger(ctx, tr, fields, prevRevision, prevRevisionKnown, newAttr)
 	})
@@ -969,6 +1225,12 @@ func (s *Server) updateTrigger(w http.ResponseWriter, r *http.Request, projectID
 		case errors.Is(err, errTriggerSourceLimitExceeded):
 			writeError(w, http.StatusConflict, ErrCodeLimitExceeded,
 				triggerSourceLimitMessage(tr.SourceKind), nil)
+		case errors.Is(err, errTriggerExecProjectCapExceeded):
+			writeError(w, http.StatusConflict, ErrCodeLimitExceeded,
+				fmt.Sprintf("project has reached the maximum of %d active exec triggers", triggerExecMaxActivePerProject), nil)
+		case errors.Is(err, errTriggerExecTargetCapExceeded):
+			writeError(w, http.StatusConflict, ErrCodeLimitExceeded,
+				fmt.Sprintf("target agent has reached the maximum of %d active exec triggers", triggerExecMaxActivePerTarget), nil)
 		case errors.Is(err, store.ErrAlreadyExists):
 			writeError(w, http.StatusConflict, ErrCodeConflict,
 				"a trigger with this name already exists in this project", nil)
@@ -983,7 +1245,7 @@ func (s *Server) updateTrigger(w http.ResponseWriter, r *http.Request, projectID
 	}
 
 	setTriggerETag(w, tr.AuthorizationRevision)
-	writeJSON(w, http.StatusOK, buildTriggerResponse(*tr))
+	writeJSON(w, http.StatusOK, buildTriggerResponse(s.newExecRevealer(ctx), *tr))
 }
 
 func (s *Server) pauseTrigger(w http.ResponseWriter, r *http.Request, projectID, triggerID string) {
@@ -1021,7 +1283,7 @@ func (s *Server) pauseTrigger(w http.ResponseWriter, r *http.Request, projectID,
 	tr.Status = store.TriggerStatusPaused
 	tr.StatusReason = store.TriggerStatusReasonNone
 	setTriggerETag(w, tr.AuthorizationRevision)
-	writeJSON(w, http.StatusOK, buildTriggerResponse(*tr))
+	writeJSON(w, http.StatusOK, buildTriggerResponse(s.newExecRevealer(ctx), *tr))
 }
 
 func (s *Server) resumeTrigger(w http.ResponseWriter, r *http.Request, projectID, triggerID string) {
@@ -1038,9 +1300,12 @@ func (s *Server) resumeTrigger(w http.ResponseWriter, r *http.Request, projectID
 		return
 	}
 
+	var ep *store.WebhookEndpoint
 	switch tr.SourceKind {
 	case store.TriggerSourceKindWebhook:
-		if _, ok := s.resolveTriggerWebhookSource(w, r, projectID, tr.SourceID); !ok {
+		var ok bool
+		ep, ok = s.resolveTriggerWebhookSource(w, r, projectID, tr.SourceID)
+		if !ok {
 			return
 		}
 	case store.TriggerSourceKindGitHub:
@@ -1054,6 +1319,9 @@ func (s *Server) resumeTrigger(w http.ResponseWriter, r *http.Request, projectID
 			return
 		}
 		if !s.authorizeGitHubTriggerSource(w, r, project, tr.SourceID) {
+			return
+		}
+		if tr.StatusReason == store.TriggerStatusReasonSourceDeleted && !s.requireGitHubInstallationHasRepo(w, r, project) {
 			return
 		}
 	default:
@@ -1072,19 +1340,22 @@ func (s *Server) resumeTrigger(w http.ResponseWriter, r *http.Request, projectID
 	}, false, false); !ok {
 		return
 	}
-	if _, _, _, ok := s.writeAndValidateTriggerSubject(w, ctx, &TriggerSubjectSpec{
-		Dialect: tr.SubjectDialect,
-		Expr:    tr.SubjectRule,
-		Mode:    tr.SubjectMode,
+	if _, _, _, _, ok := s.writeAndValidateTriggerSubject(w, ctx, &TriggerSubjectSpec{
+		Dialect:        tr.SubjectDialect,
+		Expr:           tr.SubjectRule,
+		Mode:           tr.SubjectMode,
+		CoalesceWindow: formatTriggerCoalesceWindow(tr.CoalesceWindowSeconds),
 	}, false); !ok {
 		return
 	}
-	normalizedPayload, ok := s.authorizeStoredTriggerAction(w, r, projectID, tr.SourceKind, tr.ActionType, tr.ActionPayload)
+	ceiling, prov, ok := s.triggerRevisionAuthorityCeiling(w, r, projectID, ActionUpdate)
 	if !ok {
 		return
 	}
-
-	ceiling, ok := s.triggerRevisionAuthorityCeiling(w, r, projectID, ActionUpdate)
+	if !authorizeTriggerReuseSubject(w, tr.SubjectMode, ceiling, prov) {
+		return
+	}
+	normalizedPayload, ok := s.authorizeStoredTriggerAction(w, r, projectID, tr.SourceKind, ep, tr.MatchTypes, tr.SubjectMode, tr.ActionType, tr.ActionPayload, ceiling, prov)
 	if !ok {
 		return
 	}
@@ -1120,6 +1391,11 @@ func (s *Server) resumeTrigger(w http.ResponseWriter, r *http.Request, projectID
 		if srcCount >= store.MaxActiveTriggersPerSource {
 			return errTriggerSourceLimitExceeded
 		}
+		if tr.ActionType == store.TriggerActionExec {
+			if capErr := checkTriggerExecCapsInTx(ctx, tx, projectID, execPayloadTarget(tr.ActionPayload), false, false); capErr != nil {
+				return capErr
+			}
+		}
 		return tx.UpdateTrigger(ctx, tr, fields, prevRevision, prevRevisionKnown, &newAttr)
 	})
 	if err != nil {
@@ -1132,6 +1408,12 @@ func (s *Server) resumeTrigger(w http.ResponseWriter, r *http.Request, projectID
 		case errors.Is(err, errTriggerSourceLimitExceeded):
 			writeError(w, http.StatusConflict, ErrCodeLimitExceeded,
 				triggerSourceLimitMessage(tr.SourceKind), nil)
+		case errors.Is(err, errTriggerExecProjectCapExceeded):
+			writeError(w, http.StatusConflict, ErrCodeLimitExceeded,
+				fmt.Sprintf("project has reached the maximum of %d active exec triggers", triggerExecMaxActivePerProject), nil)
+		case errors.Is(err, errTriggerExecTargetCapExceeded):
+			writeError(w, http.StatusConflict, ErrCodeLimitExceeded,
+				fmt.Sprintf("target agent has reached the maximum of %d active exec triggers", triggerExecMaxActivePerTarget), nil)
 		default:
 			writeErrorFromErr(w, err, "")
 		}
@@ -1141,7 +1423,7 @@ func (s *Server) resumeTrigger(w http.ResponseWriter, r *http.Request, projectID
 	s.invalidateTriggerRuleCache(projectID, triggerID, int64(prevRevision))
 
 	setTriggerETag(w, tr.AuthorizationRevision)
-	writeJSON(w, http.StatusOK, buildTriggerResponse(*tr))
+	writeJSON(w, http.StatusOK, buildTriggerResponse(s.newExecRevealer(ctx), *tr))
 }
 
 func (s *Server) deleteTrigger(w http.ResponseWriter, r *http.Request, projectID, triggerID string) {
@@ -1198,7 +1480,7 @@ func (s *Server) getTriggerHistory(w http.ResponseWriter, r *http.Request, proje
 	}
 
 	writeJSON(w, http.StatusOK, ListTriggerFiresResponse{
-		Fires:      buildTriggerFireResponses(result.Items),
+		Fires:      s.buildTriggerFireResponses(ctx, result.Items),
 		NextCursor: result.NextCursor,
 		TotalCount: result.TotalCount,
 		ServerTime: time.Now().UTC(),

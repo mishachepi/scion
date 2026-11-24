@@ -17,7 +17,7 @@
 /**
  * Header Component
  *
- * Provides the top header bar with breadcrumb, user menu, and actions.
+ * Provides the top header bar with page title, user menu, and actions.
  *
  * Three-tier responsive layout:
  *
@@ -45,7 +45,12 @@ import type { Project, User } from '../../shared/types.js';
 import { isFeatureEnabled } from '../../utils/feature-flags.js';
 import { TouchPrimaryController } from '../../utils/input-modality.js';
 import { apiFetch } from '../../client/api.js';
-import { TERMINAL_SESSION_COUNT_EVENT } from '../../client/terminal-workspace-events.js';
+import {
+  TERMINAL_SESSION_COUNT_EVENT,
+  getTerminalWorkspaceSnapshot,
+  type TerminalSessionCountDetail,
+  type TerminalSessionSummary,
+} from '../../client/terminal-workspace-events.js';
 import { TRAY_COUNT_EVENT, type TrayCountDetail } from '../../client/tray-count-events.js';
 import {
   CHAT_UNREAD_COUNT_EVENT,
@@ -58,6 +63,13 @@ import {
   isGraphPaletteAvailable,
 } from '../../client/graph-palette-events.js';
 import { touchMenuItemStyles } from './touch-styles.js';
+import { getBranding, getBrandName } from '../../client/branding.js';
+import {
+  brandMarkStyles,
+  observeBranding,
+  renderBrandLogoImages,
+  renderCompactBrandMark,
+} from './brand-mark.js';
 import './notification-tray.js';
 import { isMacPlatform } from '../../utils/platform.js';
 import { hasOpenModalDescendant } from './open-modal.js';
@@ -122,6 +134,18 @@ const rememberedModePaths = {
   chat: '/chat',
 };
 
+type HeaderTerminalsMenuMod = typeof import('./header-terminals-menu.js');
+let cachedTerminalsMenuMod: HeaderTerminalsMenuMod | null = null;
+let terminalsMenuModPromise: Promise<HeaderTerminalsMenuMod> | null = null;
+
+/** Single-flight lazy loader for the wide Terminals dropdown menu helper. */
+export function preloadHeaderTerminalsMenu(): Promise<HeaderTerminalsMenuMod> {
+  return (terminalsMenuModPromise ??= import('./header-terminals-menu.js').then((m) => {
+    cachedTerminalsMenuMod = m;
+    return m;
+  }));
+}
+
 @customElement('scion-header')
 export class ScionHeader extends LitElement {
   /**
@@ -131,7 +155,7 @@ export class ScionHeader extends LitElement {
   user: User | null = null;
 
   /**
-   * Current page path for breadcrumb
+   * Current page path
    */
   @property({ type: String })
   currentPath = '/';
@@ -153,6 +177,26 @@ export class ScionHeader extends LitElement {
 
   @state()
   private terminalSessionCount = 0;
+
+  @state()
+  private terminalSessions: readonly TerminalSessionSummary[] = [];
+
+  @state()
+  private terminalFocusedAgentId: string | null = null;
+
+  @state()
+  private terminalsMenuMounted = false;
+
+  @state()
+  private narrowTerminalsMounted = false;
+
+  @state()
+  private terminalsMenuOpenScope: string | null = null;
+
+  @state()
+  private terminalsMenuMod: HeaderTerminalsMenuMod | null = cachedTerminalsMenuMod;
+
+  private unsubscribeTerminalsMenu: (() => void) | null = null;
 
   /** Whether a graph view on screen offers the "Jump to agent" palette. */
   @state()
@@ -176,8 +220,32 @@ export class ScionHeader extends LitElement {
   /** Whether the device's primary pointer is touch — hides keyboard-shortcut affordances on the palette button. */
   private touchPrimary = new TouchPrimaryController(this);
 
+  constructor() {
+    super();
+    observeBranding(this);
+  }
+
   static override styles = css`
     ${touchMenuItemStyles}
+    ${brandMarkStyles}
+
+    .header-brand-logo {
+      max-height: 24px;
+      max-width: 140px;
+      object-fit: contain;
+    }
+
+    .chat-brand-badge {
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: var(--scion-text-muted, #64748b);
+      padding: 0.125rem 0.5rem;
+      border-radius: var(--scion-radius-full, 9999px);
+      background: var(--scion-bg-subtle, #f1f5f9);
+      border: 1px solid var(--scion-border, #e2e8f0);
+      line-height: 1.4;
+      white-space: nowrap;
+    }
 
     /* ------------------------------------------------------------------ */
     /* Grid: three-tier responsive                                         */
@@ -228,7 +296,7 @@ export class ScionHeader extends LitElement {
       padding: 0.5rem;
       background: transparent;
       border: none;
-      border-radius: 0.375rem;
+      border-radius: calc(var(--scion-radius, 0.5rem) * 0.75);
       cursor: pointer;
       color: var(--scion-text, #1e293b);
     }
@@ -304,7 +372,7 @@ export class ScionHeader extends LitElement {
       gap: 0.25rem;
       padding: 0.25rem;
       border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: 0.5rem;
+      border-radius: var(--scion-radius, 0.5rem);
       background: var(--scion-bg-subtle, #f1f5f9);
     }
 
@@ -314,7 +382,7 @@ export class ScionHeader extends LitElement {
       gap: 0.375rem;
       padding: 0.5rem 0.75rem;
       border: none;
-      border-radius: 0.375rem;
+      border-radius: calc(var(--scion-radius, 0.5rem) * 0.75);
       background: transparent;
       color: var(--scion-text-muted, #64748b);
       cursor: pointer;
@@ -332,7 +400,7 @@ export class ScionHeader extends LitElement {
 
     .mode-switch button.active {
       background: var(--scion-primary, #3b82f6);
-      color: white;
+      color: var(--scion-primary-text, #ffffff);
     }
 
     .mode-switch button.active:hover {
@@ -346,6 +414,31 @@ export class ScionHeader extends LitElement {
     .mode-label {
       font-size: 0.875rem;
       font-weight: 500;
+    }
+
+    .terminals-split,
+    .terminals-split > sl-tooltip,
+    .terminals-dropdown {
+      display: inline-flex;
+      align-items: stretch;
+    }
+    .terminals-split > sl-tooltip > button {
+      border-radius: calc(var(--scion-radius, 0.5rem) * 0.75) 0 0
+        calc(var(--scion-radius, 0.5rem) * 0.75);
+      padding-right: 0.625rem;
+    }
+    .mode-switch button.terminals-menu-trigger {
+      padding: 0.5rem 0.4375rem;
+      border-radius: 0 calc(var(--scion-radius, 0.5rem) * 0.75)
+        calc(var(--scion-radius, 0.5rem) * 0.75) 0;
+      border-left: 1px solid var(--scion-border, #e2e8f0);
+      gap: 0;
+    }
+    .mode-switch button.terminals-menu-trigger.active {
+      border-left-color: color-mix(in srgb, var(--scion-primary-text, #ffffff) 28%, transparent);
+    }
+    .mode-switch button.terminals-menu-trigger sl-icon {
+      font-size: 0.75rem;
     }
 
     /* ------------------------------------------------------------------ */
@@ -367,7 +460,7 @@ export class ScionHeader extends LitElement {
       min-width: 16px;
       height: 16px;
       padding: 0 4px;
-      border-radius: 8px;
+      border-radius: var(--scion-radius-full, 9999px);
       background: var(--sl-color-danger-600, #dc2626);
       box-shadow: 0 0 0 1px var(--scion-surface, #ffffff);
       color: var(--sl-color-neutral-0, #fff);
@@ -410,7 +503,7 @@ export class ScionHeader extends LitElement {
       height: 2rem;
       padding: 0;
       border: none;
-      border-radius: 0.375rem;
+      border-radius: calc(var(--scion-radius, 0.5rem) * 0.75);
       background: transparent;
       color: var(--scion-text-muted, #64748b);
       cursor: pointer;
@@ -438,7 +531,9 @@ export class ScionHeader extends LitElement {
        (32px) desktop sizing above does not meet the minimum. Desktop keeps
        the compact sizing to match the other header icon buttons. */
     @media (hover: none) and (pointer: coarse) {
-      .palette-button {
+      .palette-button,
+      .mode-trigger,
+      .mode-switch button.terminals-menu-trigger {
         min-width: 44px;
         min-height: 44px;
       }
@@ -476,7 +571,7 @@ export class ScionHeader extends LitElement {
       align-items: center;
       gap: 0.5rem;
       padding: 0.5rem 1rem;
-      border-radius: 0.5rem;
+      border-radius: var(--scion-radius, 0.5rem);
       background: var(--scion-bg-subtle, #f1f5f9);
       color: var(--scion-text, #1e293b);
       text-decoration: none;
@@ -498,7 +593,7 @@ export class ScionHeader extends LitElement {
       align-items: center;
       gap: 0.5rem;
       padding: 0.5rem 1rem;
-      border-radius: 0.5rem;
+      border-radius: var(--scion-radius, 0.5rem);
       background: transparent;
       color: var(--scion-text-muted, #64748b);
       font-size: 0.875rem;
@@ -538,7 +633,7 @@ export class ScionHeader extends LitElement {
       width: 36px;
       height: 20px;
       background: var(--scion-border, #e2e8f0);
-      border-radius: 10px;
+      border-radius: var(--scion-radius-full, 9999px);
       cursor: pointer;
       transition: background 0.2s ease;
       border: none;
@@ -596,7 +691,7 @@ export class ScionHeader extends LitElement {
       gap: 0.375rem;
       padding: 0.375rem 0.625rem;
       border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: 0.375rem;
+      border-radius: calc(var(--scion-radius, 0.5rem) * 0.75);
       background: transparent;
       color: var(--scion-text, #1e293b);
       cursor: pointer;
@@ -636,7 +731,7 @@ export class ScionHeader extends LitElement {
       gap: 0.25rem;
       padding: 0.375rem 0.5rem;
       border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: 0.375rem;
+      border-radius: calc(var(--scion-radius, 0.5rem) * 0.75);
       background: transparent;
       color: var(--scion-text-muted, #64748b);
       cursor: pointer;
@@ -682,7 +777,7 @@ export class ScionHeader extends LitElement {
       width: auto;
       height: 16px;
       padding: 0 4px;
-      border-radius: 8px;
+      border-radius: var(--scion-radius-full, 9999px);
       background: var(--sl-color-danger-600, #dc2626);
       color: var(--sl-color-neutral-0, #fff);
       font-size: 10px;
@@ -701,9 +796,9 @@ export class ScionHeader extends LitElement {
       min-width: 18px;
       height: 18px;
       padding: 0 5px;
-      border-radius: 9px;
+      border-radius: var(--scion-radius-full, 9999px);
       background: var(--scion-primary, #3b82f6);
-      color: #fff;
+      color: var(--scion-primary-text, #ffffff);
       font-size: 0.6875rem;
       font-weight: 700;
       line-height: 1;
@@ -725,9 +820,9 @@ export class ScionHeader extends LitElement {
       align-items: center;
       gap: 0.5rem;
       padding: 0.5rem 1rem;
-      border-radius: 0.5rem;
+      border-radius: var(--scion-radius, 0.5rem);
       background: var(--scion-primary, #3b82f6);
-      color: white;
+      color: var(--scion-primary-text, #ffffff);
       text-decoration: none;
       font-size: 0.875rem;
       font-weight: 500;
@@ -829,19 +924,30 @@ export class ScionHeader extends LitElement {
             `
           : ''}
         ${this.isChatView()
-          ? html`
-              <div class="logo">
-                <div class="logo-icon">🌱</div>
-                <div class="logo-text">
-                  <h1>Scion Chat</h1>
+          ? (() => {
+              const b = getBranding();
+              const hasLogo = Boolean(b?.logoLight || b?.logoDark);
+              return html`
+                <div class="logo">
+                  ${hasLogo
+                    ? html`
+                        ${renderBrandLogoImages('header-brand-logo')}
+                        <span class="chat-brand-badge">Chat</span>
+                      `
+                    : html`
+                        <div class="logo-icon">${renderCompactBrandMark()}</div>
+                        <div class="logo-text">
+                          <h1>${getBrandName()} Chat</h1>
+                        </div>
+                      `}
                 </div>
-              </div>
-            `
+              `;
+            })()
           : html`<h1 class="page-title">${this.pageTitle}</h1>`}
       </div>
 
       <!-- Wide center column: segmented mode switch with labels (>1100px) -->
-      <div class="wide-center">${this.renderModeSwitch()}</div>
+      <div class="wide-center">${this.renderModeSwitch('.wide-center')}</div>
 
       <div class="header-right">
         ${this.renderPaletteButton()}
@@ -910,7 +1016,9 @@ export class ScionHeader extends LitElement {
 
         <!-- Compact layout (<=1100px): mode segments/dropdown + user dropdown -->
         <div class="compact-right">
-          <div class="compact-mode-segments">${this.renderModeSwitch()}</div>
+          <div class="compact-mode-segments">
+            ${this.renderModeSwitch('.compact-mode-segments')}
+          </div>
           <div class="compact-mode-dropdown">${this.renderModeDropdown()}</div>
           ${this.user
             ? this.renderUserDropdown()
@@ -995,10 +1103,11 @@ export class ScionHeader extends LitElement {
 
   /**
    * Inline segmented control for switching between Console / Chat /
-   * Terminals modes. Used in the wide center column (with labels) and in
-   * the compact tier (icon-only via CSS).
+   * Terminals modes. Used in the wide center column (with labels) and in the
+   * compact medium tier (icon-only via CSS), both with the Terminals chevron
+   * split-button.
    */
-  private renderModeSwitch(): TemplateResult {
+  private renderModeSwitch(scope: string): TemplateResult {
     const chatEnabled = isFeatureEnabled(NATIVE_CHAT_FLAG);
 
     const isChat = this.isChatView();
@@ -1013,6 +1122,7 @@ export class ScionHeader extends LitElement {
         <sl-tooltip content=${withHint('Console', dashboardHint)}>
           <button
             class=${!isChat && !isTerminal ? 'active' : ''}
+            data-mode="dashboard"
             @click=${(): void => {
               void this.handleModeSwitch('dashboard');
             }}
@@ -1044,21 +1154,109 @@ export class ScionHeader extends LitElement {
               </sl-tooltip>
             `
           : ''}
-        <sl-tooltip content=${withHint(terminalsLabel, terminalsHint)}>
-          <button
-            class=${isTerminal ? 'active' : ''}
-            @click=${(): void => {
-              void this.handleModeSwitch('terminals');
-            }}
-            aria-label=${terminalsLabel}
-            aria-keyshortcuts=${terminalsHint?.aria ?? nothing}
-          >
-            <sl-icon name="terminal"></sl-icon>
-            <span class="mode-label">Terminals</span>
-          </button>
-        </sl-tooltip>
+        <div class="terminals-split">
+          <sl-tooltip content=${withHint(terminalsLabel, terminalsHint)}>
+            <button
+              class=${isTerminal ? 'active' : ''}
+              data-mode="terminals"
+              @click=${(): void => {
+                void this.handleModeSwitch('terminals');
+              }}
+              aria-label=${terminalsLabel}
+              aria-keyshortcuts=${terminalsHint?.aria ?? nothing}
+            >
+              <sl-icon name="terminal"></sl-icon>
+              <span class="mode-label">Terminals</span>
+            </button>
+          </sl-tooltip>
+          ${this.renderTerminalsDropdown(isTerminal, scope)}
+        </div>
       </div>
     `;
+  }
+
+  private terminalsMenuCtx(): {
+    currentPath: string;
+    userId: string;
+    sessions: readonly TerminalSessionSummary[];
+    focusedAgentId: string | null;
+  } {
+    return {
+      currentPath: this.currentPath,
+      userId: this.user?.id ?? '',
+      sessions: this.terminalSessions,
+      focusedAgentId: this.terminalFocusedAgentId,
+    };
+  }
+
+  private renderTerminalsDropdown(isTerminal: boolean, scope: string): TemplateResult {
+    const mod = this.terminalsMenuMounted ? this.terminalsMenuMod : null;
+    if (mod) {
+      return mod.renderMountedTerminalsDropdown({
+        ...this.terminalsMenuCtx(),
+        isTerminal,
+        open: this.terminalsMenuOpenScope === scope,
+        root: this.shadowRoot,
+        setOpen: (open: boolean): void => {
+          if (open) this.terminalsMenuOpenScope = scope;
+          else if (this.terminalsMenuOpenScope === scope) this.terminalsMenuOpenScope = null;
+        },
+      });
+    }
+    return html`<button
+      type="button"
+      class="terminals-menu-trigger ${isTerminal ? 'active' : ''}"
+      title="Open terminals menu"
+      aria-label="Open terminals menu"
+      aria-haspopup="menu"
+      aria-expanded="false"
+      @click=${(): void => {
+        void this.openTerminalsMenu(scope, 'none');
+      }}
+      @keydown=${(e: KeyboardEvent): void => {
+        const k = e.key;
+        const focus =
+          k === 'Enter' || k === ' ' || k === 'ArrowDown' || k === 'Home'
+            ? 'first'
+            : k === 'ArrowUp' || k === 'End'
+              ? 'last'
+              : null;
+        if (!focus) return;
+        e.preventDefault();
+        void this.openTerminalsMenu(scope, focus);
+      }}
+    >
+      <sl-icon name="chevron-down" aria-hidden="true"></sl-icon>
+    </button>`;
+  }
+
+  private async ensureTerminalsMenuMod(): Promise<HeaderTerminalsMenuMod | null> {
+    const mod = this.terminalsMenuMod ?? (await preloadHeaderTerminalsMenu());
+    if (!this.isConnected) return null;
+    this.terminalsMenuMod = mod;
+    mod.ensureTerminalsMenuStyles(this.shadowRoot);
+    this.unsubscribeTerminalsMenu ??= mod.subscribeCurrentAgentChanges(
+      this.handleCurrentAgentChanged
+    );
+    return mod;
+  }
+
+  private async openTerminalsMenu(
+    scope: string,
+    focusTarget: 'none' | 'first' | 'last'
+  ): Promise<void> {
+    const mod = await this.ensureTerminalsMenuMod();
+    if (!mod) return;
+    this.terminalsMenuMounted = true;
+    this.terminalsMenuOpenScope = scope;
+    await this.updateComplete;
+    mod.syncTerminalsTriggerAria(this.shadowRoot);
+    mod.openMountedTerminalsDropdown(this.shadowRoot, scope, focusTarget);
+  }
+
+  private async openNarrowTerminals(): Promise<void> {
+    const mod = await this.ensureTerminalsMenuMod();
+    if (mod) this.narrowTerminalsMounted = true;
   }
 
   // =========================================================================
@@ -1076,7 +1274,11 @@ export class ScionHeader extends LitElement {
     const isTerminal = this.isTerminalView();
 
     return html`
-      <sl-dropdown>
+      <sl-dropdown
+        @sl-show=${(): void => {
+          void this.openNarrowTerminals();
+        }}
+      >
         <button
           slot="trigger"
           class="mode-trigger"
@@ -1124,6 +1326,9 @@ export class ScionHeader extends LitElement {
               : ''}
             ${this.renderMenuShortcutHint('terminals')}
           </sl-menu-item>
+          ${this.narrowTerminalsMounted && this.terminalsMenuMod
+            ? this.terminalsMenuMod.renderNarrowTerminalsSection(this.terminalsMenuCtx())
+            : nothing}
         </sl-menu>
       </sl-dropdown>
     `;
@@ -1171,6 +1376,8 @@ export class ScionHeader extends LitElement {
     const value = e.detail.item.value;
     if (value === 'dashboard' || value === 'chat' || value === 'terminals') {
       void this.handleModeSwitch(value);
+    } else {
+      this.terminalsMenuMod?.selectNarrowTerminalValue(value);
     }
   }
 
@@ -1456,10 +1663,19 @@ export class ScionHeader extends LitElement {
       root.setAttribute('data-theme', 'light');
       root.classList.remove('sl-theme-dark');
     }
+    const terminalSnap = getTerminalWorkspaceSnapshot();
+    this.terminalSessionCount = terminalSnap.count;
+    this.terminalSessions = terminalSnap.sessions;
+    this.terminalFocusedAgentId = terminalSnap.focusedAgentId;
     window.addEventListener(
       TERMINAL_SESSION_COUNT_EVENT,
       this.handleTerminalSessionCount as EventListener
     );
+    if (this.terminalsMenuMod && (this.terminalsMenuMounted || this.narrowTerminalsMounted)) {
+      this.unsubscribeTerminalsMenu ??= this.terminalsMenuMod.subscribeCurrentAgentChanges(
+        this.handleCurrentAgentChanged
+      );
+    }
     this.graphPaletteAvailable = isGraphPaletteAvailable();
     window.addEventListener(GRAPH_PALETTE_AVAILABILITY_EVENT, this.handleGraphPaletteAvailability);
     this.rememberModePath();
@@ -1482,6 +1698,8 @@ export class ScionHeader extends LitElement {
       TERMINAL_SESSION_COUNT_EVENT,
       this.handleTerminalSessionCount as EventListener
     );
+    this.unsubscribeTerminalsMenu?.();
+    this.unsubscribeTerminalsMenu = null;
     window.removeEventListener(
       GRAPH_PALETTE_AVAILABILITY_EVENT,
       this.handleGraphPaletteAvailability
@@ -1510,6 +1728,9 @@ export class ScionHeader extends LitElement {
 
   override updated(changedProperties: Map<string, unknown>): void {
     if (changedProperties.has('currentPath')) this.rememberModePath();
+    if (this.terminalsMenuMounted) {
+      queueMicrotask(() => this.terminalsMenuMod?.syncTerminalsTriggerAria(this.shadowRoot));
+    }
   }
 
   /**
@@ -1531,8 +1752,26 @@ export class ScionHeader extends LitElement {
   // Event handlers
   // =========================================================================
 
-  private readonly handleTerminalSessionCount = (event: CustomEvent<{ count?: number }>): void => {
-    this.terminalSessionCount = Math.max(0, event.detail?.count ?? 0);
+  private readonly handleTerminalSessionCount = (
+    event: CustomEvent<Partial<TerminalSessionCountDetail>>
+  ): void => {
+    const detail = event.detail;
+    const count = Math.max(0, detail?.count ?? 0);
+    this.terminalSessionCount = count;
+    if (detail && Array.isArray(detail.sessions)) {
+      this.terminalSessions = detail.sessions;
+    } else if (count === 0) {
+      this.terminalSessions = [];
+    }
+    if (detail && 'focusedAgentId' in detail) {
+      this.terminalFocusedAgentId = detail.focusedAgentId ?? null;
+    } else if (count === 0) {
+      this.terminalFocusedAgentId = null;
+    }
+  };
+
+  private readonly handleCurrentAgentChanged = (): void => {
+    this.requestUpdate();
   };
 
   private readonly handleGraphPaletteAvailability = (): void => {

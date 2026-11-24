@@ -174,6 +174,20 @@ const (
 	// project message policy rejects an outbound agent send (ptone/scion#8047).
 	// Details carry policy, policy_revision, class, and optional remediation.
 	ErrCodeMessagePolicyRejected = "message_policy_rejected"
+	// ErrCodeBrokerDeregistered is returned (HTTP 401) when a broker presents a
+	// broker ID that has no active registration on the Hub (e.g. after the
+	// broker was deregistered). Brokers treat this as a terminal response and
+	// stop retrying until re-registered.
+	ErrCodeBrokerDeregistered = "broker_deregistered"
+	// ErrCodeBrokerOnline is returned (HTTP 409) when a broker re-registration
+	// matches an existing broker that is currently online and force was not
+	// set. Details carry brokerId, brokerName, and status.
+	ErrCodeBrokerOnline = "broker_online"
+	// ErrCodeMissingScope is the hub's 403 code when an agent credential
+	// lacks one or more ceiling-optional scopes required for an operation.
+	// Details carry every missing scope under "scopes" (and the first under
+	// "scope").
+	ErrCodeMissingScope = "missing_scope"
 )
 
 // errorResponse matches the API error response format.
@@ -306,6 +320,16 @@ func IsForbiddenError(err error) bool {
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
 		return apiErr.IsForbidden()
+	}
+	return false
+}
+
+// IsBrokerDeregisteredError reports whether err is a Hub refusal stating that
+// the broker is deregistered and must stop retrying.
+func IsBrokerDeregisteredError(err error) bool {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Code == ErrCodeBrokerDeregistered
 	}
 	return false
 }

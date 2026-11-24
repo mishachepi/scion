@@ -73,7 +73,7 @@ To avoid re-running it, install it as a LaunchDaemon; see [Apple Container DNS](
 
 ### 4. Image registry
 
-Enter the container image registry that hosts the Scion harness images (for example `us-central1-docker.pkg.dev/my-project/scion`). On a release build (`vX.Y.Z`, `vX.Y.Z-preview.N`, `vX.Y.Z-rc.N`, or `nightly-YYYYMMDD`), bundled `scion-*` images such as `<registry>/scion-claude:<version>` are pulled at the binary's version tag in the next step when `image_tag` is unset and `hub.image_tag_version_default` is on (development builds, or `image_tag: latest`, pull `:latest`; see [Image tag](/scion/reference/settings-precedence/#image-tag-experimental)). If you are not ready, choose **Skip for now** and set it later.
+Enter the container image registry that hosts the Scion harness images. When no registry is configured yet, the wizard pre-fills `ghcr.io/homebrew-scion` for public release images; you can accept it or replace it with your own registry (for example `us-central1-docker.pkg.dev/my-project/scion` or `localhost/scion`). On a release build (`vX.Y.Z`, `vX.Y.Z-preview.N`, `vX.Y.Z-rc.N`, or `nightly-YYYYMMDD`), bundled `scion-*` images such as `<registry>/scion-claude:<version>` are pulled at the binary's version tag in the next step when `image_tag` is unset and `hub.image_tag_version_default` is on (development builds, or `image_tag: latest`, pull `:latest`; see [Image tag](/scion/reference/settings-precedence/#image-tag-experimental)). If you are not ready, choose **Skip for now** and set it later.
 
 ### 5. AI harnesses
 
@@ -110,6 +110,7 @@ The final screen confirms your workstation is configured. Click **Go to Dashboar
 ## After onboarding
 
 - Start your first agent from the CLI: follow the [Tutorial](/scion/getting-started/tutorial/).
+- Want a ready-to-use set of roles right away? Import the [scion-frontiers/agent-team](https://github.com/scion-frontiers/agent-team) templates and start a `coordinator` — see [Start with an agent team](/scion/getting-started/tutorial/#start-with-an-agent-team).
 - Manage the running server with `scion server status`, `scion server restart`, and `scion server stop`. See [Workstation Server Mode](/scion/workstation/workstation-server/) for the combo server, network bridges, and lifecycle details.
 - Learn your way around the [Web Dashboard](/scion/workstation/dashboard/).
 - Understand the pieces you just configured in [Core Concepts](/scion/concepts/).

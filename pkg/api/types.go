@@ -20,6 +20,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/firewallpolicy"
 )
 
 // ParseDuration parses a duration string, returning 0 for empty or invalid input.
@@ -703,9 +705,9 @@ type AgentInfo struct {
 	// Start always sets it, so empty means an older broker (ptone/scion#620).
 	HarnessConfigSource string `json:"harnessConfigSource,omitempty"`
 	HarnessAuth         string `json:"harnessAuth,omitempty"` // Resolved harness auth method (api-key, oauth-token, auth-file, vertex-ai)
-	// Harness and Model are what Start resolved: the harness name and the
-	// effective model (resolveEffectiveModel), set only by Start. The hub
-	// records them as the run's effective configuration (WP1 slice 3).
+	// Harness and Model are the resolved harness name and effective model
+	// (set by Start and populated in Hub list responses from the stored
+	// agent config).
 	Harness string `json:"harness,omitempty"`
 	Model   string `json:"model,omitempty"`
 	// ConfigResolved marks an AgentInfo returned by one of Start's return
@@ -751,6 +753,7 @@ type AgentInfo struct {
 
 	// Runtime configuration
 	Image      string            `json:"image,omitempty"`
+	Generation int               `json:"generation,omitempty"` // Reincarnation generation (starts at 1; 0 when unknown)
 	Detached   bool              `json:"detached,omitempty"`
 	Runtime    string            `json:"runtime,omitempty"`
 	Profile    string            `json:"profile,omitempty"`
@@ -1209,6 +1212,21 @@ func IsBrokerModeFromContext(ctx context.Context) bool {
 	return v
 }
 
+type hostedModeContextKey struct{}
+
+// ContextWithHostedMode returns a new context flagged as served by a hosted
+// Runtime Broker (StartOptions.HostedMode).
+func ContextWithHostedMode(ctx context.Context) context.Context {
+	return context.WithValue(ctx, hostedModeContextKey{}, true)
+}
+
+// IsHostedModeFromContext returns true if the context indicates a hosted
+// Runtime Broker.
+func IsHostedModeFromContext(ctx context.Context) bool {
+	v, _ := ctx.Value(hostedModeContextKey{}).(bool)
+	return v
+}
+
 type reprovisionContextKey struct{}
 
 // ContextWithReprovision returns a new context flagged as a reincarnation
@@ -1491,9 +1509,20 @@ func HubAgentDefaultsFromContext(ctx context.Context) *HubAgentDefaults {
 	return v
 }
 
+// PriorStatus records the agent's last known activity status from the Hub
+// before a start, resume, or restart dispatch (ptone/scion#8900). It is used
+// to build status-aware resume/restart notices without overwriting prompt.md
+// or setting SCION_INITIAL_TASK=1.
+type PriorStatus struct {
+	Activity string    `json:"activity,omitempty"`
+	Summary  string    `json:"summary,omitempty"`
+	At       time.Time `json:"at,omitempty"`
+}
+
 type StartOptions struct {
 	Name              string
 	Task              string
+	PriorStatus       *PriorStatus
 	Template          string
 	TemplateName      string // Human-friendly template slug (overrides Template for labels when hydration replaces Template with a cache path)
 	Profile           string
@@ -1506,6 +1535,11 @@ type StartOptions struct {
 	Env               map[string]string
 	ResolvedSecrets   []ResolvedSecret
 	BrokerMode        bool // When true, auth gathering skips local sources (broker env + filesystem)
+	// HostedMode is true when the Runtime Broker serving this start runs
+	// on a hosted server (not workstation mode). Member-written config is
+	// then checked by pkg/hostedguard. Unlike BrokerMode, which is true for
+	// every Hub dispatch, it is false on a workstation.
+	HostedMode bool
 	// RecordedOriginURL is the broker-recorded origin for the project (the hub
 	// project's repository), captured from GitClone before the linked-checkout
 	// route clears GitClone. It is threaded to worktree creation so the git-lfs
@@ -1523,14 +1557,21 @@ type StartOptions struct {
 	// Env["SCION_HUB_ENDPOINT"] — see pkg/agent/run.go and
 	// pkg/runtime/substrate_egress.go.
 	TrustedHubEndpoint string
-	Detached           *bool
-	Resume             bool
-	HarnessSessionID   string // exact harness session to resume; see AgentInfo.HarnessSessionID
-	NoAuth             bool
-	Branch             string
-	Workspace          string
-	GitClone           *GitCloneConfig // When set, skip workspace creation; sciontool clones inside container
-	SharedWorkspace    bool            // When true, workspace is a shared git clone (git-workspace hybrid); skip worktree, configure credential helper
+	// InitFirewall is the broker's operator-derived egress firewall policy
+	// (extra allowed domains and SSH opt-in). Set only by the broker from
+	// operator-controlled configuration, never from Env, templates,
+	// harness-configs, or secrets. Forwarded verbatim to RunConfig.InitFirewall
+	// and rendered only into the netns-setup container's argv when
+	// SCION_INIT_FIREWALL is effective.
+	InitFirewall     firewallpolicy.Policy
+	Detached         *bool
+	Resume           bool
+	HarnessSessionID string // exact harness session to resume; see AgentInfo.HarnessSessionID
+	NoAuth           bool
+	Branch           string
+	Workspace        string
+	GitClone         *GitCloneConfig // When set, skip workspace creation; sciontool clones inside container
+	SharedWorkspace  bool            // When true, workspace is a shared git clone (git-workspace hybrid); skip worktree, configure credential helper
 	// HubProjectID is the Hub-supplied project ID of a broker dispatch (set
 	// by the broker from the request, never from agent or workspace state).
 	// It locates a shared-workspace project's broker-side external agents

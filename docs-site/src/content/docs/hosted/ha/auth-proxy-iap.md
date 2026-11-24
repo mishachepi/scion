@@ -136,7 +136,7 @@ Provisioning in proxy mode works identically to OAuth — lazy, allow-list-gated
 - **`open`**: any verified email is allowed.
 - **`domain_restricted`**: email domain must be in `authorized_domains`.
 - **`invite_only`**: email must be pre-registered (via admin invite-code flow).
-- **Roles**: Emails in `admin_emails` are granted the `admin` role automatically. Other new users get `server.auth.default_user_role` (`member` or `viewer`). An admin granted by `admin_emails` who is removed from the list is demoted to the default role; admins promoted through the Admin UI/API are not. See [Hub roles](/scion/hosted/ha/permissions/#hub-roles) and [AdminEmails and UI-promoted admins](/scion/hosted/ha/permissions/#adminemails-and-ui-promoted-admins).
+- **Roles**: Emails in `admin_emails` are granted the `admin` role automatically. Other new users get `server.auth.default_user_role` (`member`, `viewer`, or — when the `hub.custom_default_user_role` experiment is enabled — an eligible custom system-scope role). An admin granted by `admin_emails` who is removed from the list is demoted to the default role; admins promoted through the Admin UI/API are not. See [Hub roles](/scion/hosted/ha/permissions/#hub-roles) and [AdminEmails and UI-promoted admins](/scion/hosted/ha/permissions/#adminemails-and-ui-promoted-admins).
 - If not permitted, the request returns **403**. Deleted users are rejected with **401** or **403**, and suspended users are rejected with **403** (even though upstream IAP may authenticate them).
 - **Database-Backed Token Refresh**: The token refresh endpoint reads the user's active role directly from the database rather than relying on stale session cache, ensuring UI-based role promotions take effect immediately.
 
@@ -163,6 +163,9 @@ server:
       provider: jwt
       jwt:
         header: X-Auth-Proxy-JWT     # default
+        identity_headers:            # optional: extra proxy user headers stripped from agent port proxy requests
+          - X-Auth-Proxy-Email
+          - X-Auth-Proxy-User-Id
         algorithm: RS256             # required; asymmetric algorithms only
         issuer: https://auth.example.com
         audience: scion-hub
@@ -493,7 +496,7 @@ If your Scion Hub runs on a private GCE VM (or any internal VPC service) and you
 Key features:
 
 - **IAP header preservation** — forwards `X-Goog-IAP-JWT-Assertion` and authenticated-user headers to the backend Hub.
-- **HTTP/2 cleartext (h2c) support** — uses `h2c` for multiplexed streaming over Cloud Run, which is critical for SSE connections (agent events, live dashboard updates).
+- **HTTP/2 cleartext (h2c) support** — accepts `h2c` in addition to HTTP/1.1. Leave `--use-http2` disabled on Cloud Run when proxying Hub WebSocket endpoints (`scion attach`, tunnels, Conduit), as Cloud Run's TLS frontend already negotiates HTTP/2 with browsers while keeping the container hop on HTTP/1.1 (see [HTTP/2, WebSockets, and Optional Dedicated Events Service](/scion/hosted/ha/setup-gcp/#3g-http2-websockets-and-optional-dedicated-events-service)).
 - **Health probe** — exposes `/proxy-healthz` for Cloud Run health checks without proxying to the backend.
 - **Direct VPC Egress ready** — deploy with Cloud Run Direct VPC Egress to reach internal compute instances on private RFC 1918 IPs.
 

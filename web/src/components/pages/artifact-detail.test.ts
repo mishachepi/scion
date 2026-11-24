@@ -401,24 +401,30 @@ describe('artifact page', () => {
   });
 
   it("links back to the artifact's own project, not the one in the URL", async () => {
-    // The back link is the shared scion-back-link in the header's back slot.
-    const backHref = (page: Element): string | null => {
-      const link = page.shadowRoot!.querySelector(
-        'scion-detail-header > scion-back-link[slot="back"]'
-      );
-      expect(link?.textContent?.trim()).toBe('Project');
-      return link!.getAttribute('href');
+    const projectCrumb = (page: Element) => {
+      const bc = page.shadowRoot!.querySelector<
+        HTMLElement & { crumbs: readonly { label: string; href?: string }[] }
+      >('scion-detail-header > scion-breadcrumb[slot="back"]');
+      return bc?.crumbs.map((c) => [c.label, c.href]) ?? [];
     };
     mockFetch(artifact('design.md', 'text/markdown'));
     const el = await mount(true); // URL project is p-1; scopeRef is p-1 too
-    expect(backHref(el)).toBe('/projects/p-1');
+    expect(projectCrumb(el)).toEqual([
+      ['Projects', '/projects'],
+      ['p-1', '/projects/p-1'],
+      ['Design', undefined],
+    ]);
     document.body.innerHTML = '';
 
     const meta = artifact('design.md', 'text/markdown');
     meta.artifact.scopeRef = 'home-project';
     mockFetch(meta);
     const el2 = await mount(true);
-    expect(backHref(el2)).toBe('/projects/home-project');
+    expect(projectCrumb(el2)).toEqual([
+      ['Projects', '/projects'],
+      ['home-project', '/projects/home-project'],
+      ['Design', undefined],
+    ]);
   });
 
   it('links back to the artifacts list when the home project was deleted (ptone/scion#4588)', async () => {
@@ -428,11 +434,13 @@ describe('artifact page', () => {
       { crossProjectSharing: true }
     );
     const el = await mount(true);
-    const link = el.shadowRoot!.querySelector(
-      'scion-detail-header > scion-back-link[slot="back"]'
-    )!;
-    expect(link.textContent!.trim()).toBe('Artifacts');
-    expect(link.getAttribute('href')).toBe('/artifacts');
+    const bc = el.shadowRoot!.querySelector<
+      HTMLElement & { crumbs: readonly { label: string; href?: string }[] }
+    >('scion-detail-header > scion-breadcrumb[slot="back"]')!;
+    expect(bc.crumbs.map((c) => [c.label, c.href])).toEqual([
+      ['Artifacts', '/artifacts'],
+      ['Design', undefined],
+    ]);
     const dialog = el.shadowRoot!.querySelector('scion-artifact-move-dialog') as HTMLElement & {
       homeDeleted: boolean;
     };
@@ -1079,7 +1087,9 @@ describe('artifact page', () => {
     const dl = el.shadowRoot!.querySelector(
       'sl-tab-panel[name="history"] sl-icon-button[name="download"]'
     )!;
-    expect(dl.getAttribute('href')).toBe(`/api/v1/artifacts/${ID}/versions/1/files/design.md`);
+    expect(dl.getAttribute('href')).toBe(
+      `/api/v1/artifacts/${ID}/versions/1/files/design.md?download=1`
+    );
     expect(dl.getAttribute('download')).toBe('design.md');
   });
 
@@ -2308,11 +2318,13 @@ describe('artifact page: refresh, origin and version labels', () => {
       write: () => new Response(null, { status: 204 }),
     });
     const el = await mountAs(`/projects/p-1/artifacts/${ID}?from=artifacts`);
-    const back = el.shadowRoot!.querySelector(
-      'scion-detail-header > scion-back-link[slot="back"]'
-    )!;
-    expect(text(back)).toBe('Artifacts');
-    expect(back.getAttribute('href')).toBe('/artifacts');
+    const bc = el.shadowRoot!.querySelector<
+      HTMLElement & { crumbs: readonly { label: string; href?: string }[] }
+    >('scion-detail-header > scion-breadcrumb[slot="back"]')!;
+    expect(bc.crumbs.map((c) => [c.label, c.href])).toEqual([
+      ['Artifacts', '/artifacts'],
+      ['Design', undefined],
+    ]);
 
     const nav = onNav();
     try {
@@ -2342,11 +2354,14 @@ describe('artifact page: refresh, origin and version labels', () => {
       write: () => new Response(null, { status: 204 }),
     });
     const el = await mountAs();
-    const back = el.shadowRoot!.querySelector(
-      'scion-detail-header > scion-back-link[slot="back"]'
-    )!;
-    expect(text(back)).toBe('Project');
-    expect(back.getAttribute('href')).toBe('/projects/p-1');
+    const bc = el.shadowRoot!.querySelector<
+      HTMLElement & { crumbs: readonly { label: string; href?: string }[] }
+    >('scion-detail-header > scion-breadcrumb[slot="back"]')!;
+    expect(bc.crumbs.map((c) => [c.label, c.href])).toEqual([
+      ['Projects', '/projects'],
+      ['p-1', '/projects/p-1'],
+      ['Design', undefined],
+    ]);
     const nav = onNav();
     try {
       headerButton(el, 'Delete…').click();
@@ -2543,5 +2558,179 @@ describe('artifact page: refresh, origin and version labels', () => {
     expect(text(el.shadowRoot!.querySelector('.meta .version-info'))).toBe(
       `Version: v1 · current · Publish · ${formatInstant(v.createdAt)}`
     );
+  });
+});
+
+describe('Files tab shared file viewer (ptone/scion#8957)', () => {
+  beforeAll(async () => {
+    const hd = (
+      window as unknown as { happyDOM?: { settings: { disableIframePageLoading: boolean } } }
+    ).happyDOM;
+    if (hd) hd.settings.disableIframePageLoading = true;
+    await import('./artifact-detail.js');
+  }, 30_000);
+
+  afterEach(() => {
+    document.body.innerHTML = '';
+    vi.unstubAllGlobals();
+    delete window.__SCION_FEATURES__;
+    resetPrincipalNames();
+  });
+
+  type PreviewEl = HTMLElement & {
+    target: {
+      kind: string;
+      id?: string;
+      seq?: number;
+      name?: string;
+      filePath?: string;
+    } | null;
+    updateComplete: Promise<boolean>;
+  };
+
+  function fileRows(el: ScionPageArtifactDetail): HTMLElement[] {
+    return Array.from(el.shadowRoot!.querySelectorAll('sl-tab-panel[name="files"] tbody tr'));
+  }
+
+  it('opens the shared file viewer when clicking the eye icon, keeping raw and download actions available', async () => {
+    const meta = artifact('docs/readme.md', 'text/markdown');
+    meta.version!.seq = 2;
+    meta.artifact.currentSeq = 2;
+    meta.version!.files = [
+      { path: 'docs/readme.md', size: 10, sha256: 'a', mediaType: 'text/markdown' },
+      { path: 'src/app.js', size: 20, sha256: 'b', mediaType: 'text/javascript' },
+      { path: 'extra/page.html', size: 30, sha256: 'c', mediaType: 'text/html' },
+      { path: 'report.pdf', size: 40, sha256: 'd', mediaType: 'application/pdf' },
+    ];
+    mockFetch(meta, '# Hello');
+    const el = await mount(true);
+
+    const rows = fileRows(el);
+    expect(rows).toHaveLength(4);
+
+    // 1. Markdown file: eye icon opens the shared viewer (no raw href/target),
+    //    while Open raw and Download remain available.
+    const mdEye = rows[0].querySelector('sl-icon-button[name="eye"]')!;
+    expect(mdEye.hasAttribute('disabled')).toBe(false);
+    expect(mdEye.hasAttribute('href')).toBe(false);
+    expect(mdEye.hasAttribute('target')).toBe(false);
+    const mdRaw = rows[0].querySelector('sl-icon-button[name="box-arrow-up-right"]')!;
+    expect(mdRaw.getAttribute('href')).toBe(
+      `/api/v1/artifacts/${ID}/versions/2/files/docs/readme.md`
+    );
+    expect(mdRaw.getAttribute('target')).toBe('_blank');
+    expect(mdRaw.getAttribute('rel')).toBe('noopener noreferrer');
+    const mdDownload = rows[0].querySelector('sl-icon-button[name="download"]')!;
+    expect(mdDownload.getAttribute('href')).toBe(
+      `/api/v1/artifacts/${ID}/versions/2/files/docs/readme.md?download=1`
+    );
+    expect(mdDownload.getAttribute('download')).toBe('readme.md');
+
+    // 2. JS code file: eye icon is enabled (code viewer), no Open raw (not inlineSafe),
+    //    Download stays available.
+    const jsEye = rows[1].querySelector('sl-icon-button[name="eye"]')!;
+    expect(jsEye.hasAttribute('disabled')).toBe(false);
+    expect(jsEye.hasAttribute('href')).toBe(false);
+    expect(rows[1].querySelector('sl-icon-button[name="box-arrow-up-right"]')).toBeNull();
+    expect(rows[1].querySelector('sl-icon-button[name="download"]')).not.toBeNull();
+
+    // 3. Non-entry HTML file and PDF: eye icon is disabled, Download stays available.
+    expect(rows[2].querySelector('sl-icon-button[name="eye"]')!.hasAttribute('disabled')).toBe(
+      true
+    );
+    expect(rows[2].querySelector('sl-icon-button[name="download"]')).not.toBeNull();
+    expect(rows[3].querySelector('sl-icon-button[name="eye"]')!.hasAttribute('disabled')).toBe(
+      true
+    );
+    expect(rows[3].querySelector('sl-icon-button[name="download"]')).not.toBeNull();
+
+    // Clicking the eye icon on src/app.js opens <scion-chat-file-preview> for that file and version.
+    const preview = el.shadowRoot!.querySelector('scion-chat-file-preview') as PreviewEl;
+    expect(preview).not.toBeNull();
+    expect(preview.target).toBeNull();
+
+    (jsEye as HTMLElement).click();
+    for (let i = 0; i < 10; i++) {
+      await new Promise((r) => setTimeout(r, 0));
+      await el.updateComplete;
+      await preview.updateComplete;
+    }
+
+    expect(preview.target).toEqual({
+      kind: 'artifact',
+      id: ID,
+      seq: 2,
+      name: 'app.js',
+      filePath: 'src/app.js',
+    });
+    const dialog = preview.shadowRoot!.querySelector('sl-dialog.file-preview-dialog');
+    expect(dialog).not.toBeNull();
+    expect(dialog!.getAttribute('label')).toBe('app.js');
+    expect(preview.shadowRoot!.querySelector('scion-code-editor')).not.toBeNull();
+
+    // Closing the preview clears the target.
+    preview.dispatchEvent(
+      new CustomEvent('chat-file-preview-close', { bubbles: true, composed: true })
+    );
+    await el.updateComplete;
+    expect(preview.target).toBeNull();
+  });
+
+  it('enables the eye icon for an HTML entry file and opens it through the minted view', async () => {
+    const meta = artifact('index.html', 'text/html');
+    const urls = mockFetch(meta);
+    const el = await mount(true);
+
+    const rows = fileRows(el);
+    expect(rows).toHaveLength(1);
+    const htmlEye = rows[0].querySelector('sl-icon-button[name="eye"]')!;
+    expect(htmlEye.hasAttribute('disabled')).toBe(false);
+    expect(htmlEye.hasAttribute('href')).toBe(false);
+
+    (htmlEye as HTMLElement).click();
+    const preview = el.shadowRoot!.querySelector('scion-chat-file-preview') as PreviewEl;
+    for (let i = 0; i < 10; i++) {
+      await new Promise((r) => setTimeout(r, 0));
+      await el.updateComplete;
+      await preview.updateComplete;
+    }
+
+    const frame = preview.shadowRoot!.querySelector('iframe');
+    expect(frame).not.toBeNull();
+    expect(frame!.getAttribute('sandbox')).toBe('allow-scripts');
+    expect(frame!.getAttribute('src')).toBe(VIEW_URL);
+    expect(urls.filter((u) => u === `POST /api/v1/artifacts/${ID}/versions/1/view`).length).toBe(2);
+  });
+
+  it('forces attachment download (?download=1 + download attribute) for single-file markdown and other types (ptone/scion#8958)', async () => {
+    for (const [path, mediaType, expectedName] of [
+      ['docs/design.md', 'text/markdown', 'design.md'],
+      ['img/shot.png', 'image/png', 'shot.png'],
+      ['dir/report.pdf', 'application/pdf', 'report.pdf'],
+    ] as const) {
+      mockFetch(artifact(path, mediaType), '# Hello');
+      const el = await mount(true);
+
+      const headerDownload = Array.from(
+        el.shadowRoot!.querySelectorAll('.header-actions sl-button')
+      ).find((b) => b.textContent!.includes('Download'))!;
+      expect(headerDownload).toBeDefined();
+      expect(headerDownload.getAttribute('href')).toBe(
+        `/api/v1/artifacts/${ID}/versions/1/files/${path}?download=1`
+      );
+      expect(headerDownload.getAttribute('download')).toBe(expectedName);
+      expect(headerDownload.hasAttribute('target')).toBe(false);
+
+      const historyDownload = el.shadowRoot!.querySelector(
+        'sl-tab-panel[name="history"] sl-icon-button[name="download"]'
+      )!;
+      expect(historyDownload.getAttribute('href')).toBe(
+        `/api/v1/artifacts/${ID}/versions/1/files/${path}?download=1`
+      );
+      expect(historyDownload.getAttribute('download')).toBe(expectedName);
+
+      document.body.innerHTML = '';
+      vi.unstubAllGlobals();
+    }
   });
 });

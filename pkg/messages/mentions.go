@@ -26,9 +26,7 @@ const MaxMentionRecipients = 10
 // case-insensitively while preserving first-seen order (earlier lists win
 // the earlier position — callers that want explicit/caller-supplied names to
 // take precedence over body-extracted ones should pass them first). Shared
-// by the hub's fan-out (union of explicit and body mentions) and the CLI
-// (union of --cc and body mentions), which independently needed the exact
-// same logic.
+// by the hub's fan-out (union of explicit and body mentions) and the CLI.
 func DedupMentionNames(lists ...[]string) []string {
 	seen := make(map[string]bool)
 	var out []string
@@ -65,9 +63,23 @@ type MentionResult struct {
 	Error  string `json:"error,omitempty"` // human-readable reason on failure
 
 	// AgentPhase is the mentioned agent's lifecycle phase at delivery time
-	// (e.g. "running", "stopped"), set when Status is "delivered". Additive
-	// field: old clients that decode this struct simply ignore it.
+	// (e.g. "running", "stopped", "suspended"). Additive field: old clients
+	// that decode this struct simply ignore it.
 	AgentPhase string `json:"agent_phase,omitempty"`
+
+	// SuspendReason records why the target agent was suspended (e.g. "user",
+	// "idle", "stalled") when AgentPhase is "suspended".
+	SuspendReason string `json:"suspend_reason,omitempty"`
+}
+
+// MentionOptions configures optional mention extraction and translation
+// behavior. The zero value preserves the default (experiment-off) behavior.
+type MentionOptions struct {
+	// CodeSpanMentions, when true, promotes a standalone single-mention inline
+	// code span (such as `@coordinator` or `@user@example.com`) on a prose line
+	// to a mention, excluding fenced code blocks, '>' blockquote lines,
+	// multi-token code spans, escaped backticks, and slash-containing tokens.
+	CodeSpanMentions bool
 }
 
 // ExtractMentions scans message text for @name tokens and returns a deduplicated
@@ -76,7 +88,10 @@ type MentionResult struct {
 // stripped from each token.
 //
 // An @ preceded by a non-whitespace character (e.g. inside an email address like
-// user@example.com) is not treated as a mention trigger.
+// user@example.com) is not treated as a mention trigger. Tokens starting with
+// "@." or "@/" (relative or absolute paths such as @./foo or @/etc/hosts) and
+// bare numeric or hexadecimal ID tokens (such as @10, @5aaf533a, or a 40-char
+// commit SHA) are ignored.
 func ExtractMentions(text string) []string {
 	var mentions []string
 	seen := make(map[string]bool)
@@ -84,8 +99,12 @@ func ExtractMentions(text string) []string {
 		if !strings.HasPrefix(word, "@") {
 			continue
 		}
-		name := trimMentionPunct(strings.TrimPrefix(word, "@"))
-		if name == "" {
+		raw := strings.TrimPrefix(word, "@")
+		if strings.HasPrefix(raw, ".") || strings.HasPrefix(raw, "/") {
+			continue
+		}
+		name := trimMentionPunct(raw)
+		if name == "" || strings.HasPrefix(name, ".") || strings.HasPrefix(name, "/") || isNumericOrHexToken(name) {
 			continue
 		}
 		lower := strings.ToLower(name)
@@ -95,6 +114,48 @@ func ExtractMentions(text string) []string {
 		}
 	}
 	return mentions
+}
+
+// minHexIDLength is the minimum length of a bare hexadecimal token (such as a
+// 7-char git short SHA, 8-char short ID like 5aaf533a, or 40-char commit SHA)
+// that is ignored as a non-mention literal. Shorter tokens containing letters
+// (such as "abe", "ada", "e2e", "be1", "cafe") remain valid mention candidates.
+const minHexIDLength = 7
+
+// isNumericOrHexToken reports whether s is a bare numeric token (all ASCII
+// digits, e.g. "10") or a bare hexadecimal ID/SHA token (at least
+// minHexIDLength ASCII hex digits, e.g. "5aaf533a" or a 40-character commit
+// SHA). Such tokens appear routinely in prose as counts, indices, or commit/ID
+// citations and should not be treated as @mention candidates.
+func isNumericOrHexToken(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	allDigits := true
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= '0' && c <= '9' {
+			continue
+		}
+		allDigits = false
+		isHexLetter := (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+		if !isHexLetter {
+			return false
+		}
+	}
+	return allDigits || len(s) >= minHexIDLength
+}
+
+// ExtractMentionsWithOptions is ExtractMentions with configurable options.
+// When opts.CodeSpanMentions is false, it is identical to ExtractMentions.
+// When opts.CodeSpanMentions is true, fenced code blocks, '>' blockquote lines,
+// and non-qualifying inline code spans are ignored while standalone
+// single-mention inline code spans on prose lines are promoted to mentions.
+func ExtractMentionsWithOptions(text string, opts MentionOptions) []string {
+	if !opts.CodeSpanMentions {
+		return ExtractMentions(text)
+	}
+	return ExtractMentions(stripNonProseSpansWithOptions(text, opts))
 }
 
 // ExtractProseMentions is like ExtractMentions but, for agent-authored
@@ -108,7 +169,13 @@ func ExtractMentions(text string) []string {
 // Human chat continues to use ExtractMentions unchanged — this function is
 // only used for agent-authored sends.
 func ExtractProseMentions(text string) []string {
-	return ExtractMentions(stripNonProseSpans(text))
+	return ExtractProseMentionsWithOptions(text, MentionOptions{})
+}
+
+// ExtractProseMentionsWithOptions is ExtractProseMentions with configurable
+// options (such as CodeSpanMentions).
+func ExtractProseMentionsWithOptions(text string, opts MentionOptions) []string {
+	return ExtractMentions(stripNonProseSpansWithOptions(text, opts))
 }
 
 // ExtractWrappedMentions scans message text for @name and @email mention
@@ -140,7 +207,7 @@ func ExtractWrappedMentions(text string) []string {
 			name = strings.TrimSuffix(name, "_")
 		}
 		name = trimMentionPunct(name)
-		if name != "" {
+		if name != "" && !isNumericOrHexToken(name) {
 			lower := strings.ToLower(name)
 			if !seen[lower] {
 				seen[lower] = true
@@ -160,7 +227,13 @@ func ExtractWrappedMentions(text string) []string {
 // fenced code blocks, inline backtick code spans, and '>' blockquote lines
 // are skipped via stripNonProseSpans.
 func ExtractProseWrappedMentions(text string) []string {
-	return ExtractWrappedMentions(stripNonProseSpans(text))
+	return ExtractProseWrappedMentionsWithOptions(text, MentionOptions{})
+}
+
+// ExtractProseWrappedMentionsWithOptions is ExtractProseWrappedMentions with
+// configurable options (such as CodeSpanMentions).
+func ExtractProseWrappedMentionsWithOptions(text string, opts MentionOptions) []string {
+	return ExtractWrappedMentions(stripNonProseSpansWithOptions(text, opts))
 }
 
 func isWrappedWordRune(r rune) bool {
@@ -216,6 +289,10 @@ func scanWrappedMentionEnd(runes []rune, start int) int {
 // newlines) so that ExtractMentions' word-boundary scanning is unaffected
 // outside the stripped spans.
 func stripNonProseSpans(text string) string {
+	return stripNonProseSpansWithOptions(text, MentionOptions{})
+}
+
+func stripNonProseSpansWithOptions(text string, opts MentionOptions) string {
 	lines := strings.Split(text, "\n")
 	prose := proseLines(lines)
 	for i, line := range lines {
@@ -223,7 +300,11 @@ func stripNonProseSpans(text string) string {
 			lines[i] = blankString(line)
 			continue
 		}
-		lines[i] = stripInlineBackticks(line)
+		if opts.CodeSpanMentions {
+			lines[i] = promoteOrStripInlineBackticks(line)
+		} else {
+			lines[i] = stripInlineBackticks(line)
+		}
 	}
 	return strings.Join(lines, "\n")
 }
@@ -383,16 +464,176 @@ func stripInlineBackticks(line string) string {
 	return string(runes)
 }
 
+// promoteOrStripInlineBackticks handles inline code spans on a prose line when
+// MentionOptions.CodeSpanMentions is enabled: spans that have valid non-word
+// boundaries and whose trimmed inner content is an exact single mention
+// (@<slug> or @<local>@<domain>) are replaced with " @<token> " so downstream
+// extractors see them in their original position; all other inline code spans
+// are blanked with spaces.
+func promoteOrStripInlineBackticks(line string) string {
+	runes := []rune(line)
+	spans := inlineCodeSpans(runes)
+	if len(spans) == 0 {
+		return line
+	}
+	var b strings.Builder
+	b.Grow(len(line) + 8)
+	pos := 0
+	for _, span := range spans {
+		b.WriteString(string(runes[pos:span[0]]))
+		if codeSpanHasValidBoundaries(runes, span[0], span[1]) {
+			if token, ok := parseCodeSpanMention(codeSpanInner(runes, span[0], span[1])); ok {
+				b.WriteByte(' ')
+				b.WriteByte('@')
+				b.WriteString(token)
+				b.WriteByte(' ')
+				pos = span[1]
+				continue
+			}
+		}
+		for k := span[0]; k < span[1]; k++ {
+			b.WriteByte(' ')
+		}
+		pos = span[1]
+	}
+	b.WriteString(string(runes[pos:]))
+	return b.String()
+}
+
+// codeSpanInner returns the raw content inside an inline code span [start, end)
+// after stripping its matching opening and closing backtick runs.
+func codeSpanInner(runes []rune, start, end int) string {
+	n := 0
+	for start+n < end && runes[start+n] == '`' {
+		n++
+	}
+	if start+n >= end-n {
+		return ""
+	}
+	return string(runes[start+n : end-n])
+}
+
+// parseCodeSpanMention checks whether inner (the text inside an inline code
+// span) is, after optional leading/trailing ASCII space or tab trimming, an
+// exact single mention token: either @<slug> or @<local>@<domain>, with no
+// embedded newlines, no '/', no trailing '.', and no extra code punctuation.
+func parseCodeSpanMention(inner string) (string, bool) {
+	if strings.ContainsAny(inner, "\r\n") {
+		return "", false
+	}
+	trimmed := strings.Trim(inner, " \t")
+	if len(trimmed) < 2 || trimmed[0] != '@' {
+		return "", false
+	}
+	token := trimmed[1:]
+	atIdx := strings.IndexByte(token, '@')
+	if atIdx >= 0 {
+		local := token[:atIdx]
+		domain := token[atIdx+1:]
+		if !isValidCodeSpanEmailLocal(local) || !isValidCodeSpanSlug(domain) {
+			return "", false
+		}
+		return token, true
+	}
+	if !isValidCodeSpanSlug(token) || isNumericOrHexToken(token) {
+		return "", false
+	}
+	return token, true
+}
+
+func isASCIIWordOrUnderscore(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
+}
+
+func isValidCodeSpanSlug(s string) bool {
+	if len(s) == 0 || !isASCIIWordOrUnderscore(s[0]) || s[len(s)-1] == '.' {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		b := s[i]
+		if !isASCIIWordOrUnderscore(b) && b != '-' && b != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+func isValidCodeSpanEmailLocal(s string) bool {
+	if len(s) == 0 || !isASCIIWordOrUnderscore(s[0]) {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		b := s[i]
+		if !isASCIIWordOrUnderscore(b) && b != '-' && b != '.' && b != '+' {
+			return false
+		}
+	}
+	return true
+}
+
+// codeSpanHasValidBoundaries reports whether an inline code span at [start, end)
+// is not immediately adjacent to a word character or '@' (e.g. foo`@bar` or
+// `@bar`foo). Markdown emphasis underscores (`_`@alice`_`) are permitted when
+// they are not preceded/followed by word characters.
+func codeSpanHasValidBoundaries(runes []rune, start, end int) bool {
+	if start > 0 {
+		prev := runes[start-1]
+		if prev == '_' {
+			j := start - 1
+			for j >= 0 && runes[j] == '_' {
+				j--
+			}
+			if j >= 0 && (isWrappedWordRune(runes[j]) || runes[j] == '@') {
+				return false
+			}
+		} else if isWrappedWordRune(prev) || prev == '@' {
+			return false
+		}
+	}
+	if end < len(runes) {
+		next := runes[end]
+		if next == '_' {
+			j := end
+			for j < len(runes) && runes[j] == '_' {
+				j++
+			}
+			if j < len(runes) && (isWrappedWordRune(runes[j]) || runes[j] == '@') {
+				return false
+			}
+		} else if isWrappedWordRune(next) || next == '@' {
+			return false
+		}
+	}
+	return true
+}
+
+// isEscapedAt reports whether runes[idx] is preceded by an odd number of
+// consecutive backslashes.
+func isEscapedAt(runes []rune, idx int) bool {
+	bs := 0
+	for j := idx - 1; j >= 0 && runes[j] == '\\'; j-- {
+		bs++
+	}
+	return bs%2 == 1
+}
+
 // inlineCodeSpans returns the [start, end) rune bounds of every
 // backtick-delimited code span in runes, using the CommonMark run-length
-// matching described on stripInlineBackticks. Shared by
-// stripInlineBackticks and RewriteAgentMentions so both skip exactly the
-// same spans.
+// matching described on stripInlineBackticks and honoring odd-backslash
+// escapes on opening backticks. Shared by stripInlineBackticks,
+// promoteOrStripInlineBackticks, ReplaceProseMention, and RewriteAgentMentions
+// so all skip/inspect the exact same spans.
 func inlineCodeSpans(runes []rune) [][2]int {
 	var spans [][2]int
 	i := 0
 	for i < len(runes) {
 		if runes[i] != '`' {
+			i++
+			continue
+		}
+		if isEscapedAt(runes, i) {
+			// An odd number of preceding backslashes escapes this backtick so
+			// it is literal text, not a code span opener (CommonMark §6.1).
 			i++
 			continue
 		}
@@ -459,47 +700,53 @@ func blankRunes(out []rune, start, end int) {
 // a message starting with @agent-name signals explicit address override
 // rather than additive mention routing.
 func IsLeadingMention(text, firstMentionName string) bool {
+	return IsLeadingMentionWithOptions(text, firstMentionName, MentionOptions{})
+}
+
+// IsLeadingMentionWithOptions is IsLeadingMention with configurable options.
+// When opts.CodeSpanMentions is true, a leading standalone single-mention
+// inline code span (such as "`@alice` please check" or "“@alice“, check")
+// on the first non-empty prose line also counts as a leading mention.
+func IsLeadingMentionWithOptions(text, firstMentionName string, opts MentionOptions) bool {
 	fields := strings.Fields(text)
-	if len(fields) == 0 || !strings.HasPrefix(fields[0], "@") {
+	if len(fields) == 0 {
 		return false
 	}
-	name := trimMentionPunct(strings.TrimPrefix(fields[0], "@"))
-	return name != "" && strings.EqualFold(name, firstMentionName)
-}
-
-// ParseCCFlag parses a --cc flag value into a slice of agent names.
-// Names are comma-separated and whitespace-trimmed.
-func ParseCCFlag(cc string) []string {
-	if cc == "" {
-		return nil
+	if strings.HasPrefix(fields[0], "@") {
+		raw := strings.TrimPrefix(fields[0], "@")
+		if strings.HasPrefix(raw, ".") || strings.HasPrefix(raw, "/") {
+			return false
+		}
+		name := trimMentionPunct(raw)
+		return name != "" && !isNumericOrHexToken(name) && strings.EqualFold(name, firstMentionName)
 	}
-	parts := strings.Split(cc, ",")
-	var names []string
-	seen := make(map[string]bool)
-	for _, p := range parts {
-		name := strings.TrimSpace(p)
-		if name == "" {
+	if !opts.CodeSpanMentions {
+		return false
+	}
+	// Check whether the first non-empty line is a prose line whose leading
+	// non-whitespace token is a qualifying single-mention inline code span.
+	lines := strings.Split(text, "\n")
+	prose := proseLines(lines)
+	for i, line := range lines {
+		trimmed := strings.TrimLeftFunc(line, unicode.IsSpace)
+		if trimmed == "" {
 			continue
 		}
-		lower := strings.ToLower(name)
-		if !seen[lower] {
-			seen[lower] = true
-			names = append(names, name)
+		if !prose[i] {
+			return false
 		}
+		runes := []rune(trimmed)
+		spans := inlineCodeSpans(runes)
+		if len(spans) == 0 || spans[0][0] != 0 {
+			return false
+		}
+		if !codeSpanHasValidBoundaries(runes, spans[0][0], spans[0][1]) {
+			return false
+		}
+		token, ok := parseCodeSpanMention(codeSpanInner(runes, spans[0][0], spans[0][1]))
+		return ok && strings.EqualFold(token, firstMentionName)
 	}
-	return names
-}
-
-// ParseCCFlags parses a repeatable --cc flag into a slice of agent names.
-// Each occurrence may itself be a comma-separated list, so the historical
-// comma-separated form and the repeatable form are both accepted and may be
-// mixed. Names are whitespace-trimmed and de-duplicated case-insensitively
-// across all occurrences, preserving first-seen order.
-func ParseCCFlags(cc []string) []string {
-	if len(cc) == 0 {
-		return nil
-	}
-	return ParseCCFlag(strings.Join(cc, ","))
+	return false
 }
 
 // AgentInfo holds the minimal agent data needed for mention resolution.
@@ -632,6 +879,14 @@ func trimPossessiveSuffix(name string) string {
 // across prose lines in text, matching case-insensitively while leaving fenced
 // code blocks, inline backtick code spans, and '>' blockquote lines unchanged.
 func ReplaceProseMention(text, oldName, newName string) string {
+	return ReplaceProseMentionWithOptions(text, oldName, newName, MentionOptions{})
+}
+
+// ReplaceProseMentionWithOptions is ReplaceProseMention with configurable
+// options. When opts.CodeSpanMentions is true, a standalone single-mention
+// inline code span matching @oldName (e.g. `@user@example.com`) has its inner
+// mention token replaced with @newName while preserving the code span wrapper.
+func ReplaceProseMentionWithOptions(text, oldName, newName string, opts MentionOptions) string {
 	if oldName == "" {
 		return text
 	}
@@ -646,16 +901,29 @@ func ReplaceProseMention(text, oldName, newName string) string {
 	prose := proseLines(lines)
 	for i, line := range lines {
 		if prose[i] && strings.Contains(strings.ToLower(line), needleLower) {
-			lines[i] = replaceProseMentionInLine(line, targetRunes, replacementRunes)
+			lines[i] = replaceProseMentionInLineWithOptions(line, targetRunes, replacementRunes, opts.CodeSpanMentions)
 		}
 	}
 	return strings.Join(lines, "\n")
 }
 
-func replaceProseMentionInLine(line string, targetLower, replacement []rune) string {
+func replaceProseMentionInLineWithOptions(line string, targetLower, replacement []rune, codeSpanMentions bool) string {
 	runes := []rune(line)
+	spans := inlineCodeSpans(runes)
 	inCode := make([]bool, len(runes))
-	for _, span := range inlineCodeSpans(runes) {
+	// Map span start -> replacement runes for qualifying code-span mentions.
+	var spanRewrites map[int][2]int
+	targetStr := string(targetLower)
+	for _, span := range spans {
+		if codeSpanMentions && codeSpanHasValidBoundaries(runes, span[0], span[1]) {
+			if token, ok := parseCodeSpanMention(codeSpanInner(runes, span[0], span[1])); ok && strings.EqualFold(token, targetStr) {
+				if spanRewrites == nil {
+					spanRewrites = make(map[int][2]int)
+				}
+				spanRewrites[span[0]] = span
+				continue
+			}
+		}
 		for k := span[0]; k < span[1]; k++ {
 			inCode[k] = true
 		}
@@ -663,6 +931,29 @@ func replaceProseMentionInLine(line string, targetLower, replacement []rune) str
 
 	out := make([]rune, 0, len(runes))
 	for i := 0; i < len(runes); {
+		if span, ok := spanRewrites[i]; ok {
+			// Preserve backticks and any surrounding whitespace inside the span,
+			// replacing only the @oldName token with @newName.
+			n := 0
+			for span[0]+n < span[1] && runes[span[0]+n] == '`' {
+				n++
+			}
+			innerStart := span[0] + n
+			innerEnd := span[1] - n
+			tokStart := innerStart
+			for tokStart < innerEnd && (runes[tokStart] == ' ' || runes[tokStart] == '\t') {
+				tokStart++
+			}
+			tokEnd := innerEnd
+			for tokEnd > tokStart && (runes[tokEnd-1] == ' ' || runes[tokEnd-1] == '\t') {
+				tokEnd--
+			}
+			out = append(out, runes[span[0]:tokStart]...)
+			out = append(out, replacement...)
+			out = append(out, runes[tokEnd:span[1]]...)
+			i = span[1]
+			continue
+		}
 		if runes[i] != '@' || inCode[i] {
 			out = append(out, runes[i])
 			i++

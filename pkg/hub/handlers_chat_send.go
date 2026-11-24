@@ -766,6 +766,22 @@ func chatSendValidationEnvelope(msg *messages.StructuredMessage, refs []Attachme
 	return &v
 }
 
+// validationEnvelopeWithAttachmentIDs returns the message that an agent
+// message or outbound send passes to messaging.ValidateLegacyMessage.
+// Uploaded attachment IDs are resolved and authorized after envelope
+// validation and sender/routing checks, so an attachment-id-only send (empty
+// body, no inline attachment paths, ptone/scion#6154) is validated on a
+// shallow copy that lists its attachment ids in place of msg.Attachments.
+// msg itself is never changed.
+func validationEnvelopeWithAttachmentIDs(msg *messages.StructuredMessage, attachmentIDs []string) *messages.StructuredMessage {
+	if msg == nil || msg.Msg != "" || len(msg.Attachments) > 0 || len(attachmentIDs) == 0 {
+		return msg
+	}
+	v := *msg
+	v.Attachments = append([]string(nil), attachmentIDs...)
+	return &v
+}
+
 // sendChatMessage is the single chat v2 send path: conversation access
 // check, validation, routing, persistence, publish and dispatch, for a
 // message sent by user to the conversation key. It is used by the HTTP
@@ -912,14 +928,15 @@ func (s *Server) sendChatMessage(ctx context.Context, user UserIdentity, key str
 	// because of a planning error is not evidence the default agent is
 	// unreachable, so that case must keep the pre-existing human-to-human
 	// fallthrough instead of mislabelling the send "Agent unreachable".
+	mentionOpts := s.mentionOptions()
 	var planErr error
 	var humanMentionNames []string
 	if projectID != "" {
-		plan, planErr = resolveRoutingAgents(ctx, s.store, projectID, content, defaultAgent)
+		plan, planErr = resolveRoutingAgentsWithOptions(ctx, s.store, projectID, content, defaultAgent, mentionOpts)
 		if planErr != nil {
 			routingLookupFailed = true
 			slog.Error("agent routing resolution failed", "error", planErr)
-			humanMentionNames = messages.ExtractProseWrappedMentions(content)
+			humanMentionNames = messages.ExtractProseWrappedMentionsWithOptions(content, mentionOpts)
 			// Fall through: plan.Agents will be empty, triggering human-to-human.
 		} else {
 			humanMentionNames = plan.HumanMentionNames
@@ -927,8 +944,8 @@ func (s *Server) sendChatMessage(ctx context.Context, user UserIdentity, key str
 	} else if defaultAgent != nil {
 		// No project context but DM default resolved: single-recipient plan.
 		plan.Agents = []*store.Agent{defaultAgent}
-		plan.MentionNames = messages.ExtractMentions(content)
-		humanMentionNames = messages.ExtractProseWrappedMentions(content)
+		plan.MentionNames = messages.ExtractMentionsWithOptions(content, mentionOpts)
+		humanMentionNames = messages.ExtractProseWrappedMentionsWithOptions(content, mentionOpts)
 	}
 
 	now := time.Now().UTC()
@@ -962,7 +979,7 @@ func (s *Server) sendChatMessage(ctx context.Context, user UserIdentity, key str
 			&unreachableAgentOverride{
 				AgentSlug: unresolvedDefaultAgent.Slug,
 				AgentID:   unresolvedDefaultAgent.ID,
-				Reason:    agentGoneReason,
+				Reason:    agentDeletedReason,
 				Code:      dispatchFailureCodeAgentUnreachable,
 			})
 	}

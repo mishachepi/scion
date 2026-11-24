@@ -216,6 +216,7 @@ type CreateBrokerRegistrationRequest struct {
 	BrokerID     string            `json:"brokerId,omitempty"` // Optional stable broker UUID supplied by the client
 	Name         string            `json:"name"`
 	AutoProvide  bool              `json:"autoProvide,omitempty"`
+	AdminManaged bool              `json:"adminManaged,omitempty"`
 	Capabilities []string          `json:"capabilities,omitempty"`
 	Labels       map[string]string `json:"labels,omitempty"`
 
@@ -244,6 +245,14 @@ type CreateBrokerRegistrationRequest struct {
 	// its creator or a super-admin presenting an interactive session or dev
 	// credential.
 	PreserveSettings bool `json:"preserveSettings,omitempty"`
+
+	// Force allows re-registering a broker that is currently online,
+	// replacing its credentials (which disconnects the running broker).
+	// When false and the matched broker is online, registration is refused
+	// with 409 Conflict (broker_online). Not required for PreserveSettings
+	// join-token re-mints, which are explicit named operations that do not
+	// disconnect the broker until the token is redeemed.
+	Force bool `json:"force,omitempty"`
 }
 
 // Join token lifetime bounds for CreateBrokerRegistrationRequest.JoinTokenTTLSeconds.
@@ -451,6 +460,50 @@ var ErrBrokerRegistrationAuthorizationStale = errors.New("broker registration au
 // accepted range.
 var ErrJoinTokenTTLOutOfRange = fmt.Errorf("joinTokenTtlSeconds must be between %d and %d", MinJoinTokenTTLSeconds, MaxJoinTokenTTLSeconds)
 
+// ErrBrokerOnline is returned when a broker re-registration matches an existing
+// broker that is currently online and CreateBrokerRegistrationRequest.Force is
+// false.
+var ErrBrokerOnline = errors.New("matched broker is currently online")
+
+// BrokerOnlineError wraps ErrBrokerOnline with the matched broker's identity
+// and status so callers can report which online broker would be replaced.
+type BrokerOnlineError struct {
+	BrokerID   string
+	BrokerName string
+	Status     string
+}
+
+func (e *BrokerOnlineError) Error() string {
+	return fmt.Sprintf("broker %q (ID: %s) is currently online; re-registering will replace its credentials and disconnect it. Pass force=true (CLI: --force) to proceed, or use a different broker name",
+		e.BrokerName, e.BrokerID)
+}
+
+func (e *BrokerOnlineError) Unwrap() error {
+	return ErrBrokerOnline
+}
+
+// brokerOnlineHeartbeatWindow matches the stale-broker reaper threshold
+// (reaper.go): a broker marked online whose last heartbeat is older than this
+// window is treated as stale rather than actively online.
+const brokerOnlineHeartbeatWindow = 5 * time.Minute
+
+// isBrokerRecordOnline reports whether a stored broker record indicates the
+// broker is currently online based on its affinity/heartbeat freshness and
+// stored status.
+func isBrokerRecordOnline(b *store.RuntimeBroker, now time.Time) bool {
+	if b == nil {
+		return false
+	}
+	if b.ConnectedHubID != nil && *b.ConnectedHubID != "" &&
+		!b.LastHeartbeat.IsZero() && now.Sub(b.LastHeartbeat) < defaultAffinityFreshness {
+		return true
+	}
+	if b.Status == store.BrokerStatusOnline {
+		return b.LastHeartbeat.IsZero() || now.Sub(b.LastHeartbeat) < brokerOnlineHeartbeatWindow
+	}
+	return false
+}
+
 // CreateBrokerRegistration creates a new broker with a join token.
 // Requires admin authentication.
 //
@@ -582,6 +635,18 @@ func (s *BrokerAuthService) createBrokerRegistration(ctx context.Context, req Cr
 	if existingBroker.IsFlat() {
 		return nil, runtimeTargetChangedRefusal(existingBroker.ID, existingBroker.RuntimeTarget.ID, "")
 	}
+	// Service-layer backstop for the handler's online-broker guard
+	// (isBrokerOnlineForReregister), catching TOCTOU races and direct service
+	// callers. PreserveSettings re-mints ('scion hub brokers join-token create')
+	// are exempt because they are explicit, named, owner-only token mints that
+	// do not disconnect the broker until the token is redeemed.
+	if existingBroker != nil && !req.PreserveSettings && !req.Force && isBrokerRecordOnline(existingBroker, time.Now()) {
+		return nil, &BrokerOnlineError{
+			BrokerID:   existingBroker.ID,
+			BrokerName: existingBroker.Name,
+			Status:     existingBroker.Status,
+		}
+	}
 	if existingBroker == nil {
 		if err := legacyRegistrationNameConflict(ctx, s.store, req.Name, slugify(req.Name), req.BrokerID); err != nil {
 			return nil, err
@@ -591,10 +656,17 @@ func (s *BrokerAuthService) createBrokerRegistration(ctx context.Context, req Cr
 	var kept []KeptSetting
 	var gcp registrationGCPHostResult
 	if existingBroker != nil && req.PreserveSettings {
-		// Reuse existing broker and leave its record as it is: only a new
-		// join token is issued below.
+		// Reuse existing broker and leave its metadata as it is, except when
+		// an authorized adminManaged stamp upgrades an existing row (e.g.
+		// 'scion hub brokers join-token create --admin-managed', only while
+		// broker_policy.admin_managed_only is off).
 		brokerID = existingBroker.ID
 		reregistered = true
+		if req.AdminManaged {
+			if _, err := s.store.SetRuntimeBrokerAdminManaged(ctx, brokerID, true); err != nil {
+				return nil, fmt.Errorf("failed to update existing broker: %w", err)
+			}
+		}
 	} else if existingBroker != nil {
 		// Reuse existing broker - update its metadata. Labels are added
 		// when the key is absent; the GCP host pair is filled below only
@@ -616,6 +688,11 @@ func (s *BrokerAuthService) createBrokerRegistration(ctx context.Context, req Cr
 		if err := s.store.UpdateRuntimeBroker(ctx, existingBroker); err != nil {
 			return nil, fmt.Errorf("failed to update existing broker: %w", err)
 		}
+		if req.AdminManaged {
+			if _, err := s.store.SetRuntimeBrokerAdminManaged(ctx, brokerID, true); err != nil {
+				return nil, fmt.Errorf("failed to update existing broker: %w", err)
+			}
+		}
 		if gcp, err = fillRegistrationGCPHost(ctx, s.store, brokerID, req.GCPHostServiceAccountEmail, req.GCPHostProjectID, hostSA); err != nil {
 			return nil, err
 		}
@@ -635,6 +712,7 @@ func (s *BrokerAuthService) createBrokerRegistration(ctx context.Context, req Cr
 			Slug:                       slugify(req.Name),
 			Status:                     store.BrokerStatusOffline,
 			AutoProvide:                req.AutoProvide,
+			AdminManaged:               req.AdminManaged,
 			Labels:                     labels,
 			GCPHostServiceAccountEmail: req.GCPHostServiceAccountEmail,
 			GCPHostProjectID:           req.GCPHostProjectID,
@@ -1676,7 +1754,9 @@ func writeBrokerAuthError(w http.ResponseWriter, message string) {
 }
 
 // writeBrokerAuthFailure answers a failed broker signature check: 413 for a
-// body over apiclient.MaxSignedRequestBodyBytes, otherwise the 401 of
+// body over apiclient.MaxSignedRequestBodyBytes, 401 broker_deregistered for
+// an unknown/deregistered broker (so the broker treats it as terminal and
+// stops retrying), otherwise the 401 broker_auth_failed of
 // writeBrokerAuthError.
 // The HTTP error code "payload_too_large" follows the hub's existing 413
 // responses; the audit failure code for the same refusal is "malformed"
@@ -1684,6 +1764,10 @@ func writeBrokerAuthError(w http.ResponseWriter, message string) {
 func writeBrokerAuthFailure(w http.ResponseWriter, err error) {
 	if errors.Is(err, errBrokerAuthBodyTooLarge) {
 		writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", err.Error(), nil)
+		return
+	}
+	if errors.Is(err, errBrokerAuthUnknownBroker) {
+		writeError(w, http.StatusUnauthorized, ErrCodeBrokerDeregistered, err.Error(), nil)
 		return
 	}
 	writeBrokerAuthError(w, err.Error())

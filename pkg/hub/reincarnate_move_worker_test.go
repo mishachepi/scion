@@ -421,6 +421,92 @@ func TestLinkMoveTargetProvider_SelfMoveNeverLinks(t *testing.T) {
 	assert.Equal(t, "agent-move", p.LinkedBy)
 }
 
+func TestLinkMoveTargetProvider_BrokerPolicyRefusesUnmanaged(t *testing.T) {
+	t.Run("unmanaged target refused under policy", func(t *testing.T) {
+		f := setupMoveFixture(t, false, func(dst *store.RuntimeBroker) {
+			dst.CreatedBy = "move-user-owner"
+			dst.AdminManaged = false
+			dst.AutoProvide = false
+		})
+		ctx := context.Background()
+		setAttachBrokerPolicyState(t, f.srv, f.s, true, true)
+		logs := captureBrokerPolicyWarnLogs(t)
+
+		mv := &reincarnationMove{SourceBrokerID: f.src.ID, TargetBrokerID: f.dst.ID, ProjectID: f.project.ID}
+		err := f.srv.linkMoveTargetProvider(ctx, mv)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), brokerPolicyOpMove+" refused")
+		assert.Contains(t, err.Error(), brokerPolicySettingKey)
+		assert.Contains(t, err.Error(), f.dst.Name)
+		_, pErr := f.s.GetProjectProvider(ctx, f.project.ID, f.dst.ID)
+		assert.ErrorIs(t, pErr, store.ErrNotFound, "no provider row may be created when policy refuses")
+		assert.Contains(t, logs.String(), "reason="+brokerPolicyDenialReason)
+		assert.Contains(t, logs.String(), "action="+brokerPolicyOpMove)
+	})
+
+	t.Run("managed embedded and auto-provide targets allowed under policy", func(t *testing.T) {
+		for _, tc := range []struct {
+			name  string
+			setup func(b *store.RuntimeBroker)
+		}{
+			{"admin_managed", func(b *store.RuntimeBroker) {
+				b.CreatedBy = "move-user-owner"
+				b.AdminManaged = true
+				b.AutoProvide = false
+			}},
+			{"embedded", func(b *store.RuntimeBroker) {
+				b.CreatedBy = ""
+				b.AdminManaged = false
+				b.AutoProvide = false
+			}},
+			{"auto_provide", func(b *store.RuntimeBroker) {
+				b.CreatedBy = "move-user-owner"
+				b.AdminManaged = false
+				b.AutoProvide = true
+			}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				f := setupMoveFixture(t, false, tc.setup)
+				ctx := context.Background()
+				setAttachBrokerPolicyState(t, f.srv, f.s, true, true)
+
+				mv := &reincarnationMove{SourceBrokerID: f.src.ID, TargetBrokerID: f.dst.ID, ProjectID: f.project.ID}
+				require.NoError(t, f.srv.linkMoveTargetProvider(ctx, mv))
+				p, err := f.s.GetProjectProvider(ctx, f.project.ID, f.dst.ID)
+				require.NoError(t, err)
+				assert.Equal(t, "agent-move", p.LinkedBy)
+			})
+		}
+	})
+
+	t.Run("policy off or experiment off allows unmanaged target", func(t *testing.T) {
+		for _, tc := range []struct {
+			name     string
+			expOn    bool
+			policyOn bool
+		}{
+			{"experiment on policy off", true, false},
+			{"experiment off policy on", false, true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				f := setupMoveFixture(t, false, func(dst *store.RuntimeBroker) {
+					dst.CreatedBy = "move-user-owner"
+					dst.AdminManaged = false
+					dst.AutoProvide = false
+				})
+				ctx := context.Background()
+				setAttachBrokerPolicyState(t, f.srv, f.s, tc.expOn, tc.policyOn)
+
+				mv := &reincarnationMove{SourceBrokerID: f.src.ID, TargetBrokerID: f.dst.ID, ProjectID: f.project.ID}
+				require.NoError(t, f.srv.linkMoveTargetProvider(ctx, mv))
+				p, err := f.s.GetProjectProvider(ctx, f.project.ID, f.dst.ID)
+				require.NoError(t, err)
+				assert.Equal(t, "agent-move", p.LinkedBy)
+			})
+		}
+	})
+}
+
 // The worker re-checks eligibility before its first side effect: when the
 // facts changed after the request was accepted (here the target stopped
 // advertising AgentMove), the move fails from pending without stopping or
@@ -963,19 +1049,19 @@ func TestReincarnateMove_SessionUserReRecordsEdge(t *testing.T) {
 	assertEdgeReRecordedTo(t, f, user, old)
 }
 
-// A rolled-back move that changed the role keeps the authority re-recorded
-// at the claim: the edge stays the requesting user's (the re-record is not
-// part of the rollback).
-func TestReincarnateMove_SessionUserRollbackKeepsUserEdge(t *testing.T) {
+// A rolled-back move that changed the role restores the agent's prior
+// delegation edge atomically with the reverted configuration
+// (ptone/scion#3502).
+func TestReincarnateMove_SessionUserRollbackRestoresPriorEdge(t *testing.T) {
 	f := setupMoveFixture(t, true, func(dst *store.RuntimeBroker) { dst.AutoProvide = true })
 	prepareMoveWorkerFixture(t, f)
 	f.disp.moveProvisionErr = errors.New("broker returned 409")
 
-	user, old, r := moveBySessionUser(t, f, AgentRoleReadOnly)
+	_, old, r := moveBySessionUser(t, f, AgentRoleReadOnly)
 	a, err := f.s.GetAgent(context.Background(), f.agent.ID)
 	require.NoError(t, err)
 	assertRolledBackToSource(t, f, r, a)
-	assertEdgeReRecordedTo(t, f, user, old)
+	assertEdgeRestoredToPrior(t, f.s, f.agent.ID, r.ID, old, store.EdgeDeactivationReincarnateFailed)
 }
 
 // A move by another principal that keeps the role keeps the agent's edge,

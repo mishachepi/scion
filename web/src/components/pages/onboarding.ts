@@ -25,6 +25,8 @@ import {
 } from '../shared/test-hub-banner.js';
 
 import { apiFetch, extractApiError } from '../../client/api.js';
+import { getBrandName } from '../../client/branding.js';
+import { observeBranding } from '../shared/brand-mark.js';
 import { dispatchMembershipChanged } from '../../utils/membership-events.js';
 import { loadPage } from '../../client/navigation.js';
 import type { HarnessConfig } from '../../shared/types.js';
@@ -54,6 +56,8 @@ interface OnboardingStatus {
   imageRegistrySource?: string;
   /** The value the wizard may pre-fill and save; never a node env. */
   imageRegistrySaveable?: string;
+  /** Effective hub-scope image tag (e.g. release version), or omitted for :latest. */
+  imageTag?: string;
   gitVersion?: string;
   gitVersionOK?: boolean;
   gcloudADCAvailable?: boolean;
@@ -86,6 +90,18 @@ export function registryPrefill(
     input: saveable || DEFAULT_REGISTRY_SUGGESTION,
     fromNodeEnv: status?.imageRegistrySource === 'node_env',
   };
+}
+
+/**
+ * Formats the example image reference shown in the registry step preview.
+ * Uses the hub's effective image tag (e.g. a release version like
+ * `v0.4.0-preview.3`) when reported, falling back to `latest` for dev
+ * builds or hubs that do not report `imageTag`.
+ */
+export function registryPreviewImage(registryInput: string, imageTag?: string): string {
+  const registry = registryInput.trim() || 'your-registry';
+  const tag = imageTag?.trim() || 'latest';
+  return `${registry}/scion-claude:${tag}`;
 }
 
 /** One vendored skill pin of the welcome project manifest. */
@@ -194,6 +210,7 @@ export class ScionPageOnboarding extends LitElement {
   // Step 3: Registry
   @state() private imageRegistry = '';
   @state() private registryInput = '';
+  @state() private imageTag = '';
   /** The server's SCION_IMAGE_REGISTRY sets the registry; no save needed. */
   @state() private registryFromNodeEnv = false;
   @state() private registrySaving = false;
@@ -243,6 +260,11 @@ export class ScionPageOnboarding extends LitElement {
 
   /** The test-hub banner's status (shared/test-hub-banner.ts). */
   private _testHubBanner = new TestHubBannerController(this, { standalone: true });
+
+  constructor() {
+    super();
+    observeBranding(this);
+  }
 
   static override styles = css`
     ${testHubBannerStyles}
@@ -664,6 +686,7 @@ export class ScionPageOnboarding extends LitElement {
       this.imageRegistry = prefill.effective;
       this.registryInput = prefill.input;
       this.registryFromNodeEnv = prefill.fromNodeEnv;
+      this.imageTag = status?.imageTag ?? '';
       if (status?.gitVersion !== undefined) this.gitVersion = status.gitVersion;
       if (status?.gitVersionOK !== undefined) this.gitVersionOK = status.gitVersionOK;
       if (status?.gcloudADCAvailable) this.gcloudADCAvailable = true;
@@ -763,7 +786,7 @@ export class ScionPageOnboarding extends LitElement {
 
   private renderIdentity() {
     return html`
-      <h1>Welcome to Scion</h1>
+      <h1>Welcome to ${getBrandName()}</h1>
       <p>Let's get your workstation set up. First, tell us who you are.</p>
 
       <div class="form-group">
@@ -1068,8 +1091,8 @@ export class ScionPageOnboarding extends LitElement {
         ></sl-input>
       </div>
       <p style="font-size:0.8125rem;color:var(--scion-text-muted,#64748b);">
-        Images like <code>${this.registryInput || 'your-registry'}/scion-claude:latest</code> will
-        be pulled during setup.
+        Images like <code>${registryPreviewImage(this.registryInput, this.imageTag)}</code> will be
+        pulled during setup.
       </p>
       <div class="footer">
         <sl-button
@@ -1535,8 +1558,8 @@ export class ScionPageOnboarding extends LitElement {
     return html`
       <h2>Welcome project</h2>
       <p>
-        Scion can set up a "welcome" project with the latest agent-team templates and a coordinator
-        agent that greets you in chat.
+        ${getBrandName()} can set up a "welcome" project with the latest agent-team templates and a
+        coordinator agent that greets you in chat.
       </p>
       ${this.welcomePhase === 'loading'
         ? html`<div class="loading-state">

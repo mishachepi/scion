@@ -787,7 +787,7 @@ func TestExecSchedulesExperimentRegistered(t *testing.T) {
 }
 
 // TestSystemOneExperimentRegistered pins hub.system_one (ptone/scion#8044):
-// server-layer only and ships off by default.
+// server+web layers and ships off by default.
 func TestSystemOneExperimentRegistered(t *testing.T) {
 	e, ok := Default().Lookup(SystemOne)
 	if !ok {
@@ -799,8 +799,8 @@ func TestSystemOneExperimentRegistered(t *testing.T) {
 	if e.Default {
 		t.Fatal("hub.system_one must default to off")
 	}
-	if !e.HasLayer(LayerServer) || e.HasLayer(LayerWeb) {
-		t.Fatalf("must be a server-layer (only) experiment, got %v", e.Layers)
+	if !e.HasLayer(LayerServer) || !e.HasLayer(LayerWeb) {
+		t.Fatalf("must have both LayerServer and LayerWeb, got %v", e.Layers)
 	}
 	if e.Issue != "ptone/scion#8044" || e.Stage != StageAlpha || e.Owner != "system-one" {
 		t.Fatalf("unexpected registration: %+v", e)
@@ -891,6 +891,48 @@ func TestEffectivePermissionsExperimentRegistered(t *testing.T) {
 		t.Fatalf("must have both LayerServer and LayerWeb, got %v", e.Layers)
 	}
 	if e.Issue != "ptone/scion#8439" || e.Stage != StageAlpha || e.Owner != "authz" {
+		t.Fatalf("unexpected registration: %+v", e)
+	}
+}
+
+// TestCustomDefaultUserRoleExperimentRegistered pins hub.custom_default_user_role
+// (ptone/scion#8288): server+web layers, alpha, default off, owned by auth.
+func TestCustomDefaultUserRoleExperimentRegistered(t *testing.T) {
+	e, ok := Default().Lookup(CustomDefaultUserRole)
+	if !ok {
+		t.Fatalf("%s is not registered", CustomDefaultUserRole)
+	}
+	if CustomDefaultUserRole != "hub.custom_default_user_role" {
+		t.Fatalf("frozen name changed: %q", CustomDefaultUserRole)
+	}
+	if e.Default {
+		t.Fatal("hub.custom_default_user_role must default to off")
+	}
+	if !e.HasLayer(LayerServer) || !e.HasLayer(LayerWeb) {
+		t.Fatalf("must have both LayerServer and LayerWeb, got %v", e.Layers)
+	}
+	if e.Issue != "ptone/scion#8288" || e.Stage != StageAlpha || e.Owner != "auth" {
+		t.Fatalf("unexpected registration: %+v", e)
+	}
+}
+
+// TestAgentSecretsExperimentRegistered pins hub.agent_secrets
+// (ptone/scion#8742): server+web layers, alpha, default off, owned by auth.
+func TestAgentSecretsExperimentRegistered(t *testing.T) {
+	e, ok := Default().Lookup(AgentSecrets)
+	if !ok {
+		t.Fatalf("%s is not registered", AgentSecrets)
+	}
+	if AgentSecrets != "hub.agent_secrets" {
+		t.Fatalf("frozen name changed: %q", AgentSecrets)
+	}
+	if e.Default {
+		t.Fatal("hub.agent_secrets must default to off")
+	}
+	if !e.HasLayer(LayerServer) || !e.HasLayer(LayerWeb) {
+		t.Fatalf("must have both LayerServer and LayerWeb, got %v", e.Layers)
+	}
+	if e.Issue != "ptone/scion#8742" || e.Stage != StageAlpha || e.Owner != "auth" {
 		t.Fatalf("unexpected registration: %+v", e)
 	}
 }

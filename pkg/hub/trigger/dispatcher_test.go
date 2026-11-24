@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -243,6 +244,28 @@ func (m *memTriggerStore) ListTriggerEvents(context.Context, store.TriggerEventF
 func (m *memTriggerStore) CountPendingTriggerEvents(context.Context, string) (int, error) {
 	return 0, nil
 }
+func (m *memTriggerStore) UpdateTriggerEventAttributes(_ context.Context, id string, attributes map[string]string, lists map[string][]string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ev, ok := m.events[id]
+	if !ok {
+		return store.ErrNotFound
+	}
+	if ev.Status != store.TriggerEventStatusPending {
+		return nil
+	}
+	ev.Attributes = maps.Clone(attributes)
+	if lists != nil {
+		cp := make(map[string][]string, len(lists))
+		for k, vals := range lists {
+			s := make([]string, len(vals))
+			copy(s, vals)
+			cp[k] = s
+		}
+		ev.Lists = cp
+	}
+	return nil
+}
 func (m *memTriggerStore) MarkTriggerEventProcessed(_ context.Context, id string, processedAt time.Time, matchCount, fireCount int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -330,7 +353,110 @@ func (m *memTriggerStore) ClaimTriggerFireSubjectSkip(_ context.Context, fire *s
 	*fire = cp
 	return true, busy, nil, nil
 }
-func (m *memTriggerStore) FinishTriggerFire(_ context.Context, id, status, resultRef, errMsg string, finishedAt time.Time) (bool, error) {
+func (m *memTriggerStore) ClaimTriggerFireCoalescing(_ context.Context, fire *store.TriggerFire, coalesceError string, now, notBefore time.Time) (bool, bool, []store.TriggerFire, *store.TriggerFire, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now = now.UTC()
+	notBefore = notBefore.UTC()
+	leaseHorizon := fire.LeaseUntil.UTC().Sub(now)
+	if leaseHorizon <= 0 {
+		leaseHorizon = trigger.FireLeaseHorizon
+	}
+	key := fire.EventID + "|" + fire.TriggerID
+	if ex, exists := m.fires[key]; exists {
+		if ex.Status == store.TriggerFireStatusCoalescing || ex.Status == store.TriggerFireStatusDeferred {
+			if ex.NotBefore != nil && ex.NotBefore.UTC().After(now) {
+				cp := *ex
+				return false, false, nil, &cp, nil
+			}
+			ex.Status = store.TriggerFireStatusFiring
+			ex.LeaseUntil = now.Add(leaseHorizon)
+			cp := *ex
+			*fire = cp
+			return true, true, nil, nil, nil
+		}
+		if ex.Status == store.TriggerFireStatusFailed &&
+			(ex.Error == trigger.ErrFireReapedDuringCoalesce || ex.Error == trigger.ErrFireReapedDuringDefer) {
+			ex.Status = store.TriggerFireStatusFiring
+			ex.Error = ""
+			ex.FinishedAt = nil
+			ex.LeaseUntil = now.Add(leaseHorizon)
+			cp := *ex
+			*fire = cp
+			return true, true, nil, nil, nil
+		}
+		cp := *ex
+		return false, false, nil, &cp, nil
+	}
+	var superseded []store.TriggerFire
+	for _, f := range m.byFireID {
+		isPendingOrReaped := f.Status == store.TriggerFireStatusCoalescing ||
+			f.Status == store.TriggerFireStatusDeferred ||
+			(f.Status == store.TriggerFireStatusFailed && (f.Error == trigger.ErrFireReapedDuringCoalesce || f.Error == trigger.ErrFireReapedDuringDefer))
+		if f.TriggerID == fire.TriggerID && f.Subject == fire.Subject && isPendingOrReaped {
+			f.Status = store.TriggerFireStatusSkipped
+			f.Error = coalesceError
+			fin := now
+			f.FinishedAt = &fin
+			superseded = append(superseded, *f)
+		}
+	}
+	cp := *fire
+	cp.Status = store.TriggerFireStatusCoalescing
+	nb := notBefore
+	cp.NotBefore = &nb
+	cp.LeaseUntil = notBefore.Add(leaseHorizon)
+	m.fires[key] = &cp
+	m.byFireID[cp.ID] = &cp
+	*fire = cp
+	return true, false, superseded, nil, nil
+}
+func (m *memTriggerStore) DeferTriggerFire(_ context.Context, id string, deferredAt, notBefore, leaseUntil time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	f, ok := m.byFireID[id]
+	if !ok || f.Status != store.TriggerFireStatusFiring {
+		return false, nil
+	}
+	f.Status = store.TriggerFireStatusDeferred
+	if f.DeferredAt == nil && !deferredAt.IsZero() {
+		da := deferredAt.UTC()
+		f.DeferredAt = &da
+	}
+	nb := notBefore.UTC()
+	f.NotBefore = &nb
+	f.LeaseUntil = leaseUntil.UTC()
+	return true, nil
+}
+func (m *memTriggerStore) FinishPendingTriggerFire(_ context.Context, id, status, errMsg, matchedThrough, decidedDialect, ruleTrace string, finishedAt time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	f, ok := m.byFireID[id]
+	if !ok {
+		return false, nil
+	}
+	isPendingOrReaped := f.Status == store.TriggerFireStatusCoalescing ||
+		f.Status == store.TriggerFireStatusDeferred ||
+		(f.Status == store.TriggerFireStatusFailed && (f.Error == trigger.ErrFireReapedDuringCoalesce || f.Error == trigger.ErrFireReapedDuringDefer))
+	if !isPendingOrReaped {
+		return false, nil
+	}
+	f.Status = status
+	f.Error = errMsg
+	if matchedThrough != "" {
+		f.MatchedThrough = matchedThrough
+	}
+	if decidedDialect != "" {
+		f.DecidedDialect = decidedDialect
+	}
+	if ruleTrace != "" {
+		f.RuleTrace = ruleTrace
+	}
+	t := finishedAt.UTC()
+	f.FinishedAt = &t
+	return true, nil
+}
+func (m *memTriggerStore) FinishTriggerFire(_ context.Context, id, status, resultRef, targetAgentID, errMsg string, finishedAt time.Time) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	f, ok := m.byFireID[id]
@@ -339,6 +465,9 @@ func (m *memTriggerStore) FinishTriggerFire(_ context.Context, id, status, resul
 	}
 	f.Status = status
 	f.ResultRef = resultRef
+	if targetAgentID != "" {
+		f.TargetAgentID = targetAgentID
+	}
 	f.Error = errMsg
 	t := finishedAt
 	f.FinishedAt = &t
@@ -354,19 +483,68 @@ func (m *memTriggerStore) GetTriggerFire(_ context.Context, id string) (*store.T
 	cp := *f
 	return &cp, nil
 }
-func (m *memTriggerStore) ListTriggerFires(context.Context, store.TriggerFireFilter, store.ListOptions) (*store.ListResult[store.TriggerFire], error) {
+func (m *memTriggerStore) ListTriggerFires(_ context.Context, filter store.TriggerFireFilter, _ store.ListOptions) (*store.ListResult[store.TriggerFire], error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var items []store.TriggerFire
 	for _, f := range m.byFireID {
+		if filter.EventID != "" && f.EventID != filter.EventID {
+			continue
+		}
+		if filter.TriggerID != "" && f.TriggerID != filter.TriggerID {
+			continue
+		}
+		if filter.Status != "" && f.Status != filter.Status {
+			continue
+		}
 		items = append(items, *f)
 	}
 	return &store.ListResult[store.TriggerFire]{Items: items, TotalCount: len(items)}, nil
 }
-func (m *memTriggerStore) HasLiveTriggerFireForSubject(context.Context, string, string, time.Time) (bool, error) {
+func (m *memTriggerStore) CountTriggerFiresSince(context.Context, string, time.Time, ...string) (int, error) {
+	return 0, nil
+}
+func (m *memTriggerStore) HasLiveTriggerFireForSubject(_ context.Context, triggerID, subject string, now time.Time) (bool, error) {
+	return m.HasLiveTriggerFireForSubjectExcluding(context.Background(), triggerID, subject, "", true, now)
+}
+func (m *memTriggerStore) HasLiveTriggerFireForSubjectExcluding(_ context.Context, triggerID, subject, excludeFireID string, includeFiring bool, now time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, f := range m.byFireID {
+		if f.ID == excludeFireID {
+			continue
+		}
+		statusMatch := f.Status == store.TriggerFireStatusCoalescing ||
+			f.Status == store.TriggerFireStatusDeferred ||
+			(includeFiring && f.Status == store.TriggerFireStatusFiring)
+		if f.TriggerID == triggerID &&
+			f.Subject == subject &&
+			statusMatch &&
+			f.LeaseUntil.After(now.UTC()) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+func (m *memTriggerStore) HasPendingTriggerFiresForEvent(_ context.Context, eventID string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, f := range m.byFireID {
+		if f.EventID != eventID {
+			continue
+		}
+		if f.Status == store.TriggerFireStatusCoalescing ||
+			f.Status == store.TriggerFireStatusDeferred ||
+			(f.Status == store.TriggerFireStatusFailed && (f.Error == trigger.ErrFireReapedDuringCoalesce || f.Error == trigger.ErrFireReapedDuringDefer)) {
+			return true, nil
+		}
+	}
 	return false, nil
 }
 func (m *memTriggerStore) AgentHasFiredTriggerForEvent(context.Context, string, string) (bool, error) {
+	return false, nil
+}
+func (m *memTriggerStore) EventHasTriggerFireForResultRef(context.Context, string, string) (bool, error) {
 	return false, nil
 }
 func (m *memTriggerStore) ReapExpiredTriggerFires(context.Context, time.Time, int) (int, error) {
@@ -374,6 +552,30 @@ func (m *memTriggerStore) ReapExpiredTriggerFires(context.Context, time.Time, in
 }
 func (m *memTriggerStore) PurgeOldTriggerHistory(context.Context, time.Time) (int, int, error) {
 	return 0, 0, nil
+}
+func (m *memTriggerStore) ClaimTriggerSubject(context.Context, string, string, string, string, time.Time, time.Time) (*store.TriggerSubjectClaim, *store.TriggerSubjectClaim, error) {
+	return nil, nil, nil
+}
+func (m *memTriggerStore) BindTriggerSubjectClaim(context.Context, string, string, string, time.Time) (bool, error) {
+	return false, nil
+}
+func (m *memTriggerStore) ReleaseTriggerSubjectClaim(context.Context, string, string, time.Time) (bool, error) {
+	return false, nil
+}
+func (m *memTriggerStore) GetActiveTriggerSubjectClaim(context.Context, string, string) (*store.TriggerSubjectClaim, error) {
+	return nil, store.ErrNotFound
+}
+func (m *memTriggerStore) ReleaseTriggerSubjectClaimsForAgent(context.Context, string, time.Time) (int, error) {
+	return 0, nil
+}
+func (m *memTriggerStore) ReleaseTriggerSubjectClaimsForProjectBySourceKind(context.Context, string, string, string, time.Time) (int, error) {
+	return 0, nil
+}
+func (m *memTriggerStore) ReleaseTerminalTriggerSubjectClaims(context.Context, time.Time) (int, error) {
+	return 0, nil
+}
+func (m *memTriggerStore) PurgeOldTriggerSubjectClaims(context.Context, time.Time) (int, error) {
+	return 0, nil
 }
 
 func TestDispatcher_WakeFireDetachAndPerFireBudget(t *testing.T) {
@@ -1345,6 +1547,7 @@ func TestDispatcher_SharedEventBudgetAlwaysPassedAndClampsAcrossTriggers(t *test
 		MatchRules: []store.TriggerMatchRule{{Dialect: "slow_probe", Expr: "spend_45ms"}},
 		ActionType: store.TriggerActionMessage,
 		Status:     store.TriggerStatusActive,
+		CreatedAt:  t0,
 	}
 	tr2 := &store.Trigger{
 		ID:         uuid.NewString(),
@@ -1359,6 +1562,7 @@ func TestDispatcher_SharedEventBudgetAlwaysPassedAndClampsAcrossTriggers(t *test
 		},
 		ActionType: store.TriggerActionMessage,
 		Status:     store.TriggerStatusActive,
+		CreatedAt:  t0.Add(time.Second),
 	}
 	tr3 := &store.Trigger{
 		ID:         uuid.NewString(),
@@ -1370,6 +1574,7 @@ func TestDispatcher_SharedEventBudgetAlwaysPassedAndClampsAcrossTriggers(t *test
 		MatchRules: []store.TriggerMatchRule{{Dialect: "slow_probe", Expr: "never_started"}},
 		ActionType: store.TriggerActionMessage,
 		Status:     store.TriggerStatusActive,
+		CreatedAt:  t0.Add(2 * time.Second),
 	}
 	for _, tr := range []*store.Trigger{tr1, tr2, tr3} {
 		require.NoError(t, ms.CreateTrigger(ctx, tr))
@@ -3024,4 +3229,387 @@ func TestDispatcher_GitHubSubjectModeSkip_UnauthorizedRefusesWithoutSkipClaimAnd
 
 	assert.Equal(t, store.TriggerFireStatusFired, byEv[evAuth3].Status)
 	assert.Equal(t, "github:octo-org/octo-repo#43", byEv[evAuth3].Subject)
+}
+
+func TestDispatcher_DispatchAgentSkipUsesSubjectClaimsNotFireSkip(t *testing.T) {
+	ctx := context.Background()
+	ms := newMemTriggerStore()
+	core := &fakeCore{}
+	core.enabled.Store(true)
+
+	projID := uuid.NewString()
+	epID := uuid.NewString()
+	t0 := time.Date(2026, 11, 21, 1, 0, 0, 0, time.UTC)
+
+	dispTrigID := uuid.NewString()
+	require.NoError(t, ms.CreateTrigger(ctx, &store.Trigger{
+		ID:          dispTrigID,
+		ProjectID:   projID,
+		Name:        "disp-skip",
+		SourceKind:  store.TriggerSourceKindWebhook,
+		SourceID:    epID,
+		MatchTypes:  []string{"webhook.run"},
+		ActionType:  store.TriggerActionDispatchAgent,
+		SubjectMode: store.TriggerSubjectModeSkip,
+		Status:      store.TriggerStatusActive,
+	}))
+	msgTrigID := uuid.NewString()
+	require.NoError(t, ms.CreateTrigger(ctx, &store.Trigger{
+		ID:          msgTrigID,
+		ProjectID:   projID,
+		Name:        "msg-skip",
+		SourceKind:  store.TriggerSourceKindWebhook,
+		SourceID:    epID,
+		MatchTypes:  []string{"webhook.run"},
+		ActionType:  store.TriggerActionMessage,
+		SubjectMode: store.TriggerSubjectModeSkip,
+		Status:      store.TriggerStatusActive,
+	}))
+
+	evID := uuid.NewString()
+	require.NoError(t, ms.CreateTriggerEvent(ctx, &store.TriggerEvent{
+		ID:         evID,
+		ProjectID:  projID,
+		SourceKind: store.TriggerSourceKindWebhook,
+		SourceID:   epID,
+		Type:       "webhook.run",
+		Subject:    "webhook:" + epID + "/sub-1",
+		Status:     store.TriggerEventStatusPending,
+		ReceivedAt: t0,
+	}))
+
+	disp, err := trigger.NewDispatcher(trigger.DispatcherConfig{
+		Core:  core,
+		Store: ms,
+		Now:   func() time.Time { return t0 },
+	})
+	require.NoError(t, err)
+
+	raw, err := json.Marshal(trigger.EventQueuePayload{Version: trigger.EventQueuePayloadVersion, EventID: evID})
+	require.NoError(t, err)
+	res := disp.HandleItem(ctx, durablequeue.Item{Seq: 1, Kind: trigger.EventQueueKind, DedupKey: evID, Payload: raw}, nopLease{})
+	require.NoError(t, res.Err)
+	assert.True(t, res.Done)
+
+	// Only the message trigger uses PR 4's ClaimTriggerFireSubjectSkip;
+	// dispatch_agent uses ClaimTriggerFire and delegates skip to SubjectClaims.
+	assert.Equal(t, int32(1), ms.claimSubjectSkipCalls.Load(), "only message+skip must call ClaimTriggerFireSubjectSkip")
+}
+
+func TestDispatcher_EvaluatesCandidatesOldestFirst(t *testing.T) {
+	ctx := context.Background()
+	ms := newMemTriggerStore()
+	rules, err := triggerrule.NewDefault()
+	require.NoError(t, err)
+
+	projID := uuid.NewString()
+	epID := uuid.NewString()
+	evID := uuid.NewString()
+	t0 := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+
+	// Insert newest-first (mirroring Ent ListTriggers' Created DESC, ID DESC order)
+	// including a same-timestamp pair to pin ID ASC tie-breaking.
+	trNewest := &store.Trigger{
+		ID:         "00000000-0000-0000-0000-000000000004",
+		ProjectID:  projID,
+		Name:       "newest",
+		SourceKind: store.TriggerSourceKindWebhook,
+		SourceID:   epID,
+		MatchTypes: []string{"webhook.received"},
+		ActionType: store.TriggerActionMessage,
+		Status:     store.TriggerStatusActive,
+		CreatedAt:  t0.Add(3 * time.Minute),
+	}
+	trTieB := &store.Trigger{
+		ID:         "00000000-0000-0000-0000-000000000003",
+		ProjectID:  projID,
+		Name:       "tie-b",
+		SourceKind: store.TriggerSourceKindWebhook,
+		SourceID:   epID,
+		MatchTypes: []string{"webhook.received"},
+		ActionType: store.TriggerActionMessage,
+		Status:     store.TriggerStatusActive,
+		CreatedAt:  t0.Add(2 * time.Minute),
+	}
+	trTieA := &store.Trigger{
+		ID:         "00000000-0000-0000-0000-000000000002",
+		ProjectID:  projID,
+		Name:       "tie-a",
+		SourceKind: store.TriggerSourceKindWebhook,
+		SourceID:   epID,
+		MatchTypes: []string{"webhook.received"},
+		ActionType: store.TriggerActionMessage,
+		Status:     store.TriggerStatusActive,
+		CreatedAt:  t0.Add(2 * time.Minute),
+	}
+	trOldest := &store.Trigger{
+		ID:         "00000000-0000-0000-0000-000000000001",
+		ProjectID:  projID,
+		Name:       "oldest",
+		SourceKind: store.TriggerSourceKindWebhook,
+		SourceID:   epID,
+		MatchTypes: []string{"webhook.received"},
+		ActionType: store.TriggerActionMessage,
+		Status:     store.TriggerStatusActive,
+		CreatedAt:  t0.Add(1 * time.Minute),
+	}
+	for _, tr := range []*store.Trigger{trNewest, trTieB, trTieA, trOldest} {
+		require.NoError(t, ms.CreateTrigger(ctx, tr))
+	}
+	require.NoError(t, ms.CreateTriggerEvent(ctx, &store.TriggerEvent{
+		ID:         evID,
+		ProjectID:  projID,
+		SourceKind: store.TriggerSourceKindWebhook,
+		SourceID:   epID,
+		Type:       "webhook.received",
+		Subject:    "webhook:" + epID,
+		DedupKey:   "d-oldest-first",
+		OccurredAt: t0,
+		ReceivedAt: t0,
+		Payload:    `{"ok":true}`,
+		Status:     store.TriggerEventStatusPending,
+	}))
+
+	var firedNames []string
+	core := &fakeCore{
+		fireFn: func(_ context.Context, req hubfire.FireRequest) hubfire.FireOutcome {
+			firedNames = append(firedNames, req.Event.Trigger.Name)
+			return hubfire.FireOutcome{Status: hubfire.FireStatusFired}
+		},
+	}
+	core.enabled.Store(true)
+
+	disp, err := trigger.NewDispatcher(trigger.DispatcherConfig{
+		Core:  core,
+		Store: ms,
+		Rules: rules,
+		Now:   func() time.Time { return t0 },
+	})
+	require.NoError(t, err)
+
+	raw, _ := json.Marshal(trigger.EventQueuePayload{Version: 1, EventID: evID})
+	res := disp.HandleItem(ctx, durablequeue.Item{
+		Kind:     trigger.EventQueueKind,
+		DedupKey: evID,
+		Payload:  raw,
+	}, nopLease{})
+	require.NoError(t, res.Err)
+	assert.True(t, res.Done)
+	assert.Equal(t, []string{"oldest", "tie-a", "tie-b", "newest"}, firedNames)
+}
+
+func TestDispatcher_CompileBudgetExhaustionSkipsMissesKeepsHitsAndRecordsMetric(t *testing.T) {
+	ctx := context.Background()
+	ms := newMemTriggerStore()
+	rules, err := triggerrule.NewDefault()
+	require.NoError(t, err)
+
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+	otelMetrics, err := trigger.NewOTelRuleEvalMetrics(mp)
+	require.NoError(t, err)
+
+	projID := uuid.NewString()
+	epID := uuid.NewString()
+	t0 := time.Date(2026, 11, 20, 14, 0, 0, 0, time.UTC)
+
+	// Candidate order (oldest-first):
+	// 1. trCold1: uncached CEL rule -> compiles (1 miss), exhausts 1ns compile budget, evaluates & fires.
+	// 2. trCold2: uncached CEL rule -> gated before compile -> skipped with "rule compile budget exhausted" (R4).
+	// 3. trWarm:  pre-warmed CEL rule + pre-warmed subject_rule -> cache hit STILL evaluates & fires (R3).
+	// 4. trColdSubj: pre-warmed CEL rule + uncached subject_rule -> matches & fires, subject falls back to ev.Subject (R3).
+	// 5. trTypesOnly: no rules -> matches & fires.
+	trCold1 := &store.Trigger{
+		ID:                   uuid.NewString(),
+		ProjectID:            projID,
+		Name:                 "cold-1",
+		SourceKind:           store.TriggerSourceKindWebhook,
+		SourceID:             epID,
+		MatchTypes:           []string{"webhook.received"},
+		MatchRules:           []store.TriggerMatchRule{{Dialect: ruleengine.DialectCEL, Expr: `event.payload.k == "v1"`}},
+		ActionType:           store.TriggerActionMessage,
+		Status:               store.TriggerStatusActive,
+		InitiatorAttribution: store.InitiatorAttribution{AuthorizationRevision: 1},
+		CreatedAt:            t0.Add(1 * time.Second),
+	}
+	trCold2 := &store.Trigger{
+		ID:                   uuid.NewString(),
+		ProjectID:            projID,
+		Name:                 "cold-2",
+		SourceKind:           store.TriggerSourceKindWebhook,
+		SourceID:             epID,
+		MatchTypes:           []string{"webhook.received"},
+		MatchRules:           []store.TriggerMatchRule{{Dialect: ruleengine.DialectCEL, Expr: `event.payload.k2 == "v2"`}},
+		ActionType:           store.TriggerActionMessage,
+		Status:               store.TriggerStatusActive,
+		InitiatorAttribution: store.InitiatorAttribution{AuthorizationRevision: 1},
+		CreatedAt:            t0.Add(2 * time.Second),
+	}
+	trWarm := &store.Trigger{
+		ID:                   uuid.NewString(),
+		ProjectID:            projID,
+		Name:                 "warm-hit",
+		SourceKind:           store.TriggerSourceKindWebhook,
+		SourceID:             epID,
+		MatchTypes:           []string{"webhook.received"},
+		MatchRules:           []store.TriggerMatchRule{{Dialect: ruleengine.DialectCEL, Expr: `event.payload.warm == true`}},
+		SubjectDialect:       ruleengine.DialectCEL,
+		SubjectRule:          `"warm:" + event.payload.k`,
+		ActionType:           store.TriggerActionMessage,
+		Status:               store.TriggerStatusActive,
+		InitiatorAttribution: store.InitiatorAttribution{AuthorizationRevision: 1},
+		CreatedAt:            t0.Add(3 * time.Second),
+	}
+	trColdSubj := &store.Trigger{
+		ID:                   uuid.NewString(),
+		ProjectID:            projID,
+		Name:                 "warm-match-cold-subj",
+		SourceKind:           store.TriggerSourceKindWebhook,
+		SourceID:             epID,
+		MatchTypes:           []string{"webhook.received"},
+		MatchRules:           []store.TriggerMatchRule{{Dialect: ruleengine.DialectCEL, Expr: `event.payload.warm == true`}},
+		SubjectDialect:       ruleengine.DialectCEL,
+		SubjectRule:          `"coldsubj:" + event.payload.k`,
+		ActionType:           store.TriggerActionMessage,
+		Status:               store.TriggerStatusActive,
+		InitiatorAttribution: store.InitiatorAttribution{AuthorizationRevision: 1},
+		CreatedAt:            t0.Add(4 * time.Second),
+	}
+	trTypesOnly := &store.Trigger{
+		ID:                   uuid.NewString(),
+		ProjectID:            projID,
+		Name:                 "types-only",
+		SourceKind:           store.TriggerSourceKindWebhook,
+		SourceID:             epID,
+		MatchTypes:           []string{"webhook.received"},
+		ActionType:           store.TriggerActionMessage,
+		Status:               store.TriggerStatusActive,
+		InitiatorAttribution: store.InitiatorAttribution{AuthorizationRevision: 1},
+		CreatedAt:            t0.Add(5 * time.Second),
+	}
+
+	// Pre-warm trWarm's match + subject rules and trColdSubj's match rule (leaving trColdSubj's subject rule cold).
+	preAct, err := triggerrule.NewEventActivation(hubfire.FireEvent{
+		ID:        "prewarm",
+		ProjectID: projID,
+		Type:      "webhook.received",
+		Subject:   "webhook:" + epID,
+		Payload:   []byte(`{"k":"v1","k2":"v2","warm":true}`),
+	})
+	require.NoError(t, err)
+	warmScope := celengine.CacheScope{Consumer: triggerrule.ConsumerName, ProjectID: projID, ID: trWarm.ID, Revision: 1}
+	_, _, err = rules.MatchAllWithTrace(ctx, warmScope, []triggerrule.Rule{{Dialect: ruleengine.DialectCEL, Expr: trWarm.MatchRules[0].Expr}}, preAct)
+	require.NoError(t, err)
+	_, err = rules.Subject(ctx, warmScope, triggerrule.Rule{Dialect: ruleengine.DialectCEL, Expr: trWarm.SubjectRule}, preAct)
+	require.NoError(t, err)
+	coldSubjScope := celengine.CacheScope{Consumer: triggerrule.ConsumerName, ProjectID: projID, ID: trColdSubj.ID, Revision: 1}
+	_, _, err = rules.MatchAllWithTrace(ctx, coldSubjScope, []triggerrule.Rule{{Dialect: ruleengine.DialectCEL, Expr: trColdSubj.MatchRules[0].Expr}}, preAct)
+	require.NoError(t, err)
+
+	for _, tr := range []*store.Trigger{trCold1, trCold2, trWarm, trColdSubj, trTypesOnly} {
+		require.NoError(t, ms.CreateTrigger(ctx, tr))
+	}
+
+	evID := uuid.NewString()
+	require.NoError(t, ms.CreateTriggerEvent(ctx, &store.TriggerEvent{
+		ID:         evID,
+		ProjectID:  projID,
+		SourceKind: store.TriggerSourceKindWebhook,
+		SourceID:   epID,
+		Type:       "webhook.received",
+		Subject:    "webhook:" + epID,
+		DedupKey:   "d-compile-budget",
+		OccurredAt: t0,
+		ReceivedAt: t0,
+		Payload:    `{"k":"v1","k2":"v2","warm":true}`,
+		Status:     store.TriggerEventStatusPending,
+	}))
+
+	var firedNames []string
+	core := &fakeCore{
+		fireFn: func(_ context.Context, req hubfire.FireRequest) hubfire.FireOutcome {
+			firedNames = append(firedNames, req.Event.Trigger.Name)
+			return hubfire.FireOutcome{Status: hubfire.FireStatusFired}
+		},
+	}
+	core.enabled.Store(true)
+
+	disp, err := trigger.NewDispatcher(trigger.DispatcherConfig{
+		Core:          core,
+		Store:         ms,
+		Rules:         rules,
+		RuleMetrics:   otelMetrics,
+		CompileBudget: time.Nanosecond,
+		Now:           func() time.Time { return t0 },
+	})
+	require.NoError(t, err)
+
+	raw, _ := json.Marshal(trigger.EventQueuePayload{Version: 1, EventID: evID})
+	res := disp.HandleItem(ctx, durablequeue.Item{
+		Kind:     trigger.EventQueueKind,
+		DedupKey: evID,
+		Payload:  raw,
+	}, nopLease{})
+	require.NoError(t, res.Err)
+	assert.True(t, res.Done, "plain skip completes the item on attempt 0")
+	assert.Equal(t, []string{"cold-1", "warm-hit", "warm-match-cold-subj", "types-only"}, firedNames)
+
+	fires, err := ms.ListTriggerFires(ctx, store.TriggerFireFilter{EventID: evID}, store.ListOptions{})
+	require.NoError(t, err)
+	byTrig := make(map[string]store.TriggerFire, len(fires.Items))
+	for _, f := range fires.Items {
+		byTrig[f.TriggerID] = f
+	}
+	// R4: trCold2 skipped with compile-specific error and trace reason (never "rule evaluation failed" or "rule budget exhausted").
+	fCold2 := byTrig[trCold2.ID]
+	assert.Equal(t, store.TriggerFireStatusSkipped, fCold2.Status)
+	assert.Equal(t, trigger.ErrFireRuleCompileBudgetExhausted, fCold2.Error)
+	assert.Contains(t, fCold2.RuleTrace, `"reason":"compile_budget_exhausted"`)
+
+	// R3: trWarm derived its cached subject; trColdSubj fell back to ev.Subject.
+	assert.Equal(t, "warm:v1", byTrig[trWarm.ID].Subject)
+	assert.Equal(t, "webhook:"+epID, byTrig[trColdSubj.ID].Subject)
+
+	// C2: compile miss metric incremented exactly once (for trCold1) with dialect="cel" and no project_id label.
+	assert.Equal(t, map[string]int64{"cel": 1}, disp.RuleCompileMissStats())
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(ctx, &rm))
+	var missVal int64
+	foundMissMetric := false
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != trigger.MetricTriggerRuleCompileMissesTotal {
+				continue
+			}
+			foundMissMetric = true
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok)
+			for _, dp := range sum.DataPoints {
+				for _, kv := range dp.Attributes.ToSlice() {
+					assert.NotEqual(t, "project_id", string(kv.Key), "compile miss metric must not carry project_id label")
+				}
+				missVal += dp.Value
+			}
+		}
+	}
+	assert.True(t, foundMissMetric, "expected %s metric to be exported", trigger.MetricTriggerRuleCompileMissesTotal)
+	assert.Equal(t, int64(1), missVal)
+}
+
+func TestNormalizeFireSkipReason_CompileBudgetExhaustedAndAgentNameInUse(t *testing.T) {
+	assert.Equal(t, trigger.FireSkipReasonRuleCompileBudgetExhausted,
+		trigger.NormalizeFireSkipReason(trigger.ErrFireRuleCompileBudgetExhausted))
+	assert.Equal(t, trigger.FireSkipReasonRuleCompileBudgetExhausted,
+		trigger.NormalizeFireSkipReason("  rule compile budget exhausted  "))
+	assert.Equal(t, trigger.FireSkipReasonAgentNameInUse,
+		trigger.NormalizeFireSkipReason("agent name in use"))
+	assert.Equal(t, trigger.FireSkipReasonAgentNameInUse,
+		trigger.NormalizeFireSkipReason("  agent name in use  "))
+	assert.Equal(t, trigger.FireSkipReasonCommentRateLimited,
+		trigger.NormalizeFireSkipReason("comment rate limited"))
+	assert.Equal(t, trigger.FireSkipReasonCommentRateLimited,
+		trigger.NormalizeFireSkipReason("  comment rate limited  "))
+	assert.Equal(t, trigger.FireSkipReasonOther,
+		trigger.NormalizeFireSkipReason("some free-text error"))
 }

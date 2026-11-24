@@ -187,3 +187,372 @@ describe('scion-agent-message-viewer authorized-by line', () => {
     expect(apiFetchMock).not.toHaveBeenCalled();
   });
 });
+
+describe('scion-agent-message-viewer SSE reconnect and visibility backfill', () => {
+  class FakeEventSource {
+    static readonly CONNECTING = 0;
+    static readonly OPEN = 1;
+    static readonly CLOSED = 2;
+    static instances: FakeEventSource[] = [];
+
+    readonly url: string;
+    readyState = FakeEventSource.CONNECTING;
+    onopen: ((ev: Event) => void) | null = null;
+    onerror: ((ev: Event) => void) | null = null;
+    closed = false;
+    private listeners = new Map<string, Array<(ev: Event) => void>>();
+
+    constructor(url: string) {
+      this.url = url;
+      FakeEventSource.instances.push(this);
+    }
+
+    addEventListener(type: string, cb: (ev: Event) => void): void {
+      const list = this.listeners.get(type) ?? [];
+      list.push(cb);
+      this.listeners.set(type, list);
+    }
+
+    emitOpen(): void {
+      this.readyState = FakeEventSource.OPEN;
+      this.onopen?.(new Event('open'));
+    }
+
+    emitError(): void {
+      this.onerror?.(new Event('error'));
+    }
+
+    emitMessage(payload: unknown): void {
+      const ev = new MessageEvent('message', { data: JSON.stringify(payload) });
+      for (const cb of this.listeners.get('message') ?? []) cb(ev);
+    }
+
+    close(): void {
+      this.closed = true;
+      this.readyState = FakeEventSource.CLOSED;
+    }
+  }
+
+  function hubMessage(id: string, createdAt: string) {
+    return {
+      id,
+      projectId: 'p1',
+      sender: 'user:alice',
+      senderId: 'user-alice',
+      recipient: 'agent:bob',
+      recipientId: 'agent-bob',
+      msg: `message ${id}`,
+      type: 'instruction',
+      agentId: 'agent-bob',
+      createdAt,
+    };
+  }
+
+  function mockMessagesResponse(items: unknown[]) {
+    return {
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ items }),
+    };
+  }
+
+  let hidden = false;
+
+  beforeEach(() => {
+    FakeEventSource.instances = [];
+    apiFetchMock.mockReset();
+    hidden = false;
+    vi.stubGlobal('EventSource', FakeEventSource);
+    vi.spyOn(document, 'hidden', 'get').mockImplementation(() => hidden);
+    vi.spyOn(document, 'visibilityState', 'get').mockImplementation(() =>
+      hidden ? 'hidden' : 'visible'
+    );
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function setHidden(value: boolean): void {
+    hidden = value;
+    document.dispatchEvent(new Event('visibilitychange'));
+  }
+
+  it('backfills missed messages after EventSource error and reconnect without duplicating entries', async () => {
+    const m1 = hubMessage('m1', '2026-09-23T15:00:00.000Z');
+    const m2 = hubMessage('m2', '2026-09-23T15:01:00.000Z');
+    const m3 = hubMessage('m3', '2026-09-23T15:02:00.000Z');
+
+    apiFetchMock.mockResolvedValueOnce(mockMessagesResponse([m1]));
+
+    const el: AnyEl = document.createElement('scion-agent-message-viewer');
+    el.projectId = 'p1';
+    el.agentId = 'agent-bob';
+    document.body.appendChild(el);
+
+    el.loadMessages();
+    await vi.waitFor(() => expect(el.buffer.items).toHaveLength(1));
+    expect(apiFetchMock).toHaveBeenCalledTimes(1);
+
+    // Initial stream open should not trigger a redundant fetch.
+    el.startStream();
+    const es = FakeEventSource.instances[0];
+    expect(es).toBeDefined();
+    es.emitOpen();
+    await el.updateComplete;
+    expect(apiFetchMock).toHaveBeenCalledTimes(1);
+
+    // Live message arrives over SSE.
+    es.emitMessage(m2);
+    await el.updateComplete;
+    expect((el.buffer.items as { insertId: string }[]).map((r) => r.insertId)).toEqual([
+      'hub:m1',
+      'hub:m2',
+    ]);
+
+    // Stream errors and later reconnects; m3 was published during the drop.
+    apiFetchMock.mockResolvedValueOnce(mockMessagesResponse([m1, m2, m3]));
+    es.emitError();
+    es.emitOpen();
+
+    await vi.waitFor(() => expect(apiFetchMock).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(el.buffer.items).toHaveLength(3));
+    expect((el.buffer.items as { insertId: string }[]).map((r) => r.insertId)).toEqual([
+      'hub:m1',
+      'hub:m2',
+      'hub:m3',
+    ]);
+    await el.updateComplete;
+    expect(el.shadowRoot.querySelectorAll('.message-row').length).toBe(3);
+  });
+
+  it('backfills when the tab becomes visible again without duplicating existing messages', async () => {
+    const m1 = hubMessage('m1', '2026-09-23T15:00:00.000Z');
+    const m2 = hubMessage('m2', '2026-09-23T15:01:00.000Z');
+
+    apiFetchMock.mockResolvedValueOnce(mockMessagesResponse([m1]));
+
+    const el: AnyEl = document.createElement('scion-agent-message-viewer');
+    el.projectId = 'p1';
+    el.agentId = 'agent-bob';
+    document.body.appendChild(el);
+
+    // Before loadMessages(), visibility changes must not eagerly fetch.
+    setHidden(true);
+    setHidden(false);
+    expect(apiFetchMock).not.toHaveBeenCalled();
+
+    el.loadMessages();
+    await vi.waitFor(() => expect(el.buffer.items).toHaveLength(1));
+    expect(apiFetchMock).toHaveBeenCalledTimes(1);
+
+    // Tab hides and returns with m2 published in the interim.
+    apiFetchMock.mockResolvedValueOnce(mockMessagesResponse([m1, m2]));
+    setHidden(true);
+    setHidden(false);
+
+    await vi.waitFor(() => expect(apiFetchMock).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(el.buffer.items).toHaveLength(2));
+    expect((el.buffer.items as { insertId: string }[]).map((r) => r.insertId)).toEqual([
+      'hub:m1',
+      'hub:m2',
+    ]);
+
+    // After disconnect, visibility changes must no longer fetch.
+    el.remove();
+    setHidden(true);
+    setHidden(false);
+    expect(apiFetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('restarts a closed EventSource when the tab becomes visible', async () => {
+    const m1 = hubMessage('m1', '2026-09-23T15:00:00.000Z');
+    apiFetchMock.mockResolvedValue(mockMessagesResponse([m1]));
+
+    const el: AnyEl = document.createElement('scion-agent-message-viewer');
+    el.projectId = 'p1';
+    el.agentId = 'agent-bob';
+    document.body.appendChild(el);
+
+    el.loadMessages();
+    await vi.waitFor(() => expect(el.buffer.items).toHaveLength(1));
+
+    el.startStream();
+    const firstEs = FakeEventSource.instances[0];
+    firstEs.emitOpen();
+    // Simulate the browser closing the stream while backgrounded.
+    firstEs.readyState = FakeEventSource.CLOSED;
+
+    setHidden(true);
+    setHidden(false);
+
+    expect(FakeEventSource.instances).toHaveLength(2);
+    expect(firstEs.closed).toBe(true);
+  });
+});
+
+describe('scion-agent-message-viewer cross-project badge', () => {
+  function hubMessage(id: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      id,
+      projectId: 'proj-alpha',
+      sender: 'agent:builder',
+      senderId: 'agent-builder-id',
+      recipient: 'agent:reviewer',
+      recipientId: 'agent-reviewer-id',
+      msg: 'status update',
+      type: 'instruction',
+      agentId: 'agent-reviewer-id',
+      createdAt: '2026-09-23T15:00:00.000Z',
+      ...extra,
+    };
+  }
+
+  function crossProjectBadges(el: AnyEl): string[] {
+    return Array.from(
+      el.shadowRoot.querySelectorAll('.badge-cross-project') as NodeListOf<HTMLElement>
+    ).map((n) => (n.textContent ?? '').trim());
+  }
+
+  it('shows no cross-project tag for same-project sender and recipient when current project differs', async () => {
+    const el: AnyEl = document.createElement('scion-agent-message-viewer');
+    el.projectId = 'proj-other';
+    el.agentId = 'agent-reviewer-id';
+    document.body.appendChild(el);
+
+    el.mergeHubMessages([
+      hubMessage('m-same', {
+        senderProjectId: 'proj-alpha',
+        recipientProjectId: 'proj-alpha',
+      }),
+    ]);
+    await el.updateComplete;
+
+    expect(el.shadowRoot.querySelectorAll('.message-row').length).toBe(1);
+    expect(crossProjectBadges(el)).toEqual([]);
+
+    (el.shadowRoot.querySelector('.message-row') as HTMLElement).click();
+    await el.updateComplete;
+    const browser = el.shadowRoot.querySelector('scion-json-browser') as AnyEl;
+    expect(browser.data.crossProject).toBeUndefined();
+  });
+
+  it('shows cross-project tag when sender and recipient projects differ regardless of current project', async () => {
+    for (const currentProject of ['', 'proj-alpha', 'proj-other']) {
+      const el: AnyEl = document.createElement('scion-agent-message-viewer');
+      el.projectId = currentProject;
+      el.agentId = 'agent-reviewer-id';
+      document.body.appendChild(el);
+
+      el.mergeHubMessages([
+        hubMessage(`m-cross-${currentProject || 'unset'}`, {
+          senderProjectId: 'proj-alpha',
+          recipientProjectId: 'proj-beta',
+        }),
+      ]);
+      await el.updateComplete;
+
+      expect(crossProjectBadges(el)).toEqual(['cross-project']);
+
+      (el.shadowRoot.querySelector('.message-row') as HTMLElement).click();
+      await el.updateComplete;
+      const browser = el.shadowRoot.querySelector('scion-json-browser') as AnyEl;
+      expect(browser.data).toMatchObject({
+        crossProject: true,
+        senderProjectId: 'proj-alpha',
+        recipientProjectId: 'proj-beta',
+      });
+      el.remove();
+    }
+  });
+
+  it('shows no cross-project tag when provenance stamps are missing on one side', async () => {
+    const el: AnyEl = document.createElement('scion-agent-message-viewer');
+    el.projectId = 'proj-other';
+    el.agentId = 'agent-reviewer-id';
+    document.body.appendChild(el);
+
+    el.mergeHubMessages([
+      // Human-sent message: recipientProjectId is stamped, senderProjectId is absent.
+      hubMessage('m-human', {
+        sender: 'user:alice',
+        senderId: 'u-alice',
+        recipientProjectId: 'proj-alpha',
+      }),
+    ]);
+    await el.updateComplete;
+
+    expect(crossProjectBadges(el)).toEqual([]);
+  });
+
+  it('applies message-provenance cross-project logic to Cloud Logging entries', async () => {
+    const el: AnyEl = document.createElement('scion-agent-message-viewer');
+    el.projectId = 'proj-other';
+    document.body.appendChild(el);
+
+    el.mergeEntries([
+      {
+        ...entry('log-same', {
+          sender: 'agent:a',
+          recipient: 'agent:b',
+          msg_type: 'instruction',
+          sender_project_id: 'proj-alpha',
+          recipient_project_id: 'proj-alpha',
+        }),
+        timestamp: '2026-09-23T15:00:00.000Z',
+      },
+      {
+        ...entry('log-cross', {
+          sender: 'agent:a',
+          recipient: 'agent:c',
+          msg_type: 'instruction',
+          sender_project_id: 'proj-alpha',
+          recipient_project_id: 'proj-beta',
+        }),
+        timestamp: '2026-09-23T15:01:00.000Z',
+      },
+    ]);
+    await el.updateComplete;
+
+    const rows = Array.from(
+      el.shadowRoot.querySelectorAll('.message-row') as NodeListOf<HTMLElement>
+    );
+    expect(rows.length).toBe(2);
+    // Rendered newest first: log-cross (index 0) has badge; log-same (index 1) has none.
+    expect(rows[0]!.querySelector('.badge-cross-project')).not.toBeNull();
+    expect(rows[1]!.querySelector('.badge-cross-project')).toBeNull();
+  });
+
+  it('honors recorded cross_project boolean on Cloud Logging entries when project stamps are absent', async () => {
+    const el: AnyEl = document.createElement('scion-agent-message-viewer');
+    el.projectId = 'proj-other';
+    document.body.appendChild(el);
+
+    el.mergeEntries([
+      {
+        timestamp: '2026-09-23T15:00:00.000Z',
+        severity: 'INFO',
+        message: 'log line',
+        labels: { sender: 'agent:a', recipient: 'agent:b', msg_type: 'instruction' },
+        jsonPayload: { cross_project: false, message_content: 'same project' },
+        insertId: 'log-explicit-same',
+      },
+      {
+        timestamp: '2026-09-23T15:01:00.000Z',
+        severity: 'INFO',
+        message: 'log line',
+        labels: { sender: 'agent:a', recipient: 'agent:c', msg_type: 'instruction' },
+        jsonPayload: { cross_project: true, message_content: 'hello across projects' },
+        insertId: 'log-explicit-cross',
+      },
+    ]);
+    await el.updateComplete;
+
+    const rows = Array.from(
+      el.shadowRoot.querySelectorAll('.message-row') as NodeListOf<HTMLElement>
+    );
+    expect(rows.length).toBe(2);
+    expect(rows[0]!.querySelector('.badge-cross-project')).not.toBeNull();
+    expect(rows[1]!.querySelector('.badge-cross-project')).toBeNull();
+  });
+});

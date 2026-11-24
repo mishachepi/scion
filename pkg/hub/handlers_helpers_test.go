@@ -170,12 +170,20 @@ func (s *testLoginStore) UpdateUser(_ context.Context, user *store.User) error {
 	return nil
 }
 
+func (s *testLoginStore) LockUserRow(context.Context, string, bool) error {
+	return nil
+}
+
 func (s *testLoginStore) GetGroupBySlug(_ context.Context, _ string) (*store.Group, error) {
 	return nil, fmt.Errorf("not found")
 }
 
 func (s *testLoginStore) GetRoleDefinitionByName(_ context.Context, _ string, _ string) (*store.RoleDefinition, error) {
 	return nil, store.ErrNotFound
+}
+
+func (s *testLoginStore) ListRoleBindingsForPrincipal(_ context.Context, _ string, _ string) ([]*store.RoleBinding, error) {
+	return nil, nil
 }
 
 func newTestLoginStore() *testLoginStore {

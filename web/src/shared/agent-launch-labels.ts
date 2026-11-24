@@ -70,10 +70,19 @@ export const LAUNCH_CODE_LABELS: Readonly<Record<string, string>> = {
   project_path_not_initialized:
     'the project path on the runtime broker is not initialized as a project',
   git_config_refused: "the repository's git config sets keys agents may not be given",
+  hosted_config_refused: 'the hosted server does not allow this member-written config',
   skill_resolution_failed: 'a required skill could not be resolved',
   storage_migration_required: "the agent's storage settings must be migrated first",
   image_pull_failed: 'the agent image could not be pulled',
   invalid_image: 'the agent image reference is not valid',
+  runtime_unavailable:
+    'the container runtime is not running or could not be reached; start the container runtime and retry',
+  image_lacks_netns_setup:
+    'the agent image does not support runtime-managed metadata interception required by this broker; update the agent image to match the broker, or set the metadata mode to passthrough',
+  firewall_requires_metadata_interception:
+    'the init firewall (SCION_INIT_FIREWALL) requires metadata mode block or assign on Docker/Podman (firewall-only mode is not supported)',
+  podman_host_gateway_unsupported:
+    'podman does not support --add-host host-gateway; upgrade to Podman 4.7 or newer',
   container_config: 'the agent container could not be configured',
   crash_loop: 'the agent container keeps crashing on start',
   init_container_failed: 'an init container of the agent pod failed',

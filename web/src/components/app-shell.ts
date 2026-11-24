@@ -21,14 +21,13 @@
  * Uses Shoelace components for UI and integrates with shared Scion components.
  */
 
-import { LitElement, html, css, type TemplateResult } from 'lit';
+import { LitElement, html, css, nothing, type TemplateResult } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import { keyed } from 'lit/directives/keyed.js';
 
 // Import shared components
 import './shared/nav.js';
 import './shared/header.js';
-import './shared/breadcrumb.js';
 import type { User } from '../shared/types.js';
 import type { AccessDeniedDetail } from '../client/api.js';
 import { showAccessDeniedToast } from '../utils/access-denied.js';
@@ -36,7 +35,7 @@ import { performLogout } from '../utils/auth.js';
 import { setDocumentTitle, PAGE_TITLE_EVENT } from '../client/page-title.js';
 import type { PageTitleDetail } from '../client/page-title.js';
 import { enterAppFrame, exitAppFrame } from './shared/app-frame.js';
-import { decisionsEnabled, isFeatureEnabled } from '../utils/feature-flags.js';
+import { agentSecretsEnabled, decisionsEnabled, isFeatureEnabled } from '../utils/feature-flags.js';
 import { ARTIFACTS_FLAG } from '../client/artifacts-flag.js';
 import {
   TestHubBannerController,
@@ -44,6 +43,27 @@ import {
   testHubBannerStyles,
 } from './shared/test-hub-banner.js';
 import { renderTestIdentityChip, testIdentityChipStyles } from './shared/test-identity-chip.js';
+
+type ViewAsMemberBannerModule = typeof import('./shared/view-as-member-banner.js');
+let viewAsMemberBannerModule: ViewAsMemberBannerModule | null = null;
+let viewAsMemberBannerPromise: Promise<ViewAsMemberBannerModule> | null = null;
+
+function loadViewAsMemberBanner(): Promise<ViewAsMemberBannerModule> {
+  if (viewAsMemberBannerModule) return Promise.resolve(viewAsMemberBannerModule);
+  if (!viewAsMemberBannerPromise) {
+    const load = import('./shared/view-as-member-banner.js')
+      .then((mod) => {
+        viewAsMemberBannerModule = mod;
+        return mod;
+      })
+      .catch((err) => {
+        if (viewAsMemberBannerPromise === load) viewAsMemberBannerPromise = null;
+        throw err;
+      });
+    viewAsMemberBannerPromise = load;
+  }
+  return viewAsMemberBannerPromise;
+}
 
 /**
  * Page title configuration
@@ -59,8 +79,10 @@ const PAGE_TITLES: Record<string, string> = {
   '/admin/users': 'Users',
   '/admin/groups': 'Groups',
   '/admin/server-config': 'Server Config',
+  '/admin/branding': 'Branding',
   '/admin/federation': 'Federation',
   '/admin/integrations': 'Integrations',
+  '/admin/system-one': 'System One Providers',
   '/admin/roles': 'Roles',
   '/admin/role-bindings': 'Role Bindings',
   '/admin/quotas': 'Quotas',
@@ -93,6 +115,9 @@ export class ScionApp extends LitElement {
 
   @state()
   _sidebarCollapsed = false;
+
+  @state()
+  private _viewAsMemberBanner: ViewAsMemberBannerModule | null = viewAsMemberBannerModule;
 
   /** Bound listener references for cleanup */
   private _accessDeniedHandler = this.handleAccessDenied.bind(this);
@@ -277,6 +302,15 @@ export class ScionApp extends LitElement {
       // Retry a status fetch that failed earlier; a no-op once it is known.
       this._testHubBanner.ensure();
     }
+    if (changedProperties.has('user') && this.user?.viewAsMember && !this._viewAsMemberBanner) {
+      void loadViewAsMemberBanner()
+        .then((mod) => {
+          this._viewAsMemberBanner = mod;
+        })
+        .catch((err: unknown) => {
+          console.error('Failed to load View as member banner:', err);
+        });
+    }
   }
 
   /**
@@ -325,7 +359,10 @@ export class ScionApp extends LitElement {
         class="mobile-drawer"
         ?open=${this._drawerOpen}
         placement="start"
-        @sl-hide=${(): void => this.handleDrawerClose()}
+        @sl-hide=${(e: Event): void => {
+          if (e.target !== e.currentTarget) return;
+          this.handleDrawerClose();
+        }}
       >
         <scion-nav
           .user=${this.user}
@@ -340,6 +377,11 @@ export class ScionApp extends LitElement {
         <!-- Test-hub banner: keyed on the path, so every navigation renders
              a fresh element even if the previous one was removed. -->
         ${keyed(this.currentPath, renderTestHubBanner(this._testHubBanner.status))}
+        ${this.user?.viewAsMember && this._viewAsMemberBanner
+          ? html`<style>
+                ${this._viewAsMemberBanner.viewAsMemberBannerStyles.cssText}</style
+              >${this._viewAsMemberBanner.renderViewAsMemberBanner(this.user)}`
+          : nothing}
         ${renderTestIdentityChip(this.user)}
         <scion-header
           .user=${this.user}
@@ -383,6 +425,9 @@ export class ScionApp extends LitElement {
     }
     if (path.match(/^\/projects\/[^/]+\/decisions$/)) {
       return decisionsEnabled() ? 'Decisions' : 'Page Not Found';
+    }
+    if (path.match(/^\/secret-requests\/[^/]+$/)) {
+      return agentSecretsEnabled() ? 'Secret Request' : 'Page Not Found';
     }
     if (path.match(/^\/projects\/[^/]+\/metrics$/)) {
       return 'Project Metrics';

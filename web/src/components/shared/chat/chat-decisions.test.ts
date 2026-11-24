@@ -23,7 +23,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { DecisionView } from '../../../shared/types.js';
 import type { DecisionAnsweredDetail } from '../../../client/decision-prompts.js';
+import { TOUCH_PRIMARY_QUERY } from '../../../utils/input-modality.js';
 import { getMarkdownRenderer } from '../../../utils/markdown.js';
+import { elementStyleRules } from '../../pages/__fixtures__/css-rules.js';
 
 const apiFetch = vi.hoisted(() => vi.fn<(path: string, init?: RequestInit) => Promise<Response>>());
 const showToast = vi.hoisted(() => vi.fn());
@@ -117,6 +119,7 @@ beforeEach(() => {
 
 afterEach(() => {
   document.body.innerHTML = '';
+  vi.unstubAllGlobals();
 });
 
 describe('pending', () => {
@@ -155,6 +158,28 @@ describe('pending', () => {
     const el = await mount([noDefault()]);
     expect(card(el).hasAttribute('aria-describedby')).toBe(false);
     expect(root(el).querySelector('.hint')).toBeNull();
+  });
+
+  it('omits the Enter hint and aria-describedby on touch-primary devices', async () => {
+    vi.stubGlobal(
+      'matchMedia',
+      vi.fn((query: string) => ({
+        matches: query === TOUCH_PRIMARY_QUERY,
+        media: query,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      }))
+    );
+    const el = await mount([view()]);
+    expect(card(el).hasAttribute('aria-describedby')).toBe(false);
+    expect(root(el).querySelector('.hint')).toBeNull();
+  });
+
+  it('hides the Enter hint via CSS on small viewports and touch-primary devices', () => {
+    const rules = elementStyleRules('scion-chat-decisions');
+    expect(
+      rules.get('@media (max-width: 768px), (hover: none) and (pointer: coarse) .hint')
+    ).toContain('display: none');
   });
 
   it('stacks choices as rows with descriptions when any choice has one', async () => {
@@ -1142,6 +1167,14 @@ describe('single Other free-form option (ptone/scion#8152)', () => {
     await settle(el2);
     expect(root(el2).querySelector('.editor')).toBeNull();
     expect(button(el2, '$other').hasAttribute('disabled')).toBe(true);
+    // Reopening on an open row proves the draft itself was cleared, not just hidden.
+    el2.decisions = [viewWithOther({ status: 'pending' })];
+    await settle(el2);
+    button(el2, '$other').click();
+    await settle(el2);
+    expect(
+      root(el2).querySelector<HTMLElement & { value: string }>('.editor sl-input')?.value
+    ).toBe('');
 
     const el3 = await mount([viewWithOther()]);
     button(el3, '$other').click();
@@ -1151,6 +1184,13 @@ describe('single Other free-form option (ptone/scion#8152)', () => {
     await settle(el3);
     expect(root(el3).querySelector('.editor')).toBeNull();
     expect(button(el3, '$other').hasAttribute('disabled')).toBe(true);
+    el3.decisions = [viewWithOther({ status: 'pending' })];
+    await settle(el3);
+    button(el3, '$other').click();
+    await settle(el3);
+    expect(
+      root(el3).querySelector<HTMLElement & { value: string }>('.editor sl-input')?.value
+    ).toBe('');
   });
 
   it('renders stacked layout (O4) with 1 fixed choice and Other inline description + inset editor', async () => {
@@ -1240,5 +1280,778 @@ describe('single Other free-form option (ptone/scion#8152)', () => {
     expect(root(el).querySelector('.editor')).toBeNull();
     expect(button(el, 'europe-west1').getAttribute('variant')).toBe('primary');
     expect(foot(el)).toMatch(/^Answered by Bob · /);
+  });
+
+  it('supports interpreted Other confirm bar, text edit override, fixed override, and non-owner read-only (O9)', async () => {
+    const interpretedOther = viewWithOther({
+      status: 'decided',
+      decision: {
+        choiceId: '$other',
+        label: 'Another region',
+        otherText: 'europe-west4',
+        answeredByUserId: 'u-me',
+        answeredByName: 'Alice',
+        provenance: 'agent_interpreted',
+        outcome: 'answer',
+        sourceMessageId: 'src-1',
+        surface: 'slack',
+        responseMessageId: 'resp-interp-1',
+        at: '2026-11-20T03:00:00Z',
+      },
+    });
+
+    const el = await mount([interpretedOther]);
+    const otherBtn = button(el, '$other');
+    expect(otherBtn.getAttribute('variant')).toBe('primary');
+    expect(otherBtn.hasAttribute('outline')).toBe(true);
+    const input = root(el).querySelector<HTMLElement & { value: string }>('.editor sl-input')!;
+    expect(input).not.toBeNull();
+    expect(input.value).toBe('europe-west4');
+    expect(
+      root(el).querySelector('[data-action="confirm"]')?.textContent?.replace(/\s+/g, ' ').trim()
+    ).toBe('Confirm “Another region”');
+
+    // Editing the text switches from Confirm to Change answer bar.
+    typeIntoOther(el, 'europe-west4 after freeze');
+    await settle(el);
+    const bar = root(el).querySelector('.confirmbar');
+    expect(bar).not.toBeNull();
+    expect(bar?.textContent).toContain(
+      'Change your answer from Another region “europe-west4” to Another region “europe-west4 after freeze”?'
+    );
+
+    // Cancel reverts draft back to recorded text and restores Confirm.
+    root(el).querySelector<HTMLElement>('[data-action="cancel-change"]')!.click();
+    await settle(el);
+    expect(input.value).toBe('europe-west4');
+    expect(root(el).querySelector('.confirmbar')).toBeNull();
+    expect(root(el).querySelector('[data-action="confirm"]')).not.toBeNull();
+
+    // Clicking a fixed choice stages override from Other to fixed.
+    button(el, 'europe-west1').click();
+    await settle(el);
+    expect(root(el).querySelector('.confirmbar')?.textContent).toContain(
+      'Change your answer from Another region “europe-west4” to europe-west1?'
+    );
+    expect(root(el).querySelector('.editor')).toBeNull();
+    expect(root(el).querySelector('.otext')?.textContent).toBe('“europe-west4”');
+
+    // Clicking Other returns to editor; edit and submit override.
+    button(el, '$other').click();
+    await settle(el);
+    typeIntoOther(el, 'asia-east1');
+    await settle(el);
+    apiFetch.mockResolvedValueOnce(
+      res(200, {
+        decision: viewWithOther({
+          status: 'decided',
+          decision: {
+            choiceId: '$other',
+            label: 'Another region',
+            otherText: 'asia-east1',
+            previousChoiceLabel: 'Another region',
+            previousOtherText: 'europe-west4',
+            answeredByUserId: 'u-me',
+            answeredByName: 'Alice',
+            provenance: 'direct',
+            outcome: 'override',
+            surface: 'native',
+            responseMessageId: 'resp-over-1',
+            at: '2026-11-20T03:05:00Z',
+          },
+        }),
+        responseMessageId: 'resp-over-1',
+      })
+    );
+    root(el).querySelector<HTMLElement>('[data-action="confirm-change"]')!.click();
+    await settle(el);
+    expect(JSON.parse(apiFetch.mock.calls[0]![1]?.body as string)).toEqual({
+      choice_id: '$other',
+      other_text: 'asia-east1',
+      idempotency_key: expect.any(String),
+    });
+    expect(foot(el)).toContain('changed from the interpreted answer Another region “europe-west4”');
+
+    // Non-owner sees disabled robot button and static .otext, no editor.
+    const elOtherUser = await mount([interpretedOther]);
+    elOtherUser.currentUserId = 'u-other';
+    await settle(elOtherUser);
+    expect(root(elOtherUser).querySelector('.editor')).toBeNull();
+    expect(root(elOtherUser).querySelector('.otext')?.textContent).toBe('“europe-west4”');
+    expect(button(elOtherUser, '$other').hasAttribute('disabled')).toBe(true);
+
+    // Clicking Confirm on an unchanged interpreted Other posts choice_id=$other and recorded other_text.
+    const elConfirm = await mount([interpretedOther]);
+    apiFetch.mockClear();
+    apiFetch.mockResolvedValueOnce(
+      res(200, {
+        decision: viewWithOther({
+          status: 'decided',
+          decision: {
+            choiceId: '$other',
+            label: 'Another region',
+            otherText: 'europe-west4',
+            answeredByUserId: 'u-me',
+            answeredByName: 'Alice',
+            provenance: 'direct',
+            outcome: 'confirm',
+            surface: 'native',
+            responseMessageId: 'resp-conf-1',
+            at: '2026-11-20T03:04:00Z',
+          },
+        }),
+        responseMessageId: 'resp-conf-1',
+      })
+    );
+    root(elConfirm).querySelector<HTMLElement>('[data-action="confirm"]')!.click();
+    await settle(elConfirm);
+    expect(JSON.parse(apiFetch.mock.calls[0]![1]?.body as string)).toEqual({
+      choice_id: '$other',
+      other_text: 'europe-west4',
+      idempotency_key: expect.any(String),
+    });
+
+    // Leaving actionable interpreted-Other state resets the seeded draft so a subsequent
+    // pending row opens with an empty editor (kills willUpdate interpretedOtherSeedKey mutant).
+    const elSeedReset = await mount([interpretedOther]);
+    typeIntoOther(elSeedReset, 'stale-interpreted-draft');
+    await settle(elSeedReset);
+    elSeedReset.decisions = [
+      viewWithOther({ rowId: 'row-pending-after-interp', status: 'pending' }),
+    ];
+    await settle(elSeedReset);
+    button(elSeedReset, '$other').click();
+    await settle(elSeedReset);
+    expect(
+      root(elSeedReset).querySelector<HTMLElement & { value: string }>('.editor sl-input')!.value
+    ).toBe('');
+  });
+
+  it('allows changing an interpreted fixed choice to Other from the single card', async () => {
+    const interpretedFixed = viewWithOther({
+      status: 'decided',
+      decision: {
+        choiceId: 'us-central1',
+        label: 'us-central1',
+        answeredByUserId: 'u-me',
+        answeredByName: 'Alice',
+        provenance: 'agent_interpreted',
+        outcome: 'answer',
+        sourceMessageId: 'src-2',
+        surface: 'slack',
+        responseMessageId: 'resp-interp-2',
+        at: '2026-11-20T03:00:00Z',
+      },
+    });
+
+    const el = await mount([interpretedFixed]);
+    const otherBtn = button(el, '$other');
+    expect(otherBtn.hasAttribute('disabled')).toBe(false);
+    otherBtn.click();
+    await settle(el);
+
+    expect(root(el).querySelector('.editor')).not.toBeNull();
+    const changeBtn = root(el).querySelector<HTMLElement>('[data-action="confirm-change"]')!;
+    expect(changeBtn.hasAttribute('disabled')).toBe(true);
+
+    // Typing a draft and then clicking a fixed choice drops the Other draft so re-opening
+    // Other starts empty (kills onSingleChoiceClick interpreted-fixed draft-reset mutant).
+    typeIntoOther(el, 'stale-fixed-draft');
+    await settle(el);
+    button(el, 'europe-west1').click();
+    await settle(el);
+    expect(root(el).querySelector('.editor')).toBeNull();
+    button(el, '$other').click();
+    await settle(el);
+    expect(root(el).querySelector<HTMLElement & { value: string }>('.editor sl-input')!.value).toBe(
+      ''
+    );
+
+    typeIntoOther(el, 'me-central2');
+    await settle(el);
+    expect(changeBtn.hasAttribute('disabled')).toBe(false);
+    expect(root(el).querySelector('.confirmbar')?.textContent).toContain(
+      'Change your answer from us-central1 to Another region “me-central2”?'
+    );
+
+    apiFetch.mockResolvedValueOnce(
+      res(200, {
+        decision: viewWithOther({
+          status: 'decided',
+          decision: {
+            choiceId: '$other',
+            label: 'Another region',
+            otherText: 'me-central2',
+            previousChoiceLabel: 'us-central1',
+            answeredByUserId: 'u-me',
+            answeredByName: 'Alice',
+            provenance: 'direct',
+            outcome: 'override',
+            surface: 'native',
+            responseMessageId: 'resp-over-2',
+            at: '2026-11-20T03:06:00Z',
+          },
+        }),
+        responseMessageId: 'resp-over-2',
+      })
+    );
+    changeBtn.click();
+    await settle(el);
+    expect(JSON.parse(apiFetch.mock.calls[0]![1]?.body as string)).toEqual({
+      choice_id: '$other',
+      other_text: 'me-central2',
+      idempotency_key: expect.any(String),
+    });
+    expect(root(el).querySelector('.otext')?.textContent).toBe('“me-central2”');
+  });
+});
+
+describe('set card Other free-form answers (ptone/scion#8153, O5–O7)', () => {
+  function setWithOther(): DecisionView[] {
+    return [
+      view({
+        rowId: 'r1',
+        key: 'region',
+        ref: 'region',
+        question: 'Which region for the canary?',
+        defaultChoiceId: 'us-central1',
+        choices: [
+          { id: 'us-central1', label: 'us-central1' },
+          { id: 'europe-west1', label: 'europe-west1' },
+        ],
+        other: { label: 'Another region', placeholder: 'e.g. europe-west4' },
+      }),
+      view({
+        rowId: 'r2',
+        key: 'notify',
+        ref: 'notify',
+        question: 'Notify the release channel?',
+        choices: [
+          { id: 'yes', label: 'Yes' },
+          { id: 'no', label: 'No' },
+        ],
+      }),
+      view({
+        rowId: 'r3',
+        key: 'proceed',
+        ref: 'proceed',
+        question: 'Tag `v0.9` now?',
+        choices: [{ id: 'yes', label: 'Yes' }],
+        other: { label: 'Something else' },
+      }),
+    ];
+  }
+
+  function rowEl(el: ScionChatDecisions, rowId: string): HTMLElement {
+    const row = root(el).querySelector<HTMLElement>(`.row[data-row="${rowId}"]`);
+    if (!row) throw new Error(`no row ${rowId}`);
+    return row;
+  }
+
+  function rowChoice(el: ScionChatDecisions, rowId: string, choiceId: string): HTMLElement {
+    const btn = rowEl(el, rowId).querySelector<HTMLElement>(`[data-choice="${choiceId}"]`);
+    if (!btn) throw new Error(`no choice ${choiceId} in row ${rowId}`);
+    return btn;
+  }
+
+  function typeIntoSetOther(el: ScionChatDecisions, rowId: string, value: string): HTMLElement {
+    const input = rowEl(el, rowId).querySelector<HTMLElement & { value: string }>(
+      '.editor sl-input'
+    );
+    if (!input) throw new Error(`no set other sl-input in row ${rowId}`);
+    input.value = value;
+    input.dispatchEvent(new CustomEvent('sl-input', { bubbles: true, composed: true }));
+    return input;
+  }
+
+  function submitBtn(el: ScionChatDecisions): HTMLElement {
+    const btn = root(el).querySelector<HTMLElement>('.card-foot sl-button.submit');
+    if (!btn) throw new Error('no submit button');
+    return btn;
+  }
+
+  function submitHint(el: ScionChatDecisions): string {
+    return root(el).querySelector('.card-foot sl-tooltip')?.getAttribute('content') ?? '';
+  }
+
+  it('O5–O7: per-row Other editor without Send/Cancel, remaining gating, draft preservation across choice switch, submit and literal display', async () => {
+    const el = await mount(setWithOther());
+
+    // Row r2 has no Other button; r1 and r3 do.
+    expect(rowEl(el, 'r1').querySelector('[data-choice="$other"]')).not.toBeNull();
+    expect(rowEl(el, 'r2').querySelector('[data-choice="$other"]')).toBeNull();
+    expect(rowEl(el, 'r3').querySelector('[data-choice="$other"]')).not.toBeNull();
+
+    // Pick fixed answers on r2 and r3, and Other on r1.
+    rowChoice(el, 'r2', 'yes').click();
+    rowChoice(el, 'r3', 'yes').click();
+    rowChoice(el, 'r1', '$other').click();
+    await settle(el);
+
+    // Editor opens on r1 with no per-row Send/Cancel buttons.
+    const r1Editor = rowEl(el, 'r1').querySelector('.editor');
+    expect(r1Editor).not.toBeNull();
+    expect(r1Editor?.querySelector('[data-action="send-other"]')).toBeNull();
+    expect(r1Editor?.querySelector('[data-action="cancel-other"]')).toBeNull();
+    expect(r1Editor?.querySelector('.set-other-help')?.textContent?.trim()).toBe(
+      'Type your answer to include it in the submit.'
+    );
+    expect(rowChoice(el, 'r1', '$other').getAttribute('aria-pressed')).toBe('true');
+
+    // Empty Other counts as 1 remaining, Submit disabled, hint names region.
+    expect(root(el).querySelector('.counter')?.textContent?.trim()).toBe('1 remaining');
+    expect(submitBtn(el).hasAttribute('disabled')).toBe(true);
+    expect(submitHint(el)).toBe('Choose or type an answer for region first');
+    const srHintId = submitBtn(el).getAttribute('aria-describedby');
+    expect(srHintId).toBeTruthy();
+    expect(root(el).querySelector(`#${srHintId}`)?.textContent?.trim()).toBe(
+      'Choose or type an answer for region first'
+    );
+
+    // Whitespace-only still counts as remaining.
+    typeIntoSetOther(el, 'r1', '   ');
+    await el.updateComplete;
+    expect(submitBtn(el).hasAttribute('disabled')).toBe(true);
+    expect(root(el).querySelector('.counter')?.textContent?.trim()).toBe('1 remaining');
+
+    // Typing text makes 0 remaining and enables Submit.
+    const literal = 'eu-"west4" *bold* <b>hi</b> @release-bot';
+    typeIntoSetOther(el, 'r1', `  ${literal}  `);
+    await el.updateComplete;
+    expect(root(el).querySelector('.counter')?.textContent?.trim()).toBe('0 remaining');
+    expect(submitBtn(el).hasAttribute('disabled')).toBe(false);
+    expect(rowEl(el, 'r1').querySelector('.set-other-help')).toBeNull();
+
+    // Switching r1 to a fixed choice hides the editor but keeps the draft in memory.
+    rowChoice(el, 'r1', 'europe-west1').click();
+    await settle(el);
+    expect(rowEl(el, 'r1').querySelector('.editor')).toBeNull();
+    expect(rowChoice(el, 'r1', '$other').getAttribute('aria-pressed')).toBe('false');
+
+    // Switching back to Other restores the draft.
+    rowChoice(el, 'r1', '$other').click();
+    await settle(el);
+    expect(
+      rowEl(el, 'r1').querySelector<HTMLElement & { value: string }>('.editor sl-input')?.value
+    ).toBe(`  ${literal}  `);
+
+    // Also test counter at 160, 180, and >200 runes (astral emoji = 1 rune) on r3.
+    rowChoice(el, 'r3', '$other').click();
+    await settle(el);
+    typeIntoSetOther(el, 'r3', '🚀'.repeat(160));
+    await el.updateComplete;
+    expect(rowEl(el, 'r3').querySelector('.cnt')?.textContent?.trim()).toBe('160 / 200');
+    expect(submitBtn(el).hasAttribute('disabled')).toBe(false);
+
+    typeIntoSetOther(el, 'r3', '🚀'.repeat(201));
+    await el.updateComplete;
+    expect(rowEl(el, 'r3').querySelector('.cnt.over')?.textContent?.trim()).toBe('201 / 200');
+    expect(submitBtn(el).hasAttribute('disabled')).toBe(true);
+    expect(submitHint(el)).toBe('Shorten the answer for proceed');
+    const overHintId = submitBtn(el).getAttribute('aria-describedby');
+    expect(overHintId).toBeTruthy();
+    expect(root(el).querySelector(`#${overHintId}`)?.textContent?.trim()).toBe(
+      'Shorten the answer for proceed'
+    );
+
+    typeIntoSetOther(el, 'r3', 'Wait until Monday');
+    await el.updateComplete;
+    expect(submitBtn(el).hasAttribute('disabled')).toBe(false);
+
+    // Submit posts trimmed other_text only on $other rows.
+    const decided = setWithOther().map((d, idx) => ({
+      ...d,
+      status: 'decided',
+      decision:
+        idx === 0
+          ? {
+              choiceId: '$other',
+              label: 'Another region',
+              otherText: literal,
+              answeredByUserId: 'u-alice',
+              answeredByName: 'Alice',
+              provenance: 'direct',
+              surface: 'native',
+              responseMessageId: 'resp-set-1',
+              batchId: 'batch-1',
+              at: '2026-11-20T01:00:00Z',
+            }
+          : idx === 1
+            ? {
+                choiceId: 'yes',
+                label: 'Yes',
+                answeredByUserId: 'u-alice',
+                answeredByName: 'Alice',
+                provenance: 'direct',
+                surface: 'native',
+                responseMessageId: 'resp-set-1',
+                batchId: 'batch-1',
+                at: '2026-11-20T01:00:00Z',
+              }
+            : {
+                choiceId: '$other',
+                label: 'Something else',
+                otherText: 'Wait until Monday',
+                answeredByUserId: 'u-alice',
+                answeredByName: 'Alice',
+                provenance: 'direct',
+                surface: 'native',
+                responseMessageId: 'resp-set-1',
+                batchId: 'batch-1',
+                at: '2026-11-20T01:00:00Z',
+              },
+    }));
+    apiFetch.mockResolvedValueOnce(
+      res(200, { decisions: decided, responseMessageId: 'resp-set-1', batchId: 'batch-1' })
+    );
+    submitBtn(el).click();
+    await settle(el);
+
+    expect(apiFetch).toHaveBeenCalledTimes(1);
+    const [url, init] = apiFetch.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/v1/decision-prompts/m1/answers');
+    expect(JSON.parse(init.body as string)).toMatchObject({
+      answers: [
+        { decision_row_id: 'r1', choice_id: '$other', other_text: literal },
+        { decision_row_id: 'r2', choice_id: 'yes' },
+        { decision_row_id: 'r3', choice_id: '$other', other_text: 'Wait until Monday' },
+      ],
+    });
+
+    // O7: chosen Other button has no ellipsis, .otext renders literal text without HTML parsing, drafts cleared.
+    expect(rowChoice(el, 'r1', '$other').textContent?.trim()).toBe('Another region');
+    const otext = rowEl(el, 'r1').querySelector('.otext');
+    expect(otext?.textContent).toBe(`“${literal}”`);
+    expect(otext?.children.length).toBe(0);
+    expect((el as unknown as { setOtherDrafts: Map<string, string> }).setOtherDrafts.size).toBe(0);
+  });
+
+  it('preselectRecommendedChoices never selects Other', async () => {
+    const { setPreselectRecommendedChoices } =
+      await import('../../../client/decision-preferences.js');
+    setPreselectRecommendedChoices(true);
+    try {
+      const ds = setWithOther();
+      // Even if a malformed payload carried defaultChoiceId: '$other', never pick Other.
+      ds[2] = { ...ds[2]!, defaultChoiceId: '$other' };
+      const el = await mount(ds);
+
+      expect(rowChoice(el, 'r1', 'us-central1').getAttribute('aria-pressed')).toBe('true');
+      expect(rowChoice(el, 'r1', '$other').getAttribute('aria-pressed')).toBe('false');
+      expect(rowChoice(el, 'r3', '$other').getAttribute('aria-pressed')).toBe('false');
+      expect(rowEl(el, 'r3').querySelector('.editor')).toBeNull();
+    } finally {
+      setPreselectRecommendedChoices(false);
+    }
+  });
+
+  it('409 answer_set_changed keeps drafts of still-open rows and clears drafts of closed rows (not just hides)', async () => {
+    const el = await mount(setWithOther());
+
+    // Type drafts on both r1 and r3, and pick fixed choice on r2.
+    rowChoice(el, 'r1', '$other').click();
+    rowChoice(el, 'r2', 'yes').click();
+    rowChoice(el, 'r3', '$other').click();
+    await settle(el);
+    typeIntoSetOther(el, 'r1', 'draft-for-r1');
+    typeIntoSetOther(el, 'r3', 'draft-for-r3');
+    await el.updateComplete;
+
+    // 409 answer_set_changed: r3 was replaced (no longer open), r1 and r2 are still open.
+    const fresh = setWithOther();
+    fresh[2] = {
+      ...fresh[2]!,
+      status: 'replaced',
+      replacedBy: { rowId: 'r3-v2', messageId: 'm2', version: 2, at: '2026-11-20T01:05:00Z' },
+    };
+    apiFetch.mockResolvedValueOnce(
+      res(409, {
+        error: {
+          code: 'answer_set_changed',
+          message: 'the decisions to answer changed',
+          details: { decisions: fresh, reasons: { r3: 'replaced' } },
+        },
+      })
+    );
+
+    submitBtn(el).click();
+    await settle(el);
+
+    // Real assertion on internal draft map: r1 kept, r3 deleted (cleared, not just hidden).
+    const drafts = (el as unknown as { setOtherDrafts: Map<string, string> }).setOtherDrafts;
+    expect(drafts.get('r1')).toBe('draft-for-r1');
+    expect(drafts.has('r3')).toBe(false);
+    expect(
+      rowEl(el, 'r1').querySelector<HTMLElement & { value: string }>('.editor sl-input')?.value
+    ).toBe('draft-for-r1');
+    expect(rowEl(el, 'r3').querySelector('.editor')).toBeNull();
+
+    // Also verify SSE/prop update withdrawing r1 clears r1's draft too.
+    el.decisions = fresh.map((d) =>
+      d.rowId === 'r1'
+        ? { ...d, status: 'withdrawn', withdrawn: { at: '2026-11-20T01:06:00Z', byName: 'bot' } }
+        : d
+    );
+    await settle(el);
+    expect(
+      (el as unknown as { setOtherDrafts: Map<string, string> }).setOtherDrafts.has('r1')
+    ).toBe(false);
+  });
+
+  it('renders stacked layout with Other description and inset editor on a set row', async () => {
+    const ds = setWithOther();
+    ds[0] = {
+      ...ds[0]!,
+      other: {
+        label: 'Another region',
+        description: 'Any `GCP` region code',
+        placeholder: 'e.g. europe-west4',
+      },
+    };
+    const el = await mount(ds);
+    await settle(el);
+
+    expect(rowEl(el, 'r1').querySelector('.choices')?.classList.contains('stack')).toBe(true);
+    const otherOpt = rowChoice(el, 'r1', '$other');
+    expect(otherOpt.classList.contains('other-opt')).toBe(true);
+    expect(otherOpt.querySelector('.desc code')?.textContent).toBe('GCP');
+
+    otherOpt.click();
+    await settle(el);
+    expect(rowEl(el, 'r1').querySelector('.opt.sel .editor.inset sl-input')).not.toBeNull();
+    expect(rowEl(el, 'r1').querySelector('[data-action="send-other"]')).toBeNull();
+  });
+
+  it('prefills interpreted Other row selection and draft on a set card and submits confirm/override', async () => {
+    const base = setWithOther();
+    const ds: DecisionView[] = [
+      {
+        ...base[0]!,
+        status: 'decided',
+        decision: {
+          choiceId: '$other',
+          label: 'Another region',
+          otherText: 'europe-west4',
+          answeredByUserId: 'u-me',
+          answeredByName: 'Alice',
+          provenance: 'agent_interpreted',
+          outcome: 'answer',
+          sourceMessageId: 'src-set-1',
+          surface: 'slack',
+          responseMessageId: 'resp-set-interp-1',
+          at: '2026-11-20T03:00:00Z',
+        },
+      },
+      {
+        ...base[2]!,
+        rowId: 'r2',
+        key: 'window',
+        status: 'decided',
+        decision: {
+          choiceId: '$other',
+          label: 'Other',
+          otherText: 'after 6 PM',
+          answeredByUserId: 'u-me',
+          answeredByName: 'Alice',
+          provenance: 'agent_interpreted',
+          outcome: 'answer',
+          sourceMessageId: 'src-set-1',
+          surface: 'slack',
+          responseMessageId: 'resp-set-interp-1',
+          at: '2026-11-20T03:00:00Z',
+        },
+      },
+    ];
+
+    const el = await mount(ds);
+    await settle(el);
+
+    // Both rows pre-select $other (selectionOf) and pre-fill their inline editors (setRowOtherDraft).
+    expect(rowChoice(el, 'r1', '$other').getAttribute('aria-pressed')).toBe('true');
+    expect(rowChoice(el, 'r2', '$other').getAttribute('aria-pressed')).toBe('true');
+    expect(
+      rowEl(el, 'r1').querySelector<HTMLElement & { value: string }>('.editor sl-input')?.value
+    ).toBe('europe-west4');
+    expect(
+      rowEl(el, 'r2').querySelector<HTMLElement & { value: string }>('.editor sl-input')?.value
+    ).toBe('after 6 PM');
+    expect(submitBtn(el).hasAttribute('disabled')).toBe(false);
+
+    // Edit r2 while keeping r1 unchanged, then submit the set.
+    typeIntoSetOther(el, 'r2', 'after 8 PM');
+    await settle(el);
+
+    apiFetch.mockResolvedValueOnce(
+      res(200, {
+        decisions: ds.map((d) => ({
+          ...d,
+          decision: {
+            ...d.decision!,
+            otherText: d.rowId === 'r2' ? 'after 8 PM' : 'europe-west4',
+            provenance: 'direct',
+            outcome: d.rowId === 'r2' ? 'override' : 'confirm',
+          },
+        })),
+        responseMessageId: 'resp-set-sub-1',
+      })
+    );
+
+    submitBtn(el).click();
+    await settle(el);
+
+    const posted = JSON.parse(apiFetch.mock.calls[0]![1]?.body as string) as {
+      answers: Array<{ decision_row_id: string; choice_id: string; other_text?: string }>;
+      idempotency_key: string;
+    };
+    expect(posted.answers).toEqual([
+      { decision_row_id: 'r1', choice_id: '$other', other_text: 'europe-west4' },
+      { decision_row_id: 'r2', choice_id: '$other', other_text: 'after 8 PM' },
+    ]);
+    expect(posted.idempotency_key).toEqual(expect.any(String));
+  });
+});
+
+describe('single-choice confirmation decisions (ptone/scion#8786)', () => {
+  function singleChoiceView(over: Partial<DecisionView> = {}): DecisionView {
+    const { defaultChoiceId: _unused, ...base } = view({
+      key: 'confirm-deploy',
+      ref: 'confirm-deploy',
+      question: 'Approve production deploy?',
+      choices: [{ id: 'approve', label: 'Approved' }],
+    });
+    return { ...base, ...over };
+  }
+
+  it('renders a pending single-choice decision as one filled primary button and submits on click', async () => {
+    const d = singleChoiceView();
+    const el = await mount([d]);
+    await settle(el);
+
+    const buttons = root(el).querySelectorAll('[data-choice]');
+    expect(buttons.length).toBe(1);
+    const btn = button(el, 'approve');
+    expect(btn.getAttribute('variant')).toBe('primary');
+    expect(btn.hasAttribute('outline')).toBe(false);
+    expect(btn.hasAttribute('disabled')).toBe(false);
+    expect(btn.textContent?.trim()).toBe('Approved');
+    expect(foot(el)).toBe('Awaiting your answer');
+
+    apiFetch.mockResolvedValueOnce(
+      res(200, {
+        decision: singleChoiceView({
+          status: 'decided',
+          decision: {
+            choiceId: 'approve',
+            label: 'Approved',
+            answeredByUserId: 'u-me',
+            answeredByName: 'Alice',
+            provenance: 'direct',
+            surface: 'web',
+            responseMessageId: 'resp-confirm-1',
+            at: '2026-11-21T19:00:00Z',
+          },
+        }),
+        responseMessageId: 'resp-confirm-1',
+      })
+    );
+
+    btn.click();
+    await settle(el);
+
+    expect(apiFetch).toHaveBeenCalledTimes(1);
+    expect(button(el, 'approve').getAttribute('variant')).toBe('primary');
+    expect(button(el, 'approve').hasAttribute('data-readonly')).toBe(true);
+    expect(foot(el)).toContain('Answered by you');
+  });
+
+  it('keeps the button filled primary with default set and shows the concise Enter hint', async () => {
+    const el = await mount([singleChoiceView({ defaultChoiceId: 'approve' })]);
+    await settle(el);
+
+    const btn = button(el, 'approve');
+    expect(btn.getAttribute('variant')).toBe('primary');
+    expect(btn.hasAttribute('outline')).toBe(false);
+    const hintId = card(el).getAttribute('aria-describedby');
+    expect(hintId).toBeTruthy();
+    expect(root(el).getElementById(hintId!)?.textContent?.trim()).toBe('Press Enter to confirm.');
+  });
+
+  it('renders a pending single-choice option with description as outlined row rather than chosen', async () => {
+    const el = await mount([
+      singleChoiceView({
+        choices: [{ id: 'approve', label: 'Approved', description: 'Deploy build abc1234' }],
+      }),
+    ]);
+    await settle(el);
+
+    const opt = button(el, 'approve');
+    expect(opt.classList.contains('opt')).toBe(true);
+    expect(opt.classList.contains('recd')).toBe(true);
+    expect(opt.classList.contains('chosen')).toBe(false);
+  });
+
+  it('does not treat 1 fixed choice + allow_other as a single-choice confirmation', async () => {
+    const el = await mount([singleChoiceView({ other: { label: 'Other' } })]);
+    await settle(el);
+
+    expect(button(el, 'approve').getAttribute('variant')).toBe('default');
+    expect(button(el, '$other')).toBeTruthy();
+  });
+
+  it('omits "or pick another answer" on an interpreted single-choice decision', async () => {
+    const el = await mount([
+      singleChoiceView({
+        status: 'decided',
+        decision: {
+          choiceId: 'approve',
+          label: 'Approved',
+          answeredByUserId: 'u-me',
+          answeredByName: 'Alice',
+          provenance: 'agent_interpreted',
+          outcome: 'answer',
+          sourceMessageId: 'src-1',
+          surface: 'slack',
+          responseMessageId: 'resp-interp-1',
+          at: '2026-11-21T19:00:00Z',
+        },
+      }),
+    ]);
+    await settle(el);
+
+    const confirmRow = root(el).querySelector('.confirm-row');
+    expect(confirmRow).toBeTruthy();
+    expect(confirmRow?.textContent).toContain('Confirm');
+    expect(confirmRow?.textContent).not.toContain('pick another answer');
+  });
+
+  it('renders a closed (dismissed/withdrawn) single-choice button as disabled default', async () => {
+    const el = await mount([
+      singleChoiceView({
+        status: 'withdrawn',
+        withdrawn: { at: '2026-11-21T19:05:00Z', byName: 'release-bot' },
+      }),
+    ]);
+    await settle(el);
+
+    const btn = button(el, 'approve');
+    expect(btn.getAttribute('variant')).toBe('default');
+    expect(btn.hasAttribute('disabled')).toBe(true);
+  });
+
+  it('keeps a single-choice row unselected in a set card until clicked', async () => {
+    const d1 = singleChoiceView({ rowId: 'r1', key: 'confirm-1' });
+    const d2 = { ...noDefault(), rowId: 'r2', key: 'D2' };
+    const el = await mount([d1, d2]);
+    await settle(el);
+
+    const r1Btn = root(el).querySelector<HTMLElement>('[data-row="r1"] [data-choice="approve"]')!;
+    expect(r1Btn.getAttribute('data-look')).toBe('default');
+    expect(r1Btn.getAttribute('aria-pressed')).toBe('false');
+
+    r1Btn.click();
+    await settle(el);
+
+    expect(r1Btn.getAttribute('data-look')).toBe('filled');
+    expect(r1Btn.getAttribute('aria-pressed')).toBe('true');
   });
 });

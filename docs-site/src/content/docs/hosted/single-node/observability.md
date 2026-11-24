@@ -51,11 +51,13 @@ The Scion Hub and Runtime Broker use structured logging (`slog`) with an OpenTel
 1.  **Configure Environment Variables**: Set the following on your Hub and Broker server processes:
 
     ```bash
-    # Enable OTel log forwarding
+    # Enable OTel log forwarding to an OTLP collector (for example a local
+    # OpenTelemetry Collector that forwards to Google Cloud). For direct
+    # Google Cloud Logging without a collector, use SCION_CLOUD_LOGGING=true
+    # below — monitoring.googleapis.com does not accept OTLP.
     export SCION_OTEL_LOG_ENABLED=true
-
-    # Set the GCP OTLP endpoint (standard for Cloud Trace/Logging)
-    export SCION_OTEL_ENDPOINT="monitoring.googleapis.com:443"
+    export SCION_OTEL_ENDPOINT="localhost:4317"
+    export SCION_OTEL_INSECURE=true
 
     # Specify your GCP Project ID
     export SCION_GCP_PROJECT_ID="your-project-id"
@@ -107,28 +109,32 @@ telemetry:
   enabled: true
   cloud:
     enabled: true
+    # Use GCP-native SDKs for Cloud Monitoring, Cloud Trace, and Cloud Logging.
+    # (Do not point endpoint at monitoring.googleapis.com — it does not accept OTLP.)
+    provider: gcp
     # Required when exporting to Google Cloud — without it the metrics
     # dashboard has no project to query and stays empty.
     gcp_project_id: "my-gcp-project"
-    endpoint: "monitoring.googleapis.com:443"
-    protocol: grpc
   filter:
     events:
       exclude:
         - "agent.user.prompt"
 ```
 
-See the [Orchestrator Settings Reference](/scion/reference/orchestrator-settings/#telemetry-configuration-telemetry) for the full field reference, and [Metrics & OpenTelemetry](/scion/hosted/single-node/metrics/#configuration-hierarchy) for how settings merge across scopes.
+To forward to a generic OTLP collector (such as a local host OpenTelemetry Collector) instead of using GCP-native SDKs, omit `provider: gcp` and set `endpoint` and `protocol: grpc`. See [Local Host OpenTelemetry Collector](/scion/hosted/single-node/metrics/#5-alternative-local-host-opentelemetry-collector) for a complete setup, the [Orchestrator Settings Reference](/scion/reference/orchestrator-settings/#telemetry-configuration-telemetry) for the full field reference, and [Metrics & OpenTelemetry](/scion/hosted/single-node/metrics/#configuration-hierarchy) for how settings merge across scopes.
 
 #### Via Hub Environment Variables
 
 For hosted deployments, environment variables can be set at the Project or Broker level on the Hub. These are automatically injected into every agent container.
 
 ```bash
-SCION_OTEL_ENDPOINT="monitoring.googleapis.com:443"
+# GCP-native export
+SCION_TELEMETRY_CLOUD_PROVIDER="gcp"
 SCION_GCP_PROJECT_ID="your-project-id"
 SCION_TELEMETRY_ENABLED="true"
 ```
+
+For a generic OTLP collector instead of GCP-native export, set `SCION_OTEL_ENDPOINT="host.docker.internal:4317"` and `SCION_OTEL_INSECURE="true"` (and omit `SCION_TELEMETRY_CLOUD_PROVIDER`; omit `SCION_OTEL_INSECURE` if the collector terminates TLS).
 
 #### Harness-Specific Configuration
 
@@ -245,22 +251,11 @@ To debug an agent, set `SCION_LOG_LEVEL` for it explicitly. The value uses the s
   scion start my-agent --agent-log-level info,hubsync=debug
   ```
 
-  The value is saved in the agent's applied configuration and kept on later restarts and resumes. To remove or change it, delete and re-create the agent. When the Hub reuses an agent that already exists (for example, resuming a suspended agent), it keeps the stored configuration and does not apply `--agent-log-level`; both `scion start` and `scion resume` print a warning in that case.
+  The value is saved in the agent's applied configuration and kept on later restarts and resumes. To remove or change it, delete and re-create the agent. When the Hub reuses an agent that already exists (for example, resuming a suspended agent), it keeps the stored configuration and does not apply `--agent-log-level`; `scion resume` prints a warning in that case.
 
-- **Many agents, through the Hub**: store `SCION_LOG_LEVEL` as a Hub environment variable at the scope you want. Use `--always` so it is injected without a template requesting it.
+- **In agent configuration**: add `SCION_LOG_LEVEL` to the `env` of an inline `--config` file. If you also pass `--agent-log-level`, the flag wins.
 
-  ```bash
-  # Every agent in the current project
-  scion hub env set --project --always SCION_LOG_LEVEL=debug
-
-  # Every agent you start
-  scion hub env set --always SCION_LOG_LEVEL=debug
-
-  # Turn it off again
-  scion hub env clear --project SCION_LOG_LEVEL
-  ```
-
-- **In agent configuration**: add `SCION_LOG_LEVEL` to the `env` of an inline `--config` file (a template cannot set `SCION_*` keys). A value set this way overrides the Hub scopes; `--agent-log-level` overrides it in turn.
+You cannot set `SCION_LOG_LEVEL` for many agents at once through the Hub. Names beginning with `SCION_` are [reserved](/scion/hosted/user/secrets/#reserved-names), so `scion hub env set` refuses `SCION_LOG_LEVEL` at every scope, and a template cannot set `SCION_*` keys either. Set it on each agent you want to debug.
 
 ## Telemetry Collection
 
@@ -588,7 +583,7 @@ Server maintenance operations (like `rebuild-server`, `rebuild-web`, and `pull-i
 
 ### Logs Not Appearing in GCP
 
-1.  **Verify Endpoints**: Ensure `SCION_OTEL_ENDPOINT` is set to `monitoring.googleapis.com:443`.
+1.  **Verify Provider and Destination**: For Google Cloud, verify `telemetry.cloud.provider: gcp` (`SCION_TELEMETRY_CLOUD_PROVIDER=gcp`) and `gcp_project_id` (`SCION_GCP_PROJECT_ID`) are set so `sciontool` uses the GCP-native SDKs. Sending OTLP directly to `monitoring.googleapis.com:443` fails with `Unimplemented`. If forwarding through a local OpenTelemetry Collector instead, verify `SCION_OTEL_ENDPOINT` points to the collector's reachable gRPC address.
 2.  **Check Credentials**: Outside Kubernetes, an agent with no GCP identity configured runs in metadata mode `block`, where ADC gets no token. Such agents need either a service account assigned with `--service-account` (`echo $SCION_METADATA_MODE` inside the agent prints `assign`) or a GCP service account key file. For the key file, verify the `scion-telemetry-gcp-credentials` secret is registered with target `~/.scion/telemetry-gcp-credentials.json`. Inside the agent, check `echo $SCION_OTEL_GCP_CREDENTIALS` — it should point to the file. See [GCP Credentials for Agent Containers](/scion/hosted/single-node/metrics/#4-gcp-credentials-for-agent-containers-non-adc-environments) for setup.
 3.  **Check Permissions**: Verify the Workload Identity or Service Account has `roles/logging.logWriter`.
 4.  **Inspect Agent Init**: View the agent container logs (stderr) to see if `sciontool` reported a telemetry startup failure:

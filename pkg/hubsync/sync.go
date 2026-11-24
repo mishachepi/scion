@@ -487,7 +487,11 @@ func EnsureHubReady(projectPath string, opts EnsureHubReadyOptions) (*HubContext
 	// external repo). An explicit target skips this (see explicitTarget).
 	var envProjectID string
 	if hubContext && !explicitTarget {
-		envProjectID = projectkeys.ProjectIDFromEnv(os.Getenv)
+		if hubEnv := os.Getenv(projectkeys.EnvHubProjectID); hubEnv != "" {
+			envProjectID = hubEnv
+		} else {
+			envProjectID = projectkeys.ProjectIDFromEnv(os.Getenv)
+		}
 	}
 	projectID := envProjectID
 	if projectID == "" {

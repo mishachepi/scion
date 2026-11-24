@@ -29,10 +29,12 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/durablequeueitem"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/predicate"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/scheduledexecrun"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/secret"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/trigger"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/triggerevent"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/triggerfire"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/triggersubjectclaim"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/webhookendpoint"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/google/uuid"
@@ -42,6 +44,10 @@ import (
 type TriggerStore struct {
 	client *ent.Client
 	inTx   bool
+	// beforeCoalescePromoteHook is an optional test-only hook invoked inside
+	// ClaimTriggerFireCoalescing right before the coalescing->firing CAS to
+	// deterministically exercise concurrent reaper transitions.
+	beforeCoalescePromoteHook func(ctx context.Context, client *ent.Client, fireID uuid.UUID)
 }
 
 var _ store.TriggerStore = (*TriggerStore)(nil)
@@ -254,9 +260,15 @@ func (s *TriggerStore) ListWebhookEndpoints(ctx context.Context, filter store.We
 		query.Where(webhookendpoint.OwnerPrincipalIDEQ(filter.OwnerPrincipalID))
 	}
 
-	totalCount, err := query.Clone().Count(ctx)
-	if err != nil {
-		return nil, err
+	var (
+		totalCount int
+		err        error
+	)
+	if !opts.SkipTotalCount {
+		totalCount, err = query.Clone().Count(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	var (
@@ -506,34 +518,35 @@ func unmarshalMatchRules(raw string) ([]store.TriggerMatchRule, bool) {
 func entTriggerToStore(e *ent.Trigger) *store.Trigger {
 	matchRules, matchRulesCorrupt := unmarshalMatchRules(e.MatchRules)
 	tr := &store.Trigger{
-		ID:                e.ID.String(),
-		ProjectID:         e.ProjectID.String(),
-		Name:              e.Name,
-		Description:       e.Description,
-		SourceKind:        e.SourceKind,
-		SourceID:          e.SourceID,
-		MatchTypes:        unmarshalMatchTypes(e.MatchTypes),
-		MatchDialect:      e.MatchDialect,
-		MatchRule:         e.MatchRule,
-		MatchRules:        matchRules,
-		MatchForm:         e.MatchForm,
-		MatchRulesCorrupt: matchRulesCorrupt,
-		ActionType:        e.ActionType,
-		ActionPayload:     e.ActionPayload,
-		SubjectDialect:    e.SubjectDialect,
-		SubjectRule:       e.SubjectRule,
-		SubjectMode:       e.SubjectMode,
-		Status:            e.Status,
-		StatusReason:      e.StatusReason,
-		LastFireAt:        e.LastFireAt,
-		LastFireStatus:    e.LastFireStatus,
-		LastFireError:     e.LastFireError,
-		FireCount:         e.FireCount,
-		ErrorCount:        e.ErrorCount,
-		CreatedBy:         e.CreatedBy,
-		CreatedAt:         e.Created,
-		UpdatedAt:         e.Updated,
-		Fixture:           fixtureProvenanceFromColumns(e.FixtureRootID, e.FixtureIssuerID),
+		ID:                    e.ID.String(),
+		ProjectID:             e.ProjectID.String(),
+		Name:                  e.Name,
+		Description:           e.Description,
+		SourceKind:            e.SourceKind,
+		SourceID:              e.SourceID,
+		MatchTypes:            unmarshalMatchTypes(e.MatchTypes),
+		MatchDialect:          e.MatchDialect,
+		MatchRule:             e.MatchRule,
+		MatchRules:            matchRules,
+		MatchForm:             e.MatchForm,
+		MatchRulesCorrupt:     matchRulesCorrupt,
+		ActionType:            e.ActionType,
+		ActionPayload:         e.ActionPayload,
+		SubjectDialect:        e.SubjectDialect,
+		SubjectRule:           e.SubjectRule,
+		SubjectMode:           e.SubjectMode,
+		CoalesceWindowSeconds: e.CoalesceWindowSeconds,
+		Status:                e.Status,
+		StatusReason:          e.StatusReason,
+		LastFireAt:            e.LastFireAt,
+		LastFireStatus:        e.LastFireStatus,
+		LastFireError:         e.LastFireError,
+		FireCount:             e.FireCount,
+		ErrorCount:            e.ErrorCount,
+		CreatedBy:             e.CreatedBy,
+		CreatedAt:             e.Created,
+		UpdatedAt:             e.Updated,
+		Fixture:               fixtureProvenanceFromColumns(e.FixtureRootID, e.FixtureIssuerID),
 	}
 	tr.InitiatorAttribution = initiatorAttributionFromColumns(
 		e.InitiatorPrincipalKind, e.InitiatorPrincipalID,
@@ -669,6 +682,14 @@ func applyTriggerFilter(query *ent.TriggerQuery, filter store.TriggerFilter) err
 	if filter.Name != "" {
 		query.Where(trigger.NameEQ(filter.Name))
 	}
+	if len(filter.ActionTypes) > 0 {
+		query.Where(trigger.ActionTypeIn(filter.ActionTypes...))
+	}
+	if filter.TargetAgentID != "" {
+		// Pre-filter in SQL on action_payload containing the target agent ID;
+		// callers still decode action_payload to confirm the exact agentId field.
+		query.Where(trigger.ActionPayloadContains(filter.TargetAgentID))
+	}
 	if filter.InitiatorAgentID != "" {
 		query.Where(triggerRecordedAuthorityIs(store.DelegationPrincipalAgent, filter.InitiatorAgentID))
 	}
@@ -756,6 +777,7 @@ func (s *TriggerStore) CreateTrigger(ctx context.Context, tr *store.Trigger) err
 		SetSubjectDialect(subjectDialect).
 		SetSubjectRule(tr.SubjectRule).
 		SetSubjectMode(subjectMode).
+		SetCoalesceWindowSeconds(tr.CoalesceWindowSeconds).
 		SetStatus(status).
 		SetFireCount(tr.FireCount).
 		SetErrorCount(tr.ErrorCount).
@@ -840,9 +862,15 @@ func (s *TriggerStore) ListTriggers(ctx context.Context, filter store.TriggerFil
 		return nil, err
 	}
 
-	totalCount, err := query.Clone().Count(ctx)
-	if err != nil {
-		return nil, err
+	var (
+		totalCount int
+		err        error
+	)
+	if !opts.SkipTotalCount {
+		totalCount, err = query.Clone().Count(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	var (
@@ -1028,6 +1056,9 @@ func (s *TriggerStore) UpdateTrigger(
 	if fields.SubjectMode {
 		update = update.SetSubjectMode(tr.SubjectMode)
 	}
+	if fields.CoalesceWindowSeconds {
+		update = update.SetCoalesceWindowSeconds(tr.CoalesceWindowSeconds)
+	}
 	if fields.Status {
 		update = update.SetStatus(tr.Status)
 		if tr.StatusReason != "" {
@@ -1152,6 +1183,9 @@ func (s *TriggerStore) DeleteTriggersByProject(ctx context.Context, projectID st
 			}
 		}
 		if _, dErr := client.WebhookEndpoint.Delete().Where(webhookendpoint.ProjectIDEQ(pid)).Exec(ctx); dErr != nil {
+			return mapError(dErr)
+		}
+		if _, dErr := client.ScheduledExecRun.Delete().Where(scheduledexecrun.ProjectIDEQ(pid), scheduledexecrun.FireIDNotNil()).Exec(ctx); dErr != nil {
 			return mapError(dErr)
 		}
 		if _, dErr := client.TriggerFire.Delete().Where(triggerfire.ProjectIDEQ(pid)).Exec(ctx); dErr != nil {
@@ -1496,15 +1530,37 @@ func (s *TriggerStore) ListTriggerEvents(ctx context.Context, filter store.Trigg
 				sel.Where(entsql.Exists(sub))
 			}))
 		}
-		if len(visPreds) == 0 {
-			return &store.ListResult[store.TriggerEvent]{Items: []store.TriggerEvent{}, TotalCount: 0}, nil
-		}
+		// Stage 2 §5.4: an agent dispatched by a trigger fire (result_ref == agent.ID)
+		// may also read/list the event that created it (indexed on result_ref).
+		agentID := filter.VisibleToAgentID
+		visPreds = append(visPreds, predicate.TriggerEvent(func(sel *entsql.Selector) {
+			d := sel.Dialect()
+			tf := entsql.Dialect(d).Table(triggerfire.Table).As("tf_res")
+			conds := []*entsql.Predicate{
+				entsql.ColumnsEQ(tf.C(triggerfire.FieldEventID), sel.C(triggerevent.FieldID)),
+				entsql.EQ(tf.C(triggerfire.FieldResultRef), agentID),
+			}
+			if hasPID {
+				conds = append(conds, entsql.EQ(tf.C(triggerfire.FieldProjectID), pid))
+			}
+			sub := entsql.Dialect(d).
+				Select(tf.C(triggerfire.FieldID)).
+				From(tf).
+				Where(entsql.And(conds...))
+			sel.Where(entsql.Exists(sub))
+		}))
 		query.Where(triggerevent.Or(visPreds...))
 	}
 
-	totalCount, err := query.Clone().Count(ctx)
-	if err != nil {
-		return nil, err
+	var (
+		totalCount int
+		err        error
+	)
+	if !opts.SkipTotalCount {
+		totalCount, err = query.Clone().Count(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	var (
@@ -1565,6 +1621,42 @@ func (s *TriggerStore) CountPendingTriggerEvents(ctx context.Context, projectID 
 			triggerevent.StatusEQ(store.TriggerEventStatusPending),
 		).
 		Count(ctx)
+}
+
+// UpdateTriggerEventAttributes is enrichment-only (Stage 3 §5.5): it updates
+// attributes and lists on a pending trigger_events row before rule evaluation
+// and never modifies payload, type, subject, headers, dedup_key, or body_sha256.
+func (s *TriggerStore) UpdateTriggerEventAttributes(ctx context.Context, id string, attributes map[string]string, lists map[string][]string) error {
+	uid, err := parseUUID(id)
+	if err != nil {
+		return err
+	}
+	attrsJSON, err := marshalStringMap(attributes)
+	if err != nil {
+		return err
+	}
+	listsJSON, err := marshalStringListMap(lists)
+	if err != nil {
+		return err
+	}
+	affected, err := s.client.TriggerEvent.Update().
+		Where(triggerevent.IDEQ(uid), triggerevent.StatusEQ(store.TriggerEventStatusPending)).
+		SetAttributes(attrsJSON).
+		SetLists(listsJSON).
+		Save(ctx)
+	if err != nil {
+		return mapError(err)
+	}
+	if affected == 0 {
+		exists, exErr := s.client.TriggerEvent.Query().Where(triggerevent.IDEQ(uid)).Exist(ctx)
+		if exErr != nil {
+			return mapError(exErr)
+		}
+		if !exists {
+			return store.ErrNotFound
+		}
+	}
+	return nil
 }
 
 func (s *TriggerStore) MarkTriggerEventProcessed(ctx context.Context, id string, processedAt time.Time, matchCount, fireCount int) error {
@@ -1744,9 +1836,14 @@ func entTriggerFireToStore(e *ent.TriggerFire) *store.TriggerFire {
 		ExecutorKind:   e.ExecutorKind,
 		ExecutorID:     e.ExecutorID,
 		LeaseUntil:     e.LeaseUntil,
+		NotBefore:      e.NotBefore,
+		DeferredAt:     e.DeferredAt,
 		StartedAt:      e.StartedAt,
 		FinishedAt:     e.FinishedAt,
 		CreatedAt:      e.Created,
+	}
+	if e.TargetAgentID != nil {
+		tf.TargetAgentID = e.TargetAgentID.String()
 	}
 	tf.InitiatorAttribution = initiatorAttributionFromColumns(
 		e.InitiatorPrincipalKind, e.InitiatorPrincipalID,
@@ -1804,7 +1901,7 @@ func parseTriggerFireUUIDs(fire *store.TriggerFire) (uid, pid, tid, eid uuid.UUI
 	return uid, pid, tid, eid, nil
 }
 
-func buildTriggerFireCreate(client *ent.Client, uid, pid, tid, eid uuid.UUID, fire *store.TriggerFire, defaultNow time.Time) *ent.TriggerFireCreate {
+func buildTriggerFireCreate(client *ent.Client, uid, pid, tid, eid uuid.UUID, fire *store.TriggerFire, defaultNow time.Time) (*ent.TriggerFireCreate, error) {
 	startedAt := defaultNow
 	if !fire.StartedAt.IsZero() {
 		startedAt = fire.StartedAt.UTC()
@@ -1846,11 +1943,24 @@ func buildTriggerFireCreate(client *ent.Client, uid, pid, tid, eid uuid.UUID, fi
 	if fire.RuleTrace != "" {
 		create.SetRuleTrace(fire.RuleTrace)
 	}
+	if fire.TargetAgentID != "" {
+		taid, err := parseUUID(fire.TargetAgentID)
+		if err != nil {
+			return nil, err
+		}
+		create.SetTargetAgentID(taid)
+	}
+	if fire.NotBefore != nil {
+		create.SetNotBefore(fire.NotBefore.UTC())
+	}
+	if fire.DeferredAt != nil {
+		create.SetDeferredAt(fire.DeferredAt.UTC())
+	}
 	if fire.FinishedAt != nil {
 		create.SetFinishedAt(fire.FinishedAt.UTC())
 	}
 	setTriggerFireInitiatorAttribution(create, fire.InitiatorAttribution)
-	return create
+	return create, nil
 }
 
 func (s *TriggerStore) ClaimTriggerFire(ctx context.Context, fire *store.TriggerFire) (bool, *store.TriggerFire, error) {
@@ -1859,7 +1969,11 @@ func (s *TriggerStore) ClaimTriggerFire(ctx context.Context, fire *store.Trigger
 		return false, nil, err
 	}
 	now := time.Now().UTC()
-	created, err := buildTriggerFireCreate(s.client, uid, pid, tid, eid, fire, now).Save(ctx)
+	create, err := buildTriggerFireCreate(s.client, uid, pid, tid, eid, fire, now)
+	if err != nil {
+		return false, nil, err
+	}
+	created, err := create.Save(ctx)
 	if err != nil {
 		mapped := mapError(err)
 		if errors.Is(mapped, store.ErrAlreadyExists) {
@@ -1916,7 +2030,7 @@ func (s *TriggerStore) ClaimTriggerFireSubjectSkip(ctx context.Context, fire *st
 			return mapError(qErr)
 		}
 
-		busy, bErr := hasLiveTriggerFireForSubjectClient(ctx, client, tid, fire.Subject, now)
+		busy, bErr := hasLiveTriggerFireForSubjectClient(ctx, client, tid, fire.Subject, uuid.Nil, true, now)
 		if bErr != nil {
 			return mapError(bErr)
 		}
@@ -1935,7 +2049,11 @@ func (s *TriggerStore) ClaimTriggerFireSubjectSkip(ctx context.Context, fire *st
 			skippedBusy = false
 		}
 
-		created, cErr := buildTriggerFireCreate(client, uid, pid, tid, eid, &row, now).Save(ctx)
+		create, bErr := buildTriggerFireCreate(client, uid, pid, tid, eid, &row, now)
+		if bErr != nil {
+			return bErr
+		}
+		created, cErr := create.Save(ctx)
 		if cErr != nil {
 			return mapError(cErr)
 		}
@@ -1958,7 +2076,287 @@ func (s *TriggerStore) ClaimTriggerFireSubjectSkip(ctx context.Context, fire *st
 	return claimed, skippedBusy, existingOut, nil
 }
 
-func (s *TriggerStore) FinishTriggerFire(ctx context.Context, id, status, resultRef, errMsg string, finishedAt time.Time) (bool, error) {
+const (
+	errReapedDuringCoalesce = "hub restarted during coalesce"
+	errReapedDuringDefer    = "hub restarted during defer"
+)
+
+func pendingOrReapedFirePredicate() predicate.TriggerFire {
+	return triggerfire.Or(
+		triggerfire.StatusIn(store.TriggerFireStatusCoalescing, store.TriggerFireStatusDeferred),
+		triggerfire.And(
+			triggerfire.StatusEQ(store.TriggerFireStatusFailed),
+			triggerfire.ErrorIn(errReapedDuringCoalesce, errReapedDuringDefer),
+		),
+	)
+}
+
+func isReapedPendingFire(ex *ent.TriggerFire) bool {
+	return ex.Status == store.TriggerFireStatusFailed &&
+		(ex.Error == errReapedDuringCoalesce || ex.Error == errReapedDuringDefer)
+}
+
+func (s *TriggerStore) ClaimTriggerFireCoalescing(
+	ctx context.Context,
+	fire *store.TriggerFire,
+	coalesceError string,
+	now, notBefore time.Time,
+) (bool, bool, []store.TriggerFire, *store.TriggerFire, error) {
+	uid, pid, tid, eid, err := parseTriggerFireUUIDs(fire)
+	if err != nil {
+		return false, false, nil, nil, err
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	notBefore = notBefore.UTC()
+	leaseHorizon := fire.LeaseUntil.UTC().Sub(now)
+	if leaseHorizon <= 0 {
+		leaseHorizon = 10 * time.Minute
+	}
+
+	var (
+		claimed    bool
+		promoted   bool
+		superseded []store.TriggerFire
+		existing   *store.TriggerFire
+	)
+	txErr := s.withClientTx(ctx, func(client *ent.Client) error {
+		if isPostgres(client) {
+			var res sql.Result
+			lockKey := fire.TriggerID + "\x00" + fire.Subject
+			if lErr := client.Driver().Exec(ctx, "SELECT pg_advisory_xact_lock($1, $2)",
+				[]any{int32(store.LockTriggerSubjectOverlap), store.StableProjectHash(lockKey)}, &res); lErr != nil {
+				return fmt.Errorf("lock trigger subject overlap: %w", lErr)
+			}
+		}
+
+		ex, qErr := client.TriggerFire.Query().
+			Where(triggerfire.EventIDEQ(eid), triggerfire.TriggerIDEQ(tid)).
+			Only(ctx)
+		if qErr == nil {
+			// Existing row for (event_id, trigger_id).
+			if ex.Status == store.TriggerFireStatusCoalescing || ex.Status == store.TriggerFireStatusDeferred {
+				if ex.NotBefore != nil && ex.NotBefore.UTC().After(now) {
+					claimed = false
+					promoted = false
+					existing = entTriggerFireToStore(ex)
+					return nil
+				}
+				if s.beforeCoalescePromoteHook != nil {
+					s.beforeCoalescePromoteHook(ctx, client, ex.ID)
+				}
+				// Coalesce/defer window elapsed: CAS promote coalescing|deferred -> firing.
+				affected, uErr := client.TriggerFire.Update().
+					Where(triggerfire.IDEQ(ex.ID), triggerfire.StatusEQ(ex.Status)).
+					SetStatus(store.TriggerFireStatusFiring).
+					SetLeaseUntil(now.Add(leaseHorizon)).
+					Save(ctx)
+				if uErr != nil {
+					return mapError(uErr)
+				}
+				fresh, fErr := client.TriggerFire.Get(ctx, ex.ID)
+				if fErr != nil {
+					return mapError(fErr)
+				}
+				if affected > 0 {
+					*fire = *entTriggerFireToStore(fresh)
+					claimed = true
+					promoted = true
+					return nil
+				}
+				// Concurrent state transition (e.g. reaper marked the row
+				// failed "hub restarted during coalesce/defer" between read and CAS):
+				// fall through so reaped-pending is revived in place.
+				ex = fresh
+			}
+
+			if isReapedPendingFire(ex) {
+				// Stage 3 §6.3/§6.4: reaped coalescing/deferred row is re-fired in place
+				// by the queue item's retry, never re-created/duplicated.
+				affected, uErr := client.TriggerFire.Update().
+					Where(
+						triggerfire.IDEQ(ex.ID),
+						triggerfire.StatusEQ(store.TriggerFireStatusFailed),
+						triggerfire.ErrorEQ(ex.Error),
+					).
+					SetStatus(store.TriggerFireStatusFiring).
+					ClearError().
+					ClearFinishedAt().
+					SetLeaseUntil(now.Add(leaseHorizon)).
+					Save(ctx)
+				if uErr != nil {
+					return mapError(uErr)
+				}
+				if affected == 0 {
+					fresh, fErr := client.TriggerFire.Get(ctx, ex.ID)
+					if fErr != nil {
+						return mapError(fErr)
+					}
+					claimed = false
+					promoted = false
+					existing = entTriggerFireToStore(fresh)
+					return nil
+				}
+				fresh, fErr := client.TriggerFire.Get(ctx, ex.ID)
+				if fErr != nil {
+					return mapError(fErr)
+				}
+				*fire = *entTriggerFireToStore(fresh)
+				claimed = true
+				promoted = true
+				return nil
+			}
+
+			claimed = false
+			promoted = false
+			existing = entTriggerFireToStore(ex)
+			return nil
+		}
+		if !ent.IsNotFound(qErr) {
+			return mapError(qErr)
+		}
+
+		// Supersede any unreleased coalescing, deferred, or reaped-pending rows for
+		// (trigger_id, subject) via CAS so an older event's retry cannot revive
+		// and double-dispatch alongside the newer event.
+		coalesceOrReaped := pendingOrReapedFirePredicate()
+		prevRows, pErr := client.TriggerFire.Query().
+			Where(
+				triggerfire.TriggerIDEQ(tid),
+				triggerfire.SubjectEQ(fire.Subject),
+				coalesceOrReaped,
+			).
+			All(ctx)
+		if pErr != nil {
+			return mapError(pErr)
+		}
+		for _, prev := range prevRows {
+			affected, uErr := client.TriggerFire.Update().
+				Where(triggerfire.IDEQ(prev.ID), coalesceOrReaped).
+				SetStatus(store.TriggerFireStatusSkipped).
+				SetError(coalesceError).
+				SetFinishedAt(now).
+				Save(ctx)
+			if uErr != nil {
+				return mapError(uErr)
+			}
+			if affected > 0 {
+				sf := entTriggerFireToStore(prev)
+				sf.Status = store.TriggerFireStatusSkipped
+				sf.Error = coalesceError
+				fin := now
+				sf.FinishedAt = &fin
+				superseded = append(superseded, *sf)
+			}
+		}
+
+		row := *fire
+		row.Status = store.TriggerFireStatusCoalescing
+		nb := notBefore
+		row.NotBefore = &nb
+		row.LeaseUntil = notBefore.Add(leaseHorizon)
+		create, bErr := buildTriggerFireCreate(client, uid, pid, tid, eid, &row, now)
+		if bErr != nil {
+			return bErr
+		}
+		created, cErr := create.Save(ctx)
+		if cErr != nil {
+			return mapError(cErr)
+		}
+		*fire = *entTriggerFireToStore(created)
+		claimed = true
+		promoted = false
+		return nil
+	})
+	if txErr != nil {
+		if !s.inTx && errors.Is(txErr, store.ErrAlreadyExists) {
+			ex, qErr := s.client.TriggerFire.Query().
+				Where(triggerfire.EventIDEQ(eid), triggerfire.TriggerIDEQ(tid)).
+				Only(ctx)
+			if qErr != nil {
+				return false, false, nil, nil, mapError(qErr)
+			}
+			return false, false, nil, entTriggerFireToStore(ex), nil
+		}
+		return false, false, nil, nil, txErr
+	}
+	return claimed, promoted, superseded, existing, nil
+}
+
+func (s *TriggerStore) DeferTriggerFire(ctx context.Context, id string, deferredAt, notBefore, leaseUntil time.Time) (bool, error) {
+	uid, err := parseUUID(id)
+	if err != nil {
+		return false, err
+	}
+	var updated bool
+	txErr := s.withClientTx(ctx, func(client *ent.Client) error {
+		ex, qErr := client.TriggerFire.Get(ctx, uid)
+		if qErr != nil {
+			if ent.IsNotFound(qErr) {
+				return nil
+			}
+			return mapError(qErr)
+		}
+		if ex.Status != store.TriggerFireStatusFiring {
+			return nil
+		}
+		u := client.TriggerFire.Update().
+			Where(triggerfire.IDEQ(uid), triggerfire.StatusEQ(store.TriggerFireStatusFiring)).
+			SetStatus(store.TriggerFireStatusDeferred).
+			SetNotBefore(notBefore.UTC()).
+			SetLeaseUntil(leaseUntil.UTC())
+		// Preserve the first deferral timestamp across subsequent deferrals
+		// and hub restarts (Stage 3 §6.2 rev 1.16).
+		if ex.DeferredAt == nil && !deferredAt.IsZero() {
+			u.SetDeferredAt(deferredAt.UTC())
+		}
+		affected, uErr := u.Save(ctx)
+		if uErr != nil {
+			return mapError(uErr)
+		}
+		updated = affected > 0
+		return nil
+	})
+	if txErr != nil {
+		return false, txErr
+	}
+	return updated, nil
+}
+
+func (s *TriggerStore) FinishPendingTriggerFire(ctx context.Context, id, status, errMsg, matchedThrough, decidedDialect, ruleTrace string, finishedAt time.Time) (bool, error) {
+	uid, err := parseUUID(id)
+	if err != nil {
+		return false, err
+	}
+	u := s.client.TriggerFire.Update().
+		Where(triggerfire.IDEQ(uid), pendingOrReapedFirePredicate()).
+		SetStatus(status).
+		SetFinishedAt(finishedAt.UTC())
+	if errMsg != "" {
+		u.SetError(errMsg)
+	} else {
+		u.ClearError()
+	}
+	if matchedThrough != "" {
+		u.SetMatchedThrough(matchedThrough)
+	}
+	if decidedDialect != "" {
+		u.SetDecidedDialect(decidedDialect)
+	}
+	if ruleTrace != "" {
+		u.SetRuleTrace(ruleTrace)
+	}
+	affected, err := u.Save(ctx)
+	if err != nil {
+		return false, mapError(err)
+	}
+	return affected > 0, nil
+}
+
+func (s *TriggerStore) FinishTriggerFire(ctx context.Context, id, status, resultRef, targetAgentID, errMsg string, finishedAt time.Time) (bool, error) {
 	uid, err := parseUUID(id)
 	if err != nil {
 		return false, err
@@ -1971,6 +2369,13 @@ func (s *TriggerStore) FinishTriggerFire(ctx context.Context, id, status, result
 		u.SetResultRef(resultRef)
 	} else {
 		u.ClearResultRef()
+	}
+	if targetAgentID != "" {
+		taid, err := parseUUID(targetAgentID)
+		if err != nil {
+			return false, err
+		}
+		u.SetTargetAgentID(taid)
 	}
 	if errMsg != "" {
 		u.SetError(errMsg)
@@ -2023,9 +2428,15 @@ func (s *TriggerStore) ListTriggerFires(ctx context.Context, filter store.Trigge
 		query.Where(triggerfire.StatusEQ(filter.Status))
 	}
 
-	totalCount, err := query.Clone().Count(ctx)
-	if err != nil {
-		return nil, err
+	var (
+		totalCount int
+		err        error
+	)
+	if !opts.SkipTotalCount {
+		totalCount, err = query.Clone().Count(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	var (
@@ -2075,15 +2486,41 @@ func (s *TriggerStore) ListTriggerFires(ctx context.Context, filter store.Trigge
 	return result, nil
 }
 
-func hasLiveTriggerFireForSubjectClient(ctx context.Context, client *ent.Client, tid uuid.UUID, subject string, now time.Time) (bool, error) {
-	return client.TriggerFire.Query().
+func hasLiveTriggerFireForSubjectClient(ctx context.Context, client *ent.Client, tid uuid.UUID, subject string, excludeFireID uuid.UUID, includeFiring bool, now time.Time) (bool, error) {
+	statuses := []string{store.TriggerFireStatusCoalescing, store.TriggerFireStatusDeferred}
+	if includeFiring {
+		statuses = append(statuses, store.TriggerFireStatusFiring)
+	}
+	q := client.TriggerFire.Query().
 		Where(
 			triggerfire.TriggerIDEQ(tid),
 			triggerfire.SubjectEQ(subject),
-			triggerfire.StatusEQ(store.TriggerFireStatusFiring),
+			triggerfire.StatusIn(statuses...),
 			triggerfire.LeaseUntilGT(now.UTC()),
-		).
-		Exist(ctx)
+		)
+	if excludeFireID != uuid.Nil {
+		q = q.Where(triggerfire.IDNEQ(excludeFireID))
+	}
+	return q.Exist(ctx)
+}
+
+func (s *TriggerStore) CountTriggerFiresSince(ctx context.Context, triggerID string, since time.Time, excludeStatuses ...string) (int, error) {
+	tid, err := parseUUID(triggerID)
+	if err != nil {
+		return 0, err
+	}
+	preds := []predicate.TriggerFire{
+		triggerfire.TriggerIDEQ(tid),
+		triggerfire.CreatedGTE(since.UTC()),
+	}
+	if len(excludeStatuses) > 0 {
+		preds = append(preds, triggerfire.StatusNotIn(excludeStatuses...))
+	}
+	n, err := s.client.TriggerFire.Query().Where(preds...).Count(ctx)
+	if err != nil {
+		return 0, mapError(err)
+	}
+	return n, nil
 }
 
 func (s *TriggerStore) HasLiveTriggerFireForSubject(ctx context.Context, triggerID, subject string, now time.Time) (bool, error) {
@@ -2091,7 +2528,35 @@ func (s *TriggerStore) HasLiveTriggerFireForSubject(ctx context.Context, trigger
 	if err != nil {
 		return false, err
 	}
-	return hasLiveTriggerFireForSubjectClient(ctx, s.client, tid, subject, now)
+	return hasLiveTriggerFireForSubjectClient(ctx, s.client, tid, subject, uuid.Nil, true, now)
+}
+
+func (s *TriggerStore) HasLiveTriggerFireForSubjectExcluding(ctx context.Context, triggerID, subject, excludeFireID string, includeFiring bool, now time.Time) (bool, error) {
+	tid, err := parseUUID(triggerID)
+	if err != nil {
+		return false, err
+	}
+	var exID uuid.UUID
+	if excludeFireID != "" {
+		exID, err = parseUUID(excludeFireID)
+		if err != nil {
+			return false, err
+		}
+	}
+	return hasLiveTriggerFireForSubjectClient(ctx, s.client, tid, subject, exID, includeFiring, now)
+}
+
+func (s *TriggerStore) HasPendingTriggerFiresForEvent(ctx context.Context, eventID string) (bool, error) {
+	eid, err := parseUUID(eventID)
+	if err != nil {
+		return false, err
+	}
+	return s.client.TriggerFire.Query().
+		Where(
+			triggerfire.EventIDEQ(eid),
+			pendingOrReapedFirePredicate(),
+		).
+		Exist(ctx)
 }
 
 func (s *TriggerStore) AgentHasFiredTriggerForEvent(ctx context.Context, eventID, agentID string) (bool, error) {
@@ -2119,27 +2584,55 @@ func (s *TriggerStore) AgentHasFiredTriggerForEvent(ctx context.Context, eventID
 		Exist(ctx)
 }
 
+func (s *TriggerStore) EventHasTriggerFireForResultRef(ctx context.Context, eventID, resultRef string) (bool, error) {
+	eid, err := parseGetID(eventID)
+	if err != nil {
+		return false, err
+	}
+	if resultRef == "" {
+		return false, nil
+	}
+	return s.client.TriggerFire.Query().
+		Where(
+			triggerfire.EventIDEQ(eid),
+			triggerfire.ResultRefEQ(resultRef),
+		).
+		Exist(ctx)
+}
+
 func (s *TriggerStore) ReapExpiredTriggerFires(ctx context.Context, now time.Time, limit int) (int, error) {
 	now = now.UTC()
 	q := s.client.TriggerFire.Query().
 		Where(
-			triggerfire.StatusEQ(store.TriggerFireStatusFiring),
+			triggerfire.StatusIn(store.TriggerFireStatusFiring, store.TriggerFireStatusCoalescing, store.TriggerFireStatusDeferred),
 			triggerfire.LeaseUntilLTE(now),
+			triggerfire.Not(triggerfire.HasExecRun()),
 		).
 		Order(triggerfire.ByLeaseUntil())
 	if limit > 0 {
 		q = q.Limit(limit)
 	}
-	expired, err := q.Select(triggerfire.FieldID, triggerfire.FieldTriggerID).All(ctx)
+	expired, err := q.Select(triggerfire.FieldID, triggerfire.FieldTriggerID, triggerfire.FieldStatus).All(ctx)
 	if err != nil {
 		return 0, err
 	}
 	reaped := 0
 	for _, f := range expired {
+		errMsg := "hub restarted during fire"
+		switch f.Status {
+		case store.TriggerFireStatusCoalescing:
+			errMsg = errReapedDuringCoalesce
+		case store.TriggerFireStatusDeferred:
+			errMsg = errReapedDuringDefer
+		}
 		affected, uErr := s.client.TriggerFire.Update().
-			Where(triggerfire.IDEQ(f.ID), triggerfire.StatusEQ(store.TriggerFireStatusFiring)).
+			Where(
+				triggerfire.IDEQ(f.ID),
+				triggerfire.StatusEQ(f.Status),
+				triggerfire.Not(triggerfire.HasExecRun()),
+			).
 			SetStatus(store.TriggerFireStatusFailed).
-			SetError("hub restarted during fire").
+			SetError(errMsg).
 			SetFinishedAt(now).
 			Save(ctx)
 		if uErr != nil {
@@ -2147,7 +2640,15 @@ func (s *TriggerStore) ReapExpiredTriggerFires(ctx context.Context, now time.Tim
 		}
 		if affected > 0 {
 			reaped++
-			_ = s.RecordTriggerFire(ctx, f.TriggerID.String(), now, store.TriggerFireStatusFailed, "hub restarted during fire")
+			_, _ = s.client.TriggerSubjectClaim.Update().
+				Where(
+					triggersubjectclaim.FireIDEQ(f.ID),
+					triggersubjectclaim.StateEQ(store.TriggerSubjectClaimStateActive),
+				).
+				SetState(store.TriggerSubjectClaimStateReleased).
+				SetReleasedAt(now.Truncate(time.Microsecond)).
+				Save(ctx)
+			_ = s.RecordTriggerFire(ctx, f.TriggerID.String(), now, store.TriggerFireStatusFailed, errMsg)
 		}
 	}
 	return reaped, nil
@@ -2155,23 +2656,44 @@ func (s *TriggerStore) ReapExpiredTriggerFires(ctx context.Context, now time.Tim
 
 func (s *TriggerStore) PurgeOldTriggerHistory(ctx context.Context, olderThan time.Time) (int, int, error) {
 	cutoff := olderThan.UTC()
-	firesDeleted, err := s.client.TriggerFire.Delete().
-		Where(
-			triggerfire.StatusNEQ(store.TriggerFireStatusFiring),
+	var firesDeleted, eventsDeleted int
+	err := s.withClientTx(ctx, func(c *ent.Client) error {
+		purgeable := []predicate.TriggerFire{
+			triggerfire.StatusNotIn(store.TriggerFireStatusFiring, store.TriggerFireStatusCoalescing, store.TriggerFireStatusDeferred),
 			triggerfire.CreatedLT(cutoff),
-		).
-		Exec(ctx)
+		}
+		ids, err := c.TriggerFire.Query().Where(purgeable...).IDs(ctx)
+		if err != nil {
+			return mapError(err)
+		}
+		for start := 0; start < len(ids); start += scheduledExecRunsByEventChunk {
+			end := min(start+scheduledExecRunsByEventChunk, len(ids))
+			chunk := ids[start:end]
+			if _, err := c.ScheduledExecRun.Delete().Where(scheduledexecrun.FireIDIn(chunk...)).Exec(ctx); err != nil {
+				return mapError(err)
+			}
+			n, err := c.TriggerFire.Delete().
+				Where(append([]predicate.TriggerFire{triggerfire.IDIn(chunk...)}, purgeable...)...).
+				Exec(ctx)
+			if err != nil {
+				return mapError(err)
+			}
+			firesDeleted += n
+		}
+		evDel, err := c.TriggerEvent.Delete().
+			Where(
+				triggerevent.StatusNEQ(store.TriggerEventStatusPending),
+				triggerevent.CreatedLT(cutoff),
+			).
+			Exec(ctx)
+		if err != nil {
+			return mapError(err)
+		}
+		eventsDeleted = evDel
+		return nil
+	})
 	if err != nil {
-		return 0, 0, mapError(err)
-	}
-	eventsDeleted, err := s.client.TriggerEvent.Delete().
-		Where(
-			triggerevent.StatusNEQ(store.TriggerEventStatusPending),
-			triggerevent.CreatedLT(cutoff),
-		).
-		Exec(ctx)
-	if err != nil {
-		return 0, firesDeleted, mapError(err)
+		return 0, 0, err
 	}
 	return eventsDeleted, firesDeleted, nil
 }

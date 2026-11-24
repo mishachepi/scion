@@ -158,6 +158,26 @@ func (s *Server) createBrokerRegistration(w http.ResponseWriter, r *http.Request
 		Forbidden(w)
 		return
 	}
+	// Enforce broker_policy.admin_managed_only and explicit adminManaged
+	// registration (ptone/scion#7829). Runs after authorizeBrokerCreate and
+	// existing-broker lookup/remint check, and before the online-broker 409
+	// guard so policy refusals are never masked by a '--force' prompt and
+	// cannot be bypassed with --force; covers both legacy and flat paths.
+	priorAdminManaged := existingBroker != nil && existingBroker.AdminManaged
+	stampAdminManaged, ok := s.authorizeBrokerRegistrationPolicy(w, r, existingBroker, req.AdminManaged)
+	if !ok {
+		return
+	}
+	req.AdminManaged = stampAdminManaged
+
+	// Guard accidental re-registration over a live broker (ptone/scion#2563).
+	// PreserveSettings re-mints ('scion hub brokers join-token create') are
+	// exempt: they are explicit, named, owner-only operations that only mint a
+	// join token and do not disconnect the broker until the token is redeemed.
+	if req.RuntimeTarget == nil && existingBroker != nil && !existingBroker.IsFlat() && !req.PreserveSettings && !req.Force && s.isBrokerOnlineForReregister(r.Context(), existingBroker) {
+		writeBrokerOnlineConflict(w, existingBroker.ID, existingBroker.Name, existingBroker.Status)
+		return
+	}
 
 	// Turning auto-provide on offers the broker to every project on the
 	// hub, so it needs broker.auto_provide in addition to registration.
@@ -254,7 +274,12 @@ func (s *Server) createBrokerRegistration(w http.ResponseWriter, r *http.Request
 	if resp.GCPHostSet {
 		kv = append(kv, "gcp_host_set", "true")
 	}
-	LogRegistrationEvent(r.Context(), s.auditLogger, resp.BrokerID, req.Name, user.ID(), getClientIP(r),
+	newAdminManaged := priorAdminManaged || req.AdminManaged
+	kv = append(kv, "admin_managed", strconv.FormatBool(newAdminManaged))
+	if existingBroker != nil {
+		kv = append(kv, "prior_admin_managed", strconv.FormatBool(priorAdminManaged))
+	}
+	LogRegistrationEvent(r.Context(), s.auditLogger, resp.BrokerID, req.Name, user.ID(), s.clientIP(r),
 		operation, mergeBrokerAuditDetails(details, kv...))
 
 	writeJSON(w, http.StatusCreated, resp)
@@ -298,6 +323,9 @@ func (s *Server) createFlatBrokerRegistration(ctx context.Context, req CreateBro
 		AutoProvideAuthorized: autoProvideAuthorized,
 		HostSAClaim:           hostSA,
 		Apply: func(b *store.RuntimeBroker, created bool) {
+			if created && req.AdminManaged {
+				b.AdminManaged = true
+			}
 			if preserve && !created {
 				return
 			}
@@ -323,6 +351,11 @@ func (s *Server) createFlatBrokerRegistration(ctx context.Context, req CreateBro
 	})
 	if err != nil {
 		return nil, err
+	}
+	if !created && req.AdminManaged {
+		if _, err := s.store.SetRuntimeBrokerAdminManaged(ctx, row.ID, true); err != nil {
+			return nil, fmt.Errorf("failed to update flat Runtime Broker: %w", err)
+		}
 	}
 	var gcp registrationGCPHostResult
 	if !created && !preserve {
@@ -364,6 +397,11 @@ func writeBrokerRegistrationError(w http.ResponseWriter, err error) {
 		writeTestAdminBrokerRefusal(w)
 		return
 	}
+	var onlineErr *BrokerOnlineError
+	if errors.As(err, &onlineErr) {
+		writeBrokerOnlineConflict(w, onlineErr.BrokerID, onlineErr.BrokerName, onlineErr.Status)
+		return
+	}
 	if errors.Is(err, ErrBrokerRegistrationAuthorizationStale) {
 		Conflict(w, err.Error())
 		return
@@ -381,6 +419,43 @@ func writeBrokerRegistrationError(w http.ResponseWriter, err error) {
 	}
 	writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
 		"failed to create broker registration: "+err.Error(), nil)
+}
+
+// isBrokerOnlineForReregister reports whether an existing broker is currently
+// online — either via a live conduit session, an active control channel, or a
+// fresh online status/heartbeat record.
+func (s *Server) isBrokerOnlineForReregister(ctx context.Context, b *store.RuntimeBroker) bool {
+	if b == nil {
+		return false
+	}
+	if s.experimentEnabled(conduitExperiment) {
+		if live, err := s.brokerRegistryLive(ctx, b.ID); err == nil && live {
+			return true
+		}
+	}
+	if s.controlChannel != nil && s.controlChannel.IsConnected(b.ID) {
+		return true
+	}
+	return isBrokerRecordOnline(b, time.Now())
+}
+
+// writeBrokerOnlineConflict writes a 409 Conflict response naming the matched
+// online broker's name and ID so operators can confirm or choose a different
+// broker name before replacing a live broker's credentials.
+func writeBrokerOnlineConflict(w http.ResponseWriter, brokerID, brokerName, status string) {
+	if status == "" || status == store.BrokerStatusOffline {
+		status = store.BrokerStatusOnline
+	}
+	msg := (&BrokerOnlineError{
+		BrokerID:   brokerID,
+		BrokerName: brokerName,
+		Status:     status,
+	}).Error()
+	writeError(w, http.StatusConflict, ErrCodeBrokerOnline, msg, map[string]interface{}{
+		"brokerId":   brokerID,
+		"brokerName": brokerName,
+		"status":     status,
+	})
 }
 
 // authorizeBrokerCreate is the single broker.create gate for every
@@ -478,17 +553,21 @@ const brokerProvideDeniedMessage = "only the broker's owner or a super-admin may
 
 // brokerProvideDecision decides the broker side of associating broker with a
 // project: the caller must present an admitted user credential (see
-// brokerUserCredentialKindAdmitted, user access tokens included) and hold
-// broker.update on this broker, which its owner and super-admins hold and
-// no hub role grants. Project-side authority (project.update) is checked
-// separately by each caller. It writes no response; it returns the denial
-// reason and stage for the caller's log and 403.
+// brokerUserCredentialKindAdmitted, user access tokens included), the broker
+// must satisfy broker_policy.admin_managed_only when active, and the caller
+// must hold broker.update on this broker, which its owner and super-admins
+// hold and no hub role grants. Project-side authority (project.update) is
+// checked separately by each caller. It writes no response; it returns the
+// denial reason and stage for the caller's log and 403.
 func (s *Server) brokerProvideDecision(ctx context.Context, identity Identity, broker *store.RuntimeBroker) (bool, string, DeniedBy) {
 	if isNilIdentity(identity) || broker == nil {
 		return false, "no identity or broker", ""
 	}
 	if !brokerUserCredentialKindAdmitted(ctx, identity, true) {
 		return false, "credential kind not admitted for broker association", ""
+	}
+	if s.brokerPolicyRefuses(broker) {
+		return false, brokerPolicyDenialReason, DeniedByBrokerPolicy
 	}
 	decision := s.authzService.CheckAccess(ctx, identity, brokerResource(broker), ActionUpdate)
 	return decision.Allowed, decision.Reason, decision.DeniedBy
@@ -497,6 +576,10 @@ func (s *Server) brokerProvideDecision(ctx context.Context, identity Identity, b
 // writeBrokerProvideDenial logs and writes the 403 for a denied broker
 // association. r may be nil when the caller has no request at hand.
 func writeBrokerProvideDenial(w http.ResponseWriter, r *http.Request, identity Identity, broker *store.RuntimeBroker, reason string, deniedBy DeniedBy) {
+	if deniedBy == DeniedByBrokerPolicy {
+		writeBrokerPolicyDenialForIdentity(w, r, identity, brokerPolicyOpAttach, broker, "")
+		return
+	}
 	logAuthzDenial(r, identity, brokerResource(broker), ActionUpdate, reason)
 	writeForbiddenStructuredDenial(w, brokerProvideDeniedMessage, "broker", ActionUpdate, deniedBy)
 }
@@ -700,7 +783,7 @@ func (s *Server) handleBrokerJoin(w http.ResponseWriter, r *http.Request) {
 		if revokeErr != nil {
 			slog.Error("Failed to revoke a join token sent without TLS", "brokerID", req.BrokerID, "error", revokeErr)
 		}
-		LogJoinEvent(r.Context(), s.auditLogger, req.BrokerID, getClientIP(r), false,
+		LogJoinEvent(r.Context(), s.auditLogger, req.BrokerID, s.clientIP(r), false,
 			fmt.Sprintf("refused: not over TLS or from this host (join token revoked: %t)", revoked), auditevent.BrokerFailureRefused)
 		s.requireConfidentialArrival(w, r)
 		return
@@ -708,7 +791,7 @@ func (s *Server) handleBrokerJoin(w http.ResponseWriter, r *http.Request) {
 
 	// Test admin tier: only the co-located broker may complete a join.
 	if s.refuseTestAdminBrokerRegistration(w, req.BrokerID) {
-		LogJoinEvent(r.Context(), s.auditLogger, req.BrokerID, getClientIP(r), false, ErrTestAdminRemoteBrokerRefused.Error(), auditevent.BrokerFailureRefused)
+		LogJoinEvent(r.Context(), s.auditLogger, req.BrokerID, s.clientIP(r), false, ErrTestAdminRemoteBrokerRefused.Error(), auditevent.BrokerFailureRefused)
 		return
 	}
 
@@ -727,7 +810,7 @@ func (s *Server) handleBrokerJoin(w http.ResponseWriter, r *http.Request) {
 	resp, err := s.brokerAuthService.CompleteBrokerJoin(r.Context(), req, hubEndpoint)
 	if err != nil {
 		// Log failed join attempt
-		LogJoinEvent(r.Context(), s.auditLogger, req.BrokerID, getClientIP(r), false, err.Error(), brokerJoinFailureCode(err))
+		LogJoinEvent(r.Context(), s.auditLogger, req.BrokerID, s.clientIP(r), false, err.Error(), brokerJoinFailureCode(err))
 
 		if writeRuntimeTargetRefusal(w, err) {
 			return
@@ -748,7 +831,7 @@ func (s *Server) handleBrokerJoin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Log successful join
-	LogJoinEvent(r.Context(), s.auditLogger, req.BrokerID, getClientIP(r), true, "", "")
+	LogJoinEvent(r.Context(), s.auditLogger, req.BrokerID, s.clientIP(r), true, "", "")
 	s.conduitBrokerCredentialChanged(req.BrokerID)
 	// Record the reservations of the agents the broker still runs (a broker
 	// registered again under the same ID), now that its row is written and
@@ -869,7 +952,7 @@ func (s *Server) handleBrokerRotateSecret(w http.ResponseWriter, r *http.Request
 		actorID = brokerIdent.BrokerID()
 		actorType = "broker"
 	}
-	LogRotateEvent(r.Context(), s.auditLogger, brokerID, actorID, actorType, getClientIP(r), brokerAuditCredentialDetails(r.Context()))
+	LogRotateEvent(r.Context(), s.auditLogger, brokerID, actorID, actorType, s.clientIP(r), brokerAuditCredentialDetails(r.Context()))
 
 	writeJSON(w, http.StatusOK, resp)
 }

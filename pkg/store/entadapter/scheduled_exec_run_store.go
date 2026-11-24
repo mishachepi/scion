@@ -24,24 +24,29 @@ import (
 
 	entsql "entgo.io/ent/dialect/sql"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/execrunoutput"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/predicate"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/schedule"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/scheduledevent"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/scheduledexecpollcursor"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/scheduledexecrun"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/trigger"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/triggerfire"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/triggersubjectclaim"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/google/uuid"
 )
 
-// Scheduled exec runs (ptone/scion#7883). The methods live on ScheduleStore
-// so a run's outcome and its event's status share one transaction, and so
-// the event purge can remove runs in its own transaction.
+// Scheduled exec runs (ptone/scion#7883, ptone/scion#8241). The methods live
+// on ScheduleStore so a run's outcome and its owner (scheduled_events or
+// trigger_fires) share one transaction, and so purges can remove runs in the
+// same transaction.
 
 var _ store.ScheduledExecRunStore = (*ScheduleStore)(nil)
 
 func entScheduledExecRunToStore(e *ent.ScheduledExecRun) store.ScheduledExecRun {
 	run := store.ScheduledExecRun{
-		EventID:                 e.EventID.String(),
+		OverlapKey:              e.OverlapKey,
 		ProjectID:               e.ProjectID.String(),
 		TargetAgentID:           e.TargetAgentID.String(),
 		InitiatorPrincipalKind:  e.InitiatorPrincipalKind,
@@ -62,9 +67,17 @@ func entScheduledExecRunToStore(e *ent.ScheduledExecRun) store.ScheduledExecRun 
 		ExitCode:                e.ExitCode,
 		DurationMS:              e.DurationMs,
 		OutputBytes:             e.OutputBytes,
+		CaptureMode:             e.CaptureMode,
+		OutputStatus:            e.OutputStatus,
 		Runtime:                 e.Runtime,
 		LaunchID:                e.LaunchID,
 		LastPolledAt:            e.LastPolledAt,
+	}
+	if e.EventID != nil {
+		run.EventID = e.EventID.String()
+	}
+	if e.FireID != nil {
+		run.FireID = e.FireID.String()
 	}
 	if e.ScheduleID != nil {
 		run.ScheduleID = e.ScheduleID.String()
@@ -82,17 +95,57 @@ func finalExecOutcome(o string) bool {
 	return false
 }
 
-// CreateScheduledExecRun inserts the run record of an admitted exec event.
-// When run.ScheduleID is set and run.FinishedAt is nil, the insert checks
-// inside a per-schedule locked transaction that no other unfinished run of
-// that schedule holds an unexpired DB lease (ptone/scion#7884).
+// scheduledExecOverlapLockKey returns the Postgres advisory-lock key for run
+// overlap serialization. Schedule-owned runs keep the legacy hash(scheduleID)
+// key so mixed-version replicas still serialize during a rolling upgrade;
+// trigger-owned runs hash the "trigger:<id>" overlapKey.
+func scheduledExecOverlapLockKey(scheduleID, overlapKey string) (int32, bool) {
+	if scheduleID != "" {
+		return store.StableProjectHash(scheduleID), true
+	}
+	if overlapKey != "" {
+		return store.StableProjectHash(overlapKey), true
+	}
+	return 0, false
+}
+
+// CreateScheduledExecRun inserts the run record of an admitted exec event or
+// trigger fire inside a transaction that verifies the owner is still open
+// (scheduled_events status fired/expired or trigger_fires status firing;
+// ptone/scion#8210, ptone/scion#8241). Exactly one of EventID or FireID must
+// be set; trigger-owned runs must never set ScheduleID. When an overlap scope
+// (OverlapKey or ScheduleID) is set and run.FinishedAt is nil, the transaction
+// checks under a per-key advisory lock that no other unfinished run of that
+// scope holds an unexpired DB lease. For trigger-owned runs, the transaction
+// also transitions trigger_fires to fired (result_ref = fire_id,
+// target_agent_id = target) and binds any active unbound trigger_subject_claims
+// row held by fire_id.
 func (s *ScheduleStore) CreateScheduledExecRun(ctx context.Context, run *store.ScheduledExecRun) error {
-	if run == nil || run.EventID == "" || run.ProjectID == "" || run.TargetAgentID == "" || run.CommandSHA256 == "" {
+	if run == nil || run.ProjectID == "" || run.TargetAgentID == "" || run.CommandSHA256 == "" {
 		return store.ErrInvalidInput
 	}
-	eid, err := parseUUID(run.EventID)
-	if err != nil {
-		return err
+	hasEvent := run.EventID != ""
+	hasFire := run.FireID != ""
+	if hasEvent == hasFire {
+		return store.ErrInvalidInput
+	}
+	if hasFire && run.ScheduleID != "" {
+		return store.ErrInvalidInput
+	}
+	var eid, fid *uuid.UUID
+	if hasEvent {
+		parsed, err := parseUUID(run.EventID)
+		if err != nil {
+			return err
+		}
+		eid = &parsed
+	}
+	if hasFire {
+		parsed, err := parseUUID(run.FireID)
+		if err != nil {
+			return err
+		}
+		fid = &parsed
 	}
 	pid, err := parseUUID(run.ProjectID)
 	if err != nil {
@@ -110,6 +163,7 @@ func (s *ScheduleStore) CreateScheduledExecRun(ctx context.Context, run *store.S
 		}
 		sid = &parsed
 	}
+	overlapKey := run.EffectiveOverlapKey()
 	if run.Outcome == "" {
 		run.Outcome = store.ScheduledExecOutcomeStarting
 	}
@@ -121,10 +175,10 @@ func (s *ScheduleStore) CreateScheduledExecRun(ctx context.Context, run *store.S
 	}
 	insertOn := func(c *ent.Client) error {
 		create := c.ScheduledExecRun.Create().
-			SetEventID(eid).
 			SetLastPolledAt(run.StartedAt.UTC()).
 			SetProjectID(pid).
 			SetTargetAgentID(aid).
+			SetOverlapKey(overlapKey).
 			SetInitiatorPrincipalKind(run.InitiatorPrincipalKind).
 			SetInitiatorPrincipalID(run.InitiatorPrincipalID).
 			SetInitiatorCredentialKind(run.InitiatorCredentialKind).
@@ -143,7 +197,15 @@ func (s *ScheduleStore) CreateScheduledExecRun(ctx context.Context, run *store.S
 			SetLaunchID(run.LaunchID).
 			SetNillableExitCode(run.ExitCode).
 			SetNillableDurationMs(run.DurationMS).
-			SetNillableOutputBytes(run.OutputBytes)
+			SetNillableOutputBytes(run.OutputBytes).
+			SetCaptureMode(run.CaptureMode).
+			SetOutputStatus(run.OutputStatus)
+		if eid != nil {
+			create.SetEventID(*eid)
+		}
+		if fid != nil {
+			create.SetFireID(*fid)
+		}
 		if sid != nil {
 			create.SetScheduleID(*sid)
 		}
@@ -155,26 +217,69 @@ func (s *ScheduleStore) CreateScheduledExecRun(ctx context.Context, run *store.S
 		}
 		return nil
 	}
-	if sid == nil {
-		return insertOn(s.client)
-	}
 	return runInEntTx(ctx, s.client, s.inTx, func(c *ent.Client) error {
-		if isPostgres(c) {
+		if lockKey, ok := scheduledExecOverlapLockKey(run.ScheduleID, overlapKey); ok && isPostgres(c) {
 			var res sql.Result
 			if err := c.Driver().Exec(ctx, "SELECT pg_advisory_xact_lock($1, $2)",
-				[]any{int32(store.LockScheduledExecOverlap), store.StableProjectHash(run.ScheduleID)}, &res); err != nil {
+				[]any{int32(store.LockScheduledExecOverlap), lockKey}, &res); err != nil {
 				return fmt.Errorf("lock scheduled exec overlap: %w", err)
 			}
 		}
-		if run.FinishedAt == nil {
-			overlaps, err := c.ScheduledExecRun.Query().
-				Where(
-					scheduledexecrun.ScheduleIDEQ(*sid),
-					scheduledexecrun.EventIDNEQ(eid),
-					scheduledexecrun.FinishedAtIsNil(),
-					scheduledexecrun.LeaseUntilGT(run.StartedAt.UTC()),
-				).
-				Exist(ctx)
+		if eid != nil {
+			evtQuery := c.ScheduledEvent.Query().Where(scheduledevent.IDEQ(*eid))
+			if isPostgres(c) {
+				evtQuery = evtQuery.ForUpdate()
+			}
+			evt, err := evtQuery.Only(ctx)
+			if err != nil {
+				return mapError(err)
+			}
+			if evt.Status != store.ScheduledEventFired && evt.Status != store.ScheduledEventExpired {
+				hasRun, err := c.ScheduledExecRun.Query().Where(scheduledexecrun.EventIDEQ(*eid)).Exist(ctx)
+				if err != nil {
+					return mapError(err)
+				}
+				if hasRun {
+					return store.ErrAlreadyExists
+				}
+				return store.ErrScheduledExecEventClosed
+			}
+		} else {
+			fireQuery := c.TriggerFire.Query().Where(triggerfire.IDEQ(*fid))
+			if isPostgres(c) {
+				fireQuery = fireQuery.ForUpdate()
+			}
+			tf, err := fireQuery.Only(ctx)
+			if err != nil {
+				return mapError(err)
+			}
+			if tf.Status != store.TriggerFireStatusFiring {
+				hasRun, err := c.ScheduledExecRun.Query().Where(scheduledexecrun.FireIDEQ(*fid)).Exist(ctx)
+				if err != nil {
+					return mapError(err)
+				}
+				if hasRun {
+					return store.ErrAlreadyExists
+				}
+				return store.ErrScheduledExecEventClosed
+			}
+		}
+		if overlapKey != "" && run.FinishedAt == nil {
+			scopePred := scheduledexecrun.OverlapKeyEQ(overlapKey)
+			if sid != nil {
+				scopePred = scheduledexecrun.Or(scopePred, scheduledexecrun.ScheduleIDEQ(*sid))
+			}
+			preds := []predicate.ScheduledExecRun{
+				scopePred,
+				scheduledexecrun.FinishedAtIsNil(),
+				scheduledexecrun.LeaseUntilGT(run.StartedAt.UTC()),
+			}
+			if eid != nil {
+				preds = append(preds, scheduledexecrun.Or(scheduledexecrun.EventIDIsNil(), scheduledexecrun.EventIDNEQ(*eid)))
+			} else {
+				preds = append(preds, scheduledexecrun.Or(scheduledexecrun.FireIDIsNil(), scheduledexecrun.FireIDNEQ(*fid)))
+			}
+			overlaps, err := c.ScheduledExecRun.Query().Where(preds...).Exist(ctx)
 			if err != nil {
 				return mapError(err)
 			}
@@ -182,17 +287,45 @@ func (s *ScheduleStore) CreateScheduledExecRun(ctx context.Context, run *store.S
 				return store.ErrScheduledExecOverlap
 			}
 		}
-		return insertOn(c)
+		if err := insertOn(c); err != nil {
+			return err
+		}
+		if fid != nil {
+			if _, err := c.TriggerFire.Update().
+				Where(triggerfire.IDEQ(*fid), triggerfire.StatusEQ(store.TriggerFireStatusFiring)).
+				SetStatus(store.TriggerFireStatusFired).
+				SetResultRef(run.FireID).
+				SetTargetAgentID(aid).
+				Save(ctx); err != nil {
+				return mapError(err)
+			}
+			// Bind any active unbound subject claim held by this fire so
+			// skip-mode claims stay held for the lifetime of the exec run.
+			if _, err := c.TriggerSubjectClaim.Update().
+				Where(
+					triggersubjectclaim.FireIDEQ(*fid),
+					triggersubjectclaim.StateEQ(store.TriggerSubjectClaimStateActive),
+					triggersubjectclaim.AgentIDIsNil(),
+				).
+				SetAgentID(aid).
+				SetBoundAt(run.StartedAt.UTC().Truncate(time.Microsecond)).
+				Save(ctx); err != nil {
+				return mapError(err)
+			}
+		}
+		return nil
 	})
 }
 
-// GetScheduledExecRun returns the run of an event.
-func (s *ScheduleStore) GetScheduledExecRun(ctx context.Context, eventID string) (*store.ScheduledExecRun, error) {
-	eid, err := parseUUID(eventID)
+// GetScheduledExecRun returns the run of an event or trigger fire.
+func (s *ScheduleStore) GetScheduledExecRun(ctx context.Context, runID string) (*store.ScheduledExecRun, error) {
+	uid, err := parseUUID(runID)
 	if err != nil {
 		return nil, err
 	}
-	e, err := s.client.ScheduledExecRun.Query().Where(scheduledexecrun.EventIDEQ(eid)).Only(ctx)
+	e, err := s.client.ScheduledExecRun.Query().
+		Where(scheduledexecrun.Or(scheduledexecrun.EventIDEQ(uid), scheduledexecrun.FireIDEQ(uid))).
+		Only(ctx)
 	if err != nil {
 		return nil, mapError(err)
 	}
@@ -229,15 +362,41 @@ func (s *ScheduleStore) ListScheduledExecRunsByEvent(ctx context.Context, eventI
 	return out, nil
 }
 
+// ListScheduledExecRunsByFire returns the existing runs of fireIDs, keyed by
+// fire ID. IDs that are not UUIDs have no run and are skipped.
+func (s *ScheduleStore) ListScheduledExecRunsByFire(ctx context.Context, fireIDs []string) (map[string]store.ScheduledExecRun, error) {
+	out := make(map[string]store.ScheduledExecRun)
+	ids := make([]uuid.UUID, 0, len(fireIDs))
+	for _, id := range fireIDs {
+		if uid, err := uuid.Parse(id); err == nil {
+			ids = append(ids, uid)
+		}
+	}
+	for start := 0; start < len(ids); start += scheduledExecRunsByEventChunk {
+		end := min(start+scheduledExecRunsByEventChunk, len(ids))
+		rows, err := s.client.ScheduledExecRun.Query().
+			Where(scheduledexecrun.FireIDIn(ids[start:end]...)).
+			All(ctx)
+		if err != nil {
+			return nil, mapError(err)
+		}
+		for _, e := range rows {
+			run := entScheduledExecRunToStore(e)
+			out[run.FireID] = run
+		}
+	}
+	return out, nil
+}
+
 // MarkScheduledExecRunRunning moves an unfinished starting run to running.
-func (s *ScheduleStore) MarkScheduledExecRunRunning(ctx context.Context, eventID string) (bool, error) {
-	eid, err := parseUUID(eventID)
+func (s *ScheduleStore) MarkScheduledExecRunRunning(ctx context.Context, runID string) (bool, error) {
+	uid, err := parseUUID(runID)
 	if err != nil {
 		return false, err
 	}
 	n, err := s.client.ScheduledExecRun.Update().
 		Where(
-			scheduledexecrun.EventIDEQ(eid),
+			scheduledexecrun.Or(scheduledexecrun.EventIDEQ(uid), scheduledexecrun.FireIDEQ(uid)),
 			scheduledexecrun.FinishedAtIsNil(),
 			scheduledexecrun.OutcomeEQ(scheduledexecrun.OutcomeStarting),
 		).
@@ -264,25 +423,91 @@ func scheduleRunStatusForFinish(fin store.ScheduledExecRunFinish) string {
 	}
 }
 
+func triggerFireStatusForFinish(fin store.ScheduledExecRunFinish) string {
+	if fin.FireStatus != "" {
+		return fin.FireStatus
+	}
+	switch fin.Outcome {
+	case store.ScheduledExecOutcomeOK:
+		return store.TriggerFireStatusFired
+	case store.ScheduledExecOutcomeSkipped:
+		return store.TriggerFireStatusSkipped
+	default:
+		return store.TriggerFireStatusFailed
+	}
+}
+
+func recordTriggerFireOnClient(ctx context.Context, c *ent.Client, triggerID uuid.UUID, firedAt time.Time, status, errMsg string) error {
+	now := time.Now().UTC()
+	firedAt = firedAt.UTC()
+	counter := c.Trigger.UpdateOneID(triggerID).
+		AddFireCount(1).
+		SetUpdated(now)
+	if status == store.TriggerFireStatusFailed {
+		counter.AddErrorCount(1)
+	}
+	if _, err := counter.Save(ctx); err != nil {
+		return mapError(err)
+	}
+	last := c.Trigger.Update().
+		Where(trigger.ID(triggerID), trigger.Or(trigger.LastFireAtIsNil(), trigger.LastFireAtLT(firedAt))).
+		SetLastFireAt(firedAt).
+		SetLastFireStatus(status).
+		SetUpdated(now)
+	if errMsg != "" {
+		last.SetLastFireError(errMsg)
+	} else {
+		last.ClearLastFireError()
+	}
+	_, err := last.Save(ctx)
+	return mapError(err)
+}
+
 // FinishScheduledExecRun records a run's final outcome, first writer wins,
-// the event's status (when asked), and for a recurring schedule its run
-// counters and last-run fields in the same transaction.
+// and updates its owner in the same transaction:
+//   - for event-owned runs: scheduled_events status (while fired/expired) and
+//     recurring schedule counters;
+//   - for trigger-fire-owned runs: trigger_fires status/error/finished_at
+//     (while firing/fired), trigger counters, and releasing any active
+//     trigger_subject_claims row held by fire_id.
 func (s *ScheduleStore) FinishScheduledExecRun(ctx context.Context, fin store.ScheduledExecRunFinish) (bool, error) {
 	if !finalExecOutcome(fin.Outcome) {
 		return false, store.ErrInvalidInput
 	}
-	eid, err := parseUUID(fin.EventID)
-	if err != nil {
-		return false, err
+	if len(fin.Output) > store.MaxExecRunOutputBytes {
+		return false, store.ErrInvalidInput
+	}
+	hasEvent := fin.EventID != ""
+	hasFire := fin.FireID != ""
+	if hasEvent == hasFire {
+		return false, store.ErrInvalidInput
+	}
+	var ownerPred predicate.ScheduledExecRun
+	var ownerUID uuid.UUID
+	if hasEvent {
+		eid, err := parseUUID(fin.EventID)
+		if err != nil {
+			return false, err
+		}
+		ownerUID = eid
+		ownerPred = scheduledexecrun.EventIDEQ(eid)
+	} else {
+		fid, err := parseUUID(fin.FireID)
+		if err != nil {
+			return false, err
+		}
+		ownerUID = fid
+		ownerPred = scheduledexecrun.FireIDEQ(fid)
 	}
 	finishedAt := fin.FinishedAt
 	if finishedAt.IsZero() {
 		finishedAt = time.Now()
 	}
+	finishedUTC := finishedAt.UTC().Truncate(time.Microsecond)
 	var won bool
-	err = runInEntTx(ctx, s.client, s.inTx, func(c *ent.Client) error {
+	err := runInEntTx(ctx, s.client, s.inTx, func(c *ent.Client) error {
 		runRow, err := c.ScheduledExecRun.Query().
-			Where(scheduledexecrun.EventIDEQ(eid), scheduledexecrun.FinishedAtIsNil()).
+			Where(ownerPred, scheduledexecrun.FinishedAtIsNil()).
 			Only(ctx)
 		if ent.IsNotFound(err) {
 			return nil
@@ -292,11 +517,12 @@ func (s *ScheduleStore) FinishScheduledExecRun(ctx context.Context, fin store.Sc
 		}
 		n, err := c.ScheduledExecRun.Update().
 			Where(scheduledexecrun.IDEQ(runRow.ID), scheduledexecrun.FinishedAtIsNil()).
-			SetFinishedAt(finishedAt.UTC()).
+			SetFinishedAt(finishedUTC).
 			SetOutcome(scheduledexecrun.Outcome(fin.Outcome)).
 			SetNillableExitCode(fin.ExitCode).
 			SetNillableDurationMs(fin.DurationMS).
 			SetNillableOutputBytes(fin.OutputBytes).
+			SetOutputStatus(fin.OutputStatus).
 			Save(ctx)
 		if err != nil {
 			return mapError(err)
@@ -305,30 +531,82 @@ func (s *ScheduleStore) FinishScheduledExecRun(ctx context.Context, fin store.Sc
 			return nil
 		}
 		won = true
-		if fin.EventStatus != "" {
-			upd := c.ScheduledEvent.Update().
+		if len(fin.Output) > 0 {
+			if _, err := c.ExecRunOutput.Create().
+				SetID(ownerUID).
+				SetOwnerKind(execrunoutput.OwnerKindScheduledExec).
+				SetProjectID(runRow.ProjectID).
+				SetCaptureMode(runRow.CaptureMode).
+				SetContent(fin.Output).
+				SetCreatedAt(finishedAt.UTC()).
+				Save(ctx); err != nil {
+				return mapError(err)
+			}
+		}
+		if runRow.EventID != nil {
+			if fin.EventStatus != "" {
+				upd := c.ScheduledEvent.Update().
+					Where(
+						scheduledevent.IDEQ(ownerUID),
+						scheduledevent.StatusIn(store.ScheduledEventFired, store.ScheduledEventExpired),
+					).
+					SetStatus(fin.EventStatus)
+				if fin.EventError != "" {
+					upd.SetError(fin.EventError)
+				} else {
+					upd.ClearError()
+				}
+				if _, err := upd.Save(ctx); err != nil {
+					return mapError(err)
+				}
+			}
+			if runRow.ScheduleID != nil {
+				ranAt := runRow.StartedAt
+				if evt, getErr := c.ScheduledEvent.Get(ctx, ownerUID); getErr == nil && evt.FiredAt != nil {
+					ranAt = *evt.FiredAt
+				}
+				runStatus := scheduleRunStatusForFinish(fin)
+				if err := recordScheduleRunStatusOnClient(ctx, c, *runRow.ScheduleID, ranAt, runStatus, fin.EventError); err != nil && !errors.Is(err, store.ErrNotFound) {
+					return err
+				}
+			}
+		} else if runRow.FireID != nil {
+			fireStatus := triggerFireStatusForFinish(fin)
+			fireErr := fin.FireError
+			if fireErr == "" {
+				fireErr = fin.EventError
+			}
+			upd := c.TriggerFire.Update().
 				Where(
-					scheduledevent.IDEQ(eid),
-					scheduledevent.StatusIn(store.ScheduledEventFired, store.ScheduledEventExpired),
+					triggerfire.IDEQ(*runRow.FireID),
+					triggerfire.StatusIn(store.TriggerFireStatusFiring, store.TriggerFireStatusFired),
 				).
-				SetStatus(fin.EventStatus)
-			if fin.EventError != "" {
-				upd.SetError(fin.EventError)
+				SetStatus(fireStatus).
+				SetResultRef(runRow.FireID.String()).
+				SetTargetAgentID(runRow.TargetAgentID).
+				SetFinishedAt(finishedUTC)
+			if fireErr != "" {
+				upd.SetError(fireErr)
 			} else {
 				upd.ClearError()
 			}
 			if _, err := upd.Save(ctx); err != nil {
 				return mapError(err)
 			}
-		}
-		if runRow.ScheduleID != nil {
-			ranAt := runRow.StartedAt
-			if evt, getErr := c.ScheduledEvent.Get(ctx, eid); getErr == nil && evt.FiredAt != nil {
-				ranAt = *evt.FiredAt
+			if tf, getErr := c.TriggerFire.Get(ctx, *runRow.FireID); getErr == nil {
+				if err := recordTriggerFireOnClient(ctx, c, tf.TriggerID, finishedUTC, fireStatus, fireErr); err != nil && !errors.Is(err, store.ErrNotFound) {
+					return err
+				}
 			}
-			runStatus := scheduleRunStatusForFinish(fin)
-			if err := recordScheduleRunStatusOnClient(ctx, c, *runRow.ScheduleID, ranAt, runStatus, fin.EventError); err != nil && !errors.Is(err, store.ErrNotFound) {
-				return err
+			if _, err := c.TriggerSubjectClaim.Update().
+				Where(
+					triggersubjectclaim.FireIDEQ(*runRow.FireID),
+					triggersubjectclaim.StateEQ(store.TriggerSubjectClaimStateActive),
+				).
+				SetState(store.TriggerSubjectClaimStateReleased).
+				SetReleasedAt(finishedUTC).
+				Save(ctx); err != nil {
+				return mapError(err)
 			}
 		}
 		return nil
@@ -339,12 +617,31 @@ func (s *ScheduleStore) FinishScheduledExecRun(ctx context.Context, fin store.Sc
 	return won, nil
 }
 
+// GetScheduledExecRunOutput returns the captured output bytes for runID from
+// exec_run_outputs, or store.ErrNotFound when no output row exists.
+func (s *ScheduleStore) GetScheduledExecRunOutput(ctx context.Context, runID string) ([]byte, error) {
+	uid, err := parseUUID(runID)
+	if err != nil {
+		return nil, err
+	}
+	row, err := s.client.ExecRunOutput.Query().
+		Where(
+			execrunoutput.IDEQ(uid),
+			execrunoutput.OwnerKindEQ(execrunoutput.OwnerKindScheduledExec),
+		).
+		Only(ctx)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return row.Content, nil
+}
+
 // ListExpiredScheduledExecRuns returns up to limit unfinished runs whose
 // lease ended before now, oldest lease first.
 func (s *ScheduleStore) ListExpiredScheduledExecRuns(ctx context.Context, now time.Time, limit int) ([]store.ScheduledExecRun, error) {
 	rows, err := s.client.ScheduledExecRun.Query().
 		Where(scheduledexecrun.FinishedAtIsNil(), scheduledexecrun.LeaseUntilLT(now.UTC())).
-		Order(scheduledexecrun.ByLeaseUntil(), scheduledexecrun.ByEventID()).
+		Order(scheduledexecrun.ByLeaseUntil(), scheduledexecrun.ByID()).
 		Limit(clampLimit(limit)).
 		All(ctx)
 	if err != nil {
@@ -397,7 +694,10 @@ func (s *ScheduleStore) ClaimScheduledExecRunsForPoll(ctx context.Context, now t
 			scheduledexecrun.LeaseUntilGTE(nowUTC),
 		}
 		if len(excludeSQL) > 0 {
-			basePreds = append(basePreds, scheduledexecrun.EventIDNotIn(excludeSQL...))
+			basePreds = append(basePreds,
+				scheduledexecrun.Or(scheduledexecrun.EventIDIsNil(), scheduledexecrun.EventIDNotIn(excludeSQL...)),
+				scheduledexecrun.Or(scheduledexecrun.FireIDIsNil(), scheduledexecrun.FireIDNotIn(excludeSQL...)),
+			)
 		}
 
 		var targets []uuid.UUID
@@ -486,7 +786,7 @@ func (s *ScheduleStore) ClaimScheduledExecRunsForPoll(ctx context.Context, now t
 					Order(
 						scheduledexecrun.ByPollSeq(),
 						scheduledexecrun.ByLastPolledAt(),
-						scheduledexecrun.ByEventID(),
+						scheduledexecrun.ByID(),
 					).
 					Limit(need)
 				if isPostgres(c) {
@@ -629,9 +929,23 @@ func loadScheduledExecQuotaSnapshot(
 	for _, sc := range schedRows {
 		active = append(active, *entScheduleToStore(sc))
 	}
+
+	// Every kind, for the hub's per-project recurring schedule cap.
+	allPreds := []predicate.Schedule{
+		schedule.ProjectIDEQ(pid),
+		schedule.StatusEQ(store.ScheduleStatusActive),
+	}
+	if excludeScheduleID != nil {
+		allPreds = append(allPreds, schedule.IDNEQ(*excludeScheduleID))
+	}
+	allKinds, err := c.Schedule.Query().Where(allPreds...).Count(ctx)
+	if err != nil {
+		return store.ScheduledExecQuotaSnapshot{}, mapError(err)
+	}
 	return store.ScheduledExecQuotaSnapshot{
-		PendingEvents:   pending,
-		ActiveSchedules: active,
+		PendingEvents:           pending,
+		ActiveSchedules:         active,
+		ActiveSchedulesAllKinds: allKinds,
 	}, nil
 }
 
@@ -725,6 +1039,29 @@ func (s *ScheduleStore) CompleteUnadmittedExecEvent(ctx context.Context, id stri
 	}
 	var updated bool
 	err = runInEntTx(ctx, s.client, s.inTx, func(c *ent.Client) error {
+		// Lock the event row first on Postgres before checking ScheduledExecRun
+		// so concurrent CreateScheduledExecRun and CompleteUnadmittedExecEvent
+		// serialize on the event row rather than evaluating HasExecRun under a
+		// pre-lock statement snapshot (ptone/scion#8210).
+		evtQuery := c.ScheduledEvent.Query().Where(
+			scheduledevent.IDEQ(uid),
+			scheduledevent.StatusIn(store.ScheduledEventFired, store.ScheduledEventExpired),
+		)
+		if isPostgres(c) {
+			evtQuery = evtQuery.ForUpdate()
+		}
+		if _, err := evtQuery.Only(ctx); ent.IsNotFound(err) {
+			return nil
+		} else if err != nil {
+			return mapError(err)
+		}
+		admitted, err := c.ScheduledExecRun.Query().Where(scheduledexecrun.EventIDEQ(uid)).Exist(ctx)
+		if err != nil {
+			return mapError(err)
+		}
+		if admitted {
+			return nil
+		}
 		upd := c.ScheduledEvent.Update().
 			Where(
 				scheduledevent.IDEQ(uid),
@@ -804,14 +1141,32 @@ func (s *ScheduleStore) FailUnadmittedScheduledEvent(ctx context.Context, id, ev
 	}
 	var changed bool
 	err = runInEntTx(ctx, s.client, s.inTx, func(c *ent.Client) error {
-		evt, err := c.ScheduledEvent.Query().
-			Where(append([]predicate.ScheduledEvent{scheduledevent.IDEQ(uid)}, unadmittedPredicates(eventType, firedBefore)...)...).
-			Only(ctx)
+		// Lock the event row first on Postgres before checking ScheduledExecRun
+		// so concurrent CreateScheduledExecRun and FailUnadmittedScheduledEvent
+		// serialize on the event row rather than evaluating HasExecRun under a
+		// pre-lock statement snapshot (ptone/scion#8210).
+		evtQuery := c.ScheduledEvent.Query().Where(
+			scheduledevent.IDEQ(uid),
+			scheduledevent.EventTypeEQ(eventType),
+			scheduledevent.StatusIn(store.ScheduledEventFired, store.ScheduledEventExpired),
+			scheduledevent.FiredAtLT(firedBefore.UTC()),
+		)
+		if isPostgres(c) {
+			evtQuery = evtQuery.ForUpdate()
+		}
+		evt, err := evtQuery.Only(ctx)
 		if ent.IsNotFound(err) {
 			return nil
 		}
 		if err != nil {
 			return mapError(err)
+		}
+		admitted, err := c.ScheduledExecRun.Query().Where(scheduledexecrun.EventIDEQ(uid)).Exist(ctx)
+		if err != nil {
+			return mapError(err)
+		}
+		if admitted {
+			return nil
 		}
 		n, err := c.ScheduledEvent.Update().
 			Where(append([]predicate.ScheduledEvent{scheduledevent.IDEQ(uid)}, unadmittedPredicates(eventType, firedBefore)...)...).

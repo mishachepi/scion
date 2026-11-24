@@ -20,10 +20,12 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/auditevent"
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/rebuildpreflight"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
 )
@@ -74,6 +76,9 @@ type GCPTokenEvent struct {
 	ProjectID           string            `json:"projectId"`
 	ServiceAccountEmail string            `json:"serviceAccountEmail"`
 	ServiceAccountID    string            `json:"serviceAccountId"`
+	// Audience is the requested OIDC target audience for identity token
+	// events (GCPTokenEventIdentityToken).
+	Audience string `json:"audience,omitempty"`
 	// Member is the IAM member of a Workload Identity binding event
 	// (GCPTokenEventWIBinding), e.g. serviceAccount:<pool>[<ns>/<ksa>].
 	Member     string    `json:"member,omitempty"`
@@ -220,6 +225,7 @@ type AgentSecretReadEvent struct {
 	Scope     string `json:"scope,omitempty"`
 	ScopeID   string `json:"scopeId,omitempty"`
 	SecretKey string `json:"secretKey"`
+	Version   int    `json:"version,omitempty"`
 	Success   bool   `json:"success"`
 	// Derived is true when this event has a partner MaterialSelectionEvent
 	// with the same CorrelationID.
@@ -227,6 +233,24 @@ type AgentSecretReadEvent struct {
 	CorrelationID string    `json:"correlationId,omitempty"`
 	FailReason    string    `json:"failReason,omitempty"`
 	Timestamp     time.Time `json:"timestamp"`
+}
+
+// AgentSecretWriteEvent represents an auditable agent secret write (set or delete) event.
+// It covers write attempts that reached the secret backend; pre-backend refusals
+// (validation, auth, standing, policy) are not recorded.
+// Security: this event MUST NEVER contain secret values.
+type AgentSecretWriteEvent struct {
+	Operation  string    `json:"operation"` // "set" or "delete"
+	AgentID    string    `json:"agentId"`
+	ProjectID  string    `json:"projectId"`
+	Scope      string    `json:"scope"`
+	ScopeID    string    `json:"scopeId"`
+	SecretKey  string    `json:"secretKey"`
+	Version    int       `json:"version,omitempty"`
+	Created    bool      `json:"created,omitempty"`
+	Success    bool      `json:"success"`
+	FailReason string    `json:"failReason,omitempty"`
+	Timestamp  time.Time `json:"timestamp"`
 }
 
 // GCSLinkFetchReason enumerates why a gs:// link fetch was allowed or denied.
@@ -291,19 +315,30 @@ type AuditLogger interface {
 	LogLifecycleHookExecutionEvent(ctx context.Context, event *LifecycleHookExecutionEvent) error
 	// LogAgentSecretReadEvent logs an agent secret read event.
 	LogAgentSecretReadEvent(ctx context.Context, event *AgentSecretReadEvent) error
+	// LogAgentSecretWriteEvent logs an agent secret write (set or delete) event.
+	LogAgentSecretWriteEvent(ctx context.Context, event *AgentSecretWriteEvent) error
 	// LogPendingSecretEvent logs a pending secret event.
 	LogPendingSecretEvent(ctx context.Context, event *PendingSecretEvent) error
+	// LogMessageActionEvent logs a message-action lifecycle or refusal audit event.
+	LogMessageActionEvent(ctx context.Context, event *MessageActionEvent) error
 	// RecordSAAssignment logs a service-account assignment decision or binding
 	// (svc-accnt design §7). Named to match store.SAAssignmentAuditSink, which
 	// this method exists to satisfy: pkg/lifecyclehooks emits these too and
 	// cannot import pkg/hub.
 	RecordSAAssignment(ctx context.Context, event *store.SAAssignmentEvent) error
+	// LogMaintenanceOverrideEvent logs a forced rebuild-server preflight
+	// override to the hub.audit stream (S4-S6). The audit stream is an index
+	// and may be incomplete; the maintenance run rows are authoritative.
+	LogMaintenanceOverrideEvent(ctx context.Context, event *rebuildpreflight.MaintenanceOverrideEvent) error
 }
 
 // Compile-time assertion that an AuditLogger is usable as the store-side sink.
 // If these drift, the lifecycle-hook surface silently loses its audit trail —
 // it would fall back to the nil-sink warning path rather than fail to build.
 var _ store.SAAssignmentAuditSink = AuditLogger(nil)
+
+// Compile-time assertion that AuditLogger satisfies rebuildpreflight.OverrideSink.
+var _ rebuildpreflight.OverrideSink = AuditLogger(nil)
 
 // ---------------------------------------------------------------------------
 // Pending secret audit events
@@ -357,11 +392,20 @@ type LogAuditLogger struct {
 	log    *slog.Logger
 
 	// brokerEnvelopes receives the converted broker family events
-	// (auth_failure, register, join, rotate, deregister). The server sets
-	// it to a SlogSink over the shared async audit writer
+	// (register, successful join, rotate, deregister), and unauthenticated
+	// broker events (auth_failure, failed join) when no dedicated
+	// brokerUnauthenticatedEnvelopes sink is configured. The server sets it
+	// to a SlogSink over the shared async audit writer
 	// (setBrokerEnvelopeSink). Without one, a converted event is dropped
 	// with the rate-limited warning.
 	brokerEnvelopes auditevent.Sink
+	// brokerUnauthenticatedEnvelopes receives unauthenticated broker
+	// envelopes (broker/auth_failure and failed broker/join) through a
+	// reserved-headroom view of the shared async audit writer
+	// (setBrokerUnauthenticatedEnvelopeSink) so unauthenticated floods
+	// cannot starve other audit records. When nil, those events fall back
+	// to brokerEnvelopes.
+	brokerUnauthenticatedEnvelopes auditevent.Sink
 	// brokerDropWarn rate-limits the operational warning for a converted
 	// event that could not be built; nil uses defaultBrokerAuditDropWarner.
 	brokerDropWarn *auditDropWarner
@@ -567,6 +611,10 @@ func (l *LogAuditLogger) LogGCPTokenEvent(ctx context.Context, event *GCPTokenEv
 		slog.String("sa_id", event.ServiceAccountID),
 	}
 
+	if event.Audience != "" {
+		attrs = append(attrs, slog.String("audience", event.Audience))
+	}
+
 	if event.Member != "" {
 		attrs = append(attrs, slog.String("member", event.Member))
 	}
@@ -607,6 +655,46 @@ func (l *LogAuditLogger) LogGCSLinkFetchEvent(ctx context.Context, event *GCSLin
 
 	l.logger().LogAttrs(ctx, level, "gcs link fetch audit event", attrs...)
 
+	return nil
+}
+
+// LogMaintenanceOverrideEvent logs a forced rebuild-server preflight override
+// to the hub.audit slog stream (S4-S6). The record and authoritative fields
+// are always emitted from event.Authority() (never call-site literals).
+func (l *LogAuditLogger) LogMaintenanceOverrideEvent(ctx context.Context, event *rebuildpreflight.MaintenanceOverrideEvent) error {
+	if l == nil || event == nil {
+		return nil
+	}
+	record, authoritative := event.Authority()
+	eventType := event.EventType
+	if eventType == "" {
+		eventType = rebuildpreflight.MaintenanceOverrideEventType
+	}
+	op := event.Operation
+	if op == "" {
+		op = rebuildpreflight.RebuildServerKey
+	}
+	attrs := []slog.Attr{
+		slog.String("event_type", eventType),
+		slog.String("actor_id", event.ActorID),
+		slog.String("actor_email", event.ActorEmail),
+		slog.String("timestamp", event.Timestamp.UTC().Format(time.RFC3339)),
+		slog.String("run_id", event.RunID),
+		slog.String("rerun_of", event.RerunOf),
+		slog.String("operation", op),
+		slog.String("commit", event.Commit),
+		slog.String("branch", event.Branch),
+		slog.Int("blocking", event.Blocking),
+		slog.String("record", record),
+		slog.String("authoritative", authoritative),
+	}
+	if event.CouldNotRunKind != "" {
+		attrs = append(attrs, slog.String("could_not_run_kind", event.CouldNotRunKind))
+	}
+	if event.CouldNotRunClass != "" {
+		attrs = append(attrs, slog.String("could_not_run_class", event.CouldNotRunClass))
+	}
+	l.logger().LogAttrs(ctx, slog.LevelWarn, "maintenance preflight override audit event", attrs...)
 	return nil
 }
 
@@ -687,6 +775,9 @@ func (l *LogAuditLogger) LogAgentSecretReadEvent(ctx context.Context, event *Age
 	if event.ScopeID != "" {
 		attrs = append(attrs, slog.String("scope_id", event.ScopeID))
 	}
+	if event.Version > 0 {
+		attrs = append(attrs, slog.Int("version", event.Version))
+	}
 	if event.Derived {
 		attrs = append(attrs, slog.Bool("derived", event.Derived))
 	}
@@ -701,6 +792,49 @@ func (l *LogAuditLogger) LogAgentSecretReadEvent(ctx context.Context, event *Age
 	}
 
 	l.logger().LogAttrs(ctx, level, "agent secret read event", attrs...)
+
+	return nil
+}
+
+// LogAgentSecretWriteEvent logs an agent secret write (set or delete) event to the standard logger.
+// Security: this method never logs secret values.
+func (l *LogAuditLogger) LogAgentSecretWriteEvent(ctx context.Context, event *AgentSecretWriteEvent) error {
+	if event == nil {
+		return nil
+	}
+	level := slog.LevelInfo
+	if !event.Success {
+		level = slog.LevelWarn
+	}
+
+	attrs := []slog.Attr{
+		slog.String("event_type", "agent_secret_write"),
+		slog.String("operation", event.Operation),
+		slog.String("agent_id", event.AgentID),
+		slog.String("project_id", event.ProjectID),
+		slog.String("secret_key", event.SecretKey),
+		slog.Bool("success", event.Success),
+	}
+	if event.Scope != "" {
+		attrs = append(attrs, slog.String("scope", event.Scope))
+	}
+	if event.ScopeID != "" {
+		attrs = append(attrs, slog.String("scope_id", event.ScopeID))
+	}
+	if event.Version > 0 {
+		attrs = append(attrs, slog.Int("version", event.Version))
+	}
+	if event.Operation == "set" {
+		attrs = append(attrs, slog.Bool("created", event.Created))
+	}
+	if event.FailReason != "" {
+		attrs = append(attrs, slog.String("fail_reason", event.FailReason))
+	}
+	if credAttr, ok := credentialLogAttr(ctx); ok {
+		attrs = append(attrs, credAttr)
+	}
+
+	l.logger().LogAttrs(ctx, level, "agent secret write event", attrs...)
 
 	return nil
 }
@@ -812,8 +946,13 @@ func (l *LogAuditLogger) RecordSAAssignment(ctx context.Context, event *store.SA
 }
 
 // AuditableBrokerAuthMiddleware creates middleware that logs authentication events.
-// This wraps BrokerAuthMiddleware with audit logging.
-func AuditableBrokerAuthMiddleware(svc *BrokerAuthService, logger AuditLogger) func(http.Handler) http.Handler {
+// This wraps BrokerAuthMiddleware with audit logging. clientIP resolves the
+// request's client address (typically Server.clientIP); when nil, the peer
+// host from RemoteAddr is used.
+func AuditableBrokerAuthMiddleware(svc *BrokerAuthService, logger AuditLogger, clientIP func(*http.Request) string) func(http.Handler) http.Handler {
+	if clientIP == nil {
+		clientIP = func(r *http.Request) string { return trustedClientIP(r, nil) }
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Skip if broker auth service is not configured
@@ -832,7 +971,7 @@ func AuditableBrokerAuthMiddleware(svc *BrokerAuthService, logger AuditLogger) f
 			// Create base event
 			event := &BrokerAuthEvent{
 				BrokerID:  brokerID,
-				IPAddress: getClientIP(r),
+				IPAddress: clientIP(r),
 				UserAgent: r.UserAgent(),
 				Timestamp: time.Now(),
 			}
@@ -890,28 +1029,6 @@ func AuditableBrokerAuthMiddleware(svc *BrokerAuthService, logger AuditLogger) f
 			serveAfterAuth(w, next, r.WithContext(ctx))
 		})
 	}
-}
-
-// getClientIP extracts the client IP address from the request.
-func getClientIP(r *http.Request) string {
-	// Check X-Forwarded-For first
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// Take the first IP in the chain
-		for i := 0; i < len(xff); i++ {
-			if xff[i] == ',' {
-				return xff[:i]
-			}
-		}
-		return xff
-	}
-
-	// Check X-Real-IP
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
-	}
-
-	// Fall back to RemoteAddr
-	return r.RemoteAddr
 }
 
 // brokerAuditCredentialDetails returns the credential attribution recorded
@@ -1085,6 +1202,12 @@ func brokerSettingsChangeDetails(before, after *store.RuntimeBroker) []string {
 	if before.GCPHostSource != after.GCPHostSource {
 		kv = append(kv, "gcp_host_source.old", before.GCPHostSource, "gcp_host_source.new", after.GCPHostSource)
 	}
+	if before.AdminManaged != after.AdminManaged {
+		kv = append(kv,
+			"admin_managed.old", strconv.FormatBool(before.AdminManaged),
+			"admin_managed.new", strconv.FormatBool(after.AdminManaged),
+		)
+	}
 	return kv
 }
 
@@ -1207,6 +1330,28 @@ func LogGCPTokenGeneration(ctx context.Context, logger AuditLogger, eventType GC
 		ProjectID:           projectID,
 		ServiceAccountEmail: saEmail,
 		ServiceAccountID:    saID,
+		Success:             success,
+		FailReason:          failReason,
+		Timestamp:           time.Now(),
+	}
+
+	_ = logger.LogGCPTokenEvent(ctx, event)
+}
+
+// LogGCPIdentityTokenGeneration logs a GCP OIDC identity token generation
+// event, recording the requested audience without logging any token material.
+func LogGCPIdentityTokenGeneration(ctx context.Context, logger AuditLogger, agentID, projectID, saEmail, saID, audience string, success bool, failReason string) {
+	if logger == nil {
+		return
+	}
+
+	event := &GCPTokenEvent{
+		EventType:           GCPTokenEventIdentityToken,
+		AgentID:             agentID,
+		ProjectID:           projectID,
+		ServiceAccountEmail: saEmail,
+		ServiceAccountID:    saID,
+		Audience:            audience,
 		Success:             success,
 		FailReason:          failReason,
 		Timestamp:           time.Now(),

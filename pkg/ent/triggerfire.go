@@ -9,6 +9,7 @@ import (
 
 	"entgo.io/ent"
 	"entgo.io/ent/dialect/sql"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/scheduledexecrun"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/triggerfire"
 	"github.com/google/uuid"
 )
@@ -54,19 +55,48 @@ type TriggerFire struct {
 	DecidedDialect string `json:"decided_dialect,omitempty"`
 	// RuleTrace holds the value of the "rule_trace" field.
 	RuleTrace string `json:"rule_trace,omitempty"`
+	// TargetAgentID holds the value of the "target_agent_id" field.
+	TargetAgentID *uuid.UUID `json:"target_agent_id,omitempty"`
 	// ExecutorKind holds the value of the "executor_kind" field.
 	ExecutorKind string `json:"executor_kind,omitempty"`
 	// ExecutorID holds the value of the "executor_id" field.
 	ExecutorID string `json:"executor_id,omitempty"`
 	// LeaseUntil holds the value of the "lease_until" field.
 	LeaseUntil time.Time `json:"lease_until,omitempty"`
+	// NotBefore holds the value of the "not_before" field.
+	NotBefore *time.Time `json:"not_before,omitempty"`
+	// DeferredAt holds the value of the "deferred_at" field.
+	DeferredAt *time.Time `json:"deferred_at,omitempty"`
 	// StartedAt holds the value of the "started_at" field.
 	StartedAt time.Time `json:"started_at,omitempty"`
 	// FinishedAt holds the value of the "finished_at" field.
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
 	// Created holds the value of the "created" field.
-	Created      time.Time `json:"created,omitempty"`
+	Created time.Time `json:"created,omitempty"`
+	// Edges holds the relations/edges for other nodes in the graph.
+	// The values are being populated by the TriggerFireQuery when eager-loading is set.
+	Edges        TriggerFireEdges `json:"edges"`
 	selectValues sql.SelectValues
+}
+
+// TriggerFireEdges holds the relations/edges for other nodes in the graph.
+type TriggerFireEdges struct {
+	// ExecRun holds the value of the exec_run edge.
+	ExecRun *ScheduledExecRun `json:"exec_run,omitempty"`
+	// loadedTypes holds the information for reporting if a
+	// type was loaded (or requested) in eager-loading or not.
+	loadedTypes [1]bool
+}
+
+// ExecRunOrErr returns the ExecRun value or an error if the edge
+// was not loaded in eager-loading, or loaded but was not found.
+func (e TriggerFireEdges) ExecRunOrErr() (*ScheduledExecRun, error) {
+	if e.ExecRun != nil {
+		return e.ExecRun, nil
+	} else if e.loadedTypes[0] {
+		return nil, &NotFoundError{label: scheduledexecrun.Label}
+	}
+	return nil, &NotLoadedError{edge: "exec_run"}
 }
 
 // scanValues returns the types for scanning values from sql.Rows.
@@ -74,11 +104,13 @@ func (*TriggerFire) scanValues(columns []string) ([]any, error) {
 	values := make([]any, len(columns))
 	for i := range columns {
 		switch columns[i] {
+		case triggerfire.FieldTargetAgentID:
+			values[i] = &sql.NullScanner{S: new(uuid.UUID)}
 		case triggerfire.FieldAttributionVersion, triggerfire.FieldAuthorizationRevision:
 			values[i] = new(sql.NullInt64)
 		case triggerfire.FieldInitiatorPrincipalKind, triggerfire.FieldInitiatorPrincipalID, triggerfire.FieldInitiatorCredentialKind, triggerfire.FieldInitiatorCredentialID, triggerfire.FieldInitiatorCredentialSnapshot, triggerfire.FieldSubject, triggerfire.FieldActionType, triggerfire.FieldStatus, triggerfire.FieldError, triggerfire.FieldResultRef, triggerfire.FieldMatchedThrough, triggerfire.FieldDecidedDialect, triggerfire.FieldRuleTrace, triggerfire.FieldExecutorKind, triggerfire.FieldExecutorID:
 			values[i] = new(sql.NullString)
-		case triggerfire.FieldLeaseUntil, triggerfire.FieldStartedAt, triggerfire.FieldFinishedAt, triggerfire.FieldCreated:
+		case triggerfire.FieldLeaseUntil, triggerfire.FieldNotBefore, triggerfire.FieldDeferredAt, triggerfire.FieldStartedAt, triggerfire.FieldFinishedAt, triggerfire.FieldCreated:
 			values[i] = new(sql.NullTime)
 		case triggerfire.FieldID, triggerfire.FieldProjectID, triggerfire.FieldTriggerID, triggerfire.FieldEventID:
 			values[i] = new(uuid.UUID)
@@ -218,6 +250,13 @@ func (_m *TriggerFire) assignValues(columns []string, values []any) error {
 			} else if value.Valid {
 				_m.RuleTrace = value.String
 			}
+		case triggerfire.FieldTargetAgentID:
+			if value, ok := values[i].(*sql.NullScanner); !ok {
+				return fmt.Errorf("unexpected type %T for field target_agent_id", values[i])
+			} else if value.Valid {
+				_m.TargetAgentID = new(uuid.UUID)
+				*_m.TargetAgentID = *value.S.(*uuid.UUID)
+			}
 		case triggerfire.FieldExecutorKind:
 			if value, ok := values[i].(*sql.NullString); !ok {
 				return fmt.Errorf("unexpected type %T for field executor_kind", values[i])
@@ -235,6 +274,20 @@ func (_m *TriggerFire) assignValues(columns []string, values []any) error {
 				return fmt.Errorf("unexpected type %T for field lease_until", values[i])
 			} else if value.Valid {
 				_m.LeaseUntil = value.Time
+			}
+		case triggerfire.FieldNotBefore:
+			if value, ok := values[i].(*sql.NullTime); !ok {
+				return fmt.Errorf("unexpected type %T for field not_before", values[i])
+			} else if value.Valid {
+				_m.NotBefore = new(time.Time)
+				*_m.NotBefore = value.Time
+			}
+		case triggerfire.FieldDeferredAt:
+			if value, ok := values[i].(*sql.NullTime); !ok {
+				return fmt.Errorf("unexpected type %T for field deferred_at", values[i])
+			} else if value.Valid {
+				_m.DeferredAt = new(time.Time)
+				*_m.DeferredAt = value.Time
 			}
 		case triggerfire.FieldStartedAt:
 			if value, ok := values[i].(*sql.NullTime); !ok {
@@ -266,6 +319,11 @@ func (_m *TriggerFire) assignValues(columns []string, values []any) error {
 // This includes values selected through modifiers, order, etc.
 func (_m *TriggerFire) Value(name string) (ent.Value, error) {
 	return _m.selectValues.Get(name)
+}
+
+// QueryExecRun queries the "exec_run" edge of the TriggerFire entity.
+func (_m *TriggerFire) QueryExecRun() *ScheduledExecRunQuery {
+	return NewTriggerFireClient(_m.config).QueryExecRun(_m)
 }
 
 // Update returns a builder for updating this TriggerFire.
@@ -359,6 +417,11 @@ func (_m *TriggerFire) String() string {
 	builder.WriteString("rule_trace=")
 	builder.WriteString(_m.RuleTrace)
 	builder.WriteString(", ")
+	if v := _m.TargetAgentID; v != nil {
+		builder.WriteString("target_agent_id=")
+		builder.WriteString(fmt.Sprintf("%v", *v))
+	}
+	builder.WriteString(", ")
 	builder.WriteString("executor_kind=")
 	builder.WriteString(_m.ExecutorKind)
 	builder.WriteString(", ")
@@ -367,6 +430,16 @@ func (_m *TriggerFire) String() string {
 	builder.WriteString(", ")
 	builder.WriteString("lease_until=")
 	builder.WriteString(_m.LeaseUntil.Format(time.ANSIC))
+	builder.WriteString(", ")
+	if v := _m.NotBefore; v != nil {
+		builder.WriteString("not_before=")
+		builder.WriteString(v.Format(time.ANSIC))
+	}
+	builder.WriteString(", ")
+	if v := _m.DeferredAt; v != nil {
+		builder.WriteString("deferred_at=")
+		builder.WriteString(v.Format(time.ANSIC))
+	}
 	builder.WriteString(", ")
 	builder.WriteString("started_at=")
 	builder.WriteString(_m.StartedAt.Format(time.ANSIC))

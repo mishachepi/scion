@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/clitime"
@@ -122,13 +123,71 @@ func printTriggerDetail(tr *hubclient.Trigger) {
 		if subjDialect == "" {
 			subjDialect = ruleengine.DialectCEL
 		}
-		fmt.Printf("  Subject:     [%s] %q (mode: %s)\n", triggerTerminalText(subjDialect, false), tr.Subject.Expr, triggerTerminalText(tr.Subject.Mode, false))
-	} else if tr.Subject.Mode != "" {
-		fmt.Printf("  Subject:     default (mode: %s)\n", triggerTerminalText(tr.Subject.Mode, false))
+		line := fmt.Sprintf("[%s] %q (mode: %s", triggerTerminalText(subjDialect, false), tr.Subject.Expr, triggerTerminalText(tr.Subject.Mode, false))
+		if tr.Subject.CoalesceWindow != "" {
+			line += ", coalesce: " + triggerTerminalText(tr.Subject.CoalesceWindow, false)
+		}
+		line += ")"
+		fmt.Printf("  Subject:     %s\n", line)
+	} else if tr.Subject.Mode != "" || tr.Subject.CoalesceWindow != "" {
+		line := fmt.Sprintf("default (mode: %s", triggerTerminalText(tr.Subject.Mode, false))
+		if tr.Subject.CoalesceWindow != "" {
+			line += ", coalesce: " + triggerTerminalText(tr.Subject.CoalesceWindow, false)
+		}
+		line += ")"
+		fmt.Printf("  Subject:     %s\n", line)
 	}
 
-	fmt.Printf("  Agent:       %s\n", triggerTerminalText(agentLabel, false))
-	fmt.Printf("  Message:     %s\n", triggerTerminalText(tr.Action.Message, true))
+	if tr.Action.Type == "dispatch_agent" {
+		fmt.Printf("  Action:      dispatch_agent\n")
+		fmt.Printf("  Template:    %s\n", triggerTerminalText(tr.Action.Template, false))
+		if tr.Action.AgentName != "" {
+			fmt.Printf("  Agent Name:  %s\n", triggerTerminalText(tr.Action.AgentName, false))
+		}
+		if tr.Action.NameConflict != "" {
+			fmt.Printf("  On Conflict: %s\n", triggerTerminalText(tr.Action.NameConflict, false))
+		}
+		if tr.Action.Branch != "" {
+			fmt.Printf("  Branch:      %s\n", triggerTerminalText(tr.Action.Branch, false))
+		}
+		if len(tr.Action.Labels) > 0 {
+			keys := make([]string, 0, len(tr.Action.Labels))
+			for k := range tr.Action.Labels {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			pairs := make([]string, len(keys))
+			for i, k := range keys {
+				pairs[i] = triggerTerminalText(k, false) + "=" + triggerTerminalText(tr.Action.Labels[k], false)
+			}
+			fmt.Printf("  Labels:      %s\n", strings.Join(pairs, ", "))
+		}
+		if tr.Action.Ephemeral {
+			fmt.Printf("  Ephemeral:   true\n")
+		}
+		if tr.Action.GithubToken != "" {
+			fmt.Printf("  GH Token:    %s\n", triggerTerminalText(tr.Action.GithubToken, false))
+		}
+		if tr.Action.AgentRole != "" {
+			fmt.Printf("  Agent Role:  %s\n", triggerTerminalText(tr.Action.AgentRole, false))
+		}
+		if tr.Action.ReuseMessage != "" {
+			fmt.Printf("  Reuse Msg:   %s\n", triggerTerminalText(tr.Action.ReuseMessage, true))
+		}
+		if len(tr.Action.UntrustedVars) > 0 {
+			safeVars := make([]string, len(tr.Action.UntrustedVars))
+			for i, v := range tr.Action.UntrustedVars {
+				safeVars[i] = triggerTerminalText(v, false)
+			}
+			fmt.Printf("  Allowed:     %s\n", strings.Join(safeVars, ", "))
+		}
+		if tr.Action.Task != "" {
+			fmt.Printf("  Task:        %s\n", triggerTerminalText(tr.Action.Task, true))
+		}
+	} else {
+		fmt.Printf("  Agent:       %s\n", triggerTerminalText(agentLabel, false))
+		fmt.Printf("  Message:     %s\n", triggerTerminalText(tr.Action.Message, true))
+	}
 	fmt.Printf("  Fires:       %d (errors: %d)\n", tr.FireCount, tr.ErrorCount)
 	if tr.LastFireAt != nil {
 		lastFire := clitime.Ago(*tr.LastFireAt)

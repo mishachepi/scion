@@ -388,6 +388,19 @@
       },
       "additionalProperties": false
     },
+    "broker_policy": {
+      "type": "object",
+      "description": "Hub-level policy for Runtime Brokers. Global-only.",
+      "x-scope": "global",
+      "x-since": "1",
+      "properties": {
+        "admin_managed_only": {
+          "type": "boolean",
+          "description": "When true (and experiment hub.admin_managed_brokers is enabled), restricts Runtime Broker registration, attachment, placement, and agent starts to admin-managed brokers. Default false."
+        }
+      },
+      "additionalProperties": false
+    },
     "auto_expose_ports": {
       "type": "object",
       "description": "Hub-level default for automatically exposing agent container ports. Global-only.",
@@ -1526,6 +1539,11 @@
           "description": "Email addresses to auto-promote to admin role.",
           "x-env-var": "SCION_SERVER_HUB_ADMINEMAILS"
         },
+        "allowed_import_sources": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Sources, beyond https://github.com URLs, that a hosted Hub may fetch on its own host when it imports or discovers templates and harness-configs (import, discover, harness-config reimport). Each entry is an https:// URL prefix (no username, password, port other than 443, query or fragment) or a Google Cloud Storage prefix, gs://<bucket>/<prefix> or :gcs:<bucket>/<prefix>. Entries match on whole path segments. Plain http, the rclone local backend, other rclone backends and rclone connection strings with inline options can never be allowed. HTTP downloads reach public addresses only; redirects are blocked on allowlisted non-GitHub https:// sources. Unset, a hosted Hub fetches only https://github.com URLs. Workstation hubs are exempt. The Hub fails to start with an invalid entry. Read once at startup. Settable only in the settings file (no environment variable): the server-config API refuses this key in every mode."
+        },
         "soft_delete_retention": {
           "type": "string",
           "description": "How long soft-deleted agents are retained before permanent cleanup (e.g., '72h').",
@@ -1658,6 +1676,14 @@
           "type": "integer",
           "description": "Broker keepalive interval, in seconds, sent to the broker with each asynchronous create. A launch with no broker report for 8x this value is ended. Restart required to change.",
           "x-env-var": "SCION_SERVER_HUB_LAUNCHKEEPALIVESECONDS",
+          "x-since": "1"
+        },
+        "audit_retention_days": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 90,
+          "description": "Number of days to retain mutation audit records in the Hub database (default 90). Set to 0 to disable automatic cleanup and retain records indefinitely. Negative values are rejected at startup. A periodic hourly maintenance job deletes records older than this window. Restart required to change.",
+          "x-env-var": "SCION_SERVER_HUB_AUDITRETENTIONDAYS",
           "x-since": "1"
         },
         "missing_agent_grace": {
@@ -1937,12 +1963,51 @@
               "description": "Wall-clock budget for evaluating System One rules on a single message (e.g. '3s'; default '3s', must be > 0 and <= '30s').",
               "x-env-var": "SCION_SERVER_HUB_SYSTEMONE_MAXEVALTIME",
               "x-since": "1"
+            },
+            "secret_names": {
+              "type": "object",
+              "description": "Startup-only operator map of System One adapter ID to extra permitted named-secret keys (e.g. {\"gemini_decisions\": [\"MY_GEMINI_KEY\"]}). Layer-0; refused by the server-config API in every mode; changes require a Hub restart.",
+              "additionalProperties": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "x-since": "1"
             }
           }
         },
         "branding": {
           "$ref": "#/$defs/serverHubBranding",
           "description": "Hub-wide UI branding settings (product name, logos, icons, accent color, and WCAG AA validated light/dark color palettes).",
+          "x-since": "1"
+        },
+        "schedules": {
+          "type": "object",
+          "description": "Limits on recurring schedules, for every kind and author. Read at startup.",
+          "additionalProperties": false,
+          "properties": {
+            "min_interval": {
+              "type": "string",
+              "description": "Shortest interval a recurring schedule's cron expression may fire at, as a Go duration (default '5m'; '0s' turns the check off; at most '24h'). Checked on create, cron change, enable and resume.",
+              "x-env-var": "SCION_SERVER_HUB_SCHEDULES_MININTERVAL",
+              "x-since": "1"
+            },
+            "max_active_per_project": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 10000,
+              "description": "Most active recurring schedules one project may hold, of every kind (default 100; 0 = no cap). Checked on create, enable and resume.",
+              "x-env-var": "SCION_SERVER_HUB_SCHEDULES_MAXACTIVEPERPROJECT",
+              "x-since": "1"
+            }
+          }
+        },
+        "default_message_mode": {
+          "type": "string",
+          "enum": ["none", "lineage", "branch", "project"],
+          "description": "Message mode of a new agent when neither the create request, its template nor its parent agent sets one. Unset means 'project'. 'hub' is not accepted. Read at startup.",
+          "x-env-var": "SCION_SERVER_HUB_DEFAULTMESSAGEMODE",
           "x-since": "1"
         }
       }
@@ -2006,10 +2071,28 @@
           "x-env-var": "SCION_SERVER_RUNTIMEBROKER_ALLOWCONTAINERSCRIPTHARNESSES"
         },
         "cors": { "$ref": "#/$defs/corsConfig" },
+        "init_firewall": { "$ref": "#/$defs/initFirewallConfig" },
         "instances": {
           "type": ["array", "null"],
           "items": { "$ref": "#/$defs/runtimeBrokerInstance" },
           "description": "Flat (single-target) Runtime Broker instances hosted by this process, each with a unique key. Empty or absent means legacy hosting. This release accepts docker entries. Read from the global settings file only."
+        }
+      }
+    },
+    "initFirewallConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Operator-authoritative egress firewall policy applied when an agent opts into SCION_INIT_FIREWALL.",
+      "properties": {
+        "allow_domains": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Additional DNS hostnames allowed through the opt-in egress firewall (merged with the built-in list; max 64 unique entries)."
+        },
+        "allow_ssh": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow outbound SSH (tcp/22) to any IPv4 host when the opt-in egress firewall is active."
         }
       }
     },
@@ -2414,8 +2497,7 @@
         },
         "default_user_role": {
           "type": "string",
-          "description": "Role assigned to new users not in admin_emails. Values: 'member' (default), 'viewer'. 'admin' is blocked.",
-          "enum": ["member", "viewer"],
+          "description": "Role assigned to new users not in admin_emails. Values: 'member' (default), 'viewer', or an eligible custom system-scope role name when hub.custom_default_user_role is enabled. 'admin' is blocked.",
           "default": "member",
           "x-env-var": "SCION_SERVER_AUTH_DEFAULTUSERROLE",
           "x-since": "1"
@@ -2439,7 +2521,7 @@
           "type": "object",
           "description": "Proxy auth settings, consulted when mode is 'proxy'.",
           "properties": {
-            "provider": { "type": "string", "description": "Proxy auth provider: 'iap', 'jwt' or 'header'. Any other value is a startup error when mode is 'proxy'." },
+            "provider": { "type": "string", "description": "Proxy auth provider: 'iap' or 'jwt'. Any other value is a startup error when mode is 'proxy'." },
             "iap": {
               "type": "object",
               "description": "Google IAP settings.",
@@ -2454,6 +2536,11 @@
               "description": "Settings for the generic JWT proxy auth provider.",
               "properties": {
                 "header": { "type": "string", "description": "Request header that carries the JWT." },
+                "identity_headers": {
+                  "type": "array",
+                  "items": { "type": "string" },
+                  "description": "Additional user identity headers set by the front proxy (for example email or ID headers) to strip before forwarding requests to an agent's exposed port."
+                },
                 "algorithm": { "type": "string", "description": "Expected JWT signing algorithm." },
                 "issuer": { "type": "string", "description": "Expected JWT issuer." },
                 "audience": { "type": "string", "description": "If set, validated against the JWT 'aud' claim." },
@@ -3296,6 +3383,20 @@
           "enum": ["shown", "hidden"],
           "description": "Whether 'Powered by Scion' attribution is shown ('shown', default) or hidden ('hidden') when custom branding is active.",
           "x-env-var": "SCION_SERVER_HUB_BRANDING_ATTRIBUTION"
+        },
+        "corners": {
+          "type": "string",
+          "enum": ["default", "square", "rounded"],
+          "description": "Corner radius preset for UI controls and containers ('default', 'square', or 'rounded').",
+          "x-env-var": "SCION_SERVER_HUB_BRANDING_CORNERS"
+        },
+        "font_sans": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9]([A-Za-z0-9 -]{0,62}[A-Za-z0-9-])?$",
+          "description": "UI sans-serif typeface preset ('default', 'system', 'ibm-plex-sans', 'plus-jakarta-sans', 'dm-sans', 'source-sans-3') or any Google Fonts family name. Monospace (code and terminal) remains JetBrains Mono.",
+          "x-env-var": "SCION_SERVER_HUB_BRANDING_FONTSANS"
         },
         "logo": {
           "type": "object",

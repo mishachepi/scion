@@ -41,6 +41,7 @@ type Agent struct {
 	ContainerStatus   string            `json:"containerStatus,omitempty"`
 	RuntimeState      string            `json:"runtimeState,omitempty"`
 	Image             string            `json:"image,omitempty"`
+	Generation        int               `json:"generation,omitempty"`
 	Detached          bool              `json:"detached,omitempty"`
 	Runtime           string            `json:"runtime,omitempty"`
 	RuntimeBrokerID   string            `json:"runtimeBrokerId,omitempty"`
@@ -118,6 +119,7 @@ type AgentLaunch = api.AgentLaunch
 // AgentConfig represents agent configuration.
 type AgentConfig struct {
 	Image         string            `json:"image,omitempty"`
+	Harness       string            `json:"harness,omitempty"`
 	HarnessConfig string            `json:"harnessConfig,omitempty"`
 	HarnessAuth   string            `json:"harnessAuth,omitempty"`
 	Env           map[string]string `json:"env,omitempty"`
@@ -159,23 +161,36 @@ type KubernetesInfo struct {
 	SyncedAt  string `json:"syncedAt,omitempty"`
 }
 
+// GitHubAppProjectStatus reflects the health of a project's GitHub App
+// installation association.
+type GitHubAppProjectStatus struct {
+	State         string     `json:"state"`
+	ErrorCode     string     `json:"error_code,omitempty"`
+	ErrorMessage  string     `json:"error_message,omitempty"`
+	LastTokenMint *time.Time `json:"last_token_mint,omitempty"`
+	LastError     *time.Time `json:"last_error,omitempty"`
+	LastChecked   time.Time  `json:"last_checked"`
+}
+
 // Project represents a project from the Hub API.
 type Project struct {
-	ID                     string            `json:"id"`
-	Name                   string            `json:"name"`
-	Slug                   string            `json:"slug"`
-	GitRemote              string            `json:"gitRemote,omitempty"`
-	DefaultRuntimeBrokerID string            `json:"defaultRuntimeBrokerId,omitempty"`
-	Created                time.Time         `json:"created"`
-	Updated                time.Time         `json:"updated"`
-	CreatedBy              string            `json:"createdBy,omitempty"`
-	OwnerID                string            `json:"ownerId,omitempty"`
-	Labels                 map[string]string `json:"labels,omitempty"`
-	Annotations            map[string]string `json:"annotations,omitempty"`
-	Providers              []ProjectProvider `json:"providers,omitempty"`
-	AgentCount             int               `json:"agentCount,omitempty"`
-	ActiveBrokerCount      int               `json:"activeBrokerCount,omitempty"`
-	ProjectType            string            `json:"projectType,omitempty"`
+	ID                     string                  `json:"id"`
+	Name                   string                  `json:"name"`
+	Slug                   string                  `json:"slug"`
+	GitRemote              string                  `json:"gitRemote,omitempty"`
+	DefaultRuntimeBrokerID string                  `json:"defaultRuntimeBrokerId,omitempty"`
+	Created                time.Time               `json:"created"`
+	Updated                time.Time               `json:"updated"`
+	CreatedBy              string                  `json:"createdBy,omitempty"`
+	OwnerID                string                  `json:"ownerId,omitempty"`
+	Labels                 map[string]string       `json:"labels,omitempty"`
+	Annotations            map[string]string       `json:"annotations,omitempty"`
+	GitHubInstallationID   *int64                  `json:"githubInstallationId,omitempty"`
+	GitHubAppStatus        *GitHubAppProjectStatus `json:"githubAppStatus,omitempty"`
+	Providers              []ProjectProvider       `json:"providers,omitempty"`
+	AgentCount             int                     `json:"agentCount,omitempty"`
+	ActiveBrokerCount      int                     `json:"activeBrokerCount,omitempty"`
+	ProjectType            string                  `json:"projectType,omitempty"`
 }
 
 // MarshalJSON implements custom marshaling to also emit the canonical
@@ -218,6 +233,12 @@ type ProjectProvider struct {
 	// no max_agents_per_broker definition exists, or resolution failed for
 	// this provider; a broker with no agents reports 0, not unset.
 	AgentCount *int64 `json:"agentCount,omitempty"`
+	// AdminManaged is the broker's stored admin_managed approval flag (ptone/scion#7829).
+	AdminManaged bool `json:"adminManaged,omitempty"`
+	// PolicyEligible reports whether this provider broker is eligible under
+	// broker_policy.admin_managed_only (true when the policy is off). Nil when
+	// omitted by an older Hub that does not report this field.
+	PolicyEligible *bool `json:"policyEligible,omitempty"`
 	// AgentLimitSource reports which precedence step produced AgentLimit
 	// (ptone/scion#2061 P2, design.md §5.9): "broker", "entitlement",
 	// "hub_default", "unlimited", or "not_enforced" (Amendment A1: the P1b
@@ -382,6 +403,8 @@ type RuntimeBroker struct {
 	Endpoint        string              `json:"endpoint,omitempty"`
 	Projects        []BrokerProjectInfo `json:"projects,omitempty"`
 	AutoProvide     bool                `json:"autoProvide,omitempty"` // Automatically add as provider for new projects
+	AdminManaged    bool                `json:"adminManaged,omitempty"`
+	PolicyEligible  *bool               `json:"policyEligible,omitempty"`
 	Created         time.Time           `json:"created"`
 	Updated         time.Time           `json:"updated"`
 	CreatedBy       string              `json:"createdBy,omitempty"` // User ID who registered this broker
@@ -569,6 +592,7 @@ type Template struct {
 	Files         []TemplateFile   `json:"files,omitempty"`
 	BaseTemplate  string           `json:"baseTemplate,omitempty"`
 	SourceURL     string           `json:"sourceUrl,omitempty"`
+	SourceCommit  string           `json:"sourceCommit,omitempty"`
 	Locked        bool             `json:"locked,omitempty"`
 	Status        string           `json:"status"`
 	OwnerID       string           `json:"ownerId,omitempty"`
@@ -693,13 +717,14 @@ type CloneProjectRequest struct {
 
 // HarnessConfigData holds harness-specific configuration.
 type HarnessConfigData struct {
-	Harness          string            `json:"harness,omitempty"`
-	Image            string            `json:"image,omitempty"`
-	User             string            `json:"user,omitempty"`
-	Model            string            `json:"model,omitempty"`
-	Args             []string          `json:"args,omitempty"`
-	Env              map[string]string `json:"env,omitempty"`
-	AuthSelectedType string            `json:"authSelectedType,omitempty"`
-	ModelAliases     map[string]string `json:"modelAliases,omitempty"`
-	NoAuthBehavior   string            `json:"noAuthBehavior,omitempty"`
+	Harness          string                           `json:"harness,omitempty"`
+	Image            string                           `json:"image,omitempty"`
+	User             string                           `json:"user,omitempty"`
+	Model            string                           `json:"model,omitempty"`
+	Args             []string                         `json:"args,omitempty"`
+	Env              map[string]string                `json:"env,omitempty"`
+	AuthSelectedType string                           `json:"authSelectedType,omitempty"`
+	ModelAliases     map[string]string                `json:"modelAliases,omitempty"`
+	NoAuthBehavior   string                           `json:"noAuthBehavior,omitempty"`
+	Capabilities     *api.HarnessAdvancedCapabilities `json:"capabilities,omitempty"`
 }

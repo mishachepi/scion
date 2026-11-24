@@ -17,6 +17,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -24,6 +25,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
@@ -31,11 +34,26 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 )
 
+const (
+	// Podman added --add-host <host>:host-gateway support in 4.7.0.
+	podmanMinHostGatewayMajor = 4
+	podmanMinHostGatewayMinor = 7
+	podmanNativeHostAlias     = "host.containers.internal"
+)
+
+// ErrPodmanHostGatewayUnsupported is returned (wrapped in a *LaunchFailure)
+// when a container requires --add-host <host>:host-gateway on a Podman version
+// older than 4.7.
+var ErrPodmanHostGatewayUnsupported = errors.New("podman does not support --add-host host-gateway; upgrade to Podman 4.7 or newer")
+
 type PodmanRuntime struct {
 	Command  string
 	Host     string
 	Rootless bool // true when Podman is running in rootless mode
 	Options  ContainerOptions
+
+	hostGatewayOnce      sync.Once
+	hostGatewaySupported bool
 }
 
 // NewPodmanRuntime creates a new PodmanRuntime after verifying that the podman
@@ -60,7 +78,8 @@ func NewPodmanRuntime(cmdOverride string) Runtime {
 		return &ErrorRuntime{Err: fmt.Errorf("failed to get podman version: %w", err)}
 	}
 
-	version := parsePodmanVersion(strings.TrimSpace(string(out)))
+	versionOutput := strings.TrimSpace(string(out))
+	version := parsePodmanVersion(versionOutput)
 	major, err := parseMajorVersion(version)
 	if err != nil {
 		return &ErrorRuntime{Err: fmt.Errorf("failed to parse podman version %q: %w", version, err)}
@@ -72,10 +91,182 @@ func NewPodmanRuntime(cmdOverride string) Runtime {
 	// Detect and store rootless mode
 	rootless := detectRootlessMode(command)
 
-	return &PodmanRuntime{
+	rt := &PodmanRuntime{
 		Command:  command,
 		Rootless: rootless,
 	}
+	supported := probePodmanHostGateway(context.Background(), command, versionOutput)
+	rt.hostGatewayOnce.Do(func() {
+		rt.hostGatewaySupported = supported
+	})
+	return rt
+}
+
+type podmanVersionJSON struct {
+	Client *struct {
+		Version string `json:"Version"`
+	} `json:"Client"`
+	Server *struct {
+		Version string `json:"Version"`
+	} `json:"Server"`
+}
+
+// parsePodmanVersionJSON extracts major.minor from "podman version --format json"
+// output. When both Server and Client are present (remote Podman / podman machine),
+// the Server version is preferred because the service enforces --add-host support.
+// When no separate Server is present (local daemonless Podman), it falls back to
+// Client.Version.
+func parsePodmanVersionJSON(output string) (major, minor int, ok bool) {
+	trimmed := strings.TrimSpace(output)
+	idx := strings.IndexByte(trimmed, '{')
+	if idx < 0 {
+		return 0, 0, false
+	}
+	var parsed podmanVersionJSON
+	if err := json.Unmarshal([]byte(trimmed[idx:]), &parsed); err != nil {
+		return 0, 0, false
+	}
+	if parsed.Server != nil && strings.TrimSpace(parsed.Server.Version) != "" {
+		if maj, min, ok := parsePodmanMajorMinorVersion(parsed.Server.Version); ok {
+			return maj, min, true
+		}
+	}
+	if parsed.Client != nil && strings.TrimSpace(parsed.Client.Version) != "" {
+		if maj, min, ok := parsePodmanMajorMinorVersion(parsed.Client.Version); ok {
+			return maj, min, true
+		}
+	}
+	return 0, 0, false
+}
+
+// PodmanSupportsHostGateway reports whether Podman supports the special
+// "host-gateway" address used by --add-host. Support was added in Podman 4.7;
+// older releases (e.g. Podman 4.3.1 on Debian 12) reject it with
+// "invalid IP address in add-host: host-gateway". It prefers the Podman server
+// version (for remote Podman / podman machine) via "podman version --format json",
+// falling back to the client version when there is no separate server. On any
+// probe failure we conservatively assume support is present, matching
+// DockerSupportsHostGateway.
+func PodmanSupportsHostGateway(ctx context.Context, command string) bool {
+	return probePodmanHostGateway(ctx, command, "")
+}
+
+const podmanHostGatewayProbeTimeout = 5 * time.Second
+
+func probePodmanHostGateway(ctx context.Context, command, clientVersionFallback string) bool {
+	return probePodmanHostGatewayWithTimeout(ctx, command, clientVersionFallback, podmanHostGatewayProbeTimeout)
+}
+
+func probePodmanHostGatewayWithTimeout(ctx context.Context, command, clientVersionFallback string, timeout time.Duration) bool {
+	if command == "" {
+		command = "podman"
+	}
+	jsonCtx, jsonCancel := context.WithTimeout(ctx, timeout)
+	out, err := runSimpleCommand(jsonCtx, command, "version", "--format", "json")
+	jsonCancel()
+	if err == nil {
+		if major, minor, ok := parsePodmanVersionJSON(out); ok {
+			return podmanVersionSupportsHostGateway(major, minor)
+		}
+		runtimeLog().Debug("Unable to parse Podman JSON version for host-gateway support", "output", strings.TrimSpace(out))
+	} else {
+		runtimeLog().Debug("Unable to probe Podman JSON version for host-gateway support", "error", err)
+	}
+
+	if clientVersionFallback == "" {
+		fallbackCtx, fallbackCancel := context.WithTimeout(ctx, timeout)
+		fallbackOut, fallbackErr := runSimpleCommand(fallbackCtx, command, "--version")
+		fallbackCancel()
+		if fallbackErr != nil {
+			runtimeLog().Debug("Unable to probe Podman client version for host-gateway support", "error", fallbackErr)
+			return true
+		}
+		clientVersionFallback = strings.TrimSpace(fallbackOut)
+	}
+	major, minor, ok := parsePodmanMajorMinorVersion(clientVersionFallback)
+	if !ok {
+		runtimeLog().Debug("Unable to parse Podman version for host-gateway support", "version", clientVersionFallback)
+		return true
+	}
+	return podmanVersionSupportsHostGateway(major, minor)
+}
+
+func podmanVersionSupportsHostGateway(major, minor int) bool {
+	return major > podmanMinHostGatewayMajor || (major == podmanMinHostGatewayMajor && minor >= podmanMinHostGatewayMinor)
+}
+
+// parsePodmanMajorMinorVersion parses the leading "major.minor" from
+// "podman --version" output (e.g. "podman version 4.7.0" or "4.3.1"). It
+// tolerates a leading "v"/"V" prefix, pre-release suffixes (e.g. "4.7-dev"),
+// and scans line-by-line so warning noise does not defeat the probe.
+func parsePodmanMajorMinorVersion(output string) (major, minor int, ok bool) {
+	for _, line := range strings.Split(output, "\n") {
+		ver := strings.TrimLeft(strings.TrimSpace(parsePodmanVersion(strings.TrimSpace(line))), "vV")
+		parts := strings.SplitN(ver, ".", 3)
+		if len(parts) < 2 {
+			continue
+		}
+		maj, err := strconv.Atoi(parts[0])
+		if err != nil {
+			continue
+		}
+		minorStr := parts[1]
+		if idx := strings.IndexAny(minorStr, "-+~"); idx >= 0 {
+			minorStr = minorStr[:idx]
+		}
+		min, err := strconv.Atoi(minorStr)
+		if err != nil {
+			continue
+		}
+		return maj, min, true
+	}
+	return 0, 0, false
+}
+
+func (r *PodmanRuntime) supportsHostGateway(ctx context.Context) bool {
+	r.hostGatewayOnce.Do(func() {
+		r.hostGatewaySupported = PodmanSupportsHostGateway(ctx, r.Command)
+	})
+	return r.hostGatewaySupported
+}
+
+// filterPodmanExtraHosts checks config.ExtraHosts for "host-gateway" targets
+// and guards against Podman < 4.7 rejecting them. When Podman lacks support:
+//   - host.containers.internal:host-gateway is omitted with a warning, since
+//     Podman resolves host.containers.internal natively without --add-host.
+//   - Any other <host>:host-gateway entry fails with a typed *LaunchFailure
+//     naming the minimum Podman version (4.7).
+func filterPodmanExtraHosts(ctx context.Context, extraHosts []string, supports func(context.Context) bool) ([]string, error) {
+	hasHostGateway := false
+	for _, h := range extraHosts {
+		if _, target, ok := strings.Cut(h, ":"); ok && strings.EqualFold(target, "host-gateway") {
+			hasHostGateway = true
+			break
+		}
+	}
+	if !hasHostGateway || supports(ctx) {
+		return extraHosts, nil
+	}
+
+	filtered := make([]string, 0, len(extraHosts))
+	for _, h := range extraHosts {
+		name, target, ok := strings.Cut(h, ":")
+		if !ok || !strings.EqualFold(target, "host-gateway") {
+			filtered = append(filtered, h)
+			continue
+		}
+		if strings.EqualFold(name, podmanNativeHostAlias) {
+			runtimeLog().Warn("Omitting --add-host host.containers.internal:host-gateway: Podman < 4.7 does not support host-gateway and resolves host.containers.internal natively")
+			continue
+		}
+		return nil, newLaunchFailure(
+			api.LaunchCodePodmanHostGatewayUnsupported,
+			api.LaunchStepLaunching,
+			"",
+			fmt.Errorf("%w: cannot pass --add-host %s", ErrPodmanHostGatewayUnsupported, h),
+		)
+	}
+	return filtered, nil
 }
 
 // parsePodmanVersion extracts the version string from "podman version X.Y.Z" output.
@@ -148,11 +339,21 @@ func (r *PodmanRuntime) Run(ctx context.Context, config RunConfig) (string, erro
 	if r.Rootless {
 		config.MetadataInterception = false
 	}
+	if err := checkFirewallWithoutMetadataInterception(config); err != nil {
+		return "", err
+	}
 
 	if err := prepareContainerSecretEnv(&config); err != nil {
 		return "", err
 	}
 	r.Options.apply(&config)
+	config.RuntimeName = r.Name()
+
+	extraHosts, err := filterPodmanExtraHosts(ctx, config.ExtraHosts, r.supportsHostGateway)
+	if err != nil {
+		return "", err
+	}
+	config.ExtraHosts = extraHosts
 
 	args, err := buildCommonRunArgs(config)
 	if err != nil {
@@ -220,6 +421,9 @@ func (r *PodmanRuntime) Run(ctx context.Context, config RunConfig) (string, erro
 	if err := hooks.checkpoint(ctx, CheckpointStepLaunching); err != nil {
 		return "", err
 	}
+	if config.MetadataInterception {
+		checkImageNetnsSetupSupport(ctx, r.Command, config.Image)
+	}
 	// Rootless podman that starts its user namespace's pause process
 	// (catatonit -P) hands it its own environment, and the pause process
 	// outlives the run: the secret values would stay in its
@@ -243,7 +447,14 @@ func (r *PodmanRuntime) Run(ctx context.Context, config RunConfig) (string, erro
 			rollbackCancelledCreate(r.Command, config.Name, config.Labels[api.LabelRunID])
 			return "", ctx.Err()
 		}
-		return "", fmt.Errorf("container run failed: %w (output: %s)", err, out)
+		runErr := fmt.Errorf("container run failed: %w (output: %s)", err, out)
+		if code, step := classifyPodmanRunError(out, err); code != "" {
+			if step == api.LaunchStepImagePull {
+				hooks.progress(api.LaunchStepImagePull)
+			}
+			return "", newLaunchFailure(code, step, "", runErr)
+		}
+		return "", runErr
 	}
 
 	// "podman run -d" prints the full container ID, and only that, on
@@ -259,6 +470,15 @@ func (r *PodmanRuntime) Run(ctx context.Context, config RunConfig) (string, erro
 			return "", fmt.Errorf("%w; a container from this run may still exist: %v", err, rbErr)
 		}
 		return "", err
+	}
+	if config.MetadataInterception {
+		if err := runNetnsSetup(ctx, r.Command, id, config); err != nil {
+			removeNetnsSetupContainers(ctx, r.Command, id)
+			if rmErr := removeCreatedContainer(r.Command, id); rmErr != nil {
+				return "", fmt.Errorf("metadata network setup failed: %w (container cleanup also failed: %v)", err, rmErr)
+			}
+			return "", fmt.Errorf("metadata network setup failed: %w", err)
+		}
 	}
 	reportContainerCreated(hooks, config.Name, id)
 	return id, nil
@@ -282,9 +502,11 @@ func (r *PodmanRuntime) Stop(ctx context.Context, ref RunRef) error {
 	return err
 }
 
-// Delete removes the container ref.ID. The engine container ID is already
+// Delete removes the container ref.ID and best-effort removes any leftover
+// netns-setup containers labelled for it. The engine container ID is already
 // unique per run, so ref.RunID needs no further check here.
 func (r *PodmanRuntime) Delete(ctx context.Context, ref RunRef) error {
+	removeNetnsSetupContainers(ctx, r.Command, ref.ID)
 	_, err := runSimpleCommand(ctx, r.Command, "rm", "-f", ref.ID)
 	return err
 }
@@ -390,7 +612,7 @@ func (r *PodmanRuntime) Attach(ctx context.Context, id string) error {
 
 	// Check if running
 	if agent.Phase != string(state.PhaseRunning) {
-		return fmt.Errorf("agent '%s' is not running (status: %s), use 'scion start %s' to resume it", id, agent.ContainerStatus, id)
+		return fmt.Errorf("agent '%s' is not running (status: %s), use 'scion resume %s' to resume it", id, agent.ContainerStatus, id)
 	}
 
 	// Ensure tmux uses the latest client's terminal size so the session
@@ -416,7 +638,13 @@ func (r *PodmanRuntime) ImageExists(ctx context.Context, image string) (bool, er
 		if isImageNotFoundOutput(out) {
 			return false, nil
 		}
+		if ctx.Err() == nil && isPodmanDaemonConnectError(out) {
+			return false, newLaunchFailure(api.LaunchCodeRuntimeUnavailable, api.LaunchStepLaunching, "", err)
+		}
 		return false, err
+	}
+	if ctx.Err() == nil && isRuntimeBinaryNotFound(err) {
+		return false, newLaunchFailure(api.LaunchCodeRuntimeUnavailable, api.LaunchStepLaunching, "", err)
 	}
 	return false, err
 }
@@ -435,12 +663,21 @@ func (r *PodmanRuntime) RemoveImage(ctx context.Context, image string) error {
 }
 
 func (r *PodmanRuntime) PullImage(ctx context.Context, image string) error {
+	reportLaunchProgress(ctx, api.LaunchStepImagePull)
 	out, err := runSimpleCommand(ctx, r.Command, "pull", image)
 	if err != nil {
+		var pullErr error
 		if trimmed := strings.TrimSpace(out); trimmed != "" {
-			return fmt.Errorf("pull %q: %w\n%s", image, err, trimmed)
+			pullErr = fmt.Errorf("pull %q: %w\n%s", image, err, trimmed)
+		} else {
+			pullErr = fmt.Errorf("pull %q: %w", image, err)
 		}
-		return fmt.Errorf("pull %q: %w", image, err)
+		if ctx.Err() == nil {
+			if code := classifyPodmanPullError(image, out, err); code != "" {
+				return newLaunchFailure(code, api.LaunchStepImagePull, "", pullErr)
+			}
+		}
+		return pullErr
 	}
 	return nil
 }

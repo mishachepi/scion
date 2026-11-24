@@ -54,7 +54,13 @@ import {
   ARTIFACT_REF_PATTERN,
   buildArtifactLinkElement,
 } from '../../../utils/chat-file-links.js';
-import { decisionsEnabled, isFeatureEnabled } from '../../../utils/feature-flags.js';
+import {
+  agentSecretsEnabled,
+  codeSpanMentionsEnabled,
+  decisionsEnabled,
+  FEATURE_FLAGS_CHANGED_EVENT,
+  isFeatureEnabled,
+} from '../../../utils/feature-flags.js';
 import {
   ARTIFACTS_FLAG,
   orderArtifactRefs,
@@ -64,9 +70,19 @@ import './chat-file-preview.js';
 import type { PreviewTarget } from './chat-file-preview.js';
 import '../code-editor.js';
 import '../markdown-preview.js';
-import { userMentionSlug } from './prose-mentions.js';
+import {
+  parseCodeSpanMention,
+  toMentionSlug,
+  userMentionSlug,
+  type MentionRosterAgent,
+} from './prose-mentions.js';
 import './chat-decisions.js';
 import './chat-decision-response.js';
+import './chat-secret-request.js';
+import {
+  fetchSecretRequestCard,
+  type SecretRequestCardResponse,
+} from '../../../client/secret-requests.js';
 import { ANSWERABLE } from '../../../client/decision-prompts.js';
 import type { AskerAnswerability } from '../../../client/decision-prompts.js';
 import type {
@@ -76,6 +92,30 @@ import type {
   DecisionView,
 } from '../../../shared/types.js';
 import { copyToClipboard, showCopyFailedToast } from '../../../utils/clipboard.js';
+
+/** Tooltip shown on a failed message whose target agent was deleted. */
+export const DELETED_AGENT_TOOLTIP = 'Mention a live agent with @ to resend.';
+
+/**
+ * Whether a failed message's reason/code indicates an unreachable deleted agent.
+ * Matches both explicit `agent_unreachable` codes and history rows without a code.
+ */
+export function isDeletedUnreachableReason(
+  reason: string | null | undefined,
+  code?: string
+): boolean {
+  if (!reason) return false;
+  const isUnreachable =
+    code === 'agent_unreachable' || (!code && reason.startsWith('Agent unreachable'));
+  return isUnreachable && reason.endsWith('(deleted)');
+}
+
+/** Label and toast text for a message that failed because the target agent was deleted. */
+export function formatDeletedAgentLabel(agentSlug: string): string {
+  return agentSlug
+    ? `Not delivered — @${agentSlug} was deleted`
+    : 'Not delivered — agent was deleted';
+}
 
 /** Structured attachment reference from the W7 API. */
 export interface AttachmentRefInfo {
@@ -89,12 +129,131 @@ export interface AttachmentRefInfo {
   height?: number;
 }
 
-/** Roster entry used to resolve `@<email>` mentions to known Scion users (ptone/scion#8133). */
+/** Roster entry used to resolve `@<email>` and code-span `@<slug>` mentions (ptone/scion#8133, ptone/scion#8783). */
 export interface ChatMessageMember {
   name?: string;
   displayName?: string;
   email?: string;
   kind?: string;
+  slug?: string;
+}
+
+/** Detail emitted when a highlighted `@mention` requests its context menu. */
+export interface MentionContextMenuDetail {
+  slug: string;
+  mentionEl: HTMLElement;
+  clientX: number;
+  clientY: number;
+  fromKeyboard: boolean;
+  originalEvent?: MouseEvent | undefined;
+}
+
+/** Detail emitted on `pointerdown` over a highlighted `@mention` (for touch long-press). */
+export interface MentionPointerDownDetail {
+  slug: string;
+  mentionEl: HTMLElement;
+  originalEvent: PointerEvent;
+}
+
+/** How long a press-time selection snapshot stays valid for the ensuing `contextmenu`. */
+const CONTEXT_PRESS_WINDOW_MS = 1000;
+
+type ComposedSelection = Selection & {
+  getComposedRanges?: (options: { shadowRoots: ShadowRoot[] }) => StaticRange[];
+};
+
+function hasRangeSelection(sel: Selection | null | undefined): sel is Selection {
+  return !!sel && sel.type === 'Range';
+}
+
+function ancestorShadowRoots(node: Node): ShadowRoot[] {
+  const roots: ShadowRoot[] = [];
+  let cur: Node | null = node;
+  while (cur) {
+    const root = cur.getRootNode();
+    if (root instanceof ShadowRoot) {
+      roots.push(root);
+      cur = root.host;
+    } else {
+      break;
+    }
+  }
+  return roots;
+}
+
+function staticRangeCoversNode(sr: StaticRange, target: Node): boolean {
+  if (sr.collapsed) return false;
+  const startRoot = sr.startContainer.getRootNode();
+  const endRoot = sr.endContainer.getRootNode();
+  let node: Node | null = target;
+  while (node) {
+    const root = node.getRootNode();
+    if (startRoot === root || endRoot === root) {
+      const range = document.createRange();
+      if (startRoot === root) {
+        range.setStart(sr.startContainer, sr.startOffset);
+      } else {
+        range.setStart(root, 0);
+      }
+      if (endRoot === root) {
+        range.setEnd(sr.endContainer, sr.endOffset);
+      } else {
+        range.setEnd(root, root.childNodes.length);
+      }
+      return !range.collapsed && range.intersectsNode(node);
+    }
+    if (root instanceof ShadowRoot) {
+      node = root.host;
+    } else {
+      return false;
+    }
+  }
+  return false;
+}
+
+function selectionRangesCoverNode(sel: Selection | null | undefined, target: Node): boolean {
+  if (!hasRangeSelection(sel)) return false;
+  const targetRoot = target.getRootNode();
+  for (let i = 0; i < sel.rangeCount; i++) {
+    const range = sel.getRangeAt(i);
+    if (range.collapsed) continue;
+    if (range.startContainer.getRootNode() === targetRoot && range.intersectsNode(target)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Whether an active non-empty text selection covers or intersects `target`.
+ * Uses `Selection.getComposedRanges` across `target`'s enclosing shadow roots
+ * when available, falling back to `ShadowRoot.getSelection` and
+ * `window.getSelection`.
+ */
+export function selectionCoversNode(target?: EventTarget | null): boolean {
+  if (!(target instanceof Node) || typeof window === 'undefined') return false;
+  const sel: ComposedSelection | null =
+    typeof window.getSelection === 'function' ? window.getSelection() : null;
+  if (sel && typeof sel.getComposedRanges === 'function') {
+    // A collapsed Caret inside an unrelated shadow tree (for example after
+    // clicking in a sibling header component) is re-targeted by
+    // getComposedRanges to a non-collapsed StaticRange wrapping the shadow
+    // host. Only a non-collapsed Range selection can cover `target`.
+    if (!hasRangeSelection(sel)) return false;
+    const roots = ancestorShadowRoots(target);
+    return sel
+      .getComposedRanges({ shadowRoots: roots })
+      .some((sr) => staticRangeCoversNode(sr, target));
+  }
+  const root: ShadowRoot & { getSelection?: () => Selection | null } =
+    target.getRootNode() as ShadowRoot;
+  if (
+    typeof root.getSelection === 'function' &&
+    selectionRangesCoverNode(root.getSelection(), target)
+  ) {
+    return true;
+  }
+  return selectionRangesCoverNode(sel, target);
 }
 
 /**
@@ -354,11 +513,11 @@ const ENTITY_PATTERNS: EntityPattern[] = [
   // Bare UUIDs preceded by "session" (case-insensitive)
   {
     regex:
-      /\bsession\s+([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b/gi,
+      /(\bsession\s+)([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b/gi,
     linkBuilder: (m) => {
-      const uuid = m[1];
+      const [, prefix, uuid] = m;
       return [
-        'session ',
+        prefix,
         linkElement(
           {
             class: 'entity-link',
@@ -372,11 +531,11 @@ const ENTITY_PATTERNS: EntityPattern[] = [
   },
   // Commit SHAs: "commit" followed by 7-40 hex chars
   {
-    regex: /\bcommit\s+([0-9a-fA-F]{7,40})\b/gi,
+    regex: /(\bcommit\s+)([0-9a-fA-F]{7,40})\b/gi,
     linkBuilder: (m) => {
-      const sha = m[1];
+      const [, prefix, sha] = m;
       return [
-        'commit ',
+        prefix,
         linkElement(
           {
             class: 'entity-link',
@@ -415,18 +574,30 @@ const ENTITY_PATTERNS: EntityPattern[] = [
 ];
 
 /**
- * gs:// object link pattern, appended only for a message that is eligible
- * per the gate below (the `web.gcs_links` experiment and agent-sent) —
- * never for a user-sent message. Leftmost-wins in `styleEntityLinksInText`
- * means this still beats a `path-link` match starting later in the same
- * match (e.g. `gs://bkt/workspace/x.md`, where the file-path pattern would
- * otherwise match the `/workspace/x.md` tail): both patterns are tried and
- * the one that starts earliest wins, and the gs:// match always starts at
- * or before the `/workspace/...` substring it contains.
+ * Raw-text blocker for `styleEntityLinksInText` when `gs://` linking is on.
+ * Accepted `gs://` URIs are already wrapped in `<a>` by `styleGcsLinksInText`
+ * and stepped over by the entity pass; only rejected `gs://` URIs (e.g. a
+ * `?`/`#`/`&` continuation or trailing `/`) reach `styleEntityLinksInText`,
+ * where leftmost-wins claims their span as plain text so an inner
+ * `/workspace/...` or `sess_...` tail cannot be linked as a separate entity.
  */
-const GCS_ENTITY_PATTERN: EntityPattern = {
+const GCS_ENTITY_BLOCKER: EntityPattern = {
   regex: GCS_URI_PATTERN,
-  linkBuilder: (m) => {
+  linkBuilder: (m) => [m[0]],
+};
+
+/**
+ * Turn `gs://` object references in one text node into links. Only run for a
+ * message that is eligible per the gate (the `web.gcs_links` experiment and
+ * agent-sent) — never for a user-sent message. Runs before `@mentions` and
+ * other entity links so `@` inside an object name (e.g. `gs://bkt/a:@b`)
+ * stays part of the link instead of being split off as a mention. Accepted
+ * matches are wrapped in `<a>` (and added to `built` so `@mentions` step over
+ * them); rejected matches stay plain text and are shielded from entity tail
+ * linking by {@link GCS_ENTITY_BLOCKER}.
+ */
+function styleGcsLinksInText(text: string, built: WeakSet<Element>): LinkPiece[] | null {
+  return replaceMatches(text, GCS_URI_PATTERN, (m) => {
     const boundary = m[1];
     const bucket = m[2];
     const resolved = resolveGcsMatch(m);
@@ -434,9 +605,11 @@ const GCS_ENTITY_PATTERN: EntityPattern = {
     // the fragment/query/param continuation rule) — leave the raw matched
     // text unchanged rather than linking a truncated name.
     if (!resolved) return [m[0]];
-    return [boundary, buildGcsLinkElement(bucket, resolved.object), resolved.suffix];
-  },
-};
+    const link = buildGcsLinkElement(bucket, resolved.object);
+    built.add(link);
+    return [boundary, link, resolved.suffix];
+  });
+}
 
 /**
  * Turn scion://artifact/ references in one text node into links. Only run
@@ -464,16 +637,15 @@ function styleArtifactLinksInText(text: string, built: WeakSet<Element>): LinkPi
  * This is intentionally simple: it scans linearly and does not try to
  * handle overlapping matches from different patterns.
  *
- * `includeGcs` appends {@link GCS_ENTITY_PATTERN} for this call only — the
- * gate (the web.gcs_links experiment && the real sender is an agent) is
- * evaluated once per render by the caller, not baked into a shared, mutable
- * pattern list.
+ * When `includeGcs` is true, appends {@link GCS_ENTITY_BLOCKER} so any
+ * `gs://` URI rejected by `styleGcsLinksInText` still claims its span as
+ * plain text instead of letting a later entity pattern link its tail.
  */
 function styleEntityLinksInText(text: string, includeGcs: boolean): LinkPiece[] | null {
   // Collect all matches from all patterns, then sort by position.
   const replacements: { start: number; end: number; pieces: LinkPiece[] }[] = [];
 
-  const patterns = includeGcs ? [...ENTITY_PATTERNS, GCS_ENTITY_PATTERN] : ENTITY_PATTERNS;
+  const patterns = includeGcs ? [...ENTITY_PATTERNS, GCS_ENTITY_BLOCKER] : ENTITY_PATTERNS;
   for (const pattern of patterns) {
     // Clone the regex so each call starts from index 0.
     // Ensure the global flag is always set so re.exec() advances lastIndex
@@ -825,16 +997,197 @@ export function knownUsersByEmailKey(map: ReadonlyMap<string, string>): string {
     .join('\n');
 }
 
+/** Shared empty set for memoized `knownMentionSlugs` props. */
+export const EMPTY_KNOWN_MENTION_SLUGS: ReadonlySet<string> = new Set<string>();
+
+/**
+ * Build a set of lowercased known mention slugs (project agents and human
+ * members) used to roster-gate inline code-span mention promotion
+ * (ptone/scion#8783). Only tokens resolving to a known project agent or human
+ * member are promoted from inline `<code>@token</code>` to mention pills;
+ * unknown tokens like `` `@state` `` stay plain code.
+ */
+export function buildKnownMentionSlugs(
+  members: readonly ChatMessageMember[],
+  agentMembers: readonly MentionRosterAgent[] = [],
+  currentUserId = ''
+): ReadonlySet<string> {
+  const slugs = new Set<string>();
+  const add = (value: string | undefined): void => {
+    const trimmed = value?.trim().toLowerCase() ?? '';
+    if (trimmed) slugs.add(trimmed);
+  };
+  for (const a of agentMembers) {
+    add(a.slug);
+    add(a.name);
+    add(a.displayName);
+    if (a.slug) add(toMentionSlug(a.slug));
+    if (a.name) add(toMentionSlug(a.name));
+    if (a.displayName) add(toMentionSlug(a.displayName));
+  }
+  for (const m of members) {
+    if (m.kind === 'agent') {
+      add(m.slug);
+      add(m.name);
+      add(m.displayName);
+      if (m.slug) add(toMentionSlug(m.slug));
+      if (m.name) add(toMentionSlug(m.name));
+      if (m.displayName) add(toMentionSlug(m.displayName));
+      continue;
+    }
+    const name = (m.name || m.displayName || '').trim();
+    const email = (m.email || '').trim().toLowerCase();
+    if (name) {
+      add(name);
+      add(toMentionSlug(name));
+    }
+    if (email) {
+      add(userMentionSlug({ name, email }));
+      const at = email.indexOf('@');
+      if (at > 0) add(email.slice(0, at));
+    }
+  }
+  if (currentUserId) {
+    const self = peekUser(currentUserId);
+    const selfName = self?.displayName?.trim() ?? '';
+    const selfEmail = self?.email?.trim().toLowerCase() ?? '';
+    if (selfName) {
+      add(selfName);
+      add(toMentionSlug(selfName));
+    }
+    if (selfEmail) {
+      add(userMentionSlug({ name: selfName, email: selfEmail }));
+      const at = selfEmail.indexOf('@');
+      if (at > 0) add(selfEmail.slice(0, at));
+    }
+  }
+  return slugs;
+}
+
+/** Deterministic content key for a `knownMentionSlugs` set so unchanged rosters skip markdown re-renders. */
+export function knownMentionSlugsKey(set: ReadonlySet<string>): string {
+  if (set.size === 0) return '';
+  return [...set].sort().join('\n');
+}
+
+const CODE_SPAN_BOUNDARY_WORD_RE = /[\p{L}\p{N}_-]/u;
+
+const BLOCK_BOUNDARY_TAGS = new Set([
+  'p',
+  'div',
+  'li',
+  'pre',
+  'blockquote',
+  'td',
+  'th',
+  'h1',
+  'h2',
+  'h3',
+  'h4',
+  'h5',
+  'h6',
+  'dd',
+  'dt',
+]);
+
+function getAdjacentBoundaryText(code: Element, direction: 'prev' | 'next'): string {
+  let cur: Element | null = code;
+  while (cur) {
+    let sibling = direction === 'prev' ? cur.previousSibling : cur.nextSibling;
+    while (sibling && sibling.nodeType === Node.TEXT_NODE && (sibling as Text).data.length === 0) {
+      sibling = direction === 'prev' ? sibling.previousSibling : sibling.nextSibling;
+    }
+    if (sibling) {
+      return sibling.nodeType === Node.TEXT_NODE ? (sibling as Text).data : '';
+    }
+    const parent: Element | null = cur.parentElement;
+    if (!parent || BLOCK_BOUNDARY_TAGS.has(parent.localName.toLowerCase())) {
+      break;
+    }
+    cur = parent;
+  }
+  return '';
+}
+
+function hasAdjacentWordChar(code: Element): boolean {
+  const prevText = getAdjacentBoundaryText(code, 'prev');
+  if (prevText.length > 0) {
+    const last = prevText.charAt(prevText.length - 1);
+    if (CODE_SPAN_BOUNDARY_WORD_RE.test(last) || last === '@') {
+      return true;
+    }
+  }
+  const nextText = getAdjacentBoundaryText(code, 'next');
+  if (nextText.length > 0) {
+    const first = nextText.charAt(0);
+    if (CODE_SPAN_BOUNDARY_WORD_RE.test(first) || first === '@') {
+      return true;
+    }
+  }
+  return false;
+}
+
+const SKIP_CODE_SPAN_ANCESTORS = new Set(['pre', 'blockquote', 'a']);
+
+function hasAncestorTag(el: Element, tags: ReadonlySet<string>): boolean {
+  for (let cur: Element | null = el.parentElement; cur; cur = cur.parentElement) {
+    if (tags.has(cur.localName.toLowerCase())) return true;
+  }
+  return false;
+}
+
+/**
+ * Promote standalone inline `<code>@token</code>` elements (outside `<pre>`,
+ * `<blockquote>`, and `<a>`) to clickable mention pills when `token` matches
+ * the exact single-mention grammar AND resolves to a known project agent or
+ * human member (ptone/scion#8783). Unknown tokens (e.g. `` `@state` ``) and
+ * multi-token spans stay plain `<code>`.
+ */
+function promoteCodeSpanMentions(
+  root: DocumentFragment,
+  knownUsersByEmail: ReadonlyMap<string, string>,
+  knownMentionSlugs: ReadonlySet<string>
+): void {
+  const codes = Array.from(root.querySelectorAll('code'));
+  for (const code of codes) {
+    if (hasAncestorTag(code, SKIP_CODE_SPAN_ANCESTORS)) continue;
+    if (code.childNodes.length !== 1 || code.firstChild?.nodeType !== Node.TEXT_NODE) continue;
+    if (hasAdjacentWordChar(code)) continue;
+
+    const token = parseCodeSpanMention(code.textContent ?? '');
+    if (!token) continue;
+
+    const lower = token.toLowerCase();
+    if (token.includes('@')) {
+      const resolvedSlug = knownUsersByEmail.get(lower);
+      if (resolvedSlug) {
+        code.replaceWith(mentionSpan(resolvedSlug));
+      }
+      continue;
+    }
+
+    if (knownMentionSlugs.has(lower)) {
+      code.replaceWith(mentionSpan(token));
+    }
+  }
+}
+
 /**
  * Turn references in rendered, sanitized markdown into links, in this
- * order: artifact references (when `artifacts`), @mentions, entity
- * references (gs:// objects too when `gcs`), then GitHub shortform refs.
+ * order: artifact references (when `artifacts`), `gs://` object references
+ * (when `gcs`), @mentions, entity references, then GitHub shortform refs.
  * What each pass steps over:
  *
  * - Artifact references: code (`<pre>`, `<code>`) and existing links.
- * - @mentions: code, `mailto:` links, and the artifact links just built.
- *   Non-`mailto:` links are not stepped over, so an `@name` in a markdown
- *   link's text is still styled.
+ * - `gs://` object references: `<pre>` fences and existing links. Inline
+ *   `<code>` is not stepped over, so a `gs://` path inside backticks still
+ *   links.
+ * - @mentions: code, `mailto:` links, and the artifact / `gs://` links just
+ *   built. Non-`mailto:` markdown links are not stepped over, so an `@name`
+ *   in a markdown link's text is still styled. When `codeSpanMentions` is
+ *   enabled, standalone inline `<code>@token</code>` elements whose token
+ *   resolves against `knownMentionSlugs` / `knownUsersByEmail` are also
+ *   promoted to mention pills.
  * - Entity references: `<pre>` fences and existing links. Inline `<code>`
  *   is not stepped over, so a file path inside backticks still links.
  * - GitHub refs: code and existing links; a ref inside backticks is
@@ -845,21 +1198,41 @@ export function knownUsersByEmailKey(map: ReadonlyMap<string, string>): string {
  */
 function linkifyRenderedFragment(
   root: DocumentFragment,
-  opts: { artifacts: boolean; gcs: boolean; knownUsersByEmail: ReadonlyMap<string, string> }
+  opts: {
+    artifacts: boolean;
+    gcs: boolean;
+    knownUsersByEmail: ReadonlyMap<string, string>;
+    codeSpanMentions: boolean;
+    knownMentionSlugs: ReadonlySet<string>;
+  }
 ): void {
   const isCode = elementsNamed('pre', 'code');
-  const artifactLinks = new WeakSet<Element>();
+  const protectedLinks = new WeakSet<Element>();
   if (opts.artifacts) {
     linkifyTextNodes(root, elementsNamed('pre', 'code', 'a'), (text) =>
-      styleArtifactLinksInText(text, artifactLinks)
+      styleArtifactLinksInText(text, protectedLinks)
+    );
+  }
+  if (opts.gcs) {
+    linkifyTextNodes(root, elementsNamed('pre', 'a'), (text) =>
+      styleGcsLinksInText(text, protectedLinks)
     );
   }
   unwrapLeadingAtMailtoLinks(root);
   linkifyTextNodes(
     root,
-    (el) => isCode(el) || artifactLinks.has(el) || isMailtoLink(el),
+    (el) => isCode(el) || protectedLinks.has(el) || isMailtoLink(el),
     (text) => styleMentionsInText(text, opts.knownUsersByEmail)
   );
+  if (opts.codeSpanMentions) {
+    promoteCodeSpanMentions(root, opts.knownUsersByEmail, opts.knownMentionSlugs);
+  }
+  for (const el of root.querySelectorAll('.mention[data-mention]')) {
+    if (!el.closest('a, button')) {
+      el.setAttribute('tabindex', '0');
+      el.setAttribute('role', 'button');
+    }
+  }
   linkifyTextNodes(root, elementsNamed('pre', 'a'), (text) =>
     styleEntityLinksInText(text, opts.gcs)
   );
@@ -1180,6 +1553,15 @@ export class ScionChatMessage extends LitElement {
   knownUsersByEmail: ReadonlyMap<string, string> | null = null;
 
   /**
+   * Pre-computed lowercased known-mention-slug set (agents + human members)
+   * supplied by `<scion-chat-thread>` to roster-gate inline code-span mention
+   * promotion when `hub.code_span_mentions` is enabled. When null, derived
+   * from `members` and `currentUserId`.
+   */
+  @property({ attribute: false })
+  knownMentionSlugs: ReadonlySet<string> | null = null;
+
+  /**
    * The rendered body: a `.md-content` element holding the markdown
    * renderer's nodes, or null to show the body as plain text. Built once per
    * body, and kept as one element so later renders move it rather than
@@ -1273,19 +1655,76 @@ export class ScionChatMessage extends LitElement {
       position: relative;
     }
 
-    /* A decision-response is a compact line in the answerer's lane (design §4.6). */
-    .decision-response-row {
+    /* A decision-response or secret-response is a compact line in the responder's lane (design §4.6). */
+    .decision-response-row,
+    .secret-response-row {
       display: flex;
       padding: 0.25rem 1rem;
     }
 
-    .decision-response-row.own {
+    .decision-response-row.own,
+    .secret-response-row.own {
       justify-content: flex-end;
     }
 
-    .decision-response-row.other {
+    .decision-response-row.other,
+    .secret-response-row.other {
       justify-content: flex-start;
       padding-left: 3.5rem;
+    }
+
+    .secret-response-line {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.45rem;
+      max-width: 640px;
+      padding: 0.35rem 0.65rem;
+      border-radius: var(--scion-radius);
+      background: var(--scion-bg);
+      border: 1px solid var(--scion-border);
+      font-size: var(--chat-fs-sm, 0.875rem);
+      color: var(--scion-text-secondary);
+      line-height: 1.5;
+    }
+
+    .secret-response-line sl-icon {
+      flex-shrink: 0;
+      margin-top: 0.2rem;
+      color: var(--scion-primary);
+    }
+
+    .secret-response-body {
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+
+    .secret-response-body .md-content p:first-child {
+      margin-top: 0;
+    }
+
+    .secret-response-body .md-content p:last-child {
+      margin-bottom: 0;
+    }
+
+    .secret-request-status {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.65rem 0.85rem;
+      border: 1px solid var(--scion-border);
+      border-radius: var(--scion-radius-lg);
+      background: var(--scion-surface);
+      font-size: var(--chat-fs-sm, 0.875rem);
+      color: var(--scion-text-secondary);
+    }
+
+    .secret-request-status.error {
+      background: var(--scion-error-bg);
+      color: var(--scion-error-text);
+    }
+
+    .secret-request-status sl-icon {
+      flex-shrink: 0;
     }
 
     /* A choice card needs room for its buttons (design §4.1). */
@@ -1332,13 +1771,13 @@ export class ScionChatMessage extends LitElement {
       color: var(--sl-color-success-700, #15803d);
       background: var(--sl-color-success-50, #f0fdf4);
       padding: 0 0.375rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
       white-space: nowrap;
     }
 
     .bubble-content {
       padding: 0.5rem 0.75rem;
-      border-radius: 0.75rem;
+      border-radius: var(--scion-radius-lg);
       line-height: 1.5;
       font-size: var(--chat-fs-lg);
       word-break: break-word;
@@ -1347,13 +1786,13 @@ export class ScionChatMessage extends LitElement {
     .from-agent .bubble-content {
       background: var(--scion-bg-subtle, #f1f5f9);
       color: var(--scion-text, #1e293b);
-      border-top-left-radius: 0.25rem;
+      border-top-left-radius: var(--scion-radius-sm);
     }
 
     .from-user .bubble-content {
-      background: var(--scion-primary-50, #eff6ff);
+      background: var(--scion-primary-tint, #eff6ff);
       color: var(--scion-text, #1e293b);
-      border-top-right-radius: 0.25rem;
+      border-top-right-radius: var(--scion-radius-sm);
     }
 
     .from-user .bubble-header {
@@ -1418,7 +1857,7 @@ export class ScionChatMessage extends LitElement {
       font-size: 0.8125em;
       background: var(--scion-bg-subtle, #f1f5f9);
       padding: 0.1em 0.3em;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
       border: 1px solid var(--scion-border, #e2e8f0);
     }
 
@@ -1426,7 +1865,7 @@ export class ScionChatMessage extends LitElement {
       position: relative;
       background: var(--scion-bg-subtle, #f1f5f9);
       border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: 0.375rem;
+      border-radius: calc(var(--scion-radius) * 0.75);
       padding: 0.75rem;
       overflow-x: auto;
       margin: 0.5em 0;
@@ -1446,7 +1885,7 @@ export class ScionChatMessage extends LitElement {
       max-height: 400px;
       overflow: auto;
       border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: 0.375rem;
+      border-radius: calc(var(--scion-radius) * 0.75);
     }
 
     .copy-btn {
@@ -1458,7 +1897,7 @@ export class ScionChatMessage extends LitElement {
       font-family: inherit;
       line-height: var(--chat-lh-tight);
       border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
       background: var(--scion-bg-subtle, #f1f5f9);
       color: var(--scion-text-muted, #64748b);
       cursor: pointer;
@@ -1493,10 +1932,10 @@ export class ScionChatMessage extends LitElement {
 
     /* @mention pills */
     .md-content .mention {
-      background: rgba(59, 130, 246, 0.15);
-      color: #60a5fa;
+      background: color-mix(in srgb, var(--scion-primary, #3b82f6) 10%, transparent);
+      color: var(--scion-primary, #60a5fa);
       padding: 0 4px;
-      border-radius: 3px;
+      border-radius: calc(var(--scion-radius-sm) * 0.75);
       font-weight: 500;
     }
 
@@ -1505,8 +1944,17 @@ export class ScionChatMessage extends LitElement {
     }
 
     .md-content .mention.clickable:hover {
-      background: rgba(59, 130, 246, 0.25);
+      background: color-mix(in srgb, var(--scion-primary, #3b82f6) 18%, transparent);
       text-decoration: underline;
+    }
+
+    .md-content .mention.clickable:focus {
+      outline: none;
+    }
+
+    .md-content .mention.clickable:focus-visible {
+      outline: 2px solid var(--scion-primary, #3b82f6);
+      outline-offset: 1px;
     }
 
     /* A wide table scrolls sideways inside its own box rather than
@@ -1564,7 +2012,7 @@ export class ScionChatMessage extends LitElement {
     .badge {
       display: inline-block;
       padding: 0 0.375rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
       font-size: var(--chat-fs-xs);
       font-weight: 600;
       text-transform: uppercase;
@@ -1602,7 +2050,7 @@ export class ScionChatMessage extends LitElement {
       padding: 0.125rem 0.5rem;
       background: var(--scion-bg-subtle, #f1f5f9);
       border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: 0.375rem;
+      border-radius: calc(var(--scion-radius) * 0.75);
       font-size: var(--chat-fs-sm);
       color: var(--scion-text-muted, #64748b);
       cursor: default;
@@ -1635,7 +2083,7 @@ export class ScionChatMessage extends LitElement {
       display: flex;
       gap: 0.125rem;
       padding: 0.0625rem;
-      border-radius: 0.375rem;
+      border-radius: calc(var(--scion-radius) * 0.75);
       background: rgba(15, 23, 42, 0.65);
       opacity: 0;
       transition: opacity 0.15s ease;
@@ -1673,7 +2121,7 @@ export class ScionChatMessage extends LitElement {
       border: none;
       background: none;
       cursor: pointer;
-      border-radius: 0.5rem;
+      border-radius: var(--scion-radius);
     }
 
     .image-expand:focus-visible {
@@ -1690,7 +2138,7 @@ export class ScionChatMessage extends LitElement {
       max-width: 100%;
       height: auto;
       box-sizing: border-box;
-      border-radius: 0.5rem;
+      border-radius: var(--scion-radius);
       border: 1px solid var(--scion-border, #e2e8f0);
       cursor: pointer;
       object-fit: contain;
@@ -1718,7 +2166,7 @@ export class ScionChatMessage extends LitElement {
       padding: 0.25rem 0.625rem;
       background: var(--scion-surface, #fff);
       border: 1px solid var(--scion-border, #cbd5e1);
-      border-radius: 0.5rem;
+      border-radius: var(--scion-radius);
       font: inherit;
       font-size: var(--chat-fs-sm);
       color: var(--scion-text, #0f172a);
@@ -1761,7 +2209,7 @@ export class ScionChatMessage extends LitElement {
       padding: 0.375rem 0.625rem;
       background: var(--scion-bg-subtle, #f1f5f9);
       border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: 0.5rem;
+      border-radius: var(--scion-radius);
       font-size: var(--chat-fs-base);
       color: var(--scion-text, #1e293b);
       cursor: pointer;
@@ -1795,7 +2243,7 @@ export class ScionChatMessage extends LitElement {
     .attachment-preview {
       margin-top: 0.375rem;
       border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: 0.5rem;
+      border-radius: var(--scion-radius);
       overflow: hidden;
       background: var(--scion-surface, #ffffff);
     }
@@ -1926,7 +2374,7 @@ export class ScionChatMessage extends LitElement {
 
     .trace-block details {
       border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: 0.375rem;
+      border-radius: calc(var(--scion-radius) * 0.75);
       background: var(--scion-bg-subtle, #f8fafc);
       max-width: min(80%, 700px);
     }
@@ -1976,7 +2424,8 @@ export class ScionChatMessage extends LitElement {
       color: var(--scion-text-muted, #94a3b8);
     }
 
-    .delivery-state.dispatched sl-icon {
+    .delivery-state.dispatched sl-icon,
+    .delivery-state.delivered sl-icon {
       color: var(--scion-success-500, #22c55e);
     }
 
@@ -2020,7 +2469,7 @@ export class ScionChatMessage extends LitElement {
       margin-bottom: 0.25rem;
       border-left: 3px solid var(--scion-primary-400, #60a5fa);
       background: var(--scion-bg, #f8fafc);
-      border-radius: 0 0.25rem 0.25rem 0;
+      border-radius: 0 var(--scion-radius-sm) var(--scion-radius-sm) 0;
       cursor: pointer;
       font-size: var(--chat-fs-base);
       color: var(--scion-text-muted, #64748b);
@@ -2087,7 +2536,7 @@ export class ScionChatMessage extends LitElement {
       height: 1.5rem;
       padding: 0;
       border: none;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
       background: none;
       color: var(--scion-text-muted, #64748b);
       font-size: 0.875rem;
@@ -2202,7 +2651,7 @@ export class ScionChatMessage extends LitElement {
       line-height: 1.5;
       background: var(--scion-bg-subtle, #f1f5f9);
       border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: 0.375rem;
+      border-radius: calc(var(--scion-radius) * 0.75);
       padding: 0.75rem;
       overflow-x: auto;
       margin: 0.5em 0;
@@ -2214,17 +2663,17 @@ export class ScionChatMessage extends LitElement {
     }
 
     .diff-block .diff-add {
-      background: rgba(34, 197, 94, 0.15);
+      background: color-mix(in srgb, var(--scion-status-success, #22c55e) 15%, transparent);
       color: var(--scion-success-700, #15803d);
     }
 
     .diff-block .diff-remove {
-      background: rgba(239, 68, 68, 0.15);
+      background: color-mix(in srgb, var(--scion-status-danger, #ef4444) 15%, transparent);
       color: var(--scion-danger-700, #b91c1c);
     }
 
     .diff-block .diff-hunk {
-      background: rgba(59, 130, 246, 0.1);
+      background: color-mix(in srgb, var(--scion-primary, #3b82f6) 10%, transparent);
       color: var(--scion-primary-600, #2563eb);
       font-weight: 500;
     }
@@ -2257,7 +2706,7 @@ export class ScionChatMessage extends LitElement {
       padding: 0.25rem 0.75rem;
       border: 1px solid var(--scion-border, #e2e8f0);
       border-top: none;
-      border-radius: 0 0 0.375rem 0.375rem;
+      border-radius: 0 0 calc(var(--scion-radius) * 0.75) calc(var(--scion-radius) * 0.75);
       background: var(--scion-bg-subtle, #f1f5f9);
       color: var(--sl-color-primary-600, #2563eb);
       font-size: var(--chat-fs-base);
@@ -2277,7 +2726,7 @@ export class ScionChatMessage extends LitElement {
       line-height: 1.5;
       background: var(--scion-bg-subtle, #f1f5f9);
       border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: 0.375rem;
+      border-radius: calc(var(--scion-radius) * 0.75);
       padding: 0.75rem;
       overflow-x: auto;
       margin: 0.5em 0;
@@ -2320,12 +2769,14 @@ export class ScionChatMessage extends LitElement {
         padding-right: 0.5rem;
       }
 
-      .decision-response-row {
+      .decision-response-row,
+      .secret-response-row {
         padding-left: 0.5rem;
         padding-right: 0.5rem;
       }
 
-      .decision-response-row.other {
+      .decision-response-row.other,
+      .secret-response-row.other {
         padding-left: 3rem;
       }
 
@@ -2335,24 +2786,154 @@ export class ScionChatMessage extends LitElement {
     }
   `;
 
+  /** Selection coverage captured at context-menu press start (`pointerdown`). */
+  private _contextPress: { target: Node; covered: boolean; at: number } | null = null;
+
+  private readonly boundRecordContextPress: EventListener = (e: Event): void => {
+    this.recordContextPress(e);
+  };
+
+  private readonly boundHostContextPress: EventListener = (e: Event): void => {
+    if (e.composedPath()[0] === this) {
+      this.recordContextPress(e);
+    }
+  };
+
+  /** Loaded secret-request card metadata/rows for `messageType === 'secret-request'`. */
+  @state()
+  private secretRequestCard: SecretRequestCardResponse | null = null;
+
+  @state()
+  private secretRequestLoading = false;
+
+  @state()
+  private secretRequestError = '';
+
+  @state()
+  private secretRequestErrorStatus = 0;
+
+  private secretRequestAbort: AbortController | null = null;
+  private secretRequestLoadedMsgId = '';
+
+  private readonly handleFeatureFlagsChanged = (): void => {
+    const codeSpans = codeSpanMentionsEnabled();
+    const cardMode = this.showsDecisionCard || this.showsSecretRequestCard;
+    this.syncSecretRequestCard();
+    if (codeSpans !== this.renderedCodeSpanMentions || cardMode !== this.renderedCardMode) {
+      this.renderedCodeSpanMentions = codeSpans;
+      this.renderedCardMode = cardMode;
+      this.renderedKnownMentionSlugsKey = codeSpans
+        ? knownMentionSlugsKey(this.effectiveKnownMentionSlugs())
+        : '';
+      void this.renderContent();
+    }
+    if (this.messageType === 'secret-request' || this.messageType === 'secret-response') {
+      this.requestUpdate();
+    }
+  };
+
   override connectedCallback(): void {
     super.connectedCallback();
-    this.renderedCardMode = this.showsDecisionCard;
+    this.renderRoot.addEventListener('pointerdown', this.boundRecordContextPress, true);
+    this.addEventListener('pointerdown', this.boundHostContextPress, true);
+    window.addEventListener(FEATURE_FLAGS_CHANGED_EVENT, this.handleFeatureFlagsChanged);
+    this.renderedCardMode = this.showsDecisionCard || this.showsSecretRequestCard;
+    this.renderedCodeSpanMentions = codeSpanMentionsEnabled();
     this.renderedKnownUsersKey = knownUsersByEmailKey(this.effectiveKnownUsersByEmail());
+    this.renderedKnownMentionSlugsKey = this.renderedCodeSpanMentions
+      ? knownMentionSlugsKey(this.effectiveKnownMentionSlugs())
+      : '';
+    this.syncSecretRequestCard();
     void this.renderContent();
   }
 
   override disconnectedCallback(): void {
     super.disconnectedCallback();
+    this.renderRoot.removeEventListener('pointerdown', this.boundRecordContextPress, true);
+    this.removeEventListener('pointerdown', this.boundHostContextPress, true);
+    this._contextPress = null;
+    window.removeEventListener(FEATURE_FLAGS_CHANGED_EVENT, this.handleFeatureFlagsChanged);
+    this.secretRequestAbort?.abort();
+    this.secretRequestAbort = null;
+    this.secretRequestLoadedMsgId = '';
     this.previewObserver?.disconnect();
     this.previewObserver = null;
     this.observedPreviews = new WeakSet();
+  }
+
+  private recordContextPress(e: Event): void {
+    // Only record presses that can initiate a context menu: secondary button,
+    // macOS Ctrl+click, or touch long-press. Plain primary-button presses
+    // start drag-selections and clear any earlier press snapshot without
+    // masking the selection the drag creates.
+    const pe = e as Partial<PointerEvent>;
+    if (pe.button !== 2 && pe.pointerType !== 'touch' && !(pe.button === 0 && pe.ctrlKey)) {
+      this._contextPress = null;
+      return;
+    }
+    const origin = e.composedPath()[0];
+    if (!(origin instanceof Node)) return;
+    const mentionEl =
+      (origin instanceof Element ? origin : origin.parentElement)?.closest<HTMLElement>(
+        '.mention[data-mention]'
+      ) ?? null;
+    const pressTarget = mentionEl ?? origin;
+    this._contextPress = {
+      target: pressTarget,
+      covered: selectionCoversNode(pressTarget),
+      at: Date.now(),
+    };
+  }
+
+  private matchingContextPress(
+    target: Node
+  ): { target: Node; covered: boolean; at: number } | null {
+    const press = this._contextPress;
+    if (
+      press &&
+      Date.now() - press.at <= CONTEXT_PRESS_WINDOW_MS &&
+      (press.target === target || target.contains(press.target))
+    ) {
+      return press;
+    }
+    return null;
+  }
+
+  /**
+   * Whether `target` was covered by an active text selection when the
+   * context-menu press started (ignoring any word selection the browser
+   * creates between `pointerdown` and `contextmenu`, as on macOS and
+   * Android). Falls back to live `selectionCoversNode(target)` when no
+   * matching press was recorded (e.g. synthetic `contextmenu` events).
+   */
+  hasSelectionForContextMenu(target?: EventTarget | null): boolean {
+    if (!(target instanceof Node)) return false;
+    const press = this.matchingContextPress(target);
+    return press ? press.covered : selectionCoversNode(target);
+  }
+
+  /**
+   * Clear a selection that the browser created on `target` between
+   * `pointerdown` and `contextmenu` (e.g. macOS right-click word selection
+   * or touch long-press selection) once a custom menu opens. Pre-existing
+   * selections (`press.covered === true`) and selections outside `target`
+   * are preserved.
+   */
+  clearContextPressSelection(target?: EventTarget | null): void {
+    if (!(target instanceof Node) || typeof window === 'undefined') return;
+    const press = this.matchingContextPress(target);
+    if (press && !press.covered && selectionCoversNode(target)) {
+      window.getSelection()?.removeAllRanges();
+    }
   }
 
   override willUpdate(changed: Map<string, unknown>): void {
     super.willUpdate(changed);
     if (changed.has('authorizingUserId')) {
       this.resolveAuthorizer();
+    }
+    if (changed.has('messageType') || changed.has('messageId') || changed.has('deletedAt')) {
+      this.syncSecretRequestCard();
     }
   }
 
@@ -2384,17 +2965,27 @@ export class ScionChatMessage extends LitElement {
   }
 
   override updated(changed: Map<string, unknown>): void {
-    const cardMode = this.showsDecisionCard;
+    const cardMode = this.showsDecisionCard || this.showsSecretRequestCard;
+    const codeSpans = codeSpanMentionsEnabled();
     const knownUsersKey = knownUsersByEmailKey(this.effectiveKnownUsersByEmail());
+    const knownMentionSlugsKeyNow = codeSpans
+      ? knownMentionSlugsKey(this.effectiveKnownMentionSlugs())
+      : '';
     if (
       changed.has('body') ||
       changed.has('plain') ||
       changed.has('decisionIntro') ||
+      changed.has('secretRequestCard') ||
+      changed.has('secretRequestError') ||
       knownUsersKey !== this.renderedKnownUsersKey ||
+      codeSpans !== this.renderedCodeSpanMentions ||
+      knownMentionSlugsKeyNow !== this.renderedKnownMentionSlugsKey ||
       cardMode !== this.renderedCardMode
     ) {
       this.renderedCardMode = cardMode;
+      this.renderedCodeSpanMentions = codeSpans;
       this.renderedKnownUsersKey = knownUsersKey;
+      this.renderedKnownMentionSlugsKey = knownMentionSlugsKeyNow;
       void this.renderContent();
     }
     if (changed.has('renderedContent')) {
@@ -2702,8 +3293,18 @@ export class ScionChatMessage extends LitElement {
   /** Content key of the `knownUsersByEmail` map the rendered body was built for. */
   private renderedKnownUsersKey = '';
 
+  /** Whether `hub.code_span_mentions` was enabled when the rendered body was built. */
+  private renderedCodeSpanMentions = false;
+
+  /** Content key of the `knownMentionSlugs` set the rendered body was built for. */
+  private renderedKnownMentionSlugsKey = '';
+
   private effectiveKnownUsersByEmail(): ReadonlyMap<string, string> {
     return this.knownUsersByEmail ?? buildKnownUsersByEmail(this.members, this.currentUserId);
+  }
+
+  private effectiveKnownMentionSlugs(): ReadonlySet<string> {
+    return this.knownMentionSlugs ?? buildKnownMentionSlugs(this.members, [], this.currentUserId);
   }
 
   /**
@@ -2716,9 +3317,71 @@ export class ScionChatMessage extends LitElement {
     return this.messageType === 'decision-prompt' && !!d && d.length > 0 && decisionsEnabled();
   }
 
-  /** The text the bubble renders: the intro alone under a choice card. */
+  /**
+   * Whether this message renders as an inline secret-request card (design §4.6):
+   * `messageType === 'secret-request'` with `hub.agent_secrets` enabled.
+   */
+  private get showsSecretRequestCard(): boolean {
+    return (
+      this.messageType === 'secret-request' &&
+      Boolean(this.messageId) &&
+      !this.deletedAt &&
+      agentSecretsEnabled()
+    );
+  }
+
+  /**
+   * Whether this message renders as a compact secret-response line (design §4.6):
+   * `messageType === 'secret-response'` with `hub.agent_secrets` enabled.
+   */
+  private get showsSecretResponse(): boolean {
+    return this.messageType === 'secret-response' && agentSecretsEnabled();
+  }
+
+  private syncSecretRequestCard(force = false): void {
+    if (!this.showsSecretRequestCard) {
+      this.secretRequestAbort?.abort();
+      this.secretRequestAbort = null;
+      this.secretRequestCard = null;
+      this.secretRequestLoading = false;
+      this.secretRequestError = '';
+      this.secretRequestErrorStatus = 0;
+      this.secretRequestLoadedMsgId = '';
+      return;
+    }
+    if (!force && this.secretRequestLoadedMsgId === this.messageId) {
+      return;
+    }
+    this.secretRequestAbort?.abort();
+    const controller = new AbortController();
+    this.secretRequestAbort = controller;
+    const msgId = this.messageId;
+    this.secretRequestLoadedMsgId = msgId;
+    this.secretRequestLoading = true;
+    this.secretRequestError = '';
+    this.secretRequestErrorStatus = 0;
+    this.secretRequestCard = null;
+
+    void fetchSecretRequestCard(msgId, { signal: controller.signal }).then((res) => {
+      if (controller.signal.aborted || this.messageId !== msgId) return;
+      this.secretRequestLoading = false;
+      if (!res.ok) {
+        this.secretRequestError = res.message;
+        this.secretRequestErrorStatus = res.status;
+        return;
+      }
+      this.secretRequestCard = res.card;
+    });
+  }
+
+  /** The text the bubble renders: the intro alone under an action card, or fallback body on secret-request load error. */
   private get displayBody(): string {
-    return this.showsDecisionCard ? (this.decisionIntro ?? '') : this.body;
+    if (this.showsDecisionCard) return this.decisionIntro ?? '';
+    if (this.showsSecretRequestCard) {
+      if (this.secretRequestError) return this.body;
+      return this.secretRequestCard?.intro ?? '';
+    }
+    return this.body;
   }
 
   private async renderContent(): Promise<void> {
@@ -2735,10 +3398,15 @@ export class ScionChatMessage extends LitElement {
       // gs:// links are gated on the server-reported feature flag AND the
       // message being agent-sent — a user-sent message never links, however
       // the body happens to be spelled.
+      const codeSpans = codeSpanMentionsEnabled();
       linkifyRenderedFragment(fragment, {
         artifacts: isFeatureEnabled(ARTIFACTS_FLAG),
         gcs: this.senderIsAgent && isFeatureEnabled('web.gcs_links'),
         knownUsersByEmail: this.effectiveKnownUsersByEmail(),
+        codeSpanMentions: codeSpans,
+        knownMentionSlugs: codeSpans
+          ? this.effectiveKnownMentionSlugs()
+          : EMPTY_KNOWN_MENTION_SLUGS,
       });
       this.renderedContent = fragment.hasChildNodes() ? this.contentElement(fragment) : null;
     } catch {
@@ -2753,8 +3421,98 @@ export class ScionChatMessage extends LitElement {
     content.className = 'md-content';
     content.addEventListener('click', (e) => this.handleContentClick(e));
     content.addEventListener('auxclick', (e) => this.handleContentAuxClick(e));
+    content.addEventListener('pointerdown', (e) => this.handleContentPointerDown(e));
+    content.addEventListener('contextmenu', (e) => this.handleContentContextMenu(e));
+    content.addEventListener('keydown', (e) => this.handleContentKeydown(e));
     content.append(fragment);
     return content;
+  }
+
+  private handleContentPointerDown(e: PointerEvent): void {
+    const target = (e.target as HTMLElement | null)?.closest<HTMLElement>('.mention[data-mention]');
+    if (!target) return;
+    const slug = target.getAttribute('data-mention');
+    if (!slug) return;
+    if (this.hasSelectionForContextMenu(target)) return;
+    this.dispatchEvent(
+      new CustomEvent<MentionPointerDownDetail>('mention-pointerdown', {
+        bubbles: true,
+        composed: true,
+        detail: { slug, mentionEl: target, originalEvent: e },
+      })
+    );
+  }
+
+  private handleContentContextMenu(e: MouseEvent): void {
+    const target = (e.target as HTMLElement | null)?.closest<HTMLElement>('.mention[data-mention]');
+    if (!target) return;
+    const slug = target.getAttribute('data-mention');
+    if (!slug) return;
+
+    const fromKeyboard =
+      (e.clientX === 0 && e.clientY === 0) ||
+      (typeof PointerEvent !== 'undefined' && e instanceof PointerEvent && e.pointerType === '');
+    if (!fromKeyboard && this.hasSelectionForContextMenu(target)) return;
+
+    const ev = new CustomEvent<MentionContextMenuDetail>('mention-contextmenu', {
+      bubbles: true,
+      composed: true,
+      cancelable: true,
+      detail: {
+        slug,
+        mentionEl: target,
+        clientX: e.clientX,
+        clientY: e.clientY,
+        fromKeyboard,
+        originalEvent: e,
+      },
+    });
+    if (!this.dispatchEvent(ev)) {
+      this.clearContextPressSelection(target);
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  }
+
+  private handleContentKeydown(e: KeyboardEvent): void {
+    if (e.altKey || e.ctrlKey || e.metaKey) return;
+    const target = (e.target as HTMLElement | null)?.closest<HTMLElement>('.mention[data-mention]');
+    if (!target) return;
+    const slug = target.getAttribute('data-mention');
+    if (!slug) return;
+
+    if ((e.key === 'Enter' || e.key === ' ') && !e.shiftKey) {
+      e.preventDefault();
+      e.stopPropagation();
+      this.dispatchEvent(
+        new CustomEvent('mention-click', {
+          bubbles: true,
+          composed: true,
+          detail: { slug },
+        })
+      );
+      return;
+    }
+
+    if (e.key === 'ContextMenu' || (e.key === 'F10' && e.shiftKey)) {
+      const r = target.getBoundingClientRect();
+      const ev = new CustomEvent<MentionContextMenuDetail>('mention-contextmenu', {
+        bubbles: true,
+        composed: true,
+        cancelable: true,
+        detail: {
+          slug,
+          mentionEl: target,
+          clientX: r.left,
+          clientY: r.bottom,
+          fromKeyboard: true,
+        },
+      });
+      if (!this.dispatchEvent(ev)) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    }
   }
 
   /**
@@ -2906,14 +3664,17 @@ export class ScionChatMessage extends LitElement {
 
   override render() {
     if (this.showsDecisionResponse && !this.deletedAt) return this.renderDecisionResponse();
+    if (this.showsSecretResponse && !this.deletedAt) return this.renderSecretResponse();
     const dirClass = this.fromAgent ? 'from-agent' : 'from-user';
     const groupClass = !this.showHeader ? ' grouped' : '';
     const isDeleted = !!this.deletedAt;
     // An attachment-only message (ptone/scion#6146) has no text: its
     // attachments render without an empty text bubble above them.
     const decisionCard = this.showsDecisionCard;
+    const secretRequestCard = this.showsSecretRequestCard && !isDeleted;
+    const hasActionCard = decisionCard || secretRequestCard;
     const attachmentOnly =
-      !decisionCard &&
+      !hasActionCard &&
       !(this.body ?? '').trim() &&
       ((this.attachmentRefs?.length ?? 0) > 0 || (this.attachments?.length ?? 0) > 0);
     // The More actions dots sit inside the text bubble, in a reserved corner.
@@ -2935,7 +3696,7 @@ export class ScionChatMessage extends LitElement {
         <div
           class="bubble${attachmentOnly && !isDeleted && this.actionsEnabled
             ? ' actions-corner'
-            : ''}${decisionCard && !isDeleted ? ' decision' : ''}"
+            : ''}${hasActionCard && !isDeleted ? ' decision' : ''}"
         >
           ${this.showHeader && this.fromAgent
             ? html`
@@ -2976,11 +3737,13 @@ export class ScionChatMessage extends LitElement {
             : attachmentOnly
               ? nothing
               : html`<div class="bubble-content${contentActions}">
-                  ${decisionCard && !this.displayBody.trim()
+                  ${hasActionCard && !this.displayBody.trim()
                     ? nothing
                     : this.renderBody()}${decisionCard
                     ? this.renderDecisionCard()
-                    : nothing}${this.renderActionsButton()}
+                    : secretRequestCard
+                      ? this.renderSecretRequestCard()
+                      : nothing}${this.renderActionsButton()}
                 </div>`}
           ${isDeleted ? nothing : this.renderAttachments()}
           ${isDeleted ? nothing : this.renderArtifactChips()}
@@ -3108,8 +3871,15 @@ export class ScionChatMessage extends LitElement {
 
   /** Render delivery state indicator for outbound (user-sent) messages. */
   private renderDeliveryState() {
-    // Only show on user-sent messages with a dispatch state.
-    if (this.fromAgent || !this.dispatchState) return nothing;
+    if (!this.dispatchState) return nothing;
+    // Failed delivery states are shown to every human participant in the
+    // conversation, not only the sender (where `fromAgent` means "not my
+    // message" in v2). Agent-sent messages never render delivery states.
+    if (this.dispatchState === 'failed') {
+      if (this.senderIsAgent || this.sender?.startsWith('agent:')) return nothing;
+    } else if (this.fromAgent) {
+      return nothing;
+    }
 
     switch (this.dispatchState) {
       case 'pending':
@@ -3144,6 +3914,23 @@ export class ScionChatMessage extends LitElement {
               <div class="delivery-state dispatched">
                 <sl-icon name="check2"></sl-icon>
                 Accepted
+              </div>
+            `;
+      case 'delivered':
+        // ptone/scion#9015: the broker confirmed session injection succeeded
+        // (or conduit deliver-message finished). "Seen" still takes precedence
+        // once the read watermark passes this message.
+        return this.seen
+          ? html`
+              <div class="delivery-state seen">
+                <sl-icon name="check2-all"></sl-icon>
+                Seen
+              </div>
+            `
+          : html`
+              <div class="delivery-state delivered">
+                <sl-icon name="check2"></sl-icon>
+                Delivered
               </div>
             `;
       case 'deferred':
@@ -3183,13 +3970,15 @@ export class ScionChatMessage extends LitElement {
         const isUnreachable =
           this.dispatchFailureCode === 'agent_unreachable' ||
           (!this.dispatchFailureCode && this.dispatchFailureReason.startsWith('Agent unreachable'));
-        // ptone/scion#7405: pending-TTL expiry means dispatch confirmation was
+        // ptone/scion#7405 / ptone/scion#8678: pending-TTL expiry and
+        // unknown-outcome finalization both mean dispatch confirmation was
         // lost or never completed — delivery may already have occurred, so show
         // "Delivery unconfirmed" rather than claiming a definite failure.
         const isUnconfirmed =
           this.dispatchFailureCode === 'delivery_unconfirmed' ||
           (!this.dispatchFailureCode &&
-            this.dispatchFailureReason === 'expired: stuck in pending state beyond TTL');
+            (this.dispatchFailureReason === 'expired: stuck in pending state beyond TTL' ||
+              this.dispatchFailureReason === 'dispatch outcome unknown'));
         if (isUnconfirmed) {
           return html`
             <sl-tooltip
@@ -3199,6 +3988,16 @@ export class ScionChatMessage extends LitElement {
               <div class="delivery-state failed">
                 <sl-icon name="exclamation-triangle"></sl-icon>
                 Delivery unconfirmed
+              </div>
+            </sl-tooltip>
+          `;
+        }
+        if (isDeletedUnreachableReason(this.dispatchFailureReason, this.dispatchFailureCode)) {
+          return html`
+            <sl-tooltip content=${DELETED_AGENT_TOOLTIP} hoist>
+              <div class="delivery-state failed">
+                <sl-icon name="exclamation-triangle"></sl-icon>
+                ${formatDeletedAgentLabel(this.routedTo)}
               </div>
             </sl-tooltip>
           `;
@@ -3227,6 +4026,59 @@ export class ScionChatMessage extends LitElement {
       .createdAt=${this.timestamp}
       .conversationLabel=${this.conversationLabel}
     ></scion-chat-decisions>`;
+  }
+
+  private renderSecretRequestCard(): TemplateResult {
+    if (this.secretRequestLoading) {
+      return html`<div class="secret-request-status" role="status">
+        <sl-spinner></sl-spinner>
+        <span>Loading secret request…</span>
+      </div>`;
+    }
+    if (this.secretRequestError || !this.secretRequestCard) {
+      return html`<div class="secret-request-status error" role="alert">
+        <sl-icon name="exclamation-circle" aria-hidden="true"></sl-icon>
+        <span>${this.secretRequestError || 'Unable to load secret request.'}</span>
+        ${this.secretRequestErrorStatus !== 403 && this.secretRequestErrorStatus !== 404
+          ? html`<sl-button size="small" @click=${(): void => this.syncSecretRequestCard(true)}>
+              Retry
+            </sl-button>`
+          : nothing}
+      </div>`;
+    }
+    const card = this.secretRequestCard;
+    return html`<scion-chat-secret-request
+      .messageId=${card.messageId}
+      .rows=${card.rows}
+      .agentName=${card.agentName}
+      .projectName=${card.projectName ?? ''}
+      .threadId=${card.threadId ?? ''}
+      .currentUserId=${this.currentUserId}
+      .canRespond=${card.canRespond}
+      .reason=${card.reason ?? ''}
+      surface="native"
+      @secret-request-refreshed=${(e: CustomEvent<{ card: SecretRequestCardResponse }>): void => {
+        if (e.detail?.card) {
+          this.secretRequestCard = e.detail.card;
+        }
+      }}
+    ></scion-chat-secret-request>`;
+  }
+
+  private renderSecretResponse(): TemplateResult {
+    const own = Boolean(
+      this.currentUserId && this.senderId && this.senderId === this.currentUserId
+    );
+    const lane = own ? 'own' : 'other';
+    return html`<div class="secret-response-row ${lane}" data-testid="secret-response-row">
+      <div class="secret-response-line">
+        <sl-icon name="shield-lock" aria-hidden="true"></sl-icon>
+        <div class="secret-response-body">${this.renderBody()}</div>
+        ${this.timestamp
+          ? html`<span class="msg-time" title=${this.formatTimeTitle()}>${this.formatTime()}</span>`
+          : nothing}
+      </div>
+    </div>`;
   }
 
   /**

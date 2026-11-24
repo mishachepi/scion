@@ -253,7 +253,7 @@ export class ScionFacetCombobox extends LitElement {
       cursor: pointer;
       font-size: 0.85rem;
       line-height: 1;
-      border-radius: 0.2rem;
+      border-radius: calc(var(--scion-radius-sm) * 0.8);
       flex-shrink: 0;
     }
 
@@ -296,7 +296,7 @@ export class ScionFacetCombobox extends LitElement {
     .opt:hover,
     .opt.act {
       background: var(
-        --scion-primary-50,
+        --scion-primary-tint,
         color-mix(in srgb, var(--scion-primary, #2563eb) 12%, transparent)
       );
     }

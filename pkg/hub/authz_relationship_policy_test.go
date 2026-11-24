@@ -68,7 +68,9 @@ var relationshipOwnerExcluded = map[relationshipAllowKey][]string{
 	{"owner", "user", "group"}:          {},
 	// broker.auto_provide offers a broker to every project; it is held by
 	// super-admins only, so owning a broker does not grant it.
-	{"owner", "user", "broker"}: {"broker.auto_provide"},
+	// broker.manage registers and approves admin-managed brokers; owning a
+	// broker must not grant it (ptone/scion#7829).
+	{"owner", "user", "broker"}: {"broker.auto_provide", "broker.manage"},
 	// gcp_service_account.use (ptone/scion#2129) is meant for an agent's own
 	// token-mint request. It has no AgentScopes: the GCP token scope is per
 	// service account and cannot be matched statically, so no credential
@@ -118,6 +120,7 @@ var relationshipOwnerExcluded = map[relationshipAllowKey][]string{
 	{"hub_association", "agent", "env_var"}:     {},
 	{"broker_association", "agent", "secret"}:   {"secret.use"},
 	{"broker_association", "agent", "env_var"}:  {},
+	{"agent_association", "agent", "secret"}:    {"secret.use"},
 }
 
 func policyCellPermissions() map[relationshipAllowKey]map[string]bool {

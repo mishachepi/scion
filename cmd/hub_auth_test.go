@@ -296,6 +296,8 @@ func TestFetchHubCallbackBranding(t *testing.T) {
 				"branding": {
 					"name": "Acme Cloud",
 					"attribution": "shown",
+					"corners": "square",
+					"fontSans": "ibm-plex-sans",
 					"logoLight": "/brand/logo-light?v=12345678",
 					"logoDark": "https://cdn.example.com/dark.svg",
 					"light": {"bg": "#fafaf9", "surface": "#ffffff", "text": "#292524", "text_muted": "#78716c", "border": "#e7e5e4", "primary": "#0f766e"},
@@ -309,6 +311,8 @@ func TestFetchHubCallbackBranding(t *testing.T) {
 		require.NotNil(t, got)
 		assert.Equal(t, "Acme Cloud", got.Name)
 		assert.Equal(t, "shown", got.Attribution)
+		assert.Equal(t, "square", got.Corners)
+		assert.Equal(t, "ibm-plex-sans", got.FontSans)
 		assert.Equal(t, srv.URL+"/brand/logo-light?v=12345678", got.LogoLight)
 		assert.Equal(t, "https://cdn.example.com/dark.svg", got.LogoDark)
 		assert.Equal(t, "#0f766e", got.Light.Accent)

@@ -126,6 +126,7 @@ type CompositeStore struct {
 	*ExternalIdentityStore
 	*AgentReincarnationStore
 	*UserTerminalWorkspaceStore
+	*UserExecContainerStore
 	*HubInstanceStore
 	*TestIdentityDelegationStore
 	*UserDeletionStore
@@ -133,6 +134,7 @@ type CompositeStore struct {
 	*SystemOneInstanceStore
 	*TriggerStore
 	*MessagePolicyStore
+	*AgentSuspendScreenStore
 
 	client *ent.Client
 	inTx   bool // true when this CompositeStore wraps a transaction
@@ -205,6 +207,12 @@ func (c *CompositeStore) SetRelayRole(role string) {
 	c.relayRole = role
 }
 
+// SetMessagePublisher attaches a post-commit MessagePublisher to the embedded
+// MessageStore using MessageStore.WithPublisher (ptone/scion#8136).
+func (c *CompositeStore) SetMessagePublisher(p MessagePublisher) {
+	c.MessageStore = c.MessageStore.WithPublisher(p)
+}
+
 // SetBeforeFKReconcile makes Migrate pass fn to entc.AutoMigrate, which
 // calls it on SQLite just before the foreign key reconcile changes rows
 // (after PreMigrate); an error from fn aborts Migrate before the reconcile
@@ -257,6 +265,10 @@ func (c *CompositeStore) WithTx(ctx context.Context, fn func(tx store.Store) err
 		return markTransient(fmt.Errorf("begin transaction: %w", err))
 	}
 	txStore := c.newTxStore(tx)
+	var pendingMsgs []*store.Message
+	if c.MessageStore.publisher != nil {
+		txStore.pendingPublish = &pendingMsgs
+	}
 
 	defer func() {
 		// Safety net: if Commit was not called (i.e. fn panicked or returned
@@ -274,6 +286,11 @@ func (c *CompositeStore) WithTx(ctx context.Context, fn func(tx store.Store) err
 	if err := tx.Commit(); err != nil {
 		return markTransient(fmt.Errorf("commit transaction: %w", err))
 	}
+	if c.MessageStore.publisher != nil {
+		for _, m := range pendingMsgs {
+			_ = c.MessageStore.publisher.PublishUserMessage(ctx, m)
+		}
+	}
 	return nil
 }
 
@@ -289,6 +306,7 @@ func newTxCompositeStore(tx *ent.Tx) *CompositeStore {
 	txStore.MembershipLossCheckStore.inTx = true
 	txStore.AgentHoldStore.inTx = true
 	txStore.ConversationStore.inTx = true
+	txStore.MessageStore.inTx = true
 	txStore.ThreadGroupStore.inTx = true
 	txStore.ScheduleStore.inTx = true
 	txStore.SecretStore.inTx = true
@@ -348,6 +366,7 @@ func NewCompositeStore(client *ent.Client) *CompositeStore {
 		ExternalIdentityStore:       NewExternalIdentityStore(client),
 		AgentReincarnationStore:     NewAgentReincarnationStore(client),
 		UserTerminalWorkspaceStore:  NewUserTerminalWorkspaceStore(client),
+		UserExecContainerStore:      NewUserExecContainerStore(client),
 		HubInstanceStore:            NewHubInstanceStore(client),
 		TestIdentityDelegationStore: NewTestIdentityDelegationStore(client),
 		UserDeletionStore:           NewUserDeletionStore(client),
@@ -355,6 +374,7 @@ func NewCompositeStore(client *ent.Client) *CompositeStore {
 		SystemOneInstanceStore:      NewSystemOneInstanceStore(client),
 		TriggerStore:                NewTriggerStore(client),
 		MessagePolicyStore:          NewMessagePolicyStore(client),
+		AgentSuspendScreenStore:     NewAgentSuspendScreenStore(client),
 		client:                      client,
 	}
 }
@@ -594,6 +614,10 @@ func (c *CompositeStore) DeleteProject(ctx context.Context, id string) error {
 	// Decision prompt decisions, answers and the deleted agents' key counters
 	// go with the project (they have no DB-level FK either).
 	if err := deleteProjectDecisions(ctx, c.client, uid, agentIDs); err != nil {
+		return err
+	}
+	// Secret request rows go with the project (§4.7).
+	if err := deleteProjectSecretRequests(ctx, c.client, uid); err != nil {
 		return err
 	}
 	// Primary-project trigger routing entries in github_installations.trigger_routing
@@ -851,6 +875,14 @@ func (c *CompositeStore) purgeDeletedAgents(ctx context.Context, cutoff time.Tim
 			if err := deactivatePurgedAgentAuthority(ctx, txStore, removed, deactivation); err != nil {
 				return 0, err
 			}
+			for _, id := range removed {
+				if _, err := txStore.DeleteSecretsByScope(ctx, store.ScopeAgent, id); err != nil {
+					return 0, err
+				}
+				if _, err := txStore.WithdrawAgentSecretRequestsOnDelete(ctx, id, now); err != nil {
+					return 0, err
+				}
+			}
 			for _, id := range removedIDs {
 				if row := lifecycleBefore[id]; row != nil {
 					if err := observeAgentWrite(ctx, obs, tx.Client(), tx, store.AgentWrite{
@@ -1046,6 +1078,9 @@ func (c *CompositeStore) Migrate(ctx context.Context) error {
 	}
 	if err := c.BackfillDecisionChatKeys(ctx); err != nil {
 		return fmt.Errorf("decision chat_key backfill: %w", err)
+	}
+	if err := c.BackfillConversationMessageSeqs(ctx); err != nil {
+		return fmt.Errorf("conversation message seq backfill: %w", err)
 	}
 	return c.SeedMaintenanceOperations(ctx)
 }

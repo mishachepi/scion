@@ -12,6 +12,7 @@ import (
 	"entgo.io/ent/dialect/sql"
 	"entgo.io/ent/dialect/sql/sqlgraph"
 	"entgo.io/ent/schema/field"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/scheduledexecrun"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/triggerfire"
 	"github.com/google/uuid"
 )
@@ -236,6 +237,20 @@ func (_c *TriggerFireCreate) SetNillableRuleTrace(v *string) *TriggerFireCreate 
 	return _c
 }
 
+// SetTargetAgentID sets the "target_agent_id" field.
+func (_c *TriggerFireCreate) SetTargetAgentID(v uuid.UUID) *TriggerFireCreate {
+	_c.mutation.SetTargetAgentID(v)
+	return _c
+}
+
+// SetNillableTargetAgentID sets the "target_agent_id" field if the given value is not nil.
+func (_c *TriggerFireCreate) SetNillableTargetAgentID(v *uuid.UUID) *TriggerFireCreate {
+	if v != nil {
+		_c.SetTargetAgentID(*v)
+	}
+	return _c
+}
+
 // SetExecutorKind sets the "executor_kind" field.
 func (_c *TriggerFireCreate) SetExecutorKind(v string) *TriggerFireCreate {
 	_c.mutation.SetExecutorKind(v)
@@ -267,6 +282,34 @@ func (_c *TriggerFireCreate) SetNillableExecutorID(v *string) *TriggerFireCreate
 // SetLeaseUntil sets the "lease_until" field.
 func (_c *TriggerFireCreate) SetLeaseUntil(v time.Time) *TriggerFireCreate {
 	_c.mutation.SetLeaseUntil(v)
+	return _c
+}
+
+// SetNotBefore sets the "not_before" field.
+func (_c *TriggerFireCreate) SetNotBefore(v time.Time) *TriggerFireCreate {
+	_c.mutation.SetNotBefore(v)
+	return _c
+}
+
+// SetNillableNotBefore sets the "not_before" field if the given value is not nil.
+func (_c *TriggerFireCreate) SetNillableNotBefore(v *time.Time) *TriggerFireCreate {
+	if v != nil {
+		_c.SetNotBefore(*v)
+	}
+	return _c
+}
+
+// SetDeferredAt sets the "deferred_at" field.
+func (_c *TriggerFireCreate) SetDeferredAt(v time.Time) *TriggerFireCreate {
+	_c.mutation.SetDeferredAt(v)
+	return _c
+}
+
+// SetNillableDeferredAt sets the "deferred_at" field if the given value is not nil.
+func (_c *TriggerFireCreate) SetNillableDeferredAt(v *time.Time) *TriggerFireCreate {
+	if v != nil {
+		_c.SetDeferredAt(*v)
+	}
 	return _c
 }
 
@@ -316,6 +359,25 @@ func (_c *TriggerFireCreate) SetNillableID(v *uuid.UUID) *TriggerFireCreate {
 		_c.SetID(*v)
 	}
 	return _c
+}
+
+// SetExecRunID sets the "exec_run" edge to the ScheduledExecRun entity by ID.
+func (_c *TriggerFireCreate) SetExecRunID(id uuid.UUID) *TriggerFireCreate {
+	_c.mutation.SetExecRunID(id)
+	return _c
+}
+
+// SetNillableExecRunID sets the "exec_run" edge to the ScheduledExecRun entity by ID if the given value is not nil.
+func (_c *TriggerFireCreate) SetNillableExecRunID(id *uuid.UUID) *TriggerFireCreate {
+	if id != nil {
+		_c = _c.SetExecRunID(*id)
+	}
+	return _c
+}
+
+// SetExecRun sets the "exec_run" edge to the ScheduledExecRun entity.
+func (_c *TriggerFireCreate) SetExecRun(v *ScheduledExecRun) *TriggerFireCreate {
+	return _c.SetExecRunID(v.ID)
 }
 
 // Mutation returns the TriggerFireMutation object of the builder.
@@ -543,6 +605,10 @@ func (_c *TriggerFireCreate) createSpec() (*TriggerFire, *sqlgraph.CreateSpec) {
 		_spec.SetField(triggerfire.FieldRuleTrace, field.TypeString, value)
 		_node.RuleTrace = value
 	}
+	if value, ok := _c.mutation.TargetAgentID(); ok {
+		_spec.SetField(triggerfire.FieldTargetAgentID, field.TypeUUID, value)
+		_node.TargetAgentID = &value
+	}
 	if value, ok := _c.mutation.ExecutorKind(); ok {
 		_spec.SetField(triggerfire.FieldExecutorKind, field.TypeString, value)
 		_node.ExecutorKind = value
@@ -555,6 +621,14 @@ func (_c *TriggerFireCreate) createSpec() (*TriggerFire, *sqlgraph.CreateSpec) {
 		_spec.SetField(triggerfire.FieldLeaseUntil, field.TypeTime, value)
 		_node.LeaseUntil = value
 	}
+	if value, ok := _c.mutation.NotBefore(); ok {
+		_spec.SetField(triggerfire.FieldNotBefore, field.TypeTime, value)
+		_node.NotBefore = &value
+	}
+	if value, ok := _c.mutation.DeferredAt(); ok {
+		_spec.SetField(triggerfire.FieldDeferredAt, field.TypeTime, value)
+		_node.DeferredAt = &value
+	}
 	if value, ok := _c.mutation.StartedAt(); ok {
 		_spec.SetField(triggerfire.FieldStartedAt, field.TypeTime, value)
 		_node.StartedAt = value
@@ -566,6 +640,22 @@ func (_c *TriggerFireCreate) createSpec() (*TriggerFire, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.Created(); ok {
 		_spec.SetField(triggerfire.FieldCreated, field.TypeTime, value)
 		_node.Created = value
+	}
+	if nodes := _c.mutation.ExecRunIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2O,
+			Inverse: false,
+			Table:   triggerfire.ExecRunTable,
+			Columns: []string{triggerfire.ExecRunColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(scheduledexecrun.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges = append(_spec.Edges, edge)
 	}
 	return _node, _spec
 }
@@ -859,6 +949,24 @@ func (u *TriggerFireUpsert) ClearRuleTrace() *TriggerFireUpsert {
 	return u
 }
 
+// SetTargetAgentID sets the "target_agent_id" field.
+func (u *TriggerFireUpsert) SetTargetAgentID(v uuid.UUID) *TriggerFireUpsert {
+	u.Set(triggerfire.FieldTargetAgentID, v)
+	return u
+}
+
+// UpdateTargetAgentID sets the "target_agent_id" field to the value that was provided on create.
+func (u *TriggerFireUpsert) UpdateTargetAgentID() *TriggerFireUpsert {
+	u.SetExcluded(triggerfire.FieldTargetAgentID)
+	return u
+}
+
+// ClearTargetAgentID clears the value of the "target_agent_id" field.
+func (u *TriggerFireUpsert) ClearTargetAgentID() *TriggerFireUpsert {
+	u.SetNull(triggerfire.FieldTargetAgentID)
+	return u
+}
+
 // SetExecutorKind sets the "executor_kind" field.
 func (u *TriggerFireUpsert) SetExecutorKind(v string) *TriggerFireUpsert {
 	u.Set(triggerfire.FieldExecutorKind, v)
@@ -892,6 +1000,42 @@ func (u *TriggerFireUpsert) SetLeaseUntil(v time.Time) *TriggerFireUpsert {
 // UpdateLeaseUntil sets the "lease_until" field to the value that was provided on create.
 func (u *TriggerFireUpsert) UpdateLeaseUntil() *TriggerFireUpsert {
 	u.SetExcluded(triggerfire.FieldLeaseUntil)
+	return u
+}
+
+// SetNotBefore sets the "not_before" field.
+func (u *TriggerFireUpsert) SetNotBefore(v time.Time) *TriggerFireUpsert {
+	u.Set(triggerfire.FieldNotBefore, v)
+	return u
+}
+
+// UpdateNotBefore sets the "not_before" field to the value that was provided on create.
+func (u *TriggerFireUpsert) UpdateNotBefore() *TriggerFireUpsert {
+	u.SetExcluded(triggerfire.FieldNotBefore)
+	return u
+}
+
+// ClearNotBefore clears the value of the "not_before" field.
+func (u *TriggerFireUpsert) ClearNotBefore() *TriggerFireUpsert {
+	u.SetNull(triggerfire.FieldNotBefore)
+	return u
+}
+
+// SetDeferredAt sets the "deferred_at" field.
+func (u *TriggerFireUpsert) SetDeferredAt(v time.Time) *TriggerFireUpsert {
+	u.Set(triggerfire.FieldDeferredAt, v)
+	return u
+}
+
+// UpdateDeferredAt sets the "deferred_at" field to the value that was provided on create.
+func (u *TriggerFireUpsert) UpdateDeferredAt() *TriggerFireUpsert {
+	u.SetExcluded(triggerfire.FieldDeferredAt)
+	return u
+}
+
+// ClearDeferredAt clears the value of the "deferred_at" field.
+func (u *TriggerFireUpsert) ClearDeferredAt() *TriggerFireUpsert {
+	u.SetNull(triggerfire.FieldDeferredAt)
 	return u
 }
 
@@ -1262,6 +1406,27 @@ func (u *TriggerFireUpsertOne) ClearRuleTrace() *TriggerFireUpsertOne {
 	})
 }
 
+// SetTargetAgentID sets the "target_agent_id" field.
+func (u *TriggerFireUpsertOne) SetTargetAgentID(v uuid.UUID) *TriggerFireUpsertOne {
+	return u.Update(func(s *TriggerFireUpsert) {
+		s.SetTargetAgentID(v)
+	})
+}
+
+// UpdateTargetAgentID sets the "target_agent_id" field to the value that was provided on create.
+func (u *TriggerFireUpsertOne) UpdateTargetAgentID() *TriggerFireUpsertOne {
+	return u.Update(func(s *TriggerFireUpsert) {
+		s.UpdateTargetAgentID()
+	})
+}
+
+// ClearTargetAgentID clears the value of the "target_agent_id" field.
+func (u *TriggerFireUpsertOne) ClearTargetAgentID() *TriggerFireUpsertOne {
+	return u.Update(func(s *TriggerFireUpsert) {
+		s.ClearTargetAgentID()
+	})
+}
+
 // SetExecutorKind sets the "executor_kind" field.
 func (u *TriggerFireUpsertOne) SetExecutorKind(v string) *TriggerFireUpsertOne {
 	return u.Update(func(s *TriggerFireUpsert) {
@@ -1301,6 +1466,48 @@ func (u *TriggerFireUpsertOne) SetLeaseUntil(v time.Time) *TriggerFireUpsertOne 
 func (u *TriggerFireUpsertOne) UpdateLeaseUntil() *TriggerFireUpsertOne {
 	return u.Update(func(s *TriggerFireUpsert) {
 		s.UpdateLeaseUntil()
+	})
+}
+
+// SetNotBefore sets the "not_before" field.
+func (u *TriggerFireUpsertOne) SetNotBefore(v time.Time) *TriggerFireUpsertOne {
+	return u.Update(func(s *TriggerFireUpsert) {
+		s.SetNotBefore(v)
+	})
+}
+
+// UpdateNotBefore sets the "not_before" field to the value that was provided on create.
+func (u *TriggerFireUpsertOne) UpdateNotBefore() *TriggerFireUpsertOne {
+	return u.Update(func(s *TriggerFireUpsert) {
+		s.UpdateNotBefore()
+	})
+}
+
+// ClearNotBefore clears the value of the "not_before" field.
+func (u *TriggerFireUpsertOne) ClearNotBefore() *TriggerFireUpsertOne {
+	return u.Update(func(s *TriggerFireUpsert) {
+		s.ClearNotBefore()
+	})
+}
+
+// SetDeferredAt sets the "deferred_at" field.
+func (u *TriggerFireUpsertOne) SetDeferredAt(v time.Time) *TriggerFireUpsertOne {
+	return u.Update(func(s *TriggerFireUpsert) {
+		s.SetDeferredAt(v)
+	})
+}
+
+// UpdateDeferredAt sets the "deferred_at" field to the value that was provided on create.
+func (u *TriggerFireUpsertOne) UpdateDeferredAt() *TriggerFireUpsertOne {
+	return u.Update(func(s *TriggerFireUpsert) {
+		s.UpdateDeferredAt()
+	})
+}
+
+// ClearDeferredAt clears the value of the "deferred_at" field.
+func (u *TriggerFireUpsertOne) ClearDeferredAt() *TriggerFireUpsertOne {
+	return u.Update(func(s *TriggerFireUpsert) {
+		s.ClearDeferredAt()
 	})
 }
 
@@ -1841,6 +2048,27 @@ func (u *TriggerFireUpsertBulk) ClearRuleTrace() *TriggerFireUpsertBulk {
 	})
 }
 
+// SetTargetAgentID sets the "target_agent_id" field.
+func (u *TriggerFireUpsertBulk) SetTargetAgentID(v uuid.UUID) *TriggerFireUpsertBulk {
+	return u.Update(func(s *TriggerFireUpsert) {
+		s.SetTargetAgentID(v)
+	})
+}
+
+// UpdateTargetAgentID sets the "target_agent_id" field to the value that was provided on create.
+func (u *TriggerFireUpsertBulk) UpdateTargetAgentID() *TriggerFireUpsertBulk {
+	return u.Update(func(s *TriggerFireUpsert) {
+		s.UpdateTargetAgentID()
+	})
+}
+
+// ClearTargetAgentID clears the value of the "target_agent_id" field.
+func (u *TriggerFireUpsertBulk) ClearTargetAgentID() *TriggerFireUpsertBulk {
+	return u.Update(func(s *TriggerFireUpsert) {
+		s.ClearTargetAgentID()
+	})
+}
+
 // SetExecutorKind sets the "executor_kind" field.
 func (u *TriggerFireUpsertBulk) SetExecutorKind(v string) *TriggerFireUpsertBulk {
 	return u.Update(func(s *TriggerFireUpsert) {
@@ -1880,6 +2108,48 @@ func (u *TriggerFireUpsertBulk) SetLeaseUntil(v time.Time) *TriggerFireUpsertBul
 func (u *TriggerFireUpsertBulk) UpdateLeaseUntil() *TriggerFireUpsertBulk {
 	return u.Update(func(s *TriggerFireUpsert) {
 		s.UpdateLeaseUntil()
+	})
+}
+
+// SetNotBefore sets the "not_before" field.
+func (u *TriggerFireUpsertBulk) SetNotBefore(v time.Time) *TriggerFireUpsertBulk {
+	return u.Update(func(s *TriggerFireUpsert) {
+		s.SetNotBefore(v)
+	})
+}
+
+// UpdateNotBefore sets the "not_before" field to the value that was provided on create.
+func (u *TriggerFireUpsertBulk) UpdateNotBefore() *TriggerFireUpsertBulk {
+	return u.Update(func(s *TriggerFireUpsert) {
+		s.UpdateNotBefore()
+	})
+}
+
+// ClearNotBefore clears the value of the "not_before" field.
+func (u *TriggerFireUpsertBulk) ClearNotBefore() *TriggerFireUpsertBulk {
+	return u.Update(func(s *TriggerFireUpsert) {
+		s.ClearNotBefore()
+	})
+}
+
+// SetDeferredAt sets the "deferred_at" field.
+func (u *TriggerFireUpsertBulk) SetDeferredAt(v time.Time) *TriggerFireUpsertBulk {
+	return u.Update(func(s *TriggerFireUpsert) {
+		s.SetDeferredAt(v)
+	})
+}
+
+// UpdateDeferredAt sets the "deferred_at" field to the value that was provided on create.
+func (u *TriggerFireUpsertBulk) UpdateDeferredAt() *TriggerFireUpsertBulk {
+	return u.Update(func(s *TriggerFireUpsert) {
+		s.UpdateDeferredAt()
+	})
+}
+
+// ClearDeferredAt clears the value of the "deferred_at" field.
+func (u *TriggerFireUpsertBulk) ClearDeferredAt() *TriggerFireUpsertBulk {
+	return u.Update(func(s *TriggerFireUpsert) {
+		s.ClearDeferredAt()
 	})
 }
 

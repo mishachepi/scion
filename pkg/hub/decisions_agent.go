@@ -27,6 +27,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/experiments"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
+	"github.com/GoogleCloudPlatform/scion/pkg/msgaction"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
@@ -49,19 +50,22 @@ const (
 
 // AgentDecisionListItem is one decision version in GET /api/v1/agent/decisions.
 type AgentDecisionListItem struct {
-	RowID           string             `json:"rowId"`
-	Key             string             `json:"key"`
-	Ref             string             `json:"ref"`
-	Version         int                `json:"version"`
-	Status          string             `json:"status"`
-	Question        string             `json:"question"`
-	ConversationID  string             `json:"conversationId"`
-	PromptMessageID string             `json:"promptMessageId"`
-	CreatedAt       time.Time          `json:"createdAt"`
-	DecidedAt       *time.Time         `json:"decidedAt,omitempty"`
-	Withdrawn       *DecisionWithdrawn `json:"withdrawn,omitempty"`
-	Dismissed       *DecisionDismissed `json:"dismissed,omitempty"`
-	Answer          *AnswerView        `json:"answer,omitempty"`
+	RowID           string                `json:"rowId"`
+	Key             string                `json:"key"`
+	Ref             string                `json:"ref"`
+	Version         int                   `json:"version"`
+	Status          string                `json:"status"`
+	Question        string                `json:"question"`
+	Choices         []messages.Choice     `json:"choices"`
+	DefaultChoiceID string                `json:"defaultChoiceId,omitempty"`
+	Other           *messages.OtherOption `json:"other,omitempty"`
+	ConversationID  string                `json:"conversationId"`
+	PromptMessageID string                `json:"promptMessageId"`
+	CreatedAt       time.Time             `json:"createdAt"`
+	DecidedAt       *time.Time            `json:"decidedAt,omitempty"`
+	Withdrawn       *DecisionWithdrawn    `json:"withdrawn,omitempty"`
+	Dismissed       *DecisionDismissed    `json:"dismissed,omitempty"`
+	Answer          *AnswerView           `json:"answer,omitempty"`
 }
 
 // AgentDecisionListResponse is the 200 envelope of GET /api/v1/agent/decisions.
@@ -77,22 +81,23 @@ type AgentDecisionListResponse struct {
 // Answers contains every recorded answer row on this version (interpreted and
 // direct), oldest first.
 type AgentDecisionVersionView struct {
-	RowID           string              `json:"rowId"`
-	Key             string              `json:"key"`
-	Ref             string              `json:"ref"`
-	Version         int                 `json:"version"`
-	Status          string              `json:"status"`
-	Question        string              `json:"question"`
-	ConversationID  string              `json:"conversationId"`
-	PromptMessageID string              `json:"promptMessageId"`
-	Choices         []messages.Choice   `json:"choices"`
-	DefaultChoiceID string              `json:"defaultChoiceId,omitempty"`
-	ReplacedBy      *DecisionReplacedBy `json:"replacedBy,omitempty"`
-	Withdrawn       *DecisionWithdrawn  `json:"withdrawn,omitempty"`
-	Dismissed       *DecisionDismissed  `json:"dismissed,omitempty"`
-	CreatedAt       time.Time           `json:"createdAt"`
-	DecidedAt       *time.Time          `json:"decidedAt,omitempty"`
-	Answers         []AnswerView        `json:"answers"`
+	RowID           string                `json:"rowId"`
+	Key             string                `json:"key"`
+	Ref             string                `json:"ref"`
+	Version         int                   `json:"version"`
+	Status          string                `json:"status"`
+	Question        string                `json:"question"`
+	ConversationID  string                `json:"conversationId"`
+	PromptMessageID string                `json:"promptMessageId"`
+	Choices         []messages.Choice     `json:"choices"`
+	DefaultChoiceID string                `json:"defaultChoiceId,omitempty"`
+	Other           *messages.OtherOption `json:"other,omitempty"`
+	ReplacedBy      *DecisionReplacedBy   `json:"replacedBy,omitempty"`
+	Withdrawn       *DecisionWithdrawn    `json:"withdrawn,omitempty"`
+	Dismissed       *DecisionDismissed    `json:"dismissed,omitempty"`
+	CreatedAt       time.Time             `json:"createdAt"`
+	DecidedAt       *time.Time            `json:"decidedAt,omitempty"`
+	Answers         []AnswerView          `json:"answers"`
 }
 
 // AgentDecisionShowResponse is the 200 envelope of GET /api/v1/agent/decisions/{key}.
@@ -104,8 +109,9 @@ type AgentDecisionShowResponse struct {
 
 // InterpretedAnswerInput is one key=choice_id pair in POST /api/v1/agent/decisions/interpreted.
 type InterpretedAnswerInput struct {
-	Key      string `json:"key"`
-	ChoiceID string `json:"choice_id"`
+	Key       string `json:"key"`
+	ChoiceID  string `json:"choice_id"`
+	OtherText string `json:"other_text,omitempty"`
 }
 
 // RecordInterpretedRequest is the body of POST /api/v1/agent/decisions/interpreted.
@@ -275,6 +281,16 @@ func (s *Server) handleAgentDecisionList(w http.ResponseWriter, r *http.Request,
 		if convID == "" {
 			convID = convByPrompt[d.MessageID]
 		}
+		choices := d.Choices
+		if choices == nil {
+			choices = []messages.Choice{}
+		}
+		eff := d.EffectiveAnswer()
+		ans := answerView(eff)
+		if ans != nil {
+			ans.PreviousChoiceLabel = previousChoiceLabel(eff, d)
+			ans.PreviousOtherText = previousOtherText(eff, d)
+		}
 		items[i] = AgentDecisionListItem{
 			RowID:           d.ID,
 			Key:             d.Key,
@@ -282,13 +298,16 @@ func (s *Server) handleAgentDecisionList(w http.ResponseWriter, r *http.Request,
 			Version:         d.Version,
 			Status:          d.Status,
 			Question:        d.Question,
+			Choices:         choices,
+			DefaultChoiceID: d.DefaultChoiceID,
+			Other:           cloneOtherOption(d.Other),
 			ConversationID:  convID,
 			PromptMessageID: d.MessageID,
 			CreatedAt:       d.CreatedAt,
 			DecidedAt:       d.DecidedAt,
 			Withdrawn:       decisionWithdrawnView(d),
 			Dismissed:       decisionDismissedView(d),
-			Answer:          answerView(d.EffectiveAnswer()),
+			Answer:          ans,
 		}
 	}
 
@@ -336,6 +355,8 @@ func (s *Server) handleAgentDecisionShow(w http.ResponseWriter, r *http.Request,
 		ansViews := make([]AnswerView, 0, len(d.Answers))
 		for _, a := range d.Answers {
 			if av := answerView(a); av != nil {
+				av.PreviousChoiceLabel = previousChoiceLabel(a, d)
+				av.PreviousOtherText = previousOtherText(a, d)
 				ansViews = append(ansViews, *av)
 			}
 		}
@@ -357,6 +378,7 @@ func (s *Server) handleAgentDecisionShow(w http.ResponseWriter, r *http.Request,
 			PromptMessageID: d.MessageID,
 			Choices:         choices,
 			DefaultChoiceID: d.DefaultChoiceID,
+			Other:           cloneOtherOption(d.Other),
 			ReplacedBy:      rep,
 			Withdrawn:       decisionWithdrawnView(d),
 			Dismissed:       decisionDismissedView(d),
@@ -459,6 +481,19 @@ func (s *Server) handleAgentDecisionInterpreted(w http.ResponseWriter, r *http.R
 			ValidationError(w, "each answer requires non-empty key and choice_id", nil)
 			return
 		}
+		if messages.IsReservedChoiceID(req.Answers[i].ChoiceID) && req.Answers[i].ChoiceID != messages.ChoiceIDOther {
+			ValidationError(w, fmt.Sprintf("choice %q is reserved", req.Answers[i].ChoiceID), map[string]interface{}{"field": "choice_id"})
+			return
+		}
+		otherText, verr := messages.NormalizeOtherText(req.Answers[i].ChoiceID, req.Answers[i].OtherText)
+		if verr != nil {
+			ValidationError(w, verr.Message, map[string]interface{}{
+				"field": verr.Field,
+				"code":  verr.Code,
+			})
+			return
+		}
+		req.Answers[i].OtherText = otherText
 		norm := messages.DecisionKeyNorm(req.Answers[i].Key)
 		if seenNorms[norm] {
 			ValidationError(w, fmt.Sprintf("duplicate decision key %q in request", req.Answers[i].Key), nil)
@@ -474,7 +509,7 @@ func (s *Server) handleAgentDecisionInterpreted(w http.ResponseWriter, r *http.R
 	if req.IdempotencyKey != "" {
 		reqPairs := make([]store.InterpretedAnswerPair, len(req.Answers))
 		for i, a := range req.Answers {
-			reqPairs[i] = store.InterpretedAnswerPair{Key: a.Key, ChoiceID: a.ChoiceID}
+			reqPairs[i] = store.InterpretedAnswerPair{Key: a.Key, ChoiceID: a.ChoiceID, OtherText: a.OtherText}
 		}
 		replay, rerr := s.store.FindInterpretedReplay(ctx, agentID, req.IdempotencyKey, req.SourceMessageID, reqPairs)
 		switch {
@@ -678,6 +713,7 @@ func (s *Server) handleAgentDecisionInterpreted(w http.ResponseWriter, r *http.R
 			DecisionRowID: resolved[i].ID,
 			Key:           a.Key,
 			ChoiceID:      a.ChoiceID,
+			OtherText:     a.OtherText,
 		}
 	}
 
@@ -789,17 +825,26 @@ func (s *Server) loadSourceAuthorIdentity(w http.ResponseWriter, ctx context.Con
 		}
 		return NewVisitorIdentity(u.ID, issuer, u.ID, email, u.DisplayName), true
 	}
-	return NewAuthenticatedUser(u.ID, u.Email, u.DisplayName, u.Role, string(ClientTypeWeb)), true
+	return applyViewAsMemberFromContext(ctx, NewAuthenticatedUser(u.ID, u.Email, u.DisplayName, u.Role, string(ClientTypeWeb))), true
 }
 
 func formatInterpretedResponseLine(agentSlug, authorName string, items []store.InterpretedFormattedItem) string {
 	if len(items) == 1 {
+		it := items[0]
+		if it.ChoiceID == messages.ChoiceIDOther && it.OtherText != "" {
+			return fmt.Sprintf("%s recorded %s's answer \"%s\" (%s) to %s, interpreted from their reply",
+				agentSlug, authorName, messages.EscapeMarkdownPlain(it.OtherText), messages.EscapeMarkdownPlain(it.ChoiceLabel), it.Key)
+		}
 		return fmt.Sprintf("%s recorded %s's answer %s to %s, interpreted from their reply",
-			agentSlug, authorName, plainLine(items[0].ChoiceLabel), items[0].Key)
+			agentSlug, authorName, plainLine(it.ChoiceLabel), it.Key)
 	}
 	parts := make([]string, len(items))
 	for i, it := range items {
-		parts[i] = it.Key + " " + plainLine(it.ChoiceLabel)
+		if it.ChoiceID == messages.ChoiceIDOther && it.OtherText != "" {
+			parts[i] = fmt.Sprintf("%s %s \"%s\"", it.Key, messages.EscapeMarkdownPlain(it.ChoiceLabel), messages.EscapeMarkdownPlain(it.OtherText))
+		} else {
+			parts[i] = it.Key + " " + plainLine(it.ChoiceLabel)
+		}
 	}
 	return fmt.Sprintf("%s recorded %s's answers to %d decisions: %s, interpreted from their reply",
 		agentSlug, authorName, len(items), strings.Join(parts, " · "))
@@ -914,16 +959,17 @@ func formatInterpretedFailureMessage(f store.InterpretedKeyFailure) string {
 				if who == "" {
 					who = "a user"
 				}
+				ansDisp := decisionKeyStateAnswer(eff)
 				if eff.Provenance == store.DecisionProvenanceAgentInterpreted {
-					return fmt.Sprintf("%s: already answered (interpreted by you from %s's reply, %s)", f.Key, who, eff.ChoiceLabel)
+					return fmt.Sprintf("%s: already answered (interpreted by you from %s's reply, %s)", f.Key, who, ansDisp)
 				}
 				switch eff.Outcome {
 				case store.DecisionOutcomeConfirm:
-					return fmt.Sprintf("%s: already answered (confirmed by %s, %s)", f.Key, who, eff.ChoiceLabel)
+					return fmt.Sprintf("%s: already answered (confirmed by %s, %s)", f.Key, who, ansDisp)
 				case store.DecisionOutcomeOverride:
-					return fmt.Sprintf("%s: already answered (overridden by %s, %s)", f.Key, who, eff.ChoiceLabel)
+					return fmt.Sprintf("%s: already answered (overridden by %s, %s)", f.Key, who, ansDisp)
 				default:
-					return fmt.Sprintf("%s: already answered (by %s, %s)", f.Key, who, eff.ChoiceLabel)
+					return fmt.Sprintf("%s: already answered (by %s, %s)", f.Key, who, ansDisp)
 				}
 			}
 		}
@@ -958,46 +1004,32 @@ func (s *Server) handleAgentDecisionWithdraw(w http.ResponseWriter, r *http.Requ
 	ctx := r.Context()
 	agentID := agentIdent.ID()
 
-	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+	r.Body = http.MaxBytesReader(w, r.Body, msgaction.MaxRequestBodyBytes)
 	var req WithdrawDecisionsRequest
 	if err := readJSON(r, &req); err != nil {
 		ValidationError(w, "invalid JSON body: "+err.Error(), nil)
 		return
 	}
 
-	if len(req.Keys) < 1 || len(req.Keys) > messages.MaxDecisionsPerMessage {
-		ValidationError(w, fmt.Sprintf("keys must contain 1 to %d items", messages.MaxDecisionsPerMessage),
-			map[string]interface{}{"field": "keys"})
-		return
+	parsed := &msgaction.WithdrawRequest{
+		Keys:     req.Keys,
+		WholeSet: req.WholeSet,
+		Reason:   req.Reason,
 	}
-	seenNorms := make(map[string]bool, len(req.Keys))
-	for i := range req.Keys {
-		req.Keys[i] = strings.TrimSpace(req.Keys[i])
-		if req.Keys[i] == "" {
-			ValidationError(w, "each key must be non-empty", map[string]interface{}{"field": "keys"})
-			return
-		}
-		norm := messages.DecisionKeyNorm(req.Keys[i])
-		if seenNorms[norm] {
-			ValidationError(w, fmt.Sprintf("duplicate decision key %q in request", req.Keys[i]),
-				map[string]interface{}{"field": "keys"})
-			return
-		}
-		seenNorms[norm] = true
-	}
-
-	reason := strings.TrimSpace(req.Reason)
-	if utf8.RuneCountInString(reason) > store.MaxDecisionWithdrawReasonRunes {
-		ValidationError(w, fmt.Sprintf("reason is at most %d characters", store.MaxDecisionWithdrawReasonRunes),
-			map[string]interface{}{"field": "reason"})
+	if ferr := msgaction.ValidateWithdrawRequest(parsed, msgaction.WithdrawParseOptions{
+		MaxKeys:      messages.MaxDecisionsPerMessage,
+		NormalizeKey: messages.DecisionKeyNorm,
+		KeyLabel:     "decision key",
+	}); ferr != nil {
+		ValidationError(w, ferr.Message, map[string]interface{}{"field": ferr.Field})
 		return
 	}
 
 	res, err := s.store.WithdrawDecisions(ctx, &store.WithdrawDecisionsInput{
 		AskerAgentID: agentID,
-		Keys:         req.Keys,
-		WholeSet:     req.WholeSet,
-		Reason:       reason,
+		Keys:         parsed.Keys,
+		WholeSet:     parsed.WholeSet,
+		Reason:       parsed.Reason,
 	})
 	if err != nil {
 		s.writeWithdrawDecisionsError(w, ctx, err)
@@ -1102,10 +1134,11 @@ func formatWithdrawFailureMessage(f store.WithdrawKeyFailure) string {
 				if who == "" {
 					who = "a user"
 				}
+				ansDisp := decisionKeyStateAnswer(eff)
 				if eff.Provenance == store.DecisionProvenanceAgentInterpreted {
-					return fmt.Sprintf("%s: already answered by %s (%s, interpreted awaiting confirmation)", f.Key, who, eff.ChoiceLabel)
+					return fmt.Sprintf("%s: already answered by %s (%s, interpreted awaiting confirmation)", f.Key, who, ansDisp)
 				}
-				return fmt.Sprintf("%s: already answered by %s (%s)", f.Key, who, eff.ChoiceLabel)
+				return fmt.Sprintf("%s: already answered by %s (%s)", f.Key, who, ansDisp)
 			}
 		}
 		return fmt.Sprintf("%s: already answered", f.Key)

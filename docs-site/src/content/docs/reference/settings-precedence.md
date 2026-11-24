@@ -250,7 +250,7 @@ existing value.
 | `SCION_WORKSPACE_GIT` | `"true"` when the workspace is a git repository, absent otherwise | **Unconditional** — overwrites |
 | `SCION_TEMPLATE` | full template reference, for debugging | Set only when a template reference exists |
 | `SCION_BROKER_NAME` | broker name, defaults to `local` | **Guarded** — defers to an existing value |
-| `SCION_HARNESS` | the launched harness's name: the resolved harness-config's `harness:` name (for example `gemini-cli`) when the config has declarative metadata or a container script; with no harness-config, the stored harness name when a built-in harness has that name; otherwise `generic` (a harness-config with neither declarative metadata nor a container script, or no harness-config and no matching built-in harness). Not the harness name stored at provisioning when a harness-config resolves, which a harness-config switch leaves stale | **Guarded** — defers to an existing value: an explicit `SCION_HARNESS` from the request env or the settings `harness_configs.<name>.env` wins, and a warning naming both harnesses is logged when it differs from the launched one. An `env:` in the harness-config directory's `config.yaml` does not override it |
+| `SCION_HARNESS` | the launched harness's name: the resolved harness-config's `harness:` name (for example `gemini-cli`) when the config has declarative metadata or a container script; with no harness-config, the stored harness name when a built-in harness has that name; otherwise `generic` (a harness-config with neither declarative metadata nor a container script, or no harness-config and no matching built-in harness). Not the harness name stored at provisioning when a harness-config resolves, which a harness-config switch leaves stale | **Guarded** — defers to an existing value: an explicit `SCION_HARNESS` from the request env wins, and a warning naming both harnesses is logged when it differs from the launched one. Harness-config layers (both the bundle's `config.yaml` and settings `harness_configs.<name>.env`) cannot set `SCION_*` keys |
 | `SCION_MODEL` | resolved model; also the harness's `--model` argument | **Guarded** — defers to an existing value (the hub-resolved model, or an explicit `--env`); a size alias in it is resolved with the resolved harness-config's `model_aliases`, else the built-in aliases of the harness that config declares (or of the stored harness, when no harness-config resolves); an alias neither table resolves (for example, for a declared harness with no built-in alias table and no `model_aliases` of its own) is passed on in its normalized form, such as `large` |
 | `SCION_THINKING_LEVEL` | resolved thinking level | **Guarded** — defers to an existing value |
 | `SCION_CREATOR` | OS user who created the agent | **Guarded** — defers to an existing value |
@@ -596,7 +596,7 @@ The runtimes differ in their own keys and in when they apply resolved-auth env:
 - Docker, Podman and Apple containers set `SCION_HOST_UID`, `SCION_HOST_GID`, `SCION_PROJECT`,
   `SCION_PROJECT_ID` and `SCION_WORKSPACE_BACKEND` before the merged environment, so a
   merged-environment value for one of those names is used. Only the runtime sets
-  `SCION_METADATA_INTERCEPTION` and `SCION_SUPPLEMENTAL_GIDS`; a merged-environment or secret value
+  `SCION_METADATA_INTERCEPTION`, `SCION_METADATA_INTERCEPTION_SOURCE` and `SCION_SUPPLEMENTAL_GIDS`; a merged-environment or secret value
   for them is dropped. These runtimes apply resolved-auth env only when the agent has a harness.
 - Kubernetes sets `SCION_HOST_UID`, `SCION_HOST_GID`, `HOME`, `USER`, `LOGNAME`,
   `SCION_OTEL_GCP_CREDENTIALS` (when a telemetry credential is configured), the NFS-home directory
@@ -1188,7 +1188,7 @@ harness-config or in settings.)
 **Behaviour change to watch for:** a profile that sets `harness_overrides.<name>.image` now
 overrides the image of every template that uses that harness config under that profile. Remove
 the override, or pass `--image`, if a template's own image must win. Conversely, a create-time
-`--image` (or `--config` image) now persists across plain restarts. A later `scion start --image`
+`--image` (or `--config` image) now persists across plain restarts. A later `scion resume --image`
 is not applied to an existing agent; the CLI warns that the flag is ignored. Re-create the agent to
 change or drop a create-time image.
 
@@ -1218,7 +1218,7 @@ settings, then the file default. This was an accepted, narrow trade-off: the cod
 pre-upgrade agent with no recorded inline value" apart from "an agent that never had an inline
 override" from the file alone. A restart through the Hub is unaffected: the Hub resends the
 agent's recorded explicit image and inline config on every dispatch, so the value is re-applied.
-A later `scion start --image` is not applied to an existing agent (the CLI warns that the flag is
+A later `scion resume --image` is not applied to an existing agent (the CLI warns that the flag is
 ignored), so re-create the agent to change a create-time image.
 
 Separately: if an agent's **template** can no longer be resolved at all on a restart

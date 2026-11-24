@@ -103,7 +103,7 @@ export class ScionPageAdminGroupDetail extends LitElement {
     .group-icon {
       width: 2.5rem;
       height: 2.5rem;
-      border-radius: 0.5rem;
+      border-radius: var(--scion-radius);
       display: flex;
       align-items: center;
       justify-content: center;
@@ -508,7 +508,16 @@ export class ScionPageAdminGroupDetail extends LitElement {
         .group=${this.group}
         .memberCount=${this.memberCount}
         @group-deleted=${(e: CustomEvent<GroupDeletedDetail>) => this.handleGroupDeleted(e)}
-        @sl-after-hide=${() => this.returnFocusToOverflowTrigger()}
+        @sl-after-hide=${(e: Event) => {
+          const origin = e.composedPath()[0];
+          if (
+            origin !== e.currentTarget &&
+            !(origin instanceof Element && origin.tagName === 'SL-DIALOG')
+          ) {
+            return;
+          }
+          this.returnFocusToOverflowTrigger();
+        }}
       ></scion-group-delete-dialog>
     `;
   }

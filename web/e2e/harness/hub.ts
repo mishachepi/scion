@@ -20,12 +20,12 @@
  * and the test-login endpoint available. Waits for the health endpoint before
  * returning.
  *
- * With `testIdentities: true` (and `testLogin: false`) it starts a throwaway
- * member-level test hub instead: hub-issued test identities on, the test
- * infrastructure marker written to the temp database first (it holds the
- * hub-local key for test identity web sessions), and a private HOME and
- * environment under the temp dir. See README.md ("Test identity browser
- * sessions").
+ * Every hub is a hosted member-level test hub (--test-mode=member with a
+ * random pinned hub id, server.hub.class: test and the test infrastructure
+ * marker written to the temp database first): a hosted server runs with dev
+ * auth only on such a designated test hub. With `testIdentities: true` (and
+ * `testLogin: false`) it also gets a private HOME and environment under the
+ * temp dir. See README.md ("Test identity browser sessions").
  */
 
 import * as crypto from 'node:crypto';
@@ -62,7 +62,7 @@ export interface HubState {
   devToken: string;
   /** False after restartHubWithoutDevAuth; unset (dev auth on) otherwise. */
   devAuth?: boolean;
-  /** Hub id of a member-level test hub (testIdentities), else unset. */
+  /** Hub id of the member-level test hub (every hub the harness starts). */
   hubId?: string;
   /** Private HOME of a member-level test hub (under dbDir), else unset. */
   homeDir?: string;
@@ -111,6 +111,12 @@ export interface StartHubOptions {
    * registers either way. Default false.
    */
   runtimeBroker?: boolean;
+  /**
+   * Override the hub's decision dismiss minimum age for test-mode hubs only
+   * (`--test-decision-dismiss-min-age=<duration>`, e.g. `'10s'`, ptone/scion#8582).
+   * Requires `testIdentities: true` (`--test-mode=member:<hub id>`).
+   */
+  decisionDismissMinAge?: string;
   /** Hub binary to run. Default: build/scion. For the harness's own tests. */
   binary?: string;
   /**
@@ -505,6 +511,9 @@ export async function startHub(options: StartHubOptions = {}): Promise<HubState>
   if (options.runtimeBroker && !testIdentities) {
     throw new Error('startHub: runtimeBroker needs testIdentities (a private HOME)');
   }
+  if (options.decisionDismissMinAge && !testIdentities) {
+    throw new Error('startHub: decisionDismissMinAge needs testIdentities (--test-mode)');
+  }
 
   // Build assets and binary
   if (options.build ?? true) {
@@ -519,20 +528,26 @@ export async function startHub(options: StartHubOptions = {}): Promise<HubState>
   // A member-level test hub gets its own HOME and hub id, and its database
   // is marked as test infrastructure before the hub starts (the hub reads
   // the marker, and the web session key in it, only at startup).
-  let hubId: string | undefined;
+  //
+  // Every hub is a member-level test hub (--test-mode=member): a hosted
+  // server runs with dev auth only on a designated test hub, which needs the
+  // hub class "test", a pinned hub id that matches the --test-mode binding,
+  // and the marker for this hub id (written below).
+  const hubId = crypto.randomBytes(6).toString('hex');
+  const testHubEnv = { SCION_SERVER_HUB_HUBID: hubId, SCION_SERVER_HUB_CLASS: 'test' };
   let homeDir: string | undefined;
   let env: NodeJS.ProcessEnv = {
     ...process.env,
     // The binary restricts commands by CLI mode; server requires human mode
     SCION_CLI_MODE: 'human',
+    ...testHubEnv,
   };
   if (testIdentities) {
-    hubId = crypto.randomBytes(6).toString('hex');
     homeDir = path.join(dbDir, 'home');
     fs.mkdirSync(homeDir, { mode: 0o700 });
-    // --test-mode=member requires the hub class "test" and the marker for
-    // this hub id (written below); the hub id binding is in the flag value.
-    env = isolatedEnv(homeDir, { SCION_SERVER_HUB_HUBID: hubId, SCION_SERVER_HUB_CLASS: 'test' });
+    env = isolatedEnv(homeDir, testHubEnv);
+  }
+  {
     console.info(`[hub] Marking ${dbPath} as test infrastructure for hub ${hubId}...`);
     const markOut = execFileSync(
       binary,
@@ -548,7 +563,7 @@ export async function startHub(options: StartHubOptions = {}): Promise<HubState>
         '--operator',
         'e2e-harness',
       ],
-      { cwd: homeDir, env, encoding: 'utf-8', timeout: 60_000 }
+      { cwd: homeDir ?? WORKSPACE_ROOT, env, encoding: 'utf-8', timeout: 60_000 }
     );
     for (const line of markOut.trim().split('\n')) console.info(`[hub:mark] ${redact(line)}`);
   }
@@ -568,6 +583,13 @@ export async function startHub(options: StartHubOptions = {}): Promise<HubState>
 
   // Start the hub binary
   const webAssetsDir = path.join(WEB_DIR, 'dist', 'client');
+  // Tell the hub its public base URL matches baseURL (127.0.0.1:<port>) unless
+  // the caller explicitly overrides it via env; otherwise it defaults to
+  // http://localhost:<port>, which mismatches 127.0.0.1 in CSP host-sources.
+  const hasExplicitBaseURL = Object.keys(extraEnv).some((key) => {
+    const upper = key.toUpperCase();
+    return upper === 'SCION_SERVER_BASE_URL' || upper === 'SCION_SERVER_HUB_ENDPOINT';
+  });
   const args = [
     'server',
     'start',
@@ -576,6 +598,7 @@ export async function startHub(options: StartHubOptions = {}): Promise<HubState>
     '127.0.0.1',
     '--web-port',
     String(port),
+    ...(hasExplicitBaseURL ? [] : ['--base-url', baseURL]),
     '--enable-hub',
     '--enable-web',
     '--hosted',
@@ -596,7 +619,10 @@ export async function startHub(options: StartHubOptions = {}): Promise<HubState>
     args.push('--enable-runtime-broker=false');
   }
   if (testLogin) args.push('--enable-test-login', '--session-secret', E2E_SESSION_SECRET);
-  if (testIdentities) args.push(`--test-mode=member:${hubId}`);
+  args.push(`--test-mode=member:${hubId}`);
+  if (options.decisionDismissMinAge) {
+    args.push(`--test-decision-dismiss-min-age=${options.decisionDismissMinAge}`);
+  }
   args.push('--db', dbPath, '--web-assets-dir', webAssetsDir);
   const cwd = homeDir ?? WORKSPACE_ROOT;
   let { hubProcess, devToken } = await launchHub(binary, args, env, cwd, baseURL);
@@ -644,7 +670,7 @@ export async function startHub(options: StartHubOptions = {}): Promise<HubState>
     baseURL,
     dbDir,
     devToken,
-    ...(hubId ? { hubId } : {}),
+    hubId,
     ...(homeDir ? { homeDir } : {}),
     startFlags: flagNames(args),
   };

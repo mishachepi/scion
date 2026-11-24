@@ -23,9 +23,9 @@ The dashboard features an integrated notification framework with real-time SSE d
 ### Mode Switcher
 The header features a **mode switcher** that lets you move between the top-level workspaces: **Console**, **Chat**, and **Terminals** (**Console** holds the left-hand navigation, including the **Dashboard** overview page at `/`). The header adapts to the viewport width in three tiers:
 
-- **Wide (above 1100 px)**: A segmented mode switcher with text labels and icons, with inline buttons for notifications, help, theme, profile, and sign-out.
-- **Medium (768–1100 px)**: The mode switcher shows icons only. Notifications, help, theme, profile, and sign-out move into a single account dropdown. A badge dot on the dropdown shows unread notifications.
-- **Narrow (below 768 px)**: The mode switcher becomes a dropdown, next to the account dropdown and a hamburger menu.
+- **Wide (above 1100 px)**: A segmented mode switcher with text labels and icons, with inline buttons for notifications, help, theme, profile, and sign-out. A chevron next to **Terminals** opens a menu of open terminal sessions in the rail's sort order, listing the current agent first (marked **not open** when it is not yet in the rail) so you can jump straight to a terminal from any view.
+- **Medium (768–1100 px)**: The mode switcher shows icons only, keeping the **Terminals** chevron menu. Notifications, help, theme, profile, and sign-out move into a single account dropdown. A badge dot on the dropdown shows unread notifications.
+- **Narrow (below 768 px)**: The mode switcher becomes a dropdown next to the account dropdown and a hamburger menu, with an **Open terminals** section listing the current agent first and open terminal sessions below **Terminals**.
 
 Notifications stay reachable at every width. The Chat entry shows the unread conversation count, and the Terminals entry shows how many terminal sessions are open.
 
@@ -34,7 +34,7 @@ Notifications stay reachable at every width. The Chat entry shows the unread con
 The web UI also works on phones, down to 320 px wide and in landscape, including notched screens and the on-screen keyboard. Wide code blocks and tables scroll sideways on their own instead of widening the page, and a sideways swipe does not trigger the browser's Back gesture.
 
 ### Display Timezone & Clock
-The dashboard shows clock times in 24-hour format. The **Display timezone** card on your profile settings page sets the zone used to show times and to read date/time inputs in native chat and scheduling forms. Agent and project lists, relative times, admin and access-boundary views, log viewers, chat, and the file browser all format times in this zone. **Auto**, the default, follows your browser's zone. The value is stored per user as the `timezone` preference (see the [Users API](/scion/reference/api/)). It affects only what you see, never the `TZ` of agent containers. For that, see [Agent timezone](/scion/reference/times-and-timezones/#agent-tz-hub-dispatched-agents).
+The dashboard shows clock times in 24-hour format. The **Display timezone** card on your profile settings page sets the zone used to show times and to read date/time inputs in native chat and scheduling forms. Agent and project lists, relative times, admin and access-boundary views, log viewers, chat, and the file browser all format times in this zone. **Auto**, the default, follows your browser's zone. The value is stored per user as the `timezone` preference (see the [Users API](/scion/reference/api/)). Only a pinned time zone is shared with agents you message (as `sender_timezone` in message metadata; see [Inbound Message Type Discrimination](/scion/hosted/user/messaging/#3-inbound-message-type-discrimination)); **Auto** is used for display only, and neither changes how agent containers are configured (`TZ`). For that, see [Agent timezone](/scion/reference/times-and-timezones/#agent-tz-hub-dispatched-agents).
 
 ### Native Web Chat
 When enabled via the `web.native_chat` feature flag, the dashboard includes a top-level **Native Web Chat** workspace (a fourth ShellType in the SPA). It offers a rich interface for direct communication and coordination with your running agents and team.

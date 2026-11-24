@@ -16,6 +16,7 @@ package hub
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -32,31 +33,53 @@ import (
 )
 
 // Fixed allow-list of event data environment variables accepted by
-// HeadlessCreate.EventEnv (Stage 1 design §5.7 constraint 3 & 4).
+// HeadlessCreate.EventEnv (Stage 1 design §5.7 constraint 3 & 4; Stage 2 §5.4).
 const (
-	EventEnvKeyTriggerEventID = "SCION_TRIGGER_EVENT_ID"
-	EventEnvKeyTriggerID      = "SCION_TRIGGER_ID"
+	EventEnvKeyTriggerEventID   = "SCION_TRIGGER_EVENT_ID"
+	EventEnvKeyTriggerID        = "SCION_TRIGGER_ID"
+	EventEnvKeyTriggerEventFile = api.EnvTriggerEventFile
 
 	// HeadlessEventFilePath is the relative home-directory path where
 	// HeadlessCreate.EventFile is written via WithCreateHomeFiles (Stage 1
-	// design §5.7).
-	HeadlessEventFilePath = ".scion/trigger-event.json"
-	headlessEventFileMode = 0o600
+	// design §5.7, Stage 2 §5.4).
+	HeadlessEventFilePath = api.TriggerEventHomeFilePath
+	// HeadlessEventFileContainerPath is the default absolute path inside the
+	// agent container advertised via SCION_TRIGGER_EVENT_FILE (Stage 2 §5.4).
+	// The Runtime Broker overrides this with the container user's resolved
+	// home directory (e.g. /root or /home/<user>) at start time.
+	HeadlessEventFileContainerPath = "/home/scion/" + HeadlessEventFilePath
+	headlessEventFileMode          = 0o600
 
-	// maxHeadlessEventFileBytes bounds HeadlessCreate.EventFile to the 16 KiB
-	// trigger envelope cap (Stage 1 design §5.7).
-	maxHeadlessEventFileBytes = 16 * 1024
+	// maxHeadlessEventFileBytes bounds HeadlessCreate.EventFile to the 64 KiB
+	// HomeFiles channel cap (Stage 2 §5.4; external_payload inside the file is
+	// separately bounded to 16 KiB by messaging.NewExternalPayload).
+	maxHeadlessEventFileBytes = api.MaxHomeFilesTotalBytes
 )
 
 var (
 	errDisallowedHeadlessEventEnvKey       = errors.New("disallowed headless event env key")
 	errInvalidHeadlessEventEnvValue        = errors.New("headless event env value contains NUL byte")
-	errHeadlessEventFileTooLarge           = errors.New("headless create event file exceeds 16 KiB limit")
-	errHeadlessGitHubTokenUnsupported      = errors.New("headless create githubToken is not supported before Stage 2 P1c")
+	errHeadlessEventFileTooLarge           = errors.New("headless create event file exceeds limit")
+	errHeadlessInvalidGitHubToken          = errors.New("headless create: invalid githubToken preference")
 	errHeadlessProvenancePrincipalMismatch = errors.New("headless create: edge provenance principal does not match authority principal")
 	errHeadlessInvalidEdgeProvenance       = errors.New("headless create: invalid scheduler edge provenance")
 	errHeadlessNoUsableRole                = errors.New("no usable role for the recorded authority; set noAuth: true or re-authorize the schedule")
+	errHeadlessMissingResolvedRole         = errors.New("headless create: missing pre-authorized resolved role")
+	errHeadlessNoDispatcherForHomeFiles    = errors.New("no dispatcher available for homeFiles create")
+	errHeadlessAgentExists                 = errors.New("agent already exists in project")
 )
+
+type headlessAgentExistsError struct {
+	slug string
+}
+
+func (e *headlessAgentExistsError) Error() string {
+	return fmt.Sprintf("agent %q already exists in project", e.slug)
+}
+
+func (e *headlessAgentExistsError) Is(target error) bool {
+	return target == errHeadlessAgentExists
+}
 
 // HeadlessMissingEnvError is the content-free error returned when a headless
 // agent create still has unsatisfied required environment variables after
@@ -106,15 +129,30 @@ type HeadlessCreate struct {
 	Branch   string
 	Labels   map[string]string // validated by pkg/labels (<=16, <=63 chars)
 
-	// GitHubToken reserves the Stage 2 P1c dispatch token precedence preference
-	// ("" | "installation" | "user_preferred"; "" keeps today's dispatch
-	// precedence; non-empty values are refused until Stage 2 P1c lands).
+	// GitHubToken controls GitHub token delivery precedence for the created
+	// agent (Stage 2 design §5.1a: "" | "installation" | "user_preferred").
+	// Copied to AppliedConfig.GitHubTokenPreference and CreateInputs so
+	// reincarnation preserves it.
 	GitHubToken string
+
+	// OnCommitTx, when non-nil, runs inside commitAgentCreate's transaction
+	// with the newly created agent's ID before commit (e.g. binding a trigger
+	// subject claim atomically with the agent create audit, Stage 2 §5.3).
+	OnCommitTx func(ctx context.Context, tx store.Store, agentID string) error
+
+	// OnCommitted, when non-nil, runs immediately after commitAgentCreate's
+	// transaction commits successfully (and never on rollback).
+	OnCommitted func(agentID string)
 
 	// Data-only channels (never material, never participating in secret/env
 	// resolution).
 	EventEnv  map[string]string // allow-listed keys only: SCION_TRIGGER_EVENT_ID, SCION_TRIGGER_ID
 	EventFile []byte            // ~/.scion/trigger-event.json, <= 16 KiB; nil in Stage 1
+
+	// Secrets supplies optional create-time agent-scoped secrets (behind
+	// hub.agent_secrets), stored after commit and before dispatch.
+	// Future producers must not persist secret values in schedule or trigger payloads.
+	Secrets []AgentSecretInput
 
 	Detached      bool
 	NotifyBlocked func(ctx context.Context, existing *store.Agent, placementRefused bool)
@@ -132,7 +170,7 @@ type headlessResolvedRole struct {
 func validateHeadlessEventEnv(env map[string]string) error {
 	for k, v := range env {
 		switch k {
-		case EventEnvKeyTriggerEventID, EventEnvKeyTriggerID:
+		case EventEnvKeyTriggerEventID, EventEnvKeyTriggerID, EventEnvKeyTriggerEventFile:
 		default:
 			return fmt.Errorf("%w: %q", errDisallowedHeadlessEventEnvKey, k)
 		}
@@ -278,11 +316,20 @@ func (s *Server) createAgentHeadless(ctx context.Context, hc HeadlessCreate) (*s
 	if hc.Identity == nil {
 		return nil, errors.New("headless create: missing creator identity")
 	}
+	if hc.resolvedRole == nil {
+		return nil, errHeadlessMissingResolvedRole
+	}
+	validatedSecrets, secErr := s.validateCreateAgentSecrets(hc.Secrets)
+	if secErr != nil {
+		return nil, secErr
+	}
 	if hc.Name == "" {
 		return nil, fmt.Errorf("dispatch_agent payload: agentName is required")
 	}
-	if hc.GitHubToken != "" {
-		return nil, errHeadlessGitHubTokenUnsupported
+	switch hc.GitHubToken {
+	case "", DispatchAgentGitHubTokenInstallation, DispatchAgentGitHubTokenUserPreferred:
+	default:
+		return nil, fmt.Errorf("%w: %q", errHeadlessInvalidGitHubToken, hc.GitHubToken)
 	}
 	templateName := hc.Template
 	if !templateRefAllowed(templateName) {
@@ -350,22 +397,9 @@ func (s *Server) createAgentHeadless(ctx context.Context, hc HeadlessCreate) (*s
 	if err != nil {
 		return nil, err
 	}
-	var (
-		preCapRole        AgentRole
-		roleExplicit      bool
-		parentMessageMode string
-	)
-	if hc.resolvedRole != nil {
-		preCapRole = hc.resolvedRole.preCapRole
-		roleExplicit = hc.resolvedRole.roleExplicit
-		parentMessageMode = hc.resolvedRole.parentMessageMode
-	} else {
-		preCapRole, roleExplicit, parentMessageMode, err = s.resolveHeadlessPreCapRole(
-			ctx, project, hc.Authority, hc.AgentRole, hc.NoAuth)
-		if err != nil {
-			return nil, fmt.Errorf("scheduled dispatch of agent %q: %w", slug, err)
-		}
-	}
+	preCapRole := hc.resolvedRole.preCapRole
+	roleExplicit := hc.resolvedRole.roleExplicit
+	parentMessageMode := hc.resolvedRole.parentMessageMode
 	fireID := hc.Authority.Recorded.FireID
 	childRole, cause, fits := childRoleWithinCeiling(
 		uatHopEffectCeiling(edgeProvenance.SourcePrincipalKind, edgeProvenance.SourcePrincipalID, edgeProvenance, edgeCeiling),
@@ -417,19 +451,21 @@ func (s *Server) createAgentHeadless(ctx context.Context, hc HeadlessCreate) (*s
 		return nil, fmt.Errorf("failed to check existing agent %q in project %q: %w", slug, hc.ProjectID, err)
 	}
 	if err == nil && existingAgent != nil {
-		slog.Warn("Scheduler: agent already exists, skipping dispatch_agent",
-			"eventID", fireID,
-			"agentName", slug,
-			"projectID", hc.ProjectID,
-			"existingPhase", existingAgent.Phase)
-		if existingAgent.Phase == string(state.PhaseError) {
-			placementRefused := s.isScheduleBlockedPlacementRefusal(ctx, existingAgent)
-			if hc.NotifyBlocked != nil {
-				hc.NotifyBlocked(ctx, existingAgent, placementRefused)
+		if hc.Authority.Recorded.DefinitionKind != hubfire.DefinitionKindTrigger {
+			slog.Warn("Scheduler: agent already exists, skipping dispatch_agent",
+				"eventID", fireID,
+				"agentName", slug,
+				"projectID", hc.ProjectID,
+				"existingPhase", existingAgent.Phase)
+			if existingAgent.Phase == string(state.PhaseError) {
+				placementRefused := s.isScheduleBlockedPlacementRefusal(ctx, existingAgent)
+				if hc.NotifyBlocked != nil {
+					hc.NotifyBlocked(ctx, existingAgent, placementRefused)
+				}
+				return nil, scheduleBlockedError(existingAgent, placementRefused)
 			}
-			return nil, scheduleBlockedError(existingAgent, placementRefused)
 		}
-		return nil, fmt.Errorf("agent %q already exists in project", slug)
+		return nil, &headlessAgentExistsError{slug: slug}
 	}
 
 	var clonedLabels map[string]string
@@ -467,6 +503,23 @@ func (s *Server) createAgentHeadless(ctx context.Context, hc HeadlessCreate) (*s
 		Branch: hc.Branch,
 		NoAuth: effectiveNoAuth,
 	}, creatorName, childRole)
+	pinResolvedCreateProfile(agent, project, scheduledBroker, false)
+	effectiveGitHubToken := hc.GitHubToken
+	parentUsesInst, err := s.parentAgentUsesInstallationGitHubToken(ctx, hc.Authority)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s: %w", errAgentCreatorUnreadable, hc.Authority.PrincipalID, err)
+	}
+	if parentUsesInst {
+		effectiveGitHubToken = DispatchAgentGitHubTokenInstallation
+	}
+	if effectiveGitHubToken != "" {
+		agent.AppliedConfig.GitHubTokenPreference = effectiveGitHubToken
+		if agent.AppliedConfig.CreateInputs != nil {
+			agent.AppliedConfig.CreateInputs.GitHubTokenPreference = effectiveGitHubToken
+		}
+	}
+
+	templateExplicit := templateName != ""
 
 	templateFromProjectDefault := false
 	if templateName == "" && project != nil && project.Annotations != nil {
@@ -508,7 +561,7 @@ func (s *Server) createAgentHeadless(ctx context.Context, hc HeadlessCreate) (*s
 	var tmpl *store.Template
 	if templateName != "" {
 		var tmplErr error
-		tmpl, tmplErr = s.resolveTemplate(ctx, templateName, hc.ProjectID)
+		tmpl, tmplErr = s.resolveTemplateForIdentity(ctx, creatorIdentity, templateName, hc.ProjectID)
 		// SECURITY-GATE (ptone/scion#1916): same gate as the agent-create
 		// HTTP path in handlers_agents_core.go — a resolved candidate is
 		// not known to be one the revision principal may read.
@@ -553,7 +606,7 @@ func (s *Server) createAgentHeadless(ctx context.Context, hc HeadlessCreate) (*s
 	} else if parentMessageMode != "" {
 		agent.MessageMode = parentMessageMode
 	} else {
-		agent.MessageMode = store.MessageModeProject
+		agent.MessageMode = s.defaultAgentMessageMode()
 	}
 	if agent.MessageMode == store.MessageModeHub {
 		if decision := s.AuthorizeMessageModeGrant(ctx, creatorIdentity, hc.ProjectID, agent.MessageMode); !decision.Allowed {
@@ -571,14 +624,46 @@ func (s *Server) createAgentHeadless(ctx context.Context, hc HeadlessCreate) (*s
 	}
 	stampAgentPersistence(agent, persistence, persistenceSource)
 
-	saOrigin, err := s.applyScheduledProjectDefaultGCPIdentity(
-		contextWithIdentity(ctx, creatorIdentity), agent, project)
-	if err != nil {
-		return nil, fmt.Errorf("scheduled dispatch of agent %q: %w", slug, err)
+	var saOrigin store.SAAssignmentOrigin
+	if s.willBeShellAgent(agent, project) {
+		// Execution containers (shell harness) never inherit project default
+		// GCP service accounts or Kubernetes default passthrough
+		// (ptone/scion#8812 §14).
+		forceShellGCPBlock(agent)
+	} else {
+		var err error
+		saOrigin, err = s.applyScheduledProjectDefaultGCPIdentity(
+			contextWithIdentity(ctx, creatorIdentity), agent, project)
+		if err != nil {
+			return nil, fmt.Errorf("scheduled dispatch of agent %q: %w", slug, err)
+		}
 	}
+
+	templateSuppliedShellHC := templateSuppliesShellHarnessConfig(tmpl, agent, project)
 
 	if err := s.deriveAgentConfig(ctx, agent, project, tmpl); err != nil {
 		return nil, fmt.Errorf("scheduled dispatch of agent %q: %w", slug, err)
+	}
+
+	// Shell execution container admission (ptone/scion#8812 §3.2, §3.4 S6, §7):
+	// enforce human-only creation (user/dev allowlist + user principal kind),
+	// hub.exec_containers flag, no initial task, and no templates on the
+	// headless dispatch_agent path as well as HTTP create.
+	if denial := s.checkShellAgentCreateAdmission(agent, shellAgentCreateOpts{
+		IsHumanPrincipal:        isHumanShellCreatePrincipal(hc.Identity, hc.Authority.PrincipalKind),
+		TemplateExplicit:        templateExplicit,
+		TemplateSuppliedShellHC: templateSuppliedShellHC,
+	}); denial != nil {
+		return nil, fmt.Errorf("scheduled dispatch of agent %q: %w", slug, denial)
+	}
+
+	// Post-derivation GCP identity override (ptone/scion#8812 §14): after
+	// deriveAgentConfig has resolved every harness-config tier, discard any
+	// defaulted GCP identity on an execution container and force explicit
+	// "block".
+	if isShellAgent(agent) {
+		forceShellGCPBlock(agent)
+		saOrigin = ""
 	}
 
 	// Inject allow-listed event data environment variables after deriveAgentConfig
@@ -592,6 +677,16 @@ func (s *Server) createAgentHeadless(ctx context.Context, hc HeadlessCreate) (*s
 		}
 	}
 
+	// Mark create-time HomeFiles as pending before committing the agent row so
+	// no concurrent manual start can launch the agent without its event file
+	// before our create dispatch delivers it (P1c-1 O-C / sec L2).
+	if len(hc.EventFile) > 0 {
+		if agent.AppliedConfig.CreateInputs == nil {
+			agent.AppliedConfig.CreateInputs = &store.AgentCreateInputs{}
+		}
+		agent.AppliedConfig.CreateInputs.HomeFilesPending = true
+	}
+
 	agent.LaunchAsyncOptIn = true
 
 	scheduledDispatchAudit := &store.MutationAuditRecord{
@@ -599,12 +694,27 @@ func (s *Server) createAgentHeadless(ctx context.Context, hc HeadlessCreate) (*s
 		ActorPrincipalKind: creatorIdentity.Type(),
 		ActorPrincipalID:   creatorIdentity.ID(),
 		CanDelegateResult:  "allow",
+		AfterSummary:       createAuditAfterSummaryWithSecrets(validatedSecrets),
+	}
+	if effectiveGitHubToken != "" {
+		if summaryBytes, mErr := json.Marshal(map[string]string{
+			"github_token_preference": effectiveGitHubToken,
+		}); mErr == nil {
+			scheduledDispatchAudit.AfterSummary = string(summaryBytes)
+		}
 	}
 	initiator := s.scheduledInitiator(hc.Authority.Recorded.Attribution)
 	if initiatorMatchesExecutor(initiator, creatorIdentity) {
 		if hubKind := hubCredentialKindForInitiator(initiator.CredentialKind); hubKind != "" {
 			scheduledDispatchAudit.ActorCredentialType = hubKind
 			scheduledDispatchAudit.ActorCredentialID = initiator.CredentialID
+		}
+	}
+
+	var onCommitTx func(ctx context.Context, tx store.Store) error
+	if hc.OnCommitTx != nil {
+		onCommitTx = func(ctx context.Context, tx store.Store) error {
+			return hc.OnCommitTx(ctx, tx, agent.ID)
 		}
 	}
 
@@ -622,10 +732,14 @@ func (s *Server) createAgentHeadless(ctx context.Context, hc HeadlessCreate) (*s
 			Role:          agent.AppliedConfig.AgentRole,
 			Active:        true,
 		},
-		Audit:    scheduledDispatchAudit,
-		SAOrigin: saOrigin,
+		Audit:      scheduledDispatchAudit,
+		SAOrigin:   saOrigin,
+		OnCommitTx: onCommitTx,
 	}); err != nil {
 		return nil, fmt.Errorf("failed to create agent %q: %w", slug, err)
+	}
+	if hc.OnCommitted != nil {
+		hc.OnCommitted(agent.ID)
 	}
 
 	rollback := func(rb createRollback) error {
@@ -644,9 +758,35 @@ func (s *Server) createAgentHeadless(ctx context.Context, hc HeadlessCreate) (*s
 		return fmt.Errorf("failed to dispatch agent %q: %w", slug, rb.Cause)
 	}
 
+	if len(validatedSecrets) > 0 {
+		if err := s.storeCreateAgentSecrets(ctx, agent, validatedSecrets, headlessSecretCreatorAttribution(hc.Authority), true); err != nil {
+			if errors.Is(err, errAgentDeletedDuringSecretWrite) {
+				return nil, fmt.Errorf("scheduled dispatch of agent %q: %w", slug, errScheduledChildDeletedDuringCreate)
+			}
+			slog.ErrorContext(ctx, "headless agent create: failed to store create-time agent secrets; rolling back agent",
+				"agent_id", agent.ID, "error", err)
+			if rbErr := rollback(createRollback{Stage: createStageSecrets, Cause: err}); rbErr != nil {
+				return nil, fmt.Errorf("%s: %w", createAgentSecretsStoreFailedMessage, rbErr)
+			}
+			return nil, fmt.Errorf("%s: %w", createAgentSecretsStoreFailedMessage, err)
+		}
+	}
+
 	dispatchExecutor, _ := ExecutorContextFromContext(ctx)
 	dispatcher := s.GetDispatcher()
 	if dispatcher == nil {
+		if len(hc.EventFile) > 0 {
+			slog.Error("Scheduler: no dispatcher available for homeFiles create; rolling back",
+				"eventID", fireID,
+				"agent_id", agent.ID,
+				"agentName", agent.Name,
+				"executor_kind", dispatchExecutor.Kind,
+				"executor_id", dispatchExecutor.ID)
+			return nil, rollback(createRollback{
+				Stage: createStageDispatch,
+				Cause: errHeadlessNoDispatcherForHomeFiles,
+			})
+		}
 		slog.Warn("Scheduler: no dispatcher available, agent created but not started",
 			"eventID", fireID,
 			"agent_id", agent.ID,
@@ -664,7 +804,12 @@ func (s *Server) createAgentHeadless(ctx context.Context, hc HeadlessCreate) (*s
 				Content: hc.EventFile,
 			}})
 		}
-		return dispatcher.DispatchAgentCreateWithGather(ctx, agent)
+		res, derr := dispatcher.DispatchAgentCreateWithGather(ctx, agent)
+		if derr == nil && len(hc.EventFile) > 0 && res.AcceptedLaunch() == nil &&
+			(res == nil || res.EnvRequirements() == nil || len(res.EnvRequirements().Needs) == 0) {
+			s.clearAgentHomeFilesPending(ctx, agent)
+		}
+		return res, derr
 	})
 	var missingNeeds []string
 	var homeFilesMissing *homeFilesEnvGatherDeferredError
@@ -674,11 +819,19 @@ func (s *Server) createAgentHeadless(ctx context.Context, hc HeadlessCreate) (*s
 	}
 	var held *store.ClaimHeldError
 	if errors.As(err, &held) {
+		if len(hc.EventFile) > 0 {
+			slog.Warn("Scheduler: start claim held during homeFiles create; rolling back pending agent",
+				"eventID", fireID, "agent_id", agent.ID, "holder", string(held.Kind))
+			return nil, rollback(createRollback{Stage: createStageRunIntent, Cause: err})
+		}
 		slog.Info("Scheduler: agent already starting; event skipped",
 			"eventID", fireID, "agent_id", agent.ID, "holder", string(held.Kind))
 		return agent, nil
 	}
 	if errors.Is(err, ErrLaunchInvalidPhase) {
+		if len(hc.EventFile) > 0 {
+			return nil, rollback(createRollback{Stage: createStageDispatch, Cause: err})
+		}
 		return nil, fmt.Errorf("failed to dispatch agent %q: %w", slug, err)
 	}
 	if errors.Is(err, errStartClaimWrite) {
@@ -686,6 +839,9 @@ func (s *Server) createAgentHeadless(ctx context.Context, hc HeadlessCreate) (*s
 	}
 	if err != nil && !errors.Is(err, store.ErrDeleteInProgress) &&
 		(errors.Is(err, errStartingWrite) || errors.Is(err, store.ErrClaimPredicate) || errors.Is(err, errStartClaimLost)) {
+		if len(hc.EventFile) > 0 {
+			return nil, rollback(createRollback{Stage: createStageRunIntent, Cause: err})
+		}
 		return nil, fmt.Errorf("failed to dispatch agent %q: %w", slug, err)
 	}
 	if err != nil {
@@ -753,6 +909,15 @@ func (s *Server) createAgentHeadless(ctx context.Context, hc HeadlessCreate) (*s
 		}
 	} else if !s.scheduledChildLive(ctx, agent) {
 		return nil, fmt.Errorf("scheduled dispatch of agent %q: %w", slug, errScheduledChildDeletedDuringCreate)
+	} else if !s.preserveTerminalPhase(ctx, agent) {
+		// Persist the broker's synchronous create echo (including the
+		// resolved Profile recorded by store.ApplyBrokerAgentConfig) so
+		// subsequent starts and reincarnations read it from the store
+		// (ptone/scion#5149).
+		if err := s.updateAgentAfterDispatch(ctx, agent); err != nil {
+			slog.Warn("Scheduler: failed to persist agent after dispatch",
+				"eventID", fireID, "agent_id", agent.ID, "error", err)
+		}
 	}
 
 	slog.Info("Scheduler: agent dispatched successfully",

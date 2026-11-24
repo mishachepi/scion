@@ -162,7 +162,6 @@ func TestReincarnateAgent_RejectsUnsupportedOverrides(t *testing.T) {
 // re-registration.
 func TestBrokerHeartbeat_RefreshesCapabilities(t *testing.T) {
 	srv, s := testServer(t)
-	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	broker := &store.RuntimeBroker{
@@ -196,7 +195,6 @@ func TestBrokerHeartbeat_RefreshesCapabilities(t *testing.T) {
 // the field is a "refresh if present" signal, not a full replace.
 func TestBrokerHeartbeat_NoCapabilities_LeavesStoredCapabilitiesUntouched(t *testing.T) {
 	srv, s := testServer(t)
-	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	broker := &store.RuntimeBroker{
@@ -1439,7 +1437,7 @@ func TestReincarnateAgent_RowEnvMatchesFreshConfigAfterReprovision(t *testing.T)
 	assert.Equal(t, fresh.Env, final.AppliedConfig.Env, "the row's env must equal the fresh derivation's env")
 	assert.NotContains(t, final.AppliedConfig.Env, "STORED_VAR")
 	assert.NotContains(t, final.AppliedConfig.Env, "RESOLVED_VAR")
-	assert.Equal(t, KeyDiff{}, computeReincarnationPlan(final.AppliedConfig, fresh, nil, "").EnvKeys, "the next plan must show no env change")
+	assert.Equal(t, KeyDiff{}, computeReincarnationPlan(final.AppliedConfig, fresh, nil, planImageContext{SameBroker: true}).EnvKeys, "the next plan must show no env change")
 }
 
 // imageRegistryPlan runs a dry-run reincarnate against an agent whose image
@@ -1770,12 +1768,15 @@ func TestCopyBrokerEcho_MirrorsApplyBrokerAgentConfig(t *testing.T) {
 	base := store.AgentAppliedConfig{
 		Image: "ghcr.io/test-org/base:v1", HarnessConfig: "base-hc", HarnessAuth: "base-auth",
 		Profile: "base-profile", Model: "base-model", Task: "base-task",
+		CreateInputs: &store.AgentCreateInputs{},
 	}
 	echoed := base
+	echoed.CreateInputs = &store.AgentCreateInputs{}
 	applyBrokerAgentConfig(&store.Agent{AppliedConfig: &echoed}, info)
 	require.NotEqual(t, base, echoed, "the populated broker answer must change the config")
 
 	dst := base
+	dst.CreateInputs = &store.AgentCreateInputs{}
 	copyBrokerEcho(&dst, &echoed, true)
 	assert.Equal(t, echoed, dst, "copyBrokerEcho must copy every AppliedConfig field applyBrokerAgentConfig writes")
 }
@@ -2498,8 +2499,8 @@ func TestBuildReincarnationPreamble_A26StepsAndNoHandoff(t *testing.T) {
 			" 1. Verify your environment: `git status` shows the branch and state your handoff describes, and any files your handoff names as canonical are readable.\n",
 			"step 1 must keep A23's neutral wording regardless of workspace mode")
 		assert.Contains(t, preamble,
-			fmt.Sprintf(" 3. Message %s that generation %d is up, and state your next action.\n", requesterHandle, toGeneration),
-			"step 3 (§3.9, A26.1) must name both the resolved requester and the target generation")
+			fmt.Sprintf(" 3. Unless your handoff's \"Immediate active work\" section says otherwise, message %s that generation %d is up, and state your next action.\n", requesterHandle, toGeneration),
+			"step 3 (§3.9, A26.1) must name both the resolved requester and the target generation and defer to the handoff")
 		assert.Contains(t, preamble,
 			" 4. Continue from the handoff's \"Immediate active work\" section below (its next action). Do not redo anything listed under \"Do not redo\".\n",
 			"step 4 (§3.9, come in per A26) must point at the handoff template's real section headings")
@@ -2549,8 +2550,8 @@ func TestBuildReincarnationPreamble_A262_SelfRequest(t *testing.T) {
 			`You are generation 3 of agent "self-agt" (id agent-self), reincarnated at its own request.`,
 			"the header must say the migration was self-requested, never name a requester handle")
 		assert.Contains(t, preamble,
-			` 3. Message the owner named in your handoff's "Authority and ownership" section that generation 3 is up, and state your next action. If the handoff names none, message user:owner@example.com.`,
-			"step 3 must point at the handoff, then give the resolved creator hint as its own sentence (A26.3 N2)")
+			` 3. Unless your handoff's "Immediate active work" section says otherwise, message the owner named in your handoff's "Authority and ownership" section that generation 3 is up, and state your next action. If the handoff names none, message user:owner@example.com.`,
+			"step 3 must defer to the handoff, point at Authority and ownership, then give the resolved creator hint as its own sentence (A26.3 N2)")
 		assert.NotContains(t, preamble, "agent:"+agent.Slug,
 			"the preamble must never emit the agent's own handle (A26.2 R1)")
 	})
@@ -2562,7 +2563,7 @@ func TestBuildReincarnationPreamble_A262_SelfRequest(t *testing.T) {
 		assert.Contains(t, preamble,
 			`You are generation 3 of agent "self-agt" (id agent-self), reincarnated at its own request.`)
 		assert.Contains(t, preamble,
-			` 3. Message the owner named in your handoff's "Authority and ownership" section that generation 3 is up, and state your next action.`+"\n",
+			` 3. Unless your handoff's "Immediate active work" section says otherwise, message the owner named in your handoff's "Authority and ownership" section that generation 3 is up, and state your next action.`+"\n",
 			"with no creator hint, step 3 must end right after the handoff-driven instruction, no parenthetical")
 		assert.NotContains(t, preamble, "If the handoff names none",
 			"no creator hint means no fallback clause at all")
@@ -2589,8 +2590,57 @@ func TestBuildReincarnationPreamble_A262_UnresolvedRequester(t *testing.T) {
 	assert.NotContains(t, preamble, "on request of",
 		"no tautological fallback clause in the header")
 	assert.Contains(t, preamble,
-		" 3. Message whoever requested this migration that generation 5 is up, and state your next action.\n",
-		"step 3 still keeps the generic fallback phrase so there is some instruction")
+		" 3. Unless your handoff's \"Immediate active work\" section says otherwise, message whoever requested this migration that generation 5 is up, and state your next action.\n",
+		"step 3 still keeps the generic fallback phrase while deferring to the handoff")
+}
+
+// TestBuildReincarnationPreamble_Step3DefersToHandoff verifies that across all
+// requester branches, step 3 defers to the handoff's "Immediate active work"
+// section so a handoff instructing the new generation to stay idle or quiet
+// does not conflict with an unconditional "Message ..." instruction
+// (ptone/scion#8830).
+func TestBuildReincarnationPreamble_Step3DefersToHandoff(t *testing.T) {
+	srv, _ := testServer(t)
+	start := time.Date(2026, 9, 29, 8, 0, 0, 0, time.UTC)
+	agent := &store.Agent{ID: "agent-idle", Slug: "idle-agt"}
+	idleHandoff := "## Immediate active work (status, next action)\nStay idle and quiet; do not message anyone until prompted."
+
+	cases := []struct {
+		name      string
+		requester reincarnationRequesterContext
+		wantStep3 string
+	}{
+		{
+			name:      "self with resolved creator",
+			requester: reincarnationRequesterContext{IsSelf: true, CreatorHandle: "user:owner@example.com", CreatorResolved: true},
+			wantStep3: ` 3. Unless your handoff's "Immediate active work" section says otherwise, message the owner named in your handoff's "Authority and ownership" section that generation 2 is up, and state your next action. If the handoff names none, message user:owner@example.com.` + "\n",
+		},
+		{
+			name:      "self without resolved creator",
+			requester: reincarnationRequesterContext{IsSelf: true},
+			wantStep3: ` 3. Unless your handoff's "Immediate active work" section says otherwise, message the owner named in your handoff's "Authority and ownership" section that generation 2 is up, and state your next action.` + "\n",
+		},
+		{
+			name:      "resolved requester",
+			requester: reincarnationRequesterContext{Handle: "user:requester@example.com", Resolved: true},
+			wantStep3: ` 3. Unless your handoff's "Immediate active work" section says otherwise, message user:requester@example.com that generation 2 is up, and state your next action.` + "\n",
+		},
+		{
+			name:      "unresolved requester fallback",
+			requester: reincarnationRequesterContext{},
+			wantStep3: ` 3. Unless your handoff's "Immediate active work" section says otherwise, message whoever requested this migration that generation 2 is up, and state your next action.` + "\n",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			preamble := srv.buildReincarnationPreamble(agent, 2, idleHandoff, start, tc.requester, nil)
+			assert.Contains(t, preamble, tc.wantStep3)
+			assert.NotContains(t, preamble, " 3. Message ",
+				"step 3 must not emit an unconditional Message instruction")
+			assert.Contains(t, preamble, idleHandoff)
+		})
+	}
 }
 
 // TestReincarnationChangesLine is the design Amendment A26.3 FYI-1 test for
@@ -3566,7 +3616,7 @@ func TestReincarnateAgent_AC6_NonCreatorRequesterGetsNotifiedOnFailure(t *testin
 	// AppliedConfig.Task still holds the fresh preamble (design §3.4
 	// Amendment A4.3).
 	assert.Contains(t, final.AppliedConfig.Task,
-		fmt.Sprintf("Message agent:%s that generation", coordinator.Slug),
+		fmt.Sprintf("message agent:%s that generation", coordinator.Slug),
 		"the resolved requester handle must reach the dispatched preamble text")
 
 	require.Eventually(t, func() bool {
@@ -3604,7 +3654,7 @@ func TestReincarnateAgent_SelfRequest_PreambleNeverEmitsOwnHandle(t *testing.T) 
 	task := final.AppliedConfig.Task
 	assert.Contains(t, task, "reincarnated at its own request",
 		"a self-migration's header must say so, not name a requester")
-	assert.Contains(t, task, `Message the owner named in your handoff's "Authority and ownership" section`,
+	assert.Contains(t, task, `message the owner named in your handoff's "Authority and ownership" section`,
 		"step 3 must point at the handoff, not the agent's own identity")
 	assert.NotContains(t, task, "agent:"+agent.Slug,
 		"the preamble must never tell the new generation to message its own handle (A26.2 R1)")
@@ -4293,7 +4343,6 @@ type notificationRace struct {
 func newNotificationRace(t *testing.T, disp AgentDispatcher) *notificationRace {
 	t.Helper()
 	srv, s, project, broker := setupReincarnateTestServer(t, disp)
-	grantDevUserRuntimeBrokerAccess(t, s)
 
 	pub := NewChannelEventPublisher()
 	srv.SetEventPublisher(pub)
@@ -5699,9 +5748,12 @@ func TestReincarnateAgent_AC2b_Matrix_CreateAndReincarnateAgree(t *testing.T) {
 			// does not appear anywhere else in this test, so a passing
 			// assertion below can only mean the value was re-derived, not
 			// coincidentally inherited. CreateInputs is left untouched —
-			// it's the real one create persisted. ---
+			// it's the real one create persisted.
+			// HarnessConfig is NOT staled: plain reincarnate pins the live
+			// HarnessConfig when CreateInputs.HarnessConfig is empty so a
+			// changed default cannot implicitly switch an agent's harness
+			// (ptone/scion#7918). ---
 			staleThinking := 99
-			created.AppliedConfig.HarnessConfig = "stale-hc-from-old-generation"
 			created.AppliedConfig.HarnessAuth = "stale-auth"
 			created.AppliedConfig.NoAuth = false
 			created.AppliedConfig.Model = "stale-model"

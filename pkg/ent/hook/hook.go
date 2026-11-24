@@ -201,6 +201,18 @@ func (f AgentSessionMetricsFunc) Mutate(ctx context.Context, m ent.Mutation) (en
 	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.AgentSessionMetricsMutation", m)
 }
 
+// The AgentSuspendScreenFunc type is an adapter to allow the use of ordinary
+// function as AgentSuspendScreen mutator.
+type AgentSuspendScreenFunc func(context.Context, *ent.AgentSuspendScreenMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f AgentSuspendScreenFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.AgentSuspendScreenMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.AgentSuspendScreenMutation", m)
+}
+
 // The AllowListEntryFunc type is an adapter to allow the use of ordinary
 // function as AllowListEntry mutator.
 type AllowListEntryFunc func(context.Context, *ent.AllowListEntryMutation) (ent.Value, error)
@@ -475,6 +487,18 @@ func (f EnvVarFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, erro
 		return f(ctx, mv)
 	}
 	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.EnvVarMutation", m)
+}
+
+// The ExecRunOutputFunc type is an adapter to allow the use of ordinary
+// function as ExecRunOutput mutator.
+type ExecRunOutputFunc func(context.Context, *ent.ExecRunOutputMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f ExecRunOutputFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.ExecRunOutputMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.ExecRunOutputMutation", m)
 }
 
 // The ExternalIdentityFunc type is an adapter to allow the use of ordinary
@@ -1041,6 +1065,18 @@ func (f SecretFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, erro
 	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.SecretMutation", m)
 }
 
+// The SecretRequestFunc type is an adapter to allow the use of ordinary
+// function as SecretRequest mutator.
+type SecretRequestFunc func(context.Context, *ent.SecretRequestMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f SecretRequestFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.SecretRequestMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.SecretRequestMutation", m)
+}
+
 // The SkillFunc type is an adapter to allow the use of ordinary
 // function as Skill mutator.
 type SkillFunc func(context.Context, *ent.SkillMutation) (ent.Value, error)
@@ -1221,6 +1257,18 @@ func (f TriggerFireFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value,
 	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.TriggerFireMutation", m)
 }
 
+// The TriggerSubjectClaimFunc type is an adapter to allow the use of ordinary
+// function as TriggerSubjectClaim mutator.
+type TriggerSubjectClaimFunc func(context.Context, *ent.TriggerSubjectClaimMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f TriggerSubjectClaimFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.TriggerSubjectClaimMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.TriggerSubjectClaimMutation", m)
+}
+
 // The UsageReservationFunc type is an adapter to allow the use of ordinary
 // function as UsageReservation mutator.
 type UsageReservationFunc func(context.Context, *ent.UsageReservationMutation) (ent.Value, error)
@@ -1279,6 +1327,18 @@ func (f UserDeletionAgentFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.
 		return f(ctx, mv)
 	}
 	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.UserDeletionAgentMutation", m)
+}
+
+// The UserExecContainerFunc type is an adapter to allow the use of ordinary
+// function as UserExecContainer mutator.
+type UserExecContainerFunc func(context.Context, *ent.UserExecContainerMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f UserExecContainerFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.UserExecContainerMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.UserExecContainerMutation", m)
 }
 
 // The UserTerminalWorkspaceFunc type is an adapter to allow the use of ordinary

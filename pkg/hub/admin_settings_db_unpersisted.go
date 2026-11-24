@@ -23,8 +23,6 @@ import (
 	"reflect"
 	"sort"
 	"strings"
-
-	"github.com/GoogleCloudPlatform/scion/pkg/config"
 )
 
 // The DB-backed server-config PUT must never answer 200 "saved" for a key it
@@ -79,6 +77,10 @@ var dbFileOnlyRequestPaths = [][]string{
 	{"server", "hub", "chat"},
 	// System One rule evaluation ceiling (ptone/scion#8044): Layer 0, read at startup.
 	{"server", "hub", "system_one"},
+	// Recurring schedule limits: Layer 0, read at startup.
+	{"server", "hub", "schedules"},
+	// Default message mode of new agents: Layer 0, read at startup.
+	{"server", "hub", "default_message_mode"},
 	{"server", "hub", "disable_legacy_storage_fallback"},
 	{"server", "relay"},
 	// server.keyring_file is never API-writable: rejectGateProtectedSettingsKeys
@@ -91,6 +93,8 @@ var dbFileOnlyRequestPaths = [][]string{
 	{"server", "trusted_proxies"},
 	// Likewise server.hub.internal_url (never API-writable; ptone/scion#555).
 	{"server", "hub", "internal_url"},
+	// Likewise server.hub.allowed_import_sources (never API-writable; ptone/scion#8651).
+	{"server", "hub", "allowed_import_sources"},
 	{"server", "auth", "username"},
 	{"server", "auth", "display_name"},
 	{"server", "auth", "email"},
@@ -168,16 +172,15 @@ func (s *Server) rejectUnpersistedKeys(ctx context.Context, w http.ResponseWrite
 // the ServerConfigUpdateRequest decode would drop, unless that key is a
 // no-op echo of the file-mode GET view. It runs before settings.yaml is
 // read for the merge, so a rejected request writes nothing. done is true
-// if the response has been written. startup is passed to the GET view
-// (buildServerConfigFileResponse).
-func rejectUnknownFileConfigKeys(w http.ResponseWriter, rawBody []byte, startup *config.V1ServerConfig) (done bool) {
+// if the response has been written.
+func (s *Server) rejectUnknownFileConfigKeys(ctx context.Context, w http.ResponseWriter, rawBody []byte) (done bool) {
 	var top map[string]json.RawMessage
 	if err := json.Unmarshal(rawBody, &top); err != nil {
 		return false
 	}
 	candidates := unknownSettingsKeys(top, reflect.TypeOf(ServerConfigUpdateRequest{}), reflect.TypeOf(ServerConfigResponse{}))
 	rejected, err := rejectedSettingsKeys(candidates, func() (map[string]any, error) {
-		return serverConfigFileView(startup)
+		return s.serverConfigFileView(ctx)
 	})
 	if err != nil {
 		slog.Error("PUT server-config: failed to build GET view for echo check", "error", err)
@@ -242,11 +245,12 @@ func writeUnpersistedKeysRejected(w http.ResponseWriter, rejected []string) {
 
 // serverConfigFileView returns the file-mode GET /api/v1/admin/server-config
 // body as a generic JSON value, the reference for echo detection.
-func serverConfigFileView(startup *config.V1ServerConfig) (map[string]any, error) {
-	resp, err := buildServerConfigFileResponse(startup)
+func (s *Server) serverConfigFileView(ctx context.Context) (map[string]any, error) {
+	resp, err := buildServerConfigFileResponse(s.config.StartupServerSettings)
 	if err != nil {
 		return nil, err
 	}
+	s.populateDefaultUserRoleView(ctx, resp)
 	return toJSONView(resp)
 }
 

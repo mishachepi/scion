@@ -26,7 +26,6 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
-	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/systemone/metrics"
 	"github.com/GoogleCloudPlatform/scion/pkg/systemone/provider"
 	systemoneruntime "github.com/GoogleCloudPlatform/scion/pkg/systemone/runtime"
@@ -63,7 +62,7 @@ func TestSystemOne_CreateListGetDelete(t *testing.T) {
 				Adapter:  req.Adapter,
 				Model:    req.Model,
 				Endpoint: "https://api.typesafe.ai",
-				Auth: store.SystemOneInstanceAuth{
+				Auth: SystemOneInstanceAuthDTO{
 					Kind:       "api_key",
 					SecretName: "systemone.instance.inst-123",
 				},
@@ -87,7 +86,7 @@ func TestSystemOne_CreateListGetDelete(t *testing.T) {
 						Adapter:  q.Get("adapter"),
 						Model:    "jev-1.14.0",
 						Endpoint: "https://api.typesafe.ai",
-						Auth:     store.SystemOneInstanceAuth{Kind: "api_key", SecretName: "systemone.instance.inst-123"},
+						Auth:     SystemOneInstanceAuthDTO{Kind: "api_key", SecretName: "systemone.instance.inst-123"},
 						Enabled:  q.Get("enabled") != "false",
 						Revision: 1,
 					},
@@ -109,7 +108,7 @@ func TestSystemOne_CreateListGetDelete(t *testing.T) {
 				Adapter:   "typesafe",
 				Model:     "jev-1.14.0",
 				Endpoint:  "https://api.typesafe.ai",
-				Auth:      store.SystemOneInstanceAuth{Kind: "api_key", SecretName: "systemone.instance.inst-123"},
+				Auth:      SystemOneInstanceAuthDTO{Kind: "api_key", SecretName: "systemone.instance.inst-123"},
 				Enabled:   true,
 				Revision:  2,
 				CreatedAt: now,
@@ -289,6 +288,47 @@ func TestSystemOne_ProbeModelsAndSpec(t *testing.T) {
 	assert.Equal(t, "jev-1.14-prod-20261001", evalResp.Evaluation.ResolvedModel)
 	assert.True(t, evalResp.Evaluation.HasModelAliasReported())
 	assert.InDelta(t, 0.91, evalResp.Evaluation.Answers["q1"].NativeMetrics["typesafe.confidence"].Value, 1e-6)
+}
+
+func TestSystemOne_ListAdapters(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/admin/system-one/adapters", func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ListSystemOneAdaptersResponse{
+			Adapters: []SystemOneAdapterCapability{
+				{
+					ID:              "gemini_decisions",
+					Version:         "0.1.0",
+					DisplayName:     "Gemini Decisions",
+					DefaultEndpoint: "https://generativelanguage.googleapis.com",
+					ModelRequired:   true,
+					AuthModes: []SystemOneAdapterAuthMode{
+						{Mode: "owned_api_key", AuthKind: "api_key", TransportScheme: "header:x-goog-api-key", CustomEndpointAllowed: true},
+						{Mode: "secret_ref", AuthKind: "api_key", TransportScheme: "header:x-goog-api-key", CustomEndpointAllowed: false},
+						{Mode: "google_access_token", AuthKind: "google_access_token", TransportScheme: "google_access_token", CustomEndpointAllowed: false, ScopesRequired: true},
+					},
+					AllowedSecretNames:  []string{"GEMINI_API_KEY", "GEMINI_ALT_KEY"},
+					DefaultSecretName:   "GEMINI_API_KEY",
+					AllowedSecretScopes: []string{"hub", "project", "project_or_hub"},
+					DefaultSecretScope:  "project_or_hub",
+				},
+			},
+		})
+	})
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c, err := New(srv.URL)
+	require.NoError(t, err)
+
+	resp, err := c.SystemOne().ListAdapters(context.Background())
+	require.NoError(t, err)
+	require.Len(t, resp.Adapters, 1)
+	assert.Equal(t, "gemini_decisions", resp.Adapters[0].ID)
+	assert.Equal(t, []string{"GEMINI_API_KEY", "GEMINI_ALT_KEY"}, resp.Adapters[0].AllowedSecretNames)
+	assert.Equal(t, "project_or_hub", resp.Adapters[0].DefaultSecretScope)
 }
 
 func TestSystemOne_WritesDoNotRetry(t *testing.T) {

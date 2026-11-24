@@ -46,6 +46,24 @@ const actionProjectSecretRead Action = Action("secret_read")
 // production. It is accepted as a possibly-nil parameter only so this
 // function can be unit-tested directly.
 func (s *Server) materialRuntimePrecheck(ctx context.Context, ident AgentIdentity) (*TargetFacts, string, int) {
+	return s.materialRuntimePrecheckOpts(ctx, ident, true)
+}
+
+// materialRuntimePrecheckOpts is materialRuntimePrecheck with an option to
+// defer check 4 (ScopeProjectSecretRead) to project/user scope branches so
+// an agent can read its own agent-scoped secrets without holding
+// project:secret:read (ptone/scion#8742). Viewer-only roots remain refused.
+func (s *Server) materialRuntimePrecheckOpts(ctx context.Context, ident AgentIdentity, requireProjectReadScope bool) (*TargetFacts, string, int) {
+	return s.materialRuntimePrecheckAllowViewer(ctx, ident, requireProjectReadScope, false)
+}
+
+// materialRuntimePrecheckAllowViewer is materialRuntimePrecheckOpts with an
+// option to admit a root user whose only project membership is the built-in
+// project-viewer role, for user-scope allowProgeny secret reads and lists only
+// (ptone/scion#8875). When admission succeeds solely via project-viewer, the
+// returned TargetFacts has RootViewerOnly set so non-user scopes (project and
+// agent) still refuse.
+func (s *Server) materialRuntimePrecheckAllowViewer(ctx context.Context, ident AgentIdentity, requireProjectReadScope, allowViewerRoot bool) (*TargetFacts, string, int) {
 	if ident == nil {
 		return nil, ReasonTargetUnresolved, http.StatusForbidden
 	}
@@ -95,8 +113,10 @@ func (s *Server) materialRuntimePrecheck(ctx context.Context, ident AgentIdentit
 		return nil, ReasonTargetUnresolved, http.StatusForbidden
 	}
 
-	// Check 4: credential capability.
-	if !ident.HasScope(ScopeProjectSecretRead) {
+	// Check 4: credential capability. Agent-scope reads do not require
+	// ScopeProjectSecretRead; when requireProjectReadScope is false, project
+	// and user branches still enforce it per-scope.
+	if requireProjectReadScope && !ident.HasScope(ScopeProjectSecretRead) {
 		return nil, ReasonCapabilityRequired, http.StatusForbidden
 	}
 
@@ -128,8 +148,13 @@ func (s *Server) materialRuntimePrecheck(ctx context.Context, ident AgentIdentit
 	if m.Err != nil {
 		return nil, ReasonBackendError, http.StatusInternalServerError
 	}
-	// The project-viewer role alone does not admit (ptone/scion#5519).
+	// The project-viewer role alone does not admit project-scope material
+	// (ptone/scion#5519). For user-scope allowProgeny reads and lists, a
+	// viewer-only root is admitted when allowViewerRoot is true and
+	// TargetFacts.RootViewerOnly records that non-user scopes must still refuse
+	// (ptone/scion#8875).
 	admitted := m.AdmitsBeyondViewer()
+	viewerOnly := false
 	if !admitted {
 		if s.authzService == nil {
 			return nil, ReasonBackendError, http.StatusInternalServerError
@@ -147,6 +172,16 @@ func (s *Server) materialRuntimePrecheck(ctx context.Context, ident AgentIdentit
 			return nil, ReasonBackendError, http.StatusInternalServerError
 		}
 		admitted = ok
+	}
+	if !admitted && allowViewerRoot && m.IsMember && m.ViewerOnly {
+		caged, err := s.authzService.principalIsCagedTestAdmin(ctx, root.ID)
+		if err != nil {
+			return nil, ReasonBackendError, http.StatusInternalServerError
+		}
+		if !caged {
+			admitted = true
+			viewerOnly = true
+		}
 	}
 	if !admitted {
 		return nil, ReasonMembershipRequired, http.StatusForbidden
@@ -175,11 +210,12 @@ func (s *Server) materialRuntimePrecheck(ctx context.Context, ident AgentIdentit
 	}
 
 	return &TargetFacts{
-		Agent:     rec,
-		ProjectID: rec.ProjectID,
-		Ancestry:  rec.Ancestry,
-		Root:      root,
-		Project:   project,
+		Agent:          rec,
+		ProjectID:      rec.ProjectID,
+		Ancestry:       rec.Ancestry,
+		Root:           root,
+		Project:        project,
+		RootViewerOnly: viewerOnly,
 	}, ReasonAllowed, 0
 }
 
@@ -250,6 +286,36 @@ func (s *Server) authorizeRuntimeProjectItem(ctx context.Context, key string, fa
 	}
 	cand.Meta = *meta
 	return ItemResult{Candidate: cand, Allowed: true, Reason: ReasonAllowed}, ""
+}
+
+// authorizeRuntimeAgentItem is the per-item check for an agent's own
+// agent-scoped secret. It requires only that the secret exists at scope=agent
+// with scope_id == facts.Agent.ID and is not internal; it does not require
+// project:secret:read or project.secret_read.
+func (s *Server) authorizeRuntimeAgentItem(ctx context.Context, key string, facts *TargetFacts) ItemResult {
+	cand := Candidate{
+		Kind:    MaterialKindSecret,
+		Key:     key,
+		Scope:   store.ScopeAgent,
+		ScopeID: facts.Agent.ID,
+		Grant:   GrantAgentSelfRead,
+	}
+
+	meta, err := s.secretBackend.GetMeta(ctx, key, store.ScopeAgent, facts.Agent.ID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return ItemResult{Candidate: cand, Reason: ReasonNotFound}
+		}
+		return ItemResult{Candidate: cand, Reason: ReasonBackendError}
+	}
+	if meta == nil {
+		return ItemResult{Candidate: cand, Reason: ReasonBackendError}
+	}
+	if meta.SecretType == store.SecretTypeInternal {
+		return ItemResult{Candidate: cand, Reason: ReasonNotFound}
+	}
+	cand.Meta = *meta
+	return ItemResult{Candidate: cand, Allowed: true, Reason: ReasonAllowed}
 }
 
 // authorizeRuntimeUserItem is check 8, the per-item user-scope check.

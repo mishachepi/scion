@@ -117,6 +117,7 @@ func TestReimportSourceURL_InvalidOverrideRejected(t *testing.T) {
 
 func TestReimportSourceURL_ValidOverrideReimports(t *testing.T) {
 	srv, s := testInstallSourceServer(t)
+	setWorkstationImports(srv)
 	hc := installClaudeViaHub(t, srv, s, installPinnedClaudeURL)
 	src := claudeTarGzServer(t)
 	override := src.URL + "/configs/claude.tar.gz"
@@ -137,6 +138,7 @@ func TestReimportSourceURL_ValidOverrideReimports(t *testing.T) {
 
 func TestReimportSourceURL_OmittedOverrideUsesStoredURL(t *testing.T) {
 	srv, s := testInstallSourceServer(t)
+	setWorkstationImports(srv)
 	src := claudeTarGzServer(t)
 	stored := src.URL + "/configs/claude.tar.gz"
 	hc := installClaudeViaHub(t, srv, s, stored)
@@ -203,4 +205,12 @@ func TestValidReimportSourceURL(t *testing.T) {
 	}
 	// The shorthand allowance is reimport-only; finalize does not accept it.
 	assert.False(t, validRecordedSourceURL("github.com/myorg/scion-harnesses/tree/main/hermes"))
+}
+
+// TestReimportSourceURL_GCSOverride: a gs:// source, which an allowlist may
+// let a hosted Hub import from, passes the override and finalize validators.
+func TestReimportSourceURL_GCSOverride(t *testing.T) {
+	const src = "gs://team-bucket/harness-configs/claude"
+	assert.True(t, validRecordedSourceURL(src))
+	assert.True(t, validReimportSourceURL(src))
 }

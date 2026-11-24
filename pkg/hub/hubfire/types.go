@@ -63,8 +63,10 @@ type FireTracker interface {
 
 // FireTriggerRef identifies the trigger rule that initiated a FireEvent.
 type FireTriggerRef struct {
-	ID   string
-	Name string
+	ID          string
+	Name        string
+	SubjectMode string // "new" | "skip" (Stage 2 §5.3, §5.6)
+	FireSubject string // dispatcher-derived fire subject (subject_rule output or bounded event subject, Stage 1 §6.3 / Stage 2 §5.6)
 }
 
 // FireScheduleRef identifies the schedule and firing event for a schedule.fired
@@ -103,6 +105,7 @@ type FireRequest struct {
 	Event      *FireEvent
 	Executor   ExecutorContext
 	FireAt     time.Time // nominal fire/receipt time for staleness checks
+	Attempts   int       // 1-based delivery attempt count (>1 enables marker-based retry deduplication)
 	Tracked    FireTracker
 }
 
@@ -123,9 +126,10 @@ func (s FireStatus) String() string {
 
 // FireOutcome is the result returned by the fire core for a single FireRequest.
 type FireOutcome struct {
-	Status    FireStatus
-	Error     string // generic text for the history row; "" when fired
-	ResultRef string // message id, created agent id, or exec run id
+	Status        FireStatus
+	Error         string // generic text for the history row; "" when fired
+	ResultRef     string // message id, created agent id, or exec run id
+	TargetAgentID string // optional created/targeted agent UUID (trigger_fires.target_agent_id)
 	// AfterRecord runs after the caller has persisted the fire outcome.
 	AfterRecord func(ctx context.Context)
 	// Detached indicates that the action owns the fire's terminal outcome write

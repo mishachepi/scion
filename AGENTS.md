@@ -18,6 +18,8 @@ Alpha: changing or removing behavior needs no deprecation path.
 | Experimental features | `docs-site/src/content/docs/reference/experiments.md` |
 | Workspace or worktree provisioning | `docs-site/src/content/docs/local/workspace.md` ("Linked git projects") |
 | Building on another unmerged branch (stacked PRs) | `docs-repo/agents/stacked-branches.md` |
+| Adding or changing a user-visible runtime launch failure | `docs-repo/agents/typed-launch-failures.md` |
+| Live verification runs, or hosted/production-mode hardening that removes a workstation convenience | `docs-repo/agents/live-verification-gates.md` |
 
 ## Sandbox
 
@@ -37,7 +39,7 @@ Alpha: changing or removing behavior needs no deprecation path.
 - **Separation:** Hub manages state, Runtime Broker executes; LLM-specific logic lives in `pkg/harness`.
 - **Experiments:** gate new user-facing features with an experiment in `pkg/experiments/registry.go` and classify it in `pkg/hub/test_admin_policy.go`. Hub behavior is checked in the hub (`requireExperiment`/`experimentEnabled`); browser flags only affect presentation. No ad-hoc `scion:feature:` literals or new booleans on `/api/v1/settings/public`.
 - **Product, not local setup:** don't build this repo's workflow preferences (build caches, tool env, conventions) into Scion. Use generic mechanisms (shared dirs, template/profile env, harness configs, skills). Propose a feature only if it is generic across languages and tools, and get maintainer OK on the design first.
-- **Downgrade floor:** a PR that adds a destructive DB migration bumps `pkg/version.DowngradeFloor` to the first release that will contain it. Destructive means it drops a table or column, rewrites stored values into a form older binaries parse differently, or makes a change older binaries can't ignore (for example the drop block in `pkg/ent/entc/client.go`). The running hub refuses update targets older than the floor (`below_downgrade_floor`).
+- **Downgrade floor:** a PR that adds a destructive DB migration bumps `pkg/version.DowngradeFloor` to a `nightly-YYYYMMDD` tag for the first nightly that will contain it (never a preview/stable tag, which lacks an embedded date for cross-channel checks, and never dated later than the earliest preview or stable release containing the migration — nightlies cut at ~03:00 UTC). Destructive means it drops a table or column, rewrites stored values into a form older binaries parse differently, loosens a constraint (`NOT NULL` to nullable, or dropping a `CHECK`/`UNIQUE`) once new rows rely on it (older binaries re-tighten it on `entc.AutoMigrate`), or makes any other change older binaries can't ignore (for example the drop block in `pkg/ent/entc/client.go`). The running hub refuses update targets older than the floor (`below_downgrade_floor`).
 - **Terminology:** `project`, never `grove`, in new code (`project_id`, not `grove_id`). Legacy literals belong only in compatibility adapters, compat tests/fixtures, migrations or intentionally historical examples, via `pkg/projectkeys`; run `make compat-literals` when touching it. Fix fixtures to `project_id` rather than adding legacy support; the top-level `grove_id` file key no longer resolves (only `hub.grove_id` does).
 - **Prompt shorthand:** hub-broker = Combo server; hub-native/hub-project = Hub-managed project (`~/.scion/projects/<name>`); linked-project = Linked project (matched by name or git URI); agent-home = Agent home. Write the canonical term.
 
@@ -61,6 +63,7 @@ Mandatory while project-level template configuration overrides are in developmen
 
 - Pass the named harness configuration to `--harness` (alias for `--harness-config`) and the size alias to `--model`; never pass a model name or alias to `--harness` or `--harness-config`.
 - Applies only when creating or starting new agents from these four templates. Leave other templates unchanged, and do not restart or recreate existing agents solely to apply these overrides.
+- **Stall fallback:** if a worker launched with `--harness antigravity` makes no model progress for 20 minutes or more and a `continue` nudge does not recover it, the agent that started it may start the replacement with `--harness claude --model medium` without asking first, and reports the swap in the workstream. This covers only the harness and model choice: stopping or deleting the stalled agent and preserving its work follow the usual rules. It does not cover an agent that holds children, open human questions or a standing role.
 
 ```bash
 scion start <agent-name> -t developer --harness antigravity --model large \
@@ -131,3 +134,4 @@ That exact message is a tooling bug, not from the user: ignore it (you may say s
 
 - 2026-10-24 — старт модели: `mch` от `5c3f5b03` (база upstream `d1adb9a3`, 50 наших коммитов).
 - 2026-11-21 — `main` `de3bb238` (977 коммитов upstream) в ветку `sync/2026-11-21`; 27 конфликтов. Выброшено как покрытое upstream: режим `profileRequested` (теперь `profileCreate`), проверка resume по capabilities установленного harness-config, ветка CLI для `profile_unresolved`. Гейт и канарейка не пройдены, тесты `pkg/hub` не гонялись.
+- 2026-11-24 — `main` `a9908024` (378 коммитов upstream) в ветку `sync/2026-11-24`; 12 конфликтов. Выброшено как покрытое upstream: приоритет `SCION_HUB_ENDPOINT`/`SCION_HUB_URL` из env harness-config над CLI (upstream отклоняет `SCION_*` в env harness-config; адрес хаба для контейнеров задаётся `container_hub_endpoint` брокера).

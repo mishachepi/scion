@@ -124,6 +124,13 @@ func (h *HubHandler) Handle(event *hooks.Event) error {
 			err = h.client.ReportState(ctx, state.PhaseRunning, state.ActivityWorking, "Session restarted ("+source+")")
 			break
 		}
+		// Promptless start: StatusHandler ran first and kept initializing so
+		// sciontool init's readiness watcher can transition initializing ->
+		// idle once harness readiness settles. Do not report working here.
+		if readLocalActivity() == string(state.ActivityInitializing) {
+			log.Debug("Hub: Skipping working on session start (local activity still initializing)")
+			return nil
+		}
 		// New session - report running phase with working activity (clears any sticky)
 		log.Debug("Hub: Reporting running/working (session start)")
 		err = h.client.ReportState(ctx, state.PhaseRunning, state.ActivityWorking, "Session started")
@@ -240,20 +247,26 @@ func (h *HubHandler) Handle(event *hooks.Event) error {
 		if event.Name == hooks.EventAgentError {
 			return nil
 		}
-		// Check if local activity is sticky before sending working. The
+		// Check if local activity is sticky before sending. The
 		// StatusHandler runs first in the same hook process, so a
 		// waiting_for_input that a Notification set has already been
 		// replaced locally on tool-end/agent-end; this mirrors that result.
+		activity := state.ActivityWorking
+		message := "Ready"
+		if event.Name == hooks.EventToolEnd && !isSubagentEvent(event) {
+			activity = state.ActivityThinking
+			message = "Processing"
+		}
 		if h.isLocalActivitySticky() {
-			log.Debug("Hub: Skipping working (local activity is sticky)")
+			log.Debug("Hub: Skipping %s (local activity is sticky)", activity)
 			return nil
 		}
-		log.Debug("Hub: Reporting working (step completed)")
-		as := state.AgentState{Phase: state.PhaseRunning, Activity: state.ActivityWorking}
+		log.Debug("Hub: Reporting %s (step completed)", activity)
+		as := state.AgentState{Phase: state.PhaseRunning, Activity: activity}
 		err = h.client.UpdateStatus(ctx, hub.StatusUpdate{
-			Activity: state.ActivityWorking,
+			Activity: activity,
 			Status:   as.DisplayStatus(),
-			Message:  "Ready",
+			Message:  message,
 		})
 
 	case hooks.EventSubagentEnd:
@@ -375,7 +388,7 @@ func (h *HubHandler) isLocalActivitySticky() bool {
 // message, which a later waiting_for_input must not replace.
 func (h *HubHandler) isLocalWaitAgentSet() bool {
 	info := readLocalAgentInfo()
-	return isAgentSetWaiting(info) || (isNotificationWaiting(info) && parentWaitOf(info) == parentWaitAgent)
+	return isAgentSetWaiting(info) || (isNotificationWaiting(info) && isParentAgentWait(parentWaitOf(info)))
 }
 
 // isLocalSubagentEndRelease reports whether the local agent-info.json holds

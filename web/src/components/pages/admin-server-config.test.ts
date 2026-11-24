@@ -1,6 +1,12 @@
 import { describe, it, expect, vi, beforeAll, afterEach } from 'vitest';
 import { setPreferredTimeZone } from '../../utils/time.js';
 import { getPublicSettings, invalidatePublicSettings } from '../../client/server-feature-flags.js';
+import {
+  ADMIN_MANAGED_BROKERS_FLAG,
+  CUSTOM_DEFAULT_USER_ROLE_FLAG,
+  resetServerFlagStateForTests,
+  setFeatureFlag,
+} from '../../utils/feature-flags.js';
 import { requestUrl } from '../../client/__fixtures__/request-url.js';
 import type { ScionPageAdminServerConfig } from './admin-server-config.js';
 import {
@@ -120,6 +126,9 @@ const SCHEMA_RESPONSE = {
     },
     agent_secrets: {
       koanf_paths: ['agent_secrets.user_scope_only'],
+    },
+    broker_policy: {
+      koanf_paths: ['broker_policy.admin_managed_only'],
     },
     gcp_iam: {
       koanf_paths: ['server.hub.gcp_iam_check_mode', 'server.hub.gcp_iam_deny_unknown_policy'],
@@ -2604,6 +2613,166 @@ describe('scion-page-admin-server-config', () => {
     });
   });
 
+  // ── Custom Default User Role (hub.custom_default_user_role) ──
+
+  describe('Custom Default User Role', () => {
+    afterEach(() => {
+      delete window.__SCION_FEATURES__;
+      resetServerFlagStateForTests();
+    });
+
+    function defaultRoleOptions(el: HTMLElement): Element[] {
+      const select = query(el, 'sl-select.default-user-role-select');
+      return select ? Array.from(select.querySelectorAll('sl-option')) : [];
+    }
+
+    it('shows only Member and Viewer when experiment is off even if eligible roles are present', async () => {
+      setFeatureFlag(CUSTOM_DEFAULT_USER_ROLE_FLAG, false);
+      const config = makeBaseConfig({
+        eligible_default_roles: [
+          { id: 'r-1', name: 'contractor', description: 'Limited system access' },
+        ],
+      });
+      element = await createComponent(createFetchHandler(config));
+
+      const values = defaultRoleOptions(element).map((o) => o.getAttribute('value'));
+      expect(values).toEqual(['member', 'viewer']);
+      expect(query(element, '.default-user-role-help')?.textContent).not.toContain(
+        'Custom system roles:'
+      );
+      expect(query(element, 'sl-alert.default-user-role-warning')).toBeNull();
+    });
+
+    it('populates eligible custom roles and updates help text when experiment is on', async () => {
+      setFeatureFlag(CUSTOM_DEFAULT_USER_ROLE_FLAG, true);
+      const config = makeBaseConfig({
+        settings_tier: 'db',
+        eligible_default_roles: [
+          { id: 'r-1', name: 'contractor', description: 'Limited system access' },
+          { id: 'r-2', name: 'auditor' },
+        ],
+      });
+      let capturedPayload: Record<string, unknown> | null = null;
+      element = await createComponent(
+        createFetchHandler(config, {
+          putHandler: (body) => {
+            capturedPayload = body;
+            return { status: 200, body: { reload: { applied: ['access'] } } };
+          },
+        })
+      );
+
+      const options = defaultRoleOptions(element);
+      expect(options.map((o) => o.getAttribute('value'))).toEqual([
+        'member',
+        'viewer',
+        'contractor',
+        'auditor',
+      ]);
+      expect(options[2].textContent?.replace(/\s+/g, ' ').trim()).toBe(
+        'contractor — Limited system access'
+      );
+      expect(options[3].textContent?.replace(/\s+/g, ' ').trim()).toBe('auditor');
+
+      const help = query(element, '.default-user-role-help')?.textContent ?? '';
+      expect(help).toContain('Custom system roles:');
+      expect(help).toContain('replaces the');
+      expect(help).toContain('hub-member');
+
+      // Selecting a custom role sends it in the PUT payload without read-only view fields.
+      const select = query(element, 'sl-select.default-user-role-select') as HTMLElement & {
+        value: string;
+      };
+      select.value = 'contractor';
+      select.dispatchEvent(new Event('sl-change'));
+      await (element as any).updateComplete;
+
+      const buttons = queryAll(element, 'sl-button[variant="primary"]');
+      const saveBtn = buttons.find((b) => b.textContent?.trim() === 'Save & Reload');
+      (saveBtn as HTMLElement).click();
+      await vi.waitFor(() => {
+        expect(capturedPayload).not.toBeNull();
+      });
+
+      const server = capturedPayload!.server as Record<string, unknown> | undefined;
+      const auth = server?.auth as Record<string, unknown> | undefined;
+      expect(auth?.default_user_role).toBe('contractor');
+      expect(capturedPayload!.eligible_default_roles).toBeUndefined();
+      expect(capturedPayload!.default_user_role_warning).toBeUndefined();
+    });
+
+    it('renders warning alert and disabled unavailable option when configured role is missing', async () => {
+      setFeatureFlag(CUSTOM_DEFAULT_USER_ROLE_FLAG, true);
+      const base = makeBaseConfig();
+      const config = {
+        ...base,
+        server: {
+          ...base.server,
+          auth: {
+            ...base.server.auth,
+            default_user_role: 'deleted-role',
+          },
+        },
+        eligible_default_roles: [{ id: 'r-1', name: 'contractor' }],
+        default_user_role_warning: {
+          code: 'role_not_found',
+          configured_role: 'deleted-role',
+          effective_role: 'member',
+          message:
+            'Configured default_user_role "deleted-role" was not found as a system-scope role; falling back to "member".',
+        },
+      };
+      element = await createComponent(createFetchHandler(config));
+
+      const alert = query(element, 'sl-alert.default-user-role-warning');
+      expect(alert).not.toBeNull();
+      expect(alert!.getAttribute('variant')).toBe('warning');
+      expect(alert!.textContent).toContain('Fallback active:');
+      expect(alert!.textContent).toContain('deleted-role');
+
+      const options = defaultRoleOptions(element);
+      const unavailable = options.find((o) => o.getAttribute('value') === 'deleted-role');
+      expect(unavailable).toBeDefined();
+      expect(unavailable!.hasAttribute('disabled')).toBe(true);
+      expect(unavailable!.textContent?.trim()).toContain('deleted-role (unavailable)');
+    });
+
+    it('renders fallback warning even when experiment is off if a custom role is stored', async () => {
+      setFeatureFlag(CUSTOM_DEFAULT_USER_ROLE_FLAG, false);
+      const base = makeBaseConfig();
+      const config = {
+        ...base,
+        server: {
+          ...base.server,
+          auth: {
+            ...base.server.auth,
+            default_user_role: 'contractor',
+          },
+        },
+        default_user_role_warning: {
+          code: 'experiment_disabled',
+          configured_role: 'contractor',
+          effective_role: 'member',
+          message:
+            'Configured default_user_role "contractor" requires experiment hub.custom_default_user_role; falling back to "member".',
+        },
+      };
+      element = await createComponent(createFetchHandler(config));
+
+      const alert = query(element, 'sl-alert.default-user-role-warning');
+      expect(alert).not.toBeNull();
+      expect(alert!.textContent).toContain('hub.custom_default_user_role');
+
+      const options = defaultRoleOptions(element);
+      expect(options.map((o) => o.getAttribute('value'))).toEqual([
+        'member',
+        'viewer',
+        'contractor',
+      ]);
+      expect(options[2].hasAttribute('disabled')).toBe(true);
+    });
+  });
+
   // ── Agent Secrets card (design ptone/scion#2291 §8, §10 test 10) ──
 
   describe('Agent Secrets card', () => {
@@ -2697,6 +2866,101 @@ describe('scion-page-admin-server-config', () => {
 
       // The switch itself must not render while the field is env-pinned.
       expect(agentSecretsSwitch(element)).toBeUndefined();
+    });
+  });
+
+  // ── Runtime Broker Policy (hub.admin_managed_brokers, ptone/scion#7829) ──
+
+  describe('Runtime Broker Policy (broker_policy.admin_managed_only)', () => {
+    function brokerPolicySwitch(el: HTMLElement): Element | undefined {
+      const switches = queryAll(el, 'sl-switch');
+      return switches.find((s) =>
+        s.textContent?.includes('Require admin-managed Runtime Brokers only')
+      );
+    }
+
+    afterEach(() => {
+      resetServerFlagStateForTests();
+    });
+
+    it('hides section when experiment is off and setting is absent or false', async () => {
+      setFeatureFlag(ADMIN_MANAGED_BROKERS_FLAG, false);
+      element = await createComponent(createFetchHandler(makeBaseConfig()));
+
+      expect(brokerPolicySwitch(element)).toBeUndefined();
+      expect(query(element, '[data-broker-policy-mismatch]')).toBeNull();
+    });
+
+    it('shows mismatch banner when experiment is off and stored value is true', async () => {
+      setFeatureFlag(ADMIN_MANAGED_BROKERS_FLAG, false);
+      const config = makeBaseConfig({ broker_policy: { admin_managed_only: true } });
+      element = await createComponent(createFetchHandler(config));
+
+      expect(brokerPolicySwitch(element)).toBeUndefined();
+      const banner = query(element, '[data-broker-policy-mismatch]');
+      expect(banner).not.toBeNull();
+      expect(banner!.textContent).toContain('broker_policy.admin_managed_only');
+      expect(banner!.textContent).toContain(ADMIN_MANAGED_BROKERS_FLAG);
+    });
+
+    it('renders switch when experiment is on and sends diff-only payload (file and db)', async () => {
+      setFeatureFlag(ADMIN_MANAGED_BROKERS_FLAG, true);
+      for (const settingsTier of ['file', 'db'] as const) {
+        let capturedPayload: Record<string, unknown> | null = null;
+        const config = makeBaseConfig({
+          settings_tier: settingsTier,
+          broker_policy: { admin_managed_only: true },
+        });
+        element = await createComponent(
+          createFetchHandler(config, {
+            putHandler: (body) => {
+              capturedPayload = body;
+              return { status: 200, body: { reload: { applied: [] } } };
+            },
+          })
+        );
+
+        const sw = brokerPolicySwitch(element);
+        expect(sw).not.toBeUndefined();
+        expect(sw!.hasAttribute('checked')).toBe(true);
+
+        const clickSave = async () => {
+          capturedPayload = null;
+          const buttons = queryAll(element!, 'sl-button[variant="primary"]');
+          withoutSectionFilter(element!);
+          const saveBtn = buttons.find((b) => b.textContent?.trim() === 'Save & Reload');
+          (saveBtn as HTMLElement).click();
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          expect(capturedPayload).not.toBeNull();
+        };
+
+        // Untouched: omitted from diff payload.
+        await clickSave();
+        expect(capturedPayload!).not.toHaveProperty('broker_policy');
+
+        // Changed: included in diff payload.
+        (element as any).brokerPolicyAdminManagedOnly = false;
+        await clickSave();
+        expect(capturedPayload!.broker_policy).toEqual({ admin_managed_only: false });
+
+        element.remove();
+        element = null;
+      }
+    });
+
+    it('env-overridden broker_policy.admin_managed_only renders read-only with env badge', async () => {
+      setFeatureFlag(ADMIN_MANAGED_BROKERS_FLAG, true);
+      const config = makeBaseConfig({
+        settings_tier: 'file',
+        broker_policy: { admin_managed_only: true },
+        env_overrides: ['broker_policy.admin_managed_only'],
+      });
+      element = await createComponent(createFetchHandler(config));
+
+      const badges = queryAll(element, '.read-only-badge');
+      const badgeTexts = badges.map((b) => b.textContent ?? '');
+      expect(badgeTexts.some((t) => t.includes('environment variable'))).toBe(true);
+      expect(brokerPolicySwitch(element)).toBeUndefined();
     });
   });
 
@@ -5679,6 +5943,7 @@ describe('scion-page-admin-server-config', () => {
         auto_expose_ports: { enabled: true },
         quotas: { enforce_broker_quotas: true },
         agent_secrets: { user_scope_only: true },
+        broker_policy: { admin_managed_only: true },
         runtimes: { docker: { type: 'docker' } },
         profiles: { default: { runtime: 'docker' } },
         harness_configs: { gemini: { harness: 'gemini' } },
@@ -5816,6 +6081,10 @@ describe('scion-page-admin-server-config', () => {
       },
       'agent_secrets.user_scope_only': {
         clear: (el) => (el.agentSecretsUserScopeOnly = false),
+        expected: false,
+      },
+      'broker_policy.admin_managed_only': {
+        clear: (el) => (el.brokerPolicyAdminManagedOnly = false),
         expected: false,
       },
       // hub_observability: "cleared" is unset (Use default), sent as null.

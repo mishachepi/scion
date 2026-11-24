@@ -20,18 +20,35 @@
  * Provides the main sidebar navigation with Shoelace integration
  */
 
-import { LitElement, html, css } from 'lit';
+import { LitElement, html, css, nothing, type TemplateResult } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 
 import type { User } from '../../shared/types.js';
 import { loadAdminStatus } from '../../client/admin-status.js';
 import { ARTIFACTS_FLAG } from '../../client/artifacts-flag.js';
-import { isFeatureEnabled } from '../../utils/feature-flags.js';
+import {
+  INBOX_SUMMARY_CHANGED_EVENT,
+  ensureInboxSummaryStarted,
+  formatInboxSummaryBadge,
+} from '../../client/inbox-summary-loader.js';
+import {
+  FEATURE_FLAGS_CHANGED_EVENT,
+  INBOX_DASHBOARD_FLAG,
+  isFeatureEnabled,
+  isInboxDashboardEnabled,
+  SYSTEM_ONE_FLAG,
+} from '../../utils/feature-flags.js';
 import {
   type AdminStatus,
   hasAnyPermission,
   NAV_PERMISSION_MAP,
 } from '../../lib/admin-permissions.js';
+import {
+  brandMarkStyles,
+  observeBranding,
+  renderAttribution,
+  renderSidebarBrand,
+} from './brand-mark.js';
 
 interface NavItem {
   path: string;
@@ -39,6 +56,8 @@ interface NavItem {
   icon: string;
   /** Feature flag the item needs; the item is hidden while it is off. */
   flag?: string;
+  /** Optional badge text rendered on the right of the link; hidden when null. */
+  badge?: () => string | null;
 }
 
 interface NavSection {
@@ -52,7 +71,16 @@ interface NavSection {
 const NAV_SECTIONS: NavSection[] = [
   {
     title: 'Overview',
-    items: [{ path: '/', label: 'Dashboard', icon: 'house' }],
+    items: [
+      { path: '/', label: 'Dashboard', icon: 'house' },
+      {
+        path: '/profile/inbox',
+        label: 'Inbox',
+        icon: 'inbox',
+        flag: INBOX_DASHBOARD_FLAG,
+        badge: () => formatInboxSummaryBadge(),
+      },
+    ],
   },
   {
     title: 'Management',
@@ -83,8 +111,15 @@ function visibleItems(items: NavItem[]): NavItem[] {
 const ADMIN_SCOPEABLE_ITEMS: NavItem[] = [
   { path: '/settings', label: 'Hub Resources', icon: 'gear' },
   { path: '/admin/server-config', label: 'Server Config', icon: 'sliders' },
+  { path: '/admin/branding', label: 'Branding', icon: 'palette' },
   { path: '/admin/federation', label: 'Federation', icon: 'globe' },
   { path: '/admin/integrations', label: 'Integrations', icon: 'plug' },
+  {
+    path: '/admin/system-one',
+    label: 'System One Providers',
+    icon: 'robot',
+    flag: SYSTEM_ONE_FLAG,
+  },
   { path: '/admin/scheduler', label: 'Scheduler', icon: 'clock' },
   { path: '/admin/users', label: 'Users', icon: 'people' },
   { path: '/admin/groups', label: 'Groups', icon: 'diagram-3' },
@@ -143,9 +178,38 @@ export class ScionNav extends LitElement {
   /** Tracks the user ID for which admin capabilities were last checked. */
   private adminCheckUserId: string | null = null;
 
+  private readonly onFeatureFlagsChanged = (): void => {
+    if (isInboxDashboardEnabled()) {
+      ensureInboxSummaryStarted(this.user?.id || undefined);
+    }
+    this.requestUpdate();
+  };
+
+  private readonly onInboxSummaryChanged = (): void => {
+    this.requestUpdate();
+  };
+
+  override connectedCallback(): void {
+    super.connectedCallback();
+    window.addEventListener(FEATURE_FLAGS_CHANGED_EVENT, this.onFeatureFlagsChanged);
+    window.addEventListener(INBOX_SUMMARY_CHANGED_EVENT, this.onInboxSummaryChanged);
+    if (isInboxDashboardEnabled()) {
+      ensureInboxSummaryStarted(this.user?.id || undefined);
+    }
+  }
+
+  override disconnectedCallback(): void {
+    window.removeEventListener(FEATURE_FLAGS_CHANGED_EVENT, this.onFeatureFlagsChanged);
+    window.removeEventListener(INBOX_SUMMARY_CHANGED_EVENT, this.onInboxSummaryChanged);
+    super.disconnectedCallback();
+  }
+
   override updated(changedProperties: Map<PropertyKey, unknown>): void {
     if (changedProperties.has('user')) {
       void this.checkAdminCapabilities();
+      if (isInboxDashboardEnabled() && this.user?.id) {
+        ensureInboxSummaryStarted(this.user.id);
+      }
     }
   }
 
@@ -154,11 +218,9 @@ export class ScionNav extends LitElement {
    * endpoint, which returns hub-admin and super-admin flags plus the
    * user's system-scoped permissions.
    *
-   * Super-admin users are detected directly via `user.role === 'admin'`
-   * and skip the API call. For everyone else the permissions array alone
-   * decides which admin nav items are visible: isAdmin is true only for
-   * hub admins and super admins, while a member can hold permissions
-   * that open individual admin sections.
+   * Every signed-in user reads from admin-status (never `user.role === 'admin'`)
+   * so there is one source of truth for admin UI visibility, including while
+   * "View as member" mode is active.
    */
   private async checkAdminCapabilities(): Promise<void> {
     const userId = this.user?.id ?? null;
@@ -167,22 +229,15 @@ export class ScionNav extends LitElement {
     if (userId === this.adminCheckUserId) return;
     this.adminCheckUserId = userId;
 
-    // Super-admins always have admin capabilities — create an AdminStatus
-    // with isSuperAdmin: true so hasAnyPermission() short-circuits.
-    if (this.user?.role === 'admin') {
-      this.adminStatus = { isAdmin: true, isSuperAdmin: true, permissions: [] };
-      return;
-    }
-
     // No user = no admin access
     if (!this.user) {
       this.adminStatus = null;
       return;
     }
 
-    // The admin-status permissions decide which admin items show for
-    // hub-admin and custom-role users. The request is shared with the
-    // other nav instance and the startup code (client/admin-status.ts).
+    // The admin-status response decides which admin items show for super-admins,
+    // hub-admins, and custom-role users. The request is shared with the other
+    // nav instance and the startup code (client/admin-status.ts).
     const status = await loadAdminStatus(userId);
     // Only apply the result if the user hasn't changed during the fetch.
     if (this.adminCheckUserId === userId) {
@@ -191,6 +246,8 @@ export class ScionNav extends LitElement {
   }
 
   static override styles = css`
+    ${brandMarkStyles}
+
     :host {
       display: flex;
       flex-direction: column;
@@ -321,7 +378,7 @@ export class ScionNav extends LitElement {
       align-items: center;
       gap: 0.75rem;
       padding: 0.625rem 0.75rem;
-      border-radius: 0.5rem;
+      border-radius: var(--scion-radius, 0.5rem);
       color: var(--scion-text, #1e293b);
       text-decoration: none;
       font-size: 0.875rem;
@@ -340,7 +397,7 @@ export class ScionNav extends LitElement {
 
     .nav-link.active {
       background: var(--scion-primary, #3b82f6);
-      color: white;
+      color: var(--scion-primary-text, #ffffff);
     }
 
     .nav-link.active:hover {
@@ -366,6 +423,29 @@ export class ScionNav extends LitElement {
       pointer-events: none;
     }
 
+    .nav-badge {
+      margin-left: auto;
+      min-width: 1.25rem;
+      padding: 0 0.375rem;
+      border-radius: var(--scion-radius-full, 9999px);
+      font-size: 0.6875rem;
+      font-weight: 600;
+      line-height: 1.25rem;
+      text-align: center;
+      flex-shrink: 0;
+      background: var(--sl-color-primary-100, #dbeafe);
+      color: var(--sl-color-primary-700, #1d4ed8);
+    }
+
+    .nav-link.active .nav-badge {
+      background: color-mix(in srgb, var(--scion-primary-text, #ffffff) 22%, transparent);
+      color: var(--scion-primary-text, #ffffff);
+    }
+
+    :host([collapsed]) .nav-badge {
+      display: none;
+    }
+
     /* Collapse toggle */
     .collapse-toggle {
       display: flex;
@@ -375,7 +455,7 @@ export class ScionNav extends LitElement {
       margin: 0.5rem;
       padding: 0.5rem;
       border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: 0.5rem;
+      border-radius: var(--scion-radius, 0.5rem);
       background: transparent;
       color: var(--scion-text-muted, #64748b);
       cursor: pointer;
@@ -413,116 +493,68 @@ export class ScionNav extends LitElement {
       pointer-events: none;
     }
 
+    .sidebar-attribution {
+      padding: 0.25rem 0.75rem;
+      font-size: 0.75rem;
+      color: var(--scion-text-muted, #64748b);
+      text-align: center;
+      white-space: nowrap;
+      overflow: hidden;
+    }
+
+    :host([collapsed]) .sidebar-attribution {
+      display: none;
+    }
+
     /* Smooth width transition */
     :host {
       transition: width var(--scion-transition-normal, 250ms ease);
     }
   `;
 
+  constructor() {
+    super();
+    observeBranding(this);
+  }
+
   override render() {
-    const isSuperAdmin = this.user?.role === 'admin';
+    const isSuperAdmin = this.adminStatus?.isSuperAdmin === true;
+
+    const visibleAdminItems = this.adminStatus
+      ? visibleItems(ADMIN_SCOPEABLE_ITEMS).filter(
+          (item) =>
+            NAV_PERMISSION_MAP[item.path] &&
+            hasAnyPermission(this.adminStatus, NAV_PERMISSION_MAP[item.path])
+        )
+      : [];
 
     return html`
       <div class="logo">
-        <div class="logo-icon">🌱</div>
-        <div class="logo-text">
-          <h1>Scion</h1>
-          <span>Agent Orchestration</span>
-        </div>
+        ${renderSidebarBrand({
+          collapsed: this.collapsed,
+          subtitleFallback: 'Agent Orchestration',
+        })}
       </div>
 
-      <nav class="nav-container">
+      <nav class="nav-container" aria-label="Main">
         ${NAV_SECTIONS.map(
           (section) => html`
             <div class="nav-section">
               <div class="nav-section-title">${section.title}</div>
               <ul class="nav-list">
-                ${visibleItems(section.items).map(
-                  (item) => html`
-                    <li class="nav-item">
-                      <sl-tooltip
-                        style="display: block;"
-                        content="${item.label}"
-                        placement="right"
-                        ?disabled=${!this.collapsed}
-                        hoist
-                      >
-                        <a
-                          href="${item.path}"
-                          class="nav-link ${this.isActive(item.path) ? 'active' : ''}"
-                          @click=${(e: Event) => this.handleNavClick(e, item.path)}
-                        >
-                          <sl-icon name="${item.icon}"></sl-icon>
-                          <span class="nav-link-text">${item.label}</span>
-                        </a>
-                      </sl-tooltip>
-                    </li>
-                  `
-                )}
+                ${visibleItems(section.items).map((item) => this.renderNavItem(item))}
               </ul>
             </div>
           `
         )}
-        ${this.adminStatus &&
-        (isSuperAdmin ||
-          ADMIN_SCOPEABLE_ITEMS.some(
-            (item) =>
-              NAV_PERMISSION_MAP[item.path] &&
-              hasAnyPermission(this.adminStatus, NAV_PERMISSION_MAP[item.path])
-          ))
+        ${this.adminStatus && (isSuperAdmin || visibleAdminItems.length > 0)
           ? html`
               <div class="nav-section admin-section">
                 <div class="nav-section-title">Admin</div>
                 <ul class="nav-list">
-                  ${ADMIN_SCOPEABLE_ITEMS.filter(
-                    (item) =>
-                      NAV_PERMISSION_MAP[item.path] &&
-                      hasAnyPermission(this.adminStatus, NAV_PERMISSION_MAP[item.path])
-                  ).map(
-                    (item) => html`
-                      <li class="nav-item">
-                        <sl-tooltip
-                          style="display: block;"
-                          content="${item.label}"
-                          placement="right"
-                          ?disabled=${!this.collapsed}
-                          hoist
-                        >
-                          <a
-                            href="${item.path}"
-                            class="nav-link ${this.isActive(item.path) ? 'active' : ''}"
-                            @click=${(e: Event) => this.handleNavClick(e, item.path)}
-                          >
-                            <sl-icon name="${item.icon}"></sl-icon>
-                            <span class="nav-link-text">${item.label}</span>
-                          </a>
-                        </sl-tooltip>
-                      </li>
-                    `
-                  )}
+                  ${visibleAdminItems.map((item) => this.renderNavItem(item))}
                   ${isSuperAdmin
-                    ? ADMIN_SUPERADMIN_ITEMS.map(
-                        (item) => html`
-                          <li class="nav-item">
-                            <sl-tooltip
-                              style="display: block;"
-                              content="${item.label}"
-                              placement="right"
-                              ?disabled=${!this.collapsed}
-                              hoist
-                            >
-                              <a
-                                href="${item.path}"
-                                class="nav-link ${this.isActive(item.path) ? 'active' : ''}"
-                                @click=${(e: Event) => this.handleNavClick(e, item.path)}
-                              >
-                                <sl-icon name="${item.icon}"></sl-icon>
-                                <span class="nav-link-text">${item.label}</span>
-                              </a>
-                            </sl-tooltip>
-                          </li>
-                        `
-                      )
+                    ? ADMIN_SUPERADMIN_ITEMS.map((item) => this.renderNavItem(item))
                     : ''}
                 </ul>
               </div>
@@ -530,6 +562,7 @@ export class ScionNav extends LitElement {
           : ''}
       </nav>
 
+      ${renderAttribution('sidebar-attribution')}
       ${this.hideCollapse
         ? ''
         : html`
@@ -543,6 +576,39 @@ export class ScionNav extends LitElement {
               <span class="collapse-toggle-text">Collapse</span>
             </button>
           `}
+    `;
+  }
+
+  private renderNavItem(item: NavItem): TemplateResult {
+    const badge = item.badge?.() ?? null;
+    return html`
+      <li class="nav-item">
+        <sl-tooltip
+          style="display: block;"
+          content="${item.label}"
+          placement="right"
+          ?disabled=${!this.collapsed}
+          hoist
+        >
+          <a
+            href="${item.path}"
+            class="nav-link ${this.isActive(item.path) ? 'active' : ''}"
+            @click=${(e: Event) => this.handleNavClick(e, item.path)}
+          >
+            <sl-icon name="${item.icon}"></sl-icon>
+            <span class="nav-link-text">${item.label}</span>
+            ${badge
+              ? html`<span
+                  class="nav-badge"
+                  data-nav-badge
+                  title=${`${badge} items waiting in ${item.label}`}
+                  aria-label=${`${badge} items waiting in ${item.label}`}
+                  >${badge}</span
+                >`
+              : nothing}
+          </a>
+        </sl-tooltip>
+      </li>
     `;
   }
 

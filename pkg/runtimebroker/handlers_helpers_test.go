@@ -489,6 +489,14 @@ func newTestServerWithManager(t *testing.T, mgr agent.Manager) *Server {
 	rt := &runtime.MockRuntime{NameFunc: func() string { return "mock" }}
 
 	srv := New(cfg, mgr, rt, config.RuntimeBuildRecord{})
+	// Prevent background auxiliary runtime discovery (started by Start /
+	// StartServices) from invoking real host runtime detection (e.g.
+	// `podman info` on Linux) for built-in profiles such as "remote"
+	// (ptone/scion#8570). Tests that exercise real profile resolution
+	// override resolveAuxiliaryRuntime explicitly.
+	srv.resolveAuxiliaryRuntime = func(_, _, _ string) (runtime.Runtime, config.RuntimeBuildRecord) {
+		return rt, config.RuntimeBuildRecord{}
+	}
 	endAsyncLaunchesAtCleanup(t, srv)
 	return srv
 }
@@ -572,13 +580,20 @@ type provisionCapturingManager struct {
 	// onStart, when set, runs at the start of Start, so a test can observe
 	// what the agent's start would read.
 	onStart func(ctx context.Context, opts api.StartOptions)
+	// provisionProfile, when non-empty, is attached as ScionConfig.Info.Profile
+	// on Provision returns so tests can verify the broker echoes it.
+	provisionProfile string
 }
 
 func (m *provisionCapturingManager) Provision(ctx context.Context, opts api.StartOptions) (*api.ScionConfig, error) {
 	m.provisionCalled = true
 	m.lastOpts = opts
 	m.lastProvisionCtx = ctx
-	return &api.ScionConfig{Harness: "claude", HarnessConfig: "claude"}, nil
+	cfg := &api.ScionConfig{Harness: "claude", HarnessConfig: "claude"}
+	if m.provisionProfile != "" {
+		cfg.Info = &api.AgentInfo{Profile: m.provisionProfile}
+	}
+	return cfg, nil
 }
 
 func (m *provisionCapturingManager) Preflight(ctx context.Context, opts api.StartOptions) error {

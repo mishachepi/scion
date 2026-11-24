@@ -674,7 +674,7 @@ func TestCreateDecisionPrompt_InvalidInput(t *testing.T) {
 		"bad agent":           func(in *store.DecisionPromptInput) { in.AskerAgentID = "agent-1" },
 		"no decisions":        func(in *store.DecisionPromptInput) { in.Decisions = nil },
 		"invalid key":         func(in *store.DecisionPromptInput) { in.Decisions[0].Key = "a b" },
-		"unnormalized choice": func(in *store.DecisionPromptInput) { in.Decisions[0].Choices = in.Decisions[0].Choices[:1] },
+		"unnormalized choice": func(in *store.DecisionPromptInput) { in.Decisions[0].Choices = nil },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -684,6 +684,28 @@ func TestCreateDecisionPrompt_InvalidInput(t *testing.T) {
 			assert.ErrorIs(t, err, store.ErrInvalidInput)
 		})
 	}
+}
+
+func TestCreateDecisionPrompt_SingleChoice(t *testing.T) {
+	f := newDecisionFixture(t)
+	ctx := context.Background()
+	single := messages.Decision{
+		Key:      "confirm-1",
+		Question: "Approve production deploy?",
+		Choices:  []messages.Choice{{ID: "approve", Label: "Approved"}},
+	}
+	res := f.create(t, false, single)
+	require.Len(t, res.Decisions, 1)
+
+	got, err := f.cs.GetDecision(ctx, res.Decisions[0].RowID)
+	require.NoError(t, err)
+	assert.Equal(t, []messages.Choice{{ID: "approve", Label: "Approved"}}, got.Choices)
+	assert.Nil(t, got.Other)
+
+	ans, _, err := f.cs.RecordAnswer(ctx, f.answer(res.Decisions[0].RowID, "approve", "user-1", ""))
+	require.NoError(t, err)
+	assert.Equal(t, "approve", ans.ChoiceID)
+	assert.Equal(t, "Approved", ans.ChoiceLabel)
 }
 
 func TestGetDecisionAnswersByResponseMessageIDs(t *testing.T) {
@@ -3110,4 +3132,557 @@ func TestRecordAnswer_AllowOther_RoundTripIdempotencyTerminalAndUserDeletion(t *
 			require.ErrorIs(t, err, store.ErrInvalidInput)
 		})
 	}
+}
+
+func TestRecordAnswerSet_AllowOther_AtomicIdempotencyAndDismiss(t *testing.T) {
+	f := newDecisionFixture(t)
+	ctx := context.Background()
+
+	// 3-question set: row 0 has object Other, row 1 has no Other, row 2 has string Other with 1 fixed choice.
+	pIn := f.prompt("Three decisions", false,
+		messages.Decision{
+			Key:             "region",
+			Question:        "Which region for the canary?",
+			DefaultChoiceID: "1",
+			Choices:         []messages.Choice{{ID: "1", Label: "us-central1"}, {ID: "2", Label: "europe-west1"}},
+			Other:           &messages.OtherOption{Label: "Another region", Placeholder: "e.g. europe-west4"},
+		},
+		yesNo("notify", "Notify the release channel?"),
+		messages.Decision{
+			Key:      "proceed",
+			Question: "Tag v0.9 now?",
+			Choices:  []messages.Choice{{ID: "1", Label: "Yes"}},
+			Other:    &messages.OtherOption{Label: "Something else"},
+		},
+	)
+	res, err := f.cs.CreateDecisionPrompt(ctx, pIn)
+	require.NoError(t, err)
+	require.Len(t, res.Decisions, 3)
+	msgID := pIn.Message.ID
+	r0, r1, r2 := res.Decisions[0].RowID, res.Decisions[1].RowID, res.Decisions[2].RowID
+
+	makeSetInput := func(idem string, items []store.AnswerSetItem) *store.RecordAnswerSetInput {
+		return &store.RecordAnswerSetInput{
+			MessageID:        msgID,
+			AnsweredByUserID: "user-1",
+			AnsweredByName:   "Alice",
+			AnsweredByEmail:  "alice@example.com",
+			Surface:          store.DecisionSurfaceNative,
+			Answers:          items,
+			ResponseMessage: &store.Message{
+				ID:        uuid.NewString(),
+				ProjectID: f.projectID,
+				Sender:    "user:alice@example.com",
+				SenderID:  "user-1",
+				Recipient: "agent:dev",
+				Msg:       "set response",
+				Type:      messages.TypeDecisionResponse,
+				AgentID:   f.agentID,
+				Channel:   "web",
+				ThreadID:  "topic:general",
+			},
+			IdempotencyKey: idem,
+		}
+	}
+
+	// 1. Atomic validation rejections: nothing stored when any row fails.
+	badCases := map[string][]store.AnswerSetItem{
+		"$other on non-Other row": {
+			{DecisionRowID: r0, ChoiceID: "1"},
+			{DecisionRowID: r1, ChoiceID: messages.ChoiceIDOther, OtherText: "maybe"},
+			{DecisionRowID: r2, ChoiceID: "1"},
+		},
+		"empty other_text on $other row": {
+			{DecisionRowID: r0, ChoiceID: messages.ChoiceIDOther, OtherText: "   "},
+			{DecisionRowID: r1, ChoiceID: "1"},
+			{DecisionRowID: r2, ChoiceID: "1"},
+		},
+		"newline in other_text": {
+			{DecisionRowID: r0, ChoiceID: messages.ChoiceIDOther, OtherText: "a\nb"},
+			{DecisionRowID: r1, ChoiceID: "1"},
+			{DecisionRowID: r2, ChoiceID: "1"},
+		},
+		"201 runes in other_text": {
+			{DecisionRowID: r0, ChoiceID: messages.ChoiceIDOther, OtherText: strings.Repeat("é", 201)},
+			{DecisionRowID: r1, ChoiceID: "1"},
+			{DecisionRowID: r2, ChoiceID: "1"},
+		},
+		"other_text on fixed choice row": {
+			{DecisionRowID: r0, ChoiceID: "1", OtherText: "not allowed"},
+			{DecisionRowID: r1, ChoiceID: "1"},
+			{DecisionRowID: r2, ChoiceID: "1"},
+		},
+		"reserved $dismissed choice": {
+			{DecisionRowID: r0, ChoiceID: messages.ChoiceIDDismissed},
+			{DecisionRowID: r1, ChoiceID: "1"},
+			{DecisionRowID: r2, ChoiceID: "1"},
+		},
+	}
+	for name, items := range badCases {
+		t.Run(name, func(t *testing.T) {
+			_, err := f.cs.RecordAnswerSet(ctx, makeSetInput("", items))
+			require.ErrorIs(t, err, store.ErrInvalidInput)
+			for _, id := range []string{r0, r1, r2} {
+				d, gerr := f.cs.GetDecision(ctx, id)
+				require.NoError(t, gerr)
+				assert.Equal(t, store.DecisionStatusPending, d.Status)
+				assert.Empty(t, d.Answers)
+			}
+		})
+	}
+
+	// 2. Valid set submit with Other on rows 0 and 2, fixed choice on row 1.
+	validItems := []store.AnswerSetItem{
+		{DecisionRowID: r0, ChoiceID: messages.ChoiceIDOther, OtherText: "  europe-west4 canary  "},
+		{DecisionRowID: r1, ChoiceID: "1"},
+		{DecisionRowID: r2, ChoiceID: messages.ChoiceIDOther, OtherText: "Wait until Monday"},
+	}
+	setRes, err := f.cs.RecordAnswerSet(ctx, makeSetInput("set-other-idem-1", validItems))
+	require.NoError(t, err)
+	assert.False(t, setRes.Replayed)
+	require.NotEmpty(t, setRes.BatchID)
+	require.Len(t, setRes.Answers, 3)
+
+	assert.Equal(t, messages.ChoiceIDOther, setRes.Answers[0].ChoiceID)
+	assert.Equal(t, "Another region", setRes.Answers[0].ChoiceLabel)
+	assert.Equal(t, "europe-west4 canary", setRes.Answers[0].OtherText)
+	assert.False(t, setRes.Answers[0].MatchedDefault)
+
+	assert.Equal(t, "1", setRes.Answers[1].ChoiceID)
+	assert.Empty(t, setRes.Answers[1].OtherText)
+
+	assert.Equal(t, messages.ChoiceIDOther, setRes.Answers[2].ChoiceID)
+	assert.Equal(t, "Something else", setRes.Answers[2].ChoiceLabel)
+	assert.Equal(t, "Wait until Monday", setRes.Answers[2].OtherText)
+	assert.False(t, setRes.Answers[2].MatchedDefault)
+
+	// 3. Idempotency: same key + same (trimmed) text replays; different text -> ErrIdempotencyMismatch.
+	replayItems := []store.AnswerSetItem{
+		{DecisionRowID: r0, ChoiceID: messages.ChoiceIDOther, OtherText: "europe-west4 canary"},
+		{DecisionRowID: r1, ChoiceID: "1"},
+		{DecisionRowID: r2, ChoiceID: messages.ChoiceIDOther, OtherText: "  Wait until Monday "},
+	}
+	replayed, err := f.cs.RecordAnswerSet(ctx, makeSetInput("set-other-idem-1", replayItems))
+	require.NoError(t, err)
+	assert.True(t, replayed.Replayed)
+	assert.Equal(t, setRes.BatchID, replayed.BatchID)
+	require.Len(t, replayed.Answers, 3)
+	assert.Equal(t, "europe-west4 canary", replayed.Answers[0].OtherText)
+	assert.Equal(t, "Wait until Monday", replayed.Answers[2].OtherText)
+
+	diffTextItems := []store.AnswerSetItem{
+		{DecisionRowID: r0, ChoiceID: messages.ChoiceIDOther, OtherText: "asia-east1"},
+		{DecisionRowID: r1, ChoiceID: "1"},
+		{DecisionRowID: r2, ChoiceID: messages.ChoiceIDOther, OtherText: "Wait until Monday"},
+	}
+	_, err = f.cs.RecordAnswerSet(ctx, makeSetInput("set-other-idem-1", diffTextItems))
+	assert.ErrorIs(t, err, store.ErrIdempotencyMismatch)
+
+	// 4. Dismissed set rows do not match replayableAnswerSet even if idempotency_key is reused.
+	pDsm := f.prompt("Dismiss set", false,
+		messages.Decision{
+			Key:      "dsm-s1",
+			Question: "First?",
+			Choices:  []messages.Choice{{ID: "1", Label: "Yes"}},
+			Other:    &messages.OtherOption{Label: "Other"},
+		},
+		yesNo("dsm-s2", "Second?"),
+	)
+	dsmRes, err := f.cs.CreateDecisionPrompt(ctx, pDsm)
+	require.NoError(t, err)
+	dsmDec0, err := f.cs.GetDecision(ctx, dsmRes.Decisions[0].RowID)
+	require.NoError(t, err)
+	dsmIn := f.dismissInput(pDsm.Message.ID, "user-1", "No longer needed", func() time.Time {
+		return dsmDec0.CreatedAt.Add(store.DecisionDismissMinAge)
+	})
+	dsmIn.IdempotencyKey = "shared-set-dsm-key"
+	_, err = f.cs.DismissDecisions(ctx, dsmIn)
+	require.NoError(t, err)
+
+	_, err = f.cs.RecordAnswerSet(ctx, &store.RecordAnswerSetInput{
+		MessageID:        pDsm.Message.ID,
+		AnsweredByUserID: "user-1",
+		AnsweredByName:   "Alice",
+		AnsweredByEmail:  "alice@example.com",
+		Surface:          store.DecisionSurfaceNative,
+		Answers: []store.AnswerSetItem{
+			{DecisionRowID: dsmRes.Decisions[0].RowID, ChoiceID: messages.ChoiceIDOther, OtherText: "too late"},
+			{DecisionRowID: dsmRes.Decisions[1].RowID, ChoiceID: "1"},
+		},
+		ResponseMessage: &store.Message{
+			ID: uuid.NewString(), ProjectID: f.projectID, Sender: "user:alice@example.com",
+			SenderID: "user-1", Recipient: "agent:dev", Msg: "late", Type: messages.TypeDecisionResponse,
+			AgentID: f.agentID, Channel: "web", ThreadID: "topic:general",
+		},
+		IdempotencyKey: "shared-set-dsm-key",
+	})
+	var changedErr *store.AnswerSetChangedError
+	require.ErrorAs(t, err, &changedErr)
+	assert.Equal(t, store.AnswerSetReasonDismissed, changedErr.Reasons[dsmRes.Decisions[0].RowID])
+	assert.Equal(t, store.AnswerSetReasonDismissed, changedErr.Reasons[dsmRes.Decisions[1].RowID])
+}
+
+func TestRecordInterpretedAnswers_AllowOther_ReplayConfirmOverrideAndSearch(t *testing.T) {
+	f := newDecisionFixture(t)
+	ctx := context.Background()
+
+	mkSrc := func() *store.Message {
+		m := &store.Message{
+			ID:            uuid.NewString(),
+			ProjectID:     f.projectID,
+			ThreadID:      "topic:general",
+			Sender:        "user:user-1",
+			SenderID:      "user-1",
+			Recipient:     "group:topic",
+			RecipientID:   "topic:general",
+			Msg:           "use europe-west4",
+			DispatchState: store.MessageDispatchDispatched,
+			CreatedAt:     time.Now().UTC(),
+		}
+		require.NoError(t, f.cs.CreateMessage(ctx, m))
+		return m
+	}
+	mkResp := func() *store.Message {
+		return &store.Message{
+			ID:            uuid.NewString(),
+			ProjectID:     f.projectID,
+			ThreadID:      "topic:general",
+			Sender:        "agent:architect",
+			SenderID:      f.agentID,
+			Recipient:     "group:topic",
+			RecipientID:   "topic:general",
+			DispatchState: store.MessageDispatchDispatched,
+			CreatedAt:     time.Now().UTC(),
+		}
+	}
+
+	// Create 4 decisions: 3 with Other enabled, 1 without.
+	withOther := func(key, q string) messages.Decision {
+		return messages.Decision{
+			Key:             key,
+			Question:        q,
+			DefaultChoiceID: "1",
+			Choices:         []messages.Choice{{ID: "1", Label: "us-central1"}},
+			Other: &messages.OtherOption{
+				Label:       "Another region",
+				Placeholder: "e.g. europe-west4",
+			},
+		}
+	}
+	rowConfirm := f.create(t, false, withOther("reg-confirm", "Region for confirm?")).Decisions[0].RowID
+	rowOverride := f.create(t, false, withOther("reg-override", "Region for override?")).Decisions[0].RowID
+	rowFixedToOther := f.create(t, false, withOther("reg-fixed-other", "Region fixed to other?")).Decisions[0].RowID
+	f.create(t, false, yesNo("no-other-interp", "No other here?"))
+
+	src := mkSrc()
+
+	// 1. Input validation rejects reserved $dismissed, invalid/empty/too-long other_text, and other_text on fixed.
+	for name, pair := range map[string]store.InterpretedAnswerPair{
+		"reserved $dismissed": {Key: "reg-confirm", ChoiceID: messages.ChoiceIDDismissed},
+		"empty other_text":    {Key: "reg-confirm", ChoiceID: messages.ChoiceIDOther, OtherText: "   "},
+		"newline other_text":  {Key: "reg-confirm", ChoiceID: messages.ChoiceIDOther, OtherText: "a\nb"},
+		"too long other_text": {Key: "reg-confirm", ChoiceID: messages.ChoiceIDOther, OtherText: strings.Repeat("x", 201)},
+		"text on fixed":       {Key: "reg-confirm", ChoiceID: "1", OtherText: "extra"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := f.cs.RecordInterpretedAnswers(ctx, &store.RecordInterpretedInput{
+				InterpretedByAgentID: f.agentID,
+				SourceMessageID:      src.ID,
+				AnsweredByUserID:     "user-1",
+				AnsweredByName:       "Alice",
+				Surface:              store.DecisionSurfaceSlack,
+				Answers:              []store.InterpretedAnswerPair{pair},
+				ResponseMessage:      mkResp(),
+			})
+			require.ErrorIs(t, err, store.ErrInvalidInput)
+		})
+	}
+
+	// 2. $other on decision without AllowOther returns InterpretedReasonInvalidChoice.
+	_, err := f.cs.RecordInterpretedAnswers(ctx, &store.RecordInterpretedInput{
+		InterpretedByAgentID: f.agentID,
+		SourceMessageID:      src.ID,
+		AnsweredByUserID:     "user-1",
+		AnsweredByName:       "Alice",
+		Surface:              store.DecisionSurfaceSlack,
+		Answers:              []store.InterpretedAnswerPair{{Key: "no-other-interp", ChoiceID: messages.ChoiceIDOther, OtherText: "custom"}},
+		ResponseMessage:      mkResp(),
+	})
+	var iaErr *store.InterpretedAnswersError
+	require.ErrorAs(t, err, &iaErr)
+	require.Len(t, iaErr.Failures, 1)
+	assert.Equal(t, store.InterpretedReasonInvalidChoice, iaErr.Failures[0].Reason)
+
+	// 3. Record interpreted Other on reg-confirm and reg-override, and interpreted fixed on reg-fixed-other.
+	var formattedItems []store.InterpretedFormattedItem
+	recRes, err := f.cs.RecordInterpretedAnswers(ctx, &store.RecordInterpretedInput{
+		InterpretedByAgentID: f.agentID,
+		SourceMessageID:      src.ID,
+		AnsweredByUserID:     "user-1",
+		AnsweredByName:       "Alice",
+		AnsweredByEmail:      "alice@example.com",
+		Surface:              store.DecisionSurfaceSlack,
+		IdempotencyKey:       "interp-other-idem-1",
+		Answers: []store.InterpretedAnswerPair{
+			{Key: "reg-confirm", ChoiceID: messages.ChoiceIDOther, OtherText: "  europe-west4  "},
+			{Key: "reg-override", ChoiceID: messages.ChoiceIDOther, OtherText: "asia-northeast1"},
+		},
+		ResponseMessage: mkResp(),
+		FormatMessage: func(items []store.InterpretedFormattedItem) string {
+			formattedItems = items
+			return "formatted interpreted other"
+		},
+	})
+	require.NoError(t, err)
+	assert.False(t, recRes.Replayed)
+	require.Len(t, recRes.Answers, 2)
+	assert.Equal(t, messages.ChoiceIDOther, recRes.Answers[0].ChoiceID)
+	assert.Equal(t, "Another region", recRes.Answers[0].ChoiceLabel)
+	assert.Equal(t, "europe-west4", recRes.Answers[0].OtherText)
+	assert.False(t, recRes.Answers[0].MatchedDefault)
+	require.Len(t, formattedItems, 2)
+	assert.Equal(t, "europe-west4", formattedItems[0].OtherText)
+	assert.Equal(t, "asia-northeast1", formattedItems[1].OtherText)
+
+	// 4. Idempotency replay compares (choice_id, other_text): same text replays, different text -> ErrIdempotencyMismatch.
+	replaySame, err := f.cs.FindInterpretedReplay(ctx, f.agentID, "interp-other-idem-1", src.ID, []store.InterpretedAnswerPair{
+		{Key: "reg-confirm", ChoiceID: messages.ChoiceIDOther, OtherText: "europe-west4"},
+		{Key: "reg-override", ChoiceID: messages.ChoiceIDOther, OtherText: "  asia-northeast1  "},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, replaySame)
+	assert.True(t, replaySame.Replayed)
+	require.Len(t, replaySame.Answers, 2)
+
+	_, err = f.cs.FindInterpretedReplay(ctx, f.agentID, "interp-other-idem-1", src.ID, []store.InterpretedAnswerPair{
+		{Key: "reg-confirm", ChoiceID: messages.ChoiceIDOther, OtherText: "europe-west4"},
+		{Key: "reg-override", ChoiceID: messages.ChoiceIDOther, OtherText: "us-east1"},
+	})
+	require.ErrorIs(t, err, store.ErrIdempotencyMismatch)
+
+	// 5. ExistingDecisionKey.Hint includes OtherText.
+	_, err = f.cs.CreateDecisionPrompt(ctx, f.prompt("", false, withOther("reg-confirm", "Duplicate?")))
+	var existsErr *store.DecisionKeyExistsError
+	require.ErrorAs(t, err, &existsErr)
+	require.Len(t, existsErr.Existing, 1)
+	assert.Contains(t, existsErr.Existing[0].Hint(), `Another region "europe-west4"`)
+
+	// 6. Direct confirm vs override on interpreted Other.
+	// Confirm with different text fails ErrDecisionOutcomeMismatch.
+	badConfirm := f.answer(rowConfirm, messages.ChoiceIDOther, "user-1", "")
+	badConfirm.OtherText = "europe-west4-changed"
+	badConfirm.Outcome = store.DecisionOutcomeConfirm
+	_, _, err = f.cs.RecordAnswer(ctx, badConfirm)
+	require.ErrorIs(t, err, store.ErrDecisionOutcomeMismatch)
+
+	// Confirm with same text succeeds.
+	okConfirm := f.answer(rowConfirm, messages.ChoiceIDOther, "user-1", "")
+	okConfirm.OtherText = "europe-west4"
+	okConfirm.Outcome = store.DecisionOutcomeConfirm
+	confAns, _, err := f.cs.RecordAnswer(ctx, okConfirm)
+	require.NoError(t, err)
+	assert.Equal(t, store.DecisionOutcomeConfirm, confAns.Outcome)
+	assert.Equal(t, "europe-west4", confAns.OtherText)
+
+	// Override with same text fails ErrDecisionOutcomeMismatch; with different text succeeds.
+	badOverride := f.answer(rowOverride, messages.ChoiceIDOther, "user-1", "")
+	badOverride.OtherText = "asia-northeast1"
+	badOverride.Outcome = store.DecisionOutcomeOverride
+	_, _, err = f.cs.RecordAnswer(ctx, badOverride)
+	require.ErrorIs(t, err, store.ErrDecisionOutcomeMismatch)
+
+	okOverride := f.answer(rowOverride, messages.ChoiceIDOther, "user-1", "")
+	okOverride.OtherText = "me-central2"
+	okOverride.Outcome = store.DecisionOutcomeOverride
+	overAns, _, err := f.cs.RecordAnswer(ctx, okOverride)
+	require.NoError(t, err)
+	assert.Equal(t, store.DecisionOutcomeOverride, overAns.Outcome)
+	assert.Equal(t, "me-central2", overAns.OtherText)
+
+	// Interpreted fixed choice overridden by $other succeeds.
+	_, err = f.cs.RecordInterpretedAnswers(ctx, &store.RecordInterpretedInput{
+		InterpretedByAgentID: f.agentID,
+		SourceMessageID:      src.ID,
+		AnsweredByUserID:     "user-1",
+		AnsweredByName:       "Alice",
+		Surface:              store.DecisionSurfaceSlack,
+		Answers:              []store.InterpretedAnswerPair{{Key: "reg-fixed-other", ChoiceID: "1"}},
+		ResponseMessage:      mkResp(),
+	})
+	require.NoError(t, err)
+
+	fixedToOther := f.answer(rowFixedToOther, messages.ChoiceIDOther, "user-1", "")
+	fixedToOther.OtherText = "southamerica-east1"
+	fixedToOther.Outcome = store.DecisionOutcomeOverride
+	ftoAns, _, err := f.cs.RecordAnswer(ctx, fixedToOther)
+	require.NoError(t, err)
+	assert.Equal(t, store.DecisionOutcomeOverride, ftoAns.Outcome)
+	assert.Equal(t, "southamerica-east1", ftoAns.OtherText)
+
+	// 7. ListAgentDecisions search (-q) matches effective answer's other_text, not superseded interpreted text.
+	foundNew, _, err := f.cs.ListAgentDecisions(ctx, f.agentID, store.DecisionListStateDecided, "ME-CENTRAL2", "", 50)
+	require.NoError(t, err)
+	require.Len(t, foundNew, 1)
+	assert.Equal(t, "reg-override", foundNew[0].Key)
+
+	notFoundOld, _, err := f.cs.ListAgentDecisions(ctx, f.agentID, store.DecisionListStateDecided, "asia-northeast1", "", 50)
+	require.NoError(t, err)
+	assert.Empty(t, notFoundOld, "superseded interpreted other_text must not match effective-answer search")
+}
+
+func TestRecordAnswerSet_InterpretedOther_ConfirmAndOverride(t *testing.T) {
+	f := newDecisionFixture(t)
+	ctx := context.Background()
+
+	pIn := f.prompt("Two Other decisions", false,
+		messages.Decision{
+			Key:      "reg-set",
+			Question: "Which region?",
+			Choices:  []messages.Choice{{ID: "1", Label: "us-central1"}},
+			Other:    &messages.OtherOption{Label: "Another region"},
+		},
+		messages.Decision{
+			Key:      "win-set",
+			Question: "When?",
+			Choices:  []messages.Choice{{ID: "1", Label: "Now"}},
+			Other:    &messages.OtherOption{Label: "Other"},
+		},
+	)
+	created, err := f.cs.CreateDecisionPrompt(ctx, pIn)
+	require.NoError(t, err)
+	require.Len(t, created.Decisions, 2)
+	r0, r1 := created.Decisions[0].RowID, created.Decisions[1].RowID
+
+	src := &store.Message{
+		ID:            uuid.NewString(),
+		ProjectID:     f.projectID,
+		Sender:        "user:user-1",
+		SenderID:      "user-1",
+		Recipient:     "group:topic",
+		RecipientID:   "topic:general",
+		Msg:           "europe-west4, after 6 PM",
+		ThreadID:      "topic:general",
+		CreatedAt:     time.Now().UTC().Add(time.Second),
+		DispatchState: store.MessageDispatchDispatched,
+	}
+	require.NoError(t, f.cs.CreateMessage(ctx, src))
+
+	_, err = f.cs.RecordInterpretedAnswers(ctx, &store.RecordInterpretedInput{
+		InterpretedByAgentID: f.agentID,
+		SourceMessageID:      src.ID,
+		AnsweredByUserID:     "user-1",
+		AnsweredByName:       "Alice",
+		AnsweredByEmail:      "alice@test.com",
+		Surface:              store.DecisionSurfaceNative,
+		Answers: []store.InterpretedAnswerPair{
+			{DecisionRowID: r0, Key: "reg-set", ChoiceID: messages.ChoiceIDOther, OtherText: "europe-west4"},
+			{DecisionRowID: r1, Key: "win-set", ChoiceID: messages.ChoiceIDOther, OtherText: "after 6 PM"},
+		},
+		ResponseMessage: &store.Message{
+			ID: uuid.NewString(), ProjectID: f.projectID, Sender: "agent:dev", SenderID: f.agentID,
+			Recipient: "group:topic", RecipientID: "topic:general", Msg: "interpreted", Type: messages.TypeDecisionResponse,
+			AgentID: f.agentID, Channel: "web", ThreadID: "topic:general", DispatchState: store.MessageDispatchDispatched,
+		},
+		FormatMessage: func(items []store.InterpretedFormattedItem) string { return "interpreted" },
+	})
+	require.NoError(t, err)
+
+	// Mismatched Outcome vs Other text (Confirm with changed text, Override with same text) is rejected.
+	_, err = f.cs.RecordAnswerSet(ctx, &store.RecordAnswerSetInput{
+		MessageID:        pIn.Message.ID,
+		AnsweredByUserID: "user-1",
+		AnsweredByName:   "Alice",
+		AnsweredByEmail:  "alice@test.com",
+		Surface:          store.DecisionSurfaceNative,
+		Answers: []store.AnswerSetItem{
+			{DecisionRowID: r0, ChoiceID: messages.ChoiceIDOther, OtherText: "europe-west4", Outcome: store.DecisionOutcomeOverride},
+			{DecisionRowID: r1, ChoiceID: messages.ChoiceIDOther, OtherText: "after 8 PM", Outcome: store.DecisionOutcomeConfirm},
+		},
+		ResponseMessage: &store.Message{
+			ID: uuid.NewString(), ProjectID: f.projectID, Sender: "user:alice@test.com", SenderID: "user-1",
+			Recipient: "agent:dev", RecipientID: f.agentID, Msg: "answered", Type: messages.TypeDecisionResponse,
+			AgentID: f.agentID, Channel: "web", ThreadID: "topic:general",
+		},
+	})
+	var changedErr *store.AnswerSetChangedError
+	require.ErrorAs(t, err, &changedErr)
+	assert.Equal(t, store.AnswerSetReasonDecided, changedErr.Reasons[r0])
+	assert.Equal(t, store.AnswerSetReasonDecided, changedErr.Reasons[r1])
+
+	// Confirm r0 with identical Other text and override r1 with different Other text.
+	setRes, err := f.cs.RecordAnswerSet(ctx, &store.RecordAnswerSetInput{
+		MessageID:        pIn.Message.ID,
+		AnsweredByUserID: "user-1",
+		AnsweredByName:   "Alice",
+		AnsweredByEmail:  "alice@test.com",
+		Surface:          store.DecisionSurfaceNative,
+		Answers: []store.AnswerSetItem{
+			{DecisionRowID: r0, ChoiceID: messages.ChoiceIDOther, OtherText: "europe-west4", Outcome: store.DecisionOutcomeConfirm},
+			{DecisionRowID: r1, ChoiceID: messages.ChoiceIDOther, OtherText: "after 8 PM", Outcome: store.DecisionOutcomeOverride},
+		},
+		ResponseMessage: &store.Message{
+			ID: uuid.NewString(), ProjectID: f.projectID, Sender: "user:alice@test.com", SenderID: "user-1",
+			Recipient: "agent:dev", RecipientID: f.agentID, Msg: "answered", Type: messages.TypeDecisionResponse,
+			AgentID: f.agentID, Channel: "web", ThreadID: "topic:general",
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, setRes.Answers, 2)
+	assert.Equal(t, store.DecisionOutcomeConfirm, setRes.Answers[0].Outcome)
+	assert.Equal(t, "europe-west4", setRes.Answers[0].OtherText)
+	assert.Equal(t, store.DecisionOutcomeOverride, setRes.Answers[1].Outcome)
+	assert.Equal(t, "after 8 PM", setRes.Answers[1].OtherText)
+
+	d0, err := f.cs.GetDecision(ctx, r0)
+	require.NoError(t, err)
+	require.Len(t, d0.Answers, 2)
+	assert.Equal(t, store.DecisionOutcomeConfirm, d0.EffectiveAnswer().Outcome)
+
+	d1, err := f.cs.GetDecision(ctx, r1)
+	require.NoError(t, err)
+	require.Len(t, d1.Answers, 2)
+	assert.Equal(t, store.DecisionOutcomeOverride, d1.EffectiveAnswer().Outcome)
+	assert.Equal(t, "after 6 PM", d1.Answers[0].OtherText)
+	assert.Equal(t, "after 8 PM", d1.Answers[1].OtherText)
+}
+
+func TestDismissDecisions_MinAgeOverride(t *testing.T) {
+	f := newDecisionFixture(t)
+	ctx := context.Background()
+
+	msgID, rowIDs := f.createTopicSet(t, yesNo("D-AGE-OVR", "Override min age?"))
+	row, err := f.cs.GetDecision(ctx, rowIDs[0])
+	require.NoError(t, err)
+
+	// Default (MinAge=0) and negative MinAge enforce the production 5m floor.
+	for _, minAge := range []time.Duration{0, -time.Second} {
+		in := f.dismissInput(msgID, "user-1", "early", func() time.Time {
+			return row.CreatedAt.Add(10 * time.Second)
+		})
+		in.MinAge = minAge
+		_, err = f.cs.DismissDecisions(ctx, in)
+		var tooRecent *store.DecisionTooRecentError
+		require.ErrorAs(t, err, &tooRecent, "minAge=%s", minAge)
+		assert.True(t, row.CreatedAt.Add(store.DecisionDismissMinAge).Equal(tooRecent.AvailableAt))
+	}
+
+	// Positive MinAge (test-mode override) enforces the configured duration.
+	override := 3 * time.Second
+	earlyIn := f.dismissInput(msgID, "user-1", "too early for 3s", func() time.Time {
+		return row.CreatedAt.Add(2 * time.Second)
+	})
+	earlyIn.MinAge = override
+	_, err = f.cs.DismissDecisions(ctx, earlyIn)
+	var tooRecent *store.DecisionTooRecentError
+	require.ErrorAs(t, err, &tooRecent)
+	assert.True(t, row.CreatedAt.Add(override).Equal(tooRecent.AvailableAt))
+
+	okIn := f.dismissInput(msgID, "user-1", "ready at 3s", func() time.Time {
+		return row.CreatedAt.Add(override)
+	})
+	okIn.MinAge = override
+	res, err := f.cs.DismissDecisions(ctx, okIn)
+	require.NoError(t, err)
+	require.Len(t, res.Dismissed, 1)
+	assert.Equal(t, store.DecisionStatusDismissed, res.Dismissed[0].Status)
 }

@@ -177,6 +177,15 @@ While a review is the current version, the artifact shows a *Review pending* bad
 
 **Review** is shown to people who may publish versions of the artifact and to people given review access (see [Share an artifact](#share-an-artifact)). Use **Edit** for a plain edit instead of a review.
 
+#### Review drafts (experimental)
+
+When the `hub.artifacts_review_drafts` [experiment](/scion/reference/experiments/#server-experiments-with-notes) is on (alpha, off by default; requires `hub.artifacts`), the web review editor saves your in-progress review privately on the Hub so you can close the tab or switch devices and resume later before submitting.
+
+- **Saving and submitting:** The review footer shows **Cancel**, **Save Draft**, and **Submit Review** (replacing **Save review**). **Save Draft** saves immediately and resets the autosave timer; it works even before you add any marks or while text outside marks has changed. **Submit Review** publishes your review version as usual (requiring at least one mark and no unmarked edits) and deletes your saved draft on success. **Cancel** leaves Review mode immediately when there are no unsaved changes (keeping your saved draft); when you have unsaved changes, it asks whether to **Save draft and close**, **Discard changes** (reverts to the last saved draft without deleting it), or go **Back to review**.
+- **Autosave and status line:** A status line at the top of the review editor shows `Unsaved changes`, `Saving…`, `Draft saved HH:MM` (in your local time), or a warning if a save could not complete (`Not saved: retrying`, `Changed on another device or tab`, size or count limits, or lost review access, with a **Download** button when a draft cannot be saved). Nothing is saved until you make a change. Your first change starts a 30-second autosave timer (typing does not reset it), and switching away from the tab also triggers a save (for drafts up to 60 KiB). Leaving the page while changes are unsaved triggers a browser warning. If the same draft was saved in another tab or device, autosave pauses and asks whether to **Load the newer draft**, **Keep this one**, or **Download this one**.
+- **Resuming, discarding, and newer versions:** While you have a saved draft, a private **Draft** badge appears beside the header action button (which changes from **Review** to **Resume draft**), in the header **Version** menu, and on the drafted version's row in the **History** tab. Entering Review mode resumes your saved draft directly; in the graphical view, resumed suggestions are read-only, though they can still be edited in **Source** view. To start over instead, choose **Discard draft** from the **Draft** badge menu or the **Version** menu. If a newer version was published while you had a draft, resuming opens a dialog offering **Move my review to vN** (opens Review mode on the current version with your earlier text kept read-only alongside it; nothing is overwritten until you edit), **Download draft**, or **Discard draft**.
+- **Privacy and retention:** Review drafts are strictly private to you — the artifact owner, project admins, and other reviewers cannot see them, and saving or discarding a draft sends no notifications. Drafts are stored on the Hub (never in browser storage), expire 30 days after your last save, and are deleted if the artifact is deleted. See [Artifacts — Review drafts](/scion/reference/artifacts/#review-drafts).
+
 ### Review from the CLI
 
 ```bash
@@ -298,13 +307,13 @@ Keep in mind:
 
 - The Hub keeps only references that you can read, and drops the others with a warning.
 - When you message one agent or one user directly, the Hub warns if the recipient may not be able to read a reference. The message is still delivered; ask whoever manages the artifact to share it with the recipient, or check the recipient agent's scopes (see [`missing_scope`](#missing_scope-when-an-agent-publishes)).
-- `scion message --artifact` cannot be used with `group[...]` recipients or with `--in`/`--at`. Broadcast messages, @-mention copies and messages that arrive through chat plugins lose their references. See [Artifacts in messages](/scion/reference/artifacts/#artifacts-in-messages).
+- `scion message --artifact` cannot be used with `group[...]` recipients. Broadcast messages, @-mention copies and messages that arrive through chat plugins lose their references. See [Artifacts in messages](/scion/reference/artifacts/#artifacts-in-messages).
 
 ## Expiry, moving and deleting
 
 These actions are for **users** who manage the artifact. Agents cannot do any of them.
 
-- **Expiry.** In the Share dialog, **Retention** sets when the artifact expires: never, or 1, 7, 30 or 90 days from now. Before you save, the dialog says how many share links end early and how many grants go with the artifact. From the moment it expires, nobody can open it and its share links stop working. Your Hub may also give new artifacts an expiry by default.
+- **Expiry.** You can set how long an artifact is kept at publish time with `scion artifact publish --expires-in <duration>` (for example `720h`, `30d`, or `never`; see [Retention](/scion/reference/artifacts/#expiry-moving-and-deletion) for agent limits). Afterwards, in the Share dialog, **Retention** sets when the artifact expires: never, or 1, 7, 30 or 90 days from now. Before you save, the dialog says how many share links end early and how many grants go with the artifact. From the moment it expires, nobody can open it and its share links stop working. Your Hub may also give new artifacts an expiry by default.
 - **Moving.** **Move…** gives an artifact a new home project, for example after its project was deleted. It appears on the artifact page, and in the Artifacts list on rows whose home project was deleted, for the owner and users with *Can manage* (not for [stewards](#share-an-agents-artifact)), while the Hub's cross-project sharing setting is on. You must be allowed to publish in the new project. The old home project loses its access unless you add a grant for it.
 - **Deleting.** Run `scion artifact delete <ref>` (users only; add `--yes` when not at a terminal). The owner, a user with *Can manage*, the project owners and admins of the artifact's home project (and super-admins), and, for an artifact owned by an agent, the user who delegated to the agent (while they hold a role in its home project) can delete it. Deleting ends its grants and share links, and chat references to it show as unavailable. **There is no undelete.**
 
@@ -316,7 +325,7 @@ Agents use the same `scion artifact` command, but in agent mode:
 
 - **No share links.** `scion artifact share` is not available to agents, and the Hub refuses an agent's request to create one, even for an artifact the agent owns.
 - **No grants.** Agents cannot add, change or remove grants, including review access.
-- **No deleting, expiry changes or moves.** `scion artifact delete` is not available to agents. In an agent, `share` and `delete` do not exist at all: running one fails with `unknown command "share" for "scion artifact"` (or `"delete"`). That is expected, not a typo or an old CLI.
+- **No deleting, post-publish expiry changes or moves.** Agents can set publish-time retention with `--expires-in` (subject to the Hub's limits), but cannot change expiry afterwards, move an artifact, or delete one. `scion artifact delete` is not available to agents. In an agent, `share` and `delete` do not exist at all: running one fails with `unknown command "share" for "scion artifact"` (or `"delete"`). That is expected, not a typo or an old CLI.
 - **Publishing needs the right agent role.** Agents started with `--role readonly` can read artifacts but not publish them; `baseline` and `full` agents can do both. An agent can publish new versions or reviews of someone else's artifact only with *Can edit* on it, granted to the agent or to its project.
 
 An artifact an agent owns has no user owner, but it does have [stewards](#share-an-agents-artifact): the user who delegated to the agent and the owners of its home project can share it with readers and reviewers outside the project. When someone needs full ownership, they can republish it: fetch it (`scion artifact get <ref> --out <folder>`) and publish it as your own artifact. The copy is a new artifact with its own reference and without the original's history or reviews.
@@ -348,8 +357,8 @@ If the experiment is on but artifacts are disabled in the Hub's settings, the we
 
 ### A review is refused
 
-- **Text outside the marks changed** (`unmarked_changes`). The page, or the CLI, names the lines that changed outside marks. Undo those changes, or mark them, and save again. Use **Edit** or `--version-of` for a plain edit.
-- **A newer version was published, or is being published** (`stale_review`). Review the current version again, once any version being published has finished.
+- **Text outside the marks changed** (`unmarked_changes`). The page, or the CLI, names the lines that changed outside marks. Undo those changes, or mark them, and save again. Use **Edit** or `--version-of` for a plain edit. When `hub.artifacts_review_drafts` is on, your saved draft and editor buffer stay intact so no work is lost.
+- **A newer version was published, or is being published** (`stale_review`). Review the current version again, once any version being published has finished. When `hub.artifacts_review_drafts` is on, your draft and edits stay intact and you can move your review to the current version with your earlier text kept read-only alongside it.
 
 ### An HTML artifact looks broken
 

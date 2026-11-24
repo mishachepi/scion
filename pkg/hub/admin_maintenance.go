@@ -384,6 +384,11 @@ func (s *Server) resolveMaintenanceExecutor(key string) (MaintenanceExecutor, er
 		}), nil
 	case "rebuild-server":
 		installer := s.updateInstaller()
+		_, dbDialect := s.storeDB()
+		dbDriver := "sqlite"
+		if dbDialect == "postgres" || strings.HasPrefix(s.databaseDSN, "postgres://") || strings.HasPrefix(s.databaseDSN, "postgresql://") {
+			dbDriver = "postgres"
+		}
 		log.Debug("Resolved rebuild-server executor",
 			"repo_path", mc.RepoPath, "branch", mc.RepoBranch,
 			"installer", installer.Name(), "service_name", mc.ServiceName)
@@ -396,6 +401,18 @@ func (s *Server) resolveMaintenanceExecutor(key string) (MaintenanceExecutor, er
 			Snapshotter:   s.updateSnapshotter(context.Background()),
 			Store:         s.store,
 			SettingsCheck: s.requiredSettingsCheck,
+			ColocatedBrokerID: func(ctx context.Context) (string, bool, error) {
+				st := s.waitForEmbeddedBroker(ctx)
+				var regErr error
+				if st.regErr != "" {
+					regErr = errors.New(st.regErr)
+				}
+				return s.LegacyColocatedBrokerID(), !st.pending, regErr
+			},
+			DatabaseDSN:    s.databaseDSN,
+			DatabaseDriver: dbDriver,
+			ConfigPath:     s.config.ConfigPath,
+			Audit:          s.auditLogger,
 		}), nil
 	case "rebuild-web":
 		log.Debug("Resolved rebuild-web executor", "repo_path", mc.RepoPath, "branch", mc.RepoBranch)
@@ -504,8 +521,10 @@ func (s *Server) executeOperation(w http.ResponseWriter, r *http.Request, key st
 		_ = json.NewDecoder(r.Body).Decode(&body)
 	}
 	// Check the request as sent, before the parameter parser trims or
-	// drops anything (for example the branch of a Rebuild from git).
-	if _, rej := rebuildpreflight.CheckRunRequest(key, body); rej != nil {
+	// drops anything (for example the branch of a Rebuild from git, or
+	// force/rerunOf on rebuild-server).
+	forceReq, rej := rebuildpreflight.CheckRunRequest(key, body)
+	if rej != nil {
 		log.Debug("Rejected: invalid run request",
 			maintenanceLogAttrs(key, "status", rej.Status, "reason", rej.Message, "user", user.Email())...)
 		code := ErrCodeInvalidRequest
@@ -532,18 +551,59 @@ func (s *Server) executeOperation(w http.ResponseWriter, r *http.Request, key st
 		}
 	}
 
+	// Build a typed ForceGrant when force="true" & rerunOf were requested
+	// (design 3.1 steps 2-5, S1, S2, R1).
+	var grant *rebuildpreflight.ForceGrant
+	if forceReq.RerunOf != "" {
+		targetRun, err := s.store.GetMaintenanceRun(ctx, forceReq.RerunOf)
+		var targetView rebuildpreflight.RunView
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				targetView = rebuildpreflight.RunView{Exists: false}
+			} else {
+				log.Error("Failed to get rerunOf run", maintenanceLogAttrs(key, "rerun_of", forceReq.RerunOf, "error", err)...)
+				writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to look up target run", nil)
+				return
+			}
+		} else {
+			targetView = rebuildpreflight.ParseRunView(true, targetRun.ID, targetRun.OperationKey, targetRun.Status, targetRun.Result)
+		}
+
+		latestRuns, err := s.store.ListMaintenanceRuns(ctx, key, 1)
+		if err != nil {
+			log.Error("Failed to list latest run for force check", maintenanceLogAttrs(key, "error", err)...)
+			writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to check latest run", nil)
+			return
+		}
+		var latestID string
+		if len(latestRuns) > 0 {
+			latestID = latestRuns[0].ID
+		}
+		if rej := rebuildpreflight.CheckRerunTarget(targetView, latestID); rej != nil {
+			code := ErrCodeInvalidRequest
+			if rej.Status == http.StatusConflict {
+				code = ErrCodeConflict
+			}
+			writeError(w, rej.Status, code, rej.Message, nil)
+			return
+		}
+		var grantRej *rebuildpreflight.Reject
+		grant, grantRej = rebuildpreflight.NewGrant(targetView, user.ID(), user.Email())
+		if grantRej != nil {
+			code := ErrCodeInvalidRequest
+			if grantRej.Status == http.StatusConflict {
+				code = ErrCodeConflict
+			}
+			writeError(w, grantRej.Status, code, grantRej.Message, nil)
+			return
+		}
+	}
+
 	// Resolve the executor.
 	executor, err := s.resolveMaintenanceExecutor(key)
 	if err != nil {
 		log.Error("Failed to resolve executor", maintenanceLogAttrs(key, "error", err)...)
 		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error(), nil)
-		return
-	}
-	// An ordinary run has no force grant. No checkpoint writes the run row
-	// yet, so the checkpoint records nothing.
-	if err := wireMaintenanceExecutor(executor, nil, func(map[string]any) error { return nil }); err != nil {
-		log.Error("Failed to prepare executor", maintenanceLogAttrs(key, "error", err)...)
-		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to prepare the operation", nil)
 		return
 	}
 
@@ -589,6 +649,25 @@ func (s *Server) executeOperation(w http.ResponseWriter, r *http.Request, key st
 		StartedAt:    now,
 		StartedBy:    user.Email(),
 	}
+	// CN5-c: record rerunOf at creation time so F1/F13 banners hold even
+	// before Write 1.
+	if grant != nil {
+		if enc, err := encodeRunResult(map[string]any{"rerunOf": grant.RerunOf}); err == nil {
+			run.Result = enc
+		}
+	}
+
+	buf := &runLogBuffer{}
+	if rs, ok := executor.(interface{ SetMaintenanceRunID(string) }); ok {
+		rs.SetMaintenanceRunID(runID)
+	}
+	checkpoint := s.makeMaintenanceCheckpoint(run, buf, grant)
+	if err := wireMaintenanceExecutor(executor, grant, checkpoint); err != nil {
+		log.Error("Failed to prepare executor", maintenanceLogAttrs(key, "error", err)...)
+		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to prepare the operation", nil)
+		return
+	}
+
 	if blocking, err := s.createExclusiveMaintenanceRun(ctx, run); errors.Is(err, errHubRestartPending) {
 		log.Debug("Rejected: hub restart in progress", maintenanceLogAttrs(key, "user", user.Email())...)
 		writeHubRestartPending(w, key)
@@ -604,12 +683,88 @@ func (s *Server) executeOperation(w http.ResponseWriter, r *http.Request, key st
 
 	log.Info("Operation started", maintenanceLogAttrs(key, "run_id", runID, "user", user.Email())...)
 
-	s.launchMaintenanceRun(run, executor, params)
+	s.launchMaintenanceRunWithBuf(run, executor, params, buf)
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"runId":  runID,
 		"status": "running",
 	})
+}
+
+// makeMaintenanceCheckpoint builds the checkpoint closure for a maintenance
+// run (design 3.5, 4.2, Guard A):
+//   - Write 1: persist the run's current Result and Log.
+//   - On a forced override (forced == true, overrideApplied == false):
+//   - Write 2 (Guard A): re-read the failed run; fail if forcedBy is
+//     already set ("the failed run was forced meanwhile"); otherwise write
+//     forcedBy = override verbatim + {runId} onto the failed run.
+//   - Write 1b: set overrideApplied = true on the forced run and persist.
+func (s *Server) makeMaintenanceCheckpoint(run *store.MaintenanceOperationRun, buf *runLogBuffer, grant *rebuildpreflight.ForceGrant) func(map[string]any) error {
+	return func(result map[string]any) error {
+		ctx, cancel := context.WithTimeout(context.Background(), maintenanceCleanupTimeout)
+		defer cancel()
+
+		// Copy so we don't mutate the caller's map unexpectedly.
+		cp := make(map[string]any, len(result))
+		for k, v := range result {
+			cp[k] = v
+		}
+
+		enc, err := encodeRunResult(cp)
+		if err != nil {
+			return fmt.Errorf("encode checkpoint result: %w", err)
+		}
+		run.Result = enc
+		run.Log = buf.String()
+		if err := s.store.UpdateMaintenanceRun(ctx, run); err != nil {
+			return fmt.Errorf("checkpoint write 1: %w", err)
+		}
+
+		// Forced override: perform Write 2 (Guard A) and Write 1b.
+		forced, _ := cp["forced"].(bool)
+		applied, hasApplied := cp["overrideApplied"].(bool)
+		if grant != nil && forced && hasApplied && !applied {
+			ov, ok := cp["override"].(*rebuildpreflight.Override)
+			if !ok || ov == nil {
+				return errors.New("internal: forced checkpoint missing override record")
+			}
+			failedRun, err := s.store.GetMaintenanceRun(ctx, grant.RerunOf)
+			if err != nil {
+				return fmt.Errorf("checkpoint write 2 read failed run: %w", err)
+			}
+			failedMap := map[string]any{}
+			if failedRun.Result != "" {
+				if err := json.Unmarshal([]byte(failedRun.Result), &failedMap); err != nil {
+					return fmt.Errorf("checkpoint write 2 decode failed run result: %w", err)
+				}
+			}
+			if failedMap["forcedBy"] != nil {
+				return errors.New("the failed run was forced meanwhile")
+			}
+			failedMap["forcedBy"] = rebuildpreflight.ForcedByRecord(ov, run.ID)
+			failedEnc, err := encodeRunResult(failedMap)
+			if err != nil {
+				return fmt.Errorf("checkpoint write 2 encode failed run result: %w", err)
+			}
+			failedRun.Result = failedEnc
+			if err := s.store.UpdateMaintenanceRun(ctx, failedRun); err != nil {
+				return fmt.Errorf("checkpoint write 2 update failed run: %w", err)
+			}
+
+			// Write 1b: mark overrideApplied: true on the forced run.
+			cp["overrideApplied"] = true
+			enc1b, err := encodeRunResult(cp)
+			if err != nil {
+				return fmt.Errorf("checkpoint write 1b encode: %w", err)
+			}
+			run.Result = enc1b
+			run.Log = buf.String()
+			if err := s.store.UpdateMaintenanceRun(ctx, run); err != nil {
+				return fmt.Errorf("checkpoint write 1b update: %w", err)
+			}
+		}
+		return nil
+	}
 }
 
 // wireMaintenanceExecutor hands an executor what its run needs before Run:
@@ -1071,7 +1226,7 @@ func (s *Server) handleUpdateAvailable(w http.ResponseWriter, r *http.Request) {
 // symlink layout exits the hub (SIGTERM to itself; systemd Restart=always
 // starts it again), which is requested only after the response is written;
 // sudo-install runs its allowed `sudo -n systemctl restart` rule. Where the
-// installer is unsupported the previous behaviour is kept: `sudo systemctl
+// installer is unsupported the previous behaviour is kept: `sudo -n systemctl
 // restart --no-block <service>`, which works only where the hub user has
 // such a sudo rule.
 //
@@ -1168,15 +1323,28 @@ func (s *Server) handleAdminRestart(w http.ResponseWriter, r *http.Request) {
 	// deadlock.  With --no-block, systemd returns immediately, cmd.Run()
 	// completes, and we can send the response before the process is
 	// killed.
-	cmd := exec.Command("sudo", "systemctl", "restart", "--no-block", serviceName)
-	if err := cmd.Run(); err != nil {
-		if maintenance.IsStopSignalExit(err) {
+	// Detach from request cancellation (as with StrategySudoInstall) so a
+	// client disconnect does not abort a queued restart, while bounding the
+	// command with adminRestartTimeout and passing -n so sudo never prompts.
+	restartCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), s.effectiveLegacyRestartTimeout())
+	defer cancel()
+	if stderr, err := s.runLegacyRestart(restartCtx, serviceName); err != nil {
+		if restartCtx.Err() == nil && maintenance.IsStopSignalExit(err) {
 			log.Info("Hub restart command terminated by stop signal; restart is under way", "service", serviceName, "user", user.Email())
 			writeRestartAccepted(w)
 			return
 		}
 		s.releaseHubRestart(stamp)
-		log.Error("Failed to initiate hub restart", "error", err, "user", user.Email())
+		attrs := []any{"user", user.Email()}
+		if stderr != "" {
+			attrs = append(attrs, "stderr", stderr)
+		}
+		if restartCtx.Err() != nil {
+			attrs = append([]any{"error", restartCtx.Err(), "cause", err}, attrs...)
+		} else {
+			attrs = append([]any{"error", err}, attrs...)
+		}
+		log.Error("Failed to initiate hub restart", attrs...)
 		writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
 			"Failed to initiate restart", nil)
 		return
@@ -1191,6 +1359,44 @@ const adminRestartSignalDelay = 250 * time.Millisecond
 
 // adminRestartTimeout bounds the installer's Restart for Restart Hub.
 const adminRestartTimeout = 30 * time.Second
+
+// legacyRestartMaxStderrBytes caps stderr captured from the legacy restart
+// sudo command so a noisy subprocess cannot bloat memory or logs.
+const legacyRestartMaxStderrBytes = 1024
+
+type limitedBuffer struct {
+	buf bytes.Buffer
+	max int
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	if rem := b.max - b.buf.Len(); rem > 0 {
+		if len(p) > rem {
+			b.buf.Write(p[:rem])
+		} else {
+			b.buf.Write(p)
+		}
+	}
+	return len(p), nil
+}
+
+func (s *Server) runLegacyRestart(ctx context.Context, serviceName string) (string, error) {
+	if s.legacyRestartRunner != nil {
+		return "", s.legacyRestartRunner(ctx, "sudo", "-n", "systemctl", "restart", "--no-block", serviceName)
+	}
+	cmd := exec.CommandContext(ctx, "sudo", "-n", "systemctl", "restart", "--no-block", serviceName)
+	stderr := &limitedBuffer{max: legacyRestartMaxStderrBytes}
+	cmd.Stderr = stderr
+	err := cmd.Run()
+	return strings.TrimSpace(stderr.buf.String()), err
+}
+
+func (s *Server) effectiveLegacyRestartTimeout() time.Duration {
+	if s.legacyRestartTimeout > 0 {
+		return s.legacyRestartTimeout
+	}
+	return adminRestartTimeout
+}
 
 // writeRestartAccepted writes the Restart Hub response and flushes it.
 func writeRestartAccepted(w http.ResponseWriter) {

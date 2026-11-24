@@ -21,6 +21,8 @@
  */
 
 import { apiFetch, extractApiError } from './api.js';
+import { wakeOfferFromErrorBody } from './wake-offer.js';
+import type { WakeOffer } from './wake-offer.js';
 
 export { ARTIFACTS_FLAG } from './artifacts-flag.js';
 
@@ -114,6 +116,27 @@ export interface ArtifactResponse {
    * whether the version's files can be downloaded as one zip.
    */
   archive?: ArtifactArchive;
+  /**
+   * On a finalized review of an agent-owned artifact whose owner was
+   * suspended (ptone/scion#8946): whether the agent is being woken, was
+   * woken, or remains suspended.
+   */
+  reviewDelivery?: ReviewDeliveryInfo;
+}
+
+export type ReviewDeliveryStatus =
+  | 'auto_waking'
+  | 'woken'
+  | 'waking'
+  | 'suspended'
+  | 'wake_refused'
+  | 'wake_failed';
+
+export interface ReviewDeliveryInfo {
+  status: ReviewDeliveryStatus;
+  agentId?: string;
+  agentSlug?: string;
+  message?: string;
 }
 
 /** ArtifactResponse.archive: the hub's answer for the version's zip download. */
@@ -275,6 +298,16 @@ export function artifactFileUrl(id: string, seq: number, path: string, stream = 
   const version = seq > 0 ? `/versions/${seq}` : '';
   const query = stream ? '?stream=1' : '';
   return `/api/v1/artifacts/${encodeURIComponent(id)}${version}/files/${encodedPath}${query}`;
+}
+
+/**
+ * URL that forces a file download (Content-Disposition: attachment) for every
+ * media type, including types the browser would otherwise show inline and
+ * cross-origin object-storage redirects where the HTML download attribute is
+ * ignored (ptone/scion#8958).
+ */
+export function artifactDownloadUrl(id: string, seq: number, path: string): string {
+  return `${artifactFileUrl(id, seq, path)}?download=1`;
 }
 
 /** The zip of every file of version seq (ptone/scion#7106). */
@@ -580,6 +613,17 @@ export interface PublishRequest {
    * it the hub may refuse the publish (ReviewOpenError).
    */
   force?: boolean | undefined;
+  /**
+   * For a review finalize, ask the hub to offer a wake confirmation (409
+   * ReviewWakeOfferError) when the owning agent is user-suspended and the
+   * caller may wake it.
+   */
+  offerWake?: boolean | undefined;
+  /**
+   * For a review finalize, ask the hub to wake a suspended owning agent
+   * before delivering the review notice.
+   */
+  wake?: boolean | undefined;
 }
 
 /** A pending version that a failed publish left behind. */
@@ -669,6 +713,23 @@ async function reviewOpenError(res: Response): Promise<ReviewOpenError | null> {
   );
 }
 
+/**
+ * The hub paused a review finalize because the owning agent is user-suspended
+ * and the caller may wake it (409 agent_not_running with canWake=true).
+ * The pending version stays intact in `pending` so the caller can retry
+ * finalize with `wake: true` (confirmed) or `offerWake: false` (declined).
+ */
+export class ReviewWakeOfferError extends PublishError {
+  constructor(
+    message: string,
+    readonly offer: WakeOffer,
+    pending: PendingPublish | null
+  ) {
+    super(message, pending, 'agent_not_running');
+    this.name = 'ReviewWakeOfferError';
+  }
+}
+
 /** How long the hub keeps a version that was never finalized. */
 export const PENDING_VERSION_LIFETIME = '24 hours';
 
@@ -751,6 +812,14 @@ export async function publishFiles(req: PublishRequest): Promise<ArtifactRespons
         code
       );
     }
+    if (res.status === 409) {
+      const offer = wakeOfferFromErrorBody(body);
+      if (offer) {
+        const msg =
+          (body as { error?: { message?: string } }).error?.message || 'Agent is suspended';
+        throw new ReviewWakeOfferError(msg, offer, left());
+      }
+    }
     const message = prefix + (await extractApiError(res, `HTTP ${res.status}`));
     // The version is gone (404), no longer pending (409 conflict), or not
     // the caller's (403): another attempt must start a new version.
@@ -796,13 +865,18 @@ export async function publishFiles(req: PublishRequest): Promise<ArtifactRespons
   }
   let res: Response;
   try {
+    const finalizeBody: { base?: number | undefined; offer_wake?: boolean; wake?: boolean } = {
+      base: req.base,
+    };
+    if (req.offerWake) finalizeBody.offer_wake = true;
+    if (req.wake) finalizeBody.wake = true;
     res = await apiFetch(
       `${artifactPath(id)}/versions/${seq}/finalize`,
       req.kind === 'review'
         ? {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ base: req.base }),
+            body: JSON.stringify(finalizeBody),
           }
         : { method: 'POST' }
     );
@@ -883,6 +957,252 @@ export async function endReviewSession(
     });
   } catch {
     // Best effort.
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Durable artifact review drafts (ptone/scion#7116, ptone/scion#8471)
+// ---------------------------------------------------------------------------
+
+/** Maximum UTF-8 byte length of a saved draft body or carried body (1 MiB). */
+export const MAX_DRAFT_BODY_BYTES = 1 << 20;
+
+/** Maximum serialized request size sent with fetch keepalive on tab hide (60 KiB). */
+export const DRAFT_KEEPALIVE_LIMIT_BYTES = 60 * 1024;
+
+/** Read-only earlier review text kept when a draft was moved to a newer version. */
+export interface CarriedReviewDraft {
+  base: number;
+  body: string;
+}
+
+/** The caller's saved draft review of an artifact. */
+export interface ReviewDraft {
+  rev: number;
+  base: number;
+  entry: string;
+  body: string;
+  note: string;
+  carried: CarriedReviewDraft | null;
+  savedAt: string;
+  createdAt: string;
+}
+
+/** Body of GET /api/v1/artifacts/{id}/review-draft. */
+export interface ReviewDraftResponse {
+  draft: ReviewDraft | null;
+  currentSeq: number;
+}
+
+/** Body of PUT /api/v1/artifacts/{id}/review-draft. */
+export interface PutReviewDraftRequest {
+  rev: number;
+  base: number;
+  entry: string;
+  body: string;
+  note: string;
+  carried?: CarriedReviewDraft | null;
+  clientSavedAt?: string;
+}
+
+/** Body of 200 response from PUT /api/v1/artifacts/{id}/review-draft. */
+export interface PutReviewDraftResponse {
+  rev: number;
+  savedAt: string;
+  currentSeq: number;
+}
+
+/**
+ * Thrown when PUT or conditional DELETE /review-draft fails with 409
+ * draft_conflict because another device or tab wrote a newer revision.
+ * The server never returns the draft body in a 409; the client calls
+ * getReviewDraft if the user chooses to load it.
+ */
+export class DraftConflictError extends Error {
+  readonly status = 409;
+  readonly code = 'draft_conflict';
+  readonly rev: number;
+  readonly savedAt: string | null;
+  readonly base: number;
+
+  constructor(message: string, rev: number, savedAt: string | null, base: number) {
+    super(message);
+    this.name = 'DraftConflictError';
+    this.rev = rev;
+    this.savedAt = savedAt;
+    this.base = base;
+  }
+}
+
+/** Structured error for non-conflict review-draft API failures. */
+export class DraftApiError extends Error {
+  readonly status: number;
+  readonly code: string;
+  readonly limit: number | undefined;
+  readonly retryAfterMs: number | undefined;
+
+  constructor(
+    message: string,
+    status: number,
+    code: string,
+    opts?: { limit?: number | undefined; retryAfterMs?: number | undefined }
+  ) {
+    super(message);
+    this.name = 'DraftApiError';
+    this.status = status;
+    this.code = code;
+    this.limit = opts?.limit;
+    this.retryAfterMs = opts?.retryAfterMs;
+  }
+}
+
+function reviewDraftPath(artifactId: string, rev?: number): string {
+  const base = `${artifactPath(artifactId)}/review-draft`;
+  return typeof rev === 'number' && rev > 0
+    ? `${base}?rev=${encodeURIComponent(String(rev))}`
+    : base;
+}
+
+/** Parses an HTTP Retry-After header (seconds or HTTP-date) into milliseconds. */
+export function parseRetryAfterMs(header: string | null, nowMs = Date.now()): number | undefined {
+  if (!header) return undefined;
+  const trimmed = header.trim();
+  if (!trimmed) return undefined;
+  if (/^\d+$/.test(trimmed)) {
+    return Number(trimmed) * 1000;
+  }
+  const ts = Date.parse(trimmed);
+  if (Number.isFinite(ts)) {
+    return Math.max(0, ts - nowMs);
+  }
+  return undefined;
+}
+
+async function throwDraftError(res: Response): Promise<never> {
+  let body: {
+    error?: {
+      code?: string;
+      message?: string;
+      details?: {
+        rev?: unknown;
+        savedAt?: unknown;
+        base?: unknown;
+        limit?: unknown;
+      };
+    };
+  } = {};
+  try {
+    body = (await res.clone().json()) as typeof body;
+  } catch {
+    // Not JSON; fall through with status.
+  }
+  const code = body.error?.code ?? '';
+  const details = body.error?.details ?? {};
+  if (res.status === 409 && code === 'draft_conflict') {
+    throw new DraftConflictError(
+      body.error?.message || 'This draft review was changed elsewhere.',
+      typeof details.rev === 'number' ? details.rev : 0,
+      typeof details.savedAt === 'string' && details.savedAt ? details.savedAt : null,
+      typeof details.base === 'number' ? details.base : 0
+    );
+  }
+  const message = body.error?.message || (await extractApiError(res, `HTTP ${res.status}`));
+  const limit = typeof details.limit === 'number' ? details.limit : undefined;
+  const retryAfterMs = parseRetryAfterMs(res.headers.get('Retry-After'));
+  throw new DraftApiError(message, res.status, code, { limit, retryAfterMs });
+}
+
+/** Reads the caller's saved review draft for an artifact (null when none exists). */
+export async function getReviewDraft(
+  artifactId: string,
+  opts: { signal?: AbortSignal } = {}
+): Promise<ReviewDraftResponse> {
+  const res = await apiFetch(reviewDraftPath(artifactId), {
+    method: 'GET',
+    ...(opts.signal ? { signal: opts.signal } : {}),
+  });
+  if (!res.ok) await throwDraftError(res);
+  return (await res.json()) as ReviewDraftResponse;
+}
+
+/** Creates (rev=0) or updates (rev=N) the caller's saved review draft. */
+export async function putReviewDraft(
+  artifactId: string,
+  req: PutReviewDraftRequest,
+  opts: { keepalive?: boolean; signal?: AbortSignal } = {}
+): Promise<PutReviewDraftResponse> {
+  const res = await apiFetch(reviewDraftPath(artifactId), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+    keepalive: opts.keepalive === true,
+    ...(opts.signal && !opts.keepalive ? { signal: opts.signal } : {}),
+  });
+  if (!res.ok) await throwDraftError(res);
+  return (await res.json()) as PutReviewDraftResponse;
+}
+
+/** Deletes the caller's saved review draft, optionally conditional on rev. */
+export async function deleteReviewDraft(
+  artifactId: string,
+  opts: { rev?: number; signal?: AbortSignal } = {}
+): Promise<void> {
+  const res = await apiFetch(reviewDraftPath(artifactId, opts.rev), {
+    method: 'DELETE',
+    ...(opts.signal ? { signal: opts.signal } : {}),
+  });
+  if (res.status === 204 || res.ok) return;
+  await throwDraftError(res);
+}
+
+/**
+ * Derives a safe local download filename from an untrusted hub entry_path
+ * (security condition C6): uses only the final path element (splitting on
+ * both '/' and '\\'), refuses empty/'.'/'..'/volume/control-char names, and
+ * falls back to `review-of-v<base>.md`.
+ */
+export function safeReviewDownloadName(entryPath: string, base: number): string {
+  const fallback = `review-of-v${base}.md`;
+  if (!entryPath) return fallback;
+  // Reject control characters anywhere in the path, absolute/volume/UNC paths,
+  // or trailing separators.
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f\u007f]/.test(entryPath)) return fallback;
+  if (
+    entryPath.startsWith('/') ||
+    entryPath.startsWith('\\') ||
+    /^[A-Za-z]:/.test(entryPath) ||
+    entryPath.endsWith('/') ||
+    entryPath.endsWith('\\')
+  ) {
+    return fallback;
+  }
+  const parts = entryPath.split(/[/\\]/);
+  const last = parts[parts.length - 1] ?? '';
+  if (!last || last === '.' || last === '..' || last.includes(':') || /^[A-Za-z]:/.test(last)) {
+    return fallback;
+  }
+  const stem = last.replace(/\.md$/i, '');
+  if (!stem || stem === '.' || stem === '..') {
+    return fallback;
+  }
+  return `${stem}-review-of-v${base}.md`;
+}
+
+/** Triggers a browser download of plain text without touching browser storage. */
+export function downloadTextFile(filename: string, text: string): void {
+  const blob = new Blob([text], { type: 'text/markdown;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  try {
+    a.click();
+  } finally {
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 100);
   }
 }
 

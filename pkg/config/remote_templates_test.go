@@ -425,6 +425,15 @@ func TestValidateRemoteURI(t *testing.T) {
 	}
 }
 
+func BenchmarkValidateRemoteURI_Rclone(b *testing.B) {
+	uri := ":gcs:bucket/path/to/template"
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = ValidateRemoteURI(uri)
+	}
+}
+
 func TestSanitizePath(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -672,6 +681,7 @@ func TestFetchGitHubTarball(t *testing.T) {
 		status    int
 		root      string
 		wantPath  string
+		alsoTried []string
 		wantAuth  string
 		wantFiles map[string]string
 		wantErr   string
@@ -704,8 +714,10 @@ func TestFetchGitHubTarball(t *testing.T) {
 			status:   http.StatusNotFound,
 			root:     "private-main",
 			wantPath: "/acme/private/archive/refs/heads/main.tar.gz",
-			wantAuth: "Bearer ghs_test_token_123",
-			wantErr:  "tarball download failed: HTTP 404",
+			// The ref may be a tag or a commit: those archives are tried next.
+			alsoTried: []string{"/acme/private/archive/refs/tags/main.tar.gz", "/acme/private/archive/main.tar.gz"},
+			wantAuth:  "Bearer ghs_test_token_123",
+			wantErr:   `GitHub branch, tag or commit "main" was not found in acme/private: tarball download failed: HTTP 404`,
 		},
 		{
 			name:     "missing sub-path is an error",
@@ -736,14 +748,17 @@ func TestFetchGitHubTarball(t *testing.T) {
 			mu.Lock()
 			gotSeen := append([]seenRequest(nil), seen...)
 			mu.Unlock()
-			require.Len(t, gotSeen, 1, "exactly one HTTP request")
-			assert.Equal(t, seenRequest{
-				method: http.MethodGet,
-				scheme: "https",
-				host:   "github.com",
-				path:   tt.wantPath,
-				auth:   tt.wantAuth,
-			}, gotSeen[0])
+			wantPaths := append([]string{tt.wantPath}, tt.alsoTried...)
+			require.Len(t, gotSeen, len(wantPaths), "one HTTP request per archive tried")
+			for i, path := range wantPaths {
+				assert.Equal(t, seenRequest{
+					method: http.MethodGet,
+					scheme: "https",
+					host:   "github.com",
+					path:   path,
+					auth:   tt.wantAuth,
+				}, gotSeen[i])
+			}
 			if tt.wantErr != "" {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.wantErr)

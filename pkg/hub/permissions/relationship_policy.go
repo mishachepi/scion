@@ -195,9 +195,12 @@ var RelationshipPolicies = []RelationshipPolicy{
 		ReadOnly:       true,
 	},
 	{
-		// progeny/agent/secret (TestRelationshipCharacterization_Progeny). The
-		// Decide resource type is "secret"; the permission is registered on
-		// project (reviewed cross-type cell).
+		// progeny/agent/secret compatibility row
+		// (storeProgenyAdapter.ReadPermissions,
+		// TestRelationshipCharacterization_Progeny); dispatcher resolution
+		// authorizes user-scope progeny secrets via secret.use. The Decide
+		// resource type is "secret"; the permission is registered on project
+		// (reviewed cross-type cell).
 		Relationship:   "progeny",
 		PrincipalKinds: []string{"agent"},
 		ResourceType:   "secret",
@@ -281,6 +284,12 @@ var RelationshipPolicies = []RelationshipPolicy{
 		PrincipalKinds: []string{"agent"},
 		ResourceType:   "env_var",
 		PermissionIDs:  []string{"env_var.deliver"},
+	},
+	{
+		Relationship:   "agent_association",
+		PrincipalKinds: []string{"agent"},
+		ResourceType:   "secret",
+		PermissionIDs:  []string{"secret.deliver"},
 	},
 }
 

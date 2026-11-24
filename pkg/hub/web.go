@@ -109,6 +109,7 @@ const (
 	sessKeyHubRefreshToken   = "hubRefreshToken"
 	sessKeyHubTokenExpiry    = "hubTokenExpiry"
 	sessKeySessionGeneration = "sessGen"
+	sessKeyViewAsMember      = "vam"
 )
 
 // webUserContextKey is the key for storing the web session user in the request context.
@@ -122,11 +123,12 @@ type dbUserContextKey struct{}
 
 // webSessionUser represents an authenticated user from the web session.
 type webSessionUser struct {
-	UserID    string `json:"id"`
-	Email     string `json:"email"`
-	Name      string `json:"displayName"`
-	AvatarURL string `json:"avatarUrl,omitempty"`
-	Role      string `json:"role,omitempty"`
+	UserID       string `json:"id"`
+	Email        string `json:"email"`
+	Name         string `json:"displayName"`
+	AvatarURL    string `json:"avatarUrl,omitempty"`
+	Role         string `json:"role,omitempty"`
+	ViewAsMember bool   `json:"viewAsMember,omitempty"`
 
 	// Preferences is populated only by handleAuthMe, from a live store read,
 	// never cached on the session. It is nil wherever webSessionUser is
@@ -136,6 +138,23 @@ type webSessionUser struct {
 	// TestIdentity is set only by handleAuthMe, for a valid test identity
 	// web session (ptone/scion#4240, WS1).
 	TestIdentity *webTestIdentityInfo `json:"testIdentity,omitempty"`
+
+	// storedRole holds the session's real (unclamped) role from sessKeyUserRole.
+	// Unexported so it is never serialized to JSON; only RealByDesign gates
+	// (such as adminModeWebMiddleware, ptone/scion#8648 D4) read it via realRole.
+	storedRole string
+}
+
+// realRole returns the user's real (stored) role, falling back to Role when
+// constructed directly in tests without storedRole.
+func (u *webSessionUser) realRole() string {
+	if u == nil {
+		return ""
+	}
+	if u.storedRole != "" {
+		return u.storedRole
+	}
+	return u.Role
 }
 
 // getWebSessionUser retrieves the web session user from the request context.
@@ -173,8 +192,12 @@ type AccessSettingsProvider interface {
 	// ("open", "domain_restricted", "invite_only").
 	UserAccessMode() string
 	// DefaultUserRole returns the configured default role for new users
-	// ("member" or "viewer"). Returns "member" when unconfigured.
+	// ("member", "viewer", or a custom system-scope role name when enabled).
+	// Returns "member" when unconfigured.
 	DefaultUserRole() string
+	// CustomDefaultRoleEnabled reports whether the hub.custom_default_user_role
+	// experiment is enabled.
+	CustomDefaultRoleEnabled() bool
 }
 
 // WebServerConfig holds configuration for the web frontend server.
@@ -321,6 +344,9 @@ type WebServer struct {
 	// testIdentityHub is the hub whose test identity state backs test
 	// identity web sessions (SetTestIdentityWebSessions), or nil.
 	testIdentityHub *Server
+	// viewAsMemberHub is the hub whose policy, audit, and SSE hooks back
+	// POST /auth/view-as-member (SetViewAsMemberHub), or nil.
+	viewAsMemberHub viewAsMemberHub
 	// testIdentityRedeemLimiter rate-limits POST /auth/test-identity/redeem
 	// per source IP, and in proxy mode also per verified proxy assertion
 	// email (a separate key, testIdentityRedeemEmailRateKey).
@@ -408,7 +434,13 @@ var spaShellTemplate = `{{template "head" .}}{{template "body" .}}
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 
     <!-- Fonts -->
+{{- if .HasCustomFontSans}}
+{{- if .BrandFontSansURL}}
+    <link id="scion-brand-font-sans" href="{{.BrandFontSansURL}}" rel="stylesheet">
+{{- end}}
+{{- else}}
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+{{- end}}
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 
     <!-- Shoelace components, theme CSS and icons are bundled with the client
@@ -559,6 +591,8 @@ var spaShellTemplate = `{{template "head" .}}{{template "body" .}}
         /* Prevent FOUC for custom elements */
         scion-app:not(:defined),
         scion-login-page:not(:defined),
+        scion-page-invite:not(:defined),
+        scion-page-onboarding:not(:defined),
         scion-nav:not(:defined),
         scion-header:not(:defined),
         scion-breadcrumb:not(:defined),
@@ -608,7 +642,7 @@ var spaShellTemplate = `{{template "head" .}}{{template "body" .}}
 </head>
 {{end}}
 {{- define "body"}}<body>
-    <div id="app">{{if .IsLoginPage}}<scion-login-page></scion-login-page>{{else if .IsInvitePage}}<scion-page-invite></scion-page-invite>{{else}}<scion-app></scion-app>{{end}}</div>
+    <div id="app">{{if .IsLoginPage}}<scion-login-page></scion-login-page>{{else if .IsInvitePage}}<scion-page-invite></scion-page-invite>{{else if .IsOnboardingPage}}<scion-page-onboarding></scion-page-onboarding>{{else}}<scion-app></scion-app>{{end}}</div>
 
     <!-- Initial state for hydration -->
     <script id="__SCION_DATA__" type="application/json">{{.InitialData}}</script>
@@ -675,6 +709,11 @@ func renderNoAssetsPage(b *config.ResolvedBranding) string {
 	if b.HasCustomPalette {
 		bodyColor = dark.Text
 	}
+	codeRadius, hintRadius := brandPageNoAssetsRadii(b)
+	fontStack := "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+	if b.FontSans != "" && b.FontSans != config.BrandFontSansDefault && b.FontSansStack != "" {
+		fontStack = b.FontSansStack
+	}
 	var badgeHTML string
 	if isCustomBrandIdentity(b) {
 		badgeHTML = fmt.Sprintf("\n        <span class=\"badge\">%s</span>", html.EscapeString(brandBadgeText(b)))
@@ -688,7 +727,7 @@ func renderNoAssetsPage(b *config.ResolvedBranding) string {
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-family: %s;
             background: %s; color: %s;
             display: flex; align-items: center; justify-content: center;
             min-height: 100vh; padding: 2rem;
@@ -704,12 +743,12 @@ func renderNoAssetsPage(b *config.ResolvedBranding) string {
         h1 { font-size: 1.5rem; margin-bottom: 1rem; color: %s; }
         p  { line-height: 1.6; margin-bottom: 1rem; color: %s; }
         code {
-            background: %s; padding: 0.15em 0.4em; border-radius: 4px;
+            background: %s; padding: 0.15em 0.4em; border-radius: %s;
             font-size: 0.9em; color: %s;
         }
         .hint {
             margin-top: 1.5rem; padding: 1rem; background: %s;
-            border-radius: 8px; text-align: left; font-size: 0.9rem;
+            border-radius: %s; text-align: left; font-size: 0.9rem;
         }
         .hint p { margin-bottom: 0.5rem; }
         .hint p:last-child { margin-bottom: 0; }
@@ -734,11 +773,12 @@ func renderNoAssetsPage(b *config.ResolvedBranding) string {
 </body>
 </html>`,
 		html.EscapeString(b.Name),
+		fontStack,
 		dark.Bg, bodyColor,
 		dark.Text,
 		dark.TextMuted,
-		dark.Surface, dark.Primary,
-		dark.Surface,
+		dark.Surface, codeRadius, dark.Primary,
+		dark.Surface, hintRadius,
 		dark.Primary, dark.Border, dark.Surface,
 		brandLogoHTML(b),
 		badgeHTML,
@@ -749,13 +789,16 @@ func renderNoAssetsPage(b *config.ResolvedBranding) string {
 type spaShellData struct {
 	IsLoginPage        bool
 	IsInvitePage       bool
+	IsOnboardingPage   bool
 	BrandTitle         string
 	HasCustomFavicon   bool
 	FaviconHref        string
 	FaviconType        string
 	AppleTouchIconHref string
 	ThemeColor         string
-	// BrandingCSS holds validated custom palette CSS rules injected into
+	HasCustomFontSans  bool
+	BrandFontSansURL   string
+	// BrandingCSS holds validated custom palette and style CSS rules injected into
 	// <style id="scion-branding-tokens"> in <head> for zero-FOUC first paint.
 	BrandingCSS template.CSS
 	// InitialData is safe-for-HTML JSON embedded in the __SCION_DATA__ script tag.
@@ -1147,6 +1190,15 @@ func (ws *WebServer) defaultUserRole() string {
 	return ws.accessSettings.DefaultUserRole()
 }
 
+// customDefaultRoleEnabled reports whether the hub.custom_default_user_role
+// experiment is enabled via the access settings provider.
+func (ws *WebServer) customDefaultRoleEnabled() bool {
+	if ws.accessSettings == nil {
+		return false
+	}
+	return ws.accessSettings.CustomDefaultRoleEnabled()
+}
+
 // auditLoggerSource is implemented by an access settings provider that also
 // carries the hub's audit logger. *Server is the production provider (see
 // SetAccessSettingsProvider's caller in cmd/server_foreground.go).
@@ -1352,6 +1404,7 @@ func (ws *WebServer) sessionToBearerMiddleware(next http.Handler) http.Handler {
 		// tiSessionNotFixture / tiSessionUserMissing: an ordinary account
 		// (a missing one is refused by the hub's row block); continue.
 
+		sessionVam := sessionViewAsMember(session)
 		accessToken, _ := session.Values[sessKeyHubAccessToken].(string)
 		if accessToken == "" {
 			// Session has no Hub token — this happens when the OAuth callback's
@@ -1367,7 +1420,15 @@ func (ws *WebServer) sessionToBearerMiddleware(next http.Handler) http.Handler {
 				// read: a session established before a revocation yields a
 				// token the hub refuses. A cookie without the key reads 0.
 				gen, _ := session.Values[sessKeySessionGeneration].(int64)
-				if tok, _, err := ws.userTokenSvc.MintAccessToken(uid, email, name, role, gen, ClientTypeWeb); err == nil {
+				if tok, _, err := ws.userTokenSvc.MintAccessToken(UserTokenSubject{
+					UserID:            uid,
+					Email:             email,
+					DisplayName:       name,
+					Role:              role,
+					SessionGeneration: gen,
+					ClientType:        ClientTypeWeb,
+					ViewAsMember:      sessionVam,
+				}); err == nil {
 					accessToken = tok
 				} else {
 					ws.logger().Warn("Failed to regenerate Bearer token for cookie-overflow session", "error", err, "user", uid)
@@ -1393,11 +1454,18 @@ func (ws *WebServer) sessionToBearerMiddleware(next http.Handler) http.Handler {
 
 		// Validate the access token. If the signing key was rotated,
 		// the token will fail signature verification and we must
-		// force the user to re-authenticate.
+		// force the user to re-authenticate. If the token's vam claim
+		// disagrees with the session cookie, heal to the cookie by
+		// re-minting from session values (the cookie is the source of truth).
 		tokenValid := false
+		vamMismatch := false
 		if ws.userTokenSvc != nil {
-			if _, err := ws.userTokenSvc.ValidateUserToken(accessToken); err == nil {
-				tokenValid = true
+			if claims, err := ws.userTokenSvc.ValidateUserToken(accessToken); err == nil && isBearerTokenType(claims.TokenType) {
+				if claims.ViewAsMember != sessionVam {
+					vamMismatch = true
+				} else {
+					tokenValid = true
+				}
 			}
 		} else {
 			// No token service — pass through and let Hub decide.
@@ -1405,6 +1473,36 @@ func (ws *WebServer) sessionToBearerMiddleware(next http.Handler) http.Handler {
 		}
 
 		saved := false
+		if vamMismatch && ws.userTokenSvc != nil {
+			if uid, ok := session.Values[sessKeyUserID].(string); ok && uid != "" {
+				email, _ := session.Values[sessKeyUserEmail].(string)
+				name, _ := session.Values[sessKeyUserName].(string)
+				role, _ := session.Values[sessKeyUserRole].(string)
+				gen, _ := session.Values[sessKeySessionGeneration].(int64)
+				if newAccess, newRefresh, expiresIn, err := ws.userTokenSvc.MintTokenPair(UserTokenSubject{
+					UserID:            uid,
+					Email:             email,
+					DisplayName:       name,
+					Role:              role,
+					SessionGeneration: gen,
+					ClientType:        ClientTypeWeb,
+					ViewAsMember:      sessionVam,
+				}); err == nil {
+					accessToken = newAccess
+					tokenValid = true
+					session.Values[sessKeyHubAccessToken] = newAccess
+					session.Values[sessKeyHubRefreshToken] = newRefresh
+					session.Values[sessKeyHubTokenExpiry] = time.Now().Add(time.Duration(expiresIn) * time.Second).UnixMilli()
+					saved = true
+					ws.applyDevSessionCookieOptions(session)
+					if err := session.Save(r, w); err != nil {
+						ws.logger().Warn("Failed to persist healed Hub token to session", "error", err)
+					}
+				} else {
+					ws.logger().Warn("Failed to re-mint Hub token on view-as-member mismatch", "error", err, "user", uid)
+				}
+			}
+		}
 		// If token is invalid (expired or bad signature), try to refresh.
 		if !tokenValid {
 			refreshToken, _ := session.Values[sessKeyHubRefreshToken].(string)
@@ -1546,7 +1644,15 @@ func (ws *WebServer) refreshHubTokens(ctx context.Context, refreshToken string) 
 			return "", "", 0, errHubRefreshRefused
 		}
 	}
-	return ws.userTokenSvc.MintTokenPair(claims.UserID, claims.Email, claims.DisplayName, claims.Role, claims.SessionGeneration, claims.ClientType)
+	return ws.userTokenSvc.MintTokenPair(UserTokenSubject{
+		UserID:            claims.UserID,
+		Email:             claims.Email,
+		DisplayName:       claims.DisplayName,
+		Role:              claims.Role,
+		SessionGeneration: claims.SessionGeneration,
+		ClientType:        claims.ClientType,
+		ViewAsMember:      claims.ViewAsMember && claims.ClientType == ClientTypeWeb,
+	})
 }
 
 // registerRoutes sets up the web server routes.
@@ -1562,6 +1668,7 @@ func (ws *WebServer) registerRoutes() {
 	ws.mux.HandleFunc("/auth/callback/", ws.handleOAuthCallback)
 	ws.mux.HandleFunc("/auth/logout", ws.handleLogout)
 	ws.mux.HandleFunc("/auth/me", ws.handleAuthMe)
+	ws.mux.HandleFunc("/auth/view-as-member", ws.handleViewAsMember)
 	ws.mux.HandleFunc("/auth/providers", ws.handleAuthProviders)
 	ws.mux.HandleFunc("/auth/debug", ws.handleAuthDebug)
 	ws.mux.HandleFunc(devLaunchPath, ws.handleDevLaunch)
@@ -1681,7 +1788,7 @@ func (ws *WebServer) serveStaticAsset(w http.ResponseWriter, r *http.Request) {
 	// always the name checked here.
 	// A segment starting with a dot (such as .vite) is never public.
 	clean := cleanStaticPath(r.URL.Path)
-	if clean != r.URL.Path || webassets.IsVariantName(clean) || hasDotSegment(clean) {
+	if clean != r.URL.Path || webassets.IsVariantName(clean) || hasDotSegment(clean) || strings.Contains(clean, "\\") {
 		http.NotFound(w, r)
 		return
 	}
@@ -1994,11 +2101,12 @@ func resolveAPIPath(urlPath string) string {
 func (ws *WebServer) prefetchPageData(r *http.Request) template.JS {
 	// Build user info from session context (set by auth middleware).
 	type pageUser struct {
-		ID        string `json:"id"`
-		Email     string `json:"email"`
-		Name      string `json:"name"`
-		AvatarURL string `json:"avatarUrl,omitempty"`
-		Role      string `json:"role,omitempty"`
+		ID           string `json:"id"`
+		Email        string `json:"email"`
+		Name         string `json:"name"`
+		AvatarURL    string `json:"avatarUrl,omitempty"`
+		Role         string `json:"role,omitempty"`
+		ViewAsMember bool   `json:"viewAsMember,omitempty"`
 		// TestIdentity is set for a test identity web session (WS1), as
 		// in GET /auth/me; the web shell shows the identity chip from it.
 		TestIdentity *webTestIdentityInfo `json:"testIdentity,omitempty"`
@@ -2032,11 +2140,12 @@ func (ws *WebServer) prefetchPageData(r *http.Request) template.JS {
 	// Populate user from session context.
 	if u := getWebSessionUser(r.Context()); u != nil {
 		envelope.User = &pageUser{
-			ID:        u.UserID,
-			Email:     u.Email,
-			Name:      u.Name,
-			AvatarURL: u.AvatarURL,
-			Role:      u.Role,
+			ID:           u.UserID,
+			Email:        u.Email,
+			Name:         u.Name,
+			AvatarURL:    u.AvatarURL,
+			Role:         u.Role,
+			ViewAsMember: u.ViewAsMember,
 		}
 		// The session middleware admitted this request; a test identity
 		// row here means a valid test identity web session.
@@ -2213,18 +2322,21 @@ func (ws *WebServer) spaHandler() http.HandlerFunc {
 			themeColor = config.DefaultBrandThemeColor
 		}
 		var brandingCSS template.CSS
-		if branding.HasCustomPalette && branding.CSSText != "" {
+		if (branding.HasCustomPalette || branding.HasCustomStyle) && branding.CSSText != "" {
 			brandingCSS = template.CSS(branding.CSSText)
 		}
 		data := spaShellData{
 			IsLoginPage:        r.URL.Path == "/login",
 			IsInvitePage:       r.URL.Path == "/invite",
+			IsOnboardingPage:   r.URL.Path == "/onboarding",
 			BrandTitle:         branding.Name,
 			HasCustomFavicon:   branding.FaviconURL != "",
 			FaviconHref:        branding.FaviconURL,
 			FaviconType:        branding.FaviconMediaType,
 			AppleTouchIconHref: appleTouchHref,
 			ThemeColor:         themeColor,
+			HasCustomFontSans:  branding.FontSans != "" && branding.FontSans != config.BrandFontSansDefault,
+			BrandFontSansURL:   branding.FontSansStylesheetURL,
 			BrandingCSS:        brandingCSS,
 			ModulePreloads:     ws.shellModulePreloads,
 			ScriptNonce:        nonce,
@@ -2258,17 +2370,22 @@ func (ws *WebServer) tryServeStaticFile(w http.ResponseWriter, r *http.Request) 
 		return false
 	}
 	// A non-clean decoded path (dot or empty segments left by %2e or %2f),
-	// a precompressed sibling (*.br, *.gz, checked on the clean name) and a
-	// path with a segment starting with a dot (such as .vite) are never
-	// public files: treat them as missing.
-	if clean := cleanStaticPath(r.URL.Path); clean != r.URL.Path || webassets.IsVariantName(clean) || hasDotSegment(clean) {
+	// a precompressed sibling (*.br, *.gz, checked on the clean name), a
+	// path with a segment starting with a dot (such as .vite), and any path
+	// containing a backslash are never public files: treat them as missing.
+	clean := cleanStaticPath(r.URL.Path)
+	if clean != r.URL.Path || webassets.IsVariantName(clean) || hasDotSegment(clean) || strings.Contains(clean, "\\") {
 		return false
 	}
 
 	if ws.assetsDisk != "" {
-		p := filepath.Join(ws.assetsDisk, filepath.FromSlash(name))
-		info, err := os.Stat(p)
-		if err != nil || info.IsDir() {
+		f, err := webassets.DirFileSystem(ws.assetsDisk).Open(clean)
+		if err != nil {
+			return false
+		}
+		info, statErr := f.Stat()
+		_ = f.Close()
+		if statErr != nil || info.IsDir() {
 			return false
 		}
 	} else if ws.assets != nil {
@@ -2504,6 +2621,21 @@ func (ws *WebServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 		}
 		if !membershipChangedNames(evt, streamUserID) {
 			return false
+		}
+		// A session-mode toggle (view-as-member enter or exit) updates the
+		// session cookie, which this stream's connect-time context cannot
+		// observe. Skip the subject re-check and unconditionally force a
+		// reconnect so the client re-reads the cookie and re-expands wildcards
+		// (ptone/scion#9073).
+		// Client contract (consumed by web SSE client in Phase 4):
+		// `event: reconnect` with JSON payload `{"reason":"session_mode"}` —
+		// do not rename the reason value without coordinating with the frontend.
+		if membershipChangedReason(evt) == membershipChangedReasonSessionMode {
+			n, _ := fmt.Fprintf(w, "event: reconnect\ndata: {\"reason\":%q}\n\n", membershipChangedReasonSessionMode)
+			flusher.Flush()
+			stream.RecordBytes(n)
+			closeReason = eventstreams.CloseAccessChanged
+			return true
 		}
 		// Fail closed: a subject the caller may no longer read, or a
 		// re-check that cannot decide, ends the stream with a reconnect
@@ -2811,11 +2943,11 @@ func validateSSESubjects(subjects []string) string {
 // resource-scoped subjects. For example, "project.>" (meaning "all my
 // projects") is expanded to "project.<uuid>.>" for each project the caller
 // has ActionRead access to. Subjects that don't contain wildcards in a
-// resource-ID position pass through unchanged. "notification" and "broker"
-// wildcards pass through unchanged too, since authorizeSSESubjects does not
-// apply a per-resource check to those two categories. Every other category —
-// including "admin" and "system", and any namespace this function does not
-// recognize — also passes through unchanged rather than being dropped here:
+// resource-ID position pass through unchanged. "broker" wildcards pass
+// through unchanged too, since authorizeSSESubjects does not apply a
+// per-resource check to that category. Every other category — including
+// "admin", "system", and any namespace this function does not recognize —
+// also passes through unchanged rather than being dropped here:
 // authorizeSSESubjects is the single place that decides whether a category is
 // allowed, and its default case denies anything not explicitly allow-listed.
 // Dropping unknown categories at this stage instead would make a mixed
@@ -2869,9 +3001,9 @@ func (ws *WebServer) expandSSEWildcards(r *http.Request, subjects []string) []st
 				expanded = append(expanded, "user."+sessionUser.UserID+"."+s)
 			}
 
-		case "notification", "broker":
-			// These categories pass through authorization without
-			// resource checks — wildcards are fine as-is.
+		case "broker":
+			// Broker subjects pass through authorization without
+			// per-resource checks — wildcards are fine as-is.
 			expanded = append(expanded, sub)
 
 		default:
@@ -3009,7 +3141,7 @@ func isNATSWildcard(token string) bool {
 // have ActionRead on the project. Agent subjects require a concrete canonical
 // UUID and ActionRead on the resolved agent, matching the metadata endpoint.
 // For user-scoped subjects (user.<id>.*) the caller's identity must match the
-// user ID. notification.* and broker.* are an explicit, deliberate pass-through
+// user ID. broker.* is an explicit, deliberate pass-through
 // (see the switch below). system.images.<jobId> requires a concrete job ID,
 // and admin.* requires the admin role. Every other first token — including
 // any unknown or future namespace — is denied by default.
@@ -3156,13 +3288,8 @@ func (ws *WebServer) authorizeSSESubjects(r *http.Request, subjects []string) []
 			if len(tokens) < 2 || deniedUsers[tokens[1]] {
 				denied = append(denied, sub)
 			}
-		case "broker", "notification":
-			// Explicit, deliberate pass-through: neither category carries a
-			// per-resource authorization check today. notification.* is
-			// already known to over-share across projects — narrowing it
-			// to user.<subscriberId>.notification is left for a follow-up.
-			// TODO(ptone/scion#1934): scope notification.created per-user
-			// and drop this pass-through.
+		case "broker":
+			// Broker subjects do not carry a per-resource authorization check.
 		case "system":
 			// Only a concrete image-pull job ID is allowed; no wildcards
 			// and no trailing tokens past the job ID. Image-build output
@@ -3197,14 +3324,27 @@ func isAllowedSubjectChar(c rune) bool {
 		c == '*' || c == '>'
 }
 
+// isStaticAssetPath reports whether p is a normalized public static asset path
+// under /assets/ or /shoelace/. It requires the cleaned path to remain under
+// one of those prefixes and rejects non-clean paths (such as dot or empty
+// segments left by %2e or %2f), any segment starting with a dot, and backslashes.
+func isStaticAssetPath(p string) bool {
+	if p == "" || p[0] != '/' || strings.Contains(p, "\\") {
+		return false
+	}
+	clean := cleanStaticPath(p)
+	if clean != p || hasDotSegment(clean) {
+		return false
+	}
+	return strings.HasPrefix(clean, "/assets/") || strings.HasPrefix(clean, "/shoelace/")
+}
+
 // isPublicRoute returns true for routes that do not require authentication.
 func isPublicRoute(path string) bool {
 	switch {
 	case path == "/healthz" || path == "/health" || path == "/readyz":
 		return true
-	case strings.HasPrefix(path, "/assets/"):
-		return true
-	case strings.HasPrefix(path, "/shoelace/"):
+	case isStaticAssetPath(path):
 		return true
 	case strings.HasPrefix(path, "/brand/"):
 		return true
@@ -3335,6 +3475,10 @@ func isCompressBypassPath(path string) bool {
 	}
 	// The pending secret reveal returns a held secret value.
 	if len(segs) == 3 && segs[0] == "pending-secrets" && segs[2] == "reveal" {
+		return true
+	}
+	// Secret request responder endpoints handle secret values on fulfill.
+	if len(segs) >= 2 && segs[0] == "secret-requests" {
 		return true
 	}
 	// POST /api/v1/projects/{projectId}/webhook-endpoints returns the
@@ -3492,14 +3636,7 @@ func (ws *WebServer) devAuthMiddleware(next http.Handler) http.Handler {
 				}
 			}
 
-			user := &webSessionUser{
-				UserID:    uid,
-				Email:     sessionString(session, sessKeyUserEmail),
-				Name:      sessionString(session, sessKeyUserName),
-				AvatarURL: sessionString(session, sessKeyUserAvatar),
-				Role:      sessionString(session, sessKeyUserRole),
-			}
-			ctx := context.WithValue(r.Context(), webUserContextKey{}, user)
+			ctx := ws.webSessionContextFromCookie(r.Context(), session, uid, "")
 			next.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
@@ -3638,14 +3775,7 @@ func (ws *WebServer) proxyAuthMiddleware(next http.Handler) http.Handler {
 				if currentRole == expectedRole {
 					// Role unchanged — inject user into context and proceed
 					// without saving session (avoids redundant write).
-					user := &webSessionUser{
-						UserID:    uid,
-						Email:     email,
-						Name:      sessionString(session, sessKeyUserName),
-						AvatarURL: sessionString(session, sessKeyUserAvatar),
-						Role:      currentRole,
-					}
-					ctx := context.WithValue(r.Context(), webUserContextKey{}, user)
+					ctx := ws.webSessionContextFromCookie(r.Context(), session, uid, email)
 					next.ServeHTTP(w, r.WithContext(ctx))
 					return
 				}
@@ -3663,9 +3793,15 @@ func (ws *WebServer) proxyAuthMiddleware(next http.Handler) http.Handler {
 					// row read (see the cookie-overflow mint in
 					// sessionToBearerMiddleware).
 					gen, _ := session.Values[sessKeySessionGeneration].(int64)
-					accessToken, refreshToken, expiresIn, err := ws.userTokenSvc.MintTokenPair(
-						uid, email, name, expectedRole, gen, ClientTypeWeb,
-					)
+					accessToken, refreshToken, expiresIn, err := ws.userTokenSvc.MintTokenPair(UserTokenSubject{
+						UserID:            uid,
+						Email:             email,
+						DisplayName:       name,
+						Role:              expectedRole,
+						SessionGeneration: gen,
+						ClientType:        ClientTypeWeb,
+						ViewAsMember:      sessionViewAsMember(session),
+					})
 					if err == nil {
 						session.Values[sessKeyHubAccessToken] = accessToken
 						session.Values[sessKeyHubRefreshToken] = refreshToken
@@ -3746,6 +3882,7 @@ func (ws *WebServer) proxyAuthMiddleware(next http.Handler) http.Handler {
 		// Find or create user (same pattern as handleOAuthCallback)
 		user, err := ws.store.GetUserByEmail(ctx, proxyUser.Email)
 		syncGrants := true
+		applyDefaultGrants := false
 		roleChanged := false
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
 			// Genuine DB error — don't treat as "create new user"
@@ -3754,6 +3891,7 @@ func (ws *WebServer) proxyAuthMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		if err != nil {
+			applyDefaultGrants = true
 			// User not found — create new user
 			role := determineUserRole(proxyUser.Email, ws.adminEmails(), "", ws.isDemotionSafe(), false, ws.defaultUserRole())
 			user = &store.User{
@@ -3794,6 +3932,7 @@ func (ws *WebServer) proxyAuthMiddleware(next http.Handler) http.Handler {
 			activating := user.Status == store.UserStatusInvited
 
 			if activating {
+				applyDefaultGrants = true
 				// Transition invited → active on first login
 				// (mirrors handleOAuthCallback's invited→active block)
 				ws.logger().Info("user activated from invited state via proxy auth", "email", proxyUser.Email, "user_id", user.ID)
@@ -3833,6 +3972,7 @@ func (ws *WebServer) proxyAuthMiddleware(next http.Handler) http.Handler {
 					roleChanged = true
 					if oldRole == "admin" {
 						bindingSuperAdmin = "delete"
+						applyDefaultGrants = true
 					} else if newRole == "admin" {
 						bindingSuperAdmin = "ensure"
 					}
@@ -3859,13 +3999,20 @@ func (ws *WebServer) proxyAuthMiddleware(next http.Handler) http.Handler {
 			}
 		}
 
-		// Make the hub-members group and hub-viewer binding match the stored
-		// role (mirrors provisionUser). Skipped when UpdateUser failed, so the
-		// grants keep following the persisted role. Best-effort: a failure is
-		// logged and the login continues; the startup backfill repairs it.
+		// Make the hub-members group, hub-viewer binding, or custom default role
+		// binding match the stored role (mirrors provisionUser). Skipped when
+		// UpdateUser failed, so the grants keep following the persisted role.
+		// Best-effort: a failure is logged and the login continues; the startup
+		// backfill repairs built-in grants.
 		if syncGrants {
-			if err := syncHubRoleGrants(ctx, ws.store, user.ID, user.Role, store.SystemReconcileCreatedBy); err != nil {
-				ws.logger().Warn("Proxy auth: failed to sync hub role grants", "email", proxyUser.Email, "user_id", user.ID, "role", user.Role, "error", err)
+			var grantErr error
+			if applyDefaultGrants {
+				grantErr = applyDefaultUserRoleGrants(ctx, ws.store, user.ID, user.Role, ws.defaultUserRole(), ws.customDefaultRoleEnabled())
+			} else {
+				grantErr = syncHubRoleGrants(ctx, ws.store, user.ID, user.Role, store.SystemReconcileCreatedBy)
+			}
+			if grantErr != nil {
+				ws.logger().Warn("Proxy auth: failed to sync hub role grants", "email", proxyUser.Email, "user_id", user.ID, "role", user.Role, "error", grantErr)
 			}
 		}
 		if syncGrants && roleChanged {
@@ -3874,9 +4021,14 @@ func (ws *WebServer) proxyAuthMiddleware(next http.Handler) http.Handler {
 
 		// Generate Hub JWT tokens (mirrors devAuthMiddleware / handleOAuthCallback)
 		if ws.userTokenSvc != nil {
-			accessToken, refreshToken, expiresIn, err := ws.userTokenSvc.MintTokenPair(
-				user.ID, user.Email, user.DisplayName, user.Role, user.SessionGeneration, ClientTypeWeb,
-			)
+			accessToken, refreshToken, expiresIn, err := ws.userTokenSvc.MintTokenPair(UserTokenSubject{
+				UserID:            user.ID,
+				Email:             user.Email,
+				DisplayName:       user.DisplayName,
+				Role:              user.Role,
+				SessionGeneration: user.SessionGeneration,
+				ClientType:        ClientTypeWeb,
+			})
 			if err == nil {
 				session.Values[sessKeyHubAccessToken] = accessToken
 				session.Values[sessKeyHubRefreshToken] = refreshToken
@@ -3888,6 +4040,7 @@ func (ws *WebServer) proxyAuthMiddleware(next http.Handler) http.Handler {
 
 		// Populate session
 		ws.dropTestIdentityValues(w, session)
+		delete(session.Values, sessKeyViewAsMember)
 		session.Values[sessKeyUserID] = user.ID
 		session.Values[sessKeyUserEmail] = user.Email
 		session.Values[sessKeyUserName] = user.DisplayName
@@ -4005,14 +4158,7 @@ func (ws *WebServer) sessionAuthMiddleware(next http.Handler) http.Handler {
 				ctx = context.WithValue(ctx, dbUserContextKey{}, dbUser)
 			}
 
-			user := &webSessionUser{
-				UserID:    uid,
-				Email:     sessionString(session, sessKeyUserEmail),
-				Name:      sessionString(session, sessKeyUserName),
-				AvatarURL: sessionString(session, sessKeyUserAvatar),
-				Role:      sessionString(session, sessKeyUserRole),
-			}
-			ctx = context.WithValue(ctx, webUserContextKey{}, user)
+			ctx = ws.webSessionContextFromCookie(ctx, session, uid, "")
 			next.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
@@ -4243,8 +4389,10 @@ func (ws *WebServer) handleOAuthCallback(w http.ResponseWriter, r *http.Request)
 	// Find or create user
 	user, err := ws.store.GetUserByEmail(ctx, userInfo.Email)
 	syncGrants := true
+	applyDefaultGrants := false
 	roleChanged := false
 	if err != nil {
+		applyDefaultGrants = true
 		// Create new user (only reachable in open/domain_restricted modes;
 		// in invite_only mode, checkUserAuthorized already confirmed a User record exists)
 		role := determineUserRole(userInfo.Email, ws.adminEmails(), "", ws.isDemotionSafe(), false, ws.defaultUserRole())
@@ -4285,6 +4433,7 @@ func (ws *WebServer) handleOAuthCallback(w http.ResponseWriter, r *http.Request)
 		activating := user.Status == store.UserStatusInvited
 
 		if activating {
+			applyDefaultGrants = true
 			// Transition invited → active on first login
 			// TODO(NG4): This duplicates the invited→active logic in provisionUser.
 			// Consolidate into a shared function in a future refactor.
@@ -4334,6 +4483,7 @@ func (ws *WebServer) handleOAuthCallback(w http.ResponseWriter, r *http.Request)
 				roleChanged = true
 				if oldRole == "admin" {
 					bindingSuperAdmin = "delete"
+					applyDefaultGrants = true
 				} else if newRole == "admin" {
 					bindingSuperAdmin = "ensure"
 				}
@@ -4360,13 +4510,20 @@ func (ws *WebServer) handleOAuthCallback(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	// Make the hub-members group and hub-viewer binding match the stored
-	// role (mirrors provisionUser). Skipped when UpdateUser failed, so the
-	// grants keep following the persisted role. Best-effort: a failure is
-	// logged and the login continues; the startup backfill repairs it.
+	// Make the hub-members group, hub-viewer binding, or custom default role
+	// binding match the stored role (mirrors provisionUser). Skipped when
+	// UpdateUser failed, so the grants keep following the persisted role.
+	// Best-effort: a failure is logged and the login continues; the startup
+	// backfill repairs built-in grants.
 	if syncGrants {
-		if err := syncHubRoleGrants(ctx, ws.store, user.ID, user.Role, store.SystemReconcileCreatedBy); err != nil {
-			ws.logger().Warn("OAuth login: failed to sync hub role grants", "email", userInfo.Email, "user_id", user.ID, "role", user.Role, "error", err)
+		var grantErr error
+		if applyDefaultGrants {
+			grantErr = applyDefaultUserRoleGrants(ctx, ws.store, user.ID, user.Role, ws.defaultUserRole(), ws.customDefaultRoleEnabled())
+		} else {
+			grantErr = syncHubRoleGrants(ctx, ws.store, user.ID, user.Role, store.SystemReconcileCreatedBy)
+		}
+		if grantErr != nil {
+			ws.logger().Warn("OAuth login: failed to sync hub role grants", "email", userInfo.Email, "user_id", user.ID, "role", user.Role, "error", grantErr)
 		}
 	}
 	if syncGrants && roleChanged {
@@ -4375,9 +4532,14 @@ func (ws *WebServer) handleOAuthCallback(w http.ResponseWriter, r *http.Request)
 
 	// Generate Hub tokens if token service is available
 	if ws.userTokenSvc != nil {
-		accessToken, refreshToken, expiresIn, err := ws.userTokenSvc.MintTokenPair(
-			user.ID, user.Email, user.DisplayName, user.Role, user.SessionGeneration, ClientTypeWeb,
-		)
+		accessToken, refreshToken, expiresIn, err := ws.userTokenSvc.MintTokenPair(UserTokenSubject{
+			UserID:            user.ID,
+			Email:             user.Email,
+			DisplayName:       user.DisplayName,
+			Role:              user.Role,
+			SessionGeneration: user.SessionGeneration,
+			ClientType:        ClientTypeWeb,
+		})
 		if err != nil {
 			ws.logger().Warn("Failed to generate Hub tokens", "error", err)
 		} else {
@@ -4389,6 +4551,7 @@ func (ws *WebServer) handleOAuthCallback(w http.ResponseWriter, r *http.Request)
 
 	// Store user info in session
 	ws.dropTestIdentityValues(w, session)
+	delete(session.Values, sessKeyViewAsMember)
 	session.Values[sessKeyUserID] = user.ID
 	session.Values[sessKeyUserEmail] = user.Email
 	session.Values[sessKeyUserName] = user.DisplayName
@@ -4426,11 +4589,34 @@ func (ws *WebServer) handleOAuthCallback(w http.ResponseWriter, r *http.Request)
 func (ws *WebServer) handleLogout(w http.ResponseWriter, r *http.Request) {
 	// In proxy mode, the hub does not own the session.
 	if ws.config.AuthMode == "proxy" {
-		// A test identity web session is still cleared here.
+		// A test identity web session is still cleared here; a view-as-member
+		// flag is also cleared so IAP sign-out ends the mode.
 		if ws.sessionStore == nil {
 			// No session store: nothing to clear.
-		} else if session, err := ws.sessionStore.Get(r, webSessionName); err == nil && ws.classifyTestIdentitySession(r, session, nil).isTestIdentitySession() {
-			ws.clearTestIdentitySession(w, r, session)
+		} else if session, err := ws.sessionStore.Get(r, webSessionName); err == nil {
+			if ws.classifyTestIdentitySession(r, session, nil).isTestIdentitySession() {
+				ws.clearTestIdentitySession(w, r, session)
+			} else if sessionViewAsMember(session) {
+				uid := sessionString(session, sessKeyUserID)
+				delete(session.Values, sessKeyViewAsMember)
+				delete(session.Values, sessKeyHubAccessToken)
+				delete(session.Values, sessKeyHubRefreshToken)
+				delete(session.Values, sessKeyHubTokenExpiry)
+				if saveErr := session.Save(r, w); saveErr != nil {
+					ws.logger().Error("Failed to clear view-as-member on proxy logout", "error", saveErr)
+				}
+				if ws.viewAsMemberHub != nil && uid != "" {
+					ws.viewAsMemberHub.RecordViewAsMemberTransition(r.Context(), uid, false, viewAsMemberReasonSignOut)
+					defer func() {
+						if flusher, ok := w.(http.Flusher); ok {
+							flusher.Flush()
+						}
+						ws.viewAsMemberHub.PublishSessionModeChanged(r.Context(), uid)
+					}()
+				}
+			} else if _, present := ws.readTestIdentityMarker(r); present {
+				ws.expireTestIdentityMarker(w)
+			}
 		} else if _, present := ws.readTestIdentityMarker(r); present {
 			ws.expireTestIdentityMarker(w)
 		}
@@ -4453,6 +4639,9 @@ func (ws *WebServer) handleLogout(w http.ResponseWriter, r *http.Request) {
 		session, _ = ws.sessionStore.New(r, webSessionName)
 	}
 
+	wasVam := sessionViewAsMember(session)
+	vamUID := sessionString(session, sessKeyUserID)
+
 	// Clear all session values
 	for key := range session.Values {
 		delete(session.Values, key)
@@ -4463,6 +4652,15 @@ func (ws *WebServer) handleLogout(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, present := ws.readTestIdentityMarker(r); present {
 		ws.expireTestIdentityMarker(w)
+	}
+	if wasVam && ws.viewAsMemberHub != nil && vamUID != "" {
+		ws.viewAsMemberHub.RecordViewAsMemberTransition(r.Context(), vamUID, false, viewAsMemberReasonSignOut)
+		defer func() {
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			ws.viewAsMemberHub.PublishSessionModeChanged(r.Context(), vamUID)
+		}()
 	}
 
 	if isBrowserRequest(r) {
@@ -4547,13 +4745,7 @@ func (ws *WebServer) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user := &webSessionUser{
-		UserID:    uid,
-		Email:     sessionString(session, sessKeyUserEmail),
-		Name:      sessionString(session, sessKeyUserName),
-		AvatarURL: sessionString(session, sessKeyUserAvatar),
-		Role:      sessionString(session, sessKeyUserRole),
-	}
+	user := ws.webSessionUserFromCookie(session, uid, "")
 	user.Preferences = loadUserPreferences(r.Context(), ws.store, uid)
 
 	w.Header().Set("Content-Type", "application/json")
@@ -4731,6 +4923,12 @@ func (ws *WebServer) buildHandler() http.Handler {
 	// Dev-auth middleware (loads an existing dev session; sessions come
 	// only from a sign-in link, see handleDevSignIn)
 	handler = ws.devAuthMiddleware(handler)
+
+	// Behind an authenticating front proxy (AuthMode == "proxy"), apply the
+	// same state-changing request checks to web sign-in/sign-out endpoints
+	// (/auth/* and /api/v1/auth/test-login) before authentication. No-op in
+	// other auth modes.
+	handler = ws.proxyModeWriteGuard(handler)
 
 	// Refuse new requests once shutdown has begun (ptone/scion#5054); the
 	// health endpoints stay reachable, and requests for the mounted hub API

@@ -283,7 +283,10 @@ project, whichever broker an agent lands on.
 To give agents on a remote Hub git worktrees instead of separate clones, create the project with the
 `worktree-per-agent` [workspace sharing mode](/scion/local/workspaces-and-sharing/): the broker then
 makes a worktree per agent of its own shared clone. The mode is set when the project is created on
-the Hub and cannot be changed later.
+the Hub and cannot be changed later. `worktree-per-agent` is not supported on shared (`nfs`) project
+storage for Docker, Podman, or Apple `container` runtimes (agent create, start, and restart are
+refused with `412 unsupported_capability`): use `clone-per-agent` on NFS, or run the project on a
+Runtime Broker using local `project_storage`.
 
 #### Git that Scion runs on the host
 
@@ -316,9 +319,14 @@ the agent start or workspace pull rather than being ignored.
 - **Refused on both** (so an agent cannot make the broker's or your own git run a command): any
   `credential.*`, `url.*.insteadOf`, `http.*`, `gpg.*` program/signing-file keys, any `*.program`,
   `alias.*`, `core.sshCommand`/`editor`, a remote's `uploadpack`/`receivepack`/`proxy`, diff/merge
-  command or textconv drivers, non-standard `filter.*` drivers, and any key not on the list. If a
-  command is refused, the error names the key; remove it from the repository's `.git/config` (or
-  `config.worktree`).
+  command or textconv drivers, non-standard `filter.*` drivers, and any key not on the list.
+  Host-side git (including `git worktree add` and branch lookups during agent creation on a linked
+  checkout) always refuses command keys outside the four pinned keys above (`core.hooksPath`,
+  `core.fsmonitor`, `core.pager`, `submodule.recurse`). If a command is refused, the error names
+  the offending key; remove it from the repository's `.git/config` (or `config.worktree`), and
+  instead set personal git preferences in your global git config (`~/.gitconfig` /
+  `git config --global`) or pass them per command with `git -c <key>=<val>` (for example,
+  `git -c core.editor=vim ...`).
 - **Partial clones:** a partial clone made by current git (`git clone --filter=...`, which records
   `remote.<name>.promisor` and `remote.<name>.partialclonefilter`) is allowed; git then fetches
   missing objects from that remote's own URL. `extensions.partialClone` (written by older git) and
@@ -490,7 +498,11 @@ init` lists `.scion/agents/` in `.gitignore`) and start the agent again.
 
 On Kubernetes, git projects that share one repository across agents (worktree-per-agent or
 shared-workspace on NFS) are not supported: use a clone-per-agent workspace, where each agent gets
-its own clone of the repository, or run the project on a local or Docker Runtime Broker.
+its own clone of the repository, or run the project on a local or Docker, Podman, or Apple Runtime
+Broker. On shared (`nfs`) project storage, Docker, Podman, and Apple `container` also refuse
+`worktree-per-agent` at create, start, and restart (`412 unsupported_capability`); use
+`clone-per-agent` on NFS, or run `worktree-per-agent` on a Runtime Broker using local
+`project_storage`.
 
 ---
 

@@ -1,4 +1,5 @@
 import type { User } from '../shared/types.js';
+import { BRANDING_UPDATED_EVENT, getBrandName, isCustomBranding } from './branding.js';
 import {
   TerminalSessionRegistry,
   AGENT_UNAVAILABLE_REASONS,
@@ -18,12 +19,16 @@ import type { TerminalAgentMetadata } from './terminal-metadata.js';
 import type { ScionHeader } from '../components/shared/header.js';
 import type { ScionTerminalPane } from '../components/terminal/terminal-pane.js';
 import {
-  TERMINAL_SESSION_COUNT_EVENT,
   TERMINAL_DRAG_MIME,
+  TERMINAL_DROPDOWN_SELECT_EVENT,
   TERMINAL_PALETTE_NEW_AGENT_EVENT,
   TERMINAL_PANE_DIALOG_OPEN_EVENT,
-  type TerminalSessionCountDetail,
+  publishTerminalWorkspaceSnapshot,
+  type TerminalDropdownSelectDetail,
   type TerminalPaletteNewAgentDetail,
+  type TerminalSessionDot,
+  type TerminalSessionDotColour,
+  type TerminalSessionSummary,
 } from './terminal-workspace-events.js';
 import { enterAppFrame, exitAppFrame } from '../components/shared/app-frame.js';
 import type { PaletteCandidate } from './palette-types.js';
@@ -40,6 +45,7 @@ import '../components/terminal/terminal-pane.js';
 import { render as litRender } from 'lit';
 import { keyed } from 'lit/directives/keyed.js';
 import { renderTestHubBanner } from '../components/shared/test-hub-banner.js';
+import { renderViewAsMemberBanner } from '../components/shared/view-as-member-banner.js';
 import {
   TEST_INFRA_STATUS_EVENT,
   getTestInfraStatus,
@@ -115,13 +121,10 @@ export function isInactiveEntry(entry: RailEntryStatus): boolean {
 }
 
 /** The colour of a rail row's status dot. */
-export type ConnectionDotColour = 'green' | 'amber' | 'red' | 'grey' | 'neutral';
+export type ConnectionDotColour = TerminalSessionDotColour;
 
 /** A status dot's colour and its short meaning, shown as tooltip and spoken text. */
-export interface ConnectionDot {
-  colour: ConnectionDotColour;
-  meaning: string;
-}
+export type ConnectionDot = TerminalSessionDot;
 
 /**
  * The status dot for a rail row. The rail styles the dot from the colour
@@ -221,6 +224,8 @@ export class TerminalWorkspaceRoot {
   private readonly header: ScionHeader = document.createElement('scion-header');
   /** Holds the test-hub banner, above the header (shared/test-hub-banner.ts). */
   private readonly testHubBannerHost = document.createElement('div');
+  /** Holds the view-as-member banner, below the test-hub banner and above the header. */
+  private readonly viewAsMemberBannerHost = document.createElement('div');
   private readonly shell = document.createElement('div');
   private readonly rail = document.createElement('aside');
   private readonly railList = document.createElement('div');
@@ -367,6 +372,14 @@ export class TerminalWorkspaceRoot {
    */
   private _frameEntered = false;
 
+  private readonly handleBrandingUpdated = (): void => {
+    this.header.pageTitle = this.terminalViewerTitle();
+  };
+
+  private terminalViewerTitle(): string {
+    return isCustomBranding() ? `${getBrandName()} Terminal Viewer` : '🌱 Scion Terminal Viewer';
+  }
+
   constructor(user: User | null = null) {
     this.user = user;
     this.element.id = 'terminal-workspace';
@@ -380,8 +393,9 @@ export class TerminalWorkspaceRoot {
     this.installStyles();
     this.header.user = user;
     this.header.currentPath = this.currentPath;
-    this.header.pageTitle = '🌱 Scion Terminal Viewer';
+    this.header.pageTitle = this.terminalViewerTitle();
     this.header.showMobileMenu = false;
+    window.addEventListener(BRANDING_UPDATED_EVENT, this.handleBrandingUpdated);
 
     this.shell.className = 'terminal-workspace-shell';
     this.rail.className = 'terminal-rail';
@@ -445,15 +459,19 @@ export class TerminalWorkspaceRoot {
 
     this.shell.append(this.rail, this.createPaneArea());
     this.testHubBannerHost.className = 'terminal-test-hub-banner';
+    this.viewAsMemberBannerHost.className = 'terminal-view-as-member-banner';
     this.element.append(
       this.testHubBannerHost,
+      this.viewAsMemberBannerHost,
       this.header,
       this.shell,
       this.ariaLive,
       this.placeMenu
     );
     window.addEventListener(TEST_INFRA_STATUS_EVENT, this.handleTestInfraStatus);
+    window.addEventListener(TERMINAL_DROPDOWN_SELECT_EVENT, this.handleDropdownSelect);
     this.renderTestHubBanner();
+    this.renderViewAsMemberBanner();
     if (!getTestInfraStatus()) void loadTestInfraStatus();
 
     // Subscribe to layout state (lives as long as the workspace root).
@@ -638,6 +656,7 @@ export class TerminalWorkspaceRoot {
   setUser(user: User | null): void {
     this.user = user;
     this.header.user = user;
+    this.renderViewAsMemberBanner();
     for (const pane of this.panes.values()) {
       pane.userId = user?.id ?? '';
     }
@@ -661,12 +680,24 @@ export class TerminalWorkspaceRoot {
    */
   private renderTestHubBanner(): void {
     if (this.testHubBannerHost.parentNode !== this.element) {
-      this.element.insertBefore(this.testHubBannerHost, this.header);
+      this.element.insertBefore(
+        this.testHubBannerHost,
+        this.viewAsMemberBannerHost.parentNode === this.element
+          ? this.viewAsMemberBannerHost
+          : this.header
+      );
     }
     litRender(
       keyed(this.currentPath, renderTestHubBanner(getTestInfraStatus())),
       this.testHubBannerHost
     );
+  }
+
+  private renderViewAsMemberBanner(): void {
+    if (this.viewAsMemberBannerHost.parentNode !== this.element) {
+      this.element.insertBefore(this.viewAsMemberBannerHost, this.header);
+    }
+    litRender(renderViewAsMemberBanner(this.user), this.viewAsMemberBannerHost);
   }
 
   /**
@@ -779,11 +810,29 @@ export class TerminalWorkspaceRoot {
   }
 
   /**
+   * Opens the "Jump to agent" palette when no terminals are open in this
+   * window and no cross-window status action is active (used by the Dashboard
+   * "Open Terminal" quick action, ptone/scion#8468). Focuses the rail footer's
+   * "Jump to agent" button first so a non-selection dismiss (Escape) restores
+   * focus to a visible control inside the workspace.
+   */
+  openPaletteIfEmpty(): void {
+    if (this.element.hidden) return;
+    if (this.entries.size > 0) return;
+    if (this.statusAction.dataset.active === 'true') return;
+    if (this.paletteHost.hasUnrelatedModalOpen()) return;
+    this.jumpButton?.focus({ preventScroll: true });
+    this.openPalette();
+  }
+
+  /**
    * Removes the document-level listeners this root installs. The root lives
    * for the whole tab in production; tests call this between instances.
    */
   dispose(): void {
+    window.removeEventListener(BRANDING_UPDATED_EVENT, this.handleBrandingUpdated);
     window.removeEventListener(TEST_INFRA_STATUS_EVENT, this.handleTestInfraStatus);
+    window.removeEventListener(TERMINAL_DROPDOWN_SELECT_EVENT, this.handleDropdownSelect);
     document.removeEventListener('keydown', this.handleGlobalKeydown);
     document.removeEventListener('focusin', this.handleGlobalFocusIn);
     this.element.removeEventListener(TERMINAL_PANE_DIALOG_OPEN_EVENT, this.handlePaneDialogOpen);
@@ -869,6 +918,7 @@ export class TerminalWorkspaceRoot {
       inRailOrPane = true;
       for (const [key, pane] of this.panes) {
         if (pane === node) {
+          const prevFocused = this.lastFocusedPaneSessionKey;
           this.lastFocusedPaneSessionKey = key;
           if (
             this.railFocusAgentId !== null &&
@@ -882,6 +932,9 @@ export class TerminalWorkspaceRoot {
             this.entries.get(key)?.state.agentId !== this.paletteFocusAgentId
           ) {
             this.paletteFocusAgentId = null;
+          }
+          if (prevFocused !== key) {
+            this.publishWorkspaceSnapshot();
           }
           return;
         }
@@ -1199,9 +1252,12 @@ export class TerminalWorkspaceRoot {
             entry.session.markUnavailable('agent-deleted', next.error ?? 'Agent was deleted.');
           } else if (
             // A crashed container reports phase 'error', not 'stopped'
-            // (ptone/scion#2096); treat both the same so a crashed agent's
-            // pane also re-arms once it is running again.
-            (next.agent?.phase === 'stopped' || next.agent?.phase === 'error') &&
+            // (ptone/scion#2096), and a suspended agent stops its container
+            // too (ptone/scion#8954); treat all three the same so the pane
+            // records the down observation and re-arms once running again.
+            (next.agent?.phase === 'stopped' ||
+              next.agent?.phase === 'error' ||
+              next.agent?.phase === 'suspended') &&
             entry.session.state.connection !== 'closed' &&
             // Idle entries (restored, not yet connected) stay idle while
             // their agent is stopped: marking a never-connected entry
@@ -1211,7 +1267,11 @@ export class TerminalWorkspaceRoot {
             entry.session.state.connection !== 'idle'
           ) {
             if (entry.session.state.connection !== 'unavailable') {
-              entry.session.markUnavailable('agent-stopped', AGENT_STOPPED_MESSAGE);
+              const message =
+                next.agent.phase === 'suspended'
+                  ? 'Agent phase is suspended. Terminal is not available until the agent has started.'
+                  : AGENT_STOPPED_MESSAGE;
+              entry.session.markUnavailable('agent-stopped', message);
             } else {
               // The session is already unavailable — most often because a
               // WebSocket close already reported agent_stopped before this
@@ -1363,7 +1423,7 @@ export class TerminalWorkspaceRoot {
 
     // Visibility
     this.refreshPaneVisibility();
-    this.publishCount();
+    this.publishWorkspaceSnapshot(entries);
     this.focusPaletteTarget();
     this.focusRailTarget();
   }
@@ -2096,12 +2156,70 @@ export class TerminalWorkspaceRoot {
     }
   }
 
-  private publishCount(): void {
-    window.dispatchEvent(
-      new CustomEvent<TerminalSessionCountDetail>(TERMINAL_SESSION_COUNT_EVENT, {
-        detail: { count: this.entries.size },
-      })
-    );
+  /**
+   * Handles a selection from the header's Terminals dropdown: places an
+   * existing rail session into the next free multi-pane slot (matching a rail
+   * click) and moves keyboard focus into that agent's pane once visible.
+   */
+  private readonly handleDropdownSelect = (event: Event): void => {
+    const agentId = (event as CustomEvent<TerminalDropdownSelectDetail>).detail?.agentId;
+    if (!agentId) return;
+    const key = this.findSessionKeyByAgentId(agentId);
+    if (key) {
+      this.placeInNextFreeSlot(key);
+    }
+    this.railFocusAgentId = agentId;
+    this.focusRailTarget();
+  };
+
+  /**
+   * Resolves the current focused agent inside the terminal workspace:
+   * - when zoomed: the zoomed pane's agent;
+   * - when a single pane is effectively shown (single preset or narrow viewport):
+   *   that single visible slot's agent;
+   * - in a multi-pane grid: `lastFocusedPaneSessionKey`'s agent when that key is
+   *   currently in the visible slots, or null when no visible pane has focus.
+   */
+  private getFocusedAgentId(): string | null {
+    const zoomedKey = this.layoutManager.getZoomed();
+    if (zoomedKey) {
+      return this.entries.get(zoomedKey)?.state.agentId ?? null;
+    }
+    const state = this.layoutManager.getState();
+    if (this.isSinglePaneView()) {
+      const activeSlots = this.getActivePresetSlots(state.active);
+      const firstOccupied = activeSlots.find((s) => s !== null) ?? null;
+      return firstOccupied ? (this.entries.get(firstOccupied)?.state.agentId ?? null) : null;
+    }
+    const visibleSlots = this.layoutManager.getVisibleSlots();
+    if (this.lastFocusedPaneSessionKey && visibleSlots.includes(this.lastFocusedPaneSessionKey)) {
+      return this.entries.get(this.lastFocusedPaneSessionKey)?.state.agentId ?? null;
+    }
+    return null;
+  }
+
+  private publishWorkspaceSnapshot(sortedEntries?: readonly RailEntry[]): void {
+    let entries: readonly RailEntry[];
+    if (sortedEntries) {
+      entries = sortedEntries;
+    } else {
+      const copy = [...this.entries.values()];
+      this.sortEntries(copy);
+      entries = copy;
+    }
+    const sessions: TerminalSessionSummary[] = entries.map((entry) => {
+      const agent = entry.metadata.agent ?? entry.state.agent;
+      return {
+        agentId: entry.state.agentId,
+        name: agent?.name || entry.state.agentId,
+        dot: connectionDot(entry, !this.shownKeys.has(entry.state.key)),
+      };
+    });
+    publishTerminalWorkspaceSnapshot({
+      count: this.entries.size,
+      sessions,
+      focusedAgentId: this.getFocusedAgentId(),
+    });
   }
 
   // ── URL layout sync (#1715) ─────────────────────────────────────────────
@@ -2197,14 +2315,27 @@ export class TerminalWorkspaceRoot {
       #terminal-workspace > scion-header {
         padding-inline: 1.5rem;
       }
-      .terminal-test-hub-banner {
+      .terminal-test-hub-banner,
+      .terminal-view-as-member-banner {
         flex-shrink: 0;
       }
-      .terminal-test-hub-banner sl-alert.test-hub-banner {
+      .terminal-test-hub-banner sl-alert.test-hub-banner,
+      .terminal-view-as-member-banner sl-alert.view-as-member-banner {
         display: block;
       }
-      .terminal-test-hub-banner sl-alert.test-hub-banner::part(base) {
+      .terminal-test-hub-banner sl-alert.test-hub-banner::part(base),
+      .terminal-view-as-member-banner sl-alert.view-as-member-banner::part(base) {
         border-radius: 0;
+      }
+      .terminal-view-as-member-banner .view-as-member-banner-body {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.75rem;
+        flex-wrap: wrap;
+      }
+      .terminal-view-as-member-banner .view-as-member-exit-btn {
+        flex-shrink: 0;
       }
       .terminal-workspace-shell {
         flex: 1;
@@ -2328,7 +2459,7 @@ export class TerminalWorkspaceRoot {
         gap: 0.5rem;
         padding: 0 0.625rem;
         border: 0;
-        border-radius: 6px;
+        border-radius: calc(var(--scion-radius) * 0.75);
         background: transparent;
         color: var(--scion-text, #1e293b);
         font: inherit;
@@ -2380,7 +2511,7 @@ export class TerminalWorkspaceRoot {
         grid-template-columns: auto minmax(0, 1fr) auto;
         align-items: center;
         gap: 0.25rem;
-        border-radius: 6px;
+        border-radius: calc(var(--scion-radius) * 0.75);
       }
       .terminal-rail-item[data-dragging='true'] {
         opacity: 0.5;
@@ -2416,7 +2547,7 @@ export class TerminalWorkspaceRoot {
       .terminal-rail-select:focus-visible {
         outline: none;
         background: var(--scion-bg-subtle, #f1f5f9);
-        border-radius: 6px;
+        border-radius: calc(var(--scion-radius) * 0.75);
       }
       .terminal-connection-dot {
         width: 0.625rem;
@@ -2475,7 +2606,7 @@ export class TerminalWorkspaceRoot {
         border: 0;
         background: transparent;
         color: var(--scion-text-muted, #64748b);
-        border-radius: 4px;
+        border-radius: var(--scion-radius-sm);
         cursor: pointer;
       }
       .terminal-icon-action:hover,
@@ -2513,7 +2644,7 @@ export class TerminalWorkspaceRoot {
         font-size: 0.75rem;
         padding: 0.25rem 0.5rem;
         border: 1px solid var(--scion-border, #e2e8f0);
-        border-radius: 4px;
+        border-radius: var(--scion-radius-sm);
         background: transparent;
         color: var(--scion-text-muted, #64748b);
         cursor: pointer;
@@ -2536,7 +2667,7 @@ export class TerminalWorkspaceRoot {
         padding: 0.25rem 0.5rem;
         margin-left: auto;
         border: 1px solid var(--scion-border, #e2e8f0);
-        border-radius: 4px;
+        border-radius: var(--scion-radius-sm);
         background: transparent;
         color: var(--scion-text-muted, #64748b);
         cursor: pointer;
@@ -2567,7 +2698,7 @@ export class TerminalWorkspaceRoot {
         min-height: 0;
         min-width: 0;
         border: 1px solid #333;
-        border-radius: 4px;
+        border-radius: var(--scion-radius-sm);
       }
       /* Focus outline only in multi-pane layouts — in single-pane mode focus
          is implicit and the outline is visual noise (#1716). */
@@ -2583,7 +2714,7 @@ export class TerminalWorkspaceRoot {
         align-items: center;
         justify-content: center;
         border: 2px dashed var(--scion-border, #e2e8f0);
-        border-radius: 8px;
+        border-radius: var(--scion-radius);
         margin: 4px;
         color: var(--scion-text-muted, #64748b);
         font-size: 0.875rem;
@@ -2622,7 +2753,7 @@ export class TerminalWorkspaceRoot {
         min-width: 12rem;
         background: var(--scion-surface, #fff);
         border: 1px solid var(--scion-border, #e2e8f0);
-        border-radius: 6px;
+        border-radius: calc(var(--scion-radius) * 0.75);
         box-shadow: 0 4px 12px rgba(0,0,0,0.1);
         padding: 0.25rem;
       }
@@ -2636,7 +2767,7 @@ export class TerminalWorkspaceRoot {
         color: var(--scion-text, #1e293b);
         font-size: 0.8125rem;
         cursor: pointer;
-        border-radius: 4px;
+        border-radius: var(--scion-radius-sm);
       }
       .terminal-place-menu-item:hover,
       .terminal-place-menu-item:focus-visible {
@@ -2670,7 +2801,7 @@ export class TerminalWorkspaceRoot {
         max-width: 18rem;
         padding: 0.6rem 0.75rem;
         border: 1px solid var(--scion-border, #cbd5e1);
-        border-radius: 0.375rem;
+        border-radius: calc(var(--scion-radius) * 0.75);
         background: var(--scion-surface, #ffffff);
         color: var(--scion-text, #0f172a);
         font-size: 0.875rem;
@@ -2685,7 +2816,7 @@ export class TerminalWorkspaceRoot {
         z-index: 2;
         padding: 0.4rem 0.9rem;
         border: 1px solid var(--scion-border, #cbd5e1);
-        border-radius: 0.375rem;
+        border-radius: calc(var(--scion-radius) * 0.75);
         background: var(--scion-surface, #ffffff);
         color: var(--scion-text, #0f172a);
         font: inherit;
@@ -2723,6 +2854,7 @@ export class TerminalWorkspaceRoot {
          what is left through their own ResizeObserver. Nothing hidden here holds a text field, so
          hiding it cannot blur the field that raised the keyboard. */
       html[data-keyboard='open'] #terminal-workspace > .terminal-test-hub-banner,
+      html[data-keyboard='open'] #terminal-workspace > .terminal-view-as-member-banner,
       html[data-keyboard='open'] #terminal-workspace > scion-header,
       html[data-keyboard='open'] #terminal-workspace .terminal-rail,
       html[data-keyboard='open'] #terminal-workspace .terminal-layout-bar {

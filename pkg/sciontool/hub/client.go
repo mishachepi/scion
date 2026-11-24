@@ -30,6 +30,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -666,7 +667,11 @@ func (c *Client) ListPorts(ctx context.Context) ([]ExposedPort, error) {
 	defer func() { _ = resp.Body.Close() }()
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return nil, &StatusError{StatusCode: resp.StatusCode, Body: string(respBody)}
+		return nil, &StatusError{
+			StatusCode: resp.StatusCode,
+			Body:       string(respBody),
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+		}
 	}
 	var out ListPortsResponse
 	if err := json.Unmarshal(respBody, &out); err != nil {
@@ -707,6 +712,7 @@ func (c *Client) DeletePort(ctx context.Context, port int) error {
 type StatusError struct {
 	StatusCode int
 	Body       string
+	RetryAfter time.Duration
 }
 
 func (e *StatusError) Error() string {
@@ -716,6 +722,10 @@ func (e *StatusError) Error() string {
 // HTTPStatusCode returns the hub's HTTP status. Packages that cannot import
 // this one (the metadata server) classify hub errors through it.
 func (e *StatusError) HTTPStatusCode() int { return e.StatusCode }
+
+// RetryAfterDuration returns the parsed Retry-After duration from the hub's
+// response header, or 0 if absent or unparseable.
+func (e *StatusError) RetryAfterDuration() time.Duration { return e.RetryAfter }
 
 // IsForbidden reports whether err carries an HTTP 403 from the hub, meaning
 // the hub refused the request for this agent.
@@ -731,6 +741,36 @@ func IsUnauthorized(err error) bool {
 	return errors.As(err, &se) && se.StatusCode == http.StatusUnauthorized
 }
 
+// IsTooManyRequests reports whether err carries an HTTP 429 from the hub,
+// meaning the agent exceeded the hub's rate limit.
+func IsTooManyRequests(err error) bool {
+	var se *StatusError
+	return errors.As(err, &se) && se.StatusCode == http.StatusTooManyRequests
+}
+
+// parseRetryAfter parses an HTTP Retry-After header (delta-seconds or
+// HTTP-date) into a positive duration, returning 0 if absent, invalid, or
+// non-positive.
+func parseRetryAfter(val string) time.Duration {
+	val = strings.TrimSpace(val)
+	if val == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(val); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(val); err == nil {
+		d := time.Until(t)
+		if d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
 func (c *Client) absoluteURL(path string) string {
 	if path == "" || strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
 		return path
@@ -739,15 +779,15 @@ func (c *Client) absoluteURL(path string) string {
 }
 
 // SetSecret stores a secret via the Hub API.
-// The value should already be base64-encoded. Scope selects project (default)
-// or user; an empty scope is treated as "project".
+// The value should already be base64-encoded. Scope selects project (default),
+// user, or agent; an empty scope is treated as "project".
 func (c *Client) SetSecret(ctx context.Context, key, value, secretType, target, scope string, force bool, allowProgeny *bool) (*SetSecretResponse, error) {
 	if !c.IsConfigured() {
 		return nil, fmt.Errorf("hub client not configured (is SCION_HUB_ENDPOINT set?)")
 	}
 
 	endpoint := fmt.Sprintf("%s/api/v1/agents/%s/secrets/%s",
-		strings.TrimSuffix(c.hubURL, "/"), c.agentID, key)
+		strings.TrimSuffix(c.hubURL, "/"), c.agentID, url.PathEscape(key))
 
 	reqBody := SetSecretRequest{
 		Value:        value,
@@ -807,8 +847,59 @@ func (c *Client) SetSecret(ctx context.Context, key, value, secretType, target, 
 				"approve or reject them before saving more (%s)", key, ErrCodeSecretPendingCap)
 		}
 		return nil, fmt.Errorf("hub returned error %d: %s", resp.StatusCode, string(respBody))
+	case http.StatusBadRequest:
+		if scope == "agent" && isAgentScopeUnavailableResponse(scope, respBody) {
+			return nil, fmt.Errorf("%w: %s", ErrAgentScopeUnavailable, string(respBody))
+		}
+		return nil, fmt.Errorf("hub returned error %d: %s", resp.StatusCode, string(respBody))
 	default:
 		return nil, fmt.Errorf("hub returned error %d: %s", resp.StatusCode, string(respBody))
+	}
+}
+
+// DeleteSecret deletes an agent-scoped secret via the Hub API.
+func (c *Client) DeleteSecret(ctx context.Context, key, scope string) error {
+	if !c.IsConfigured() {
+		return fmt.Errorf("hub client not configured (is SCION_HUB_ENDPOINT set?)")
+	}
+
+	endpoint := fmt.Sprintf("%s/api/v1/agents/%s/secrets/%s",
+		strings.TrimSuffix(c.hubURL, "/"), c.agentID, url.PathEscape(key))
+	if scope != "" {
+		endpoint += "?scope=" + url.QueryEscape(scope)
+	}
+
+	c.tokenMu.RLock()
+	currentToken := c.token
+	c.tokenMu.RUnlock()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	c.setAgentAuth(req.Header, currentToken)
+
+	resp, err := c.do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, _ := io.ReadAll(resp.Body)
+
+	switch resp.StatusCode {
+	case http.StatusNoContent, http.StatusOK:
+		return nil
+	case http.StatusNotFound:
+		return fmt.Errorf("secret %q not found", key)
+	case http.StatusBadRequest:
+		if scope == "agent" && isAgentScopeUnavailableResponse(scope, respBody) {
+			return fmt.Errorf("%w: %s", ErrAgentScopeUnavailable, string(respBody))
+		}
+		return fmt.Errorf("hub returned error %d: %s", resp.StatusCode, string(respBody))
+	default:
+		return fmt.Errorf("hub returned error %d: %s", resp.StatusCode, string(respBody))
 	}
 }
 
@@ -818,17 +909,28 @@ type GetSecretResponse struct {
 	Value  string `json:"value"` // base64-encoded
 	Type   string `json:"type"`
 	Target string `json:"target"`
+	Scope  string `json:"scope,omitempty"`
 }
 
-// GetSecret retrieves a project-scoped secret via the Hub API.
-// Returns the secret key, value (base64-encoded), type and target.
+// GetSecret retrieves a secret via the Hub API using the default scope
+// resolution (agent scope first when enabled, then project scope).
+// Returns the secret key, value (base64-encoded), type, target and scope.
 func (c *Client) GetSecret(ctx context.Context, key string) (*GetSecretResponse, error) {
+	return c.GetSecretWithScope(ctx, key, "")
+}
+
+// GetSecretWithScope retrieves a secret via the Hub API, optionally pinning
+// the lookup to a specific scope ("agent", "project", or "user").
+func (c *Client) GetSecretWithScope(ctx context.Context, key, scope string) (*GetSecretResponse, error) {
 	if !c.IsConfigured() {
 		return nil, fmt.Errorf("hub client not configured (is SCION_HUB_ENDPOINT set?)")
 	}
 
 	endpoint := fmt.Sprintf("%s/api/v1/agents/%s/secrets/%s",
-		strings.TrimSuffix(c.hubURL, "/"), c.agentID, key)
+		strings.TrimSuffix(c.hubURL, "/"), c.agentID, url.PathEscape(key))
+	if scope != "" {
+		endpoint += "?scope=" + url.QueryEscape(scope)
+	}
 
 	c.tokenMu.RLock()
 	currentToken := c.token
@@ -865,6 +967,7 @@ type ListSecretsSecretMeta struct {
 	Key    string `json:"key"`
 	Type   string `json:"type"`
 	Target string `json:"target"`
+	Scope  string `json:"scope,omitempty"`
 }
 
 // ListSecretsResponse is the response from the agent secret LIST endpoint.
@@ -872,14 +975,28 @@ type ListSecretsResponse struct {
 	Secrets []ListSecretsSecretMeta `json:"secrets"`
 }
 
-// ListSecrets lists metadata for all project-scoped secrets via the Hub API.
+// ListSecrets lists metadata for all secrets accessible to the agent via the Hub API.
 func (c *Client) ListSecrets(ctx context.Context) (*ListSecretsResponse, error) {
+	return c.ListSecretsWithScope(ctx, "")
+}
+
+// ErrAgentScopeUnavailable is returned by ListSecretsWithScope when the Hub
+// rejects the requested scope with HTTP 400 (for example, when hub.agent_secrets
+// is not enabled on the Hub).
+var ErrAgentScopeUnavailable = errors.New("agent secret scope is not enabled on this hub")
+
+// ListSecretsWithScope lists metadata for secrets accessible to the agent,
+// optionally filtered by scope ("agent", "project", "user", or "all").
+func (c *Client) ListSecretsWithScope(ctx context.Context, scope string) (*ListSecretsResponse, error) {
 	if !c.IsConfigured() {
 		return nil, fmt.Errorf("hub client not configured (is SCION_HUB_ENDPOINT set?)")
 	}
 
 	endpoint := fmt.Sprintf("%s/api/v1/agents/%s/secrets",
 		strings.TrimSuffix(c.hubURL, "/"), c.agentID)
+	if scope != "" {
+		endpoint += "?scope=" + url.QueryEscape(scope)
+	}
 
 	c.tokenMu.RLock()
 	currentToken := c.token
@@ -900,6 +1017,9 @@ func (c *Client) ListSecrets(ctx context.Context) (*ListSecretsResponse, error) 
 
 	respBody, _ := io.ReadAll(resp.Body)
 
+	if resp.StatusCode == http.StatusBadRequest && (scope == "agent" || scope == "all") && isAgentScopeUnavailableResponse(scope, respBody) {
+		return nil, fmt.Errorf("%w: %s", ErrAgentScopeUnavailable, string(respBody))
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("hub returned error %d: %s", resp.StatusCode, string(respBody))
 	}
@@ -909,6 +1029,29 @@ func (c *Client) ListSecrets(ctx context.Context) (*ListSecretsResponse, error) 
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 	return &result, nil
+}
+
+// isAgentScopeUnavailableResponse reports whether a 400 response body from
+// /api/v1/agents/{id}/secrets is specifically the Hub's invalid-scope error
+// returned when hub.agent_secrets is disabled.
+func isAgentScopeUnavailableResponse(scope string, body []byte) bool {
+	var env struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return false
+	}
+	switch scope {
+	case "all":
+		return env.Error.Code == "validation_error" && env.Error.Message == `scope must be "project" or "user"`
+	case "agent":
+		return env.Error.Code == "invalid_request" && env.Error.Message == "invalid scope: agent"
+	default:
+		return false
+	}
 }
 
 // RefreshTokenEntry represents a single token in the generalized refresh response.
@@ -2672,7 +2815,11 @@ func (c *Client) FetchGCPToken(ctx context.Context, scopes []string) (*GCPAccess
 
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return nil, &StatusError{StatusCode: resp.StatusCode, Body: string(respBody)}
+		return nil, &StatusError{
+			StatusCode: resp.StatusCode,
+			Body:       string(respBody),
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+		}
 	}
 
 	var token GCPAccessTokenResponse
@@ -2716,7 +2863,11 @@ func (c *Client) FetchGCPIdentityToken(ctx context.Context, audience string) (st
 
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return "", &StatusError{StatusCode: resp.StatusCode, Body: string(respBody)}
+		return "", &StatusError{
+			StatusCode: resp.StatusCode,
+			Body:       string(respBody),
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+		}
 	}
 
 	var result struct {
@@ -2787,6 +2938,8 @@ func (c *Client) RequestIdentityToken(ctx context.Context, audience string) (*Id
 type AgentSelf struct {
 	Phase       string            `json:"phase,omitempty"`
 	Activity    string            `json:"activity,omitempty"`
+	Image       string            `json:"image,omitempty"`
+	Generation  int               `json:"generation,omitempty"`
 	Labels      map[string]string `json:"labels,omitempty"`
 	Annotations map[string]string `json:"annotations,omitempty"`
 	Ancestry    []string          `json:"ancestry,omitempty"`
@@ -2797,6 +2950,14 @@ type AgentSelf struct {
 	// CreatedBy is the ID of the principal (user or agent) that created
 	// this agent.
 	CreatedBy string `json:"createdBy,omitempty"`
+	// AppliedConfig carries the subset of appliedConfig fields used as
+	// fallbacks when top-level fields are absent.
+	AppliedConfig *AgentSelfAppliedConfig `json:"appliedConfig,omitempty"`
+}
+
+// AgentSelfAppliedConfig is the subset of appliedConfig fields decoded by GetSelf.
+type AgentSelfAppliedConfig struct {
+	Image string `json:"image,omitempty"`
 }
 
 // GetSelf fetches the current agent's metadata from the Hub API.
@@ -2974,4 +3135,61 @@ func (c *Client) FetchSecrets(ctx context.Context, keys []string) (*SecretFetchR
 	}
 
 	return &result, nil
+}
+
+// ErrHubInfoUnsupported is returned by GetHubID when the Hub responds with
+// HTTP 404 to GET /api/v1/agent/hub, indicating an older Hub that does not
+// serve hub metadata on the agent-scoped API yet.
+var ErrHubInfoUnsupported = errors.New("hub does not support GET /api/v1/agent/hub")
+
+// GetHubID fetches the Hub's identifier (hub_id) from the agent-scoped
+// GET /api/v1/agent/hub endpoint using the agent's credential.
+// Returns an error wrapping ErrHubInfoUnsupported only when the Hub responds
+// with HTTP 404.
+func (c *Client) GetHubID(ctx context.Context) (string, error) {
+	if !c.IsConfigured() {
+		return "", fmt.Errorf("hub client not configured")
+	}
+
+	endpoint := strings.TrimSuffix(c.hubURL, "/") + "/api/v1/agent/hub"
+
+	c.tokenMu.RLock()
+	currentToken := c.token
+	c.tokenMu.RUnlock()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+	c.setAgentAuth(req.Header, currentToken)
+
+	resp, err := c.do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode == http.StatusNotFound {
+		return "", fmt.Errorf("hub returned 404: %w", ErrHubInfoUnsupported)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("hub returned error %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		HubID string `json:"hub_id"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", fmt.Errorf("failed to parse response: %w", err)
+	}
+	id := strings.TrimSpace(result.HubID)
+	if id == "" {
+		return "", fmt.Errorf("hub /api/v1/agent/hub response does not report hub_id")
+	}
+	return id, nil
 }

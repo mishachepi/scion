@@ -179,9 +179,15 @@ type AgentDMInput struct {
 	AttachmentAddressee string
 
 	// RecordLogged reports that the adapter already wrote this message's
-	// record to the message log (handleAgentMessage does so before it
-	// reaches here). When set, the operation does not write another.
+	// record to the message log (or writes it via OnAdmitted). When set, the
+	// operation does not write another at step 8c.
 	RecordLogged bool
+
+	// OnAdmitted, when set, runs once Phase 1 and Phase 1b admission and
+	// phase checks have passed and right before Phase 2 side effects, so an
+	// HTTP adapter can log its acceptance record ("message received for
+	// delivery") only after validation succeeds (ptone/scion#4650).
+	OnAdmitted func()
 }
 
 // AgentDMOutcome enumerates the possible delivery result states.
@@ -447,6 +453,9 @@ func (s *Server) ExecuteAgentDM(ctx context.Context, input *AgentDMInput) (*Agen
 	// buffered dispatch, which a starting agent receives once up.
 	autoWake := false
 	wakeQueued := false
+	if isShellAgent(input.TargetAgent) {
+		return nil, shellAgentNotMessageableError(input.TargetAgent)
+	}
 	if !deferred {
 		held, holdErr := s.agentHeld(ctx, input.TargetAgent.ID)
 		mode := autoWakeNone
@@ -508,6 +517,9 @@ func (s *Server) ExecuteAgentDM(ctx context.Context, input *AgentDMInput) (*Agen
 	}
 
 	// ── Phase 2: Side effects ───────────────────────────────────────────
+	if input.OnAdmitted != nil {
+		input.OnAdmitted()
+	}
 
 	// Re-check shutdown after Phase 1b (which may have waited on a wake):
 	// refuse with retryable 503 before ingesting attachments or persisting a
@@ -905,9 +917,11 @@ func (s *Server) ExecuteAgentDM(ctx context.Context, input *AgentDMInput) (*Agen
 			}, nil
 		}
 		if !dispatched {
-			// CAS miss — already transitioned by concurrent process.
-			// The dispatch itself succeeded; log for visibility but not an error.
-			s.messageLog.Warn("agent DM: MarkMessageDispatched CAS miss (already transitioned)",
+			// CAS miss — already transitioned by a concurrent process (for
+			// example, a fast interrupt DM whose broker delivery confirmation
+			// already transitioned pending->delivered before this call ran).
+			// The dispatch itself succeeded; keep at Debug to avoid Warn noise.
+			s.messageLog.Debug("agent DM: MarkMessageDispatched CAS miss (already transitioned)",
 				"message_id", msgID)
 		}
 	}
@@ -1042,11 +1056,24 @@ func (s *Server) agentDMAutoWakeItem(input *AgentDMInput, storeMsg *store.Messag
 			}
 			if err != nil {
 				LogDMDispatchOutcome(input.SenderAgent, woken, msgID, DispatchFailed, err)
-				reason := err.Error()
 				if isAmbiguousDispatchError(err) {
-					reason = dispatchOutcomeUnknownReason
+					// The synchronous caller already received AgentDMWakeQueued
+					// ("delivered"), so no HTTP response can inform it of the
+					// ambiguous dispatch. Finalize immediately as failed
+					// (ptone/scion#5111) via atomic CAS and send the sender one
+					// DELIVERY_UNCONFIRMED notice only when this call owns the
+					// transition (leaving already-delivered or already-failed
+					// rows untouched and preventing duplicate sweep notices).
+					won, markErr := s.failUndelivered(fctx, msgID, dispatchOutcomeUnknownReason)
+					if markErr != nil {
+						s.messageLog.Error("agent DM: failed to mark message failed",
+							"message_id", msgID, "error", markErr)
+					} else if won {
+						s.notifyStoredMessageSenderUnconfirmed(fctx, woken, curMsg)
+					}
+					return
 				}
-				if markErr := s.markFailed(fctx, msgID, reason); markErr != nil {
+				if markErr := s.markFailed(fctx, msgID, err.Error()); markErr != nil {
 					s.messageLog.Error("agent DM: failed to mark message failed",
 						"message_id", msgID, "error", markErr)
 				}

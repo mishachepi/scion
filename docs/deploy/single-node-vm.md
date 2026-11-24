@@ -42,6 +42,14 @@ Key properties:
 | Permissions | Project Owner, or Editor plus `roles/resourcemanager.projectIamAdmin` and `roles/run.admin` (create VMs, Cloud Run services, service accounts, IAM bindings) — Editor alone lacks both `resourcemanager.projects.setIamPolicy` (the project-level IAM bindings this script creates) and `run.services.setIamPolicy` (the Cloud Run service's own invoker binding); `projectIamAdmin` covers the first but not the second, hence `run.admin` too. Both Owner and Editor already include `iam.serviceAccounts.actAs` on the service accounts the script uses, so no separate Service Account User grant is needed. The script also grants `roles/iap.tunnelResourceAccessor` to the deployer for SSH access to the private VM. With the optional hybrid tier enabled, also `roles/iam.serviceAccountAdmin` (`iam.serviceAccounts.setIamPolicy`, for the transport service account's token-creator binding) and `roles/iap.admin` (`iap.webServices.setIamPolicy`, for its IAP access grant). Owner already covers both. |
 | VM OS image | Ubuntu 22.04 LTS — pinned, not currently configurable (see [Architecture](#architecture)). |
 
+> **Warning — never use `scion` as an SSH or OS Login username:** The Hub runs as
+> the `scion` Unix service account. On GCE, connecting via SSH or OS Login as
+> `scion` (or having a `scion` key in project or instance SSH metadata) causes the
+> Compute Engine guest agent to add `scion` to `google-sudoers` (passwordless
+> root), bypassing narrow sudoers rules. Always connect as a distinct operator
+> username; `deploy.sh` checks for `google-sudoers` membership on `scion` and
+> warns if it is present.
+
 ## Quick Start
 
 From the repository root:
@@ -750,15 +758,10 @@ The Phase 3 file does **not** turn on dev auth. `server.auth.mode: dev` on its o
 does not enable it, so until Phase 5 the Hub answers `/healthz` normally and
 every authenticated API call with `401`. Dev auth is turned on only by the
 `--dev-auth` flag or `server.auth.dev_mode: true` (environment variable
-`SCION_SERVER_AUTH_DEVMODE=true`). The server refuses to start with dev auth
-when the web server binds a non-loopback address. From Phase 5 on, the Hub
-binds `0.0.0.0` so that the IAP proxy can reach it, so do not enable dev auth
-on the VM. If you need authenticated access before Phase 5, configure OAuth
+`SCION_SERVER_AUTH_DEVMODE=true`). The VM runs the server in hosted mode,
+which refuses to start with dev auth enabled, so do not enable it on the VM.
+If you need authenticated access before Phase 5, configure OAuth
 (see [Authentication](../../docs-site/src/content/docs/hosted/single-node/auth.md)).
-For a short-lived test only, you can bind the Hub to loopback
-(`--host 127.0.0.1`) with dev auth and reach it through an SSH tunnel
-(`gcloud compute ssh scion-hub-my-hub -- -L 8080:localhost:8080`). Revert both
-before Phase 5, because the IAP proxy cannot reach a loopback-only Hub.
 
 Final configuration:
 

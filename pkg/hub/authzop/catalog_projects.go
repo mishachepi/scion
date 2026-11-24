@@ -870,6 +870,7 @@ var projectOperations = []OperationSpec{
 		Description: "Read a scheduled event, a recurring schedule or a schedule's run history",
 		EntryPoints: []EntryPoint{
 			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/projects/{projectId}/scheduled-events/{id}", Method: "GET"},
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/projects/{projectId}/scheduled-events/{id}/output", Method: "GET"},
 			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/projects/{projectId}/schedules/{id}", Method: "GET"},
 			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/projects/{projectId}/schedules/{id}/history", Method: "GET"},
 		},
@@ -1189,9 +1190,30 @@ var projectOperations = []OperationSpec{
 		Bearer: AdmitOn(BearerTargetProjectPath, BearerBoundaryProject, BearerBoundaryHub),
 	},
 	{
+		ID:          "trigger.render",
+		Domain:      "trigger",
+		Description: "Dry-run compile and render a trigger's template slots against a stored trigger event without firing or exercising recorded authority. Requires trigger.read on the trigger and read visibility on the event (agents without visibility on the event receive 404)",
+		EntryPoints: []EntryPoint{
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/projects/{projectId}/triggers/{id}/render", Method: "POST"},
+		},
+		Principals:       []PrincipalKind{PrincipalUser, PrincipalAgent},
+		Credentials:      []CredentialKind{CredentialSessionJWT, CredentialScopedUAT, CredentialAgentJWT},
+		ResourceResolver: "project-from-url",
+		BasePermission:   "trigger.read",
+		Effects:          []SecurityEffect{EffectReadOne},
+		DelegationKind:   DelegationNone,
+		AuthorityEval:    AuthorityEvalNone,
+		DenialCodes:      []DenialCode{DenialForbidden, DenialResourceNotFound},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub", Function: "TestTriggerRender"},
+			{Package: "pkg/hub", Function: "TestBearerDispositionMatrix_CatalogEntryPoints"},
+		},
+		Bearer: AdmitOn(BearerTargetProjectPath, BearerBoundaryProject, BearerBoundaryHub),
+	},
+	{
 		ID:          "trigger.create",
 		Domain:      "trigger",
-		Description: "Create an event trigger in a project. Webhook triggers resolve source.id through webhookEndpointAccessDecision(read); GitHub triggers (source.kind=github, source.id=\"\") require hub.github_triggers and an authorized GitHub App association on the project; both pass the action's target checks",
+		Description: "Create an event trigger in a project. Webhook triggers resolve source.id through webhookEndpointAccessDecision(read); GitHub triggers (source.kind=github, source.id=\"\") require hub.github_triggers and an authorized GitHub App association on the project; a github.comment action or a dispatch_agent action with ackComment requires github_trigger.comment (users only in Stage 3; agents cannot author github.comment triggers or ackComment because github_trigger.comment has no agent scope); all actions pass their target checks",
 		EntryPoints: []EntryPoint{
 			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/projects/{projectId}/triggers", Method: "POST"},
 		},
@@ -1209,12 +1231,12 @@ var projectOperations = []OperationSpec{
 		},
 		Bearer: AdmitOn(BearerTargetProjectPath, BearerBoundaryProject, BearerBoundaryHub),
 		DelegationDescription: "Authoring a trigger records the author's initiator attribution and frozen effect ceiling (triggerRevisionAuthorityCeiling) on the trigger row. " +
-			"In Stage 1 only the message action is supported, which grants no authority; fire-time delivery remains bounded by the recorded principal's current authority and frozen ceiling",
+			"A message trigger grants no authority; a dispatch_agent trigger requires agent.create and CanDelegate within the caller's role ceiling and creates agents bounded by the recorded principal's current authority and frozen ceiling; a github.comment action or a dispatch_agent action with ackComment requires github_trigger.comment (users only in Stage 3; agents are refused because github_trigger.comment has no agent scope)",
 	},
 	{
 		ID:          "trigger.update",
 		Domain:      "trigger",
-		Description: "Update or resume a trigger in a project. Agents cannot PATCH triggers; resume and dispatch-affecting updates re-validate the source (webhook endpoint read access or authorized GitHub App association) and action target and record the caller's attribution and frozen ceiling",
+		Description: "Update or resume a trigger in a project. Agents cannot PATCH triggers; resume and dispatch-affecting updates re-validate the source (webhook endpoint read access or authorized GitHub App association) and action target (a github.comment action or a dispatch_agent action with ackComment requires github_trigger.comment, users only in Stage 3) and record the caller's attribution and frozen ceiling",
 		EntryPoints: []EntryPoint{
 			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/projects/{projectId}/triggers/{id}", Method: "PATCH"},
 			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/projects/{projectId}/triggers/{id}/resume", Method: "POST"},
@@ -1233,7 +1255,7 @@ var projectOperations = []OperationSpec{
 		},
 		Bearer: AdmitOn(BearerTargetProjectPath, BearerBoundaryProject, BearerBoundaryHub),
 		DelegationDescription: "A resume, and an update that changes the source, match rules, action, subject rules or status, records the caller's initiator attribution and frozen effect ceiling " +
-			"(triggerRevisionAuthorityCeiling) in place of the stored ones; a metadata-only update changes neither. In Stage 1 only the message action is supported, which grants no authority",
+			"(triggerRevisionAuthorityCeiling) in place of the stored ones; a metadata-only update changes neither. A message trigger grants no authority; a dispatch_agent trigger requires agent.create and CanDelegate within the caller's role ceiling; a github.comment action or a dispatch_agent action with ackComment requires github_trigger.comment (users only in Stage 3; agents have no github_trigger.comment scope)",
 	},
 	{
 		ID:          "trigger.pause",
@@ -1292,9 +1314,12 @@ var projectOperations = []OperationSpec{
 	{
 		ID:          "trigger.fire",
 		Domain:      "trigger",
-		Description: "Fire a matched event trigger's message action through the shared fire core under the authority recorded by the trigger's current revision",
+		Description: "Fire a matched event trigger's message, dispatch_agent, or github.comment action through the shared fire core under the authority recorded by the trigger's current revision; a dispatch_agent fire re-checks agent.create, CanDelegate, the frozen ceiling and standing, and creates the agent under the recorded principal",
 		EntryPoints: []EntryPoint{
 			{Kind: EntryPointSchedulerJob, Pattern: "triggerDrainer:message"},
+			{Kind: EntryPointSchedulerJob, Pattern: "triggerDrainer:dispatch_agent"},
+			{Kind: EntryPointSchedulerJob, Pattern: "triggerDrainer:exec"},
+			{Kind: EntryPointSchedulerJob, Pattern: "triggerDrainer:github.comment"},
 		},
 		Principals:       []PrincipalKind{PrincipalSystem},
 		Credentials:      []CredentialKind{CredentialSystemInternal},
@@ -1306,6 +1331,8 @@ var projectOperations = []OperationSpec{
 		TestRefs: []TestRef{
 			{Package: "pkg/hub", Function: "TestTriggerDispatchE2E_RevokedAuthorityRecordsRefusedFire"},
 			{Package: "pkg/hub", Function: "TestScheduledFire_UsesRecordedTokenCeiling"},
+			{Package: "pkg/hub", Function: "TestTriggerDispatchAgent_EndToEndWebhookToAgent"},
+			{Package: "pkg/hub", Function: "TestTriggerDispatchAgent_RenderRefusalAndCollisionMatrix"},
 		},
 		Exemptions: []Exemption{{
 			Kind: ExemptionInternalOnly,
@@ -1661,7 +1688,7 @@ var projectOperations = []OperationSpec{
 		AuditObligation: &AuditObligation{
 			EventType:     "artifact_event (deleted)",
 			ContextFields: []string{"artifact_id", "actor_kind", "actor_ref", "authority"},
-			BeforeFields:  []string{"grantsRemoved", "linksRevoked"},
+			BeforeFields:  []string{"grantsRemoved", "linksRevoked", "draftsRemoved"},
 			Atomic:        true,
 		},
 		DenialCodes: []DenialCode{DenialResourceNotFound, DenialForbidden},
@@ -1730,6 +1757,60 @@ var projectOperations = []OperationSpec{
 			{Package: "pkg/hub", Function: "TestArtifactsOpenReviewOnRoutes"},
 			{Package: "pkg/artifacts", Function: "TestReviewSessionAuthorization"},
 			{Package: "pkg/artifacts", Function: "TestReviewSessionEndLogged"},
+		},
+		Bearer: artifactVersionBearer,
+	},
+	{
+		ID:          "artifact.review.draft.read",
+		Domain:      "artifact",
+		Description: "Read the caller's own saved draft review of an artifact (200 with draft null when none exists, plus currentSeq; ptone/scion#7116, ptone/scion#8470); 404 while the hub.artifacts_review_drafts experiment is off; requires review access (the readableArtifact and canWriteErr checks of artifact.version.create); the row is always keyed by the caller's own principal with no administrator, steward, owner or publisher override",
+		EntryPoints: []EntryPoint{
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/artifacts/{id}/review-draft", Method: "GET"},
+		},
+		Principals:       []PrincipalKind{PrincipalUser, PrincipalAgent},
+		Credentials:      []CredentialKind{CredentialSessionJWT, CredentialScopedUAT, CredentialAgentJWT},
+		ResourceResolver: "artifact-home-project",
+		BasePermission:   "artifact.create",
+		Effects:          []SecurityEffect{EffectReadOne},
+		DelegationKind:   DelegationNone,
+		AuthorityEval:    AuthorityEvalNone,
+		DenialCodes:      []DenialCode{DenialResourceNotFound, DenialForbidden},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub", Function: "TestArtifactsReviewDraftsOnRoutes"},
+			{Package: "pkg/hub", Function: "TestArtifactsReviewDraftsAgentCreatorAndScopedTokenIsolation"},
+			{Package: "pkg/artifacts", Function: "TestReviewDraftAuthorizationOrder"},
+		},
+		Bearer: artifactVersionBearer,
+	},
+	{
+		ID:          "artifact.review.draft.write",
+		Domain:      "artifact",
+		Description: "Create, replace or delete the caller's own saved draft review of an artifact with optimistic rev concurrency (ptone/scion#7116, ptone/scion#8470); 404 while the hub.artifacts_review_drafts experiment is off; requires review access (the readableArtifact and canWriteErr checks of artifact.version.create); rate limited per principal (LimitDraftWrite) after authorization and before reading the request body; the row is always keyed by the caller's own principal with no override; a DELETE that deletes the caller's draft row writes a review_draft_deleted decision-log entry without content, while a DELETE when no draft exists writes none (both answer 204); draft saves never trigger review notifications",
+		EntryPoints: []EntryPoint{
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/artifacts/{id}/review-draft", Method: "PUT"},
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/artifacts/{id}/review-draft", Method: "DELETE"},
+		},
+		Principals:       []PrincipalKind{PrincipalUser, PrincipalAgent},
+		Credentials:      []CredentialKind{CredentialSessionJWT, CredentialScopedUAT, CredentialAgentJWT},
+		ResourceResolver: "artifact-home-project",
+		BasePermission:   "artifact.create",
+		Effects:          []SecurityEffect{EffectCreateResource, EffectUpdateResource, EffectDeleteResource},
+		DelegationKind:   DelegationNone,
+		AuthorityEval:    AuthorityEvalNone,
+		AuditObligation: &AuditObligation{
+			EventType:     "artifact decision log (review_draft_deleted)",
+			ContextFields: []string{"route", "principal_kind", "principal_id", "project_id"},
+			BeforeFields:  []string{"artifact_id"},
+			Atomic:        false,
+			NonAtomicJustification: "The entry is written after the store deletes the caller's draft row, outside its transaction, as for every artifact decision-log entry (version creates and finalizes included; artifact_event records only artifact lifetime, home and access changes, and never records a reviewer's private draft activity on the artifact). " +
+				"A draft is the caller's own private, 30-day-TTL scratch state rather than a shared resource or authority grant, and is routinely deleted by the caller immediately after submitting a review",
+		},
+		DenialCodes: []DenialCode{DenialResourceNotFound, DenialForbidden, "rate_limited", "too_many_drafts"},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub", Function: "TestArtifactsReviewDraftsOnRoutes"},
+			{Package: "pkg/hub", Function: "TestArtifactsReviewDraftsAgentCreatorAndScopedTokenIsolation"},
+			{Package: "pkg/artifacts", Function: "TestReviewDraftAuthorizationOrder"},
+			{Package: "pkg/artifacts", Function: "TestReviewDraftNoContentInLogsOrErrors"},
 		},
 		Bearer: artifactVersionBearer,
 	},

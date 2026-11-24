@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/rebuildpreflight"
 	"github.com/GoogleCloudPlatform/scion/pkg/secret"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/stretchr/testify/require"
@@ -412,6 +413,9 @@ func (plainAuditLogger) LogLifecycleHookExecutionEvent(context.Context, *Lifecyc
 func (plainAuditLogger) LogAgentSecretReadEvent(context.Context, *AgentSecretReadEvent) error {
 	return nil
 }
+func (plainAuditLogger) LogAgentSecretWriteEvent(context.Context, *AgentSecretWriteEvent) error {
+	return nil
+}
 func (plainAuditLogger) RecordSAAssignment(context.Context, *store.SAAssignmentEvent) error {
 	return nil
 }
@@ -426,5 +430,13 @@ func (f *materialFixture) recordAgentEdge(t *testing.T) {
 }
 
 func (plainAuditLogger) LogPendingSecretEvent(context.Context, *PendingSecretEvent) error {
+	return nil
+}
+
+func (plainAuditLogger) LogMessageActionEvent(context.Context, *MessageActionEvent) error {
+	return nil
+}
+
+func (plainAuditLogger) LogMaintenanceOverrideEvent(context.Context, *rebuildpreflight.MaintenanceOverrideEvent) error {
 	return nil
 }

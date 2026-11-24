@@ -34,6 +34,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/decisionkeycounter"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/predicate"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
+	"github.com/GoogleCloudPlatform/scion/pkg/msgaction"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
@@ -41,59 +42,14 @@ import (
 // methods live on CompositeStore because each one writes a message and
 // decision rows in one transaction.
 
-// errDecisionRace marks a write that lost a race with a concurrent prompt
-// or answer: a unique-index violation on decisions, decision_answers or
-// decision_key_counters, or an active version replaced under us. The
-// non-transactional entry points retry (CreateDecisionPrompt, up to
-// maxDecisionRaceRetries times) or re-read (RecordAnswer) once on it.
-var errDecisionRace = errors.New("concurrent decision write")
-
-// maxDecisionRaceRetries bounds CreateDecisionPrompt's retries of a lost
-// race: each retry reads the winner's rows, so n concurrent reposts of one
-// key need up to n-1 retries for the last one.
-const maxDecisionRaceRetries = 5
-
-// markDecisionRace wraps a constraint violation as errDecisionRace, maps Ent
-// field validation failures to store.ErrInvalidInput, and maps any other error
-// as usual.
-func markDecisionRace(err error) error {
-	if ent.IsConstraintError(err) {
-		return fmt.Errorf("%w: %v", errDecisionRace, err)
-	}
-	if ent.IsValidationError(err) {
-		return fmt.Errorf("%w: %v", store.ErrInvalidInput, err)
-	}
-	return mapError(err)
-}
-
 // CreateDecisionPrompt implements store.DecisionStore.
 func (c *CompositeStore) CreateDecisionPrompt(ctx context.Context, in *store.DecisionPromptInput) (*store.DecisionPromptResult, error) {
 	if err := validateDecisionPromptInput(in); err != nil {
 		return nil, err
 	}
-	if c.inTx {
-		return c.createDecisionPromptTx(ctx, in)
-	}
-	var res *store.DecisionPromptResult
-	for attempt := 0; ; attempt++ {
-		err := c.WithTx(ctx, func(tx store.Store) error {
-			var err error
-			res, err = tx.(*CompositeStore).createDecisionPromptTx(ctx, in)
-			return err
-		})
-		if err == nil {
-			return res, nil
-		}
-		// The loser of a concurrent repost (or of the first use of the
-		// agent's counter) retries on the winner's rows.
-		if attempt < maxDecisionRaceRetries && (errors.Is(err, errDecisionRace) || errors.Is(err, store.ErrTransient)) {
-			continue
-		}
-		if errors.Is(err, errDecisionRace) {
-			return nil, store.ErrTransient
-		}
-		return nil, err
-	}
+	return insertNextActionVersion(ctx, c, func(tx *CompositeStore) (*store.DecisionPromptResult, error) {
+		return tx.createDecisionPromptTx(ctx, in)
+	})
 }
 
 func validateDecisionPromptInput(in *store.DecisionPromptInput) error {
@@ -122,9 +78,7 @@ func validateDecisionPromptInput(in *store.DecisionPromptInput) error {
 			}
 			seen[norm] = true
 		}
-		minChoices := messages.MinChoicesPerDecision
 		if d.Other != nil {
-			minChoices = messages.MinChoicesPerDecisionWithOther
 			if strings.TrimSpace(d.Other.Label) == "" {
 				return fmt.Errorf("%w: decision %d has an empty other label", store.ErrInvalidInput, i)
 			}
@@ -138,7 +92,7 @@ func validateDecisionPromptInput(in *store.DecisionPromptInput) error {
 				return fmt.Errorf("%w: decision %d other placeholder exceeds %d characters", store.ErrInvalidInput, i, messages.MaxOtherPlaceholderLen)
 			}
 		}
-		if d.Question == "" || len(d.Choices) < minChoices {
+		if d.Question == "" || len(d.Choices) < messages.MinChoicesPerDecision {
 			return fmt.Errorf("%w: decision %d is not normalized", store.ErrInvalidInput, i)
 		}
 	}
@@ -194,6 +148,25 @@ func (c *CompositeStore) createDecisionPromptTx(ctx context.Context, in *store.D
 	if err != nil {
 		return nil, err
 	}
+	headFor := func(key string, st *keyState) *msgaction.Head {
+		if st == nil {
+			return nil
+		}
+		h := &msgaction.Head{
+			Key:     key,
+			Version: st.maxVersion,
+			Status:  store.DecisionStatusReplaced,
+		}
+		if st.active != nil {
+			h.RowID = st.active.ID.String()
+			h.Key = st.active.Key
+			h.Status = string(st.active.Status)
+			if st.active.ReplacedByID != nil {
+				h.ReplacedBy = st.active.ReplacedByID.String()
+			}
+		}
+		return h
+	}
 	if !in.Update {
 		var existing []store.ExistingDecisionKey
 		var activeIDs []uuid.UUID
@@ -211,18 +184,20 @@ func (c *CompositeStore) createDecisionPromptTx(ctx context.Context, in *store.D
 			if d.Key == "" || !ok {
 				continue
 			}
-			ek := store.ExistingDecisionKey{Key: d.Key, Version: st.maxVersion, Status: store.DecisionStatusReplaced}
-			if st.active != nil {
-				ek.Key = st.active.Key
-				ek.Status = string(st.active.Status)
-				switch st.active.Status {
-				case decision.StatusDecided:
-					ek.Answer = effectiveAnswer(answers[st.active.ID])
-				case decision.StatusDismissed:
-					ek.Dismissal = dismissalAnswer(answers[st.active.ID])
+			if _, planErr := msgaction.PlanRepost(msgaction.DecisionKindSpec, headFor(d.Key, st), false); planErr != nil {
+				ek := store.ExistingDecisionKey{Key: d.Key, Version: st.maxVersion, Status: store.DecisionStatusReplaced}
+				if st.active != nil {
+					ek.Key = st.active.Key
+					ek.Status = string(st.active.Status)
+					switch st.active.Status {
+					case decision.StatusDecided:
+						ek.Answer = effectiveAnswer(answers[st.active.ID])
+					case decision.StatusDismissed:
+						ek.Dismissal = dismissalAnswer(answers[st.active.ID])
+					}
 				}
+				existing = append(existing, ek)
 			}
-			existing = append(existing, ek)
 		}
 		if len(existing) > 0 {
 			return nil, &store.DecisionKeyExistsError{Existing: existing}
@@ -259,37 +234,45 @@ func (c *CompositeStore) createDecisionPromptTx(ctx context.Context, in *store.D
 			r.KeySource = store.DecisionKeySourceHub
 		}
 		if st, ok := states[messages.DecisionKeyNorm(keyed[i].Key)]; ok && d.Key != "" {
-			r.Version = st.maxVersion + 1
-			if st.active != nil {
+			plan, planErr := msgaction.PlanRepost(msgaction.DecisionKindSpec, headFor(keyed[i].Key, st), in.Update)
+			if planErr != nil {
+				return nil, fmt.Errorf("%w: %v", store.ErrInvalidInput, planErr)
+			}
+			r.Version = plan.NextVersion
+			if plan.DisplayKey != "" {
 				// Display the key as first given.
-				keyed[i].Key = st.active.Key
+				keyed[i].Key = plan.DisplayKey
+			}
+			if plan.ReplacesRowID != "" && st.active != nil {
 				prev := &store.ReplacedDecision{RowID: st.active.ID.String(), Version: st.active.Version, Status: string(st.active.Status)}
 				if st.active.Status == decision.StatusDecided {
 					prev.Answer = effectiveAnswer(decided[st.active.ID])
 				}
-				var n int
-				if store.DecisionStatusTerminal(string(st.active.Status)) {
-					// A withdrawn or dismissed version keeps its terminal status when
-					// --update re-asks the key as the next version, while replaced_by_id
-					// links v1 -> v2 (design-8145 D7, design-8194 section 4.8).
-					n, err = client.Decision.Update().
-						Where(decision.ID(st.active.ID), decision.StatusIn(decision.StatusWithdrawn, decision.StatusDismissed), decision.ReplacedByIDIsNil()).
-						SetReplacedAt(now).
-						SetReplacedByID(rowIDs[i]).
-						Save(ctx)
-				} else {
-					n, err = client.Decision.Update().
+				casOK, _, casErr := casActionRows[*ent.Decision](ctx, 1, func(ctx context.Context) (int, error) {
+					if !plan.MarkReplaced {
+						// A withdrawn or dismissed version keeps its terminal status when
+						// --update re-asks the key as the next version, while replaced_by_id
+						// links v1 -> v2 (design-8145 D7, design-8194 section 4.8).
+						return client.Decision.Update().
+							Where(decision.ID(st.active.ID), decision.StatusIn(decision.StatusWithdrawn, decision.StatusDismissed), decision.ReplacedByIDIsNil()).
+							SetSettled(true).
+							SetReplacedAt(now).
+							SetReplacedByID(rowIDs[i]).
+							Save(ctx)
+					}
+					return client.Decision.Update().
 						Where(decision.ID(st.active.ID), decision.StatusNotIn(decision.StatusReplaced, decision.StatusWithdrawn, decision.StatusDismissed), decision.ReplacedByIDIsNil()).
 						SetStatus(decision.StatusReplaced).
+						SetSettled(true).
 						SetReplacedAt(now).
 						SetReplacedByID(rowIDs[i]).
 						Save(ctx)
+				}, nil)
+				if casErr != nil {
+					return nil, casErr
 				}
-				if err != nil {
-					return nil, mapError(err)
-				}
-				if n != 1 {
-					return nil, fmt.Errorf("%w: version %d of %s was replaced concurrently", errDecisionRace, st.active.Version, st.active.Key)
+				if !casOK {
+					return nil, fmt.Errorf("%w: version %d of %s was replaced concurrently", errMessageActionRace, st.active.Version, st.active.Key)
 				}
 				r.Replaced = prev
 			}
@@ -359,7 +342,7 @@ func (c *CompositeStore) createDecisionPromptTx(ctx context.Context, in *store.D
 		creates[i] = cr
 	}
 	if _, err := client.Decision.CreateBulk(creates...).Save(ctx); err != nil {
-		return nil, markDecisionRace(err)
+		return nil, markMessageActionRace(err)
 	}
 	return &store.DecisionPromptResult{Decisions: results, IntroLength: introLen}, nil
 }
@@ -388,7 +371,7 @@ func reserveDecisionNumbers(ctx context.Context, client *ent.Client, agentID uui
 	}
 	row, err = client.DecisionKeyCounter.Create().SetID(agentID).SetNext(int64(need) + 1).Save(ctx)
 	if err != nil {
-		return 0, markDecisionRace(err)
+		return 0, markMessageActionRace(err)
 	}
 	return row.Next, nil
 }
@@ -630,7 +613,7 @@ func (c *CompositeStore) RecordAnswer(ctx context.Context, in *store.RecordAnswe
 	if err == nil {
 		return answer, replayed, nil
 	}
-	if !errors.Is(err, errDecisionRace) {
+	if !errors.Is(err, errMessageActionRace) {
 		return nil, false, err
 	}
 	// A concurrent answer won. It is ours to replay only if it carries
@@ -850,7 +833,7 @@ func (c *CompositeStore) recordAnswerTx(ctx context.Context, in *store.RecordAns
 	}
 	saved, err := cr.Save(ctx)
 	if err != nil {
-		return nil, false, markDecisionRace(err)
+		return nil, false, markMessageActionRace(err)
 	}
 	// Only the pending-to-decided transition sets decided_at; a later
 	// answer (a direct one after an interpreted one) leaves it.
@@ -858,10 +841,26 @@ func (c *CompositeStore) recordAnswerTx(ctx context.Context, in *store.RecordAns
 	// concurrent repost replaced the version, and the whole answer rolls
 	// back.
 	if row.Status == decision.StatusPending {
-		n, err := client.Decision.Update().
+		upd := client.Decision.Update().
 			Where(decision.ID(rowID), decision.StatusEQ(decision.StatusPending)).
 			SetStatus(decision.StatusDecided).
-			SetDecidedAt(now).
+			SetDecidedAt(now)
+		if in.Provenance == store.DecisionProvenanceDirect {
+			upd.SetSettled(true)
+		}
+		n, err := upd.Save(ctx)
+		if err != nil {
+			return nil, false, mapError(err)
+		}
+		if n != 1 {
+			return nil, false, fmt.Errorf("%w: version %d of %s was replaced concurrently", store.ErrDecisionReplaced, row.Version, row.Key)
+		}
+	} else if in.Provenance == store.DecisionProvenanceDirect {
+		// Direct answer confirming or overriding an agent_interpreted answer
+		// settles the already-decided row.
+		n, err := client.Decision.Update().
+			Where(decision.ID(rowID), decision.StatusEQ(decision.StatusDecided)).
+			SetSettled(true).
 			Save(ctx)
 		if err != nil {
 			return nil, false, mapError(err)
@@ -878,30 +877,9 @@ func (c *CompositeStore) RecordAnswerSet(ctx context.Context, in *store.RecordAn
 	if err := validateRecordAnswerSetInput(in); err != nil {
 		return nil, err
 	}
-	if c.inTx {
-		return c.recordAnswerSetTx(ctx, in)
-	}
-	var res *store.AnswerSetResult
-	for attempt := 0; ; attempt++ {
-		err := c.WithTx(ctx, func(tx store.Store) error {
-			var err error
-			res, err = tx.(*CompositeStore).recordAnswerSetTx(ctx, in)
-			return err
-		})
-		if err == nil {
-			return res, nil
-		}
-		// The loser of a concurrent answer or repost retries: the next
-		// attempt sees the winner's rows and reports the changed set (or
-		// replays its own key).
-		if attempt < maxDecisionRaceRetries && (errors.Is(err, errDecisionRace) || errors.Is(err, store.ErrTransient)) {
-			continue
-		}
-		if errors.Is(err, errDecisionRace) {
-			return nil, store.ErrTransient
-		}
-		return nil, err
-	}
+	return withMessageActionRetry(ctx, c, func(tx *CompositeStore) (*store.AnswerSetResult, error) {
+		return tx.recordAnswerSetTx(ctx, in)
+	})
 }
 
 func validateRecordAnswerSetInput(in *store.RecordAnswerSetInput) error {
@@ -927,8 +905,11 @@ func validateRecordAnswerSetInput(in *store.RecordAnswerSetInput) error {
 		if a.DecisionRowID == "" || a.ChoiceID == "" {
 			return fmt.Errorf("%w: every answer needs a decision row id and a choice id", store.ErrInvalidInput)
 		}
-		if messages.IsReservedChoiceID(a.ChoiceID) {
+		if messages.IsReservedChoiceID(a.ChoiceID) && a.ChoiceID != messages.ChoiceIDOther {
 			return fmt.Errorf("%w: choice %q is reserved", store.ErrInvalidInput, a.ChoiceID)
+		}
+		if _, verr := messages.NormalizeOtherText(a.ChoiceID, a.OtherText); verr != nil {
+			return fmt.Errorf("%w: %s", store.ErrInvalidInput, verr.Error())
 		}
 		if seen[a.DecisionRowID] {
 			return fmt.Errorf("%w: decision row %s is answered twice", store.ErrInvalidInput, a.DecisionRowID)
@@ -989,21 +970,38 @@ func (c *CompositeStore) recordAnswerSetTx(ctx context.Context, in *store.Record
 	// Shape: every requested row is in the prompt and names one of its
 	// choices.
 	labels := make(map[string]string, len(in.Answers))
+	otherTexts := make(map[string]string, len(in.Answers))
 	for _, a := range in.Answers {
 		r, ok := byID[a.DecisionRowID]
 		if !ok {
 			return nil, fmt.Errorf("%w: decision row %s is not in message %s", store.ErrInvalidInput, a.DecisionRowID, in.MessageID)
 		}
-		label := ""
-		for _, ch := range r.Choices {
-			if ch.ID == a.ChoiceID {
-				label = ch.Label
+		var label string
+		if a.ChoiceID == messages.ChoiceIDOther {
+			if !r.AllowOther {
+				return nil, fmt.Errorf("%w: %s has no choice %q", store.ErrInvalidInput, r.Key, a.ChoiceID)
+			}
+			if r.OtherLabel != nil && *r.OtherLabel != "" {
+				label = *r.OtherLabel
+			} else {
+				label = messages.DefaultOtherLabel
+			}
+		} else {
+			for _, ch := range r.Choices {
+				if ch.ID == a.ChoiceID {
+					label = ch.Label
+				}
 			}
 		}
 		if label == "" {
 			return nil, fmt.Errorf("%w: %s has no choice %q", store.ErrInvalidInput, r.Key, a.ChoiceID)
 		}
+		otherText, verr := messages.NormalizeOtherText(a.ChoiceID, a.OtherText)
+		if verr != nil {
+			return nil, fmt.Errorf("%w: %s", store.ErrInvalidInput, verr.Error())
+		}
 		labels[a.DecisionRowID] = label
+		otherTexts[a.DecisionRowID] = otherText
 	}
 
 	// The actionable set (design choices v5, 4.1) must equal the request.
@@ -1045,7 +1043,11 @@ func (c *CompositeStore) recordAnswerSetTx(ctx context.Context, in *store.Record
 			if e.Provenance == decisionanswer.ProvenanceAgentInterpreted {
 				interpreted = true
 				want = store.DecisionOutcomeConfirm
-				if e.ChoiceID != a.ChoiceID {
+				eOther := ""
+				if e.OtherText != nil {
+					eOther = *e.OtherText
+				}
+				if e.ChoiceID != a.ChoiceID || eOther != otherTexts[a.DecisionRowID] {
 					want = store.DecisionOutcomeOverride
 				}
 			}
@@ -1097,6 +1099,7 @@ func (c *CompositeStore) recordAnswerSetTx(ctx context.Context, in *store.Record
 			SetQuestionText(r.Question).
 			SetChoiceID(a.ChoiceID).
 			SetChoiceLabel(labels[a.DecisionRowID]).
+			SetNillableOtherText(nullableString(otherTexts[a.DecisionRowID])).
 			SetAnsweredByUserID(in.AnsweredByUserID).
 			SetAnsweredByName(in.AnsweredByName).
 			SetAnsweredByEmail(in.AnsweredByEmail).
@@ -1106,26 +1109,45 @@ func (c *CompositeStore) recordAnswerSetTx(ctx context.Context, in *store.Record
 			SetResponseMessageID(responseID).
 			SetNillableIdempotencyKey(nullableString(in.IdempotencyKey)).
 			SetBatchID(batchID).
-			SetMatchedDefault(r.DefaultChoiceID != nil && *r.DefaultChoiceID == a.ChoiceID).
+			SetMatchedDefault(a.ChoiceID != messages.ChoiceIDOther && r.DefaultChoiceID != nil && *r.DefaultChoiceID == a.ChoiceID).
 			SetCreatedAt(now).
 			Save(ctx)
 		if err != nil {
-			return nil, markDecisionRace(err)
+			return nil, markMessageActionRace(err)
 		}
 		// Only the pending-to-decided transition sets decided_at. It must
 		// change exactly the row read above; none changed means a
 		// concurrent write won, and the whole set rolls back and retries.
+		// RecordAnswerSet always writes provenance=direct, so every answered
+		// row is settled (both pending->decided and confirm/override on
+		// already-decided interpreted rows).
 		if r.Status == decision.StatusPending {
-			n, err := client.Decision.Update().
-				Where(decision.ID(r.ID), decision.StatusEQ(decision.StatusPending)).
-				SetStatus(decision.StatusDecided).
-				SetDecidedAt(now).
-				Save(ctx)
-			if err != nil {
-				return nil, mapError(err)
+			casOK, _, casErr := casActionRows[*ent.Decision](ctx, 1, func(ctx context.Context) (int, error) {
+				return client.Decision.Update().
+					Where(decision.ID(r.ID), decision.StatusEQ(decision.StatusPending)).
+					SetStatus(decision.StatusDecided).
+					SetSettled(true).
+					SetDecidedAt(now).
+					Save(ctx)
+			}, nil)
+			if casErr != nil {
+				return nil, casErr
 			}
-			if n != 1 {
-				return nil, fmt.Errorf("%w: version %d of %s changed concurrently", errDecisionRace, r.Version, r.Key)
+			if !casOK {
+				return nil, fmt.Errorf("%w: version %d of %s changed concurrently", errMessageActionRace, r.Version, r.Key)
+			}
+		} else {
+			casOK, _, casErr := casActionRows[*ent.Decision](ctx, 1, func(ctx context.Context) (int, error) {
+				return client.Decision.Update().
+					Where(decision.ID(r.ID), decision.StatusEQ(decision.StatusDecided)).
+					SetSettled(true).
+					Save(ctx)
+			}, nil)
+			if casErr != nil {
+				return nil, casErr
+			}
+			if !casOK {
+				return nil, fmt.Errorf("%w: version %d of %s changed concurrently", errMessageActionRace, r.Version, r.Key)
 			}
 		}
 		res.Answers = append(res.Answers, answerToStore(saved))
@@ -1146,8 +1168,13 @@ func replayableAnswerSet(ctx context.Context, client *ent.Client, rows []*ent.De
 		pos[r.ID] = i
 	}
 	found, err := client.DecisionAnswer.Query().
-		Where(decisionanswer.DecisionRowIDIn(rowIDs...), decisionanswer.IdempotencyKey(in.IdempotencyKey),
-			decisionanswer.BatchIDNotNil(), decisionanswer.AnsweredByUserID(in.AnsweredByUserID)).
+		Where(
+			decisionanswer.DecisionRowIDIn(rowIDs...),
+			decisionanswer.IdempotencyKey(in.IdempotencyKey),
+			decisionanswer.BatchIDNotNil(),
+			decisionanswer.AnsweredByUserID(in.AnsweredByUserID),
+			decisionanswer.OutcomeNEQ(decisionanswer.OutcomeDismiss),
+		).
 		All(ctx)
 	if err != nil {
 		return nil, false, mapError(err)
@@ -1159,16 +1186,28 @@ func replayableAnswerSet(ctx context.Context, client *ent.Client, rows []*ent.De
 	if len(found) != len(in.Answers) {
 		return nil, false, mismatch
 	}
-	want := make(map[string]string, len(in.Answers))
+	type setAnswerWant struct {
+		choiceID  string
+		otherText string
+	}
+	want := make(map[string]setAnswerWant, len(in.Answers))
 	for _, a := range in.Answers {
-		want[a.DecisionRowID] = a.ChoiceID
+		otherText, verr := messages.NormalizeOtherText(a.ChoiceID, a.OtherText)
+		if verr != nil {
+			return nil, false, fmt.Errorf("%w: %s", store.ErrInvalidInput, verr.Error())
+		}
+		want[a.DecisionRowID] = setAnswerWant{choiceID: a.ChoiceID, otherText: otherText}
 	}
 	batch := *found[0].BatchID
 	for _, f := range found {
 		if f.AnsweredByUserID == nil || *f.AnsweredByUserID != in.AnsweredByUserID || f.BatchID == nil || *f.BatchID != batch {
 			return nil, false, mismatch
 		}
-		if choice, ok := want[f.DecisionRowID.String()]; !ok || choice != f.ChoiceID {
+		fOther := ""
+		if f.OtherText != nil {
+			fOther = *f.OtherText
+		}
+		if w, ok := want[f.DecisionRowID.String()]; !ok || w.choiceID != f.ChoiceID || w.otherText != fOther {
 			return nil, false, mismatch
 		}
 	}
@@ -1484,7 +1523,7 @@ func dismissalReasonContainsFold(q string) predicate.Decision {
 // effectiveAnswerLabelContainsFold matches decisions whose effective answer
 // (Decision.EffectiveAnswer: the direct answer when present, otherwise the
 // agent-interpreted answer, skipping dismissed decisions and outcome=dismiss
-// rows) has a choice_label containing q case-insensitively.
+// rows) has a choice_label or other_text containing q case-insensitively.
 func effectiveAnswerLabelContainsFold(q string) predicate.Decision {
 	return func(s *entsql.Selector) {
 		ta := entsql.Table(decisionanswer.Table).As("da_eff")
@@ -1505,7 +1544,10 @@ func effectiveAnswerLabelContainsFold(q string) predicate.Decision {
 					Where(entsql.And(
 						entsql.ColumnsEQ(ta.C(decisionanswer.FieldDecisionRowID), s.C(decision.FieldID)),
 						entsql.NEQ(ta.C(decisionanswer.FieldOutcome), decisionanswer.OutcomeDismiss),
-						entsql.ContainsFold(ta.C(decisionanswer.FieldChoiceLabel), q),
+						entsql.Or(
+							entsql.ContainsFold(ta.C(decisionanswer.FieldChoiceLabel), q),
+							entsql.ContainsFold(ta.C(decisionanswer.FieldOtherText), q),
+						),
 						entsql.Or(
 							entsql.EQ(ta.C(decisionanswer.FieldProvenance), decisionanswer.ProvenanceDirect),
 							entsql.And(
@@ -1585,29 +1627,11 @@ func (c *CompositeStore) RecordInterpretedAnswers(ctx context.Context, in *store
 	if err := validateRecordInterpretedInput(in); err != nil {
 		return nil, err
 	}
-	if c.inTx {
-		return c.recordInterpretedAnswersTx(ctx, in)
-	}
 	origMsg := in.ResponseMessage.Msg
-	var res *store.AnswerSetResult
-	for attempt := 0; ; attempt++ {
+	return withMessageActionRetry(ctx, c, func(tx *CompositeStore) (*store.AnswerSetResult, error) {
 		in.ResponseMessage.Msg = origMsg
-		err := c.WithTx(ctx, func(tx store.Store) error {
-			var err error
-			res, err = tx.(*CompositeStore).recordInterpretedAnswersTx(ctx, in)
-			return err
-		})
-		if err == nil {
-			return res, nil
-		}
-		if attempt < maxDecisionRaceRetries && (errors.Is(err, errDecisionRace) || errors.Is(err, store.ErrTransient)) {
-			continue
-		}
-		if errors.Is(err, errDecisionRace) {
-			return nil, store.ErrTransient
-		}
-		return nil, err
-	}
+		return tx.recordInterpretedAnswersTx(ctx, in)
+	})
 }
 
 func validateRecordInterpretedInput(in *store.RecordInterpretedInput) error {
@@ -1637,6 +1661,12 @@ func validateRecordInterpretedInput(in *store.RecordInterpretedInput) error {
 		if a.ChoiceID == "" || (a.Key == "" && a.DecisionRowID == "") {
 			return fmt.Errorf("%w: every pair needs a decision key or row id and a choice id", store.ErrInvalidInput)
 		}
+		if messages.IsReservedChoiceID(a.ChoiceID) && a.ChoiceID != messages.ChoiceIDOther {
+			return fmt.Errorf("%w: choice %q is reserved", store.ErrInvalidInput, a.ChoiceID)
+		}
+		if _, verr := messages.NormalizeOtherText(a.ChoiceID, a.OtherText); verr != nil {
+			return fmt.Errorf("%w: %s", store.ErrInvalidInput, verr.Error())
+		}
 		if a.DecisionRowID != "" {
 			if _, err := parseUUID(a.DecisionRowID); err != nil {
 				return err
@@ -1661,6 +1691,7 @@ type validatedInterpretedItem struct {
 	row         *ent.Decision
 	choiceID    string
 	choiceLabel string
+	otherText   string
 }
 
 func compareEntDecisionOrder(ri, rj *ent.Decision) bool {
@@ -1794,11 +1825,25 @@ func (c *CompositeStore) recordInterpretedAnswersTx(ctx context.Context, in *sto
 			})
 			continue
 		}
+		otherText, verr := messages.NormalizeOtherText(a.ChoiceID, a.OtherText)
+		if verr != nil {
+			return nil, fmt.Errorf("%w: %s", store.ErrInvalidInput, verr.Error())
+		}
 		label := ""
-		for _, ch := range row.Choices {
-			if ch.ID == a.ChoiceID {
-				label = ch.Label
-				break
+		if a.ChoiceID == messages.ChoiceIDOther {
+			if row.AllowOther {
+				if row.OtherLabel != nil && *row.OtherLabel != "" {
+					label = *row.OtherLabel
+				} else {
+					label = messages.DefaultOtherLabel
+				}
+			}
+		} else {
+			for _, ch := range row.Choices {
+				if ch.ID == a.ChoiceID {
+					label = ch.Label
+					break
+				}
 			}
 		}
 		if label == "" {
@@ -1814,6 +1859,7 @@ func (c *CompositeStore) recordInterpretedAnswersTx(ctx context.Context, in *sto
 			row:         row,
 			choiceID:    a.ChoiceID,
 			choiceLabel: label,
+			otherText:   otherText,
 		})
 	}
 	if len(failures) > 0 {
@@ -1841,6 +1887,7 @@ func (c *CompositeStore) recordInterpretedAnswersTx(ctx context.Context, in *sto
 			Key:         v.row.Key,
 			ChoiceID:    v.choiceID,
 			ChoiceLabel: v.choiceLabel,
+			OtherText:   v.otherText,
 		}
 	}
 
@@ -1878,6 +1925,7 @@ func (c *CompositeStore) recordInterpretedAnswersTx(ctx context.Context, in *sto
 			SetQuestionText(v.row.Question).
 			SetChoiceID(v.choiceID).
 			SetChoiceLabel(v.choiceLabel).
+			SetNillableOtherText(nullableString(v.otherText)).
 			SetNillableAnsweredByUserID(nullableString(in.AnsweredByUserID)).
 			SetAnsweredByName(in.AnsweredByName).
 			SetAnsweredByEmail(in.AnsweredByEmail).
@@ -1889,22 +1937,24 @@ func (c *CompositeStore) recordInterpretedAnswersTx(ctx context.Context, in *sto
 			SetResponseMessageID(responseUUID).
 			SetNillableIdempotencyKey(nullableString(in.IdempotencyKey)).
 			SetNillableBatchID(batchUUID).
-			SetMatchedDefault(v.row.DefaultChoiceID != nil && *v.row.DefaultChoiceID == v.choiceID).
+			SetMatchedDefault(v.choiceID != messages.ChoiceIDOther && v.row.DefaultChoiceID != nil && *v.row.DefaultChoiceID == v.choiceID).
 			SetCreatedAt(now).
 			Save(ctx)
 		if err != nil {
-			return nil, markDecisionRace(err)
+			return nil, markMessageActionRace(err)
 		}
-		n, err := client.Decision.Update().
-			Where(decision.ID(v.row.ID), decision.StatusEQ(decision.StatusPending)).
-			SetStatus(decision.StatusDecided).
-			SetDecidedAt(now).
-			Save(ctx)
-		if err != nil {
-			return nil, mapError(err)
+		casOK, _, casErr := casActionRows[*ent.Decision](ctx, 1, func(ctx context.Context) (int, error) {
+			return client.Decision.Update().
+				Where(decision.ID(v.row.ID), decision.StatusEQ(decision.StatusPending)).
+				SetStatus(decision.StatusDecided).
+				SetDecidedAt(now).
+				Save(ctx)
+		}, nil)
+		if casErr != nil {
+			return nil, casErr
 		}
-		if n != 1 {
-			return nil, fmt.Errorf("%w: version %d of %s changed concurrently", errDecisionRace, v.row.Version, v.row.Key)
+		if !casOK {
+			return nil, fmt.Errorf("%w: version %d of %s changed concurrently", errMessageActionRace, v.row.Version, v.row.Key)
 		}
 		res.Answers = append(res.Answers, answerToStore(saved))
 	}
@@ -1984,6 +2034,17 @@ func replayableInterpretedAnswers(ctx context.Context, client *ent.Client, agent
 		if f == nil || matched[f.ID] || f.ChoiceID != a.ChoiceID {
 			return nil, false, mismatch
 		}
+		wantOther, verr := messages.NormalizeOtherText(a.ChoiceID, a.OtherText)
+		if verr != nil {
+			return nil, false, mismatch
+		}
+		gotOther := ""
+		if f.OtherText != nil {
+			gotOther = *f.OtherText
+		}
+		if gotOther != wantOther {
+			return nil, false, mismatch
+		}
 		if a.DecisionRowID != "" && f.DecisionRowID.String() != a.DecisionRowID && a.Key == "" {
 			return nil, false, mismatch
 		}
@@ -2021,27 +2082,9 @@ func (c *CompositeStore) WithdrawDecisions(ctx context.Context, in *store.Withdr
 	if err := validateWithdrawDecisionsInput(in); err != nil {
 		return nil, err
 	}
-	if c.inTx {
-		return c.withdrawDecisionsTx(ctx, in)
-	}
-	var res *store.WithdrawDecisionsResult
-	for attempt := 0; ; attempt++ {
-		err := c.WithTx(ctx, func(tx store.Store) error {
-			var err error
-			res, err = tx.(*CompositeStore).withdrawDecisionsTx(ctx, in)
-			return err
-		})
-		if err == nil {
-			return res, nil
-		}
-		if attempt < maxDecisionRaceRetries && (errors.Is(err, errDecisionRace) || errors.Is(err, store.ErrTransient)) {
-			continue
-		}
-		if errors.Is(err, errDecisionRace) {
-			return nil, store.ErrTransient
-		}
-		return nil, err
-	}
+	return withMessageActionRetry(ctx, c, func(tx *CompositeStore) (*store.WithdrawDecisionsResult, error) {
+		return tx.withdrawDecisionsTx(ctx, in)
+	})
 }
 
 func validateWithdrawDecisionsInput(in *store.WithdrawDecisionsInput) error {
@@ -2066,8 +2109,7 @@ func validateWithdrawDecisionsInput(in *store.WithdrawDecisionsInput) error {
 		}
 		seenNorms[norm] = true
 	}
-	reason := strings.TrimSpace(in.Reason)
-	if utf8.RuneCountInString(reason) > store.MaxDecisionWithdrawReasonRunes {
+	if _, err := msgaction.NormalizeReason(in.Reason); err != nil {
 		return fmt.Errorf("%w: reason is at most %d characters", store.ErrInvalidInput, store.MaxDecisionWithdrawReasonRunes)
 	}
 	return nil
@@ -2157,11 +2199,11 @@ func (c *CompositeStore) withdrawDecisionsTx(ctx context.Context, in *store.With
 	for _, norm := range norms {
 		latest := latestByNorm[norm]
 		if latest != nil && activeByNorm[norm] == nil && (latest.Status == decision.StatusReplaced || latest.ReplacedByID != nil) {
-			return nil, fmt.Errorf("%w: %s was replaced concurrently", errDecisionRace, latest.Key)
+			return nil, fmt.Errorf("%w: %s was replaced concurrently", errMessageActionRace, latest.Key)
 		}
 		if in.WholeSet {
 			if active := activeByNorm[norm]; active != nil && !peekedMsgSet[active.MessageID] {
-				return nil, fmt.Errorf("%w: %s moved to a newer prompt concurrently", errDecisionRace, active.Key)
+				return nil, fmt.Errorf("%w: %s moved to a newer prompt concurrently", errMessageActionRace, active.Key)
 			}
 		}
 	}
@@ -2276,19 +2318,22 @@ func (c *CompositeStore) withdrawDecisionsTx(ctx context.Context, in *store.With
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	withdrawnOut := make([]*store.Decision, len(pendingRows))
 	for i, r := range pendingRows {
-		upd := client.Decision.Update().
-			Where(decision.ID(r.ID), decision.StatusEQ(decision.StatusPending)).
-			SetStatus(decision.StatusWithdrawn).
-			SetWithdrawnAt(now)
-		if reason != "" {
-			upd.SetWithdrawnReason(reason)
+		casOK, _, casErr := casActionRows[*ent.Decision](ctx, 1, func(ctx context.Context) (int, error) {
+			upd := client.Decision.Update().
+				Where(decision.ID(r.ID), decision.StatusEQ(decision.StatusPending)).
+				SetStatus(decision.StatusWithdrawn).
+				SetSettled(true).
+				SetWithdrawnAt(now)
+			if reason != "" {
+				upd.SetWithdrawnReason(reason)
+			}
+			return upd.Save(ctx)
+		}, nil)
+		if casErr != nil {
+			return nil, casErr
 		}
-		n, err := upd.Save(ctx)
-		if err != nil {
-			return nil, mapError(err)
-		}
-		if n != 1 {
-			return nil, fmt.Errorf("%w: version %d of %s changed concurrently", errDecisionRace, r.Version, r.Key)
+		if !casOK {
+			return nil, fmt.Errorf("%w: version %d of %s changed concurrently", errMessageActionRace, r.Version, r.Key)
 		}
 		d := decisionToStore(r)
 		d.Status = store.DecisionStatusWithdrawn
@@ -2310,29 +2355,11 @@ func (c *CompositeStore) DismissDecisions(ctx context.Context, in *store.Dismiss
 	if err := validateDismissDecisionsInput(in); err != nil {
 		return nil, err
 	}
-	if c.inTx {
-		return c.dismissDecisionsTx(ctx, in)
-	}
 	origMsg := in.ResponseMessage.Msg
-	var res *store.DismissDecisionsResult
-	for attempt := 0; ; attempt++ {
+	return withMessageActionRetry(ctx, c, func(tx *CompositeStore) (*store.DismissDecisionsResult, error) {
 		in.ResponseMessage.Msg = origMsg
-		err := c.WithTx(ctx, func(tx store.Store) error {
-			var err error
-			res, err = tx.(*CompositeStore).dismissDecisionsTx(ctx, in)
-			return err
-		})
-		if err == nil {
-			return res, nil
-		}
-		if attempt < maxDecisionRaceRetries && (errors.Is(err, errDecisionRace) || errors.Is(err, store.ErrTransient)) {
-			continue
-		}
-		if errors.Is(err, errDecisionRace) {
-			return nil, store.ErrTransient
-		}
-		return nil, err
-	}
+		return tx.dismissDecisionsTx(ctx, in)
+	})
 }
 
 func validateDismissDecisionsInput(in *store.DismissDecisionsInput) error {
@@ -2371,11 +2398,10 @@ func validateDismissDecisionsInput(in *store.DismissDecisionsInput) error {
 	if surface == "" {
 		surface = store.DecisionSurfaceNative
 	}
-	if surface != store.DecisionSurfaceNative && surface != store.DecisionSurfaceDecisionsPage {
+	if surface != store.DecisionSurfaceNative && surface != store.DecisionSurfaceDecisionsPage && surface != store.DecisionSurfaceInbox {
 		return fmt.Errorf("%w: invalid dismiss surface %q", store.ErrInvalidInput, in.Surface)
 	}
-	reason := strings.TrimSpace(in.Reason)
-	if utf8.RuneCountInString(reason) > store.MaxDecisionDismissReasonRunes {
+	if _, err := msgaction.NormalizeReason(in.Reason); err != nil {
 		return fmt.Errorf("%w: reason is at most %d characters", store.ErrInvalidInput, store.MaxDecisionDismissReasonRunes)
 	}
 	return nil
@@ -2451,6 +2477,8 @@ func (c *CompositeStore) dismissDecisionsTx(ctx context.Context, in *store.Dismi
 		}
 	}
 
+	minAge := dismissMinAge(in)
+
 	var toDismiss []*ent.Decision
 	var alreadyRows []*ent.Decision
 	var earliestAvailableAt time.Time
@@ -2460,7 +2488,7 @@ func (c *CompositeStore) dismissDecisionsTx(ctx context.Context, in *store.Dismi
 	if len(requestedSet) > 0 {
 		// Explicit RowIDs: all-or-nothing. Every requested row must either be
 		// already dismissed (idempotent no-op) or pass DecisionActionableReason
-		// for the user and meet DecisionDismissMinAge.
+		// for the user and meet minAge (DecisionDismissMinAge in production).
 		for _, r := range rows {
 			id := r.ID.String()
 			if !requestedSet[id] {
@@ -2477,7 +2505,7 @@ func (c *CompositeStore) dismissDecisionsTx(ctx context.Context, in *store.Dismi
 				reasons[id] = actReason
 				continue
 			}
-			avail := r.CreatedAt.Add(store.DecisionDismissMinAge)
+			avail := r.CreatedAt.Add(minAge)
 			if rawNow.Before(avail) {
 				reasons[id] = store.AnswerSetReasonTooRecent
 				if avail.After(latestTooRecentAt) {
@@ -2493,9 +2521,9 @@ func (c *CompositeStore) dismissDecisionsTx(ctx context.Context, in *store.Dismi
 	} else {
 		// Empty RowIDs: dismiss every open row of the prompt waiting on the user
 		// (pending or agent_interpreted naming the user, D6) that has reached
-		// DecisionDismissMinAge; too-recent open rows are skipped, and if none
-		// remain eligible, return DecisionTooRecentError with the earliest time
-		// (design-8194 section 4.4a).
+		// minAge (DecisionDismissMinAge in production); too-recent open rows are
+		// skipped, and if none remain eligible, return DecisionTooRecentError
+		// with the earliest time (design-8194 section 4.4a).
 		for _, r := range rows {
 			dStore := decisionToStore(r)
 			dStore.Answers = answersToStore(existingAnswers[r.ID])
@@ -2505,7 +2533,7 @@ func (c *CompositeStore) dismissDecisionsTx(ctx context.Context, in *store.Dismi
 			}
 			actReason := store.DecisionActionableReason(dStore, in.User.UserID)
 			if actReason == "" {
-				avail := r.CreatedAt.Add(store.DecisionDismissMinAge)
+				avail := r.CreatedAt.Add(minAge)
 				if rawNow.Before(avail) {
 					if earliestAvailableAt.IsZero() || avail.Before(earliestAvailableAt) {
 						earliestAvailableAt = avail
@@ -2586,22 +2614,25 @@ func (c *CompositeStore) dismissDecisionsTx(ctx context.Context, in *store.Dismi
 			SetCreatedAt(writeNow).
 			Save(ctx)
 		if err != nil {
-			return nil, markDecisionRace(err)
+			return nil, markMessageActionRace(err)
 		}
 
 		// Transition pending or decided (interpreted awaiting confirm, D6) to
 		// dismissed while keeping any prior agent_interpreted answer row in
 		// decision_answers.
-		n, err := client.Decision.Update().
-			Where(decision.ID(r.ID), decision.StatusEQ(r.Status)).
-			SetStatus(decision.StatusDismissed).
-			SetDismissedAt(writeNow).
-			Save(ctx)
-		if err != nil {
-			return nil, mapError(err)
+		casOK, _, casErr := casActionRows[*ent.Decision](ctx, 1, func(ctx context.Context) (int, error) {
+			return client.Decision.Update().
+				Where(decision.ID(r.ID), decision.StatusEQ(r.Status)).
+				SetStatus(decision.StatusDismissed).
+				SetSettled(true).
+				SetDismissedAt(writeNow).
+				Save(ctx)
+		}, nil)
+		if casErr != nil {
+			return nil, casErr
 		}
-		if n != 1 {
-			return nil, fmt.Errorf("%w: version %d of %s changed concurrently", errDecisionRace, r.Version, r.Key)
+		if !casOK {
+			return nil, fmt.Errorf("%w: version %d of %s changed concurrently", errMessageActionRace, r.Version, r.Key)
 		}
 
 		d := decisionToStore(r)
@@ -2710,10 +2741,10 @@ func replayableDismissal(
 				continue
 			}
 			// If another row of the prompt is still waiting on the user and was
-			// already >= 5 minutes old at recordedAt, the original call under
+			// already >= minAge old at recordedAt, the original call under
 			// this key must have been an explicit subset rather than empty RowIDs.
 			if store.DecisionActionableReason(dStore, in.User.UserID) == "" &&
-				!recordedAt.Before(r.CreatedAt.Add(store.DecisionDismissMinAge).Truncate(time.Microsecond)) {
+				!recordedAt.Before(r.CreatedAt.Add(dismissMinAge(in)).Truncate(time.Microsecond)) {
 				return nil, false, mismatch
 			}
 		}
@@ -2731,4 +2762,11 @@ func replayableDismissal(
 		BatchID:          batch.String(),
 		Replayed:         true,
 	}, true, nil
+}
+
+func dismissMinAge(in *store.DismissDecisionsInput) time.Duration {
+	if in != nil && in.MinAge > 0 {
+		return in.MinAge
+	}
+	return store.DecisionDismissMinAge
 }

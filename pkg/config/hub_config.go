@@ -42,6 +42,7 @@ import (
 	yamlv3 "gopkg.in/yaml.v3"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/firewallpolicy"
 )
 
 // HubServerConfig holds configuration for the Hub API server.
@@ -90,6 +91,14 @@ type HubServerConfig struct {
 	// AdminEmails is a list of email addresses to auto-promote to admin role.
 	AdminEmails []string `json:"adminEmails" yaml:"adminEmails" koanf:"adminEmails"`
 
+	// AllowedImportSources (server.hub.allowed_import_sources) lists the
+	// sources, beyond https://github.com URLs, that a hosted Hub may fetch when
+	// it imports or discovers templates and harness-configs: https:// URL
+	// prefixes and Cloud Storage prefixes (gs://<bucket>/<prefix>). See
+	// CheckHubImportSource and NormalizeAllowedImportSources. Operator-only
+	// (settings file only, no env); read once at startup.
+	AllowedImportSources []string `json:"allowedImportSources,omitempty" yaml:"allowedImportSources,omitempty" koanf:"allowedImportSources"`
+
 	// SoftDeleteRetention is how long soft-deleted agents are retained before purging.
 	// Zero means soft-delete is disabled (hard-delete immediately).
 	SoftDeleteRetention time.Duration `json:"softDeleteRetention" yaml:"softDeleteRetention" koanf:"softDeleteRetention"`
@@ -97,6 +106,12 @@ type HubServerConfig struct {
 	// SoftDeleteRetainFiles controls whether workspace files are preserved during soft-delete.
 	// When true, the broker skips file cleanup for soft-deleted agents.
 	SoftDeleteRetainFiles bool `json:"softDeleteRetainFiles" yaml:"softDeleteRetainFiles" koanf:"softDeleteRetainFiles"`
+
+	// AuditRetentionDays is the number of days to retain mutation audit records
+	// in the Hub database. Nil means unset (Hub defaults to 90 days); explicit
+	// 0 disables automatic cleanup (retain indefinitely); negative values are
+	// rejected at Hub startup.
+	AuditRetentionDays *int `json:"auditRetentionDays,omitempty" yaml:"auditRetentionDays,omitempty" koanf:"auditRetentionDays"`
 
 	// Chat holds web chat server limits (settings server.hub.chat).
 	Chat HubChatConfig `json:"chat" yaml:"chat" koanf:"chat"`
@@ -268,6 +283,35 @@ type HubServerConfig struct {
 	// Branding holds Hub-wide UI branding settings (server.hub.branding).
 	// Reloadable at runtime via OperationalSettings.
 	Branding BrandingConfig `json:"branding,omitempty" yaml:"branding,omitempty" koanf:"branding"`
+
+	// Schedules holds the limits on recurring schedules
+	// (server.hub.schedules). Read at startup.
+	Schedules HubSchedulesConfig `json:"schedules" yaml:"schedules" koanf:"schedules"`
+
+	// DefaultMessageMode is server.hub.default_message_mode: the message
+	// mode of a new agent when neither the create request, its template nor
+	// its parent agent sets one. Empty means "project", the built-in
+	// default. See ValidateDefaultMessageMode for the accepted values.
+	DefaultMessageMode string `json:"defaultMessageMode,omitempty" yaml:"defaultMessageMode,omitempty" koanf:"defaultMessageMode"`
+}
+
+// defaultMessageModeValues are the values server.hub.default_message_mode
+// accepts. "hub" is not one of them: hub mode reaches agents in other
+// projects and must be granted per agent, never by a hub-wide default.
+var defaultMessageModeValues = []string{"none", "lineage", "branch", "project"}
+
+// ValidateDefaultMessageMode checks server.hub.default_message_mode. Empty
+// (unset) is valid and means "project".
+func ValidateDefaultMessageMode(mode string) error {
+	if mode == "" {
+		return nil
+	}
+	for _, v := range defaultMessageModeValues {
+		if mode == v {
+			return nil
+		}
+	}
+	return fmt.Errorf("invalid server.hub.default_message_mode %q: must be one of %s", mode, strings.Join(defaultMessageModeValues, ", "))
 }
 
 // DefaultHubID generates a deterministic hub instance ID from the machine hostname.
@@ -796,10 +840,31 @@ type RuntimeBrokerConfig struct {
 	// to true; set false to block provisioner-based dispatches on this broker.
 	AllowContainerScriptHarnesses bool `json:"allowContainerScriptHarnesses" yaml:"allowContainerScriptHarnesses" koanf:"allowContainerScriptHarnesses"`
 
+	// InitFirewall configures the operator-authoritative egress firewall
+	// policy (server.broker.init_firewall) applied when an agent opts into
+	// SCION_INIT_FIREWALL.
+	InitFirewall *InitFirewallConfig `json:"initFirewall,omitempty" yaml:"initFirewall,omitempty" koanf:"initFirewall"`
+
 	// Instances mirrors settings server.broker.instances (flat Runtime Broker
 	// instances). Only settings.yaml may set it; a legacy server.yaml that
 	// does is rejected by LoadGlobalConfig.
 	Instances []RuntimeBrokerInstanceConfig `json:"instances,omitempty" yaml:"instances,omitempty" koanf:"instances"`
+}
+
+// InitFirewallConfig is the GlobalConfig form of V1InitFirewallConfig
+// (server.broker.init_firewall).
+type InitFirewallConfig struct {
+	AllowDomains []string `json:"allowDomains,omitempty" yaml:"allowDomains,omitempty" koanf:"allowDomains"`
+	AllowSSH     bool     `json:"allowSsh,omitempty" yaml:"allowSsh,omitempty" koanf:"allowSsh"`
+}
+
+// Normalize validates and canonicalizes the configured init-firewall policy.
+// A nil receiver returns an empty policy with no error.
+func (c *InitFirewallConfig) Normalize() (firewallpolicy.Policy, error) {
+	if c == nil {
+		return firewallpolicy.Policy{}, nil
+	}
+	return firewallpolicy.Normalize(c.AllowDomains, c.AllowSSH)
 }
 
 // RuntimeBrokerInstanceConfig is the server-config form of
@@ -1061,7 +1126,7 @@ type TransportAuthConfig struct {
 
 // ProxyAuthConfig holds proxy authentication settings.
 type ProxyAuthConfig struct {
-	// Provider selects the proxy auth provider: "iap", "jwt", or "header".
+	// Provider selects the proxy auth provider: "iap" or "jwt".
 	Provider string `json:"provider" yaml:"provider" koanf:"provider"`
 	// IAP holds Google IAP-specific settings.
 	IAP *IAPAuthConfig `json:"iap,omitempty" yaml:"iap,omitempty" koanf:"iap"`
@@ -1097,6 +1162,12 @@ type JWTAuthConfig struct {
 	// Header is the HTTP header containing the JWT assertion.
 	// Default: "X-Auth-Proxy-JWT"
 	Header string `json:"header,omitempty" yaml:"header,omitempty" koanf:"header"`
+
+	// IdentityHeaders lists additional HTTP headers the front proxy sets with
+	// user identity information (for example email or ID headers). They are
+	// stripped alongside the assertion header when proxying requests to an
+	// agent's exposed port.
+	IdentityHeaders []string `json:"identityHeaders,omitempty" yaml:"identityHeaders,omitempty" koanf:"identityHeaders"`
 
 	// Algorithm is the expected JWT signing algorithm (MANDATORY).
 	// Must be an asymmetric algorithm: RS256, RS384, RS512, ES256, ES384, ES512,
@@ -1397,6 +1468,14 @@ type GlobalConfig struct {
 	// applies.
 	AgentSecretsUserScopeOnly *bool `json:"-" yaml:"-" koanf:"-"`
 
+	// BrokerPolicyAdminManagedOnly controls whether Runtime Broker
+	// registration, attachment, placement, and starts are restricted to
+	// admin-managed brokers (gated by experiment hub.admin_managed_brokers;
+	// ptone/scion#7829). Populated from settings.yaml
+	// broker_policy.admin_managed_only in file/SQLite mode. nil means unset
+	// (default false).
+	BrokerPolicyAdminManagedOnly *bool `json:"-" yaml:"-" koanf:"-"`
+
 	// DefaultHarnessConfig is the hub-level default harness config name.
 	// Populated from the top-level default_harness_config key in settings.yaml
 	// in file/SQLite mode.
@@ -1640,6 +1719,9 @@ func LoadGlobalConfig(configPath string) (*GlobalConfig, error) {
 		return nil, err
 	}
 	if ok {
+		if err := validateBrokerInitFirewall(gc); err != nil {
+			return nil, err
+		}
 		markTrustedProxiesSet(gc, nil)
 		return gc, nil
 	}
@@ -1652,8 +1734,24 @@ func LoadGlobalConfig(configPath string) (*GlobalConfig, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := validateBrokerInitFirewall(gc); err != nil {
+		return nil, err
+	}
 	markTrustedProxiesSet(gc, nil)
 	return gc, nil
+}
+
+func validateBrokerInitFirewall(gc *GlobalConfig) error {
+	if gc == nil || gc.RuntimeBroker.InitFirewall == nil {
+		return nil
+	}
+	policy, err := gc.RuntimeBroker.InitFirewall.Normalize()
+	if err != nil {
+		return fmt.Errorf("invalid server.broker.init_firewall: %w", err)
+	}
+	gc.RuntimeBroker.InitFirewall.AllowDomains = policy.AllowDomains
+	gc.RuntimeBroker.InitFirewall.AllowSSH = policy.AllowSSH
+	return nil
 }
 
 // markTrustedProxiesSet sets gc.TrustedProxiesSet when server.trusted_proxies
@@ -2115,11 +2213,15 @@ func envKeyToConfigKey(envKey string) string {
 	if directServerEnvNames[strings.ToUpper(name)] {
 		return "" // read directly with os.Getenv, never a GlobalConfig field
 	}
+	if _, ok := parseSystemOneSecretNamesEnvRest(envKey); ok {
+		return "" // decoded by applySystemOneSecretNamesEnv after file load
+	}
 	// The residue takes one segment per GlobalConfig field (the collapsed
 	// spelling, as before the table): SCION_SERVER_ADMIN_MODE does not
 	// become adminMode.
 	segs := strings.Split(strings.ToLower(envKey), "_")
 	if p, end, ok := koanfTagPathEnd(reflect.TypeOf(GlobalConfig{}), segs); ok && !isObjectListType(end) &&
+		derefType(end).Kind() != reflect.Map &&
 		!ownsGlobalConfigEnvPath(strings.Join(p, ".")) {
 		return strings.Join(p, ".")
 	}
@@ -2146,6 +2248,12 @@ func serverEnvToOpsettingsKey(envKey string) string {
 	}
 	if directServerEnvNames[strings.ToUpper(name)] {
 		return ""
+	}
+	if adapter, ok := parseSystemOneSecretNamesEnvRest(envKey); ok {
+		if adapter == "" {
+			return SystemOneSecretNamesKey
+		}
+		return SystemOneSecretNamesKey + "." + adapter
 	}
 	return settingsEnvResidue(strings.Split(strings.ToLower(envKey), "_"), true, true)
 }
@@ -2568,6 +2676,7 @@ var envListConfigKeys = []string{
 	"hub.conduit.peerServiceAccounts",
 	"hub.conduit.tcpAllowedPorts",
 	"hub.conduit.denyPorts",
+	"runtimeBroker.initFirewall.allowDomains",
 }
 
 // splitCommaSeparatedKoanfKeys splits comma-separated string values into slices
@@ -2639,6 +2748,9 @@ type globalConfigEnvOverlay struct {
 	AgentSecrets struct {
 		UserScopeOnly *bool `koanf:"user_scope_only"`
 	} `koanf:"agent_secrets"`
+	BrokerPolicy struct {
+		AdminManagedOnly *bool `koanf:"admin_managed_only"`
+	} `koanf:"broker_policy"`
 	DefaultHarnessConfig               *string `koanf:"default_harness_config"`
 	DefaultTimezone                    *string `koanf:"default_timezone"`
 	DefaultGCPIdentityMode             *string `koanf:"default_gcp_identity_mode"`
@@ -2656,6 +2768,9 @@ type globalConfigEnvOverlay struct {
 // does every koanf field. A variable leaves the rest of its section in
 // place. It runs after the file values are applied.
 func applyEnvToOutsideKoanfFields(gc *GlobalConfig) error {
+	if err := applySystemOneSecretNamesEnv(gc); err != nil {
+		return err
+	}
 	k := koanf.New(".")
 	_ = k.Load(nonEmptyEnvProvider(serverEnvPrefix, func(rest string) string {
 		if e, ok := resolveServerEnv(serverEnvPrefix+rest, false); ok {
@@ -2686,6 +2801,9 @@ func applyEnvToOutsideKoanfFields(gc *GlobalConfig) error {
 	}
 	if v := ov.AgentSecrets.UserScopeOnly; v != nil {
 		gc.AgentSecretsUserScopeOnly = v
+	}
+	if v := ov.BrokerPolicy.AdminManagedOnly; v != nil {
+		gc.BrokerPolicyAdminManagedOnly = v
 	}
 	for dst, src := range map[*string]*string{
 		&gc.DefaultHarnessConfig:               ov.DefaultHarnessConfig,
@@ -3443,6 +3561,7 @@ var topLevelSettingsSectionKeys = []string{
 	"project_defaults",
 	"quotas",
 	"agent_secrets",
+	"broker_policy",
 	"default_harness_config",
 	"default_timezone",
 	"default_gcp_identity_mode",
@@ -3504,6 +3623,16 @@ func applyTopLevelSettingsSections(gc *GlobalConfig, raw map[string]interface{})
 	}
 	if decodeTopLevelSection(raw, "agent_secrets", &as) && as.UserScopeOnly != nil {
 		gc.AgentSecretsUserScopeOnly = as.UserScopeOnly
+	}
+
+	// Check for top-level "broker_policy" section — it lives outside
+	// "server" in settings.yaml and controls hub-level policy for Runtime
+	// Brokers (ptone/scion#7829).
+	var bp struct {
+		AdminManagedOnly *bool `yaml:"admin_managed_only"`
+	}
+	if decodeTopLevelSection(raw, "broker_policy", &bp) && bp.AdminManagedOnly != nil {
+		gc.BrokerPolicyAdminManagedOnly = bp.AdminManagedOnly
 	}
 
 	// Top-level default_harness_config — read from raw YAML.

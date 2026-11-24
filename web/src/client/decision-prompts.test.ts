@@ -34,6 +34,7 @@ const {
   applyDecisionHistoryMaps,
   carryDecisionFields,
   dismissAvailableAtMs,
+  dismissAvailableAtMsForDecisions,
   dismissDecisionPrompt,
   dismissDialogRows,
   dismissRemainingMinutes,
@@ -656,6 +657,37 @@ describe('dismissRemainingMinutes and dismissDecisionPrompt', () => {
     expect(dismissRemainingMinutes('not-a-date', createdMs)).toBe(0);
   });
 
+  it('prefers hub-provided DecisionView.dismissAvailableAt and falls back to createdAt + 5m', () => {
+    const created = '2026-11-16T09:00:00Z';
+    const createdMs = Date.parse(created);
+    const shortAvail = '2026-11-16T09:00:10Z';
+    const laterAvail = '2026-11-16T09:00:20Z';
+
+    // Falls back to createdAt + DISMISS_MIN_AGE_MS when no decision carries dismissAvailableAt.
+    expect(dismissAvailableAtMsForDecisions([view()], created)).toBe(
+      createdMs + DISMISS_MIN_AGE_MS
+    );
+    expect(dismissAvailableAtMsForDecisions(undefined, created)).toBe(
+      createdMs + DISMISS_MIN_AGE_MS
+    );
+
+    // Prefers earliest open decision's hub-computed dismissAvailableAt over fallback.
+    expect(
+      dismissAvailableAtMsForDecisions(
+        [
+          view({
+            rowId: 'r-closed',
+            status: 'decided',
+            dismissAvailableAt: '2026-11-16T09:00:05Z',
+          }),
+          view({ rowId: 'r-open-2', status: 'pending', dismissAvailableAt: laterAvail }),
+          view({ rowId: 'r-open-1', status: 'pending', dismissAvailableAt: shortAvail }),
+        ],
+        created
+      )
+    ).toBe(Date.parse(shortAvail));
+  });
+
   it('posts trimmed reason and surface to /dismiss and reads 200 response', async () => {
     const d1 = view({
       status: 'dismissed',
@@ -817,5 +849,53 @@ describe('dismissRemainingMinutes and dismissDecisionPrompt', () => {
     apiFetch.mockImplementation(() => Promise.reject(new TypeError('offline')));
     const out = await dismissDecisionPrompt('m1');
     expect(out).toMatchObject({ ok: false, status: 0 });
+  });
+});
+
+describe('answerDecisionSet other_text (ptone/scion#8153)', () => {
+  it('sends other_text only on items where it is provided', async () => {
+    apiFetch.mockClear();
+    apiFetch.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          decisions: [
+            view({
+              rowId: 'r1',
+              status: 'decided',
+              decision: {
+                choiceId: '$other',
+                label: 'Another region',
+                otherText: 'europe-west4',
+                provenance: 'direct',
+                surface: 'native',
+                responseMessageId: 'rm1',
+                at: '2026-11-20T00:00:00Z',
+              },
+            }),
+            view({ rowId: 'r2', status: 'decided' }),
+          ],
+          responseMessageId: 'rm1',
+          batchId: 'b1',
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    const out = await answerDecisionSet(
+      'm1',
+      [
+        { rowId: 'r1', choiceId: '$other', otherText: 'europe-west4' },
+        { rowId: 'r2', choiceId: '1' },
+      ],
+      'idem-set-other'
+    );
+    expect(out.ok).toBe(true);
+    const [, init] = apiFetch.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      idempotency_key: 'idem-set-other',
+      answers: [
+        { decision_row_id: 'r1', choice_id: '$other', other_text: 'europe-west4' },
+        { decision_row_id: 'r2', choice_id: '1' },
+      ],
+    });
   });
 });

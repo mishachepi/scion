@@ -28,6 +28,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
+	"github.com/GoogleCloudPlatform/scion/pkg/experiments"
 	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/transfer"
@@ -63,10 +64,11 @@ type ResourceRecord struct {
 	StoragePath   string
 	// Layout is the storage layout (store.Template.Layout,
 	// store.HarnessConfig.Layout).
-	Layout    string
-	Files     []store.TemplateFile
-	Status    string
-	SourceURL string
+	Layout       string
+	Files        []store.TemplateFile
+	Status       string
+	SourceURL    string
+	SourceCommit string
 }
 
 // Resource lifecycle states. Templates and harness-configs use identical string
@@ -179,6 +181,13 @@ type ResourceStore struct {
 	// it collected to be that subdirectory of within's root.
 	within     *collectedDir
 	withinPath string
+	// createOnly, when true, refuses to overwrite an existing resource in
+	// Bootstrap's existing-row branch (used for agent-initiated template
+	// imports).
+	createOnly bool
+	// sourceCommit is the validated 40-char git commit SHA attested by a
+	// GitHub import/refresh caller; empty for non-GitHub or local sources.
+	sourceCommit string
 }
 
 // templateStore returns a ResourceStore for templates.
@@ -212,6 +221,23 @@ func (rs *ResourceStore) requireConfigName() {
 	case *targetHarnessConfigPersistence:
 		p.nameFromConfig = true
 	}
+}
+
+// setCreateOnly restricts Bootstrap to creating new resources only: existing
+// resources and templates bundling already-existing harness-configs are
+// refused without writing.
+func (rs *ResourceStore) setCreateOnly(scope, scopeID string) {
+	rs.createOnly = true
+	if p, ok := rs.pers.(*templatePersistence); ok {
+		p.createOnly = true
+		p.createOnlyScope = scope
+		p.createOnlyScopeID = scopeID
+	}
+}
+
+// setSourceCommit sets the validated source commit SHA for this Bootstrap call.
+func (rs *ResourceStore) setSourceCommit(commit string) {
+	rs.sourceCommit = validateSourceCommit(commit)
 }
 
 // collectFiles opens an os.Root at dir (openRealDirRoot) and collects the
@@ -385,15 +411,16 @@ func (rs *ResourceStore) Bootstrap(ctx context.Context, name, dir, scope, scopeI
 	defer func() { _ = cd.root.Close() }()
 	files, root := cd.files, cd.root
 
-	// Pre-upload content check: a refusal writes nothing (no row, no
-	// storage change).
-	if err := rs.checkDir(ctx, name, cd); err != nil {
-		return false, err
-	}
-
 	slug := api.Slugify(name)
 	existing, err := p.GetBySlug(ctx, slug, scope, scopeID)
 	if err != nil {
+		return false, err
+	}
+
+	// Pre-upload content check: runs after GetBySlug so templatePersistence
+	// sees the existing row's manifest (change-only validation per D1/D3) and
+	// before Create/upload so a refusal writes nothing.
+	if err := rs.checkDir(ctx, name, cd); err != nil {
 		return false, err
 	}
 
@@ -412,6 +439,7 @@ func (rs *ResourceStore) Bootstrap(ctx context.Context, name, dir, scope, scopeI
 			StorageBucket: stor.Bucket(),
 			StorageURI:    storage.ResourceStorageURI(rs.hubID, stor.Bucket(), kind, scope, scopeID, slug),
 			SourceURL:     sourceURL,
+			SourceCommit:  rs.sourceCommit,
 		}
 		if err := p.Create(ctx, rec, cd); err != nil {
 			return false, err
@@ -434,9 +462,15 @@ func (rs *ResourceStore) Bootstrap(ctx context.Context, name, dir, scope, scopeI
 		return true, nil
 	}
 
+	// Existing resource — refuse under createOnly (agent template import).
+	if rs.createOnly {
+		return false, errors.New("template exists; agents can only create new templates")
+	}
+
 	// Existing resource — short-circuit on unchanged content unless forced.
 	if !force {
 		if rs.srv.computeContentHash(toResourceFiles(files)) == existing.ContentHash {
+			existing.SourceCommit = rs.sourceCommit
 			return p.OnHashMatch(ctx, existing, cd)
 		}
 	}
@@ -463,6 +497,7 @@ func (rs *ResourceStore) Bootstrap(ctx context.Context, name, dir, scope, scopeI
 	if sourceURL != "" {
 		existing.SourceURL = sourceURL
 	}
+	existing.SourceCommit = rs.sourceCommit
 	// Activate the record now that the upload succeeded. This also recovers a
 	// record left in "pending" by a prior bootstrap that failed mid-upload: the
 	// retry re-syncs and flips it to active rather than leaving it stuck.
@@ -485,12 +520,19 @@ type templatePersistence struct {
 	// written lists the blob objects UploadFiles wrote, which the commit in
 	// Update does not check again.
 	written map[string]bool
+	// createOnly, when true, refuses templates that bundle a harness-config
+	// whose slug already exists in the target scope (CheckDir) and never
+	// overwrites existing bundled harness-configs in PostFinalize.
+	createOnly        bool
+	createOnlyScope   string
+	createOnlyScopeID string
 }
 
 func (p *templatePersistence) Kind() storage.ResourceKind { return storage.ResourceKindTemplate }
 func (p *templatePersistence) Label() string              { return "template bootstrap" }
 
 func (p *templatePersistence) GetBySlug(ctx context.Context, slug, scope, scopeID string) (*ResourceRecord, error) {
+	p.model = nil
 	t, err := p.s.store.GetTemplateBySlug(ctx, slug, scope, scopeID)
 	if err == store.ErrNotFound {
 		return nil, nil
@@ -513,6 +555,7 @@ func (p *templatePersistence) Create(ctx context.Context, rec *ResourceRecord, _
 		Status:        rec.Status,
 		StorageBucket: rec.StorageBucket,
 		SourceURL:     rec.SourceURL,
+		SourceCommit:  rec.SourceCommit,
 	}
 	// New templates are created in the blob layout, with a row-unique
 	// storage path (ptone/scion#4221).
@@ -558,7 +601,13 @@ func (p *templatePersistence) Update(ctx context.Context, rec *ResourceRecord, c
 		p.ensureStoragePath(t)
 	}
 	apply(t)
-	err := p.s.commitTemplateFiles(ctx, t, rec.Files, commitOpts{collected: cd, written: p.written})
+	opts := commitOpts{
+		collected:       cd,
+		written:         p.written,
+		sourceCommit:    rec.SourceCommit,
+		setSourceCommit: true,
+	}
+	err := p.s.commitTemplateFiles(ctx, t, rec.Files, opts)
 	if errors.Is(err, store.ErrTemplateConflict) {
 		// Another commit changed the row since it was read: re-read it and
 		// commit the directory's files once more against the fresh row
@@ -569,7 +618,7 @@ func (p *templatePersistence) Update(ctx context.Context, rec *ResourceRecord, c
 		fresh, err = p.rereadAfterConflict(ctx, t)
 		if err == nil {
 			apply(fresh)
-			if err = p.s.commitTemplateFiles(ctx, fresh, rec.Files, commitOpts{collected: cd, written: p.written}); err == nil {
+			if err = p.s.commitTemplateFiles(ctx, fresh, rec.Files, opts); err == nil {
 				p.model = fresh
 				t = fresh
 			}
@@ -607,12 +656,19 @@ func (p *templatePersistence) OnHashMatch(ctx context.Context, rec *ResourceReco
 	if err != nil {
 		return false, fmt.Errorf("%s: failed to re-derive template %q: %w", p.Label(), t.Name, err)
 	}
-	if templateIndexMatches(t, idx) {
+	indexMatches := templateIndexMatches(t, idx)
+	commitMatches := t.SourceCommit == rec.SourceCommit
+	if indexMatches && commitMatches {
 		return false, nil
 	}
 	prevStoragePath := t.StoragePath
 	p.ensureStoragePath(t)
-	err = p.s.commitTemplateFiles(ctx, t, t.Files, commitOpts{collected: cd})
+	opts := commitOpts{
+		collected:       cd,
+		sourceCommit:    rec.SourceCommit,
+		setSourceCommit: true,
+	}
+	err = p.s.commitTemplateFiles(ctx, t, t.Files, opts)
 	if errors.Is(err, store.ErrTemplateConflict) {
 		var fresh *store.Template
 		fresh, err = p.rereadAfterConflict(ctx, t)
@@ -624,7 +680,7 @@ func (p *templatePersistence) OnHashMatch(ctx context.Context, rec *ResourceReco
 				return false, nil
 			}
 			p.ensureStoragePath(fresh)
-			if err = p.s.commitTemplateFiles(ctx, fresh, fresh.Files, commitOpts{collected: cd}); err == nil {
+			if err = p.s.commitTemplateFiles(ctx, fresh, fresh.Files, opts); err == nil {
 				p.model = fresh
 				t = fresh
 			}
@@ -634,10 +690,12 @@ func (p *templatePersistence) OnHashMatch(ctx context.Context, rec *ResourceReco
 		t.StoragePath = prevStoragePath
 		return false, fmt.Errorf("%s: failed to re-derive template %q: %w", p.Label(), t.Name, err)
 	}
-	p.s.importTemplateHarnessConfigs(ctx, cd, t.Scope, t.ScopeID)
-	p.s.templateLog.Info(p.Label()+": re-derived template index",
-		"template", t.Name, "harness", t.Harness, "defaultHarnessConfig", t.DefaultHarnessConfig)
-	return false, nil
+	if !indexMatches {
+		p.s.importTemplateHarnessConfigs(ctx, cd, t.Scope, t.ScopeID)
+		p.s.templateLog.Info(p.Label()+": re-derived template index",
+			"template", t.Name, "harness", t.Harness, "defaultHarnessConfig", t.DefaultHarnessConfig)
+	}
+	return !commitMatches, nil
 }
 
 // UploadFiles writes the directory's files as blobs under the template's
@@ -752,11 +810,41 @@ func blobPathSet(written map[string]bool) map[string]struct{} {
 }
 
 // CheckDir refuses a template directory that bundles a harness-config with
-// an unusable provisioner, before the shared store uploads anything. The
-// commit path runs the same check again (defence in depth).
-func (p *templatePersistence) CheckDir(ctx context.Context, _ string, cd *collectedDir) error {
-	if err := checkBundledHarnessConfigs(ctx, cd.fileReader(), toResourceFiles(cd.files)); err != nil {
+// an unusable provisioner or (when hub.template_config_validation is enabled)
+// has a schema-invalid agent config, before the shared store uploads anything.
+// Under createOnly (agent imports), it also refuses the whole template if any
+// bundled harness-config slug already exists in the target scope. The commit
+// path runs the provisioner and schema checks again (defence in depth) and
+// handles warn-logging when the experiment is off.
+func (p *templatePersistence) CheckDir(ctx context.Context, name string, cd *collectedDir) error {
+	manifest := toResourceFiles(cd.files)
+	if err := checkBundledHarnessConfigs(ctx, cd.fileReader(), manifest); err != nil {
 		return fmt.Errorf("%s: template in %q not imported: %w", p.Label(), cd.base(), err)
+	}
+	if p.s != nil && p.s.experimentEnabled(experiments.TemplateConfigValidation) {
+		var prevFiles []store.TemplateFile
+		if p.model != nil {
+			prevFiles = p.model.Files
+		}
+		if err := p.s.checkTemplateAgentConfig(ctx, name, cd.fileReader(), prevFiles, manifest); err != nil {
+			return err
+		}
+	}
+	if p.createOnly {
+		hcScope := store.HarnessConfigScopeGlobal
+		if p.createOnlyScope == string(store.TemplateScopeProject) {
+			hcScope = store.HarnessConfigScopeProject
+		}
+		for _, hcName := range cd.subdirs("harness-configs") {
+			slug := api.Slugify(hcName)
+			existing, err := p.s.store.GetHarnessConfigBySlug(ctx, slug, hcScope, p.createOnlyScopeID)
+			if err != nil && err != store.ErrNotFound {
+				return fmt.Errorf("%s: failed to check bundled harness-config %q: %w", p.Label(), hcName, err)
+			}
+			if existing != nil {
+				return fmt.Errorf("bundled harness-config %q already exists; agents can only create new templates and bundled harness configs", hcName)
+			}
+		}
 	}
 	return nil
 }
@@ -788,7 +876,7 @@ func templateIndexMatches(t *store.Template, idx templateIndex) bool {
 }
 
 func (p *templatePersistence) PostFinalize(ctx context.Context, rec *ResourceRecord, cd *collectedDir) {
-	p.s.importTemplateHarnessConfigs(ctx, cd, rec.Scope, rec.ScopeID)
+	p.s.importTemplateHarnessConfigsWithOptions(ctx, cd, rec.Scope, rec.ScopeID, p.createOnly)
 }
 
 func templateToRecord(t *store.Template) *ResourceRecord {
@@ -811,6 +899,7 @@ func templateToRecord(t *store.Template) *ResourceRecord {
 		Files:         t.Files,
 		Status:        t.Status,
 		SourceURL:     t.SourceURL,
+		SourceCommit:  t.SourceCommit,
 	}
 }
 
@@ -850,11 +939,16 @@ func (p *harnessConfigPersistence) GetBySlug(ctx context.Context, slug, scope, s
 	return harnessConfigToRecord(hc), nil
 }
 
-// Create writes the pending row. It carries no files and no derived Config:
+// Create writes the pending row. On a hosted hub a project-scope row cannot
+// take the slug of a global harness config (checkHarnessConfigSlugNotGlobal).
+// It carries no files and no derived Config:
 // the Update that follows the upload commits both through
 // commitHarnessConfigFiles. Harness is set because the column is non-empty;
 // the commit replaces it with the derived value.
 func (p *harnessConfigPersistence) Create(ctx context.Context, rec *ResourceRecord, cd *collectedDir) error {
+	if err := p.s.checkHarnessConfigSlugNotGlobal(ctx, rec.Scope, rec.Slug); err != nil {
+		return err
+	}
 	harnessType := p.harness
 	if idx := deriveHarnessConfigIndexFromCollected(cd, rec.Name); idx.Harness != "" {
 		harnessType = idx.Harness

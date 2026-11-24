@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"entgo.io/ent/dialect/sql"
+	"entgo.io/ent/dialect/sql/sqlgraph"
 	"github.com/google/uuid"
 )
 
@@ -50,20 +51,35 @@ const (
 	FieldDecidedDialect = "decided_dialect"
 	// FieldRuleTrace holds the string denoting the rule_trace field in the database.
 	FieldRuleTrace = "rule_trace"
+	// FieldTargetAgentID holds the string denoting the target_agent_id field in the database.
+	FieldTargetAgentID = "target_agent_id"
 	// FieldExecutorKind holds the string denoting the executor_kind field in the database.
 	FieldExecutorKind = "executor_kind"
 	// FieldExecutorID holds the string denoting the executor_id field in the database.
 	FieldExecutorID = "executor_id"
 	// FieldLeaseUntil holds the string denoting the lease_until field in the database.
 	FieldLeaseUntil = "lease_until"
+	// FieldNotBefore holds the string denoting the not_before field in the database.
+	FieldNotBefore = "not_before"
+	// FieldDeferredAt holds the string denoting the deferred_at field in the database.
+	FieldDeferredAt = "deferred_at"
 	// FieldStartedAt holds the string denoting the started_at field in the database.
 	FieldStartedAt = "started_at"
 	// FieldFinishedAt holds the string denoting the finished_at field in the database.
 	FieldFinishedAt = "finished_at"
 	// FieldCreated holds the string denoting the created field in the database.
 	FieldCreated = "created"
+	// EdgeExecRun holds the string denoting the exec_run edge name in mutations.
+	EdgeExecRun = "exec_run"
 	// Table holds the table name of the triggerfire in the database.
 	Table = "trigger_fires"
+	// ExecRunTable is the table that holds the exec_run relation/edge.
+	ExecRunTable = "scheduled_exec_runs"
+	// ExecRunInverseTable is the table name for the ScheduledExecRun entity.
+	// It exists in this package in order to avoid circular dependency with the "scheduledexecrun" package.
+	ExecRunInverseTable = "scheduled_exec_runs"
+	// ExecRunColumn is the table column denoting the exec_run relation/edge.
+	ExecRunColumn = "fire_id"
 )
 
 // Columns holds all SQL columns for triggerfire fields.
@@ -87,9 +103,12 @@ var Columns = []string{
 	FieldMatchedThrough,
 	FieldDecidedDialect,
 	FieldRuleTrace,
+	FieldTargetAgentID,
 	FieldExecutorKind,
 	FieldExecutorID,
 	FieldLeaseUntil,
+	FieldNotBefore,
+	FieldDeferredAt,
 	FieldStartedAt,
 	FieldFinishedAt,
 	FieldCreated,
@@ -226,6 +245,11 @@ func ByRuleTrace(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldRuleTrace, opts...).ToFunc()
 }
 
+// ByTargetAgentID orders the results by the target_agent_id field.
+func ByTargetAgentID(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldTargetAgentID, opts...).ToFunc()
+}
+
 // ByExecutorKind orders the results by the executor_kind field.
 func ByExecutorKind(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldExecutorKind, opts...).ToFunc()
@@ -241,6 +265,16 @@ func ByLeaseUntil(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldLeaseUntil, opts...).ToFunc()
 }
 
+// ByNotBefore orders the results by the not_before field.
+func ByNotBefore(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldNotBefore, opts...).ToFunc()
+}
+
+// ByDeferredAt orders the results by the deferred_at field.
+func ByDeferredAt(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldDeferredAt, opts...).ToFunc()
+}
+
 // ByStartedAt orders the results by the started_at field.
 func ByStartedAt(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldStartedAt, opts...).ToFunc()
@@ -254,4 +288,18 @@ func ByFinishedAt(opts ...sql.OrderTermOption) OrderOption {
 // ByCreated orders the results by the created field.
 func ByCreated(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldCreated, opts...).ToFunc()
+}
+
+// ByExecRunField orders the results by exec_run field.
+func ByExecRunField(field string, opts ...sql.OrderTermOption) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborTerms(s, newExecRunStep(), sql.OrderByField(field, opts...))
+	}
+}
+func newExecRunStep() *sqlgraph.Step {
+	return sqlgraph.NewStep(
+		sqlgraph.From(Table, FieldID),
+		sqlgraph.To(ExecRunInverseTable, FieldID),
+		sqlgraph.Edge(sqlgraph.O2O, false, ExecRunTable, ExecRunColumn),
+	)
 }

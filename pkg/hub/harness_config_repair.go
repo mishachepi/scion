@@ -254,13 +254,15 @@ func (s *Server) syncHarnessConfigFromStorageInner(ctx context.Context, id strin
 // It mirrors HarnessConfigRepairRef: ID is authoritative when set (an
 // agent's AppliedConfig.TemplateID, or the record already in hand during
 // sync-all), and a stale ID is "not found", never re-targeted by name.
-// Name/ProjectID are used only when no ID was stamped: the reference is
+// Name/ProjectID/UserID are used only when no ID was stamped: the reference is
 // resolved the same way agent create resolves it (ID, then slug in the
-// agent's project scope, then global), never "any template with that name".
+// agent's project scope, then owner's user scope, then global), never "any
+// template with that name".
 type TemplateRepairRef struct {
 	ID        string
 	Name      string
 	ProjectID string
+	UserID    string
 }
 
 func (r TemplateRepairRef) String() string {
@@ -529,8 +531,9 @@ func (s *Server) syncAllResourcesFromStorage(ctx context.Context, kind storage.R
 // is "not found", with no name fallback — the dispatch retry still carries
 // the stale ID and hash, so repairing some other same-named row could not
 // make it succeed and would only touch an unrelated record. The name is
-// used only when no ID was stamped, looked up by slug in the agent's project
-// scope, then global scope. Returns (nil, nil) when nothing matches.
+// used only when no ID was stamped, looked up by slug in the scopes and order
+// dispatch uses (harnessConfigLookupScopes). Returns (nil, nil) when nothing
+// matches.
 //
 // There is deliberately no Status filter (the old name lookup required
 // "active"): resolveDerivedConfig stamps the ID via the same unfiltered
@@ -550,21 +553,15 @@ func (s *Server) resolveHarnessConfigForRepair(ctx context.Context, ref HarnessC
 	if ref.Name == "" {
 		return nil, nil
 	}
-	if ref.ProjectID != "" {
-		hc, err := s.store.GetHarnessConfigBySlug(ctx, ref.Name, store.HarnessConfigScopeProject, ref.ProjectID)
+	// The scopes in dispatch's order (resolveHarnessConfigBySlug).
+	for _, sc := range s.harnessConfigLookupScopes(ref.ProjectID) {
+		hc, err := s.store.GetHarnessConfigBySlug(ctx, ref.Name, sc.scope, sc.scopeID)
 		if err == nil && hc != nil {
 			return hc, nil
 		}
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
-			return nil, fmt.Errorf("lookup project harness-config %q: %w", ref.Name, err)
+			return nil, fmt.Errorf("lookup %s harness-config %q: %w", sc.scope, ref.Name, err)
 		}
-	}
-	hc, err := s.store.GetHarnessConfigBySlug(ctx, ref.Name, store.HarnessConfigScopeGlobal, "")
-	if err == nil && hc != nil {
-		return hc, nil
-	}
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		return nil, fmt.Errorf("lookup global harness-config %q: %w", ref.Name, err)
 	}
 	return nil, nil
 }
@@ -573,8 +570,8 @@ func (s *Server) resolveHarnessConfigForRepair(ctx context.Context, ref HarnessC
 // on. When an ID is given it is authoritative: a missing record is "not
 // found", with no name fallback. Otherwise the name is resolved with
 // resolveTemplateRef (the rule agent create uses): by ID, then by slug in the
-// agent's project scope, then global. Returns (nil, nil) when nothing
-// matches.
+// agent's project scope, then owner's user scope, then global. Returns
+// (nil, nil) when nothing matches.
 func (s *Server) resolveTemplateForRepair(ctx context.Context, ref TemplateRepairRef) (*store.Template, error) {
 	if ref.ID != "" {
 		tmpl, err := s.store.GetTemplate(ctx, ref.ID)
@@ -589,7 +586,7 @@ func (s *Server) resolveTemplateForRepair(ctx context.Context, ref TemplateRepai
 	if ref.Name == "" {
 		return nil, nil
 	}
-	tmpl, err := resolveTemplateRef(ctx, s.store, ref.Name, ref.ProjectID)
+	tmpl, err := resolveTemplateRef(ctx, s.store, ref.Name, ref.ProjectID, ref.UserID)
 	if err != nil {
 		return nil, fmt.Errorf("lookup template %q: %w", ref.Name, err)
 	}

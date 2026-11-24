@@ -119,10 +119,11 @@ func newProxyAuthStoreWithRoles() *proxyAuthStore {
 // staticAccessSettings is a test implementation of AccessSettingsProvider
 // with mutable fields for simulating live config changes in tests.
 type staticAccessSettings struct {
-	adminEmails       []string
-	authorizedDomains []string
-	userAccessMode    string
-	defaultUserRole   string
+	adminEmails              []string
+	authorizedDomains        []string
+	userAccessMode           string
+	defaultUserRole          string
+	customDefaultRoleEnabled bool
 }
 
 func newTestWebServer(t *testing.T, cfg WebServerConfig) *WebServer {
@@ -268,6 +269,14 @@ func (s *proxyAuthStore) UpdateUserLastLogin(ctx context.Context, id string, tim
 	return nil
 }
 
+func (s *proxyAuthStore) WithTx(_ context.Context, fn func(tx store.Store) error) error {
+	return fn(s)
+}
+
+func (s *proxyAuthStore) LockUserRow(context.Context, string, bool) error {
+	return nil
+}
+
 func (s *proxyAuthStore) GetGroupBySlug(_ context.Context, _ string) (*store.Group, error) {
 	return nil, store.ErrNotFound // hub-members group not found is gracefully handled
 }
@@ -352,6 +361,9 @@ func (s *staticAccessSettings) DefaultUserRole() string {
 	}
 	return s.defaultUserRole
 }
+func (s *staticAccessSettings) CustomDefaultRoleEnabled() bool {
+	return s.customDefaultRoleEnabled
+}
 
 func (t *mockOAuthTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	var body string
@@ -392,11 +404,12 @@ func hubPageHeaderValues(t *testing.T) map[string]string {
 
 // proxiedPageHeaderValues is hubPageHeaderValues for a page served from an
 // agent's port: the hub's own values, except that the untrusted-content
-// Permissions-Policy replaces the web pages' one.
+// Permissions-Policy and Referrer-Policy replace the web pages' ones.
 func proxiedPageHeaderValues(t *testing.T) map[string]string {
 	t.Helper()
 	out := hubPageHeaderValues(t)
 	out["Permissions-Policy"] = untrustedContentPermissionsPolicy
+	out["Referrer-Policy"] = "no-referrer"
 	return out
 }
 

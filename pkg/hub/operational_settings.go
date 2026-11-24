@@ -32,6 +32,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/config/opsettings"
+	"github.com/GoogleCloudPlatform/scion/pkg/experiments"
 	"github.com/GoogleCloudPlatform/scion/pkg/secret"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
@@ -160,6 +161,9 @@ type Layer1Snapshot struct {
 
 	// Agent secrets
 	AgentSecretsUserScopeOnly *bool
+
+	// Broker policy (ptone/scion#7829)
+	BrokerPolicyAdminManagedOnly *bool
 
 	// Project defaults
 	DefaultScratchpad *bool
@@ -1370,6 +1374,12 @@ func buildSnapshotFromKoanf(k *koanf.Koanf) Layer1Snapshot {
 		snap.AgentSecretsUserScopeOnly = &v
 	}
 
+	// Broker policy
+	if k.Exists("broker_policy.admin_managed_only") {
+		v := k.Bool("broker_policy.admin_managed_only")
+		snap.BrokerPolicyAdminManagedOnly = &v
+	}
+
 	// Project defaults
 	if k.Exists("project_defaults.default_scratchpad") {
 		v := k.Bool("project_defaults.default_scratchpad")
@@ -1569,6 +1579,10 @@ func BuildLayer1SnapshotFromFile(gc *config.GlobalConfig) Layer1Snapshot {
 	// section, so a file-mode admin save takes effect without a restart.
 	snap.AgentSecretsUserScopeOnly = gc.AgentSecretsUserScopeOnly
 
+	// Broker policy — read from settings.yaml top-level broker_policy
+	// section, so a file-mode admin save takes effect without a restart.
+	snap.BrokerPolicyAdminManagedOnly = gc.BrokerPolicyAdminManagedOnly
+
 	// Hub observability export switches — read at startup only.
 	snap.HubMetricsEnabled = gc.Hub.Observability.MetricsEnabled
 	snap.HubTracingEnabled = gc.Hub.Observability.TracingEnabled
@@ -1762,6 +1776,8 @@ func ApplySnapshot(s *Server, snap Layer1Snapshot) map[string]interface{} {
 		applied = append(applied, "telemetry_config")
 	}
 	s.config.TelemetryConfig = telemetryConfig
+	nextMetricsProject := s.effectiveMetricsProjectLocked(telemetryConfig)
+	s.config.TelemetryProjectID = nextMetricsProject
 
 	// Auto-expose ports. In a DB-backed snapshot an unset value (cleared,
 	// or the section removed) returns to the startup value
@@ -1810,6 +1826,14 @@ func ApplySnapshot(s *Server, snap Layer1Snapshot) map[string]interface{} {
 	s.config.AgentSecretsUserScopeOnly = snap.AgentSecretsUserScopeOnly
 	if !boolPtrEqual(oldAgentSecretsUserScopeOnly, snap.AgentSecretsUserScopeOnly) {
 		applied = append(applied, "agent_secrets_user_scope_only")
+	}
+
+	// Broker policy. Like agent_secrets above, nil is a meaningful value
+	// (default false/permissive), so assign unconditionally.
+	oldBrokerPolicyAdminManagedOnly := s.config.BrokerPolicyAdminManagedOnly
+	s.config.BrokerPolicyAdminManagedOnly = snap.BrokerPolicyAdminManagedOnly
+	if !boolPtrEqual(oldBrokerPolicyAdminManagedOnly, snap.BrokerPolicyAdminManagedOnly) {
+		applied = append(applied, "broker_policy_admin_managed_only")
 	}
 
 	// Admin emails — sanitize (TrimSpace + ToLower, drop empties) to match
@@ -1911,14 +1935,13 @@ func ApplySnapshot(s *Server, snap Layer1Snapshot) map[string]interface{} {
 		applied = append(applied, "user_access_mode")
 	}
 
-	// Default user role. Writes are validated (schema enum in DB mode,
-	// explicit check in the file-mode PUT), but a hand-edited settings.yaml
-	// or DB row can still hold garbage. Normalize anything other than
-	// member/viewer to member so the live config never grants an
-	// unexpected role at user creation (design D6). The rule itself lives in
-	// normalizedDefaultRole; "" stays unset here (clear semantics).
+	// Default user role. When hub.custom_default_user_role is enabled,
+	// preserve custom role names verbatim so runtime resolution can look up
+	// the role definition (and fall back with a warning if missing/ineligible).
+	// When the experiment is off, normalize anything other than member/viewer
+	// to member (design D6). "" stays unset here (clear semantics).
 	defaultRole := snap.DefaultUserRole
-	if defaultRole != "" {
+	if defaultRole != "" && !s.experimentEnabled(experiments.CustomDefaultUserRole) {
 		if n := normalizedDefaultRole(defaultRole); n != defaultRole {
 			slog.Warn("invalid default_user_role, using member",
 				"configured", defaultRole, "allowed", []string{store.UserRoleMember, store.UserRoleViewer})
@@ -2125,6 +2148,13 @@ func ApplySnapshot(s *Server, snap Layer1Snapshot) map[string]interface{} {
 	// (ptone/scion#3904).
 	if snap.FromOperationalSettings && s.applyNotificationChannels(snap.NotificationChannels) {
 		applied = append(applied, "notification_channels")
+	}
+
+	// Metrics dashboard: retarget or rebuild outside s.mu (creating a
+	// Cloud Monitoring client may perform credential discovery / I/O).
+	// Serialized by s.settingsApply.mu.
+	if s.applyMetricsDashboardProject(nextMetricsProject) {
+		applied = append(applied, "metrics_dashboard")
 	}
 
 	// Propagate hub_name to the GCP secret backend so new secrets get the

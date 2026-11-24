@@ -80,6 +80,12 @@ type Service struct {
 	provider func() Backend
 	// reviewNotifier is told about each finalized review version.
 	reviewNotifier func(context.Context, ReviewNotice)
+	// reviewDeliveryNotifier, when set, replaces reviewNotifier and returns
+	// optional delivery/wake metadata for the finalize response.
+	reviewDeliveryNotifier func(context.Context, http.ResponseWriter, ReviewNotice) *ReviewDeliveryInfo
+	// reviewWakeOfferer, when set, checks before finalizing a review whether
+	// a user-suspended owning agent should trigger a wake-confirm offer.
+	reviewWakeOfferer func(context.Context, *Artifact) *ReviewWakeOffer
 
 	// htmlNotice remembers, by entry digest, whether an HTML entry
 	// references remote images (see entryHasRemoteImages).
@@ -118,6 +124,9 @@ type Service struct {
 	archiveSlots   *archiveSlots
 	archiveNow     func() time.Time
 
+	// nowFn overrides time.Now in tests; nil means time.Now.
+	nowFn func() time.Time
+
 	// viewIssuanceClosedWarned makes the view issuance-closed warning
 	// appear once (warnViewIssuanceClosed).
 	viewIssuanceClosedWarned atomic.Bool
@@ -137,6 +146,11 @@ type Backend struct {
 	// ViewKeys sign and check view capabilities (see RouteView). Without
 	// them (the zero ViewKeys), HTML entries cannot be viewed.
 	ViewKeys ViewKeys
+	// Initializing is true while the host is still initializing the artifact
+	// store at startup. When Store is nil and Initializing is true, HTTP
+	// routes answer 503 with a starting-up message and a Retry-After header
+	// instead of reporting that storage is not configured.
+	Initializing bool
 }
 
 // Limits are the size limits the service enforces.
@@ -208,6 +222,17 @@ type ReviewNotice struct {
 	// that request itself, and the reviewer is not the owner
 	// (ptone/scion#6853).
 	SubmitAuthorized bool
+	// Wake is true when the caller explicitly requested waking a suspended
+	// owning agent (after confirming a wake offer) on review finalize.
+	Wake bool
+}
+
+// ReviewWakeOffer describes a user-suspended owning agent that the caller is
+// authorized to wake, returned before finalizing a review when OfferWake is set.
+type ReviewWakeOffer struct {
+	AgentID   string
+	AgentSlug string
+	Phase     string
 }
 
 // Ref is the notice's versioned reference.
@@ -223,26 +248,75 @@ func (s *Service) SetReviewNotifier(fn func(context.Context, ReviewNotice)) {
 	s.reviewNotifier = fn
 }
 
+// SetReviewDeliveryNotifier sets a review notifier that also returns optional
+// delivery/wake metadata for ArtifactResponse.ReviewDelivery. When set, it
+// takes precedence over SetReviewNotifier.
+func (s *Service) SetReviewDeliveryNotifier(fn func(context.Context, http.ResponseWriter, ReviewNotice) *ReviewDeliveryInfo) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reviewDeliveryNotifier = fn
+}
+
+// SetReviewWakeOfferer sets the pre-finalize check that determines whether a
+// review of a user-suspended agent should return a 409 wake offer.
+func (s *Service) SetReviewWakeOfferer(fn func(context.Context, *Artifact) *ReviewWakeOffer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reviewWakeOfferer = fn
+}
+
+// offerReviewWake asks the host whether finalizing a review of a should prompt
+// the caller to confirm waking a user-suspended owning agent.
+func (s *Service) offerReviewWake(ctx context.Context, a *Artifact, v *Version) *ReviewWakeOffer {
+	s.mu.RLock()
+	fn := s.reviewWakeOfferer
+	s.mu.RUnlock()
+	if fn == nil || (v.CreatedByKind == a.OwnerKind && v.CreatedByRef == a.OwnerRef) {
+		return nil
+	}
+	return fn(ctx, a)
+}
+
 // notifyReview tells the review notifier about review version v of a,
 // finalized by a caller with access.
 func (s *Service) notifyReview(ctx context.Context, a *Artifact, v *Version, access writeAccess) {
+	_ = s.notifyReviewWithDelivery(ctx, nil, a, v, access, false)
+}
+
+// notifyReviewWithDelivery tells the review notifier about review version v
+// of a and returns optional delivery/wake metadata for the finalize response.
+func (s *Service) notifyReviewWithDelivery(ctx context.Context, w http.ResponseWriter, a *Artifact, v *Version, access writeAccess, wake bool) *ReviewDeliveryInfo {
 	s.mu.RLock()
+	deliveryFn := s.reviewDeliveryNotifier
 	fn := s.reviewNotifier
 	s.mu.RUnlock()
-	if fn == nil || (v.CreatedByKind == a.OwnerKind && v.CreatedByRef == a.OwnerRef) {
-		return
+	if (deliveryFn == nil && fn == nil) || (v.CreatedByKind == a.OwnerKind && v.CreatedByRef == a.OwnerRef) {
+		return nil
 	}
-	fn(context.WithoutCancel(ctx), ReviewNotice{
+	notice := ReviewNotice{
 		ArtifactID: a.ID, Seq: v.Seq, ScopeKind: a.ScopeKind, ScopeRef: a.ScopeRef,
 		OwnerKind: a.OwnerKind, OwnerRef: a.OwnerRef,
 		ReviewerKind: v.CreatedByKind, ReviewerRef: v.CreatedByRef,
 		Note:             v.Note,
 		SubmitAuthorized: access.allowsKind(VersionKindReview) && access != accessOwner,
-	})
+		Wake:             wake,
+	}
+	if deliveryFn != nil {
+		return deliveryFn(context.WithoutCancel(ctx), w, notice)
+	}
+	fn(context.WithoutCancel(ctx), notice)
+	return nil
 }
 
 // Host returns the host the service was built with.
 func (s *Service) Host() Host { return s.host }
+
+func (s *Service) now() time.Time {
+	if s.nowFn != nil {
+		return s.nowFn()
+	}
+	return time.Now()
+}
 
 // SetBackendProvider makes the service ask fn for its store, blob storage
 // and hub id on each request, instead of the values given to SetStore and
@@ -334,11 +408,12 @@ func (s *Service) SetLimits(fn func(context.Context) Limits) {
 
 // backend is a consistent snapshot of the service's configuration.
 type backend struct {
-	store    Store
-	blobs    storage.Storage
-	hubID    string
-	viewKeys ViewKeys
-	limits   func(context.Context) Limits
+	store        Store
+	blobs        storage.Storage
+	hubID        string
+	viewKeys     ViewKeys
+	limits       func(context.Context) Limits
+	initializing bool
 }
 
 func (s *Service) backend() (backend, bool) {
@@ -348,9 +423,26 @@ func (s *Service) backend() (backend, bool) {
 	s.mu.RUnlock()
 	if provider != nil {
 		p := provider()
-		b.store, b.blobs, b.hubID, b.viewKeys = p.Store, p.Blobs, p.HubID, p.ViewKeys
+		b.store, b.blobs, b.hubID, b.viewKeys, b.initializing = p.Store, p.Blobs, p.HubID, p.ViewKeys, p.Initializing
 	}
 	return b, b.store != nil && b.blobs != nil && b.hubID != ""
+}
+
+// startupRetryAfter is the Retry-After value (in seconds) sent with 503
+// responses while the artifact store is still initializing at startup.
+const startupRetryAfter = "2"
+
+// writeBackendUnavailable writes the 503 response when s.backend() reports no
+// ready backend. While the store is still initializing at startup it answers
+// with a starting-up message and a Retry-After header rather than claiming
+// that artifact storage is not configured.
+func writeBackendUnavailable(w http.ResponseWriter, b backend, unconfiguredMsg string) {
+	if b.initializing && b.store == nil {
+		w.Header().Set("Retry-After", startupRetryAfter)
+		writeError(w, http.StatusServiceUnavailable, "unavailable", "artifact storage is starting up; retry shortly")
+		return
+	}
+	writeError(w, http.StatusServiceUnavailable, "unavailable", unconfiguredMsg)
 }
 
 func (b backend) maxFileBytes(ctx context.Context) int64 {
@@ -419,6 +511,9 @@ func (s *Service) RegisterRoutes(mux Mux, guard Guard) {
 //	DELETE /api/v1/artifacts/{id}/links/{linkId}            revoke a share link
 //	PUT  /api/v1/artifacts/{id}/review-sessions/{sid}       heartbeat of an open review tab
 //	DELETE /api/v1/artifacts/{id}/review-sessions/{sid}     the review was closed, or its page left
+//	GET  /api/v1/artifacts/{id}/review-draft                the caller's saved draft review of the artifact
+//	PUT  /api/v1/artifacts/{id}/review-draft                create or replace the caller's saved draft review
+//	DELETE /api/v1/artifacts/{id}/review-draft              delete the caller's saved draft review
 //	GET  /api/v1/artifacts/shared/{token}[/files/{path}]    a share-link read (303 to the view route)
 //
 // Everything else answers 404.
@@ -522,6 +617,8 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.handleReviewSession(w, r, id, segs[2])
+	case len(segs) == 2 && segs[1] == reviewDraftSegment:
+		s.handleReviewDraft(w, r, id)
 	case len(segs) == 2 && segs[1] == "versions":
 		switch {
 		case isRead(r.Method):

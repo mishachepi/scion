@@ -46,6 +46,8 @@ func (e *apiError) write(w http.ResponseWriter) {
 	writeError(w, e.status, e.code, e.message, e.details)
 }
 
+const threadNameInvalidCharsMessage = "name contains invalid characters: must start with an ASCII letter or digit, contain only ASCII letters, digits, spaces, underscores, and hyphens, and be 100 characters or fewer"
+
 // validateThreadName trims and validates a thread/topic name. Rules (shared
 // with handleCreateThread, handlers_chat_v2.go): non-empty after trimming,
 // at most 100 runes, and matching threadNameRegexp. Returns the trimmed name.
@@ -62,7 +64,7 @@ func validateThreadName(raw string) (string, error) {
 		return "", errors.New("name must be 100 characters or fewer")
 	}
 	if !threadNameRegexp.MatchString(name) {
-		return "", errors.New("name contains invalid characters")
+		return "", errors.New(threadNameInvalidCharsMessage)
 	}
 	return name, nil
 }
@@ -183,9 +185,8 @@ func (s *Server) createNativeGroupConversation(ctx context.Context, p createGrou
 	}
 
 	// Read back the conversation CreateTopic minted atomically alongside the
-	// topic. A not-found here means the SQLite hasConversationsTable() gate
-	// was false, which cannot happen on a hub where the conversation API
-	// itself works (design §3.4) — treat it as an internal error.
+	// topic. A not-found here cannot happen because CreateTopic mints the
+	// conversation in the same transaction — treat it as an internal error.
 	conv, err := s.store.GetConversation(ctx, topic.ConversationID)
 	if err != nil {
 		slog.ErrorContext(ctx, "createGroupConversation: read-back of newly created conversation failed",

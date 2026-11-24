@@ -60,12 +60,29 @@ import type {
   AgentFieldEditState,
   AgentInlineConfig,
   AgentResourceSpec,
+  AgentSecretInput,
   CapabilityField,
   HarnessAdvancedCapabilities,
+  InjectionMode,
   MessageMode,
+  SecretType,
   TelemetryConfig,
 } from '../../shared/types.js';
+import {
+  emptyAgentSecretRow,
+  isAgentSecretRowEmpty,
+  MAX_CREATE_AGENT_SECRETS,
+  toCreateAgentSecrets,
+  validateAgentSecretRows,
+  type AgentSecretDraftRow,
+} from '../../shared/agent-create-secrets.js';
+import {
+  AGENT_SECRETS_FLAG,
+  FEATURE_FLAGS_CHANGED_EVENT,
+  isFeatureEnabled,
+} from '../../utils/feature-flags.js';
 import type { AgentConfigPlaceholder } from '../../shared/agent-config-inherited.js';
+import { isZeroDurationLimit } from '../../shared/duration-limit.js';
 import type { GcpIdentityState, GcpMetadataMode } from '../../shared/gcp-identity-state.js';
 import { MESSAGE_MODE_DISPLAY } from '../../shared/message-mode.js';
 import { isValidTimeZone } from '../../utils/time.js';
@@ -87,7 +104,14 @@ export type { AgentConfigPlaceholder } from '../../shared/agent-config-inherited
  * tabs, and in edit mode the Agent group first (name, next task and the
  * fields fixed at creation).
  */
-export type AgentConfigTab = 'agent' | 'general' | 'auth' | 'prompts' | 'limits' | 'environment';
+export type AgentConfigTab =
+  | 'agent'
+  | 'general'
+  | 'auth'
+  | 'prompts'
+  | 'limits'
+  | 'environment'
+  | 'secrets';
 
 export const AGENT_CONFIG_TABS: ReadonlyArray<{ id: AgentConfigTab; label: string }> = [
   { id: 'agent', label: 'Agent' },
@@ -96,10 +120,8 @@ export const AGENT_CONFIG_TABS: ReadonlyArray<{ id: AgentConfigTab; label: strin
   { id: 'prompts', label: 'Prompts' },
   { id: 'limits', label: 'Limits & Resources' },
   { id: 'environment', label: 'Environment & Labels' },
+  { id: 'secrets', label: 'Secrets' },
 ];
-
-/** The function groups create mode shows as tabs: every group but Agent. */
-const CREATE_TABS = AGENT_CONFIG_TABS.filter((t) => t.id !== 'agent');
 
 /** How the edit form groups its fields. */
 export type AgentConfigGrouping = 'function' | 'tier';
@@ -136,7 +158,9 @@ type StringConfigKey = {
  * emits its key's JSON type (a duration is a string, so Unlimited is "0").
  */
 export type AgentConfigPatch = {
-  [K in keyof AgentInlineConfig]?: NonNullable<AgentInlineConfig[K]> | null;
+  [K in keyof AgentInlineConfig]?: K extends 'env'
+    ? Record<string, string | null> | null
+    : NonNullable<AgentInlineConfig[K]> | null;
 };
 
 /** The create or PATCH request's top-level keys the form owns. */
@@ -169,9 +193,8 @@ export interface AgentConfigEditValues {
   env?: Record<string, string> | undefined;
   /**
    * False when the hub withheld the agent's env from the caller (it is
-   * returned only with attach access). The env fields are then locked: a
-   * PATCH env replaces the whole env, so an edit made without seeing it
-   * would drop the keys the caller cannot see.
+   * returned only with attach access). The env fields are then locked, since
+   * editing config.env also requires attach access.
    */
   envVisible?: boolean | undefined;
   /**
@@ -782,10 +805,31 @@ export class ScionAgentConfigForm extends LitElement {
   @state() private autoExpose: AutoExposeDraft | null = null;
   @state() private envEntries: EnvEntry[] | null = null;
   @state() private labelEntries: Array<{ key: string; value: string }> | null = null;
+  /**
+   * Create-time agent secrets (behind hub.agent_secrets). Held strictly in
+   * memory here: never written to drafts, localStorage, sessionStorage, URL,
+   * logs or config.env. Cleared on disconnect, reset(), and clearSecrets().
+   */
+  @state() private secretRows: AgentSecretDraftRow[] = [];
   /** Bumped when the GCP identity state changes, to re-render. */
   @state() private gcpVersion = 0;
 
   private unsubscribeGcp: (() => void) | null = null;
+
+  private readonly boundOnFeatureFlagsChanged = (): void => {
+    this.requestUpdate();
+  };
+
+  /** Whether the create-mode Secrets tab is enabled. */
+  private get createSecretsEnabled(): boolean {
+    return this.mode === 'create' && isFeatureEnabled(AGENT_SECRETS_FLAG);
+  }
+
+  /** The tabs create mode shows: every group except Agent, plus Secrets when enabled. */
+  private get createTabs(): ReadonlyArray<{ id: AgentConfigTab; label: string }> {
+    const showSecrets = this.createSecretsEnabled;
+    return AGENT_CONFIG_TABS.filter((t) => t.id !== 'agent' && (t.id !== 'secrets' || showSecrets));
+  }
 
   /** The rendered fields. */
   get fields(): ReadonlyArray<AgentConfigFieldDef> {
@@ -941,15 +985,29 @@ export class ScionAgentConfigForm extends LitElement {
       out.env = { ...env, ...autoExposeEnv };
       return out;
     }
-    // Edit mode: the hub replaces the agent's env with the one sent, so the
-    // whole env goes: every row, shown or edited, minus TZ. The auto-expose
-    // keys go only when that control was used; the hub keeps the agent's
-    // auto-expose keys a request leaves out.
-    const rows = this.envEntries ?? this.storedEnvEntries();
-    for (const e of rows) {
-      if (e.key && e.key !== TZ_ENV_KEY && !AUTO_EXPOSE_ENV_KEYS.has(e.key)) env[e.key] = e.value;
+    // Edit mode: the hub merges config.env by key (explicit null removes a
+    // key; absent keys are kept). Send only added/changed keys and explicit
+    // nulls for stored keys that were deleted or renamed away, skipping TZ
+    // and auto-expose keys. Auto-expose keys are sent only when that control
+    // was used.
+    const envDelta: Record<string, string | null> = {};
+    if (this.envEntries !== null) {
+      const stored = new Map(this.storedEnvEntries().map((e) => [e.key, e.value]));
+      const next = new Map<string, string>();
+      for (const e of this.envEntries) {
+        if (e.key && e.key !== TZ_ENV_KEY && !AUTO_EXPOSE_ENV_KEYS.has(e.key)) {
+          next.set(e.key, e.value);
+        }
+      }
+      for (const [k, v] of next) {
+        if (!stored.has(k) || stored.get(k) !== v) envDelta[k] = v;
+      }
+      for (const k of stored.keys()) {
+        if (!next.has(k)) envDelta[k] = null;
+      }
     }
-    out.env = { ...env, ...autoExposeEnv };
+    const merged: Record<string, string | null> = { ...envDelta, ...autoExposeEnv };
+    if (Object.keys(merged).length > 0) out.env = merged;
     return out;
   }
 
@@ -1025,7 +1083,27 @@ export class ScionAgentConfigForm extends LitElement {
         errors.push(`${f.label} must be a duration such as 30m or 2h, or Unlimited.`);
       }
     }
+    if (this.createSecretsEnabled) {
+      errors.push(...validateAgentSecretRows(this.secretRows));
+    }
     return errors;
+  }
+
+  /**
+   * Returns create-time agent secrets for the CreateAgentRequest `secrets`
+   * field. Empty when none were entered, in edit mode, or with the experiment
+   * off, so callers omit `secrets` from the request body.
+   */
+  collectSecrets(): AgentSecretInput[] {
+    if (!this.createSecretsEnabled) return [];
+    return toCreateAgentSecrets(this.secretRows);
+  }
+
+  /** Clears all in-memory create-time secret values immediately. */
+  clearSecrets(): void {
+    if (this.secretRows.length === 0) return;
+    this.secretRows = [];
+    this.emitChange();
   }
 
   /**
@@ -1045,6 +1123,7 @@ export class ScionAgentConfigForm extends LitElement {
     this.autoExpose = null;
     this.envEntries = null;
     this.labelEntries = null;
+    this.secretRows = [];
     this.emitChange();
   }
 
@@ -1094,12 +1173,19 @@ export class ScionAgentConfigForm extends LitElement {
   override connectedCallback(): void {
     super.connectedCallback();
     this.subscribeGcp();
+    if (typeof window !== 'undefined') {
+      window.addEventListener(FEATURE_FLAGS_CHANGED_EVENT, this.boundOnFeatureFlagsChanged);
+    }
   }
 
   override disconnectedCallback(): void {
     super.disconnectedCallback();
     this.unsubscribeGcp?.();
     this.unsubscribeGcp = null;
+    if (typeof window !== 'undefined') {
+      window.removeEventListener(FEATURE_FLAGS_CHANGED_EVENT, this.boundOnFeatureFlagsChanged);
+    }
+    this.secretRows = [];
   }
 
   private subscribeGcp(): void {
@@ -1186,11 +1272,12 @@ export class ScionAgentConfigForm extends LitElement {
   }
 
   /**
-   * Whether the stored value of a limit is Unlimited: "0" for a duration, 0
-   * for a count limit (absent or null is inherit).
+   * Whether the stored value of a limit is Unlimited: any Go zero-duration
+   * spelling ("0", "0s", "0m", "0h", etc.) for a duration, 0 for a count limit
+   * (absent or null is inherit).
    */
   private storedUnlimited(f: AgentConfigFieldDef): boolean {
-    if (f.control === 'limit-duration') return this.values?.[f.configKey] === '0';
+    if (f.control === 'limit-duration') return isZeroDurationLimit(this.values?.[f.configKey]);
     if (f.control === 'limit-count') return this.values?.[f.configKey] === 0;
     return false;
   }
@@ -1935,9 +2022,9 @@ export class ScionAgentConfigForm extends LitElement {
     }
     return html`${this.mode === 'edit'
         ? html`<div class="hint">TZ is not set here: the Timezone field pins the timezone.</div>
-            <div class="hint" data-testid="env-replace-note">
-              Saving a change here replaces the agent's stored environment with this list. Values
-              this page cannot show you, such as GITHUB_TOKEN, are not kept.
+            <div class="hint" data-testid="env-merge-note">
+              Only added, changed, or removed variables are sent. Values this page cannot show you,
+              such as GITHUB_TOKEN, are kept.
             </div>`
         : nothing}
       <scion-env-editor
@@ -2083,22 +2170,215 @@ export class ScionAgentConfigForm extends LitElement {
     `;
   }
 
+  private updateSecretRow(index: number, patch: Partial<AgentSecretDraftRow>): void {
+    this.secretRows = this.secretRows.map((row, i) => (i === index ? { ...row, ...patch } : row));
+    this.emitChange();
+  }
+
+  private addSecretRow(): void {
+    if (this.secretRows.length >= MAX_CREATE_AGENT_SECRETS) return;
+    this.secretRows = [...this.secretRows, emptyAgentSecretRow()];
+    this.emitChange();
+  }
+
+  private removeSecretRow(index: number): void {
+    this.secretRows = this.secretRows.filter((_, i) => i !== index);
+    this.emitChange();
+  }
+
+  private renderCreateSecretsTab(): TemplateResult {
+    const activeCount = this.secretRows.filter((r) => !isAgentSecretRowEmpty(r)).length;
+    return html`
+      <div class="secrets-editor" data-testid="create-secrets-editor">
+        <div class="hint secrets-intro">
+          Encrypted secrets stored only for this agent. Values are write-only, go directly to the
+          secret backend at creation, and are never saved in drafts or the agent's environment
+          config. For secrets shared across agents, use
+          <a href="/profile/secrets" data-testid="profile-secrets-link">Profile Secrets</a>.
+        </div>
+
+        ${this.secretRows.map(
+          (row, i) => html`
+            <div class="secret-row" data-testid="secret-row" data-index=${i}>
+              <div class="secret-row-top">
+                <sl-input
+                  size="small"
+                  label=${row.type === 'file' ? 'Name' : 'Key'}
+                  data-field="key"
+                  placeholder=${row.type === 'file' ? 'e.g. ssh_deploy_key' : 'e.g. GITHUB_TOKEN'}
+                  .value=${row.key}
+                  ?disabled=${this.disabled}
+                  @sl-input=${(e: Event) =>
+                    this.updateSecretRow(i, {
+                      key: (e.target as HTMLElement & { value: string }).value,
+                    })}
+                ></sl-input>
+
+                <sl-select
+                  size="small"
+                  label="Type"
+                  data-field="type"
+                  .value=${row.type}
+                  ?disabled=${this.disabled}
+                  @sl-change=${(e: Event) =>
+                    this.updateSecretRow(i, {
+                      type: (e.target as HTMLElement & { value: string }).value as SecretType,
+                    })}
+                >
+                  <sl-option value="environment">Environment</sl-option>
+                  <sl-option value="file">File</sl-option>
+                  <sl-option value="variable">Variable</sl-option>
+                </sl-select>
+
+                <sl-select
+                  size="small"
+                  label="Inject"
+                  data-field="injectionMode"
+                  .value=${row.injectionMode}
+                  ?disabled=${this.disabled}
+                  @sl-change=${(e: Event) =>
+                    this.updateSecretRow(i, {
+                      injectionMode: (e.target as HTMLElement & { value: string })
+                        .value as InjectionMode,
+                    })}
+                >
+                  <sl-option value="as_needed">As needed</sl-option>
+                  <sl-option value="always">Always</sl-option>
+                </sl-select>
+
+                <sl-icon-button
+                  class="secret-remove-btn"
+                  name="trash"
+                  label="Remove secret"
+                  data-action="remove"
+                  ?disabled=${this.disabled}
+                  @click=${() => this.removeSecretRow(i)}
+                ></sl-icon-button>
+              </div>
+
+              <div class="secret-row-value">
+                ${row.type === 'file'
+                  ? !row.revealed && !row.editing && row.value !== ''
+                    ? html`
+                        <div class="secret-file-masked" data-testid="secret-file-masked">
+                          <sl-icon name="lock"></sl-icon>
+                          <span
+                            >&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;
+                            (${row.value.split('\n').length}
+                            ${row.value.split('\n').length === 1 ? 'line' : 'lines'}, hidden — click
+                            Show to view or edit)</span
+                          >
+                        </div>
+                      `
+                    : html`
+                        <sl-textarea
+                          size="small"
+                          label="Value"
+                          data-field="value"
+                          rows="3"
+                          resize="vertical"
+                          placeholder="Paste file contents (e.g. private key)"
+                          .value=${row.value}
+                          ?disabled=${this.disabled}
+                          @sl-focus=${() => this.updateSecretRow(i, { editing: true })}
+                          @sl-blur=${() => this.updateSecretRow(i, { editing: false })}
+                          @sl-input=${(e: Event) =>
+                            this.updateSecretRow(i, {
+                              value: (e.target as HTMLElement & { value: string }).value,
+                            })}
+                        ></sl-textarea>
+                      `
+                  : html`
+                      <sl-input
+                        size="small"
+                        label="Value"
+                        data-field="value"
+                        type=${row.revealed ? 'text' : 'password'}
+                        placeholder="Secret value"
+                        .value=${row.value}
+                        ?disabled=${this.disabled}
+                        @sl-input=${(e: Event) =>
+                          this.updateSecretRow(i, {
+                            value: (e.target as HTMLElement & { value: string }).value,
+                          })}
+                      ></sl-input>
+                    `}
+                <sl-icon-button
+                  class="secret-reveal-btn"
+                  name=${row.revealed ? 'eye-slash' : 'eye'}
+                  label=${row.revealed ? 'Hide value' : 'Show value'}
+                  data-action="toggle-reveal"
+                  ?disabled=${this.disabled}
+                  @click=${() =>
+                    this.updateSecretRow(i, {
+                      revealed: !row.revealed,
+                      editing: false,
+                    })}
+                ></sl-icon-button>
+              </div>
+
+              <div class="secret-row-target">
+                <sl-input
+                  size="small"
+                  label=${row.type === 'file' ? 'Target path (required)' : 'Target (optional)'}
+                  data-field="target"
+                  placeholder=${row.type === 'file'
+                    ? 'e.g. ~/.ssh/id_ed25519 or /etc/app/key.pem'
+                    : 'Defaults to key'}
+                  .value=${row.target}
+                  ?disabled=${this.disabled}
+                  @sl-input=${(e: Event) =>
+                    this.updateSecretRow(i, {
+                      target: (e.target as HTMLElement & { value: string }).value,
+                    })}
+                ></sl-input>
+              </div>
+            </div>
+          `
+        )}
+
+        <div class="secrets-footer">
+          <sl-button
+            size="small"
+            variant="default"
+            data-testid="add-secret-row"
+            ?disabled=${this.disabled || this.secretRows.length >= MAX_CREATE_AGENT_SECRETS}
+            @click=${() => this.addSecretRow()}
+          >
+            <sl-icon slot="prefix" name="plus-lg"></sl-icon>
+            Add Secret
+          </sl-button>
+          ${activeCount > 0
+            ? html`<span class="hint" data-testid="secrets-count"
+                >${activeCount} / ${MAX_CREATE_AGENT_SECRETS} secrets</span
+              >`
+            : nothing}
+        </div>
+      </div>
+    `;
+  }
+
   override render() {
     if (this.mode === 'create') {
-      const groups = CREATE_TABS.map((t) => ({
+      const groups = this.createTabs.map((t) => ({
         ...t,
         fields: this.fields.filter((f) => f.tab === t.id),
       }));
       return html`
         <sl-tab-group>
           ${groups.map(
-            (g, i) => html`<sl-tab slot="nav" panel=${g.id} ?active=${i === 0}>${g.label}</sl-tab>`
+            (g, i) =>
+              html`<sl-tab slot="nav" panel=${g.id} ?active=${i === 0} data-testid="tab-${g.id}"
+                >${g.label}</sl-tab
+              >`
           )}
           ${groups.map(
             (g) => html`
               <sl-tab-panel name=${g.id}>
                 <section class="group" data-tab=${g.id}>
-                  ${g.fields.map((f) => this.renderField(f))}
+                  ${g.id === 'secrets'
+                    ? this.renderCreateSecretsTab()
+                    : g.fields.map((f) => this.renderField(f))}
                 </section>
               </sl-tab-panel>
             `
@@ -2283,6 +2563,59 @@ export class ScionAgentConfigForm extends LitElement {
     scion-timezone-picker {
       flex: 1 1 auto;
       max-width: 28rem;
+    }
+    .secrets-editor {
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+    .secrets-intro {
+      margin-top: 0;
+    }
+    .secret-row {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      padding: 0.75rem;
+      border: 1px solid var(--scion-border, var(--sl-color-neutral-200));
+      border-radius: var(--scion-radius, var(--sl-border-radius-medium));
+      background: var(--scion-bg-subtle, var(--sl-color-neutral-50));
+    }
+    .secret-row-top {
+      display: grid;
+      grid-template-columns: 1fr 8.5rem 8rem auto;
+      gap: 0.5rem;
+      align-items: end;
+    }
+    .secret-row-value {
+      display: flex;
+      align-items: flex-end;
+      gap: 0.375rem;
+    }
+    .secret-row-value sl-input,
+    .secret-row-value sl-textarea,
+    .secret-file-masked {
+      flex: 1 1 auto;
+    }
+    .secret-file-masked {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.5rem 0.75rem;
+      border: 1px solid var(--scion-border, var(--sl-color-neutral-300));
+      border-radius: var(--scion-radius, var(--sl-border-radius-medium));
+      background: var(--scion-surface, var(--sl-color-neutral-0));
+      color: var(--scion-text-muted, var(--sl-color-neutral-600));
+      font-size: var(--sl-font-size-small);
+    }
+    .secret-remove-btn,
+    .secret-reveal-btn {
+      flex-shrink: 0;
+    }
+    .secrets-footer {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
     }
   `;
 }

@@ -99,9 +99,20 @@ type messageDeliveryFailure struct {
 	Reason    string `json:"reason,omitempty"`
 }
 
+// messageDeliveryConfirmation is one successful session injection reported by
+// a broker (ptone/scion#9015).
+type messageDeliveryConfirmation struct {
+	MessageID string `json:"messageId"`
+	AgentID   string `json:"agentId,omitempty"`
+	ProjectID string `json:"projectId,omitempty"`
+}
+
 // messageDeliveryFailuresRequest is the body of a message-failures report.
 type messageDeliveryFailuresRequest struct {
 	Failures []messageDeliveryFailure `json:"failures"`
+	// Deliveries are hub messages whose session injection succeeded on the
+	// broker (ptone/scion#9015). Optional and additive for mixed-version hubs.
+	Deliveries []messageDeliveryConfirmation `json:"deliveries,omitempty"`
 	// AttachmentOutcomes are the per-file outcomes of attachment deliveries
 	// (ptone/scion#4596); logged and counted only.
 	AttachmentOutcomes []attachmentDeliveryOutcome `json:"attachmentOutcomes,omitempty"`
@@ -152,9 +163,10 @@ const maxAttachmentOutcomesPerReport = 100
 
 // messageDeliveryFailuresResponse reports how many rows were updated.
 type messageDeliveryFailuresResponse struct {
-	Marked  int `json:"marked"`
-	Held    int `json:"held,omitempty"`
-	Ignored int `json:"ignored"`
+	Marked    int `json:"marked"`
+	Delivered int `json:"delivered,omitempty"`
+	Held      int `json:"held,omitempty"`
+	Ignored   int `json:"ignored"`
 }
 
 // handleBrokerMessageFailures processes a broker's report of messages that
@@ -185,6 +197,10 @@ func (s *Server) handleBrokerMessageFailures(w http.ResponseWriter, r *http.Requ
 		BadRequest(w, "too many failures in one report")
 		return
 	}
+	if len(req.Deliveries) > maxMessageFailuresPerReport {
+		BadRequest(w, "too many deliveries in one report")
+		return
+	}
 	for _, f := range req.Failures {
 		if f.Code != "" && f.Code != messageFailureCodeAwaitingSession {
 			BadRequest(w, "invalid failure code")
@@ -210,6 +226,13 @@ func (s *Server) handleBrokerMessageFailures(w http.ResponseWriter, r *http.Requ
 		case brokerFailureHeld:
 			resp.Held++
 		default:
+			resp.Ignored++
+		}
+	}
+	for _, d := range req.Deliveries {
+		if s.applyBrokerMessageDeliveryOutcome(ctx, brokerID, d) {
+			resp.Delivered++
+		} else {
 			resp.Ignored++
 		}
 	}
@@ -276,6 +299,8 @@ func (s *Server) applyBrokerMessageFailureOutcome(ctx context.Context, brokerID 
 	}
 
 	// Ownership: the recipient agent must be assigned to the reporting broker.
+	// Always derive ownership from the stored msg.RecipientID; request body
+	// agentId and projectId are informational only and never trusted.
 	recipientAgentID := msg.RecipientID
 	if recipientAgentID == "" || !strings.HasPrefix(msg.Recipient, "agent:") {
 		return brokerFailureIgnored
@@ -370,6 +395,79 @@ func (s *Server) applyBrokerMessageFailureOutcome(ctx context.Context, brokerID 
 	return brokerFailureMarked
 }
 
+// applyBrokerMessageDeliveryOutcome validates broker ownership and atomically
+// transitions a pending/dispatched message row to delivered, pushing a live
+// SSE update to human senders (ptone/scion#9015).
+func (s *Server) applyBrokerMessageDeliveryOutcome(ctx context.Context, brokerID string, d messageDeliveryConfirmation) bool {
+	if d.MessageID == "" {
+		return false
+	}
+	msg, err := s.store.GetMessage(ctx, d.MessageID)
+	if err != nil {
+		if !errors.Is(err, store.ErrNotFound) {
+			slog.Warn("message-failures: delivery message lookup failed",
+				"broker_id", brokerID, "message_id", d.MessageID, "error", err)
+		}
+		return false
+	}
+
+	// Ownership: the recipient agent must be assigned to the reporting broker.
+	// Always derive ownership from the stored msg.RecipientID; request body
+	// agentId and projectId are informational only and never trusted.
+	recipientAgentID := msg.RecipientID
+	if recipientAgentID == "" || !strings.HasPrefix(msg.Recipient, "agent:") {
+		return false
+	}
+	agent, err := s.store.GetAgent(ctx, recipientAgentID)
+	if err != nil || agent == nil || agent.RuntimeBrokerID != brokerID {
+		slog.Warn("message-failures: broker reported delivery for message it does not own",
+			"broker_id", brokerID, "message_id", d.MessageID)
+		return false
+	}
+
+	switch msg.DispatchState {
+	case store.MessageDispatchDispatched, store.MessageDispatchPending:
+	default:
+		return false
+	}
+
+	finCtx, finCancel := finalizationContext(ctx)
+	defer finCancel()
+	won, err := s.store.MarkMessageDelivered(finCtx, msg.ID)
+	if err != nil {
+		slog.Error("message-failures: failed to mark message delivered",
+			"broker_id", brokerID, "message_id", msg.ID, "error", err)
+		return false
+	}
+	if !won {
+		return false
+	}
+	if s.messageLog != nil {
+		s.messageLog.Info("message delivery confirmed by broker; marked delivered",
+			"message_id", msg.ID,
+			"agent_id", agent.ID,
+			"project_id", agent.ProjectID,
+			"broker_id", brokerID,
+		)
+	}
+
+	s.notifyStoredMessageSenderDelivered(finCtx, msg)
+	return true
+}
+
+// notifyStoredMessageSenderDelivered pushes a live SSE update to connected
+// human browser clients after dispatch_state=delivered has committed.
+func (s *Server) notifyStoredMessageSenderDelivered(ctx context.Context, msg *store.Message) {
+	if msg == nil {
+		return
+	}
+	if strings.HasPrefix(msg.Sender, "user:") && s.events != nil {
+		cp := *msg
+		cp.DispatchState = store.MessageDispatchDelivered
+		s.events.PublishUserMessage(ctx, &cp, nil, nil)
+	}
+}
+
 // notifyStoredMessageSenderFailed notifies an agent sender (via DELIVERY_FAILED
 // notice) or connected human browser clients (via PublishUserMessage) after the
 // stored message row's dispatch_state=failed write has already committed.
@@ -411,11 +509,12 @@ func (s *Server) notifyStoredMessageSenderFailed(ctx context.Context, agent *sto
 // notifyStoredMessageSenderUnconfirmed notifies an agent sender (via
 // DELIVERY_UNCONFIRMED notice) or connected human browser clients (via
 // PublishUserMessage with dispatchFailureCode=delivery_unconfirmed) after
-// ExpireAndListStuckPendingMessages has committed dispatch_state=failed with
-// store.MessageExpiredStuckPendingReason (ptone/scion#7405). Because a stored
-// pending row carries no pre- vs post-dispatch marker to separate never-sent
-// rows from AC-3/AC-4 rows that were or may have been delivered, every
-// pending-TTL expiry uses unconfirmed wording telling the sender to check
+// dispatch_state=failed has been committed for an ambiguous delivery outcome —
+// either when ExpireAndListStuckPendingMessages expires a stuck pending row
+// with store.MessageExpiredStuckPendingReason (ptone/scion#7405) or when a
+// background auto-wake dispatch finalizes an ambiguous timeout/cancellation
+// via FailUndeliveredMessage with dispatchOutcomeUnknownReason. In both cases
+// delivery may have occurred, so unconfirmed wording tells the sender to check
 // before resending.
 func (s *Server) notifyStoredMessageSenderUnconfirmed(ctx context.Context, agent *store.Agent, msg *store.Message) {
 	if msg == nil {

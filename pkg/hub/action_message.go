@@ -158,6 +158,15 @@ func (a *messageAction) Authorize(
 		}
 		return nil, &FireRefusal{Reason: errScheduledMessageRefused.Error()}, nil
 	}
+	if agent == nil || !agent.DeletedAt.IsZero() {
+		slog.Warn("Scheduler: target agent no longer exists",
+			"eventID", fireID,
+			"agentName", payload.AgentName,
+			"agent_id", payload.AgentID,
+			"projectID", req.ProjectID,
+			"cause", "target agent deleted")
+		return nil, &FireRefusal{Reason: errScheduledMessageRefused.Error()}, nil
+	}
 
 	// ---- Fire-time authorization ----
 	// Authorize the send for the revision's identity through the production
@@ -176,6 +185,11 @@ func (a *messageAction) Authorize(
 	}
 	if err := s.fireStanding(ctx, auth, agent); err != nil {
 		return nil, &FireRefusal{Reason: err.Error()}, nil
+	}
+
+	// Shell execution containers cannot receive messages (ptone/scion#8812 §3.4 S5).
+	if isShellAgent(agent) {
+		return nil, &FireRefusal{Reason: shellAgentNotMessageableError(agent).Message}, nil
 	}
 
 	// Migration gate (design agent-reincarnate §3.7, R3 p2a-r1 review).

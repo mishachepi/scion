@@ -16,7 +16,7 @@ package agent
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -645,6 +645,236 @@ func TestStartReturnsRunningStatus(t *testing.T) {
 	}
 }
 
+func TestStartReuseRunningContainer_AgentIDLabel(t *testing.T) {
+	const (
+		oldAgentUUID   = "11111111-1111-1111-1111-111111111111"
+		newAgentUUID   = "22222222-2222-2222-2222-222222222222"
+		mixedAgentUUID = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+		lowerAgentUUID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	)
+
+	errStaleDeleted := errors.New("stale container delete invoked")
+
+	tests := []struct {
+		name           string
+		existing       api.AgentInfo
+		scionAgentID   string
+		wantReuse      bool
+		wantDeleteRunI string
+	}{
+		{
+			name: "empty agent_id label with SCION_AGENT_ID reuses",
+			existing: api.AgentInfo{
+				ContainerID:     "ctr-empty-1",
+				Name:            "test-agent",
+				ProjectID:       identityProjB,
+				ContainerStatus: "Up 1 hour",
+				Phase:           string(state.PhaseRunning),
+			},
+			scionAgentID: newAgentUUID,
+			wantReuse:    true,
+		},
+		{
+			name: "empty agent_id label without SCION_AGENT_ID reuses",
+			existing: api.AgentInfo{
+				ContainerID:     "ctr-empty-2",
+				Name:            "test-agent",
+				ProjectID:       identityProjB,
+				ContainerStatus: "Up 1 hour",
+				Phase:           string(state.PhaseRunning),
+			},
+			scionAgentID: "",
+			wantReuse:    true,
+		},
+		{
+			name: "legacy non-UUID agent_id label with SCION_AGENT_ID reuses",
+			existing: api.AgentInfo{
+				ContainerID:     "ctr-legacy-1",
+				Name:            "test-agent",
+				ProjectID:       identityProjB,
+				ContainerStatus: "Up 1 hour",
+				Phase:           string(state.PhaseRunning),
+				Labels:          map[string]string{api.LabelAgentID: "test-agent"},
+			},
+			scionAgentID: newAgentUUID,
+			wantReuse:    true,
+		},
+		{
+			name: "legacy non-UUID agent_id label without SCION_AGENT_ID reuses",
+			existing: api.AgentInfo{
+				ContainerID:     "ctr-legacy-2",
+				Name:            "test-agent",
+				ProjectID:       identityProjB,
+				ContainerStatus: "Up 1 hour",
+				Phase:           string(state.PhaseRunning),
+				Labels:          map[string]string{api.LabelAgentID: "legacy-slug"},
+			},
+			scionAgentID: "",
+			wantReuse:    true,
+		},
+		{
+			name: "matching UUID agent_id label reuses",
+			existing: api.AgentInfo{
+				ContainerID:     "ctr-match-1",
+				Name:            "test-agent",
+				ProjectID:       identityProjB,
+				ContainerStatus: "Up 1 hour",
+				Phase:           string(state.PhaseRunning),
+				Labels:          map[string]string{api.LabelAgentID: newAgentUUID},
+			},
+			scionAgentID: newAgentUUID,
+			wantReuse:    true,
+		},
+		{
+			name: "matching UUID agent_id label canonicalized case reuses",
+			existing: api.AgentInfo{
+				ContainerID:     "ctr-match-case",
+				Name:            "test-agent",
+				ProjectID:       identityProjB,
+				ContainerStatus: "Up 1 hour",
+				Phase:           string(state.PhaseRunning),
+				Labels:          map[string]string{api.LabelAgentID: mixedAgentUUID},
+			},
+			scionAgentID: lowerAgentUUID,
+			wantReuse:    true,
+		},
+		{
+			name: "mismatched UUID agent_id label is treated as stale",
+			existing: api.AgentInfo{
+				ContainerID:     "ctr-stale-1",
+				RunID:           "old-run-1",
+				Name:            "test-agent",
+				ProjectID:       identityProjB,
+				ContainerStatus: "Up 2 hours",
+				Phase:           string(state.PhaseRunning),
+				Labels:          map[string]string{api.LabelAgentID: oldAgentUUID},
+			},
+			scionAgentID:   newAgentUUID,
+			wantReuse:      false,
+			wantDeleteRunI: "old-run-1",
+		},
+		{
+			name: "UUID agent_id label with non-UUID SCION_AGENT_ID is treated as stale",
+			existing: api.AgentInfo{
+				ContainerID:     "ctr-stale-nonuuid",
+				RunID:           "old-run-nonuuid",
+				Name:            "test-agent",
+				ProjectID:       identityProjB,
+				ContainerStatus: "Up 2 hours",
+				Phase:           string(state.PhaseRunning),
+				Labels:          map[string]string{api.LabelAgentID: oldAgentUUID},
+			},
+			scionAgentID:   "not-a-uuid",
+			wantReuse:      false,
+			wantDeleteRunI: "old-run-nonuuid",
+		},
+		{
+			name: "UUID agent_id label with empty SCION_AGENT_ID is treated as stale",
+			existing: api.AgentInfo{
+				ContainerID:     "ctr-stale-2",
+				RunID:           "old-run-2",
+				Name:            "test-agent",
+				ProjectID:       identityProjB,
+				ContainerStatus: "Up 2 hours",
+				Phase:           string(state.PhaseRunning),
+				Labels:          map[string]string{api.LabelAgentID: oldAgentUUID},
+			},
+			scionAgentID:   "",
+			wantReuse:      false,
+			wantDeleteRunI: "old-run-2",
+		},
+		{
+			name: "mismatched UUID in AgentInfo.ID without Labels is treated as stale",
+			existing: api.AgentInfo{
+				ID:              oldAgentUUID,
+				ContainerID:     "ctr-stale-3",
+				RunID:           "old-run-3",
+				Name:            "test-agent",
+				ProjectID:       identityProjB,
+				ContainerStatus: "Up 2 hours",
+				Phase:           string(state.PhaseRunning),
+			},
+			scionAgentID:   newAgentUUID,
+			wantReuse:      false,
+			wantDeleteRunI: "old-run-3",
+		},
+		{
+			name: "matching UUID in AgentInfo.ID without Labels reuses",
+			existing: api.AgentInfo{
+				ID:              newAgentUUID,
+				ContainerID:     "ctr-match-id",
+				Name:            "test-agent",
+				ProjectID:       identityProjB,
+				ContainerStatus: "Up 2 hours",
+				Phase:           string(state.PhaseRunning),
+			},
+			scionAgentID: newAgentUUID,
+			wantReuse:    true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var deleted []runtime.RunRef
+			var checkpoints []string
+
+			mockRT := &runtime.MockRuntime{
+				ListFunc: func(ctx context.Context, labelFilter map[string]string) ([]api.AgentInfo, error) {
+					return []api.AgentInfo{tc.existing}, nil
+				},
+				DeleteFunc: func(ctx context.Context, ref runtime.RunRef) error {
+					deleted = append(deleted, ref)
+					return errStaleDeleted
+				},
+			}
+
+			env := map[string]string{"SCION_PROJECT_ID": identityProjB}
+			if tc.scionAgentID != "" {
+				env["SCION_AGENT_ID"] = tc.scionAgentID
+			}
+
+			mgr := NewManager(mockRT)
+			result, err := mgr.Start(context.Background(), api.StartOptions{
+				Name: "test-agent",
+				Env:  env,
+				Checkpoint: func(ctx context.Context, step string) error {
+					checkpoints = append(checkpoints, step)
+					return nil
+				},
+			})
+
+			if tc.wantReuse {
+				if err != nil {
+					t.Fatalf("expected reuse without error, got: %v", err)
+				}
+				if len(deleted) != 0 {
+					t.Errorf("expected no Delete calls on reuse, got %+v", deleted)
+				}
+				if result.ContainerID != tc.existing.ContainerID {
+					t.Errorf("reused ContainerID = %q, want %q", result.ContainerID, tc.existing.ContainerID)
+				}
+				if result.Phase != string(state.PhaseRunning) {
+					t.Errorf("reused Phase = %q, want %q", result.Phase, state.PhaseRunning)
+				}
+				return
+			}
+
+			if !errors.Is(err, errStaleDeleted) {
+				t.Fatalf("expected stale container to trigger pre-clean Delete (errStaleDeleted), got result=%+v err=%v", result, err)
+			}
+			if len(checkpoints) != 1 || checkpoints[0] != runtime.CheckpointStepPreClean {
+				t.Errorf("expected CheckpointStepPreClean before Delete, got %v", checkpoints)
+			}
+			if len(deleted) != 1 {
+				t.Fatalf("expected 1 Delete call, got %d (%+v)", len(deleted), deleted)
+			}
+			if deleted[0].ID != tc.existing.ContainerID || deleted[0].RunID != tc.wantDeleteRunI {
+				t.Errorf("Delete ref = %+v, want {ID:%q RunID:%q}", deleted[0], tc.existing.ContainerID, tc.wantDeleteRunI)
+			}
+		})
+	}
+}
+
 // TestSortedEnvVarKeysOmitsValues verifies the helper backing the auth debug
 // log line returns only key names, sorted, never the values -- so a caller
 // formatting this result into a log message cannot accidentally print an env
@@ -681,134 +911,4 @@ func TestSortedEnvVarKeysEmpty(t *testing.T) {
 	if got := sortedEnvVarKeys(nil); len(got) != 0 {
 		t.Errorf("sortedEnvVarKeys(nil) = %v, want empty", got)
 	}
-}
-
-// TestStartSettingsEnvEndpointPrecedence covers the endpoint env override
-// contract (originally feat/runtime-endpoint-env-precedence, re-expressed on
-// top of the G3-full settings model where harness-config env is the only
-// settings-declared env source):
-//   - SCION_HUB_ENDPOINT / SCION_HUB_URL in a settings harness-config entry
-//     authoritatively override the CLI-resolved value already sitting in
-//     opts.Env, because CLI values are laptop-scoped (loopback /
-//     operator-local) and won't route from a remote runtime like a k8s pod.
-//   - Non-endpoint keys keep the ordinary "first writer wins" precedence so
-//     CLI-scope flags (SCION_DEBUG, etc.) remain authoritative.
-func TestStartSettingsEnvEndpointPrecedence(t *testing.T) {
-	setup := func(t *testing.T, hcEnv map[string]string) map[string]string {
-		t.Helper()
-		tmpDir := t.TempDir()
-
-		oldWd, _ := os.Getwd()
-		os.Chdir(tmpDir)
-		t.Cleanup(func() { os.Chdir(oldWd) })
-
-		originalHome := os.Getenv("HOME")
-		t.Cleanup(func() { os.Setenv("HOME", originalHome) })
-		os.Setenv("HOME", tmpDir)
-
-		for _, k := range []string{"SCION_DEV_TOKEN", "SCION_AUTH_TOKEN", "SCION_HUB_ENDPOINT", "SCION_HUB_URL"} {
-			if old, ok := os.LookupEnv(k); ok {
-				k := k
-				t.Cleanup(func() { os.Setenv(k, old) })
-				os.Unsetenv(k)
-			}
-		}
-
-		globalScionDir := filepath.Join(tmpDir, ".scion")
-		hcDir := filepath.Join(globalScionDir, "harness-configs", "cfg")
-		os.MkdirAll(hcDir, 0755)
-		os.WriteFile(filepath.Join(hcDir, "config.yaml"),
-			[]byte("harness: gemini\nuser: scion\nimage: test-image:latest\n"), 0644)
-
-		tplDir := filepath.Join(globalScionDir, "templates", "default")
-		os.MkdirAll(tplDir, 0755)
-		os.WriteFile(filepath.Join(tplDir, "scion-agent.json"),
-			[]byte(`{"default_harness_config": "cfg"}`), 0644)
-
-		var envLines []string
-		for k, v := range hcEnv {
-			envLines = append(envLines, fmt.Sprintf("      %s: %q", k, v))
-		}
-		hcBlock := ""
-		if len(envLines) > 0 {
-			hcBlock = "harness_configs:\n  cfg:\n    env:\n" + strings.Join(envLines, "\n") + "\n"
-		}
-		os.WriteFile(filepath.Join(globalScionDir, "settings.yaml"),
-			[]byte("schema_version: \"1\"\nactive_profile: k8s-remote\n"+hcBlock+
-				"profiles:\n  k8s-remote:\n    runtime: docker\n"+
-				"runtimes:\n  docker:\n    type: docker\n"), 0644)
-
-		projectDir := filepath.Join(tmpDir, "project")
-		projectScionDir := filepath.Join(projectDir, ".scion")
-		os.MkdirAll(projectScionDir, 0755)
-
-		var capturedConfig runtime.RunConfig
-		mockRT := &runtime.MockRuntime{
-			ListFunc: func(ctx context.Context, labelFilter map[string]string) ([]api.AgentInfo, error) {
-				return []api.AgentInfo{}, nil
-			},
-			RunFunc: func(ctx context.Context, cfg runtime.RunConfig) (string, error) {
-				capturedConfig = cfg
-				return "mock-id", nil
-			},
-		}
-
-		mgr := NewManager(mockRT)
-		_, err := mgr.Start(context.Background(), api.StartOptions{
-			Name:        "test-agent",
-			ProjectPath: projectScionDir,
-			NoAuth:      true,
-			// Simulate cmd/common.go priming opts.Env with CLI-resolved endpoint
-			// and a laptop-scope debug flag.
-			Env: map[string]string{
-				"SCION_HUB_ENDPOINT": "http://cli-loopback:9810",
-				"SCION_HUB_URL":      "http://cli-loopback:9810",
-				"SCION_DEBUG":        "1",
-			},
-		})
-		if err != nil {
-			t.Fatalf("Start failed: %v", err)
-		}
-		envMap := make(map[string]string)
-		for _, e := range capturedConfig.Env {
-			parts := strings.SplitN(e, "=", 2)
-			if len(parts) == 2 {
-				envMap[parts[0]] = parts[1]
-			}
-		}
-		return envMap
-	}
-
-	t.Run("harness-config SCION_HUB_ENDPOINT overrides CLI-injected loopback", func(t *testing.T) {
-		envMap := setup(t, map[string]string{
-			"SCION_HUB_ENDPOINT": "http://hc-remote:9810",
-			"SCION_HUB_URL":      "http://hc-remote:9810",
-		})
-		if got := envMap["SCION_HUB_ENDPOINT"]; got != "http://hc-remote:9810" {
-			t.Errorf("SCION_HUB_ENDPOINT = %q, want harness-config %q", got, "http://hc-remote:9810")
-		}
-		if got := envMap["SCION_HUB_URL"]; got != "http://hc-remote:9810" {
-			t.Errorf("SCION_HUB_URL = %q, want harness-config %q", got, "http://hc-remote:9810")
-		}
-	})
-
-	t.Run("non-endpoint keys keep first-writer-wins", func(t *testing.T) {
-		envMap := setup(t, map[string]string{
-			"SCION_DEBUG": "0", // harness config would clear debug, must NOT win
-			"MY_VAR":      "hc-value",
-		})
-		if got := envMap["SCION_DEBUG"]; got != "1" {
-			t.Errorf("SCION_DEBUG = %q, want CLI-scoped %q (non-endpoint keys must not be overridden)", got, "1")
-		}
-		if got := envMap["MY_VAR"]; got != "hc-value" {
-			t.Errorf("MY_VAR = %q, want %q (no CLI value → harness-config env wins by default)", got, "hc-value")
-		}
-	})
-
-	t.Run("no harness-config env leaves CLI-injected endpoint intact", func(t *testing.T) {
-		envMap := setup(t, nil)
-		if got := envMap["SCION_HUB_ENDPOINT"]; got != "http://cli-loopback:9810" {
-			t.Errorf("SCION_HUB_ENDPOINT = %q, want CLI-injected %q", got, "http://cli-loopback:9810")
-		}
-	})
 }

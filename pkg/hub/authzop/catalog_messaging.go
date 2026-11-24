@@ -66,6 +66,31 @@ var messagingOperations = []OperationSpec{
 	// and acts only on records inside its boundary.
 	// =====================================================================
 	{
+		ID:          "inbox.summary.read",
+		Domain:      "inbox",
+		Description: "Read the caller's aggregated inbox summary across categories (approvals, waiting agents, artifact reviews, chat, decisions). Interactive web sessions and dev credentials receive the full view; user access tokens with inbox:read receive the token view (approvals marked unavailable, excluded from total). Agents, visitors, federated users, and UATs without inbox:read get 403; unsupported methods get 405; 404 while web.inbox_dashboard is off",
+		EntryPoints: []EntryPoint{
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/users/me/inbox/summary", Method: "GET"},
+		},
+		Principals:       []PrincipalKind{PrincipalUser},
+		Credentials:      []CredentialKind{CredentialSessionJWT, CredentialScopedUAT},
+		ResourceResolver: "self-principal",
+		BasePermission:   "inbox.read",
+		Effects:          []SecurityEffect{EffectListScoped},
+		DelegationKind:   DelegationNone,
+		AuthorityEval:    AuthorityEvalNone,
+		DenialCodes:      []DenialCode{DenialForbidden, DenialResourceNotFound},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub", Function: "TestUserMeInboxSummary_AuthAndValidation"},
+		},
+		Bearer: BearerDisposition{
+			Kind:       BearerAdmit,
+			Target:     BearerTargetSelfRecord,
+			Boundaries: []BearerBoundary{BearerBoundaryProject, BearerBoundaryHub},
+			Pin:        "TestUserMeInboxSummary_AuthAndValidation",
+		},
+	},
+	{
 		ID:          "inbox.message.read",
 		Domain:      "inbox",
 		Description: "List and read the caller's own inbox messages. A project token lists only messages of its boundary project",
@@ -211,6 +236,7 @@ var messagingOperations = []OperationSpec{
 			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/conversations/{id}", Method: "GET", Variant: "group"},
 			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/conversations/{id}/messages", Method: "GET", Variant: "group"},
 			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/conversations/{id}/messages/{messageId}", Method: "GET", Variant: "group"},
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/conversations/{id}/watch", Method: "GET", Variant: "group"},
 		},
 		Principals:       []PrincipalKind{PrincipalUser, PrincipalAgent},
 		Credentials:      []CredentialKind{CredentialSessionJWT, CredentialScopedUAT, CredentialAgentJWT},
@@ -222,6 +248,7 @@ var messagingOperations = []OperationSpec{
 		DenialCodes:      []DenialCode{DenialForbidden},
 		TestRefs: []TestRef{
 			{Package: "pkg/hub", Function: "TestGroupConversationToken_ProjectlessGroupRequiresHubBoundary"},
+			{Package: "pkg/hub", Function: "TestConversationWatch_AuthzParity"},
 		},
 		Bearer: AdmitOn(BearerTargetConversationRecord, BearerBoundaryProject, BearerBoundaryHub),
 	},
@@ -233,6 +260,7 @@ var messagingOperations = []OperationSpec{
 			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/conversations/{id}", Method: "GET", Variant: "direct"},
 			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/conversations/{id}/messages", Method: "GET", Variant: "direct"},
 			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/conversations/{id}/messages/{messageId}", Method: "GET", Variant: "direct"},
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/conversations/{id}/watch", Method: "GET", Variant: "direct"},
 		},
 		Principals:       []PrincipalKind{PrincipalUser, PrincipalAgent},
 		Credentials:      []CredentialKind{CredentialSessionJWT, CredentialScopedUAT, CredentialAgentJWT},
@@ -244,6 +272,7 @@ var messagingOperations = []OperationSpec{
 		DenialCodes:      []DenialCode{DenialForbidden},
 		TestRefs: []TestRef{
 			{Package: "pkg/hub", Function: "TestDirectConversationToken_PeerAgentMustBeInsideBoundary"},
+			{Package: "pkg/hub", Function: "TestConversationWatch_AuthzParity"},
 		},
 		Bearer: AdmitOn(BearerTargetSelfRecord, BearerBoundaryProject, BearerBoundaryHub),
 	},

@@ -14,6 +14,12 @@
 
 package store
 
+import (
+	"log/slog"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
+)
+
 // BrokerAgentConfig is the part of a Runtime Broker's agent answer that
 // records what the broker resolved for the agent: template, harness config
 // and auth, image, profile and runtime. A synchronous dispatch reads it from
@@ -42,7 +48,16 @@ func ApplyBrokerAgentConfig(a *Agent, c BrokerAgentConfig) {
 	}
 	if a.AppliedConfig != nil {
 		if c.HarnessConfig != "" {
-			a.AppliedConfig.HarnessConfig = c.HarnessConfig
+			if a.HarnessConfig == state.ShellHarnessName || a.AppliedConfig.HarnessConfig == state.ShellHarnessName {
+				if c.HarnessConfig != state.ShellHarnessName {
+					slog.Warn("store: broker report disagreed on execution container harness_config; keeping shell",
+						"agent_id", a.ID,
+						"reported_harness_config", c.HarnessConfig)
+				}
+				a.AppliedConfig.HarnessConfig = state.ShellHarnessName
+			} else {
+				a.AppliedConfig.HarnessConfig = c.HarnessConfig
+			}
 		}
 		if c.HarnessAuth != "" {
 			a.AppliedConfig.HarnessAuth = c.HarnessAuth
@@ -60,6 +75,14 @@ func ApplyBrokerAgentConfig(a *Agent, c BrokerAgentConfig) {
 		}
 		if c.Profile != "" && !a.IsPinned() {
 			a.AppliedConfig.Profile = c.Profile
+			// Record the broker-resolved profile into CreateInputs when empty
+			// so reincarnate replays the profile chosen at create rather than
+			// re-resolving against a later broker default or project active
+			// profile (ptone/scion#5149). Never overwrites an already-recorded
+			// explicit or create-time profile.
+			if a.AppliedConfig.CreateInputs != nil && a.AppliedConfig.CreateInputs.Profile == "" {
+				a.AppliedConfig.CreateInputs.Profile = c.Profile
+			}
 		}
 	}
 	if c.Runtime != "" {

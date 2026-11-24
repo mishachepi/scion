@@ -1210,3 +1210,162 @@ func TestMintInstallationToken_ParseErrorPopulatesUpstreamDetail(t *testing.T) {
 		t.Error("response body leaked into error")
 	}
 }
+
+func TestIntersectTokenPermissions(t *testing.T) {
+	defaults := DefaultTokenPermissions()
+	tests := []struct {
+		name      string
+		requested TokenPermissions
+		appPerms  map[string]string
+		want      TokenPermissions
+	}{
+		{
+			name:      "full grant preserves defaults",
+			requested: defaults,
+			appPerms: map[string]string{
+				"contents":      "write",
+				"pull_requests": "write",
+				"issues":        "write",
+				"metadata":      "read",
+			},
+			want: defaults,
+		},
+		{
+			name:      "read-only app lowers contents and drops pull_requests and issues",
+			requested: defaults,
+			appPerms: map[string]string{
+				"contents": "read",
+				"metadata": "read",
+			},
+			want: TokenPermissions{
+				Contents: "read",
+				Metadata: "read",
+			},
+		},
+		{
+			name:      "git-only app without issues drops issues only",
+			requested: defaults,
+			appPerms: map[string]string{
+				"contents":      "write",
+				"pull_requests": "write",
+				"metadata":      "read",
+			},
+			want: TokenPermissions{
+				Contents:     "write",
+				PullRequests: "write",
+				Metadata:     "read",
+			},
+		},
+		{
+			name:      "cannot widen read to write or write to admin or add unrequested fields",
+			requested: defaults,
+			appPerms: map[string]string{
+				"contents":       "admin",
+				"pull_requests":  "admin",
+				"issues":         "read",
+				"metadata":       "write",
+				"checks":         "write",
+				"actions":        "write",
+				"administration": "admin",
+				"secrets":        "write",
+			},
+			want: TokenPermissions{
+				Contents:     "write",
+				PullRequests: "write",
+				Issues:       "read",
+				Metadata:     "read",
+			},
+		},
+		{
+			name: "drops unknown requested and app levels",
+			requested: TokenPermissions{
+				Contents: "write",
+				Checks:   "admin",
+				Actions:  "read",
+				Metadata: "read",
+			},
+			appPerms: map[string]string{
+				"contents": "none",
+				"checks":   "admin",
+				"actions":  "bogus",
+				"metadata": "read",
+			},
+			want: TokenPermissions{
+				Metadata: "read",
+			},
+		},
+		{
+			name:      "nil app permissions returns empty",
+			requested: defaults,
+			appPerms:  nil,
+			want:      TokenPermissions{},
+		},
+		{
+			name:      "empty app permissions returns empty",
+			requested: defaults,
+			appPerms:  map[string]string{},
+			want:      TokenPermissions{},
+		},
+		{
+			name:      "disjoint app permissions returns empty",
+			requested: defaults,
+			appPerms: map[string]string{
+				"actions": "write",
+				"checks":  "read",
+			},
+			want: TokenPermissions{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := IntersectTokenPermissions(tt.requested, tt.appPerms)
+			if got != tt.want {
+				t.Errorf("IntersectTokenPermissions(%+v, %v) = %+v, want %+v", tt.requested, tt.appPerms, got, tt.want)
+			}
+		})
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+type failingReadCloser struct {
+	err error
+}
+
+func (f failingReadCloser) Read([]byte) (int, error) { return 0, f.err }
+func (f failingReadCloser) Close() error             { return nil }
+
+func TestMintInstallationToken_Non201ReadErrorSetsStatusCode(t *testing.T) {
+	pemData, _ := generateTestKey(t)
+	client, err := NewClient(Config{AppID: 42, APIBaseURL: "https://api.github.test"}, pemData)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusBadGateway,
+			Header:     make(http.Header),
+			Body:       failingReadCloser{err: errors.New("connection reset by peer")},
+		}, nil
+	})
+
+	_, err = client.MintInstallationToken(context.Background(), 12345, []string{"repo"}, DefaultTokenPermissions())
+	var mintErr *TokenMintError
+	if !errors.As(err, &mintErr) {
+		t.Fatalf("expected TokenMintError, got %T: %v", err, err)
+	}
+	if mintErr.ErrorCode != ErrCodeTokenMintFailed {
+		t.Errorf("ErrorCode = %q, want %q", mintErr.ErrorCode, ErrCodeTokenMintFailed)
+	}
+	if mintErr.StatusCode != http.StatusBadGateway {
+		t.Errorf("StatusCode = %d, want %d", mintErr.StatusCode, http.StatusBadGateway)
+	}
+	if mintErr.UpstreamDetail() == "" {
+		t.Error("expected UpstreamDetail for non-201 read error")
+	}
+}

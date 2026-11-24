@@ -259,6 +259,7 @@ func (s *Server) handleAgentLaunchReport(w http.ResponseWriter, r *http.Request,
 	if sr.State == store.LaunchReportStateSucceeded && answer.HTTPStatus == 0 &&
 		(answer.Result == store.LaunchReportResultApplied || answer.Result == store.LaunchReportResultCompleted) {
 		s.recordLaunchReportEcho(ctx, agentID, brokerID, req.LaunchID, req.Agent)
+		s.clearAgentHomeFilesPending(ctx, &updated)
 	}
 
 	// A write that changed the row (applied, or a 409 stale_launch that
@@ -339,7 +340,8 @@ type launchSettleReport struct {
 // failed write is logged and leaves the row as it was, which costs a later
 // delete only a run-scoped refusal or extra 404s, and a completed resend of
 // the report can settle it later. On a swap, row's RunID and
-// PreviousRunIDs are updated to match.
+// PreviousRunIDs are updated to match. When canAdoptBrokerRunID refuses a
+// different run ID, no swap runs and PreviousRunIDs is left unchanged.
 func (s *Server) settleLaunchedRun(ctx context.Context, row *store.Agent, info *RemoteAgentInfo, rep launchSettleReport) {
 	if info == nil || info.RunID == "" {
 		return
@@ -347,6 +349,13 @@ func (s *Server) settleLaunchedRun(ctx context.Context, row *store.Agent, info *
 	if row.RunIDUpdatedAt == nil {
 		s.agentLifecycleLog.Debug("Launch report: the agent's run has no recorded change time; not settling the launched run",
 			"agent_id", row.ID, "run_id", row.RunID, "broker_run_id", info.RunID)
+		return
+	}
+	fromRun := row.RunID
+	if rep.Result == store.LaunchReportResultCompleted {
+		fromRun = row.LaunchRunID
+	}
+	if info.RunID != fromRun && !canAdoptBrokerRunID(ctx, s.store, s.agentLifecycleLog, "Launch report", row, fromRun, info) {
 		return
 	}
 	var swapped bool

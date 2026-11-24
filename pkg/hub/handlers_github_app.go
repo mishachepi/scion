@@ -844,9 +844,14 @@ func (s *Server) handleProjectGitHubPermissions(w http.ResponseWriter, r *http.R
 	switch r.Method {
 	case http.MethodGet:
 		perms := project.GitHubPermissions
-		if perms == nil || *perms == (store.GitHubTokenPermissions{}) {
-			// Return the same defaults token minting falls back to.
-			defaults := store.GitHubTokenPermissions(githubapp.DefaultTokenPermissions())
+		if !hasUsableStoredGitHubPermissions(perms) {
+			// Return the same defaults token minting falls back to, capped at
+			// the App's granted permissions when App identity is available.
+			effective := githubapp.DefaultTokenPermissions()
+			if id, ok := s.GitHubAppIdentity(r.Context()); ok && id != nil {
+				effective = githubapp.IntersectTokenPermissions(effective, id.Permissions)
+			}
+			defaults := store.GitHubTokenPermissions(effective)
 			perms = &defaults
 		}
 		writeJSON(w, http.StatusOK, perms)
@@ -875,6 +880,7 @@ func (s *Server) handleProjectGitHubPermissions(w http.ResponseWriter, r *http.R
 			writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to update project", nil)
 			return
 		}
+		s.githubTokenCache.invalidateProject(project.ID)
 
 		writeJSON(w, http.StatusOK, perms)
 
@@ -884,6 +890,7 @@ func (s *Server) handleProjectGitHubPermissions(w http.ResponseWriter, r *http.R
 			writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to update project", nil)
 			return
 		}
+		s.githubTokenCache.invalidateProject(project.ID)
 
 		w.WriteHeader(http.StatusNoContent)
 
@@ -963,7 +970,8 @@ func (s *Server) handleGitHubAppSyncPermissions(w http.ResponseWriter, r *http.R
 
 	appPermissions, affectedProjects, err := s.syncAppPermissions(ctx)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, ErrCodeInternalError, err.Error(), nil)
+		slog.ErrorContext(ctx, "GitHub App permission sync failed", "error", upstreamText(err.Error()))
+		writeError(w, http.StatusBadGateway, ErrCodeInternalError, githubAppIdentityErrorMessage(err), nil)
 		return
 	}
 
@@ -993,20 +1001,30 @@ func (s *Server) syncAppPermissions(ctx context.Context) (map[string]string, []m
 	// Page through all projects and check their requested permissions against the app's permissions
 	var affectedProjects []map[string]interface{}
 	now := timeNow()
+	defaults := githubapp.DefaultTokenPermissions()
+	defaultsStore := store.GitHubTokenPermissions(defaults)
+	defaultIntersectionEmpty := githubapp.IntersectTokenPermissions(defaults, appPermissions) == (githubapp.TokenPermissions{})
 
 	if err := s.forEachGitHubAppProject(ctx, func(project *store.Project) {
-		if project.GitHubInstallationID == nil || project.GitHubPermissions == nil {
+		if project.GitHubInstallationID == nil {
 			return
 		}
 
-		// Compare each project's requested permissions against the app's permissions
-		missingPerms := comparePermissions(project.GitHubPermissions, appPermissions)
+		var missingPerms []string
+		if hasUsableStoredGitHubPermissions(project.GitHubPermissions) {
+			missingPerms = comparePermissions(project.GitHubPermissions, appPermissions)
+		} else if defaultIntersectionEmpty {
+			// No stored permissions: minting intersects defaults with the App's
+			// grant, so a non-empty intersection is healthy. Only mark degraded
+			// when the App grants none of the defaults and minting fails closed.
+			missingPerms = comparePermissions(&defaultsStore, appPermissions)
+		}
 		if len(missingPerms) == 0 {
 			return
 		}
 
 		// Project requests permissions the app doesn't have — mark as degraded
-		msg := fmt.Sprintf("App is missing permissions requested by this project: %s. Update the GitHub App's permissions in the app settings.", strings.Join(missingPerms, ", "))
+		msg := formatMissingPermissionsMessage(missingPerms)
 
 		project.GitHubAppStatus = &store.GitHubAppProjectStatus{
 			State:        store.GitHubAppStateDegraded,
@@ -1016,8 +1034,8 @@ func (s *Server) syncAppPermissions(ctx context.Context) (map[string]string, []m
 			LastError:    &now,
 		}
 
-		if err := s.store.UpdateProject(ctx, project); err != nil {
-			slog.Error("Failed to update project after permission sync",
+		if err := s.store.UpdateProjectGitHubAppStatus(ctx, project.ID, project.GitHubAppStatus); err != nil {
+			slog.ErrorContext(ctx, "Failed to update project after permission sync",
 				"project_id", project.ID, "error", err)
 			return
 		}
@@ -1039,11 +1057,20 @@ func (s *Server) syncAppPermissions(ctx context.Context) (map[string]string, []m
 	return appPermissions, affectedProjects, nil
 }
 
+// formatMissingPermissionsMessage builds a fixed-format, user-safe degraded
+// status message from validated permission labels returned by comparePermissions.
+func formatMissingPermissionsMessage(missingPerms []string) string {
+	return fmt.Sprintf("App is missing permissions requested by this project: %s. Update the GitHub App's permissions in the app settings.", strings.Join(missingPerms, ", "))
+}
+
 // comparePermissions checks each non-empty permission in the project's requested
 // permissions against the app's available permissions. Returns a list of
 // permission names that the project requests but the app does not have (or has
-// at a lower level).
+// at a lower level). Never includes raw/unknown upstream level strings.
 func comparePermissions(projectPerms *store.GitHubTokenPermissions, appPerms map[string]string) []string {
+	if projectPerms == nil {
+		return nil
+	}
 	var missing []string
 
 	checks := []struct {
@@ -1064,16 +1091,12 @@ func comparePermissions(projectPerms *store.GitHubTokenPermissions, appPerms map
 		}
 
 		appLevel, ok := appPerms[check.name]
-		if !ok {
-			// App doesn't have this permission at all
-			missing = append(missing, fmt.Sprintf("%s:%s", check.name, check.level))
-			continue
-		}
-
-		// Check if the app's level is sufficient
-		// "write" satisfies "read", but "read" does not satisfy "write"
-		if check.level == "write" && appLevel == "read" {
-			missing = append(missing, fmt.Sprintf("%s:%s (app has %s)", check.name, check.level, appLevel))
+		if !ok || !githubPermissionSatisfies(appLevel, check.level) {
+			if check.level == "write" && appLevel == "read" {
+				missing = append(missing, fmt.Sprintf("%s:%s (app has read)", check.name, check.level))
+			} else {
+				missing = append(missing, fmt.Sprintf("%s:%s", check.name, check.level))
+			}
 		}
 	}
 

@@ -16,6 +16,7 @@ package hub
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -29,6 +30,7 @@ import (
 
 	monitoring "cloud.google.com/go/monitoring/apiv3/v2"
 	"cloud.google.com/go/monitoring/apiv3/v2/monitoringpb"
+	"github.com/GoogleCloudPlatform/scion/pkg/secret"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/telemetrycontract"
 	gax "github.com/googleapis/gax-go/v2"
@@ -215,6 +217,25 @@ func NewMetricsDashboardService(ctx context.Context, projectID string) (*Metrics
 	}, nil
 }
 
+// ProjectID returns the GCP project ID currently targeted by this service.
+func (s *MetricsDashboardService) ProjectID() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.projectID
+}
+
+// SetProjectID retargets this service to query Cloud Monitoring in projectID
+// and clears any cached responses from the previous project.
+func (s *MetricsDashboardService) SetProjectID(projectID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.projectID == projectID {
+		return
+	}
+	s.projectID = projectID
+	s.cache = make(map[string]*cacheEntry)
+}
+
 // Close releases resources.
 func (s *MetricsDashboardService) Close() error {
 	if s.rawClient == nil {
@@ -233,7 +254,13 @@ type DashboardSummary struct {
 	TotalAPICalls int64  `json:"totalApiCalls"`
 	TotalTokens   int64  `json:"totalTokens"`
 	UniqueAgents  int    `json:"uniqueAgents"`
+	// TelemetryHint surfaces an actionable setup hint when cloud telemetry
+	// cannot export under the current hub/project configuration (for example,
+	// GCP cloud telemetry on in metadata block mode without credentials).
+	TelemetryHint string `json:"telemetryHint,omitempty"`
 }
+
+const missingGCPTelemetryCredentialsHint = "Cloud telemetry is enabled for GCP, but the default metadata mode is block and the scion-telemetry-gcp-credentials secret is not configured. Agents without an assigned service account cannot export metrics to Cloud Monitoring, so this dashboard will stay empty. Configure the scion-telemetry-gcp-credentials Hub secret, assign a service account (--service-account), or remove provider: gcp and point telemetry.cloud.endpoint at a local OpenTelemetry Collector."
 
 // TimeSeriesPoint represents a single data point in a time series.
 type TimeSeriesPoint struct {
@@ -291,14 +318,28 @@ func (s *MetricsDashboardService) setCache(key string, data interface{}) {
 	s.setZonedCache(key, "", data)
 }
 
+func (s *MetricsDashboardService) setCacheForProject(projectID, key string, data interface{}) {
+	s.setZonedCacheForProject(projectID, key, "", data)
+}
+
 // setZonedCache stores a view computed for the resolved zone name zone. It
 // first drops expired entries, so the map does not grow without bound. A
 // zone other than UTC is cached only while fewer than maxCachedZones
 // distinct non-UTC zones have live entries (or this zone already has one);
 // otherwise the view is returned uncached. It reports whether it cached.
 func (s *MetricsDashboardService) setZonedCache(key, zone string, data interface{}) bool {
+	return s.setZonedCacheForProject(s.ProjectID(), key, zone, data)
+}
+
+// setZonedCacheForProject stores a view only if the service is still targeting
+// expectedProjectID, preventing an in-flight query started before a
+// SetProjectID retarget from populating the new project's cache.
+func (s *MetricsDashboardService) setZonedCacheForProject(expectedProjectID, key, zone string, data interface{}) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.projectID != expectedProjectID {
+		return false
+	}
 	now := time.Now()
 	for k, e := range s.cache {
 		if now.Sub(e.fetchedAt) > cacheTTL {
@@ -441,6 +482,7 @@ func queryGroupedMetricsView[T any](
 	build func([][]LabeledTimeSeries) *T,
 ) (*T, error) {
 	cfg := applyQueryOptions(opts)
+	gcpProject := s.ProjectID()
 	cacheKey := cfg.cacheKey(cachePrefix, periodDays)
 	if cached, ok := s.getCached(cacheKey); ok {
 		return cached.(*T), nil
@@ -461,7 +503,7 @@ func queryGroupedMetricsView[T any](
 		return view, err
 	}
 
-	s.setZonedCache(cacheKey, cfg.zoneName(), view)
+	s.setZonedCacheForProject(gcpProject, cacheKey, cfg.zoneName(), view)
 	return view, nil
 }
 
@@ -488,6 +530,7 @@ func tokenTypeFilter(tokenType string) string {
 // QuerySummary returns aggregate metric counts for the given period.
 func (s *MetricsDashboardService) QuerySummary(ctx context.Context, periodDays int, opts ...QueryOption) (*DashboardSummary, error) {
 	cfg := applyQueryOptions(opts)
+	gcpProject := s.ProjectID()
 	cacheKey := cfg.cacheKey("summary", periodDays)
 	if cached, ok := s.getCached(cacheKey); ok {
 		return cached.(*DashboardSummary), nil
@@ -531,13 +574,14 @@ func (s *MetricsDashboardService) QuerySummary(ctx context.Context, periodDays i
 		return summary, fmt.Errorf("partial query failures: %s", strings.Join(queryErrors, "; "))
 	}
 
-	s.setZonedCache(cacheKey, cfg.zoneName(), summary)
+	s.setZonedCacheForProject(gcpProject, cacheKey, cfg.zoneName(), summary)
 	return summary, nil
 }
 
 // QuerySessions returns daily session counts and active agent counts.
 func (s *MetricsDashboardService) QuerySessions(ctx context.Context, periodDays int, opts ...QueryOption) (*SessionsView, error) {
 	cfg := applyQueryOptions(opts)
+	gcpProject := s.ProjectID()
 	cacheKey := cfg.cacheKey("sessions", periodDays)
 	if cached, ok := s.getCached(cacheKey); ok {
 		return cached.(*SessionsView), nil
@@ -571,7 +615,7 @@ func (s *MetricsDashboardService) QuerySessions(ctx context.Context, periodDays 
 		return view, fmt.Errorf("partial query failures: %s", strings.Join(queryErrors, "; "))
 	}
 
-	s.setZonedCache(cacheKey, cfg.zoneName(), view)
+	s.setZonedCacheForProject(gcpProject, cacheKey, cfg.zoneName(), view)
 	return view, nil
 }
 
@@ -618,7 +662,7 @@ func (s *MetricsDashboardService) fetchTimeSeries(ctx context.Context, metricNam
 	}
 
 	req := &monitoringpb.ListTimeSeriesRequest{
-		Name:   fmt.Sprintf("projects/%s", s.projectID),
+		Name:   fmt.Sprintf("projects/%s", s.ProjectID()),
 		Filter: filter,
 		Interval: &monitoringpb.TimeInterval{
 			StartTime: timestamppb.New(fetchStart),
@@ -937,6 +981,7 @@ type ProjectMetricsSummary struct {
 
 // QueryProjectSummary returns lightweight scalar metrics for a project over the last 24 hours.
 func (s *MetricsDashboardService) QueryProjectSummary(ctx context.Context, projectID string) (*ProjectMetricsSummary, error) {
+	gcpProject := s.ProjectID()
 	cacheKey := fmt.Sprintf("project-summary:%s", projectID)
 	if cached, ok := s.getCached(cacheKey); ok {
 		return cached.(*ProjectMetricsSummary), nil
@@ -983,8 +1028,68 @@ func (s *MetricsDashboardService) QueryProjectSummary(ctx context.Context, proje
 		return summary, fmt.Errorf("partial query failures: %s", strings.Join(queryErrors, "; "))
 	}
 
-	s.setCache(cacheKey, summary)
+	s.setCacheForProject(gcpProject, cacheKey, summary)
 	return summary, nil
+}
+
+// currentMetricsDashboard returns the active MetricsDashboardService, or nil.
+func (s *Server) currentMetricsDashboard() *MetricsDashboardService {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.metricsDashboard
+}
+
+// newMetricsDashboardService constructs a MetricsDashboardService using the
+// configured factory (or NewMetricsDashboardService in production).
+func (s *Server) newMetricsDashboardService(ctx context.Context, projectID string) (*MetricsDashboardService, error) {
+	if s.metricsDashboardFactory != nil {
+		return s.metricsDashboardFactory(ctx, projectID)
+	}
+	return NewMetricsDashboardService(ctx, projectID)
+}
+
+// applyMetricsDashboardProject updates s.metricsDashboard to target projectID:
+// retargeting an existing service in place (clearing its cache), creating a
+// new service when previously unconfigured, or closing and clearing it when
+// projectID is empty. Callers hold s.settingsApply.mu and must NOT hold s.mu.
+func (s *Server) applyMetricsDashboardProject(projectID string) bool {
+	cur := s.currentMetricsDashboard()
+	curProject := ""
+	if cur != nil {
+		curProject = cur.ProjectID()
+	}
+	if curProject == projectID {
+		return false
+	}
+	if projectID == "" {
+		s.mu.Lock()
+		old := s.metricsDashboard
+		s.metricsDashboard = nil
+		s.mu.Unlock()
+		if old != nil {
+			if err := old.Close(); err != nil {
+				slog.Warn("Failed to close metrics dashboard", "error", err)
+			}
+			slog.Info("Metrics dashboard service disabled (no telemetry project ID)")
+			return true
+		}
+		return false
+	}
+	if cur != nil {
+		cur.SetProjectID(projectID)
+		slog.Info("Metrics dashboard service retargeted", "previous_project", curProject, "project", projectID)
+		return true
+	}
+	metricsSvc, err := s.newMetricsDashboardService(context.Background(), projectID)
+	if err != nil {
+		slog.Warn("Failed to initialize metrics dashboard service", "project", projectID, "error", err)
+		return false
+	}
+	s.mu.Lock()
+	s.metricsDashboard = metricsSvc
+	s.mu.Unlock()
+	slog.Info("Metrics dashboard service initialized", "project", projectID)
+	return true
 }
 
 // handleProjectMetricsSummary returns lightweight metrics summary for a project.
@@ -1035,12 +1140,13 @@ func (s *Server) handleProjectMetricsSummary(w http.ResponseWriter, r *http.Requ
 	}
 
 	// If metrics service is not configured, return unavailable indicator
-	if s.metricsDashboard == nil {
+	dashboard := s.currentMetricsDashboard()
+	if dashboard == nil {
 		writeJSON(w, http.StatusOK, map[string]interface{}{"available": false})
 		return
 	}
 
-	data, err := s.metricsDashboard.QueryProjectSummary(ctx, projectID)
+	data, err := dashboard.QueryProjectSummary(ctx, projectID)
 	if err != nil {
 		if data == nil {
 			writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
@@ -1132,7 +1238,8 @@ func (s *Server) serveMetricsDashboard(w http.ResponseWriter, r *http.Request, o
 		return
 	}
 
-	if s.metricsDashboard == nil {
+	dashboard := s.currentMetricsDashboard()
+	if dashboard == nil {
 		writeError(w, http.StatusServiceUnavailable, "metrics_unavailable",
 			"Metrics dashboard is not configured (no telemetry project ID)", nil)
 		return
@@ -1162,7 +1269,7 @@ func (s *Server) serveMetricsDashboard(w http.ResponseWriter, r *http.Request, o
 
 	switch view {
 	case "summary":
-		data, err := s.metricsDashboard.QuerySummary(ctx, periodDays, opts...)
+		data, err := dashboard.QuerySummary(ctx, periodDays, opts...)
 		if err != nil {
 			if data == nil {
 				writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
@@ -1172,10 +1279,15 @@ func (s *Server) serveMetricsDashboard(w http.ResponseWriter, r *http.Request, o
 			slog.Warn("Partial metrics query failure", "view", view, "error", err)
 
 		}
+		if hint := s.metricsTelemetryHint(ctx, applyQueryOptions(opts).ProjectID); hint != "" {
+			cp := *data
+			cp.TelemetryHint = hint
+			data = &cp
+		}
 		writeJSON(w, http.StatusOK, data)
 
 	case "sessions":
-		data, err := s.metricsDashboard.QuerySessions(ctx, periodDays, opts...)
+		data, err := dashboard.QuerySessions(ctx, periodDays, opts...)
 		if err != nil {
 			if data == nil {
 				writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
@@ -1188,7 +1300,7 @@ func (s *Server) serveMetricsDashboard(w http.ResponseWriter, r *http.Request, o
 		writeJSON(w, http.StatusOK, data)
 
 	case "model-calls":
-		data, err := s.metricsDashboard.QueryModelCalls(ctx, periodDays, opts...)
+		data, err := dashboard.QueryModelCalls(ctx, periodDays, opts...)
 		if err != nil {
 			if data == nil {
 				writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
@@ -1201,7 +1313,7 @@ func (s *Server) serveMetricsDashboard(w http.ResponseWriter, r *http.Request, o
 		writeJSON(w, http.StatusOK, data)
 
 	case "tokens":
-		data, err := s.metricsDashboard.QueryTokens(ctx, periodDays, opts...)
+		data, err := dashboard.QueryTokens(ctx, periodDays, opts...)
 		if err != nil {
 			if data == nil {
 				writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
@@ -1217,4 +1329,101 @@ func (s *Server) serveMetricsDashboard(w http.ResponseWriter, r *http.Request, o
 		writeError(w, http.StatusBadRequest, "invalid_view",
 			fmt.Sprintf("Unknown view: %s. Valid views: summary, sessions, model-calls, tokens", view), nil)
 	}
+}
+
+// metricsTelemetryHint returns an actionable dashboard hint when GCP cloud
+// telemetry is enabled, the effective default metadata mode is block, and the
+// scion-telemetry-gcp-credentials secret is not configured.
+func (s *Server) metricsTelemetryHint(ctx context.Context, projectID string) string {
+	tel := s.hubTelemetryDefault()
+	if tel == nil || tel.Cloud == nil || tel.Cloud.Provider != "gcp" {
+		return ""
+	}
+	if tel.Cloud.Enabled != nil && !*tel.Cloud.Enabled {
+		return ""
+	}
+
+	var project *store.Project
+	if projectID != "" && s.store != nil {
+		if p, err := s.store.GetProject(ctx, projectID); err == nil {
+			project = p
+		}
+	}
+	if policy := projectTelemetryPolicy(project); policy != nil {
+		if !*policy {
+			return ""
+		}
+	} else if tel.Enabled != nil && !*tel.Enabled {
+		return ""
+	}
+
+	mode := s.hubAgentDefaults().DefaultGCPIdentityMode
+	if project != nil {
+		if pm := projectSettingsFromAnnotations(project).DefaultGCPIdentityMode; pm != "" {
+			mode = pm
+		}
+	}
+	if mode != "" && mode != store.GCPMetadataModeBlock {
+		return ""
+	}
+	if mode == "" && s.allBrokersKubernetesOnly(ctx) {
+		return ""
+	}
+
+	if s.secretBackend == nil {
+		return ""
+	}
+	meta, err := s.secretBackend.GetMeta(ctx, telemetryGCPCredentialsSecretName, store.ScopeHub, s.hubID)
+	if err == nil && meta != nil && meta.SecretType == store.SecretTypeFile && secret.HubSecretDeliverable(*meta) {
+		return ""
+	}
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return ""
+	}
+	if projectID != "" {
+		pMeta, pErr := s.secretBackend.GetMeta(ctx, telemetryGCPCredentialsSecretName, store.ScopeProject, projectID)
+		if pErr == nil && pMeta != nil && pMeta.SecretType == store.SecretTypeFile {
+			return ""
+		}
+		if pErr != nil && !errors.Is(pErr, store.ErrNotFound) {
+			return ""
+		}
+	}
+	if userIdent := GetUserIdentityFromContext(ctx); userIdent != nil && userIdent.ID() != "" {
+		uMeta, uErr := s.secretBackend.GetMeta(ctx, telemetryGCPCredentialsSecretName, store.ScopeUser, userIdent.ID())
+		if uErr == nil && uMeta != nil && uMeta.SecretType == store.SecretTypeFile {
+			return ""
+		}
+		if uErr != nil && !errors.Is(uErr, store.ErrNotFound) {
+			return ""
+		}
+	}
+
+	return missingGCPTelemetryCredentialsHint
+}
+
+// allBrokersKubernetesOnly reports whether the hub has at least one registered
+// runtime broker and every registered broker profile is a Kubernetes runtime
+// (where an unset GCP identity mode defaults to passthrough rather than block).
+func (s *Server) allBrokersKubernetesOnly(ctx context.Context) bool {
+	if s.store == nil {
+		return false
+	}
+	res, err := s.store.ListRuntimeBrokers(ctx, store.RuntimeBrokerFilter{}, store.ListOptions{})
+	if err != nil || res == nil || len(res.Items) == 0 {
+		return false
+	}
+	sawProfile := false
+	for _, b := range res.Items {
+		if len(b.Profiles) == 0 {
+			return false
+		}
+		for _, p := range b.Profiles {
+			sawProfile = true
+			if !isKubernetesRuntimeType(p.Type) {
+				return false
+			}
+		}
+	}
+	return sawProfile
 }

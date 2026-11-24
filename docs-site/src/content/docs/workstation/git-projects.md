@@ -52,6 +52,8 @@ A `scion.dev/clone-url` label must use `https`, `ssh` or `git`. Agents of a proj
 
 When creating a project, Scion associates it with a matching GitHub App installation when the association is authorized: the project's git remote must be on the configured GitHub host (`github.com`, or the host of `github_app.api_base_url` for GitHub Enterprise), the installation must be active and its account must match the remote's owner, and either a Hub admin binds the installation to the project (`PUT /api/v1/projects/{id}/github-installation`) or your user-scope `GITHUB_TOKEN` secret has at least `pull` access to that repository on GitHub (`pull`-only proof yields a read-only installation token; `push` access is required for write permissions). This authorization is checked both when the association is recorded and at every token mint. The system maintains a background refresh loop for installation tokens, and the `sciontool` credential helper provides fresh tokens to `git` on-demand inside the agent container.
 
+Hub admins setting up the App for the first time should follow [GitHub App Setup](/scion/hosted/single-node/github-app/).
+
 ### Option B: Personal Access Tokens
 
 Scion uses a GitHub **fine-grained Personal Access Token (PAT)** to clone repositories over HTTPS inside agent containers. Fine-grained PATs are preferred over classic tokens because they can be scoped to specific repositories.
@@ -127,8 +129,9 @@ Once your project is created, you can configure its settings via the Web Dashboa
 3. Click the **Settings** gear icon to configure:
    - **General**: Update the project description or default branch.
    - **Limits**: Set maximum concurrency, maximum execution duration, and workspace storage limits. These limits automatically prepopulate the agent creation form.
-   - **Resources**: Manage runtime brokers and message broker plugins available to agents in this project.
-   - **Secrets**: Manage project-scoped secrets, such as API keys and PATs.
+   - **Agent Resources**: Set default CPU, memory, and disk requests and limits for new agents.
+   - **Runtime Brokers**: Manage Runtime Brokers available to agents in this project.
+   - **Project Resources** (**Secrets** tab): Manage project-scoped secrets, such as API keys and PATs.
 
 ---
 

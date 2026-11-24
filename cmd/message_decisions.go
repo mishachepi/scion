@@ -26,6 +26,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
+	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/agentstatus"
 )
 
@@ -54,6 +55,57 @@ var runDecisionsAskUser = agentstatus.RunAskUser
 // decisionsSummaryMax caps the first question in the ask_user summary.
 const decisionsSummaryMax = 120
 
+// Soft length thresholds (in Unicode runes) for decision prompts
+// (ptone/scion#8581). Exceeding them prints a warning on stderr pointing to
+// the message body for context without blocking the send.
+const (
+	decisionQuestionSoftMax    = 200
+	decisionChoiceLabelSoftMax = 40
+)
+
+// decisionLengthWarnings returns soft warnings for any decision question or
+// choice label that exceeds the recommended length thresholds. Malformed
+// decision elements are ignored so the hub remains the authority on schema
+// validation.
+func decisionLengthWarnings(payload json.RawMessage) []string {
+	if len(payload) == 0 {
+		return nil
+	}
+	var decisions []messages.DecisionInput
+	if err := json.Unmarshal(payload, &decisions); err != nil {
+		return nil
+	}
+	var warnings []string
+	for i, d := range decisions {
+		ref := strings.TrimSpace(d.ID)
+		if ref == "" {
+			ref = fmt.Sprintf("#%d", i+1)
+		}
+		if qLen := utf8.RuneCountInString(strings.TrimSpace(d.Question)); qLen > decisionQuestionSoftMax {
+			warnings = append(warnings, fmt.Sprintf(
+				"Warning: decision %s question is %d characters (soft limit %d); keep questions to one short sentence and put background details, links, and caveats in the message body",
+				ref, qLen, decisionQuestionSoftMax,
+			))
+		}
+		for j, ch := range d.Choices {
+			if lLen := utf8.RuneCountInString(strings.TrimSpace(ch.Label)); lLen > decisionChoiceLabelSoftMax {
+				warnings = append(warnings, fmt.Sprintf(
+					"Warning: decision %s choice %d label is %d characters (soft limit %d); keep choice labels to a few words and put context in the message body",
+					ref, j+1, lLen, decisionChoiceLabelSoftMax,
+				))
+			}
+		}
+	}
+	return warnings
+}
+
+// warnDecisionLengths writes any soft length warnings for payload to w.
+func warnDecisionLengths(w io.Writer, payload json.RawMessage) {
+	for _, msg := range decisionLengthWarnings(payload) {
+		_, _ = fmt.Fprintln(w, msg)
+	}
+}
+
 // decisionsRequested reports whether this invocation sends decisions.
 func decisionsRequested() bool {
 	return msgDecisions != "" || msgDecisionsFile != "" || msgLegacyChoices != "" || msgLegacyChoicesFile != ""
@@ -80,8 +132,8 @@ func validateDecisionFlags(agentTarget, group bool) error {
 		return newUsageError("--decisions and --decisions-file are mutually exclusive")
 	}
 	if !decisionsRequested() {
-		if msgDecisionsUpdate {
-			return newUsageError("--update is valid only with --decisions or --decisions-file")
+		if msgDecisionsUpdate && !secretRequestsRequested() {
+			return newUsageError("--update is valid only with --decisions, --decisions-file, --secret-request, or --secret-request-file")
 		}
 		return nil
 	}
@@ -90,9 +142,6 @@ func validateDecisionFlags(agentTarget, group bool) error {
 	}
 	if agentTarget || group {
 		return errors.New("decisions can be sent only to a user or a conversation (user:<email>, @<email>, conv:<id>, #<thread>), not to an agent or a group")
-	}
-	if msgIn != "" || msgAt != "" {
-		return newUsageError("--decisions cannot be combined with --in or --at")
 	}
 	// The hub refuses these too (attachments) or ignores them for a decision
 	// prompt; refuse them here, before anything is read or sent.
@@ -103,9 +152,6 @@ func validateDecisionFlags(agentTarget, group bool) error {
 		{"--attach", len(msgAttach) > 0},
 		{"--artifact", len(msgArtifacts) > 0},
 		{"--wake", msgWake},
-		{"--cc", len(msgCC) > 0},
-		{"--channel", msgChannel != ""},
-		{"--thread-id", msgThreadID != ""},
 	} {
 		if f.set {
 			return newUsageError("--decisions cannot be combined with %s", f.name)

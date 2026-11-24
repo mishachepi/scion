@@ -74,7 +74,7 @@ Common fields:
 | `mcp_servers` | MCP server definitions, translated per harness. |
 | `secrets` | Names of the secrets the job requires (values come from user, project, hub or broker secrets). |
 | `services`, `max_turns`, `max_model_calls`, `max_duration`, `thinking_level`, `command_args`, `task_flag` | Further job settings. |
-| `message_mode` | Hub only: the initial message mode for agents created from the template. |
+| `message_mode` | Hub only: the initial message mode for agents created from the template. With `none` (sealed), give the task when you create the agent: later messages are refused unless a super-admin sends them (see [Piercing](/scion/hosted/user/messaging/#piercing)). |
 
 A `max_turns` or `max_model_calls` of `0` means no limit and overrides the hub and broker default limits (taking effect on Runtime Brokers that advertise the `unlimitedCountLimits` capability); leave the key out to inherit them. Older versions accepted `0` silently and treated it as "inherit", and the Runtime Broker logs each template that sets a count limit to `0` when provisioning an agent.
 
@@ -263,7 +263,7 @@ When you reference a template by bare name, Scion searches in this order and use
 
 A template name (anything that is not a remote URI or an absolute path) is a single path component, with no `/`, `\`, `..`, `.`, leading `:` or `://`. A name in another form (for example `team/reviewer`) is refused rather than looked up. The same rule applies to harness-config names. The Hub and store refuse such a name on every write (`CreateTemplate`, `UpdateTemplate`, `CreateHarnessConfig`, `UpdateHarnessConfig`, create, rename, clone or import) with `name must be a single path component`, and when an agent create request names a template (`template must be a template name or ID`) or harness-config (`harness config must be a harness-config name`). `scion templates pull` and `scion harness-config pull` without `--to` build the destination directory only from a name in that form.
 
-When connected to a Hub, templates resolve from the Hub across three scopes. If a name matches in several locations, the CLI prompts you to choose; the `--local`, `--hub`, and `--global` flags narrow the search (`templates delete` defaults to `project` scope and takes `--scope <project|global>` or `--global` to delete a global template; `templates update` takes `--scope <global|project|user>`).
+When connected to a Hub, templates resolve from the Hub across three scopes. If a name matches in several locations, the CLI prompts you to choose; the `--local`, `--hub`, and `--global` flags narrow the search (`templates delete` defaults to `project` scope and takes `--scope <project|global|user>` or `--global`; `templates sync`/`push` and `templates update` also take `--scope <global|project|user>`).
 
 ### Hub Template Scopes
 
@@ -312,8 +312,9 @@ scion templates clone code-reviewer my-custom-reviewer
 # Delete a project template (alias: rm); defaults to project scope
 scion templates delete my-old-role
 
-# Delete a global template
+# Delete a global or user template
 scion templates delete my-old-role --scope global
+scion templates delete my-old-role --scope user
 
 # Refresh the built-in default template from the binary
 scion templates update-default --force
@@ -350,8 +351,9 @@ scion templates sync code-reviewer          # alias: scion templates push
 # Sync every local project template at once
 scion templates sync --all
 
-# Sync to global scope, or under a different Hub name
+# Sync to global or user scope, or under a different Hub name
 scion --global templates sync code-reviewer
+scion templates sync code-reviewer --scope user
 scion templates sync code-reviewer --name team-reviewer
 
 # Sync a template directory by path (Hub name defaults to its base name)
@@ -377,6 +379,37 @@ On the Hub, a template's files are stored as content-addressed blobs, and each c
 
 Beyond the CLI, project templates are a **fully managed Hub-level resource** with full CRUD, SDK, and Web UI support. A connected Hub can import a whole repository of templates server-side via the **Load Templates** action in the Web UI, and imported templates can be browsed, edited, and deleted directly within the dashboard (when discovering or importing workspace templates for a linked project whose recorded provider path ends in `.scion`, the Hub resolves paths from the checkout root, the parent of `.scion`). When the Hub bootstraps or imports a template directory (or any bundled `harness-configs/<name>` subdirectory inside it), it opens the collected directory as a root, reads only the regular files recorded during collection without following symlinks or replaced directories, and verifies each file's size and SHA-256 digest on every read (`scion-agent.yaml`, `config.yaml`, and uploaded files).
 
+### Importing templates from a GitHub URL through the Hub
+
+`scion templates import-url <github-url>` imports one or more templates from a GitHub folder URL directly on the Hub (mirroring **Load Templates** in the Web UI):
+
+```bash
+# Import all templates from a GitHub folder into the current project
+scion templates import-url https://github.com/org/repo/tree/main/.scion/templates
+
+# Preview discovered template names without writing anything
+scion templates import-url https://github.com/org/repo/tree/main/.scion/templates --dry-run
+
+# Import specific template(s) by name
+scion templates import-url https://github.com/org/repo/tree/main/.scion/templates --name code-reviewer --name planner
+
+# Import into global or user scope (with --scope or root --global)
+scion templates import-url https://github.com/org/repo/tree/main/.scion/templates --scope global
+scion templates import-url https://github.com/org/repo/tree/main/.scion/templates --scope user
+```
+
+Import always overwrites templates with the same name in the target scope (skipping templates whose content hash is unchanged). Credentials are resolved server-side by the Hub from the target scope's secrets (see [Template and Harness-Config Imports](/scion/hosted/user/secrets/#template-and-harness-config-imports)); no GitHub token is sent from the CLI. In agent mode (`full`-role agents), `--scope` defaults to `project`, agents can only target their own project, and imports are create-only (existing templates and templates bundling an already-existing harness-config are refused).
+
+`scion templates show <name>` displays the template's redacted `Source URL` (in both text and `--format json` output) when set.
+
+### Sources a hosted Hub imports from
+
+A hosted Hub import, discovery, or harness-config reimport fetches the source on the Hub's own host, so hosted Hubs restrict what they fetch. By default a hosted Hub accepts only `https://github.com/...` URLs (GitHub folders and archives on `github.com`, without query strings or fragments). An administrator can allow additional sources — `https://` URL prefixes and Cloud Storage prefixes (`gs://<bucket>/<prefix>`, submitted as `gs://...` or `:gcs:<bucket>/<prefix>`) — with [`server.hub.allowed_import_sources`](/scion/reference/server-config/#hub-settings-serverhub) in the settings file (no environment variable or API write). Other sources are refused: plain `http://`, the rclone `:local:` backend, other rclone backends, and connection strings with inline options are never accepted. HTTP downloads go to public addresses on port 443 only; redirects are blocked on allowlisted non-GitHub `https://` sources, and a failed download reports neither the address nor the server's response. Workstation hubs are exempt and keep fetching local and `http://` sources as before.
+
+Each hosted fetch is bounded: a download may be at most 64 MiB and take at most 2 minutes, an archive may unpack to at most 512 MiB, the files written (including a GitHub tarball's temporary extraction of the whole repository) may total at most 256 MiB and 20,000 files and directories, and the whole fetch has 5 minutes. A Cloud Storage source is counted before anything is copied and capped during sync. A GitHub folder is downloaded as the archive of its ref: the Hub tries the branch of that name, then the tag, then the commit SHA, and reports that no branch, tag, or commit was found when none exists. On a hosted Hub, a GitHub folder whose archive cannot be downloaded is not retried with a `git` checkout, as the CLI does, because a checkout cannot be held to these limits. The archive holds the whole repository, so its size and file count count toward the limits even when the folder is small; for a folder in a large repository, import from a smaller repository or ask a Hub administrator to allowlist a dedicated source in `server.hub.allowed_import_sources`. A `.zip` archive's central directory is checked before it is parsed: one that lists more entries than the file limit, entry names longer than 1,024 bytes, or a ZIP64 archive is refused.
+
+The CLI is not affected: `scion templates import` and `scion harness-config install` fetch on your own machine and still accept every source form, including rclone sources and `http://` URLs, before uploading the result.
+
 ### Refreshing a Hub template from its source
 
 A template the Hub imported from a GitHub folder URL remembers that **source URL**, and can be refreshed from it later. A refresh replaces the template's files with the current content of the source folder (a full overwrite, no merge):
@@ -398,7 +431,7 @@ scion templates update code-reviewer --scope project
 scion templates update code-reviewer --scope global --hub https://scion.example.com
 ```
 
-Inside a project, `templates update` considers global and user templates plus the current project's templates (use `--project` to pick another project); outside a project it considers every template you can see. A failed refresh makes the command exit non-zero, in both text and JSON output.
+Inside a project, `templates update` considers global and user templates plus the current project's templates (use `--project` to pick another project); outside a project it considers every template you can see. In agent mode, `--scope` defaults to `project` and `--url` overrides are refused (agents can refresh a template only from its stored source URL). A failed refresh makes the command exit non-zero, in both text and JSON output.
 
 Refreshing works only for sources in a GitHub repository: a folder on a branch (`https://github.com/<owner>/<repo>/tree/<branch>/<path>`), a branch's root (`https://github.com/<owner>/<repo>/tree/<branch>`), or `https://github.com/<owner>/<repo>[/<path>]` on branch `main`. As a `--url` override, a bare repository URL (`https://github.com/<owner>/<repo>` or `github.com/<owner>/<repo>`) is read as that repository's `.scion/templates` folder on branch `main`, the same as when importing. Folder names may contain letters, digits, spaces and `.` `_` `@` `+` `-`, and branch names letters, digits and `.` `_` `-`. Built-in templates and templates created without a source URL cannot be refreshed: `--all` skips them, and the Web UI does not offer a refresh for them. The Hub checks the source URL each time, refuses URLs that include a username or password, and limits how large the download and the extracted folder may be and how many entries the folder may contain (directories count toward this limit as well as files). A refresh writes only into the named template, even when the source folder holds several: it uses the one folder named after the template's name or slug, refuses a source with none or more than one such folder, and never creates a new template. A refresh does not touch harness-configs: a `harness-configs/` folder inside the template's source is stored as part of the template's files, but no Hub harness-config is created or updated from it. It needs the same permission as importing a template into that scope (`template.create_global` for a global template; see [Global template authoring permissions](#global-template-authoring-permissions)). A source in a private repository needs a repository credential in the template's scope, the same one importing would use (see [Template and Harness-Config Imports](/scion/hosted/user/secrets/#template-and-harness-config-imports)). With `--all`, each template's refresh has its own time limit.
 
