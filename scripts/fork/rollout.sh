@@ -3,11 +3,12 @@
 #
 #   scripts/fork/rollout.sh <тег> [--only hub,hub-broker,mac,local] [--partial] [--dry-run]
 #
-#   hub         хаб на Linux-хосте: плагин TG (install во временный файл + mv, старый — .<прежний тег>), затем
-#               плейбук scion-hub-rebuild.yaml (hub_binary, hub_commit, hub_version)
+#   hub         хаб на Linux-хосте: плейбук scion-hub-rebuild.yaml (hub_binary, hub_commit, hub_version, hub_plugin)
+#               ставит бинарь хаба и плагин telegram, перезапускает хаб и брокер на хосте хаба; если хаб не поднялся
+#               на новом теге, плейбук сам возвращает прежние файлы и падает
 #   hub-broker  брокер на хосте хаба: linux-amd64 scion+sciontool в каталог runtimes.<имя>.binaries контейнерного
-#               рантайма ($HUB_LINUX_BIN, если задан), рестарт user-юнита scion-broker (плейбук его не трогает),
-#               runtime-broker status
+#               рантайма. Вместе с hub — тем же прогоном плейбука (hub_sciontool), один рестарт брокера; без hub —
+#               копированием в $HUB_LINUX_BIN, рестарт user-юнита scion-broker, runtime-broker status
 #   mac         брокер на удалённом Mac: scp darwin-arm64 + shasum, rm+cp в каталог бинарей, kickstart -k
 #   local       брокер на этом Mac: rm+cp darwin-arm64 и linux-arm64 (каталог runtimes.<имя>.binaries
 #               контейнерного рантайма), bootout + bootstrap + kickstart
@@ -16,8 +17,10 @@
 #               затем обычный rollout брокеров
 #   --dry-run   напечатать команды, ничего не выполнять
 #
-# Порядок фиксирован: хаб раньше брокеров. Старые бинари остаются рядом как <имя>.<прежний тег>. В конце —
-# /healthz по тегу, scion version на каждом узле и `hub brokers`: все брокеры online. Сбой останавливает раскатку.
+# До первого изменения — проверка: ssh до каждого выбранного узла и, с hub, плейбук с --check. Её сбой — выход
+# без изменений. Порядок фиксирован: хаб раньше брокеров. Старые бинари остаются рядом как <имя>.<прежний тег>.
+# В конце — /healthz по тегу, scion version на каждом узле и `hub brokers`: все брокеры online. Сбой
+# останавливает раскатку.
 #
 # Хосты, пользователи, ключи и пути — из файла $SCION_FLEET_ENV (у оператора, в форк не попадает); переменные —
 # scripts/fork/fleet.env.example. Релиз берётся из $SCION_STAGED/<тег>/.
@@ -65,27 +68,31 @@ done
 SH
 swap() { bash -s -- "$@" <<<"$SWAP"; }
 
-if wants hub; then
-  step "хаб: плагин telegram"
-  run scp "$REL/linux-amd64/scion-plugin-telegram" "$HUB_SSH:/tmp/scion-plugin-telegram.$TAG"
-  remote "$HUB_SSH" "$HUB_BIN" "$TAG" <<'SH'
-set -euo pipefail
-bin=$1 tag=$2 p=$1/scion-plugin-telegram
-old=$("$bin/scion" version 2>/dev/null | sed -nE 's/^scion ([^ ]+) \(commit.*/\1/p' | tail -1)
-[[ -f $p ]] && sudo cp -n "$p" "$p.${old:-prev}"
-sudo install -m0755 "/tmp/scion-plugin-telegram.$tag" "$p.new" && sudo mv -f "$p.new" "$p"
-rm -f "/tmp/scion-plugin-telegram.$tag"
-SH
-  step "хаб: плейбук scion-hub-rebuild.yaml"
-  if ((DRY)); then
-    echo "  (cd $INFRA_DIR && ansible-playbook playbooks/infra/scion-hub-rebuild.yaml --private-key $ANSIBLE_KEY -e hub_binary=$REL/linux-amd64/scion -e hub_commit=$COMMIT -e hub_version=$TAG)"
-  else
-    (cd "$INFRA_DIR" && ansible-playbook playbooks/infra/scion-hub-rebuild.yaml --private-key "$ANSIBLE_KEY" \
-      -e "hub_binary=$REL/linux-amd64/scion" -e "hub_commit=$COMMIT" -e "hub_version=$TAG")
+# Плейбук хаба: бинарь хаба и плагин, с hub-broker — ещё бинари контейнеров брокера; аргументы — его доп. флаги.
+PLAYBOOK_ARGS=(-e "hub_binary=$REL/linux-amd64/scion" -e "hub_commit=$COMMIT" -e "hub_version=$TAG"
+  -e "hub_plugin=$REL/linux-amd64/scion-plugin-telegram")
+wants hub-broker && PLAYBOOK_ARGS+=(-e "hub_sciontool=$REL/linux-amd64/sciontool")
+playbook() { (cd "$INFRA_DIR" && ansible-playbook playbooks/infra/scion-hub-rebuild.yaml --private-key "$ANSIBLE_KEY" "${PLAYBOOK_ARGS[@]}" "$@"); }
+run_playbook() { if ((DRY)); then echo "  (cd $INFRA_DIR && ansible-playbook playbooks/infra/scion-hub-rebuild.yaml --private-key $ANSIBLE_KEY ${PLAYBOOK_ARGS[*]})"; else playbook; fi; }
+
+step "проверка до изменений"
+if ((DRY)); then
+  echo "  ssh до выбранных узлов; с hub — плейбук --check"
+else
+  { wants hub || wants hub-broker; } && { ssh -o BatchMode=yes -o ConnectTimeout=10 "$HUB_SSH" true || { echo "нет ssh до $HUB_SSH" >&2; exit 1; }; }
+  wants mac && { ssh -o BatchMode=yes -o ConnectTimeout=10 "$MAC_SSH" true || { echo "нет ssh до $MAC_SSH" >&2; exit 1; }; }
+  if wants hub && ! out=$(playbook --check 2>&1); then
+    tail -20 <<<"$out" >&2; echo "плейбук --check не прошёл, ничего не изменено" >&2; exit 1
   fi
+  echo "  узлы доступны${ONLY:+ ($ONLY)}"
 fi
 
-if wants hub-broker; then
+if wants hub; then
+  step "хаб: плейбук scion-hub-rebuild.yaml"
+  run_playbook
+fi
+
+if wants hub-broker && ! wants hub; then
   if [[ -n ${HUB_LINUX_BIN:-} ]]; then
     step "брокер на хосте хаба: бинари для контейнеров ($HUB_LINUX_BIN)"
     run ssh "$HUB_SSH" mkdir -p "/tmp/$TAG"
